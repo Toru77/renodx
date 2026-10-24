@@ -592,11 +592,18 @@ struct WorldDrawCallback {
 
     bool skip_cascade_draw = false;
     if (on_immediate && g_state.skip_cascade_shadow.load(std::memory_order_relaxed)) {
-      auto* render_state = renodx::utils::state::GetCurrentState(context.cmd_list);
-      if (render_state != nullptr && render_state->depth_stencil.handle != 0u) {
-        const auto resource = device->get_resource_from_view(render_state->depth_stencil);
+      ID3D11DepthStencilView* native_dsv = nullptr;
+      bvh::GpuTimerContext(context.cmd_list)->OMGetRenderTargets(0u, nullptr, &native_dsv);
+      if (native_dsv != nullptr) {
+        const reshade::api::resource_view dsv = {reinterpret_cast<uintptr_t>(native_dsv)};
+        native_dsv->Release();
+        const auto resource = device->get_resource_from_view(dsv);
         skip_cascade_draw = IsShadowSizedTexture(device, resource)
                             && device->get_resource_desc(resource).texture.depth_or_layers == 4u;
+        if (skip_cascade_draw && method == 0u) {
+          const float far_depth = 1.0f;
+          context.cmd_list->clear_depth_stencil_view(dsv, &far_depth, nullptr);
+        }
       }
     }
 

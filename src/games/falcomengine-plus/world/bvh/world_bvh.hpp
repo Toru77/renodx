@@ -437,12 +437,12 @@ inline bool DrawBvhPanel() {
 
   ImGui::SameLine();
   bool skip_cascade = g_state.skip_cascade_shadow.load(std::memory_order_relaxed);
-  if (ImGui::Checkbox("Skip sun cascade shadow draws (experiment)", &skip_cascade)) {
+  if (ImGui::Checkbox("Disable sun cascade shadows (experiment)", &skip_cascade)) {
     g_state.skip_cascade_shadow.store(skip_cascade, std::memory_order_relaxed);
   }
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Drops every draw into the 4-layer 4096 cascade shadow array (copies and casters) on the immediate list. "
-                      "Sun shadows go stale or missing. Session only, not saved. Census and pool still see the draws. Measurement only.");
+    ImGui::SetTooltip("Drops the game's draws into the 4-layer 4096 cascade array, clears its slices to no-shadow, and makes the sun shadow resolve and blur output fully lit. "
+                      "Sun shadows vanish. Session only, not saved. Census, pool and BVH still see every draw. Measurement only.");
   }
 
   bool do_dump_obj = false;

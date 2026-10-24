@@ -89,6 +89,7 @@ void main(
   float4 r0,r1,r2,r3,r4;
   uint4 bitmask, uiDest;
   float4 fDest;
+  if (shader_injection_data.shadow_csm_off > 0.5f) { o0 = 1.0; return; }
 
   r0.z = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
   r1.x = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).x;

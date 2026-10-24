@@ -746,11 +746,11 @@ struct ShaderInjectData {
   // a pre-scaled vector (the Sora/Kai 10-step march needs it to be), and the Ray
   // Length default should be set against a measured number rather than a guess.
   float char_cam_debug;
-  // Size: 439 floats = 1756 bytes (measured at cf637e7d). The host declares the range as
+  float shadow_csm_off;       // 0/1 runtime, session only: Sora 2nd shadow resolve and blur output 1.0 (lit); set by the world toggle in SyncISFASTToShaderInjection
+  // Size: 440 floats = 1760 bytes (exactly 110 float4s). The host declares the range as
   // sizeof(ShaderInjectData) / 4 push values (CreateShadowsPipelinesIfNeeded and RunShadows);
-  // fxc pads CB13 up to 110 float4s (1760 bytes), so the .w of the last float4 is padding
-  // that no shader reads. One more float fits in that padding; the 441st float starts a new
-  // float4, and the host range grows with sizeof automatically. Prefer reusing a RETIRED slot.
+  // the next added float starts a new float4, and the host range grows with sizeof automatically.
+  // Prefer reusing a RETIRED slot.
  };
 
 #ifndef __cplusplus

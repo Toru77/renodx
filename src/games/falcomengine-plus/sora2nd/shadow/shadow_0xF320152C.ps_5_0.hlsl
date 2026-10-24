@@ -186,6 +186,8 @@ void main(
   uint4 bitmask, uiDest;
   float4 fDest;
 
+  if (shader_injection_data.shadow_csm_off > 0.5f) { o0 = float4(1.0, 1.0, 1.0, 1.0); return; }
+
   // ── CHSS jitter setup ──
   float chss_jitter_angle = 0;
   bool chss_active = shader_injection_data.shadow_filter_method > 1.5f;
