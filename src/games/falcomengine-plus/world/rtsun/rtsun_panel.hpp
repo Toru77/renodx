@@ -46,7 +46,8 @@ inline void DrawRtSunPanel() {
     ImGui::TextDisabled("RT sun: camera sun data not captured");
   }
   if (frame.width != 0u) {
-    ImGui::Text("Trace: %u x %u (Full)", frame.width, frame.height);
+    ImGui::Text("Trace: %u x %u (%s), denoised", frame.width, frame.height,
+                frame.divisor == 1u ? "Full" : (frame.divisor == 2u ? "Half" : "Quarter"));
   }
   ImGui::Text("Characters: casters %s (%u objects traced); not receivers", g_rtsun_trace_characters > 0.5f ? "on" : "off",
               frame.character_objects);
@@ -59,7 +60,7 @@ inline void DrawRtSunPanel() {
   }
   if (g_rtsun_stats.valid) {
     const uint32_t* v = g_rtsun_stats.values;
-    ImGui::Text("Pixels: traced %u of %u (sky %u, normal %u, character %u, scaled %u, region %u, beyond range %u)",
+    ImGui::Text("Per trace pixel: traced %u of %u (sky %u, normal %u, character %u, scaled %u, region %u, beyond range %u)",
                 v[kRtSunStatTraced], v[kRtSunStatPixels], v[kRtSunStatSky], v[kRtSunStatNormal], v[kRtSunStatCharacter],
                 v[kRtSunStatScaled], v[kRtSunStatRegion], v[kRtSunStatBeyondRange]);
     const uint32_t rays = v[kRtSunStatRays];

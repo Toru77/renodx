@@ -9488,9 +9488,9 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
   push_rtls();
 }
 
-// RT Sun Shadows (world/rtsun, R3a): traces the sun shadow rays for the cascade range RT owns and records the raw term.
-// The image is not changed. Dispatched inline after RT Local Shadows with the same guards; the guard returns end only this
-// stage.
+// RT Sun Shadows (world/rtsun, R3a/R3c): traces the sun shadow rays for the cascade range RT owns, denoises the term (the
+// shared rtgi chain) and binds the denoised output at t39 for the lighting draw. Dispatched inline after RT Local Shadows
+// with the same guards; the guard returns end only this stage.
 static void RunRtSunInline(reshade::api::command_list* cmd_list) {
   namespace rtsun = falcom_world::rtsun;
   namespace rtao = falcom_world::rtao;
@@ -9526,12 +9526,12 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
     frame.reason = rtsun::Reason::DeferredList;
     return;
   }
-  // Binds this frame's RT sun term (raw, depth size) at t39 for this lighting draw, also on a second lighting draw of the
-  // frame. Only while the latched count is nonzero: the CSM is then skipped in range this frame and the term replaces it.
+  // Binds this frame's RT sun term (the denoised output, full size) at t39 for this lighting draw, also on a second
+  // lighting draw of the frame. Only while the latched count is nonzero: the CSM is then skipped in range this frame and the term replaces it.
   const auto push_rtsun = [&]() {
     if (falcom_world::g_state.rt_sun_cascades.load(std::memory_order_relaxed) == 0) return;
     const rtsun::RtSunDeviceData& data = rtsun::GetRtSunDeviceData(dev);
-    const reshade::api::resource_view term_srv = data.raw.srv[0];
+    const reshade::api::resource_view term_srv = data.denoise.output.srv[data.denoise.output_index];
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel,
         reshade::api::pipeline_layout{0},
@@ -9573,6 +9573,38 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
   frame.isfast_unavailable = rtsun::g_rtsun_isfast > 0.5f && !isfast_used;
   const float spp = (std::max)(rtsun::g_rtsun_samples, 1.f);
   const rtao::NoiseSample noise = rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>(spp), false);
+  const uint32_t divisor = rtao::RtgiTraceDivisor(rtsun::g_rtsun_trace_resolution);
+  const uint32_t trace_width = rtao::RtgiTraceExtent(dd->captured_depth_w, divisor);
+  const uint32_t trace_height = rtao::RtgiTraceExtent(dd->captured_depth_h, divisor);
+  // RT sun temporal: the reset rule shared with RT Local Shadows (rtao::TemporalResetReason) over the RT sun snapshot.
+  // Strength, Max Darkening and the spatial filter act after the history and are not in it.
+  const bool temporal_on = rtsun::g_rtsun_temporal_enabled > 0.5f;
+  const bool motion_ok = UpdateRtMotion(dev, dd, temporal_on);
+  const rtsun::ParameterSnapshot params = {
+      rtsun::g_rtsun_cascade_range, rtsun::g_rtsun_samples, rtsun::g_rtsun_ray_max, rtsun::g_rtsun_light_size,
+      rtsun::g_rtsun_normal_bias, rtsun::g_rtsun_trace_characters, rtsun::g_rtsun_isfast, rtsun::g_rtsun_trace_resolution,
+      rtsun::g_rtsun_temporal_enabled, rtsun::g_rtsun_history_weight, rtsun::g_rtsun_depth_rejection,
+      rtsun::g_rtsun_normal_rejection, rtsun::g_rtsun_history_clamp, rtsun::g_rtsun_debug};
+  const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
+  frame.prev_params = params;
+  frame.prev_params_valid = true;
+  auto& rd = rtsun::GetRtSunDeviceData(dev);
+  const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
+      .temporal_on = temporal_on,
+      .was_on = frame.temporal_last,
+      .resized = rd.denoise.history_color.width != 0u
+          && (rd.denoise.history_color.width != trace_width || rd.denoise.history_color.height != trace_height),
+      .frame = dd->frame_index,
+      .last_frame = frame.dispatched_frame,
+      .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
+      .scaled = false,
+      .params_changed = params_changed,
+      .motion_ok = motion_ok});
+  frame.reset = reset;
+  if (temporal_on && reset != rtao::ResetReason::None) {
+    frame.last_reset = reset;
+    frame.reset_counts[static_cast<size_t>(reset)] += 1u;
+  }
   rtsun::RtSunDispatchInputs in = {
       .depth_view = dd->captured_depth_srv,
       .mrt_normal_view = dd->captured_mrt_normal_srv,
@@ -9580,14 +9612,28 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
       .scene_cbv_view = dd->captured_scene_cbv_view,
       .full_width = dd->captured_depth_w,
       .full_height = dd->captured_depth_h,
+      .trace_width = trace_width,
+      .trace_height = trace_height,
       .push = {
           .params = {rtsun::g_rtsun_ray_max, rtsun::g_rtsun_normal_bias, spp, static_cast<float>(frame.cascades_effective)},
           .sampling = {isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed, rtsun::g_rtsun_debug},
-          .sun = {rtsun::g_rtsun_light_size, 0.f, 0.f, 0.f},
+          .sun = {rtsun::g_rtsun_light_size, 0.f, 0.f, static_cast<float>(divisor)},
           .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
                      bvh_data->tlas_region_size},
           .size = {0.f, 0.f, falcom_world::bvh::kPoolRegionRayMargin, 0.f}},
       .debug_mode = static_cast<int>(rtsun::g_rtsun_debug),
+      .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
+      .temporal = temporal_on,
+      .temporal_push = {.params = {rtsun::g_rtsun_history_weight, rtsun::g_rtsun_depth_rejection, rtsun::g_rtsun_normal_rejection,
+                                   rtsun::g_rtsun_history_clamp},
+                        .size = {0.f, 0.f, 0.f, reset == rtao::ResetReason::None ? 1.f : 0.f}},
+      .spatial = rtsun::g_rtsun_spatial_enabled > 0.5f,
+      .filter_type = static_cast<int>(rtsun::g_rtsun_filter_type),
+      .filter_radius = static_cast<int>(rtsun::g_rtsun_filter_radius),
+      .filter_passes = static_cast<int>(rtsun::g_rtsun_filter_passes),
+      .filter_taps = static_cast<int>(rtsun::g_rtsun_filter_type > 0.5f ? rtsun::g_rtsun_filter_taps_atrous
+                                                                       : rtsun::g_rtsun_filter_taps_separable),
+      .filter_value_stop = rtsun::g_rtsun_filter_value_stop,
   };
   if (rtsun::g_rtsun_trace_characters > 0.5f) {
     in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
@@ -9597,17 +9643,26 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
     frame.reason = rtsun::Reason::PipelineFailed;
     return;
   }
-  const auto& rd = rtsun::GetRtSunDeviceData(dev);
   frame.producing = true;
   frame.debug_written = result.debug_written;
   frame.dispatched_frame = dd->frame_index;
   frame.gpu_ms = rd.timer.last_ms;
-  frame.width = dd->captured_depth_w;
-  frame.height = dd->captured_depth_h;
+  frame.width = trace_width;
+  frame.height = trace_height;
+  frame.divisor = divisor;
+  frame.temporal_ran = result.temporal_ran;
+  frame.temporal_last = temporal_on && result.temporal_ran;
+  frame.filter_ran = result.filter_ran;
+  frame.denoise_gpu_ms = rd.denoise.timer.last_ms;
   frame.character_objects = in.dynamic.count;
   frame.isfast_used = isfast_used;
   frame.texture_bytes = static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
-      + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u + sizeof(uint32_t) * rtsun::kRtSunStatsCount;
+      + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
+      + static_cast<uint64_t>(rd.denoise.history_color.width) * rd.denoise.history_color.height * 8u * 2u
+      + static_cast<uint64_t>(rd.denoise.history_normal.width) * rd.denoise.history_normal.height * 4u * 2u
+      + static_cast<uint64_t>(rd.denoise.filter.width) * rd.denoise.filter.height * 8u * 3u
+      + static_cast<uint64_t>(rd.denoise.output.width) * rd.denoise.output.height * 4u * 2u
+      + sizeof(uint32_t) * rtsun::kRtSunStatsCount;
   push_rtsun();
 }
 

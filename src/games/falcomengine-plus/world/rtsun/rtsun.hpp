@@ -38,6 +38,16 @@ struct RtSunFrameState {
   float built_range = 0.f;     // BVH region range (m) the effective count was limited by
   uint32_t character_objects = 0u;
   uint64_t texture_bytes = 0u;
+  uint32_t divisor = 1u;               // trace divisor (1 Full, 2 Half, 4 Quarter); width and height are the trace size
+  float denoise_gpu_ms = -1.f;         // temporal, filter and upsample (negative: none yet)
+  bool temporal_ran = false;
+  bool temporal_last = false;          // Temporal was on and ran in the last frame that ran the reset rule
+  bool filter_ran = false;
+  rtao::ResetReason reset = rtao::ResetReason::Disabled;
+  rtao::ResetReason last_reset = rtao::ResetReason::Disabled;
+  uint64_t reset_counts[static_cast<size_t>(rtao::ResetReason::Count)] = {};
+  bool prev_params_valid = false;
+  ParameterSnapshot prev_params = {};
 };
 inline RtSunFrameState g_rtsun_frame;
 struct RtSunStatsState { std::atomic_bool requested{false}; bool valid = false; uint32_t values[kRtSunStatsCount] = {}; };
@@ -50,19 +60,31 @@ struct RtSunDispatchInputs {
   reshade::api::resource_view scene_cbv_view = {0u};
   uint32_t full_width = 0u;
   uint32_t full_height = 0u;
-  RtSunPushConstants push = {};
-  int debug_mode = 0;               // RT Sun Debug: 1 raw shadow, 2 pixel classes
+  uint32_t trace_width = 0u;
+  uint32_t trace_height = 0u;
+  RtSunPushConstants push = {};     // sun[3] is the trace divisor
+  int debug_mode = 0;               // RT Sun Debug: 1 raw shadow, 2 pixel classes, 4 to 6 denoise views
+  reshade::api::resource_view motion_view = {0u};  // null: the temporal pass does not run
+  bool temporal = false;
+  rtgi::RtgiTemporalPushConstants temporal_push = {};  // params and size[3] (history valid) set by the caller
+  bool spatial = false;
+  int filter_type = 1;
+  int filter_radius = 2;
+  int filter_passes = 1;
+  int filter_taps = 5;
+  float filter_value_stop = 0.f;   // filter c2.w: penumbra edge stop k
   bvh::DynamicTraceInputs dynamic = {};
 };
-struct RtSunDispatchResult { bool ok = false; bool debug_written = false; };
+struct RtSunDispatchResult { bool ok = false; bool debug_written = false; bool temporal_ran = false; bool filter_ran = false; };
 
 inline RtSunDispatchResult Dispatch(reshade::api::device* device, reshade::api::command_list* cmd_list, const RtSunDispatchInputs& in) {
   const bvh::PoolCpuTimer cpu_timer{&bvh::g_perf_gate.rtsun_record_us};
   auto* bvh_data = bvh::GetBvhDeviceData(device);
   RtSunDeviceData& data = GetRtSunDeviceData(device);
-  if (bvh_data == nullptr || in.full_width == 0u || in.full_height == 0u) return {};
+  if (bvh_data == nullptr || in.full_width == 0u || in.full_height == 0u || in.trace_width == 0u || in.trace_height == 0u) return {};
   if (!rtgi::EnsureRtgiPipeline(device, &data.trace_pipeline, {.srv_count = kRtSunSrvCount, .uav_count = kRtSunUavCount, .sampler_count = 0u,
-                                                               .push_count = kRtSunPushConstantCount, .code = kRtSunTraceShader, .name = "rtsun_trace"})) {
+                                                               .push_count = kRtSunPushConstantCount, .code = kRtSunTraceShader, .name = "rtsun_trace"})
+      || !rtgi::EnsureRtgiPipeline(device, &data.denoise.upsample_pipeline, rtgi::kRtgiUpsamplePipelineDesc)) {
     return {};
   }
   if (data.stats_buffer.handle == 0u) {
@@ -74,15 +96,28 @@ inline RtSunDispatchResult Dispatch(reshade::api::device* device, reshade::api::
       return {};
     }
   }
-  bool debug_ready = in.debug_mode >= 1 && in.debug_mode <= 2;
+  bool debug_ready = (in.debug_mode >= 1 && in.debug_mode <= 2) || (in.debug_mode >= 4 && in.debug_mode <= 6);
   if (debug_ready && !rtgi::EnsureRtgiTextureSet(device, &data.debug, reshade::api::format::r8g8b8a8_unorm, 4u, in.full_width, in.full_height)) {
     renodx::utils::log::w("[world-rtsun] debug texture creation failed");
     debug_ready = false;
   }
-  if (!rtgi::EnsureRtgiTextureSet(device, &data.raw, reshade::api::format::r16g16b16a16_float, 8u, in.full_width, in.full_height)) {
+  const bool trace_debug = debug_ready && in.debug_mode <= 2;
+  if (!rtgi::EnsureRtgiTextureSet(device, &data.raw, reshade::api::format::r16g16b16a16_float, 8u, in.trace_width, in.trace_height)) {
     renodx::utils::log::w("[world-rtsun] raw texture creation failed");
     return {};
   }
+  const rtgi::RtgiDenoiseReady denoise = rtgi::EnsureRtgiDenoise(device, &data.denoise,
+                                                                 {.output_format = reshade::api::format::r8g8b8a8_unorm,
+                                                                  .output_bytes_per_pixel = 4u,
+                                                                  .trace_width = in.trace_width,
+                                                                  .trace_height = in.trace_height,
+                                                                  .full_width = in.full_width,
+                                                                  .full_height = in.full_height,
+                                                                  .temporal = in.temporal && in.motion_view.handle != 0u,
+                                                                  .spatial = in.spatial,
+                                                                  .filter_code = rtls::kRtlsFilterShader,
+                                                                  .log_prefix = "[world-rtsun]"});
+  if (!denoise.ok) return {};
 
   RtSunPushConstants push = in.push;
   push.size[0] = static_cast<float>(in.full_width);
@@ -102,7 +137,7 @@ inline RtSunDispatchResult Dispatch(reshade::api::device* device, reshade::api::
   srvs[18] = in.isfast_view;
   srvs[19] = bvh_data->dynamic.instances_srv;
   const reshade::api::resource_view uavs[kRtSunUavCount] = {
-      debug_ready ? data.debug.uav[0] : reshade::api::resource_view{0u}, data.stats_uav, data.raw.uav[0]};
+      trace_debug ? data.debug.uav[0] : reshade::api::resource_view{0u}, data.stats_uav, data.raw.uav[0]};
   const reshade::api::descriptor_type kCbv = reshade::api::descriptor_type::constant_buffer;
   const reshade::api::descriptor_type kSrv = reshade::api::descriptor_type::shader_resource_view;
   const reshade::api::descriptor_type kUav = reshade::api::descriptor_type::unordered_access_view;
@@ -116,23 +151,54 @@ inline RtSunDispatchResult Dispatch(reshade::api::device* device, reshade::api::
   const reshade::api::descriptor_table tables[3] = {trace.cbv_table, trace.srv_table, trace.uav_table};
   cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, trace.layout, 0, 3, tables);
   cmd_list->push_constants(reshade::api::shader_stage::all_compute, trace.layout, 3, 0, kRtSunPushConstantCount, &push);
-  cmd_list->dispatch((in.full_width + 7u) / 8u, (in.full_height + 7u) / 8u, 1u);
+  cmd_list->dispatch((in.trace_width + 7u) / 8u, (in.trace_height + 7u) / 8u, 1u);
   rtao::NullComputeSlots(cmd_list, kRtSunSrvCount, kRtSunUavCount, 0u);
-  if (debug_ready) {
+  if (trace_debug) {
     cmd_list->barrier(data.debug.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   }
   cmd_list->barrier(data.raw.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   bvh::EndGpuTimer(cmd_list, &data.timer);
 
-  // App-side tables: null contents (ReShade keeps descriptors in the table object). The CBV tables keep their view.
-  const reshade::api::resource_view table_null_srv[kRtSunSrvCount] = {};
-  const reshade::api::resource_view table_null_uav[kRtSunUavCount] = {};
-  const reshade::api::descriptor_table_update table_nulls[2] = {
-      {trace.srv_table, 0, 0, kRtSunSrvCount, kSrv, table_null_srv},
-      {trace.uav_table, 0, 0, kRtSunUavCount, kUav, table_null_uav},
+  // RT Sun Debug 4 to 6 are the chain's views 4 (accumulated), 5 (history confidence) and 6 (final, after the upsample).
+  const int denoise_debug = in.debug_mode >= 4 && in.debug_mode <= 6 ? in.debug_mode : 0;
+  const reshade::api::resource_view table_null_views[kRtSunSrvCount] = {};
+  std::vector<reshade::api::descriptor_table_update> table_nulls = {
+      {trace.srv_table, 0, 0, kRtSunSrvCount, kSrv, table_null_views},
+      {trace.uav_table, 0, 0, kRtSunUavCount, kUav, table_null_views},
   };
-  device->update_descriptor_tables(2, table_nulls);
-  return {.ok = true, .debug_written = debug_ready};
+  const rtgi::RtgiDenoiseResult denoised = rtgi::DispatchRtgiDenoise(
+      device, cmd_list, &data.denoise,
+      {.raw_view = data.raw.srv[0],
+       .depth_view = in.depth_view,
+       .mrt_normal_view = in.mrt_normal_view,
+       .scene_cbv_view = in.scene_cbv_view,
+       .motion_view = in.motion_view,
+       .albedo_view = reshade::api::resource_view{0u},
+       .stats_uav = data.stats_uav,
+       .debug_uav = debug_ready && denoise_debug != 0 ? data.debug.uav[0] : reshade::api::resource_view{0u},
+       .debug_texture = data.debug.texture[0],
+       .trace_width = in.trace_width,
+       .trace_height = in.trace_height,
+       .full_width = in.full_width,
+       .full_height = in.full_height,
+       .divisor = in.push.sun[3],
+       .debug_mode = denoise_debug,
+       .temporal_push = in.temporal_push,
+       .filter_type = in.filter_type,
+       .filter_radius = in.filter_radius,
+       .filter_passes = in.filter_passes,
+       .filter_taps = in.filter_taps,
+       .filter_value_stop = in.filter_value_stop,
+       .upsample_intensity = 1.f,
+       .upsample_char_intensity = 1.f,
+       .upsample_saturation = 1.f},
+      denoise, &table_nulls);
+  // App-side tables: null contents (ReShade keeps descriptors in the table object). The CBV tables keep their view.
+  device->update_descriptor_tables(static_cast<uint32_t>(table_nulls.size()), table_nulls.data());
+  return {.ok = true,
+          .debug_written = trace_debug || denoised.temporal_debug || denoised.upsample_debug,
+          .temporal_ran = denoise.temporal,
+          .filter_ran = denoise.spatial};
 }
 
 struct RtSunJsonInput {
@@ -152,7 +218,21 @@ inline std::string BuildRtSunJson(const RtSunJsonInput& in) {
   out << "  \"input_reason\": \"" << rtao::ReasonName(f.input_reason) << "\",\n";
   out << "  \"producing\": " << (f.producing ? "true" : "false") << ",\n";
   out << "  \"gpu_ms\": " << f.gpu_ms << ",\n";
-  out << "  \"trace\": {\"width\": " << f.width << ", \"height\": " << f.height << "},\n";
+  out << "  \"trace\": {\"divisor\": " << f.divisor << ", \"width\": " << f.width << ", \"height\": " << f.height << "},\n";
+  out << "  \"denoise_gpu_ms\": " << f.denoise_gpu_ms << ",\n";
+  out << "  \"temporal\": {\"on\": " << (g_rtsun_temporal_enabled > 0.5f ? "true" : "false")
+      << ", \"ran\": " << (f.temporal_ran ? "true" : "false")
+      << ", \"reset\": \"" << rtao::ResetReasonName(f.reset) << "\""
+      << ", \"last_reset\": \"" << rtao::ResetReasonName(f.last_reset) << "\", \"reset_counts\": [";
+  for (size_t r = 0; r < static_cast<size_t>(rtao::ResetReason::Count); ++r) {
+    out << (r == 0u ? "" : ", ") << f.reset_counts[r];
+  }
+  out << "]},\n";
+  out << "  \"spatial_filter\": {\"on\": " << (g_rtsun_spatial_enabled > 0.5f ? "true" : "false")
+      << ", \"ran\": " << (f.filter_ran ? "true" : "false") << ", \"type\": " << g_rtsun_filter_type
+      << ", \"radius\": " << g_rtsun_filter_radius << ", \"passes\": " << g_rtsun_filter_passes
+      << ", \"taps\": " << (g_rtsun_filter_type > 0.5f ? g_rtsun_filter_taps_atrous : g_rtsun_filter_taps_separable)
+      << ", \"value_stop\": " << g_rtsun_filter_value_stop << "},\n";
   out << "  \"cascades\": {\"requested\": " << f.cascades_requested << ", \"effective\": " << f.cascades_effective
       << ", \"camera\": " << f.cascades_camera << ", \"covered_m\": " << f.covered_m
       << ", \"built_range_m\": " << f.built_range << "},\n";
@@ -161,8 +241,9 @@ inline std::string BuildRtSunJson(const RtSunJsonInput& in) {
   out << "  \"settings\": {\"debug\": " << g_rtsun_debug << ", \"cascade_range\": " << g_rtsun_cascade_range
       << ", \"trace_characters\": " << g_rtsun_trace_characters << ", \"samples\": " << g_rtsun_samples
       << ", \"max_ray_m\": " << g_rtsun_ray_max << ", \"light_size_deg\": " << g_rtsun_light_size
-      << ", \"normal_bias_m\": " << g_rtsun_normal_bias << ", \"isfast\": " << g_rtsun_isfast << "},\n";
-  out << "  \"stats\": {\"pixels\": " << v[kRtSunStatPixels] << ", \"traced\": " << v[kRtSunStatTraced]
+      << ", \"normal_bias_m\": " << g_rtsun_normal_bias << ", \"isfast\": " << g_rtsun_isfast
+      << ", \"trace_resolution\": " << g_rtsun_trace_resolution << "},\n";
+  out << "  \"stats\": {\"unit\": \"per trace pixel\", \"pixels\": " << v[kRtSunStatPixels] << ", \"traced\": " << v[kRtSunStatTraced]
       << ", \"sky\": " << v[kRtSunStatSky] << ", \"normal\": " << v[kRtSunStatNormal]
       << ", \"region\": " << v[kRtSunStatRegion] << ", \"beyond_range\": " << v[kRtSunStatBeyondRange]
       << ", \"scaled\": " << v[kRtSunStatScaled] << ", \"character\": " << v[kRtSunStatCharacter]
@@ -189,7 +270,7 @@ inline void MaybeCaptureRtSunStats(reshade::api::device* device, reshade::api::c
   std::memcpy(g_rtsun_stats.values, bytes.data(), sizeof(g_rtsun_stats.values));
   g_rtsun_stats.valid = true;
   const uint32_t* v = g_rtsun_stats.values;
-  renodx::utils::log::i("[world-rtsun] stats: pixels=", v[kRtSunStatPixels], " traced=", v[kRtSunStatTraced],
+  renodx::utils::log::i("[world-rtsun] stats (per trace pixel): pixels=", v[kRtSunStatPixels], " traced=", v[kRtSunStatTraced],
                         " beyond_range=", v[kRtSunStatBeyondRange], " rays=", v[kRtSunStatRays],
                         " blocked=", v[kRtSunStatRaysBlocked], " character_rays=", v[kRtSunStatCharacterRays],
                         " self_blocked=", v[kRtSunStatSelfBlocked], " invalid_refs=", v[kRtSunStatInvalidRefs],

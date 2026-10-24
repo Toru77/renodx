@@ -1,6 +1,7 @@
 // world_rtsun.cs_5_0.hlsl - RT Sun Shadows trace (world/docs/ROADMAP.md, RT Sun Shadows R3a).
 //
-// One thread per pixel (full size). Environment pixels inside the RT cascade range (RtSunWeight > 0) and the BVH region
+// One thread per trace pixel: a d x d block of full-size pixels (d = trace divisor, c2.w); the representative pixel is the
+// block centre. Environment pixels inside the RT cascade range (RtSunWeight > 0) and the BVH region
 // shoot shadow rays toward the sun (a disk of Light Size, IS-FAST or IGN) through the live BVH; character casters block
 // them (characters are not receivers here, their pixels are skipped and counted). Writes x shadow x w, z w and a 1 traced /
 // -1 not traced (u2), the debug views 1-2 (u0) and counters (u1). The image is not changed by this pass.
@@ -40,7 +41,7 @@ cbuffer cb_rtsun : register(b12)
 {
     float4 g_rtsun_params : packoffset(c0);   // Max Ray Distance (m), normal bias (m), samples per pixel, effective RT cascades
     float4 g_rtsun_sampling : packoffset(c1); // IS-FAST flag (1 loaded), slice base, IGN seed, debug mode
-    float4 g_rtsun_sun : packoffset(c2);      // light size (degrees), character object count, P2b record count (z, uint bits), 0
+    float4 g_rtsun_sun : packoffset(c2);      // light size (degrees), character object count, P2b record count (z, uint bits), trace divisor (w)
     float4 g_rtsun_region : packoffset(c3);   // BVH region min xyz, region size
     float4 g_rtsun_size : packoffset(c4);     // full width, full height, region margin (m; kPoolRegionRayMargin), 0
 };
@@ -72,9 +73,14 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
     for (uint s = group_index; s < RTSUN_STAT_COUNT; s += 64u) gs_stats[s] = 0u;
     GroupMemoryBarrierWithGroupSync();
 
-    if (all(id.xy < uint2(g_rtsun_size.xy)))
+    const uint d = max((uint)g_rtsun_sun.w, 1u);
+    const uint2 full = uint2(g_rtsun_size.xy);
+    const uint2 trace = (full + d - 1u) / d;
+    if (all(id.xy < trace))
     {
-        const uint2 px = id.xy;
+        // Representative pixel: the block centre min(tp * d + d / 2, full - 1) (px = tp at Full).
+        const uint2 tp = id.xy;
+        const uint2 px = min(tp * d + d / 2u, full - 1u);
         const int debug_mode = (int)g_rtsun_sampling.w;
         float4 raw = float4(0.0, 0.0, 0.0, -1.0);
         float3 cls = float3(0.0, 0.0, 0.0);
@@ -194,9 +200,20 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
             }
         }
         InterlockedAdd(gs_stats[RTSUN_STAT_PIXELS], 1u);
-        g_rtsun_raw[px] = raw;
-        if (debug_mode == 1) g_rtsun_debug[px] = float4(raw.a > 0.0 ? raw.xxx : float3(0.0, 0.0, 0.0), 1.0);
-        else if (debug_mode == 2) g_rtsun_debug[px] = float4(cls, 1.0);
+        g_rtsun_raw[tp] = raw;
+        if (debug_mode == 1 || debug_mode == 2)
+        {
+            // The debug texture is full size: the trace pixel fills its d x d block.
+            const float3 dbg = debug_mode == 1 ? (raw.a > 0.0 ? raw.xxx : float3(0.0, 0.0, 0.0)) : cls;
+            for (uint by = 0u; by < d; ++by)
+            {
+                for (uint bx = 0u; bx < d; ++bx)
+                {
+                    const uint2 block_px = tp * d + uint2(bx, by);
+                    if (all(block_px < full)) g_rtsun_debug[block_px] = float4(dbg, 1.0);
+                }
+            }
+        }
     }
 
     GroupMemoryBarrierWithGroupSync();

@@ -11,7 +11,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <string>
 
@@ -21,6 +23,7 @@
 #include "src/games/falcomengine-plus/world/rtsun/rtsun_range.hpp"
 
 namespace rtsun = falcom_world::rtsun;
+namespace rtao = falcom_world::rtao;
 
 static int g_failures = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { ++g_failures; std::printf("FAIL %s:%d %s | ", __FILE__, __LINE__, #cond); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
@@ -130,6 +133,80 @@ static void TestRtSunTrace() {
   CHECK(Count(text, "raw = float4(shadow * w, 0.0, w, 1.0);") == 1, "raw output (shadow * w, 0, w, 1)");
 }
 
+// R3c: the sun denoise. Fields that must NOT be in rtsun::ParameterSnapshot: they act after the history (lighting shader
+// or spatial filter).
+template <typename T> concept SunSnapshotHasStrength = requires(T t) { t.strength; };
+template <typename T> concept SunSnapshotHasMaxDarkening = requires(T t) { t.max_darkening; };
+template <typename T> concept SunSnapshotHasSpatial = requires(T t) { t.spatial_enabled; } || requires(T t) { t.filter_type; }
+    || requires(T t) { t.filter_radius; } || requires(T t) { t.filter_passes; } || requires(T t) { t.filter_taps_separable; }
+    || requires(T t) { t.filter_taps_atrous; } || requires(T t) { t.filter_value_stop; };
+
+static void TestSunParameterSnapshot() {
+  rtsun::ParameterSnapshot a = {};
+  rtsun::ParameterSnapshot b = {};
+  CHECK(a == b, "equal snapshots compare equal");
+  b.trace_resolution = 2.f;
+  CHECK(!(a == b), "a trace resolution change is a parameter change");
+  b = a;
+  b.history_weight = 0.5f;
+  CHECK(!(a == b), "a history weight change is a parameter change");
+  CHECK(!SunSnapshotHasStrength<rtsun::ParameterSnapshot>, "Strength is not in the snapshot (no history reset)");
+  CHECK(!SunSnapshotHasMaxDarkening<rtsun::ParameterSnapshot>, "Max Darkening is not in the snapshot (no history reset)");
+  CHECK(!SunSnapshotHasSpatial<rtsun::ParameterSnapshot>, "no spatial filter field or edge stop is in the snapshot");
+  // Exactly the 14 float fields listed in rtsun_state.hpp; each one takes part in the comparison.
+  CHECK(sizeof(rtsun::ParameterSnapshot) == 14u * sizeof(float), "snapshot is 14 floats (%zu bytes)", sizeof(rtsun::ParameterSnapshot));
+  for (size_t i = 0u; i < 14u; ++i) {
+    rtsun::ParameterSnapshot changed = {};
+    float fields[14] = {};
+    std::memcpy(fields, &changed, sizeof(fields));
+    fields[i] = 1.f;
+    std::memcpy(&changed, fields, sizeof(fields));
+    CHECK(!(changed == rtsun::ParameterSnapshot{}), "field %zu takes part in the comparison", i);
+  }
+}
+
+// R3c: the trace resolution (divisor 1, 2, 4), the trace extent arithmetic shared by the shader and the C++ and the debug
+// view numbering (1, 2 trace; 4 to 6 denoise; 3 unused).
+static void TestSunDenoiseText() {
+  CHECK(rtao::RtgiTraceDivisor(0.f) == 1u && rtao::RtgiTraceDivisor(1.f) == 2u && rtao::RtgiTraceDivisor(2.f) == 4u, "divisors 1, 2, 4");
+  for (uint32_t d : {1u, 2u, 4u}) {
+    for (uint32_t full : {1u, 7u, 1280u, 1921u}) {
+      const uint32_t shader_extent = (full + d - 1u) / d;
+      CHECK(rtao::RtgiTraceExtent(full, d) == shader_extent, "trace extent %u / %u matches the shader arithmetic", full, d);
+    }
+  }
+  const std::string shader = ReadText("src/games/falcomengine-plus/world/shaders/world_rtsun.cs_5_0.hlsl");
+  CHECK(Count(shader, "const uint2 trace = (full + d - 1u) / d;") == 1, "shader trace extent uses (full + d - 1) / d");
+  CHECK(Count(shader, "const uint d = max((uint)g_rtsun_sun.w, 1u);") == 1, "divisor from sun.w, at least 1");
+  CHECK(Count(shader, "g_rtsun_raw[tp] = raw;") == 1, "raw written at the trace pixel");
+  CHECK(Count(shader, "if (debug_mode == 1 || debug_mode == 2)") == 1, "debug views 1 and 2 are written per block");
+  CHECK(Count(shader, "debug_mode == 3") == 0, "debug view 3 is unused in the shader");
+  const std::string rtao_state = ReadText("src/games/falcomengine-plus/world/rtao/rtao_state.hpp");
+  CHECK(Count(rtao_state, "return (full + divisor - 1u) / divisor;") == 1, "RtgiTraceExtent arithmetic");
+  const std::string sun = ReadText("src/games/falcomengine-plus/world/rtsun/rtsun.hpp");
+  CHECK(Count(sun, "in.debug_mode >= 4 && in.debug_mode <= 6 ? in.debug_mode : 0") == 1, "denoise views 4 to 6 map to the chain");
+  CHECK(Count(sun, "debug_mode == 3") == 0, "debug view 3 is unused in the C++");
+  CHECK(Count(sun, "rtls::kRtlsFilterShader") == 1, "the spatial filter source is the RTLS filter (edge stop)");
+  const std::string addon = ReadText("../../src/games/falcomengine-plus/addon.cpp");  // the harness copy has no addon.cpp
+  // Scoped to RunRtSunInline (RTLS and RTGI have the same expressions).
+  const size_t sun_begin = addon.find("static void RunRtSunInline(");
+  const size_t sun_end = addon.find("static void RunRtgiInline(", sun_begin);
+  const std::string sun_block = sun_begin != std::string::npos && sun_end != std::string::npos ? addon.substr(sun_begin, sun_end - sun_begin) : "";
+  CHECK(!sun_block.empty(), "RunRtSunInline found in addon.cpp");
+  CHECK(Count(sun_block, "rtao::RtgiTraceExtent(dd->captured_depth_w, divisor)") == 1, "addon trace width from the divisor");
+  CHECK(Count(sun_block, "data.denoise.output.srv[data.denoise.output_index]") == 1, "lighting binds the denoised output");
+  // The snapshot block of RunRtSunInline must not read Strength or Max Darkening.
+  const size_t begin = sun_block.find("const rtsun::ParameterSnapshot params = {");
+  const size_t end = sun_block.find("const bool params_changed", begin);
+  CHECK(begin != std::string::npos && end != std::string::npos, "RT sun snapshot block found in addon.cpp");
+  if (begin != std::string::npos && end != std::string::npos) {
+    const std::string block = sun_block.substr(begin, end - begin);
+    CHECK(Count(block, "g_rtsun_strength") == 0 && Count(block, "g_rtsun_max_darkening") == 0, "snapshot block excludes Strength and Max Darkening");
+  }
+  const std::string settings = ReadText("src/games/falcomengine-plus/world/world_settings.hpp");
+  CHECK(Count(settings, "\"RtSunFilterValueStop\"") == 1 && Count(settings, "\"RtSunTraceResolution\"") == 1, "RT sun rows: edge stop and trace resolution");
+}
+
 int main() {
   HStage("boundary transcription");
   TestBoundary();
@@ -139,6 +216,9 @@ int main() {
   TestEffective();
   HStage("sun trace text and constants");
   TestRtSunTrace();
+  HStage("sun denoise snapshot and text");
+  TestSunParameterSnapshot();
+  TestSunDenoiseText();
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);
   return g_failures != 0;
 }

@@ -1,7 +1,8 @@
 #pragma once
 
-// RT Sun Shadows GPU resources: the trace pipeline (world_rtsun), the stats buffer, the raw sun term (rgba16f at full
-// size) and the debug texture (r8g8b8a8_unorm, created while RT Sun Debug is 1 or 2). Created lazily from RunRtSunInline
+// RT Sun Shadows GPU resources: the trace pipeline (world_rtsun), the stats buffer, the raw sun term (rgba16f at the trace
+// size), the denoise chain (shared rtgi; output full size) and the debug texture (r8g8b8a8_unorm, full size, created while
+// RT Sun Debug is 1, 2 or 4 to 6). Created lazily from RunRtSunInline
 // (rtsun.hpp); no module mutex is held around any graphics call here.
 
 #include <cstddef>
@@ -10,6 +11,7 @@
 #include <unordered_map>
 
 #include "../rtgi/rtgi_resources.hpp"
+#include "../rtls/rtls_resources.hpp"
 
 namespace falcom_world::rtsun {
 
@@ -43,7 +45,7 @@ inline constexpr std::span<const std::uint8_t> kRtSunTraceShader = {};
 struct RtSunPushConstants {
   float params[4];    // c0: Max Ray Distance (m), normal bias (m), samples per pixel, effective RT cascades
   float sampling[4];  // c1: IS-FAST flag (1 loaded), slice base, IGN seed, debug mode
-  float sun[4];       // c2: light size (degrees), character object count, P2b record count (z, uint bits), 0
+  float sun[4];       // c2: light size (degrees), character object count, P2b record count (z, uint bits), trace divisor (w)
   float region[4];    // c3: BVH region min xyz, region size
   float size[4];      // c4: full width, full height, region margin (m; kPoolRegionRayMargin), 0
 };
@@ -56,8 +58,9 @@ struct RtSunDeviceData {
   rtgi::RtgiPipeline trace_pipeline;
   reshade::api::resource stats_buffer = {0u};
   reshade::api::resource_view stats_uav = {0u};
-  rtgi::RtgiTextureSet<1> raw;    // rgba16f, full size: x shadow x w, y 0, z w (RT cascade weight), a 1 traced / -1 not
-  rtgi::RtgiTextureSet<1> debug;  // r8g8b8a8_unorm, full size; created while RT Sun Debug is 1 or 2
+  rtgi::RtgiTextureSet<1> raw;    // rgba16f, trace size: x shadow x w, y 0, z w (RT cascade weight), a 1 traced / -1 not
+  rtgi::RtgiDenoiseSet denoise;   // temporal, filter and upsample; output r8g8b8a8_unorm, full size (x = the denoised term)
+  rtgi::RtgiTextureSet<1> debug;  // r8g8b8a8_unorm, full size; created while RT Sun Debug is 1, 2 or 4 to 6
   bvh::GpuTimer timer;
 };
 
@@ -71,6 +74,7 @@ inline void DestroyRtSunDeviceData(reshade::api::device* device) {
   RtSunDeviceData& data = found->second;
   rtgi::DestroyRtgiTextureSet(device, &data.raw);
   rtgi::DestroyRtgiTextureSet(device, &data.debug);
+  rtgi::DestroyRtgiDenoiseSet(device, &data.denoise);
   bvh::DestroyBuffer(device, &data.stats_uav, &data.stats_buffer);
   bvh::DestroyGpuTimer(&data.timer);
   rtgi::DestroyRtgiPipeline(device, data.trace_pipeline);
