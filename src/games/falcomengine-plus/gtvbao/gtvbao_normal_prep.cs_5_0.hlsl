@@ -24,11 +24,8 @@ void main(uint2 dt : SV_DispatchThreadID)
   // disagree. Unwritten texels stay a ZERO vector, which the à-trous and
   // upscale consumers read as "no g-buffer normal here" and fall back to
   // depth-only weighting for.
-  // This texture feeds the AO-side filters (à-trous, upscale), so it uses the
-  // AO transform mode.
   g_outPrepNormal[dt] = float4(
       TransformNormalToView(
-          DecodeFalcomMrtNormal(g_srcPrepMrtNormal.Load(int3(dt, 0)).xy),
-          GTVBAO_normal_transform_mode),
+          DecodeFalcomMrtNormal(g_srcPrepMrtNormal.Load(int3(dt, 0)).xy)),
       0.0);
 }

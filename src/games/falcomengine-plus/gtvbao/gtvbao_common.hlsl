@@ -20,14 +20,8 @@
 #define VA_SATURATE(x) saturate(x)
 #endif
 
-// Dynamic settings from push_constants at b13.
-#define GT_VBAO_USE_DEFAULT_CONSTANTS 0
-
 // Use fp32 math for fxc / cs_5_0 compatibility.
 #define GT_VBAO_USE_HALF_FLOAT_PRECISION 0
-
-// Enable visibility bitmask AO (replaces GTAO horizon angles).
-#define GT_VBAO_USE_BITMASK 1
 
 // Floor for the "normal Z preservation" tuning weight. Scaling n.z to exactly 0
 // discards the only component that distinguishes an up-facing surface from a
@@ -57,100 +51,50 @@ cbuffer cb_scene : register(b0)
 // Must be declared BEFORE GTVBAO.hlsli so GTVBAO_MainPass can reference it.
 cbuffer cb_gtvbao : register(b13)
 {
-  float GTVBAO_quality;
-  float GTVBAO_denoise_passes;
-  float GTVBAO_radius;
-  float GTVBAO_falloff_range;
-  float GTVBAO_radius_multiplier;
-  float GTVBAO_final_value_power;
-  float GTVBAO_sample_distribution_power;
-  float GTVBAO_thin_occluder_compensation;
-  float GTVBAO_depth_mip_sampling_offset;
-  float GTVBAO_denoise_blur_beta;
-  float GTVBAO_noise_index;
-  float GTVBAO_debug_mode;
-  float GTVBAO_denoise_is_last_pass;
+  float GTVBAO_quality;                  // c[00] - 0=Low 2x4, 1=Medium 3x4, 2=High 3x6, 3=Ultra 4x10
+  float GTVBAO_radius;                   // c[01]
+  float GTVBAO_radius_multiplier;        // c[02]
+  float GTVBAO_final_value_power;        // c[03]
+  float GTVBAO_sample_distribution_power;// c[04]
+  float GTVBAO_bitmask_thickness;        // c[05]
+  float GTVBAO_depth_mip_sampling_offset;// c[06]
   // The c[NN] tags below are 0-based indices into the array built by
   // BuildGTVBAOPushConstants() in addon.cpp; the two lists must stay in lockstep.
-  float GTVBAO_normal_input_mode;       // c[13] - 0=depth-derived, 1=MRT g-buffer
-  float GTVBAO_mrt_normal_available;    // c[14]
-  float GTVBAO_normal_influence;        // c[15]
-  float GTVBAO_normal_depth_blend;      // c[16]
-  float GTVBAO_normal_sharpness;        // c[17]
-  float GTVBAO_normal_edge_rejection;   // c[18]
-  float GTVBAO_normal_z_preservation;   // c[19]
-  float GTVBAO_normal_detail_response;  // c[20]
-  float GTVBAO_normal_max_darkening;    // c[21]
-  float GTVBAO_normal_darkening_mode;   // c[22]
-  float GTVBAO_normal_transform_mode;   // c[23] - 0=view_g+flipZ, 1=viewInv_g, 2=passthrough, 3=view_g, 4=viewInv_g+flipZ
-  // - GI parameters -
-  float g_gi_enabled;                   // c[24] - 0=off, 1=on
-  float g_gi_light_exposure;            // c[25] - HDR light buffer exposure scale [0.001..10]
-  float g_gi_intensity;                 // c[26] - GI intensity [0..5]
-  float g_gi_saturation;                // c[27] - GI saturation [0..2]
-  float g_gi_multibounce;               // c[28] - multi-bounce enable (0/1)
-  float g_gi_multibounce_strength;      // c[29] - feedback intensity [0..10]
-  float g_gi_multibounce_saturation;    // c[30] - feedback color saturation [0..2]
-  float g_gi_multibounce_max_clamp;     // c[31] - max multi-bounce per-channel (0=off)
-  // - SSGI / IS-FAST noise -
-  float g_vbgi_debug_view;              // c[32] - SSGI debug view mode
-  float GTVBAO_isfast_enabled;          // c[33] - IS-FAST enable (0/1)
-  float GTVBAO_isfast_strength;         // c[34] - IS-FAST noise strength [0..1]
-  float GTVBAO_isfast_debug;            // c[35] - IS-FAST texture loaded flag (set by shader check)
-  float GTVBAO_adaptive_mode;           // c[36] - 0=GI color, 1=albedo
-  float GTVBAO_adaptive_luma_strength;  // c[37] - target luma (0=off)
-  float GTVBAO_adaptive_luma_blend;     // c[38] - blend original<->normalized
-  float GTVBAO_isfast_spatial_scale;    // c[39] - IS-FAST spatial scale [0.25..4]
-  float GTVBAO_isfast_temporal_speed;   // c[40] - IS-FAST temporal speed [0..5]
-  float GTVBAO_isfast_seed;             // c[41] - IS-FAST seed offset [0..64]
-  // - Denoiser (unused, removed in M3) -
-  float GTVBAO_denoise_leak_threshold;  // c[42] - unused, removed in M3
-  float GTVBAO_denoise_leak_strength;   // c[43] - unused, removed in M3
-  float GTVBAO_temporal_blend;          // c[44] - always 0 (spatial only)
-  float GTVBAO_disocclusion_threshold;  // c[45] - unused (spatial only)
-  float GTVBAO_noise_type;              // c[46] - 0=IS-FAST, 1=IGN, 2=Hilbert
-  // - GTVBAO upgrades: always On (UI toggles removed) -
-  float GTVBAO_gtvbao_cdf_enabled;      // c[47] - always 1
-  float GTVBAO_gtvbao_cosine_enabled;   // c[48] - always 1
-  float GTVBAO_gtvbao_cosine_mode;      // c[49] - 0=Weight, 1=Project, 2=CDF
-  float GTVBAO_gtvbao_thickness_enabled;// c[50] - always 1
-  float GTVBAO_prefilter_enabled;       // c[51] - 0=Off, 1=On
+  float GTVBAO_noise_index;              // c[07] - frame % 64
+  float GTVBAO_debug_mode;               // c[08]
+  float GTVBAO_denoise_is_last_pass;     // c[09]
+  float GTVBAO_normal_input_mode;        // c[10] - 0=depth-derived, 1=MRT g-buffer
+  float GTVBAO_mrt_normal_available;     // c[11]
+  float GTVBAO_normal_influence;         // c[12]
+  float GTVBAO_normal_depth_blend;       // c[13]
+  float GTVBAO_normal_sharpness;         // c[14]
+  float GTVBAO_normal_edge_rejection;    // c[15]
+  float GTVBAO_normal_z_preservation;    // c[16]
+  float GTVBAO_normal_detail_response;   // c[17]
+  float GTVBAO_normal_max_darkening;     // c[18]
+  float GTVBAO_isfast_enabled;           // c[19] - IS-FAST enable (0/1)
+  float GTVBAO_isfast_strength;          // c[20] - IS-FAST noise strength [0..1]
+  float GTVBAO_isfast_debug;             // c[21] - IS-FAST texture loaded flag (set by shader check)
+  float GTVBAO_isfast_spatial_scale;     // c[22] - IS-FAST spatial scale [0.25..4]
+  float GTVBAO_isfast_temporal_speed;    // c[23] - IS-FAST temporal speed [0..5]
+  float GTVBAO_isfast_seed;              // c[24] - IS-FAST seed offset [0..64]
+  float GTVBAO_noise_type;               // c[25] - 0=IS-FAST, 1=IGN, 2=Hilbert
+  float GTVBAO_gtvbao_cosine_mode;       // c[26] - 0=Weight, 1=Project, 2=CDF
   // - Foliage -
-  float GTVBAO_exclude_foliage;         // c[52] - 0=Off, 1=On - skip AO on foliage
-  float GTVBAO_foliage_ao_value;        // c[53] - [0..1] - AO value for excluded foliage
-  float GTVBAO_foliage_channel_mode;    // c[54] - 0=o1.w (Sora), 1=o1.z (Kai)
-  float GTVBAO_foliage_mask_valid;      // c[55] - 1 = mask pre-pass ran this frame (mask is fresh)
-  float GTVBAO_denoise_stage;           // c[56] - unused, removed in M3
+  float GTVBAO_exclude_foliage;          // c[27] - 0=Off, 1=On - skip AO on foliage
+  float GTVBAO_foliage_ao_value;         // c[28] - [0..1] - AO value for excluded foliage
+  float GTVBAO_foliage_channel_mode;     // c[29] - 0=o1.w (Sora), 1=o1.z (Kai)
+  float GTVBAO_foliage_mask_valid;       // c[30] - 1 = mask pre-pass ran this frame (mask is fresh)
   // - a-trous wavelet filter -
-  float GTVBAO_atrous_enabled;          // c[57] - 0=Off, 1=On - wavelet spatial filter
-  float GTVBAO_atrous_depth_sigma;      // c[58] - [0.05..4] relative depth edge-stop strength
-  float GTVBAO_atrous_normal_sigma;     // c[59] - [2..128] normal edge-stop power
-  float GTVBAO_atrous_step;             // c[60] - wavelet stride for this dispatch (1, 2, 4)
+  float GTVBAO_atrous_enabled;           // c[31] - 0=Off, 1=On - wavelet spatial filter
+  float GTVBAO_atrous_depth_sigma;       // c[32] - [0.05..4] relative depth edge-stop strength
+  float GTVBAO_atrous_normal_sigma;      // c[33] - [2..128] normal edge-stop power
+  float GTVBAO_atrous_step;              // c[34] - wavelet stride for this dispatch (1, 2, 4)
   // - Half-resolution spatial pipeline (appended; Full path ignores these) -
-  float GTVBAO_resolution;              // c[61] - 0=Full, 1=Half
-  float GTVBAO_upscale_plane_sigma;     // c[62] - reconstruction plane edge-stop sigma
-  float GTVBAO_upscale_normal_power;    // c[63] - reconstruction normal weight power
-  float GTVBAO_upscale_debug;           // c[64] - reconstruction diagnostics mode
-  // ── VBGI (GI) MRT normal settings — INDEPENDENT of the AO ones above ──
-  // VBGI is a bleeding effect and often wants different geometry handling from
-  // AO, so it gets its own copy rather than mirroring c[13]/c[15]/c[19]/c[23].
-  // These are push-constant scalars, so both consumers branch on a UNIFORM
-  // value: no warp divergence and no extra memory traffic, and only one of the
-  // MRT / depth paths ever executes. Texel mapping, decode and transform
-  // arithmetic are deliberately NOT duplicated -- those are correctness
-  // surfaces, and letting AO and GI disagree on them is how drift starts.
-  float GTVBAO_gi_normal_input_mode;      // c[65] - 0=depth, 1=MRT g-buffer
-  float GTVBAO_gi_normal_influence;       // c[66] - xy scale, 1 = untouched
-  float GTVBAO_gi_normal_z_preservation;  // c[67] - z scale, 1 = untouched
-  float GTVBAO_gi_normal_transform_mode;  // c[68] - same encoding as c[23]
-  // Fraction of the local direct light re-emitted per bounce (diffuse albedo).
-  // Read only by the multi-bounce accumulate pass.
-  float g_gi_multibounce_bounce_fraction;  // c[69] - [0..0.5], 0.15 = subtle
-  // c[70] 1 = the GI sample path may reuse the à-trous normal pre-decode.
-  // Host enables it only when the pre-decode ran, the GI/AO normal transforms
-  // match and the GI normal scaling is neutral, so the prepped normal equals
-  // the per-sample decode result.
-  float GTVBAO_gi_prepped_normal;          // c[70] - 0/1
+  float GTVBAO_resolution;               // c[35] - 0=Full, 1=Half
+  float GTVBAO_upscale_plane_sigma;      // c[36] - reconstruction plane edge-stop sigma
+  float GTVBAO_upscale_normal_power;     // c[37] - reconstruction normal weight power
+  float GTVBAO_upscale_debug;            // c[38] - reconstruction diagnostics mode
 };
 
 // ── Half-res → full-res block-center mapping (odd-dimension safe) ──
@@ -288,38 +232,13 @@ float3 GTVBAO_TuneNormal(float3 viewNormal, float influence, float zPreservation
 // X and Y already agree: GTVBAO's NDCToViewMul maps uv.x to +right and uv.y to
 // +up, matching the engine's world-up convention.
 //
-// The mode is a full 2x2 so every combination can be A/B tested in-game without
-// a rebuild: {view_g, viewInv_g} x {flip Z, no flip}.
-//
-//   0 = view_g    + flip Z   <- believed correct
-//   1 = viewInv_g (no flip)
-//   2 = passthrough
-//   3 = view_g    (no flip)
-//   4 = viewInv_g + flip Z
-// `transformMode` is passed in rather than read from the AO constant so callers
-// can select a matrix through the same code.
-float3 TransformNormalToView(float3 decoded, float transformMode)
+// This is the former mode 4 (viewInv_g plus flip Z), the shipped default.
+float3 TransformNormalToView(float3 decoded)
 {
   if (!FalcomNormalValid(decoded)) return float3(0.0, 0.0, 0.0);
 
-  const int mode = (int)transformMode;
-
-  // 2: leave the world-space normal completely alone (diagnostic only - the
-  // result is not in view space at all, so the AO maths is meaningless).
-  if (mode == 2) return FalcomSafeNormalize3(decoded, float3(0.0, 0.0, 0.0));
-
-  // viewInv_g is the inverse of view_g, so for a rigid (orthonormal rotation)
-  // view matrix it is the transpose of view_g's rotation. It is only a
-  // meaningful normal transform if the two spaces happen to coincide, which is
-  // why modes 1 and 4 exist purely as comparison baselines.
-  const bool use_viewInv = (mode == 1 || mode == 4);
-  const bool flip_z      = (mode == 0 || mode == 4);
-
-  float3x3 m = (float3x3)view_g;
-  if (use_viewInv) m = (float3x3)viewInv_g;
-
-  float3 vn = mul(m, decoded);
-  if (flip_z) vn.z = -vn.z;
+  float3 vn = mul((float3x3)viewInv_g, decoded);
+  vn.z = -vn.z;
   return FalcomSafeNormalize3(vn, float3(0.0, 0.0, 0.0));
 }
 
@@ -355,15 +274,12 @@ GTAOConstants BuildGTAOConstants(uint2 viewport_size)
   consts.NDCToViewMul_x_PixelSize = consts.NDCToViewMul * consts.ViewportPixelSize;
 
   consts.EffectRadius = max(0.001, GTVBAO_radius);
-  consts.EffectFalloffRange = saturate(GTVBAO_falloff_range);
   consts.RadiusMultiplier = max(0.3, GTVBAO_radius_multiplier);
   consts.FinalValuePower = max(0.5, GTVBAO_final_value_power);
-  consts.DenoiseBlurBeta = max(0.01, GTVBAO_denoise_blur_beta);
   consts.SampleDistributionPower = max(1.0, GTVBAO_sample_distribution_power);
-  consts.ThinOccluderCompensation = max(0.0, GTVBAO_thin_occluder_compensation);
+  consts.BitmaskThickness = max(0.0, GTVBAO_bitmask_thickness);
   consts.DepthMIPSamplingOffset = max(0.0, GTVBAO_depth_mip_sampling_offset);
   consts.NoiseIndex = (int)GTVBAO_noise_index;
-  consts.Padding0 = 0.0;
 
   return consts;
 }

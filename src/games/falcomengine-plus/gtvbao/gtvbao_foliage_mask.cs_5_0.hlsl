@@ -4,9 +4,7 @@
 // Sora only; Kai uses o1.w for normal data (bit 15 reserved by other fields).
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#define GT_VBAO_USE_DEFAULT_CONSTANTS 0
 #define GT_VBAO_USE_HALF_FLOAT_PRECISION 0
-#define GT_VBAO_USE_BITMASK 1
 
 #include "gtvbao_common.hlsl"
 

@@ -517,7 +517,7 @@ constexpr uint32_t kGtvbaoPushConstantsLayoutParam = 4u;   // push_constants at 
 // Must match the cbuffer declared in gtvbao_common.hlsl. Named so the builder,
 // the layout range and all nine push sites cannot drift apart -- a mismatch
 // here silently truncates the tail of the block rather than failing loudly.
-constexpr uint32_t kGtvbaoPushConstantFloats = 71;
+constexpr uint32_t kGtvbaoPushConstantFloats = 39;
 constexpr uint32_t kLightingMrtNormalRegister = 1u;  // t1 = mrtTexture0 (g-buffer normals)
 constexpr uint64_t kGTVBAOStartupGuardFrames = 8u;
 constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
@@ -696,11 +696,6 @@ static float g_gtvbao_normal_sharpness      = 1.f;   // gamma: 1 = passthrough
 static float g_gtvbao_normal_edge_rejection = 0.f;   // 0 = no silhouette rejection
 static float g_gtvbao_normal_detail_response = 0.f; // 0 = no disagreement reweight
 static float g_gtvbao_normal_max_darkening  = 1.f;   // cap: 1 = uncapped
-static float g_gtvbao_normal_darkening_mode = 0.f;
-// 2x2 A/B matrix: {view_g, viewInv_g} x {flip Z, no flip}.
-// 0=view_g+flipZ (suspected correct: GTVBAO is +Z forward, view_g is -Z),
-// 1=viewInv_g, 2=passthrough, 3=view_g, 4=viewInv_g+flipZ
-static float g_gtvbao_normal_transform_mode = 0.f;
 // -- VBGI (GI) normal settings: independent copies of the four that shape the
 // GI sample normal (input mode, influence, z preservation, transform mode) --
 // Defaults match the AO neutral values, so enabling VBGI changes nothing until
@@ -889,7 +884,6 @@ static bool IsLightingShader(uint32_t hash) {
 }
 
 // -- CPU optimization toggles --
-static float g_gtvbao_frame_skip         = 0.f;  // per-component frame skip (0=off, 1=every 2nd, �)
 static float g_gtvbao_cs_dispatch_fix    = 0.f;  // 0=Off, 1=Restore, 2=Null, 3=Null+Restore
 static float g_vbgi_frame_skip           = 0.f;
 static float g_multibounce_frame_skip    = 0.f;
@@ -3348,6 +3342,7 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAOQuality", .binding = &shader_injection.gtvbao_quality_level,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 2.f, .label = "Quality Level", .section = "GTVBAO",
+      .tooltip = "Slices x steps per side. Low 2x4, Medium 3x4, High 3x6, Ultra 4x10.",
       .labels = {"Low", "Medium", "High", "Ultra"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     },
@@ -3398,13 +3393,6 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAORadius", .binding = &shader_injection.gtvbao_radius,
       .default_value = 0.25f, .label = "Radius", .section = "GTVBAO",
       .min = 0.01f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOFalloffRange", .binding = &shader_injection.gtvbao_falloff_range,
-      .default_value = 0.615f, .label = "Falloff Range", .section = "GTVBAO",
-      .min = 0.0f, .max = 1.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -3561,15 +3549,6 @@ renodx::utils::settings::Settings settings = {
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAONormalDarkeningMode", .binding = &g_gtvbao_normal_darkening_mode,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Normal Darkening Mode", .section = "GTVBAO",
-      .tooltip = "Multiply applies the Normal Max Darkening cap to the final blend weight; Replace skips it. Neutral either way while Max Darkening is at 1.0.",
-      .labels = {"Multiply", "Replace"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
       .key = "GTVBAOGINormalInputMode", .binding = &g_gtvbao_gi_normal_input_mode,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "VBGI Normal Input", .section = "GTVBAO",
@@ -3604,15 +3583,6 @@ renodx::utils::settings::Settings settings = {
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAONormalTransformMode", .binding = &g_gtvbao_normal_transform_mode,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 4.f, .label = "Normal Transform Mode", .section = "GTVBAO",
-      .tooltip = "How to transform MRT normals into GTVBAO's view space. The MRT stores WORLD-space normals and GTVBAO's space is +Z forward while the engine's view_g is -Z forward, so view_g needs a Z flip. The other modes are wrong baselines kept for A/B comparison.",
-      .labels = {"view_g + flip Z (suspected correct)", "viewInv_g (no flip)", "Passthrough (no transform)", "view_g (no flip)", "viewInv_g + flip Z"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
       .key = "GTVBAODebugView", .binding = &shader_injection.gtvbao_debug_view,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Debug View", .section = "GTVBAO",
@@ -3637,16 +3607,6 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Composite-side AO encoding diagnostic (Sora lighting shaders only). 0=Off (baseline).",
       .labels = {"Off", "1:Neutral 1.0", "2:No 0xFF mask", "3:Inverted", "4:All channels"},
       .is_enabled = []() { return !falcom_world::rtao::RtaoRequested(); },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    // -- GTVBAO scheduling --
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOFrameSkip", .binding = &g_gtvbao_frame_skip,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Frame Skip", .section = "GTVBAO",
-      .tooltip = "Skip GTVBAO AO+GI computation every N frames to improve performance.",
-      .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // -- GTVBAO Foliage --
@@ -12332,60 +12292,50 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
                                                        float atrous_step = 1.f) {
   std::array<float, kGtvbaoPushConstantFloats> c = {};
   c[0]  = shader_injection.gtvbao_quality_level;
-  c[2]  = std::max(0.001f, shader_injection.gtvbao_radius);
-  c[3]  = std::clamp(shader_injection.gtvbao_falloff_range, 0.f, 1.f);
-  c[4]  = std::clamp(shader_injection.gtvbao_radius_multiplier, 0.3f, 3.f);
-  c[5]  = std::clamp(shader_injection.gtvbao_final_power, 0.5f, 5.f);
-  c[6]  = std::clamp(shader_injection.gtvbao_sample_distribution, 1.f, 3.f);
-  c[7]  = std::clamp(shader_injection.gtvbao_bitmask_thickness, 0.01f, 2.f);
-  c[8]  = std::clamp(shader_injection.gtvbao_depth_mip_offset, 0.f, 30.f);
-  c[10] = (float)((data ? data->frame_index : 0u) % 64u);
-  c[11] = shader_injection.gtvbao_debug_view;
-  c[12] = denoise_last_pass ? 1.f : 0.f;
+  c[1]  = std::max(0.001f, shader_injection.gtvbao_radius);
+  c[2]  = std::clamp(shader_injection.gtvbao_radius_multiplier, 0.3f, 3.f);
+  c[3]  = std::clamp(shader_injection.gtvbao_final_power, 0.5f, 5.f);
+  c[4]  = std::clamp(shader_injection.gtvbao_sample_distribution, 1.f, 3.f);
+  c[5]  = std::clamp(shader_injection.gtvbao_bitmask_thickness, 0.01f, 2.f);
+  c[6]  = std::clamp(shader_injection.gtvbao_depth_mip_offset, 0.f, 30.f);
+  c[7]  = (float)((data ? data->frame_index : 0u) % 64u);
+  c[8]  = shader_injection.gtvbao_debug_view;
+  c[9]  = denoise_last_pass ? 1.f : 0.f;
   // Normal input: use game MRT normals when available, depth fallback otherwise.
-  c[13] = g_gtvbao_normal_input_mode;
-  c[14] = (data && data->captured_mrt_normal_srv.handle != 0u) ? 1.f : 0.f;
-  c[15] = g_gtvbao_normal_influence;
-  c[16] = g_gtvbao_normal_depth_blend;
-  c[17] = g_gtvbao_normal_sharpness;
-  c[18] = g_gtvbao_normal_edge_rejection;
-  c[19] = g_gtvbao_normal_z_preservation;
-  c[20] = g_gtvbao_normal_detail_response;
-  c[21] = g_gtvbao_normal_max_darkening;
-  c[22] = g_gtvbao_normal_darkening_mode;
-  c[23] = g_gtvbao_normal_transform_mode;
-  c[33] = g_isfast_enabled;                                          // IS-FAST enable (0/1)
-  c[34] = std::clamp(g_isfast_strength, 0.f, 1.f);                   // IS-FAST noise strength
-  c[35] = (data && data->isfast_texture_loaded) ? 1.f : 0.f;         // IS-FAST texture loaded flag
-  c[39] = std::clamp(g_isfast_spatial_scale, 0.25f, 4.f);          // IS-FAST spatial scale
-  c[40] = std::clamp(g_isfast_temporal_speed, 0.f, 5.f);           // IS-FAST temporal speed
-  c[41] = std::clamp(g_isfast_seed_offset, 0.f, 64.f);             // IS-FAST seed offset
-  // -- Spatial denoiser only (Spatio-Temporal / Poisson removed) --
-  c[44] = 0.f;  // temporal_blend: off (spatial only)
-  c[45] = 0.01f;  // disocclusion_threshold: unused by spatial path
-  c[46] = shader_injection.gtvbao_noise_type;    // 0=IS-FAST, 1=IGN, 2=Hilbert
-  // -- GTVBAO upgrades: always On (UI toggles removed) --
-  c[47] = 1.f;  // cdf_enabled
-  c[48] = 1.f;  // cosine_enabled
-  c[49] = shader_injection.gtvbao_cosine_mode;
-  c[50] = 1.f;  // thickness_enabled
+  c[10] = g_gtvbao_normal_input_mode;
+  c[11] = (data && data->captured_mrt_normal_srv.handle != 0u) ? 1.f : 0.f;
+  c[12] = g_gtvbao_normal_influence;
+  c[13] = g_gtvbao_normal_depth_blend;
+  c[14] = g_gtvbao_normal_sharpness;
+  c[15] = g_gtvbao_normal_edge_rejection;
+  c[16] = g_gtvbao_normal_z_preservation;
+  c[17] = g_gtvbao_normal_detail_response;
+  c[18] = g_gtvbao_normal_max_darkening;
+  c[19] = g_isfast_enabled;                                          // IS-FAST enable (0/1)
+  c[20] = std::clamp(g_isfast_strength, 0.f, 1.f);                   // IS-FAST noise strength
+  c[21] = (data && data->isfast_texture_loaded) ? 1.f : 0.f;         // IS-FAST texture loaded flag
+  c[22] = std::clamp(g_isfast_spatial_scale, 0.25f, 4.f);          // IS-FAST spatial scale
+  c[23] = std::clamp(g_isfast_temporal_speed, 0.f, 5.f);           // IS-FAST temporal speed
+  c[24] = std::clamp(g_isfast_seed_offset, 0.f, 64.f);             // IS-FAST seed offset
+  c[25] = shader_injection.gtvbao_noise_type;    // 0=IS-FAST, 1=IGN, 2=Hilbert
+  c[26] = shader_injection.gtvbao_cosine_mode;
   // -- Foliage / prefilter --
   // -- Foliage exclusion --
-  c[52] = shader_injection.gtvbao_exclude_foliage;
-  c[53] = std::clamp(shader_injection.gtvbao_foliage_ao_value, 0.f, 1.f);
-  c[54] = IsKai() ? 1.f : 0.f;
-  // c[55] - foliage mask is only fresh when the pre-pass dispatched this frame.
-  c[55] = foliage_mask_valid ? 1.f : 0.f;
+  c[27] = shader_injection.gtvbao_exclude_foliage;
+  c[28] = std::clamp(shader_injection.gtvbao_foliage_ao_value, 0.f, 1.f);
+  c[29] = IsKai() ? 1.f : 0.f;
+  // c[30] - foliage mask is only fresh when the pre-pass dispatched this frame.
+  c[30] = foliage_mask_valid ? 1.f : 0.f;
   // -- Denoiser upgrades (R1-R4) --
-  c[57] = shader_injection.gtvbao_atrous_enabled;
-  c[58] = std::clamp(shader_injection.gtvbao_atrous_depth_sigma, 0.01f, 8.f);
-  c[59] = std::clamp(shader_injection.gtvbao_atrous_normal_sigma, 1.f, 128.f);
-  c[60] = std::clamp(atrous_step, 1.f, 8.f);                           // �-trous stride (1/2/4)
+  c[31] = shader_injection.gtvbao_atrous_enabled;
+  c[32] = std::clamp(shader_injection.gtvbao_atrous_depth_sigma, 0.01f, 8.f);
+  c[33] = std::clamp(shader_injection.gtvbao_atrous_normal_sigma, 1.f, 128.f);
+  c[34] = std::clamp(atrous_step, 1.f, 8.f);                           // �-trous stride (1/2/4)
   // �� Half-resolution spatial pipeline (appended; Full path ignores these) ��
-  c[61] = shader_injection.gtvbao_resolution > 0.5f ? 1.f : 0.f;
-  c[62] = std::clamp(shader_injection.gtvbao_upscale_plane_sigma, 1.f, 400.f);
-  c[63] = std::clamp(shader_injection.gtvbao_upscale_normal_power, 1.f, 64.f);
-  c[64] = shader_injection.gtvbao_upscale_debug;
+  c[35] = shader_injection.gtvbao_resolution > 0.5f ? 1.f : 0.f;
+  c[36] = std::clamp(shader_injection.gtvbao_upscale_plane_sigma, 1.f, 400.f);
+  c[37] = std::clamp(shader_injection.gtvbao_upscale_normal_power, 1.f, 64.f);
+  c[38] = shader_injection.gtvbao_upscale_debug;
   return c;
 }
 
@@ -12631,16 +12581,6 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
 
 static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   if (!d->captured_depth_srv.handle) return false;
-
-  // -- Frame skips (independent per component) --
-  auto skip_this_frame = [&](float setting) -> bool {
-    if (setting <= 0.5f) return false;
-    uint64_t n = (uint64_t)setting + 1u;
-    return (d->frame_index % n) != 0u;
-  };
-  bool skip_GTVBAO      = skip_this_frame(g_gtvbao_frame_skip);       // skips entire dispatch
-
-  if (skip_GTVBAO) return true;  // skip everything, no work done
 
   auto* dev = cl->get_device();
 

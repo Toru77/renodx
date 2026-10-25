@@ -449,23 +449,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     g_outputDbgImage[pixCoord] = 1.0 - float4( edgesLRTB.x, edgesLRTB.y * 0.5 + edgesLRTB.w * 0.5, edgesLRTB.z, 1.0 );
 #endif
 
-#if GT_VBAO_USE_DEFAULT_CONSTANTS != 0
-    const lpfloat effectRadius              = (lpfloat)consts.EffectRadius * (lpfloat)GT_VBAO_DEFAULT_RADIUS_MULTIPLIER;
-    const lpfloat sampleDistributionPower   = (lpfloat)GT_VBAO_DEFAULT_SAMPLE_DISTRIBUTION_POWER;
-    const lpfloat thinOccluderCompensation  = (lpfloat)GT_VBAO_DEFAULT_THIN_OCCLUDER_COMPENSATION;
-    const lpfloat falloffRange              = (lpfloat)GT_VBAO_DEFAULT_FALLOFF_RANGE * effectRadius;
-#else
     const lpfloat effectRadius              = (lpfloat)consts.EffectRadius * (lpfloat)consts.RadiusMultiplier;
     const lpfloat sampleDistributionPower   = (lpfloat)consts.SampleDistributionPower;
-    const lpfloat thinOccluderCompensation  = (lpfloat)consts.ThinOccluderCompensation;
-    const lpfloat falloffRange              = (lpfloat)consts.EffectFalloffRange * effectRadius;
-#endif
-
-    const lpfloat falloffFrom       = effectRadius * ((lpfloat)1-(lpfloat)consts.EffectFalloffRange);
-
-    // fadeout precompute optimisation
-    const lpfloat falloffMul        = (lpfloat)-1.0 / ( falloffRange );
-    const lpfloat falloffAdd        = falloffFrom / ( falloffRange ) + (lpfloat)1.0;
+    const lpfloat bitmaskThickness          = (lpfloat)consts.BitmaskThickness;
 
     lpfloat visibility = 0;
     lpfloat totalWeight = 0.0; // GTVBAO cosine mode 0: accumulate actual weight sum
@@ -606,7 +592,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             // line 15 from the paper
             lpfloat n = signNorm * GTVBAO_FastACos(cosNorm);
 
-#ifdef GT_VBAO_USE_BITMASK
             // ═══════════════════════════════════════════════════════════════
             // Visibility Bitmask AO
             // Replaces GTAO horizon angles with a uint bitmask.
@@ -623,7 +608,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             const float sliceJitter =
                 frac(noiseSample + sliceK * 0.75487766624669276) * (1.0f / (float)GT_VBAO_BITMASK_SECTOR_COUNT);
 
-            [unroll]
+            [loop]
             for( lpfloat step = 0; step < stepsPerSlice; step++ )
             {
                 // R1 sequence (http://extremelearning.com.au/unreasonable-effectiveness-of-quasirandom-sequences/)
@@ -677,7 +662,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     // in for the GTAO radial falloff the bitmask branch never
                     // had: the sector arc grows as t/distance, so a flat t
                     // starves distant occluders.
-                    float thickness = (float)thinOccluderCompensation
+                    float thickness = (float)bitmaskThickness
                         * (1.0f + (float)sampleDist / max((float)effectRadius, 0.001f));
 
                     // ── Front-face and back-face (per-sample thickness offset, always On) ──
@@ -763,154 +748,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             visibility += sliceAO;
 
 
-#else // !GT_VBAO_USE_BITMASK — original GTAO horizon-angle path (preserved)
-            // this is a lower weight target; not using -1 as in the original paper because it is under horizon, so a 'weight' has different meaning based on the normal
-            const lpfloat lowHorizonCos0  = cos(n+GT_VBAO_PI_HALF);
-            const lpfloat lowHorizonCos1  = cos(n-GT_VBAO_PI_HALF);
-
-            // lines 17, 18 from the paper, manually unrolled the 'side' loop
-            lpfloat horizonCos0           = lowHorizonCos0; //-1;
-            lpfloat horizonCos1           = lowHorizonCos1; //-1;
-
-            [unroll]
-            for( lpfloat step = 0; step < stepsPerSlice; step++ )
-            {
-                // R1 sequence (http://extremelearning.com.au/unreasonable-effectiveness-of-quasirandom-sequences/)
-                const lpfloat stepBaseNoise = lpfloat(slice + step * stepsPerSlice) * 0.6180339887498948482; // <- this should unroll
-                lpfloat stepNoise = frac(noiseSample + stepBaseNoise);
-
-                // approx line 20 from the paper, with added noise
-                lpfloat s = (step+stepNoise) / (stepsPerSlice); // + (lpfloat2)1e-6f);
-
-                // additional distribution modifier
-                s       = (lpfloat)pow( s, (lpfloat)sampleDistributionPower );
-
-                // avoid sampling center pixel
-                s       += minS;
-
-                // approx lines 21-22 from the paper, unrolled
-                lpfloat2 sampleOffset = s * omega;
-
-                lpfloat sampleOffsetLength = length( sampleOffset );
-
-                // note: when sampling, using point_point_point or point_point_linear sampler works, but linear_linear_linear will cause unwanted interpolation between neighbouring depth values on the same MIP level!
-                const lpfloat mipLevel    = (lpfloat)clamp( log2( sampleOffsetLength ) - consts.DepthMIPSamplingOffset, 0, GT_VBAO_DEPTH_MIP_LEVELS );
-
-                // Snap to pixel center (more correct direction math, avoids artifacts due to sampling pos not matching depth texel center - messes up slope - but adds other 
-                // artifacts due to them being pushed off the slice). Also use full precision for high res cases.
-                sampleOffset = round(sampleOffset) * (lpfloat2)consts.ViewportPixelSize;
-
-#ifdef GT_VBAO_SHOW_DEBUG_VIZ
-                int mipLevelU = (int)round(mipLevel);
-                float4 mipColor = saturate( float4( mipLevelU>=3, mipLevelU>=1 && mipLevelU<=3, mipLevelU<=1, 1.0 ) );
-                if( all( sampleOffset == 0 ) )
-                    DebugDraw2DText( pixCoord, float4( 1, 0, 0, 1), pixelTooCloseThreshold );
-                [branch] if (IsUnderCursorRange(pixCoord, int2(1, 1)))
-                {
-                    //DebugDraw2DText( (normalizedScreenPos + sampleOffset) * consts.ViewportSize, mipColor, mipLevelU );
-                    //DebugDraw2DText( (normalizedScreenPos + sampleOffset) * consts.ViewportSize, mipColor, (uint)slice );
-                    //DebugDraw2DText( (normalizedScreenPos - sampleOffset) * consts.ViewportSize, mipColor, (uint)slice );
-                    //DebugDraw2DText( (normalizedScreenPos - sampleOffset) * consts.ViewportSize, saturate( float4( mipLevelU>=3, mipLevelU>=1 && mipLevelU<=3, mipLevelU<=1, 1.0 ) ), mipLevelU );
-                }
-#endif
-
-                float2 sampleScreenPos0 = normalizedScreenPos + sampleOffset;
-                float  SZ0 = sourceViewspaceDepth.SampleLevel( depthSampler, sampleScreenPos0, mipLevel ).x;
-
-                float2 sampleScreenPos1 = normalizedScreenPos - sampleOffset;
-                float  SZ1 = sourceViewspaceDepth.SampleLevel( depthSampler, sampleScreenPos1, mipLevel ).x;
-                // ── Foliage cast-AO prevention: set depth to center (non-occluding) ──
-                // Only when the mask is fresh (pre-pass dispatched this frame).
-                if (GTVBAO_exclude_foliage > 0.5f && GTVBAO_foliage_mask_valid > 0.5f && !gtvbao_foliage_pixel) {
-                    int2 mc0 = int2(saturate(sampleScreenPos0) * float2(g_maskW, g_maskH));
-                    int2 mc1 = int2(saturate(sampleScreenPos1) * float2(g_maskW, g_maskH));
-                    if (foliageMaskTexture.Load(int3(mc0, 0)) != 0u) SZ0 = (float)viewspaceZ;
-                    if (foliageMaskTexture.Load(int3(mc1, 0)) != 0u) SZ1 = (float)viewspaceZ;
-                }
-                float3 samplePos0 = GTVBAO_ComputeViewspacePosition( sampleScreenPos0, SZ0, consts );
-                float3 samplePos1 = GTVBAO_ComputeViewspacePosition( sampleScreenPos1, SZ1, consts );
-
-                float3 sampleDelta0     = (samplePos0 - float3(pixCenterPos)); // using lpfloat for sampleDelta causes precision issues
-                float3 sampleDelta1     = (samplePos1 - float3(pixCenterPos)); // using lpfloat for sampleDelta causes precision issues
-                lpfloat sampleDist0     = (lpfloat)length( sampleDelta0 );
-                lpfloat sampleDist1     = (lpfloat)length( sampleDelta1 );
-
-                // approx lines 23, 24 from the paper, unrolled
-                lpfloat3 sampleHorizonVec0 = (lpfloat3)(sampleDelta0 / sampleDist0);
-                lpfloat3 sampleHorizonVec1 = (lpfloat3)(sampleDelta1 / sampleDist1);
-
-                // any sample out of radius should be discarded - also use fallof range for smooth transitions; this is a modified idea from "4.3 Implementation details, Bounding the sampling area"
-#if GT_VBAO_USE_DEFAULT_CONSTANTS != 0 && GT_VBAO_DEFAULT_THIN_OBJECT_HEURISTIC == 0
-                lpfloat weight0         = saturate( sampleDist0 * falloffMul + falloffAdd );
-                lpfloat weight1         = saturate( sampleDist1 * falloffMul + falloffAdd );
-#else
-                // this is our own thickness heuristic that relies on sooner discarding samples behind the center
-                lpfloat falloffBase0    = length( lpfloat3(sampleDelta0.x, sampleDelta0.y, sampleDelta0.z * (1+thinOccluderCompensation) ) );
-                lpfloat falloffBase1    = length( lpfloat3(sampleDelta1.x, sampleDelta1.y, sampleDelta1.z * (1+thinOccluderCompensation) ) );
-                lpfloat weight0         = saturate( falloffBase0 * falloffMul + falloffAdd );
-                lpfloat weight1         = saturate( falloffBase1 * falloffMul + falloffAdd );
-#endif
-
-                // sample horizon cos
-                lpfloat shc0 = (lpfloat)dot(sampleHorizonVec0, viewVec);
-                lpfloat shc1 = (lpfloat)dot(sampleHorizonVec1, viewVec);
-
-                // discard unwanted samples
-                shc0 = lerp( lowHorizonCos0, shc0, weight0 ); // this would be more correct but too expensive: cos(lerp( acos(lowHorizonCos0), acos(shc0), weight0 ));
-                shc1 = lerp( lowHorizonCos1, shc1, weight1 ); // this would be more correct but too expensive: cos(lerp( acos(lowHorizonCos1), acos(shc1), weight1 ));
-
-                // thickness heuristic - see "4.3 Implementation details, Height-field assumption considerations"
-#if 0   // (disabled, not used) this should match the paper
-                lpfloat newhorizonCos0 = max( horizonCos0, shc0 );
-                lpfloat newhorizonCos1 = max( horizonCos1, shc1 );
-                horizonCos0 = (horizonCos0 > shc0)?( lerp( newhorizonCos0, shc0, thinOccluderCompensation ) ):( newhorizonCos0 );
-                horizonCos1 = (horizonCos1 > shc1)?( lerp( newhorizonCos1, shc1, thinOccluderCompensation ) ):( newhorizonCos1 );
-#elif 0 // (disabled, not used) this is slightly different from the paper but cheaper and provides very similar results
-                horizonCos0 = lerp( max( horizonCos0, shc0 ), shc0, thinOccluderCompensation );
-                horizonCos1 = lerp( max( horizonCos1, shc1 ), shc1, thinOccluderCompensation );
-#else   // this is a version where thicknessHeuristic is completely disabled
-                horizonCos0 = max( horizonCos0, shc0 );
-                horizonCos1 = max( horizonCos1, shc1 );
-#endif
-
-
-#ifdef GT_VBAO_SHOW_DEBUG_VIZ
-                [branch] if (IsUnderCursorRange(pixCoord, int2(1, 1)))
-                {
-                    float3 WS_samplePos0 = mul(g_globals.ViewInv, float4(samplePos0, 1)).xyz;
-                    float3 WS_samplePos1 = mul(g_globals.ViewInv, float4(samplePos1, 1)).xyz;
-                    float3 WS_sampleHorizonVec0 = mul( (float3x3)g_globals.ViewInv, sampleHorizonVec0).xyz;
-                    float3 WS_sampleHorizonVec1 = mul( (float3x3)g_globals.ViewInv, sampleHorizonVec1).xyz;
-                    // DebugDraw3DSphere( WS_samplePos0, effectRadius * 0.02, DbgGetSliceColor(slice, sliceCount, false) );
-                    // DebugDraw3DSphere( WS_samplePos1, effectRadius * 0.02, DbgGetSliceColor(slice, sliceCount, true) );
-                    DebugDraw3DSphere( WS_samplePos0, effectRadius * 0.02, mipColor );
-                    DebugDraw3DSphere( WS_samplePos1, effectRadius * 0.02, mipColor );
-                    // DebugDraw3DArrow( WS_samplePos0, WS_samplePos0 - WS_sampleHorizonVec0, 0.002, float4(1, 0, 0, 1 ) );
-                    // DebugDraw3DArrow( WS_samplePos1, WS_samplePos1 - WS_sampleHorizonVec1, 0.002, float4(1, 0, 0, 1 ) );
-                    // DebugDraw3DText( WS_samplePos0, float2(0,  0), float4( 1, 0, 0, 1), weight0 );
-                    // DebugDraw3DText( WS_samplePos1, float2(0,  0), float4( 1, 0, 0, 1), weight1 );
-
-                    // DebugDraw2DText( float2( 500, 94+(step+slice*3)*12 ), float4( 0, 1, 0, 1 ), float4( projectedNormalVecLength, 0, horizonCos0, horizonCos1 ) );
-                }
-#endif
-            }
-
-#if 1       // I can't figure out the slight overdarkening on high slopes, so I'm adding this fudge - in the training set, 0.05 is close (PSNR 21.34) to disabled (PSNR 21.45)
-            projectedNormalVecLength = lerp( projectedNormalVecLength, 1, 0.05 );
-#endif
-
-            // line ~27, unrolled
-            lpfloat h0 = -GTVBAO_FastACos((lpfloat)horizonCos1);
-            lpfloat h1 = GTVBAO_FastACos((lpfloat)horizonCos0);
-#if 0       // we can skip clamping for a tiny little bit more performance
-            h0 = n + clamp( h0-n, (lpfloat)-GT_VBAO_PI_HALF, (lpfloat)GT_VBAO_PI_HALF );
-            h1 = n + clamp( h1-n, (lpfloat)-GT_VBAO_PI_HALF, (lpfloat)GT_VBAO_PI_HALF );
-#endif
-            lpfloat iarc0 = ((lpfloat)cosNorm + (lpfloat)2 * (lpfloat)h0 * (lpfloat)sin(n)-(lpfloat)cos((lpfloat)2 * (lpfloat)h0-n))/(lpfloat)4;
-            lpfloat iarc1 = ((lpfloat)cosNorm + (lpfloat)2 * (lpfloat)h1 * (lpfloat)sin(n)-(lpfloat)cos((lpfloat)2 * (lpfloat)h1-n))/(lpfloat)4;
-            lpfloat localVisibility = (lpfloat)projectedNormalVecLength * (lpfloat)(iarc0+iarc1);
-            visibility += localVisibility;
-#endif // GT_VBAO_USE_BITMASK
 
 #ifdef GT_VBAO_COMPUTE_BENT_NORMALS
             // see "Algorithm 2 Extension that computes bent normals b."
@@ -1000,7 +837,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         uint4 rawDbg = mrtNormalTexture.Load(int3(mrtTcDbg, 0));
         float3 decodedDbg = DecodeFalcomMrtNormal(rawDbg.xy);
         bool  texelWrittenDbg = FalcomNormalValid(decodedDbg);
-        float3 viewNDbg = texelWrittenDbg ? TransformNormalToView(decodedDbg, GTVBAO_normal_transform_mode) : float3(0, 0, 0);
+        float3 viewNDbg = texelWrittenDbg ? TransformNormalToView(decodedDbg) : float3(0, 0, 0);
 
         if (dbgMode == 22) {
             // Raw packed values. 0x0000 in BOTH channels means the G-buffer
@@ -1087,20 +924,16 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     } // end g_trackDebug
 }
 
+static const float GTVBAO_DEPTH_MIP_RANGE = 0.31875f;   // 0.75 * radius 0.25 * multiplier 1.7 (shipped defaults)
+static const float GTVBAO_DEPTH_MIP_FALLOFF = 0.615f;
+
 // weighted average depth filter
-lpfloat GTVBAO_DepthMIPFilter( lpfloat depth0, lpfloat depth1, lpfloat depth2, lpfloat depth3, const GTAOConstants consts )
+lpfloat GTVBAO_DepthMIPFilter( lpfloat depth0, lpfloat depth1, lpfloat depth2, lpfloat depth3 )
 {
     lpfloat maxDepth = max( max( depth0, depth1 ), max( depth2, depth3 ) );
 
-    const lpfloat depthRangeScaleFactor = 0.75; // found empirically :)
-#if GT_VBAO_USE_DEFAULT_CONSTANTS != 0
-    const lpfloat effectRadius              = depthRangeScaleFactor * (lpfloat)consts.EffectRadius * (lpfloat)GT_VBAO_DEFAULT_RADIUS_MULTIPLIER;
-    const lpfloat falloffRange              = (lpfloat)GT_VBAO_DEFAULT_FALLOFF_RANGE * effectRadius;
-#else
-    const lpfloat effectRadius              = depthRangeScaleFactor * (lpfloat)consts.EffectRadius * (lpfloat)consts.RadiusMultiplier;
-    const lpfloat falloffRange              = (lpfloat)consts.EffectFalloffRange * effectRadius;
-#endif
-    const lpfloat falloffFrom       = effectRadius * ((lpfloat)1-(lpfloat)consts.EffectFalloffRange);
+    const lpfloat falloffRange              = (lpfloat)GTVBAO_DEPTH_MIP_FALLOFF * (lpfloat)GTVBAO_DEPTH_MIP_RANGE;
+    const lpfloat falloffFrom       = (lpfloat)GTVBAO_DEPTH_MIP_RANGE * ((lpfloat)1-(lpfloat)GTVBAO_DEPTH_MIP_FALLOFF);
     // fadeout precompute optimisation
     const lpfloat falloffMul        = (lpfloat)-1.0 / ( falloffRange );
     const lpfloat falloffAdd        = falloffFrom / ( falloffRange ) + (lpfloat)1.0;
@@ -1142,7 +975,7 @@ void GTVBAO_PrefilterDepths16x16( uint2 dispatchThreadID /*: SV_DispatchThreadID
     outDepth0[ pixCoord + uint2(1, 1) ] = (lpfloat)depth3;
 
     // MIP 1
-    lpfloat dm1 = GTVBAO_DepthMIPFilter( depth0, depth1, depth2, depth3, consts );
+    lpfloat dm1 = GTVBAO_DepthMIPFilter( depth0, depth1, depth2, depth3 );
     outDepth1[ baseCoord ] = (lpfloat)dm1;
     g_scratchDepths[ groupThreadID.x ][ groupThreadID.y ] = dm1;
 
@@ -1157,7 +990,7 @@ void GTVBAO_PrefilterDepths16x16( uint2 dispatchThreadID /*: SV_DispatchThreadID
         lpfloat inBL = g_scratchDepths[groupThreadID.x+0][groupThreadID.y+1];
         lpfloat inBR = g_scratchDepths[groupThreadID.x+1][groupThreadID.y+1];
 
-        lpfloat dm2 = GTVBAO_DepthMIPFilter( inTL, inTR, inBL, inBR, consts );
+        lpfloat dm2 = GTVBAO_DepthMIPFilter( inTL, inTR, inBL, inBR );
         outDepth2[ baseCoord / 2 ] = (lpfloat)dm2;
         g_scratchDepths[ groupThreadID.x ][ groupThreadID.y ] = dm2;
     }
@@ -1173,7 +1006,7 @@ void GTVBAO_PrefilterDepths16x16( uint2 dispatchThreadID /*: SV_DispatchThreadID
         lpfloat inBL = g_scratchDepths[groupThreadID.x+0][groupThreadID.y+2];
         lpfloat inBR = g_scratchDepths[groupThreadID.x+2][groupThreadID.y+2];
 
-        lpfloat dm3 = GTVBAO_DepthMIPFilter( inTL, inTR, inBL, inBR, consts );
+        lpfloat dm3 = GTVBAO_DepthMIPFilter( inTL, inTR, inBL, inBR );
         outDepth3[ baseCoord / 4 ] = (lpfloat)dm3;
         g_scratchDepths[ groupThreadID.x ][ groupThreadID.y ] = dm3;
     }
@@ -1189,7 +1022,7 @@ void GTVBAO_PrefilterDepths16x16( uint2 dispatchThreadID /*: SV_DispatchThreadID
         lpfloat inBL = g_scratchDepths[groupThreadID.x+0][groupThreadID.y+4];
         lpfloat inBR = g_scratchDepths[groupThreadID.x+4][groupThreadID.y+4];
 
-        lpfloat dm4 = GTVBAO_DepthMIPFilter( inTL, inTR, inBL, inBR, consts );
+        lpfloat dm4 = GTVBAO_DepthMIPFilter( inTL, inTR, inBL, inBR );
         outDepth4[ baseCoord / 8 ] = (lpfloat)dm4;
         //g_scratchDepths[ groupThreadID.x ][ groupThreadID.y ] = dm4;
     }

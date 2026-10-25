@@ -2,7 +2,7 @@
 // falcomengine-plus GTVBAO — Pass 2: Main (visibility bitmask AO)
 //
 // Kai-style: builds GTAOConstants in-shader, gets quality from push_constants.
-// Quality is determined by GTVBAO_quality push constant, not hardcoded slices.
+// Quality is set by the GTVBAO_quality push constant; the quality table (slices x steps) lives in main().
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "gtvbao_common.hlsl"
@@ -166,7 +166,7 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
       && GTVBAO_normal_depth_blend >= 1.0f
       && GTVBAO_normal_edge_rejection <= 0.0f
       && GTVBAO_normal_detail_response <= 0.0f
-      && (GTVBAO_normal_darkening_mode >= 0.5f || GTVBAO_normal_max_darkening >= 1.0f))
+      && GTVBAO_normal_max_darkening >= 1.0f)
   {
     uint omw, omh;
     g_srcMrtNormal.GetDimensions(omw, omh);
@@ -177,7 +177,7 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
       float3 odecoded = DecodeMrtNormalAsIs((uint2)omrt_tc);
       if (FalcomNormalValid(odecoded))
       {
-        float3 omrt_normal = TransformNormalToView(odecoded, GTVBAO_normal_transform_mode);
+        float3 omrt_normal = TransformNormalToView(odecoded);
         return GTVBAO_TuneNormal(omrt_normal, GTVBAO_normal_influence, GTVBAO_normal_z_preservation);
       }
     }
@@ -204,7 +204,7 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
 
   // Shaping lives in GTVBAO_TuneNormal so every MRT reader applies the
   // identical tuning.
-  float3 mrt_normal = TransformNormalToView(decoded, GTVBAO_normal_transform_mode);
+  float3 mrt_normal = TransformNormalToView(decoded);
   float3 tuned = GTVBAO_TuneNormal(mrt_normal, GTVBAO_normal_influence, GTVBAO_normal_z_preservation);
 
   // Every term below is a no-op at its neutral setting, so `tuned` reaches the
@@ -224,8 +224,7 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
   float detail_gain = lerp(1.0, lerp(0.35, 1.25, pow(normal_delta, 0.5)),
                            saturate(GTVBAO_normal_detail_response));
   float final_blend = saturate(base_blend * edge_att * detail_gain);
-  if (GTVBAO_normal_darkening_mode < 0.5)
-    final_blend *= saturate(GTVBAO_normal_max_darkening);
+  final_blend *= saturate(GTVBAO_normal_max_darkening);
 
   return FalcomSafeNormalize3(lerp(depth_fallback, tuned, final_blend), depth_fallback);
 }
@@ -259,13 +258,13 @@ void main(uint2 p : SV_DispatchThreadID)
   lpfloat3 normal = (lpfloat3)BuildSelectedInputNormal(p, uint2(width, height), consts);
 
   // Quality from push constant
-  lpfloat slice_count = 3.0;
-  lpfloat steps_per_slice = 3.0;
+  lpfloat slice_count = 2.0;
+  lpfloat steps_per_slice = 4.0;
   uint q = (uint)round(clamp(GTVBAO_quality, 0.0, 3.0));
-  if (q == 0u)      { slice_count = 3.0; steps_per_slice = 3.0; }  // Low
-  else if (q == 1u) { slice_count = 4.0; steps_per_slice = 3.0; }  // Medium
-  else if (q == 2u) { slice_count = 6.0; steps_per_slice = 3.0; }  // High
-  else              { slice_count = 9.0; steps_per_slice = 3.0; }  // Ultra
+  if (q == 0u)      { slice_count = 2.0; steps_per_slice = 4.0; }   // Low 2x4
+  else if (q == 1u) { slice_count = 3.0; steps_per_slice = 4.0; }   // Medium 3x4
+  else if (q == 2u) { slice_count = 3.0; steps_per_slice = 6.0; }   // High 3x6
+  else              { slice_count = 4.0; steps_per_slice = 10.0; }  // Ultra 4x10
 
   GTVBAO_MainPass(p, slice_count, steps_per_slice, n, normal,
       consts, g_srcWorkingDepth, g_samplerPointClamp,
