@@ -423,20 +423,6 @@ float FalcomShadowStrength(float rawTerm, float strength, bool isCharacter,
   return 1.0 - darkening * s;
 }
 
-// Soft cap on a darkening amount d in [0,1] with ceiling m. Identity below the knee m*m,
-// eases into m above it, and reaches m at d=1. Slope at the knee is 1.
-float FalcomSoftCapDarkening(float darkening, float maxDarkening)
-{
-  const float d = saturate(darkening);
-  const float m = saturate(maxDarkening);
-  if (m >= 1.0) return d;
-  if (m <= 1e-4) return 0.0;
-  const float s = m * m;
-  if (d <= s) return d;
-  const float t = (d - s) / (1.0 - s);
-  return s + (m - s) * (1.0 - pow(1.0 - t, (1.0 + m) / m));
-}
-
 // ── Micro Shadows: applied to the resolved colour ──
 //
 // Micro is an APERTURE term derived from ambient occlusion, so it belongs on the

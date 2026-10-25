@@ -341,30 +341,8 @@ static void TestLightingApply() {
 }
 
 // Transcription of the lighting visibility (F2) and the spot cover lerp (F6, F10).
-static float SoftCapDarkening(float darkening, float max_darkening) {
-  const float d = std::clamp(darkening, 0.f, 1.f);
-  const float m = std::clamp(max_darkening, 0.f, 1.f);
-  if (m >= 1.f) return d;
-  if (m <= 1e-4f) return 0.f;
-  const float s = m * m;
-  if (d <= s) return d;
-  const float t = (d - s) / (1.f - s);
-  return s + (m - s) * (1.f - std::pow(1.f - t, (1.f + m) / m));
-}
-
-static double SoftCapDarkeningDouble(double darkening, double max_darkening) {
-  const double d = std::clamp(darkening, 0.0, 1.0);
-  const double m = std::clamp(max_darkening, 0.0, 1.0);
-  if (m >= 1.0) return d;
-  if (m <= 1e-4) return 0.0;
-  const double s = m * m;
-  if (d <= s) return d;
-  const double t = (d - s) / (1.0 - s);
-  return s + (m - s) * (1.0 - std::pow(1.0 - t, (1.0 + m) / m));
-}
-
 static float LampVisibility(float shadow, float strength, float max_darkening) {
-  return 1.f - SoftCapDarkening(shadow * strength, max_darkening);
+  return 1.f - std::min(shadow * strength, max_darkening);
 }
 
 static void TestLightingMath() {
@@ -372,32 +350,6 @@ static void TestLightingMath() {
   CHECK(LampVisibility(0.75f, 1.f, 1.f) == 0.25f, "defaults: visibility = 1 - shadow");
   CHECK(LampVisibility(1.f, 1.f, 0.5f) == 0.5f, "Max Darkening 0.5 caps a full shadow at half");
   CHECK(LampVisibility(0.25f, 1.f, 0.5f) == 0.75f, "Max Darkening leaves lighter shadows unchanged");
-  for (float d = 0.f; d <= 1.f; d += 0.05f) {
-    CHECK(SoftCapDarkening(d, 1.f) == d, "soft cap m=1 is identity at %f", d);
-  }
-  for (float m = 0.1f; m <= 1.f; m += 0.1f) {
-    const float s = m * m;
-    CHECK(SoftCapDarkening(s * 0.5f, m) == s * 0.5f, "below knee unchanged m=%f", m);
-    CHECK(std::fabs(SoftCapDarkening(1.f, m) - m) < 1e-5f, "d=1 gives m=%f", m);
-    CHECK(std::fabs(SoftCapDarkening(s, m) - s) < 1e-6f, "knee continuous m=%f", m);
-    float prev = -1.f;
-    for (float d = 0.f; d <= 1.f; d += 0.01f) {
-      const float v = SoftCapDarkening(d, m);
-      CHECK(v >= prev, "monotonic m=%f d=%f", m, d);
-      prev = v;
-    }
-    const double eps = 1e-4;
-    const double sd = static_cast<double>(m) * m;
-    const double slope = (SoftCapDarkeningDouble(sd + eps, m) - SoftCapDarkeningDouble(sd, m)) / eps;
-    CHECK(std::fabs(slope - 1.0) < 1e-3, "slope at knee m=%f (%f)", m, slope);
-  }
-  CHECK(LampVisibility(0.81f, 1.f, 0.9f) == 1.f - 0.81f, "m=0.9 leaves d <= 0.81 unchanged");
-  CHECK(LampVisibility(0.9f, 1.f, 0.9f) != 1.f - 0.9f, "m=0.9 changes d > 0.81");
-  for (float d = 0.f; d <= 1.f; d += 0.05f) {
-    CHECK(SoftCapDarkening(d, 1.0f) == d, "cap 1.0f is identity at %f", d);
-  }
-  CHECK(SoftCapDarkening(0.0f, 1.0f) == 0.0f, "cap 1.0f is identity at 0");
-  CHECK(SoftCapDarkening(1.0f, 1.0f) == 1.0f, "cap 1.0f is identity at 1");
   CHECK(LampVisibility(1.f, 0.f, 1.f) == 1.f, "Strength 0: no RT shadow");
   // lerp(a, 1, c) as HLSL computes it: a + c * (1 - a). Cover 0 must return the game's PCF value bit-exactly.
   const float pcf[4] = {0.f, 0.2f, 0.6f, 1.f};

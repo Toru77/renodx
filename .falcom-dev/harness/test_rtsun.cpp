@@ -239,29 +239,19 @@ static void TestCharacterReceiveText() {
   CHECK(Count(lit, "if (((uint)shader_injection_data.rtsun_flags & RTSUN_FLAG_APPLIED) != 0u) {") == 1, "R4: environment path gated by the applied bit only");
   CHECK(Count(lit, "if (((uint)shader_injection_data.rtsun_flags & (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) == (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) {") == 1,
         "R4: character path runs only with the applied and receive bits");
-  CHECK(Count(lit, "const float rtsunCharVisibility = 1.0 - FalcomSoftCapDarkening(rtsunCharTerm * shader_injection_data.rtsun_strength, shader_injection_data.rtsun_max_darkening);") == 1,
-        "R4: character visibility = 1 - soft cap(term x Strength, Max Darkening)");
+  CHECK(Count(lit, "const float rtsunCharVisibility = 1.0 - min(rtsunCharTerm * shader_injection_data.rtsun_strength, shader_injection_data.rtsun_max_darkening);") == 1,
+        "R4: character visibility = 1 - min(term x Strength, Max Darkening)");
   CHECK(Count(lit, "r3.z *= lerp(1.0, rtsunCharVisibility, saturate(shader_injection_data.rtsun_spare));") == 1, "R4: Character Intensity lerps from CSM (0) to RT (1)");
   CHECK(Count(lit, "rtsunTexture.SampleLevel(samPoint_s, v1.xy, 0)") == 2, "R4: both RT sun samples use samPoint at v1.xy");
-  // Transcription of FalcomSoftCapDarkening (shadows_common.hlsli) and the character lerp (lighting shader).
-  const auto soft_cap = [](float darkening, float max_darkening) {
-    const float d = std::fmin(std::fmax(darkening, 0.f), 1.f);
-    const float m = std::fmin(std::fmax(max_darkening, 0.f), 1.f);
-    if (m >= 1.f) return d;
-    if (m <= 1e-4f) return 0.f;
-    const float s = m * m;
-    if (d <= s) return d;
-    const float t = (d - s) / (1.f - s);
-    return s + (m - s) * (1.f - std::pow(1.f - t, (1.f + m) / m));
-  };
+  // Transcription of the character visibility (lighting shader) and the character lerp.
   const float term = 0.8f, strength = 1.f, max_dark = 0.5f;
-  const float vis = 1.f - soft_cap(term * strength, max_dark);
+  const float vis = 1.f - std::fmin(term * strength, max_dark);
   const auto char_term = [&](float intensity) {
     const float i = std::fmin(std::fmax(intensity, 0.f), 1.f);
     return 1.f + (vis - 1.f) * i;
   };
-  CHECK(soft_cap(term, max_dark) < term, "R4 numeric: Max Darkening 0.5 cap is active at term 0.8");
-  CHECK(std::fabs(vis - 0.504741f) < 1e-4f, "R4 numeric: visibility at term 0.8, Max Darkening 0.5 is 0.5047 (got %f)", vis);
+  CHECK(std::fmin(term * strength, max_dark) < term, "R4 numeric: Max Darkening 0.5 cap is active at term 0.8");
+  CHECK(std::fabs(vis - 0.5f) < 1e-6f, "R4 numeric: visibility at term 0.8, Max Darkening 0.5 is 0.5 (got %f)", vis);
   CHECK(std::fabs(char_term(0.f) - 1.f) < 1e-6f, "R4 numeric: Character Intensity 0 gives 1 (CSM only)");
   CHECK(std::fabs(char_term(1.f) - vis) < 1e-6f, "R4 numeric: Character Intensity 1 gives the RT visibility");
   CHECK(std::fabs(char_term(0.5f) - (1.f + vis) / 2.f) < 1e-6f, "R4 numeric: Character Intensity 0.5 gives (1 + vis) / 2");
