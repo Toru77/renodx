@@ -933,6 +933,13 @@ int main() {
       CHECK(known, "world_pool.json shadow_coverage verdict is a known string (at %zu)", at);
     }
   }
+  {
+    const std::vector<uint8_t> bytes = ReadFile((bvh::PoolOutputDir() / "world_pool.json").string());
+    const std::string text(bytes.begin(), bytes.end());
+    const size_t inspect = text.find("\"inspect\": {");
+    CHECK(inspect != std::string::npos && text.find("\"hit_kind\": null", inspect) != std::string::npos, "world_pool.json inspect carries hit_kind");
+    CHECK(inspect != std::string::npos && text.find("\"deform_key\": null", inspect) != std::string::npos, "world_pool.json inspect carries deform_key");
+  }
   bvh::OnDestroyDevicePool(&dev);
   std::printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAILED", g_failures);
   Golden("end");

@@ -208,13 +208,39 @@ inline void RunBvhDebugPass(
     } else {
       DescribeLiveInspect(data);
     }
-    // Kept for world_pool.json ("inspect"); the hit's ids are known for static instances only.
+    // Kept for world_pool.json ("inspect"). The ids are known for static instances, the mesh uid for P2b records
+    // and the identity key for deform objects; resolved here, before g_pool.mutex.
+    const bool hit = data->inspect.valid && data->inspect.hit;
+    const uint32_t hit_instance = data->inspect.instance;
+    const bool known = hit && (hit_instance & kDynamicFlagsMask) == 0u && hit_instance < data->tlas_info.size();
+    std::string hit_kind;
+    uint64_t p2b_mesh_uid = 0u;
+    std::string deform_key;
+    if (!hit) {
+      // nothing hit
+    } else if ((hit_instance & kDynamicFlagsMask) == 0u) {
+      hit_kind = "static_instance";
+    } else if ((hit_instance & kDynamicFlagsMask) == kDynamicDrawFlag) {
+      hit_kind = "p2b_record";
+      const uint32_t record = hit_instance & ~kDynamicFlagsMask;
+      for (const DynamicDrawGPU& draw : data->dynamic.last_table) {
+        if (record >= draw.info[2] && record < draw.info[2] + draw.info[1]) {
+          const uint32_t slot = draw.extra[2];
+          if (slot < data->slots.size()) p2b_mesh_uid = data->slots[slot].uid;
+          break;
+        }
+      }
+    } else if ((hit_instance & kDynamicInstanceFlag) != 0u) {
+      hit_kind = "deform_object";
+      uint64_t key = 0u;
+      if (DynamicObjectKey(hit_instance, &key)) deform_key = renodx::utils::log::AsHex(key);
+    }
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    const bool known = data->inspect.valid && data->inspect.hit && (data->inspect.instance & kDynamicFlagsMask) == 0u
-                       && data->inspect.instance < data->tlas_info.size();
-    g_pool.inspect = PoolInspectRecord{.set = true, .frame = g_state.frame.load(), .hit = data->inspect.valid && data->inspect.hit,
-                                       .instance_id = known ? data->tlas_info[data->inspect.instance].id : 0u,
-                                       .mesh_uid = known ? data->tlas_info[data->inspect.instance].uid : 0u,
+    g_pool.inspect = PoolInspectRecord{.set = true, .frame = g_state.frame.load(), .hit = hit,
+                                       .instance_id = known ? data->tlas_info[hit_instance].id : 0u,
+                                       .mesh_uid = known ? data->tlas_info[hit_instance].uid : p2b_mesh_uid,
+                                       .hit_kind = hit_kind,
+                                       .deform_key = deform_key,
                                        .lines = data->inspect.lines,
                                        .ray_valid = data->inspect.ray_valid,
                                        .ray_origin = data->inspect.ray_origin,

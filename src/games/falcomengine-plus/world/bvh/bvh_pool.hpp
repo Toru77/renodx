@@ -1300,7 +1300,9 @@ struct PoolInspectRecord {
   uint32_t frame = 0u;
   bool hit = false;
   uint64_t instance_id = 0u;  // PoolState instance id of the hit (0: none, or a moving instance)
-  uint64_t mesh_uid = 0u;     // WorldMesh::uid of the hit (0: none, or a moving instance)
+  uint64_t mesh_uid = 0u;     // WorldMesh::uid of the hit (0: none, or a deform object)
+  std::string hit_kind;       // "static_instance", "p2b_record", "deform_object" (empty: nothing hit)
+  std::string deform_key;     // identity key (hex) of a deform_object hit (empty: none, or no longer in the object list)
   std::vector<std::string> lines;
   bool ray_valid = false;
   std::array<float, 3> ray_origin = {};
@@ -7762,7 +7764,10 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   out << "\n  ],\n";
   out << "  \"inspect\": {\"set\": " << (inspect.set ? "true" : "false") << ", \"frame\": " << inspect.frame
       << ", \"hit\": " << (inspect.hit ? "true" : "false") << ", \"instance_id\": " << inspect.instance_id
-      << ", \"mesh_uid\": " << inspect.mesh_uid << ", \"camera_ray\": ";
+      << ", \"mesh_uid\": " << inspect.mesh_uid
+      << ", \"hit_kind\": " << (inspect.hit_kind.empty() ? "null" : ("\"" + inspect.hit_kind + "\""))
+      << ", \"deform_key\": " << (inspect.deform_key.empty() ? "null" : ("\"" + inspect.deform_key + "\""))
+      << ", \"camera_ray\": ";
   if (inspect.ray_valid) {
     out << "{\"origin\": [" << PoolJsonFloat{inspect.ray_origin[0]} << ", " << PoolJsonFloat{inspect.ray_origin[1]} << ", "
         << PoolJsonFloat{inspect.ray_origin[2]} << "], \"direction\": [" << PoolJsonFloat{inspect.ray_direction[0]} << ", "

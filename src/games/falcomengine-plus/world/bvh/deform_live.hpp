@@ -1401,6 +1401,15 @@ inline void DumpDeformLive() {
   renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_deform_live.json", text);
 }
 
+// Identity key of a deforming object (trace hit.instance with kDynamicInstanceFlag); false when it is no longer in the object list.
+inline bool DynamicObjectKey(uint32_t instance, uint64_t* key) {
+  const uint32_t index = instance & ~kDynamicInstanceFlag;
+  std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+  if (index >= g_deform_live.object_info.size()) return false;
+  *key = g_deform_live.object_info[index].key;
+  return true;
+}
+
 // Inspect lines for a hit on a dynamic object (trace hit.instance with kDynamicInstanceFlag).
 inline void DescribeDynamicInspect(BvhInspect& inspect, const char* compare) {
   inspect.lines.clear();
