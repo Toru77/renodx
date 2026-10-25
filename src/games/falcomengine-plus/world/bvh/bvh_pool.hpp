@@ -159,6 +159,7 @@ inline constexpr size_t kPoolDumpMaxAlphaRefusals = 32u;  // alpha_refusals_by_v
 inline constexpr size_t kPoolDumpMaxMeshDetail = 256u;  // mesh_failed[], failed_meshes_detail[], mesh_mismatches[], mismatch_meshes_detail[]
 inline constexpr size_t kPoolDumpMaxNoMeshKeys = 32u;  // alpha_no_mesh_keys[] in world_pool.json
 inline constexpr size_t kPoolDumpMaxStaleDynamic = 256u;  // stale_dynamic[] in world_pool.json
+inline constexpr size_t kPoolDumpMaxDynamicCandidates = 12u;  // dynamic_candidates[] in world_pool.json
 inline constexpr uint32_t kPoolDumpStaleFrames = 30u;     // stale_dynamic: camera-visible, not followed for more frames than this
 inline constexpr size_t kPoolNoMeshKeysMax = 4096u;  // alpha keys with no mesh tracked by frame and count (diagnostic)
 inline constexpr size_t kPoolFirstRawCount = 16u;  // raw index values kept per read (first_raw)
@@ -936,6 +937,14 @@ struct PoolDynamicMesh {
   uint64_t follows = 0u;            // pose updates of its instances (follow mode)
   bool moving_now = true;           // moving evidence not yet released (see NotePoolCameraMotion)
   uint32_t released = 0u;           // times released by a still sighting
+  uint64_t records_from_camera = 0u;     // P2b records of its draws from a camera view (RecordPoolDynamicDraw)
+  uint64_t records_from_light = 0u;      // P2b records of its draws from a light view
+  uint32_t last_camera_record_frame = 0u;
+  uint32_t last_light_record_frame = 0u;
+  uint64_t refused_alpha = 0u;      // RecordPoolDynamicDraw refusals: alpha-tested
+  uint64_t refused_deferred = 0u;   // refusals: deferred context
+  uint64_t refused_cap = 0u;        // refusals: arena, record or instance caps
+  uint64_t refused_unflagged = 0u;  // refusals: its mesh is not flagged
   float world[kPoolWorldFloats] = {};       // the sighting with the largest translation difference
   float prev_world[kPoolWorldFloats] = {};
 };
@@ -3331,16 +3340,23 @@ inline void CountPoolSkip(PoolFamilyStats& family, PoolSkip skip, PoolDrawState 
 inline bool RecordPoolDynamicDraw(uint64_t mesh_key, const DrawRecord& draw, uint8_t pass, bool indirect, bool deferred,
                                   int32_t base, uint32_t count, uint64_t args_offset, PoolDynamicDraw* out) {
   const auto mesh = g_pool.mesh_by_key.find(mesh_key);
-  if (mesh == g_pool.mesh_by_key.end() || !g_pool.meshes[mesh->second].dynamic) return false;
+  const auto dynamic_entry = g_pool.dynamic_keys.find(mesh_key);  // diagnostics only (world_pool.json dynamic_candidates)
+  const bool has_entry = dynamic_entry != g_pool.dynamic_keys.end();
+  if (mesh == g_pool.mesh_by_key.end() || !g_pool.meshes[mesh->second].dynamic) {
+    if (has_entry) dynamic_entry->second.refused_unflagged += 1u;
+    return false;
+  }
   if (!g_pool.live_on.load(std::memory_order_relaxed) || !g_pool.dynamic_per_frame.load(std::memory_order_relaxed)) return false;
   if (deferred) {
     g_pool.stats.dynamic_deferred += 1u;
+    if (has_entry) dynamic_entry->second.refused_deferred += 1u;
     return false;
   }
   // With exclude_moving on, AdmitPoolInstance refuses flagged meshes, so an alpha dynamic mesh is in neither the TLAS
   // nor the records in that mode (the same as before P2b); the default follow path is unaffected.
   if (g_pool.meshes[mesh->second].alpha) {
     g_pool.stats.dynamic_alpha_skipped += 1u;  // alpha-tested: not traced as solid (header.z = 0), stays in the TLAS
+    if (has_entry) dynamic_entry->second.refused_alpha += 1u;
     return false;
   }
   const uint64_t slice_bytes = static_cast<uint64_t>(count) * kPoolInstanceStride;
@@ -3349,7 +3365,18 @@ inline bool RecordPoolDynamicDraw(uint64_t mesh_key, const DrawRecord& draw, uin
       || g_pool.dynamic_arena_used + slice_bytes + args_bytes > kPoolDynamicArenaBytes
       || g_pool.dynamic_out_used + count > kPoolDynamicInstances) {
     g_pool.stats.dynamic_refused += 1u;
+    if (has_entry) dynamic_entry->second.refused_cap += 1u;
     return false;
+  }
+  if (has_entry) {
+    PoolDynamicMesh& entry = dynamic_entry->second;
+    if ((pass & kPoolPassCamera) != 0u) {
+      entry.records_from_camera += 1u;
+      entry.last_camera_record_frame = g_state.frame.load();
+    } else if ((pass & kPoolPassLight) != 0u) {
+      entry.records_from_light += 1u;
+      entry.last_light_record_frame = g_state.frame.load();
+    }
   }
   PoolDynamicDraw record;
   record.mesh_key = mesh_key;
@@ -6264,6 +6291,9 @@ struct PoolDynamicDumpEntry {
   uint32_t mesh_id = 0u;
   uint64_t mesh_uid = 0u;
   bool mesh_dynamic = false;
+  bool mesh_alpha = false;
+  uint32_t camera_draws = 0u;
+  uint32_t light_draws = 0u;
   uint32_t triangles = 0u;
   float bbox_min[3] = {};
   float bbox_max[3] = {};
@@ -6290,6 +6320,9 @@ inline std::vector<PoolDynamicDumpEntry> SnapshotPoolDynamic() {
       out.mesh_id = mesh.mesh_id;
       out.mesh_uid = mesh.uid;
       out.mesh_dynamic = mesh.dynamic;
+      out.mesh_alpha = mesh.alpha;
+      out.camera_draws = mesh.camera_draws;
+      out.light_draws = mesh.light_draws;
       out.triangles = mesh.triangle_count;
       std::memcpy(out.bbox_min, mesh.bbox_min, sizeof(out.bbox_min));
       std::memcpy(out.bbox_max, mesh.bbox_max, sizeof(out.bbox_max));
@@ -6360,6 +6393,97 @@ inline void WritePoolDynamic(std::ostringstream& out, const std::vector<PoolDyna
     out << "]}";
   }
   out << "]},\n";
+}
+
+// world_pool.json "dynamic_candidates": meshes with light draws that are flagged now or were ever flagged, nearest the camera
+// first; an entry whose mesh does not exist yet is listed with verdict "no_mesh". The verdict is the first rule that matches
+// (diagnostic only).
+inline void WritePoolDynamicCandidates(std::ostream& out, const std::vector<PoolDynamicDumpEntry>& entries,
+                                       const PoolCameraInfo& camera, const PoolAlphaDumpMaps& alpha_maps, uint32_t frame) {
+  struct Candidate {
+    const PoolDynamicDumpEntry* item = nullptr;
+    float translation[3] = {};
+    float distance = 0.f;  // distance from the camera to the sighting translation (sighting_world_translation)
+    float bbox_size = 0.f;
+    bool resident = false;
+    bool tlas_waiting = false;
+    std::string verdict;
+  };
+  std::vector<Candidate> candidates;
+  for (const PoolDynamicDumpEntry& item : entries) {
+    if (item.has_mesh && item.light_draws == 0u) continue;
+    Candidate& candidate = candidates.emplace_back();
+    candidate.item = &item;
+    const PoolDynamicMesh& entry = item.entry;
+    PoolMatrixTranslation(entry.world, candidate.translation);
+    float offset_sq = 0.f;
+    float size_sq = 0.f;
+    for (int k = 0; k < 3; ++k) {
+      const float d = candidate.translation[k] - camera.position[k];
+      offset_sq += d * d;
+      const float s = item.bbox_max[k] - item.bbox_min[k];
+      size_sq += s * s;
+    }
+    candidate.distance = std::sqrt(offset_sq);
+    candidate.bbox_size = std::sqrt(size_sq);
+    candidate.resident = alpha_maps.resident_uids.count(item.mesh_uid) != 0u;
+    candidate.tlas_waiting = item.mesh_alpha && candidate.resident && alpha_maps.slice_of_uid.find(item.mesh_uid) == alpha_maps.slice_of_uid.end();
+    if (!item.has_mesh) {
+      candidate.verdict = "no_mesh";
+    } else if (item.mesh_alpha) {
+      candidate.verdict = "alpha_skipped";
+    } else if (!candidate.resident) {
+      candidate.verdict = "not_resident";
+    } else if (!item.mesh_dynamic && entry.released > 0u) {
+      candidate.verdict = "released_unflagged";
+    } else if (entry.records_from_light == 0u || entry.last_light_record_frame + 60u < frame) {
+      candidate.verdict = "no_light_records_since_frame " + std::to_string(entry.last_light_record_frame);
+    } else {
+      candidate.verdict = "p2b_light_records_ok";
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+    return a.distance != b.distance ? a.distance < b.distance : a.item->mesh_key < b.item->mesh_key;
+  });
+  const size_t shown = (std::min)(candidates.size(), kPoolDumpMaxDynamicCandidates);
+  out << "  \"dynamic_candidates\": [";
+  for (size_t i = 0; i < shown; ++i) {
+    const Candidate& c = candidates[i];
+    const PoolDynamicDumpEntry& item = *c.item;
+    const PoolDynamicMesh& entry = item.entry;
+    // Mesh fields print null while the mesh does not exist (verdict no_mesh).
+    const auto mesh_value = [&](auto value) {
+      if (item.has_mesh) {
+        out << value;
+      } else {
+        out << "null";
+      }
+    };
+    out << (i != 0u ? ",\n    " : "\n    ") << "{\"mesh_uid\": ";
+    mesh_value(item.mesh_uid);
+    out << ", \"mesh_key\": \"" << renodx::utils::log::AsHex(item.mesh_key) << "\", \"vs_hash\": \"" << PoolHashText(entry.vs_hash)
+        << "\", \"triangles\": ";
+    mesh_value(item.triangles);
+    out << ", \"bbox_size\": ";
+    mesh_value(PoolJsonFloat{c.bbox_size});
+    out << ", \"sighting_world_translation\": [" << PoolJsonFloat{c.translation[0]} << ", " << PoolJsonFloat{c.translation[1]} << ", "
+        << PoolJsonFloat{c.translation[2]} << "], \"distance_m\": " << PoolJsonFloat{c.distance} << ", \"camera_draws\": ";
+    mesh_value(item.camera_draws);
+    out << ", \"light_draws\": ";
+    mesh_value(item.light_draws);
+    out << ", \"flagged_now\": ";
+    mesh_value(item.mesh_dynamic ? "true" : "false");
+    out << ", \"released\": " << entry.released << ", \"alpha\": ";
+    mesh_value(item.mesh_alpha ? "true" : "false");
+    out << ", \"tlas_waiting\": ";
+    mesh_value(c.tlas_waiting ? "true" : "false");
+    out << ", \"records_from_camera\": " << entry.records_from_camera << ", \"records_from_light\": " << entry.records_from_light
+        << ", \"last_camera_record_frame\": " << entry.last_camera_record_frame
+        << ", \"last_light_record_frame\": " << entry.last_light_record_frame << ", \"refused_alpha\": " << entry.refused_alpha
+        << ", \"refused_deferred\": " << entry.refused_deferred << ", \"refused_cap\": " << entry.refused_cap
+        << ", \"refused_unflagged\": " << entry.refused_unflagged << ", \"verdict\": \"" << c.verdict << "\"}";
+  }
+  out << "\n  ],\n";
 }
 
 // Camera visibility of the admitted instances, for the dump (see
@@ -7219,6 +7343,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
 
   WritePoolMotion(out, stats.motion, motion_detail, instances);
   WritePoolDynamic(out, dynamic, stats);
+  WritePoolDynamicCandidates(out, dynamic, camera, alpha_maps, frame);
   WritePoolP2b(out, stats);
   out << "  \"tlas_timing\": {\"rebuilds\": " << tlas_timing.rebuilds
       << ", \"rebuilds_refit_quality\": " << tlas_timing.rebuilds_refit_quality

@@ -903,6 +903,21 @@ int main() {
     CHECK(text.find("\"following_instances\": " + std::to_string(dynamic) + ",") != std::string::npos, "world_pool.json following_instances equals dynamic instances (%zu)",
           dynamic);
   }
+  {
+    const std::vector<uint8_t> bytes = ReadFile((bvh::PoolOutputDir() / "world_pool.json").string());
+    const std::string text(bytes.begin(), bytes.end());
+    const size_t list = text.find("\"dynamic_candidates\": [");
+    const size_t list_end = list == std::string::npos ? std::string::npos : text.find("\n  ],", list);
+    CHECK(list != std::string::npos && list_end != std::string::npos, "world_pool.json dynamic_candidates list present");
+    CHECK(text.find("\"verdict\": ", list) >= list_end || text.find("\"sighting_world_translation\": [", list) < list_end, "world_pool.json dynamic_candidates rows carry sighting_world_translation");
+    const char* verdicts[] = {"\"alpha_skipped\"", "\"not_resident\"", "\"released_unflagged\"", "\"no_light_records_since_frame ", "\"p2b_light_records_ok\""};
+    for (size_t at = text.find("\"verdict\": ", list); list != std::string::npos && at != std::string::npos && at < list_end;
+         at = text.find("\"verdict\": ", at + 1)) {
+      bool known = false;
+      for (const char* verdict : verdicts) known = known || text.compare(at + 11, std::strlen(verdict), verdict) == 0;
+      CHECK(known, "world_pool.json dynamic_candidates verdict is a known string (at %zu)", at);
+    }
+  }
   bvh::OnDestroyDevicePool(&dev);
   std::printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAILED", g_failures);
   Golden("end");
