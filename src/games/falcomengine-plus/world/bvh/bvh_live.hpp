@@ -2173,6 +2173,58 @@ inline void ExpandLiveDynamic(reshade::api::device* device, reshade::api::comman
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     std::vector<PoolDynamicDraw> draws;
     draws.swap(g_pool.dynamic_present);
+    uint32_t next_out = draws.empty() ? 0u : draws.back().out + draws.back().count;
+    std::unordered_set<uint64_t> drawn;
+    for (const PoolDynamicDraw& draw : draws) drawn.insert(draw.mesh_key);
+    uint32_t held_emitted = 0u;
+    std::vector<std::array<float, 3>> live_light;
+    if (!g_pool.held.empty()) {
+      const uint32_t frame_now = g_state.frame.load();
+      for (const auto& item : g_pool.dynamic_keys) {
+        const PoolDynamicMesh& entry = item.second;
+        if (entry.records_from_light != 0u && entry.last_light_record_frame + kPoolMovingHoldFrames >= frame_now) {
+          float translation[3];
+          PoolMatrixTranslation(entry.world, translation);
+          live_light.push_back({translation[0], translation[1], translation[2]});
+        }
+      }
+    }
+    for (auto held = g_pool.held.begin(); held != g_pool.held.end();) {
+      const auto mesh = g_pool.mesh_by_key.find(held->first);
+      const auto dynamic_entry = g_pool.dynamic_keys.find(held->first);
+      bool valid = mesh != g_pool.mesh_by_key.end() && mesh->second < g_pool.meshes.size()
+                   && g_pool.meshes[mesh->second].dynamic && dynamic_entry != g_pool.dynamic_keys.end()
+                   && dynamic_entry->second.records_from_light == 0u
+                   && dynamic_entry->second.max_meters < kPoolTraceSwayMeters;
+      bool twin = false;
+      if (valid) {
+        float held_translation[3];
+        PoolMatrixTranslation(dynamic_entry->second.world, held_translation);
+        for (const auto& light : live_light) {
+          const float dx = light[0] - held_translation[0], dy = light[1] - held_translation[1], dz = light[2] - held_translation[2];
+          if (std::sqrt(dx * dx + dy * dy + dz * dz) < kPoolHeldTwinMeters) {
+            twin = true;
+            break;
+          }
+        }
+      }
+      if (!valid || twin) {
+        g_pool.held_used.reset(held->second.slot);
+        held = g_pool.held.erase(held);
+        continue;
+      }
+      if (drawn.count(held->first) == 0u && next_out + held->second.draw.count <= kPoolDynamicInstances) {
+        PoolDynamicDraw hold = held->second.draw;
+        hold.pass = kPoolPassLight;
+        hold.out = next_out;
+        next_out += hold.count;
+        draws.push_back(hold);
+        held_emitted += 1u;
+      }
+      ++held;
+    }
+    g_pool.stats.dynamic_held_keys = static_cast<uint32_t>(g_pool.held.size());
+    g_pool.stats.dynamic_held_emitted = held_emitted;
     for (const PoolDynamicDraw& draw : draws) {
       DynamicDrawGPU entry = {};
       uint32_t slot = 0u;

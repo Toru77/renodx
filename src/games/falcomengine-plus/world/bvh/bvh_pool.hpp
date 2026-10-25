@@ -219,6 +219,12 @@ inline constexpr size_t kPoolTraceMaxRecords = 1500u;
 inline constexpr size_t kPoolMaxDynamicKeys = 4096u;
 inline constexpr size_t kPoolMaxDynamicDraws = 4096u;  // P2b: draws of flagged meshes recorded per present
 inline constexpr uint64_t kPoolDynamicArenaBytes = uint64_t{8} << 20;  // P2b: copied instance slices and args per present
+inline constexpr uint32_t kPoolHeldSlots = 128u;
+inline constexpr uint32_t kPoolHeldElements = 16u;
+inline constexpr uint64_t kPoolHeldSlotBytes = kPoolHeldElements * kPoolInstanceStride + kPoolIndirectArgsBytes;
+inline constexpr uint64_t kPoolHeldArenaBytes = kPoolHeldSlots * kPoolHeldSlotBytes;
+inline constexpr uint32_t kPoolLightChurnSamples = 3u;  // consecutive fresh poses across frames, each within kPoolTraceSwayMeters of the one before, that flag a light-only key moving
+inline constexpr float kPoolHeldTwinMeters = 1.0f;     // a live light key this close to a held key replaces the held copy
 inline constexpr uint32_t kPoolDynamicInstances = 32768u;             // P2b: expanded instance records per present
 inline constexpr size_t kPoolMotionRuleSamples = 16u;
 inline constexpr float kPoolRegionMinSize = 64.f;
@@ -922,6 +928,8 @@ struct PoolDynamicDraw {
   uint32_t out = 0u;          // P2b: first expanded record of this present
   reshade::api::resource buffer = {0u};  // P2b: the arena (copy destination)
 };
+struct PoolHeldDraw { PoolDynamicDraw draw; uint32_t slot = 0u; size_t index = 0u; };
+struct PoolLightTrail { float world[kPoolWorldFloats] = {}; uint32_t frame = 0u; uint32_t chain = 0u; };
 
 // A draw key seen moving in a camera view (path 2, P2a), with its evidence.
 struct PoolDynamicMesh {
@@ -1210,6 +1218,11 @@ struct PoolStats {
   uint64_t dynamic_expand_failed = 0u;    // P2b: passes that failed to set up or upload (total)
   uint64_t dynamic_flagged_total = 0u;    // P2b: meshes flagged dynamic now
   uint64_t dynamic_flagged_resident = 0u;  // P2b: flagged meshes resident in the live store now
+  uint64_t dynamic_indirect_remaps = 0u;  // P2b: light-pass indirect schedule keys re-learned to another mesh key (total)
+  uint64_t dynamic_indirect_unlearned = 0u;  // P2b: light-pass indirect draws with no learned mesh key (total)
+  uint32_t dynamic_held_keys = 0u;
+  uint32_t dynamic_held_emitted = 0u;
+  uint32_t dynamic_light_flagged = 0u;
   size_t following = 0u;          // dynamic instances (following their object) now
   uint64_t scan_first_frame = 0u;
   uint64_t scan_last_frame = 0u;
@@ -1529,6 +1542,9 @@ struct PoolState {
   std::vector<PoolDynamicDraw> dynamic_draws;    // P2b: flagged draws of this present, recorded at draw time
   std::vector<PoolDynamicDraw> dynamic_present;  // P2b: the last present's draws (moved by DrainPoolScan, expanded by ExpandLiveDynamic)
   std::unordered_map<uint64_t, uint64_t> dynamic_indirect;  // P2b: indirect schedule key (PoolIndirectScheduleKey at the draw) -> its mesh key (learned at resolve)
+  std::unordered_map<uint64_t, PoolHeldDraw> held;
+  std::bitset<kPoolHeldSlots> held_used;
+  std::unordered_map<uint64_t, PoolLightTrail> light_trails;
   reshade::api::resource dynamic_arena = {0u};   // P2b: copy destination of the draws (created by ExpandLiveDynamic)
   uint64_t dynamic_arena_used = 0u;              // bytes reserved in the arena this present
   uint32_t dynamic_out_used = 0u;                // expanded records reserved this present
@@ -3362,11 +3378,32 @@ inline bool RecordPoolDynamicDraw(uint64_t mesh_key, const DrawRecord& draw, uin
     if (has_entry) dynamic_entry->second.refused_alpha += 1u;
     return false;
   }
-  const uint64_t slice_bytes = static_cast<uint64_t>(count) * kPoolInstanceStride;
+  const auto held_entry = g_pool.held.find(mesh_key);
+  const bool held_this_present = held_entry != g_pool.held.end() && held_entry->second.index < g_pool.dynamic_draws.size()
+                                 && g_pool.dynamic_draws[held_entry->second.index].arena == held_entry->second.draw.arena;
+  const bool hold = has_entry && (pass & kPoolPassCamera) != 0u && dynamic_entry->second.records_from_light == 0u
+                    && dynamic_entry->second.max_meters < kPoolTraceSwayMeters && count != 0u;
+  uint32_t held_slot = kPoolHeldSlots;
+  if (hold && !held_this_present) {
+    if (held_entry != g_pool.held.end()) {
+      held_slot = held_entry->second.slot;
+    } else if (g_pool.held.size() < kPoolHeldSlots) {
+      for (uint32_t s = 0u; s < kPoolHeldSlots; ++s) {
+        if (!g_pool.held_used.test(s)) {
+          held_slot = s;
+          break;
+        }
+      }
+    }
+  }
+  const bool keep = held_slot < kPoolHeldSlots;
+  const uint32_t copy_count = keep ? (std::min)(count, kPoolHeldElements) : count;
+  const uint64_t slice_bytes = static_cast<uint64_t>(copy_count) * kPoolInstanceStride;
   const uint64_t args_bytes = indirect ? kPoolIndirectArgsBytes : 0u;
+  const uint64_t arena_need = keep ? 0u : slice_bytes + args_bytes;
   if (g_pool.dynamic_arena.handle == 0u || g_pool.dynamic_draws.size() >= kPoolMaxDynamicDraws
-      || g_pool.dynamic_arena_used + slice_bytes + args_bytes > kPoolDynamicArenaBytes
-      || g_pool.dynamic_out_used + count > kPoolDynamicInstances) {
+      || g_pool.dynamic_arena_used + arena_need > kPoolDynamicArenaBytes - kPoolHeldArenaBytes
+      || g_pool.dynamic_out_used + copy_count > kPoolDynamicInstances) {
     g_pool.stats.dynamic_refused += 1u;
     if (has_entry) dynamic_entry->second.refused_cap += 1u;
     return false;
@@ -3387,15 +3424,24 @@ inline bool RecordPoolDynamicDraw(uint64_t mesh_key, const DrawRecord& draw, uin
   record.pass = pass;
   record.indirect = indirect;
   record.base = base;
-  record.count = count;
+  record.count = copy_count;
   record.args_offset = args_offset;
-  record.arena = g_pool.dynamic_arena_used;
-  record.args = g_pool.dynamic_arena_used + slice_bytes;
+  if (keep) {
+    record.arena = (kPoolDynamicArenaBytes - kPoolHeldArenaBytes) + held_slot * kPoolHeldSlotBytes;
+    record.args = record.arena + kPoolHeldElements * kPoolInstanceStride;
+  } else {
+    record.arena = g_pool.dynamic_arena_used;
+    record.args = g_pool.dynamic_arena_used + slice_bytes;
+  }
   record.out = g_pool.dynamic_out_used;
   record.buffer = g_pool.dynamic_arena;
-  g_pool.dynamic_arena_used += slice_bytes + args_bytes;
-  g_pool.dynamic_out_used += count;
+  g_pool.dynamic_arena_used += arena_need;
+  g_pool.dynamic_out_used += copy_count;
   g_pool.dynamic_draws.push_back(record);
+  if (keep) {
+    g_pool.held[mesh_key] = PoolHeldDraw{record, held_slot, g_pool.dynamic_draws.size() - 1u};
+    g_pool.held_used.set(held_slot);
+  }
   g_pool.stats.dynamic_copied += 1u;
   *out = record;
   return true;
@@ -4457,6 +4503,7 @@ inline void OnPoolScanIndirectDraw(
       // The args decide the mesh key only at resolve: a schedule identity learned there leads to its mesh (P2b).
       const auto learned_mesh = g_pool.dynamic_indirect.find(schedule_key);
       const uint64_t dynamic_key = learned_mesh != g_pool.dynamic_indirect.end() ? learned_mesh->second : 0u;
+      if (dynamic_key == 0u && (gate.pass & kPoolPassLight) != 0u) g_pool.stats.dynamic_indirect_unlearned += 1u;
       if (wind_read && dynamic_key != 0u && g_pool.wind_keys.count(dynamic_key) != 0u) g_pool.wind_sway[dynamic_key] = wind;
       uint32_t window = max_window;
       const auto known = g_pool.schedule.find(schedule_key);
@@ -5753,6 +5800,10 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         mesh_key = PoolMeshKey(record);
         // At the cap, only an identity already learned may still change its mesh; new identities are dropped.
         if (g_pool.dynamic_indirect.size() < kPoolMaxDynamicKeys || g_pool.dynamic_indirect.count(copy.schedule_key) != 0u) {
+          const auto prior = g_pool.dynamic_indirect.find(copy.schedule_key);
+          if ((copy.pass & kPoolPassLight) != 0u && prior != g_pool.dynamic_indirect.end() && prior->second != mesh_key) {
+            g_pool.stats.dynamic_indirect_remaps += 1u;
+          }
           g_pool.dynamic_indirect[copy.schedule_key] = mesh_key;
         }
         const PoolIndirectAlpha* alpha_side = copy.alpha_index != UINT32_MAX ? &indirect_alpha[copy.alpha_index] : nullptr;
@@ -5811,6 +5862,40 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         if (verdict != PoolSightingVerdict::Unknown) {
           NotePoolCameraMotion(mesh_key, copy.vs_hash, world, prev_world, indirect, copy.frame, verdict);
         }
+        if (element == 0u && (copy.pass & kPoolPassCamera) == 0u && (copy.pass & kPoolPassLight) != 0u
+            && verdict == PoolSightingVerdict::Unknown) {
+          // A light-only key (the light-view twin of a sign) never reads moving from its camera
+          // sightings: flag it from its pose churn across frames.
+          const auto dynamic = g_pool.dynamic_keys.find(mesh_key);
+          if (dynamic == g_pool.dynamic_keys.end() || !dynamic->second.moving_now) {
+            const auto observed = g_pool.observations.find(InstanceKey{mesh_key, MatrixHash(world, kPoolWorldFloats)});
+            const bool fresh = observed == g_pool.observations.end() || observed->second.count == 0u;
+            const auto trail = g_pool.light_trails.find(mesh_key);
+            if (trail == g_pool.light_trails.end()) {
+              if (g_pool.light_trails.size() < kPoolMaxDynamicKeys) {
+                PoolLightTrail& created = g_pool.light_trails[mesh_key];
+                std::memcpy(created.world, world, sizeof(float) * kPoolWorldFloats);
+                created.frame = copy.frame;
+              }
+            } else if (copy.frame > trail->second.frame) {
+              float previous[kPoolWorldFloats];
+              std::memcpy(previous, trail->second.world, sizeof(float) * kPoolWorldFloats);
+              if (fresh && PoolTranslationDistance(world, previous) < kPoolTraceSwayMeters
+                  && copy.frame <= trail->second.frame + kPoolPruneAge) {
+                trail->second.chain += 1u;
+              } else {
+                trail->second.chain = 0u;
+              }
+              std::memcpy(trail->second.world, world, sizeof(float) * kPoolWorldFloats);
+              trail->second.frame = copy.frame;
+              if (trail->second.chain >= kPoolLightChurnSamples) {
+                NotePoolCameraMotion(mesh_key, copy.vs_hash, world, previous, false, copy.frame, PoolSightingVerdict::Moving);
+                g_pool.stats.dynamic_light_flagged += 1u;
+                g_pool.light_trails.erase(mesh_key);
+              }
+            }
+          }
+        }
         if ((copy.pass & kPoolPassCamera) != 0u) {
           FollowPoolMovingInstance(mesh_key, copy.vs_hash, world, prev_world, copy.follow, copy.frame, verdict);
         }
@@ -5854,6 +5939,13 @@ inline void PrunePool(uint32_t frame) {
       g_pool.mesh_queued.erase(it->first);
       g_pool.stats.mesh_expired += 1u;
       it = g_pool.mesh_requests.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = g_pool.light_trails.begin(); it != g_pool.light_trails.end();) {
+    if (frame > it->second.frame + kPoolPruneAge) {
+      it = g_pool.light_trails.erase(it);
     } else {
       ++it;
     }
@@ -6424,7 +6516,11 @@ inline void WritePoolP2b(std::ostringstream& out, const PoolStats& stats) {
       << ", \"trace_frame\": " << stats.dynamic_trace_frame << ", \"tlas_per_frame\": " << stats.dynamic_tlas_per_frame
       << ", \"tlas_dynamic_partition\": " << stats.dynamic_tlas_partition
       << ", \"tlas_flagged_skipped\": " << stats.dynamic_tlas_p2b_skipped
-      << ", \"flagged_meshes_total\": " << stats.dynamic_flagged_total << ", \"flagged_meshes_resident\": " << stats.dynamic_flagged_resident << "},\n";
+      << ", \"flagged_meshes_total\": " << stats.dynamic_flagged_total << ", \"flagged_meshes_resident\": " << stats.dynamic_flagged_resident
+      << ", \"indirect_remaps_total\": " << stats.dynamic_indirect_remaps
+      << ", \"indirect_unlearned_light_total\": " << stats.dynamic_indirect_unlearned
+      << ", \"held_keys\": " << stats.dynamic_held_keys << ", \"held_emitted_last_present\": " << stats.dynamic_held_emitted << ", \"light_churn_flagged\": " << stats.dynamic_light_flagged
+      << "},\n";
 }
 
 inline void WritePoolDynamic(std::ostringstream& out, const std::vector<PoolDynamicDumpEntry>& entries,

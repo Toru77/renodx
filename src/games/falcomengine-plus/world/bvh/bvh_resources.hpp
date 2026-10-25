@@ -555,6 +555,8 @@ inline void DestroyDynamicExpand(reshade::api::device* device, BvhDeviceData* da
     g_pool.dynamic_present.clear();
     g_pool.dynamic_arena_used = 0u;
     g_pool.dynamic_out_used = 0u;
+    g_pool.held.clear();
+    g_pool.held_used.reset();
   }
   if (dynamic.srv_table.handle != 0u) device->free_descriptor_table(dynamic.srv_table);
   if (dynamic.uav_table.handle != 0u) device->free_descriptor_table(dynamic.uav_table);
