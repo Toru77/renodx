@@ -80,6 +80,8 @@ struct SpatialRows {
   float taps_separable_default;
   float* taps_atrous;
   float taps_atrous_default;
+  const char* enabled_key = nullptr;
+  const char* passes_key = nullptr;
 };
 // Adds the five Temporal Accumulation rows for RTAO or RTGI. A plain function: MSVC rejects (C2326) the Setting
 // aggregate initialisation inside a lambda, because Setting's default member initialisers are lambdas.
@@ -161,7 +163,7 @@ inline void AddSpatialRows(renodx::utils::settings::Settings* settings, const st
   using SettingValueType = renodx::utils::settings::SettingValueType;
   const std::string prefix = rows.prefix;
   settings->push_back(new Setting{
-      .key = prefix + "SpatialEnabled",
+      .key = rows.enabled_key ? std::string(rows.enabled_key) : prefix + "SpatialEnabled",
       .binding = rows.enabled,
       .value_type = SettingValueType::BOOLEAN,
       .default_value = rows.enabled_default,
@@ -196,7 +198,7 @@ inline void AddSpatialRows(renodx::utils::settings::Settings* settings, const st
       .is_visible = visible,
   });
   settings->push_back(new Setting{
-      .key = prefix + "FilterPasses",
+      .key = rows.passes_key ? std::string(rows.passes_key) : prefix + "FilterPasses",
       .binding = rows.filter_passes,
       .value_type = SettingValueType::INTEGER,
       .default_value = rows.filter_passes_default,

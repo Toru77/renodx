@@ -235,7 +235,9 @@ float2 GTVBAO_ScreenDirFromViewDir(float3 P, float3 D, GTAOConstants consts)
 
 void GTVBAO_OutputWorkingTerm( const uint2 pixCoord, lpfloat visibility, RWTexture2D<uint> outWorkingAOTerm )
 {
-    visibility = saturate( visibility / lpfloat(GT_VBAO_OCCLUSION_TERM_SCALE) );
+    if (GTVBAO_final_pass < 0.5f)
+        visibility = visibility / lpfloat(GT_VBAO_OCCLUSION_TERM_SCALE);
+    visibility = saturate( visibility );
     outWorkingAOTerm[pixCoord] = uint(visibility * 255.0 + 0.5);
 }
 

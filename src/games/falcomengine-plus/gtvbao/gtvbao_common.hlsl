@@ -37,6 +37,7 @@ cbuffer cb_scene : register(b0)
   float4x4 viewInv_g       : packoffset(c4);
   float4x4 proj_g          : packoffset(c8);
   float4x4 projInv_g       : packoffset(c12);
+  float4x4 viewProjInv_g   : packoffset(c20);
 };
 
 // ── User settings via push_constants (b13) ──
@@ -54,7 +55,7 @@ cbuffer cb_gtvbao : register(b13)
   // BuildGTVBAOPushConstants() in addon.cpp; the two lists must stay in lockstep.
   float GTVBAO_noise_index;              // c[07] - frame % 64
   float GTVBAO_debug_mode;               // c[08]
-  float GTVBAO_denoise_is_last_pass;     // c[09]
+  float GTVBAO_final_pass;               // c[09]
   float GTVBAO_normal_input_mode;        // c[10] - 0=depth-derived, 1=MRT g-buffer
   float GTVBAO_mrt_normal_available;     // c[11]
   float GTVBAO_normal_influence;         // c[12]
@@ -77,22 +78,33 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_foliage_ao_value;         // c[28] - [0..1] - AO value for excluded foliage
   float GTVBAO_foliage_channel_mode;     // c[29] - 0=o1.w (Sora), 1=o1.z (Kai)
   float GTVBAO_foliage_mask_valid;       // c[30] - 1 = mask pre-pass ran this frame (mask is fresh)
-  // - a-trous wavelet filter -
-  float GTVBAO_atrous_enabled;           // c[31] - 0=Off, 1=On - wavelet spatial filter
-  float GTVBAO_atrous_depth_sigma;       // c[32] - [0.05..4] relative depth edge-stop strength
-  float GTVBAO_atrous_normal_sigma;      // c[33] - [2..128] normal edge-stop power
-  float GTVBAO_atrous_step;              // c[34] - wavelet stride for this dispatch (1, 2, 4)
+  // - spatial filter -
+  float GTVBAO_filter_kind;              // c[31] - 0=Separable bilateral, 1=A-trous
+  float GTVBAO_filter_radius;            // c[32] - pixel radius
+  float GTVBAO_filter_taps;              // c[33] - taps per axis (separable) or square kernel side (a-trous)
+  float GTVBAO_filter_step;              // c[34] - a-trous stride for this dispatch (1, 2, 4)
   // - Half-resolution spatial pipeline (appended; Full path ignores these) -
   float GTVBAO_resolution;               // c[35] - 0=Full, 1=Half
   float GTVBAO_upscale_plane_sigma;      // c[36] - reconstruction plane edge-stop sigma
   float GTVBAO_upscale_normal_power;     // c[37] - reconstruction normal weight power
   float GTVBAO_upscale_debug;            // c[38] - reconstruction diagnostics mode
   float GTVBAO_hemisphere_weighting;     // c[39] - 0=Cosine, 1=Uniform
+  // - Spatial filter direction and temporal accumulation (appended) -
+  float GTVBAO_filter_direction;         // c[40] - separable pass: 0=Horizontal, 1=Vertical, 2=Both (a-trous)
+  float GTVBAO_temporal_history_weight;  // c[41] - maximum blend toward validated history
+  float GTVBAO_temporal_depth_rejection; // c[42] - relative depth difference allowed between history and current
+  float GTVBAO_temporal_normal_rejection;// c[43] - normal dot product below which history taps fade out
+  float GTVBAO_temporal_history_clamp;   // c[44] - 3x3 neighbourhood clamp, k sigma (0 = off)
+  float GTVBAO_temporal_history_valid;   // c[45] - 1 when the history may be used (reset == None)
 };
 
 // ── Half-res → full-res block-center mapping (odd-dimension safe) ──
 // halfTexel covers full block {2*h, 2*h+1}; center representative is 2*h+1,
 // clamped for odd full dims (e.g. full=5, half=3: h=2 -> min(5,4)=4).
+float GTVBAO_Divisor() {
+  return GTVBAO_resolution > 0.5f ? 2.f : 1.f;
+}
+
 int2 GTVBAO_HalfToFullCenter(int2 halfTC, int2 fullDims) {
   return min(halfTC * 2 + 1, max(fullDims - 1, int2(0, 0)));
 }
