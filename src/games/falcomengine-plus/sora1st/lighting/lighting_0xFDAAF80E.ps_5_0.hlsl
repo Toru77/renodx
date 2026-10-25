@@ -323,50 +323,14 @@ void main(
       o0.rgb = float3(ao_sample.x * hdr_scale, 0.0, 0.0);
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
-    if (mode == 2) {
-      // GTVBAO Raw: uint4.x decoded directly
-      uint width, height;
-      gtvbaoTexture.GetDimensions(width, height);
-      uint2 texel = uint2(saturate(v1.xy) * float2(width, height));
-      uint4 raw = gtvbaoTexture.Load(int3(texel, 0));
-      float raw_ao = float(raw.x) / 255.0;
-      o0.rgb = float3(raw_ao, raw_ao, raw_ao) * hdr_scale;
-      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
-    }
-    if (mode == 3) {
-      // GTVBAO Raw RGBA: uint4 channels decoded directly
-      uint width, height;
-      gtvbaoTexture.GetDimensions(width, height);
-      uint2 texel = uint2(saturate(v1.xy) * float2(width, height));
-      uint4 raw = gtvbaoTexture.Load(int3(texel, 0));
-      o0.rgba = float4(
-        float(raw.x) / 255.0,
-        float(raw.y) / 255.0,
-        float(raw.z) / 255.0,
-        float(raw.w) / 255.0
-      ) * hdr_scale;
-      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
-    }
-    if (mode == 4) {
-      // Vanilla SSAO: t5.x greyscale
-      float s = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).x;
-      o0.rgb = float3(s, s, s) * hdr_scale;
-      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
-    }
-    if (mode == 5) {
-      // Depth: t4.x greyscale
-      float d = depthTexture.SampleLevel(samLinear_s, v1.xy, 0).x;
-      o0.rgb = float3(d, d, d) * hdr_scale;
-      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
-    }
-    if (mode == 9) {
-      // FoliageMask: GTVBAO raw AO (mid-gray = foliage detected)
-      uint fw, fh;
-      gtvbaoTexture.GetDimensions(fw, fh);
-      uint2 ftexel = uint2(saturate(v1.xy) * float2(fw, fh));
-      uint4 fraw = gtvbaoTexture.Load(int3(ftexel, 0));
-      float fraw_ao = float(fraw.x) / 255.0;
-      o0.rgb = float3(fraw_ao, fraw_ao, fraw_ao) * hdr_scale;
+    if (mode >= 22 && mode <= 29) {
+      // GTVBAO compute debug views: the compute pass wrote them into the debug UAV, pushed to t23.
+      // Magenta when that push did not happen this frame.
+      if (shader_injection_data.gtvbao_mrt_normal_debug < 0.5f) {
+        o0.rgb = float3(1.0, 0.0, 1.0);
+      } else {
+        o0.rgb = vbgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb * hdr_scale;
+      }
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
   }

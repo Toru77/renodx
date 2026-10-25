@@ -4,7 +4,7 @@
 // full-res pixel min(tp * d + d / 2, full - 1), blends 2x2 bilinear history taps (depth and soft normal accept),
 // clamps to the 3x3 raw neighbourhood and blends by History Weight times the valid fraction. Reads the raw AO (t0),
 // the game depth (t1), the MRT normal (t2), the motion (t3, texel units) and the history (t4: R accumulated AO,
-// G distance, BA octahedral normal). Writes the history (u0), the output AO byte (u1) and debug views 30/31 (u2).
+// G distance, BA octahedral normal). Writes the history (u0), the output AO byte (u1) and debug view 23 (u2, valid fraction; black on non-surface pixels).
 
 #include "gtvbao_common.hlsl"
 #include "../taa/taa_reproject.hlsli"
@@ -47,6 +47,7 @@ void main(uint3 id : SV_DispatchThreadID)
   {
     g_history_write[tp] = float4(0.0, 0.0, 0.0, 0.0);
     g_ao_out[tp] = (uint)(saturate(raw * output_scale) * 255.0 + 0.5);
+    if ((int)GTVBAO_debug_mode == GTVBAO_DEBUG_TEMPORAL) GTVBAO_WriteDebug(g_debug, tp, float4(0.0, 0.0, 0.0, 1.0));
     return;
   }
 
@@ -115,17 +116,8 @@ void main(uint3 id : SV_DispatchThreadID)
   g_history_write[tp] = float4(ao, dist_cur, OctEncode(N));
   g_ao_out[tp] = (uint)(saturate(ao * output_scale) * 255.0 + 0.5);
 
-  const int debug_mode = (int)GTVBAO_debug_mode;
-  if (debug_mode == 30 || debug_mode == 31)
+  if ((int)GTVBAO_debug_mode == GTVBAO_DEBUG_TEMPORAL)
   {
-    const float v = debug_mode == 30 ? valid_fraction : ao;
-    for (uint by = 0u; by < d; ++by)
-    {
-      for (uint bx = 0u; bx < d; ++bx)
-      {
-        const uint2 block_px = tp * d + uint2(bx, by);
-        if (all(block_px < full_size)) g_debug[block_px] = float4(v, v, v, 1.0);
-      }
-    }
+    GTVBAO_WriteDebug(g_debug, tp, float4(valid_fraction, valid_fraction, valid_fraction, 1.0));
   }
 }

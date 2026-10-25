@@ -113,7 +113,7 @@ struct ShaderInjectData {
   float gtvbao_temporal_frame_count; // DEPRECATED: unused (spatial only)
   float gtvbao_disocclusion_threshold; // DEPRECATED: unused (spatial only)
   float gtvbao_noise_type;         // 0=IS-FAST, 1=IGN, 2=Hilbert — noise selection when IS-FAST on
-  float gtvbao_debug_view;          // 0=Off, 1=AO gray, 2=GI only, 3=Bitmask viz
+  float gtvbao_debug_view;          // internal GTVBAO debug mode: 0=Off, 1=AO Only, 22-26=compute views (set each frame from GTVBAODebugMode)
   float gtvbao_debug_logging;       // 0=Off, 1=On
   float gtvbao_dedicated_bound;     // 0/1 — set at runtime: t22 holds valid GTVBAO AO
   float gtvbao_fix_experimental;    // 0=Off, 1-5 — composite-side AO encoding diagnostic (sora1st/sora2nd lighting only)
@@ -433,7 +433,7 @@ struct ShaderInjectData {
   float gtvbao_resolution;                   // 0=Full (existing behavior), 1=Half (half AO/GI + full-res reconstruction)
   float gtvbao_upscale_plane_sigma;          // reconstruction plane edge-stop sigma, default 40
   float gtvbao_upscale_normal_power;         // reconstruction normal weight power, default 16
-  float gtvbao_upscale_debug;                // 0=Final, others=reconstruction diagnostics
+  float gtvbao_upscale_debug;                // RETIRED: never set by the host; the upscale diagnostics are removed
   // —— DOF IS-FAST rotated gather (appended last: do not insert above) ——
   float dof_isfast_enabled;                  // 0/1 — per-pixel rotated bokeh gather (Improved mode)
   float dof_isfast_noise_frame;              // runtime: frame_index % 64, or -1 when noise unusable

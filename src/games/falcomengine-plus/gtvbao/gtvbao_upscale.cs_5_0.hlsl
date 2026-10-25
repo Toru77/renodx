@@ -22,7 +22,6 @@ Texture2D<uint4>     g_srcFullMrt     : register(t3);
 Texture2D<float4>    g_srcFullNormal  : register(t4);
 SamplerState         g_samplerPointClamp : register(s0);
 RWTexture2D<uint>    g_outFullAO      : register(u0);
-RWTexture2D<float4>  g_outFullDebug   : register(u2);
 
 // Depth-derived full-res normal at a full texel (fallback when pre-decoded
 // normals are unavailable, e.g. no MRT capture).
@@ -86,8 +85,6 @@ void main(uint2 dt : SV_DispatchThreadID) {
   int2 hc0 = clamp(int2(floor(hpos + 0.5f)), int2(0, 0), hmax);
 
   float aoSum = 0.0f, wSum = 0.0f;
-  float dwAcc = 0.0f, nwAcc = 0.0f;
-  const bool wantDbg = GTVBAO_upscale_debug > 0.5f;
   float nearestAO = (float)g_srcHalfAO.Load(int3(hc0, 0)) * (1.0f / 255.0f);
 
   [unroll]
@@ -126,10 +123,6 @@ void main(uint2 dt : SV_DispatchThreadID) {
 
       aoSum += aoLow * w;
       wSum += w;
-      if (wantDbg) {
-        dwAcc += depthW;
-        nwAcc += normalW;
-      }
     }
   }
 
@@ -143,27 +136,4 @@ void main(uint2 dt : SV_DispatchThreadID) {
   aoOut = saturate(aoOut);
 
   g_outFullAO[dt] = (uint)(aoOut * 255.0f + 0.5f);
-
-  // ── Diagnostics ──
-  if (wantDbg) {
-    int dbg = (int)GTVBAO_upscale_debug;
-    float4 dbgOut = float4(0, 0, 0, 0);
-    if (dbg == 1 || dbg == 2) {
-      float av = pow(saturate(nearestAO), 3.0f);
-      dbgOut = float4(av, av, av, 1);
-    } else if (dbg == 3) {
-      float av = pow(saturate(aoOut), 3.0f);
-      dbgOut = float4(av, av, av, 1);
-    } else if (dbg == 4) {
-      float d = saturate(dwAcc / 4.0f);
-      dbgOut = float4(d, 0.5f * (1.0f - d), 1.0f - d, 1);
-    } else if (dbg == 5) {
-      float d = saturate(nwAcc / 4.0f);
-      dbgOut = float4(d, d, d, 1);
-    } else if (dbg == 6) {
-      float wAvg = wSum / 4.0f;
-      dbgOut = float4(wAvg, wAvg, wAvg, 1);
-    }
-    g_outFullDebug[dt] = dbgOut;
-  }
 }

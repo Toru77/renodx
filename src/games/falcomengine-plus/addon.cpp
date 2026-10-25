@@ -517,7 +517,7 @@ constexpr uint32_t kGtvbaoPushConstantsLayoutParam = 4u;   // push_constants at 
 // Must match the cbuffer declared in gtvbao_common.hlsl. Named so the builder,
 // the layout range and all nine push sites cannot drift apart -- a mismatch
 // here silently truncates the tail of the block rather than failing loudly.
-constexpr uint32_t kGtvbaoPushConstantFloats = 46;
+constexpr uint32_t kGtvbaoPushConstantFloats = 45;
 constexpr uint32_t kGtvbaoSnapshotFloats = 32;
 constexpr uint32_t kLightingMrtNormalRegister = 1u;  // t1 = mrtTexture0 (g-buffer normals)
 constexpr uint64_t kGTVBAOStartupGuardFrames = 8u;
@@ -901,6 +901,10 @@ static float g_gtvbao_filter_type = 1.f;
 static float g_gtvbao_filter_radius = 8.f;
 static float g_gtvbao_filter_taps_separable = 5.f;
 static float g_gtvbao_filter_taps_atrous = 5.f;
+static float g_gtvbao_debug_ui = 0.f;  // GTVBAODebugMode index into kGtvbaoDebugModes
+constexpr int kGtvbaoDebugModes[7] = {0, 1, 22, 23, 24, 25, 26};
+static int GtvbaoDebugMode() { return kGtvbaoDebugModes[std::clamp((int)g_gtvbao_debug_ui, 0, 6)]; }
+static bool IsGtvbaoComputeDebug(int mode) { return mode >= 22 && mode <= 29; }
 
 using GTVBAODescriptorTableSet =
     std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount>;
@@ -1015,6 +1019,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint64_t captured_depth_frame = UINT64_MAX;   // frame_index of last lighting depth capture (kept for future detectors)
   bool resources_created = false;
   uint64_t frame_index = 0u;
+  uint64_t gtvbao_debug_frame = UINT64_MAX;
+  float gtvbao_debug_mode_written = 0.f;
   uint64_t resize_guard_until_frame = 0u;
   reshade::api::command_list* immediate_cmd_list = nullptr;  // refreshed every present; scheduler ctx check
 
@@ -3391,14 +3397,6 @@ renodx::utils::settings::Settings settings = {
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOUpscaleDebug", .binding = &shader_injection.gtvbao_upscale_debug,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Upscale Debug", .section = "GTVBAO",
-      .tooltip = "Half-mode reconstruction diagnostics (replaces the scene while active).",
-      .labels = {"Final", "Raw Half AO", "Denoised Half AO", "Reconstructed AO", "Depth Weight", "Normal Weight", "Combined Weight"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
       .key = "GTVBAONoiseType", .binding = &shader_injection.gtvbao_noise_type,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Noise Type", .section = "GTVBAO",
@@ -3570,18 +3568,11 @@ renodx::utils::settings::Settings settings = {
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAODebugView", .binding = &shader_injection.gtvbao_debug_view,
+      .key = "GTVBAODebugMode", .binding = &g_gtvbao_debug_ui,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Debug View", .section = "GTVBAO",
-      .labels = {"Off", "AO Only", "GTVBAO raw .a", "GTVBAO RGBA", "Vanilla SSAO", "Depth",
-                 "6:BitmaskHeat", "7:SectorCount", "8:1stSliceBits", "9:FoliageMask",
-                 "10:Kai MRT (Kai only)", "11:Kai MRT (Kai only)", "12:Kai MRT (Kai only)", "13:Kai MRT (Kai only)",
-                 "14:Kai MRT (Kai only)", "15:Kai MRT (Kai only)", "16:Kai MRT (Kai only)", "17:Kai MRT (Kai only)",
-                 "18:Kai MRT (Kai only)", "19:Kai MRT (Kai only)", "20:Kai MRT (Kai only)", "21:Kai MRT (Kai only)",
-                 "22:Raw MRT0 xy", "23:Decoded normal + valid",
-                 "24:View normal (GTVBAO space)", "25:NdotV + source", "26:cosNorm/projLen/vis",
-                 "27:Raw slice AO", "28:Weighting loss", "29:NdotV/MRT Z/occlusion",
-                 "30:Temporal confidence (needs temporal)", "31:Temporal accumulated AO (needs temporal)"},
+      .tooltip = "Off: normal output.\nAO Only: the final AO on the lighting pass.\nRaw AO: this frame's AO before temporal and filter.\nTemporal Confidence: valid history fraction (blue when temporal does not run).\nSlice AO: mean unoccluded slice fraction (flat surface ~1.0).\nBitmask: first slice's horizon mask (R popcount, G first set bit, B last set bit).\nAO Normal: the view-space normal the AO uses.\nKyoto and Daybreak 2 do not support the compute views (Raw AO, Temporal Confidence, Slice AO, Bitmask, AO Normal).",
+      .labels = {"Off", "AO Only", "Raw AO", "Temporal Confidence", "Slice AO", "Bitmask", "AO Normal"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3993,7 +3984,7 @@ renodx::utils::settings::Settings settings = {
       .key = "CPUOptDeferredDispatch", .binding = &g_cpuopt_deferred_dispatch,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Deferred Dispatch", .section = "CPU Opt",
-      .tooltip = "Move GTVBAO/VBGI dispatch to OnPresent (1-frame latency). Kai-only, default OFF � avoids latency. Temporal Accumulation is disabled while this is On.",
+      .tooltip = "Move GTVBAO/VBGI dispatch to OnPresent (1-frame latency). Kai-only, default OFF � avoids latency. Temporal Accumulation is disabled while this is On. Debug views are one frame behind.",
       .labels = {"Off", "On"},
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -9768,6 +9759,7 @@ static void OnDrawnLightingShader(reshade::api::command_list* cmd_list) {
 
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // IMPORTANT: returning false would BYPASS the draw (skip it entirely).
+  shader_injection.gtvbao_debug_view = (float)GtvbaoDebugMode();
   shader_injection.gtvbao_dedicated_bound = 0.f;
   SyncISFASTToShaderInjection(cmd_list);  // keep IS-FAST mirrors in sync
   // Push IS-FAST noise texture for PCSS shadow jitter (t24 only � NO sampler push,
@@ -9837,6 +9829,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     shader_injection.gtvbao_mrt_normal_debug = 0.f;
   }
   shader_injection.vbgi_debug_view = 0.f;
+  // Reset every frame, including when GTVBAO is off: the lighting shader reads this to decide whether the
+  // t23 push is a diagnostic texture it should display. Leaving it set would make a later frame show a stale debug view.
+  shader_injection.gtvbao_mrt_normal_debug = 0.f;
   // Rising/falling-edge latch (runs before the early-out so it also happens when every
   // feature is off): rising edge schedules an immediate refresh cycle WITHOUT wiping
   // history (toggle off/on preserves the cache; first boot still clears via Create).
@@ -9929,44 +9924,19 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   if (gtvbao_active) {
   shader_injection.gtvbao_vbgi_bound = 0.f;
   shader_injection.gtvbao_vbgi_debug = 0.f;
-  // Reset every frame: the lighting shader reads this to decide whether the
-  // t23 push is a diagnostic texture it should display. Leaving it set would
-  // make a later frame show a stale debug view.
-  shader_injection.gtvbao_mrt_normal_debug = 0.f;
 
   // Determine what to push to t23.
   reshade::api::resource_view push_srv = {};
   bool do_push = false;
-  bool debug_replace = false;
-  // Set when the pushed texture is the GTVBAO compute pass's own debug UAV
-  // (bitmask views 6-8, MRT/horizon diagnostics 22-25). The lighting shader
-  // displays it on this flag rather than on vbgi_debug_view, which is a
-  // persistent user setting and must not be overwritten to make the push
-  // visible.
-  bool push_is_gtvbao_debug = false;
 
-  const bool half_active_dbg = shader_injection.gtvbao_resolution > 0.5f
-      && dd->upscale_ao_srv.handle;
-  // Upscale reconstruction diagnostics are lowest priority so an explicitly
-  // requested VBGI/GTVBAO debug view is never silently overridden.
-  // Sora/Kyoto replace via gtvbao_vbgi_debug; Kai/Daybreak2 via the widened
-  // vbgi_debug_view || gtvbao_upscale_debug checks in their lighting shaders.
-  const bool upscale_dbg_active = half_active_dbg
-      && shader_injection.gtvbao_upscale_debug > 0.5f
-      && dd->debug_srv.handle;
-  // Bitmask debug views 6-8, and MRT/horizon diagnostics 22-29: push the
-  // dedicated debug UAV output to the lighting shader's VBGI debug slot.
-  if ((shader_injection.gtvbao_debug_view > 5.5f && shader_injection.gtvbao_debug_view < 8.5f)
-        || (shader_injection.gtvbao_debug_view > 21.5f && shader_injection.gtvbao_debug_view < 31.5f)) {
+  // Compute debug views 22-29: push the GTVBAO debug UAV output to the lighting shader's t23 slot.
+  const uint64_t max_age = (g_cpuopt_deferred_dispatch > 0.5f) ? 1u : 0u;
+  if (IsGtvbaoComputeDebug(GtvbaoDebugMode())
+      && dd->gtvbao_debug_frame != UINT64_MAX
+      && (dd->frame_index - dd->gtvbao_debug_frame) <= max_age
+      && dd->gtvbao_debug_mode_written == (float)GtvbaoDebugMode()) {
     push_srv = dd->debug_srv;
     do_push = true;
-    debug_replace = true;
-    push_is_gtvbao_debug = true;
-  }
-  else if (upscale_dbg_active) {
-    push_srv = dd->debug_srv;
-    do_push = true;
-    debug_replace = true;
   }
 
   if (do_push) {
@@ -9982,9 +9952,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               reshade::api::descriptor_type::texture_shader_resource_view,
               &push_srv,
           });
-      shader_injection.gtvbao_vbgi_bound = 1.f;
-      if (debug_replace) shader_injection.gtvbao_vbgi_debug = 1.f;
-      if (push_is_gtvbao_debug) shader_injection.gtvbao_mrt_normal_debug = 1.f;
+      shader_injection.gtvbao_mrt_normal_debug = 1.f;
     }
   }
   }  // gtvbao_active (t23 section)
@@ -12303,8 +12271,8 @@ struct GtvbaoPassPush {
 
 // Push indices that make up the temporal reset snapshot (settings that shape the AO; not debug, filter or per-frame values).
 constexpr uint32_t kGtvbaoSnapshotIndex[kGtvbaoSnapshotFloats] = {
-    0, 35, 1, 2, 3, 4, 5, 6, 26, 39, 25, 19, 20, 21, 22, 23, 24, 27, 28,
-    10, 11, 12, 13, 14, 15, 16, 17, 18, 41, 42, 43, 44};
+    0, 35, 1, 2, 3, 4, 5, 6, 26, 38, 25, 19, 20, 21, 22, 23, 24, 27, 28,
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 40, 41, 42, 43};
 
 static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(DeviceData* data, const GtvbaoPassPush& pass = {}) {
   std::array<float, kGtvbaoPushConstantFloats> c = {};
@@ -12316,7 +12284,7 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   c[5]  = std::clamp(shader_injection.gtvbao_bitmask_thickness, 0.01f, 2.f);
   c[6]  = std::clamp(shader_injection.gtvbao_depth_mip_offset, 0.f, 30.f);
   c[7]  = (float)((data ? data->frame_index : 0u) % 64u);
-  c[8]  = shader_injection.gtvbao_debug_view;
+  c[8]  = (float)GtvbaoDebugMode();
   c[9]  = pass.final_pass ? 1.f : 0.f;
   // Normal input: use game MRT normals when available, depth fallback otherwise.
   c[10] = g_gtvbao_normal_input_mode;
@@ -12352,14 +12320,13 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   c[35] = shader_injection.gtvbao_resolution > 0.5f ? 1.f : 0.f;
   c[36] = std::clamp(shader_injection.gtvbao_upscale_plane_sigma, 1.f, 400.f);
   c[37] = std::clamp(shader_injection.gtvbao_upscale_normal_power, 1.f, 64.f);
-  c[38] = shader_injection.gtvbao_upscale_debug;
-  c[39] = g_gtvbao_hemisphere_weighting;       // hemisphere weighting 0=Cosine, 1=Uniform
-  c[40] = (float)pass.filter_direction;
-  c[41] = g_gtvbao_history_weight;
-  c[42] = g_gtvbao_depth_rejection;
-  c[43] = g_gtvbao_normal_rejection;
-  c[44] = g_gtvbao_history_clamp;
-  c[45] = pass.history_valid ? 1.f : 0.f;
+  c[38] = g_gtvbao_hemisphere_weighting;       // hemisphere weighting 0=Cosine, 1=Uniform
+  c[39] = (float)pass.filter_direction;
+  c[40] = g_gtvbao_history_weight;
+  c[41] = g_gtvbao_depth_rejection;
+  c[42] = g_gtvbao_normal_rejection;
+  c[43] = g_gtvbao_history_clamp;
+  c[44] = pass.history_valid ? 1.f : 0.f;
   return c;
 }
 
@@ -12802,7 +12769,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     // The debug UAV is only read while a debug view is active; bind the
     // fallback otherwise so nothing can sample stale debug output.
-    const bool gtvbao_debug_active = shader_injection.gtvbao_debug_view > 0.5f;
+    const bool gtvbao_debug_active = IsGtvbaoComputeDebug(GtvbaoDebugMode());
     // Shader register order: u0=AO, u1=debug
     reshade::api::resource_view main_uavs[2] = {
         d->ao_term_a_uav,
@@ -12820,13 +12787,14 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   }
   cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
   bar(d->ao_term_a_texture, UA, SR);
+  if (IsGtvbaoComputeDebug(GtvbaoDebugMode())) {
+    d->gtvbao_debug_frame = d->frame_index;
+    d->gtvbao_debug_mode_written = (float)GtvbaoDebugMode();
+  }
   // Skip barriers for UAVs nothing reads. debug_texture is only read by the
   // gtvbao debug views (see t23 pushes).
   {
-    const bool dbgRead = (shader_injection.gtvbao_debug_view > 5.5f
-            && shader_injection.gtvbao_debug_view < 8.5f)
-        || (shader_injection.gtvbao_debug_view > 21.5f
-            && shader_injection.gtvbao_debug_view < 31.5f);
+    const bool dbgRead = IsGtvbaoComputeDebug(GtvbaoDebugMode()) && !(GtvbaoDebugMode() == 23 && temporal_run);
     if (dbgRead)
       bar(d->debug_texture, UA, SR);         // Debug output ready for read
   }
@@ -12839,8 +12807,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     if (temporal_run) {
       const uint32_t read_i = d->temporal_history_index & 1u;
       const uint32_t write_i = read_i ^ 1u;
-      const int debug_view = (int)shader_injection.gtvbao_debug_view;
-      const bool temporal_dbg = debug_view == 30 || debug_view == 31;
+      const bool temporal_dbg = GtvbaoDebugMode() == 23;
       bind_pipe(d->temporal_pipeline);
       reshade::api::resource_view t_srvs[5] = {
           d->ao_term_a_srv, d->captured_depth_srv, d->captured_mrt_normal_srv,
@@ -12911,14 +12878,10 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
           d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv    // t3 full MRT
               : d->fallback_srv,
           d->normal_prep_srv.handle ? d->normal_prep_srv : d->fallback_srv}; // t4 full normals
-      // Debug UAV only when upscale diagnostics are requested; otherwise the
-      // main-pass bitmask/sample-activity debug output survives untouched.
-      const bool upscale_dbg_out = shader_injection.gtvbao_upscale_debug > 0.5f
-          && d->debug_uav.handle;
       reshade::api::resource_view up_uavs[3] = {
           d->upscale_ao_uav,
           d->fallback_uav,
-          upscale_dbg_out ? d->debug_uav : d->fallback_uav};
+          d->fallback_uav};
       reshade::api::descriptor_table_update uu[4] = {
         {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
         {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
@@ -12930,8 +12893,6 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       cl->push_constants(CS, d->upscale_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_u.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->upscale_ao_texture, UA, SR);
-      if (upscale_dbg_out)
-        bar(d->debug_texture, UA, SR);  // upscale diagnostics -> t23 read
     }
   }
   if (shader_injection.gtvbao_debug_logging > 0.5f)

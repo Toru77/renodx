@@ -87,15 +87,14 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_resolution;               // c[35] - 0=Full, 1=Half
   float GTVBAO_upscale_plane_sigma;      // c[36] - reconstruction plane edge-stop sigma
   float GTVBAO_upscale_normal_power;     // c[37] - reconstruction normal weight power
-  float GTVBAO_upscale_debug;            // c[38] - reconstruction diagnostics mode
-  float GTVBAO_hemisphere_weighting;     // c[39] - 0=Cosine, 1=Uniform
+  float GTVBAO_hemisphere_weighting;     // c[38] - 0=Cosine, 1=Uniform
   // - Spatial filter direction and temporal accumulation (appended) -
-  float GTVBAO_filter_direction;         // c[40] - separable pass: 0=Horizontal, 1=Vertical, 2=Both (a-trous)
-  float GTVBAO_temporal_history_weight;  // c[41] - maximum blend toward validated history
-  float GTVBAO_temporal_depth_rejection; // c[42] - relative depth difference allowed between history and current
-  float GTVBAO_temporal_normal_rejection;// c[43] - normal dot product below which history taps fade out
-  float GTVBAO_temporal_history_clamp;   // c[44] - 3x3 neighbourhood clamp, k sigma (0 = off)
-  float GTVBAO_temporal_history_valid;   // c[45] - 1 when the history may be used (reset == None)
+  float GTVBAO_filter_direction;         // c[39] - separable pass: 0=Horizontal, 1=Vertical, 2=Both (a-trous)
+  float GTVBAO_temporal_history_weight;  // c[40] - maximum blend toward validated history
+  float GTVBAO_temporal_depth_rejection; // c[41] - relative depth difference allowed between history and current
+  float GTVBAO_temporal_normal_rejection;// c[42] - normal dot product below which history taps fade out
+  float GTVBAO_temporal_history_clamp;   // c[43] - 3x3 neighbourhood clamp, k sigma (0 = off)
+  float GTVBAO_temporal_history_valid;   // c[44] - 1 when the history may be used (reset == None)
 };
 
 // ── Half-res → full-res block-center mapping (odd-dimension safe) ──
@@ -103,6 +102,27 @@ cbuffer cb_gtvbao : register(b13)
 // clamped for odd full dims (e.g. full=5, half=3: h=2 -> min(5,4)=4).
 float GTVBAO_Divisor() {
   return GTVBAO_resolution > 0.5f ? 2.f : 1.f;
+}
+
+// Debug view modes (GTVBAO_debug_mode). 27 is reserved.
+#define GTVBAO_DEBUG_RAW_AO 22
+#define GTVBAO_DEBUG_TEMPORAL 23
+#define GTVBAO_DEBUG_SLICE_AO 24
+#define GTVBAO_DEBUG_BITMASK 25
+#define GTVBAO_DEBUG_NORMAL 26
+
+// Writes a debug value into every full-res texel of the d x d block that AO pixel pixCoord covers.
+void GTVBAO_WriteDebug(RWTexture2D<float4> outDebug, uint2 pixCoord, float4 value) {
+  uint dw, dh;
+  outDebug.GetDimensions(dw, dh);
+  const uint d = (uint)GTVBAO_Divisor();
+  const uint2 base = pixCoord * d;
+  for (uint by = 0; by < d; ++by) {
+    for (uint bx = 0; bx < d; ++bx) {
+      const uint2 tc = base + uint2(bx, by);
+      if (tc.x < dw && tc.y < dh) outDebug[tc] = value;
+    }
+  }
 }
 
 int2 GTVBAO_HalfToFullCenter(int2 halfTC, int2 fullDims) {

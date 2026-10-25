@@ -461,7 +461,7 @@ void main(
       o1 = r1;
       return;
     }
-    if (is_character_pixel) {
+    if (is_character_pixel && !(GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 29u)) {
       o0 = float4(0.0, 0.0, 0.0, 1.0);
       o1 = r1;
       return;
@@ -587,6 +587,12 @@ void main(
           is_foliage_pixel_t1_broad ? 1.0 : 0.0,
           is_foliage_pixel_t1_sss ? 1.0 : 0.0,
           t10_debug);
+    } else if (GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 29u) {
+      if (shader_injection_data.gtvbao_mrt_normal_debug < 0.5) {
+        debug_color = float3(1.0, 0.0, 1.0);
+      } else {
+        debug_color = gtvbaoVBGITexture.SampleLevel(samLinear_s, v1.zw, 0).xyz;
+      }
     }
 
     o0 = float4(debug_color, 1.0);
