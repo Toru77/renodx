@@ -134,18 +134,6 @@ lpfloat4 GTVBAO_CalculateEdges( const lpfloat centerZ, const lpfloat leftZ, cons
     return lpfloat4(saturate( ( 1.25 - edgesLRTB / (centerZ * 0.011) ) ));
 }
 
-// packing/unpacking for edges; 2 bits per edge mean 4 gradient values (0, 0.33, 0.66, 1) for smoother transitions!
-lpfloat GTVBAO_PackEdges( lpfloat4 edgesLRTB )
-{
-    // integer version:
-    // edgesLRTB = saturate(edgesLRTB) * 2.9.xxxx + 0.5.xxxx;
-    // return (((uint)edgesLRTB.x) << 6) + (((uint)edgesLRTB.y) << 4) + (((uint)edgesLRTB.z) << 2) + (((uint)edgesLRTB.w));
-    // 
-    // optimized, should be same as above
-    edgesLRTB = round( saturate( edgesLRTB ) * 2.9 );
-    return dot( edgesLRTB, lpfloat4( 64.0 / 255.0, 16.0 / 255.0, 4.0 / 255.0, 1.0 / 255.0 ) ) ;
-}
-
 float3 GTVBAO_CalculateNormal( const float4 edgesLRTB, float3 pixCenterPos, float3 pixLPos, float3 pixRPos, float3 pixTPos, float3 pixBPos )
 {
     // Get this pixel's viewspace normal
@@ -359,7 +347,7 @@ lpfloat3x3 GTVBAO_RotFromToMatrix( lpfloat3 from, lpfloat3 to )
 }
 
 void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPerSlice, const lpfloat2 localNoise, lpfloat3 viewspaceNormal, const GTAOConstants consts, 
-    Texture2D<lpfloat> sourceViewspaceDepth, SamplerState depthSampler, RWTexture2D<uint> outWorkingAOTerm, RWTexture2D<float> outWorkingEdges,
+    Texture2D<lpfloat> sourceViewspaceDepth, SamplerState depthSampler, RWTexture2D<uint> outWorkingAOTerm,
     Texture2D<uint4> mrtNormalTexture,
     Texture2D<uint> foliageMaskTexture,
     RWTexture2D<float4> outDebug
@@ -410,12 +398,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         foliageMaskTexture.GetDimensions(g_maskW, g_maskH);
 
     lpfloat4 edgesLRTB  = GTVBAO_CalculateEdges( (lpfloat)viewspaceZ, (lpfloat)pixLZ, (lpfloat)pixRZ, (lpfloat)pixTZ, (lpfloat)pixBZ );
-    // The à-trous chain never reads the edge texture (it edge-stops on depth
-    // and pre-decoded normals), so the pack + full-res write are only needed
-    // for the spatial bilateral chain.
-    if (GTVBAO_atrous_enabled < 0.5f)
-        outWorkingEdges[pixCoord] = GTVBAO_PackEdges(edgesLRTB);
-
     // ── Foliage detection (toggle on, or debug mode 9 always checks) ──
     // Foliage PS sets o1.w bit 15 (0x8000) to mark the pixel.
     // When detected: normal AO is fully computed, then blended toward
@@ -1213,152 +1195,6 @@ void GTVBAO_PrefilterDepths16x16( uint2 dispatchThreadID /*: SV_DispatchThreadID
     }
 }
 
-lpfloat4 GTVBAO_UnpackEdges( lpfloat _packedVal )
-{
-    uint packedVal = (uint)(_packedVal * 255.5);
-    lpfloat4 edgesLRTB;
-    edgesLRTB.x = lpfloat((packedVal >> 6) & 0x03) / 3.0;          // there's really no need for mask (as it's an 8 bit input) but I'll leave it in so it doesn't cause any trouble in the future
-    edgesLRTB.y = lpfloat((packedVal >> 4) & 0x03) / 3.0;
-    edgesLRTB.z = lpfloat((packedVal >> 2) & 0x03) / 3.0;
-    edgesLRTB.w = lpfloat((packedVal >> 0) & 0x03) / 3.0;
-
-    return saturate( edgesLRTB );
-}
-
-#ifdef GT_VBAO_COMPUTE_BENT_NORMALS
-typedef lpfloat4 AOTermType;            // .xyz is bent normal, .w is visibility term
-#else
-typedef lpfloat AOTermType;             // .x is visibility term
-#endif
-
-void GTVBAO_AddSample( AOTermType ssaoValue, lpfloat edgeValue, inout AOTermType sum, inout lpfloat sumWeight )
-{
-    lpfloat weight = edgeValue;    
-
-    sum += (weight * ssaoValue);
-    sumWeight += weight;
-}
-
-void GTVBAO_Output( uint2 pixCoord, RWTexture2D<uint> outputTexture, AOTermType outputValue, const uniform bool finalApply )
-{
-#ifdef GT_VBAO_COMPUTE_BENT_NORMALS
-    lpfloat     visibility = outputValue.w * ((finalApply)?((lpfloat)GT_VBAO_OCCLUSION_TERM_SCALE):(1));
-    lpfloat3    bentNormal = normalize(outputValue.xyz);
-    outputTexture[pixCoord.xy] = GTVBAO_EncodeVisibilityBentNormal( visibility, bentNormal );
-#else
-    // Multiply back OCCLUSION_TERM_SCALE on final output to undo the
-    // pre-denoise division in GTVBAO_OutputWorkingTerm (same as bent-normal path).
-    lpfloat vis = outputValue;
-    if (finalApply) vis = saturate(vis * (lpfloat)GT_VBAO_OCCLUSION_TERM_SCALE);
-    outputTexture[pixCoord.xy] = uint(vis * 255.0 + 0.5);
-#endif
-}
-
-void GTVBAO_DecodeGatherPartial( const uint4 packedValue, out AOTermType outDecoded[4] )
-{
-    for( int i = 0; i < 4; i++ )
-#ifdef GT_VBAO_COMPUTE_BENT_NORMALS
-        GTVBAO_DecodeVisibilityBentNormal( packedValue[i], outDecoded[i].w, outDecoded[i].xyz );
-#else
-        outDecoded[i] = lpfloat(packedValue[i]) / lpfloat(255.0);
-#endif
-}
-
-void GTVBAO_Denoise( const uint2 pixCoordBase, const GTAOConstants consts, Texture2D<uint> sourceAOTerm, Texture2D<lpfloat> sourceEdges, SamplerState texSampler, RWTexture2D<uint> outputTexture, const uniform bool finalApply )
-{
-    const lpfloat blurAmount = (finalApply)?((lpfloat)consts.DenoiseBlurBeta):((lpfloat)consts.DenoiseBlurBeta/(lpfloat)5.0);
-    const lpfloat diagWeight = 0.85 * 0.5;
-
-    AOTermType aoTerm[2];   // pixel pixCoordBase and pixel pixCoordBase + int2( 1, 0 )
-    lpfloat4 edgesC_LRTB[2];
-    lpfloat weightTL[2];
-    lpfloat weightTR[2];
-    lpfloat weightBL[2];
-    lpfloat weightBR[2];
-
-    // gather edge and visibility quads, used later
-    const float2 gatherCenter = float2( pixCoordBase.x, pixCoordBase.y ) * consts.ViewportPixelSize;
-    lpfloat4 edgesQ0        = sourceEdges.GatherRed( texSampler, gatherCenter, int2( 0, 0 ) );
-    lpfloat4 edgesQ1        = sourceEdges.GatherRed( texSampler, gatherCenter, int2( 2, 0 ) );
-    lpfloat4 edgesQ2        = sourceEdges.GatherRed( texSampler, gatherCenter, int2( 1, 2 ) );
-
-    AOTermType visQ0[4];    GTVBAO_DecodeGatherPartial( sourceAOTerm.GatherRed( texSampler, gatherCenter, int2( 0, 0 ) ), visQ0 );
-    AOTermType visQ1[4];    GTVBAO_DecodeGatherPartial( sourceAOTerm.GatherRed( texSampler, gatherCenter, int2( 2, 0 ) ), visQ1 );
-    AOTermType visQ2[4];    GTVBAO_DecodeGatherPartial( sourceAOTerm.GatherRed( texSampler, gatherCenter, int2( 0, 2 ) ), visQ2 );
-    AOTermType visQ3[4];    GTVBAO_DecodeGatherPartial( sourceAOTerm.GatherRed( texSampler, gatherCenter, int2( 2, 2 ) ), visQ3 );
-
-    for( int side = 0; side < 2; side++ )
-    {
-        const int2 pixCoord = int2( pixCoordBase.x + side, pixCoordBase.y );
-
-        lpfloat4 edgesL_LRTB  = GTVBAO_UnpackEdges( (side==0)?(edgesQ0.x):(edgesQ0.y) );
-        lpfloat4 edgesT_LRTB  = GTVBAO_UnpackEdges( (side==0)?(edgesQ0.z):(edgesQ1.w) );
-        lpfloat4 edgesR_LRTB  = GTVBAO_UnpackEdges( (side==0)?(edgesQ1.x):(edgesQ1.y) );
-        lpfloat4 edgesB_LRTB  = GTVBAO_UnpackEdges( (side==0)?(edgesQ2.w):(edgesQ2.z) );
-
-        edgesC_LRTB[side]     = GTVBAO_UnpackEdges( (side==0)?(edgesQ0.y):(edgesQ1.x) );
-
-        // Edges aren't perfectly symmetrical: edge detection algorithm does not guarantee that a left edge on the right pixel will match the right edge on the left pixel (although
-        // they will match in majority of cases). This line further enforces the symmetricity, creating a slightly sharper blur. Works real nice with TAA.
-        edgesC_LRTB[side] *= lpfloat4( edgesL_LRTB.y, edgesR_LRTB.x, edgesT_LRTB.w, edgesB_LRTB.z );
-
-#if 1   // this allows some small amount of AO leaking from neighbours if there are 3 or 4 edges; this reduces both spatial and temporal aliasing
-        const lpfloat leak_threshold = (lpfloat)GTVBAO_denoise_leak_threshold; const lpfloat leak_strength = (lpfloat)GTVBAO_denoise_leak_strength;
-        lpfloat edginess = (saturate(4.0 - leak_threshold - dot( edgesC_LRTB[side], lpfloat4( 1.0, 1.0, 1.0, 1.0 ) )) / (4-leak_threshold)) * leak_strength;
-        edgesC_LRTB[side] = saturate( edgesC_LRTB[side] + edginess );
-#endif
-
-#ifdef GT_VBAO_SHOW_EDGES
-        g_outputDbgImage[pixCoord] = 1.0 - lpfloat4( edgesC_LRTB[side].x, edgesC_LRTB[side].y * 0.5 + edgesC_LRTB[side].w * 0.5, edgesC_LRTB[side].z, 1.0 );
-        //g_outputDbgImage[pixCoord] = 1 - float4( edgesC_LRTB[side].z, edgesC_LRTB[side].w , 1, 0 );
-        //g_outputDbgImage[pixCoord] = edginess.xxxx;
-#endif
-
-        // for diagonals; used by first and second pass
-        weightTL[side] = diagWeight * (edgesC_LRTB[side].x * edgesL_LRTB.z + edgesC_LRTB[side].z * edgesT_LRTB.x);
-        weightTR[side] = diagWeight * (edgesC_LRTB[side].z * edgesT_LRTB.y + edgesC_LRTB[side].y * edgesR_LRTB.z);
-        weightBL[side] = diagWeight * (edgesC_LRTB[side].w * edgesB_LRTB.x + edgesC_LRTB[side].x * edgesL_LRTB.w);
-        weightBR[side] = diagWeight * (edgesC_LRTB[side].y * edgesR_LRTB.w + edgesC_LRTB[side].w * edgesB_LRTB.y);
-
-        // first pass
-        AOTermType ssaoValue     = (side==0)?(visQ0[1]):(visQ1[0]);
-        AOTermType ssaoValueL    = (side==0)?(visQ0[0]):(visQ0[1]);
-        AOTermType ssaoValueT    = (side==0)?(visQ0[2]):(visQ1[3]);
-        AOTermType ssaoValueR    = (side==0)?(visQ1[0]):(visQ1[1]);
-        AOTermType ssaoValueB    = (side==0)?(visQ2[2]):(visQ3[3]);
-        AOTermType ssaoValueTL   = (side==0)?(visQ0[3]):(visQ0[2]);
-        AOTermType ssaoValueBR   = (side==0)?(visQ3[3]):(visQ3[2]);
-        AOTermType ssaoValueTR   = (side==0)?(visQ1[3]):(visQ1[2]);
-        AOTermType ssaoValueBL   = (side==0)?(visQ2[3]):(visQ2[2]);
-
-        lpfloat sumWeight = blurAmount;
-        AOTermType sum = ssaoValue * sumWeight;
-
-        GTVBAO_AddSample( ssaoValueL, edgesC_LRTB[side].x, sum, sumWeight );
-        GTVBAO_AddSample( ssaoValueR, edgesC_LRTB[side].y, sum, sumWeight );
-        GTVBAO_AddSample( ssaoValueT, edgesC_LRTB[side].z, sum, sumWeight );
-        GTVBAO_AddSample( ssaoValueB, edgesC_LRTB[side].w, sum, sumWeight );
-
-        GTVBAO_AddSample( ssaoValueTL, weightTL[side], sum, sumWeight );
-        GTVBAO_AddSample( ssaoValueTR, weightTR[side], sum, sumWeight );
-        GTVBAO_AddSample( ssaoValueBL, weightBL[side], sum, sumWeight );
-        GTVBAO_AddSample( ssaoValueBR, weightBR[side], sum, sumWeight );
-
-        aoTerm[side] = sum / sumWeight;
-
-        GTVBAO_Output( pixCoord, outputTexture, aoTerm[side], finalApply );
-
-#ifdef GT_VBAO_SHOW_BENT_NORMALS
-        if( finalApply )
-        {
-            g_outputDbgImage[pixCoord] = float4( DisplayNormalSRGB( aoTerm[side].xyz /** aoTerm[side].www*/ ), 1 );
-        }
-#endif
-
-    }
-}
-
-// ── Poisson denoisers removed (spatial-only): GTVBAO_DenoiseAO_Poisson, GTVBAO_DenoiseGI_Poisson, GTVBAO_Denoise_Poisson, GTVBAO_PoissonSample/Rotation, GTVBAO_ComputeNormalFromDepth deleted. ──
 
 // Generic viewspace normal generate pass
 float3 GTVBAO_ComputeViewspaceNormal( const uint2 pixCoord, const GTAOConstants consts, Texture2D<float> sourceNDCDepth, SamplerState depthSampler )

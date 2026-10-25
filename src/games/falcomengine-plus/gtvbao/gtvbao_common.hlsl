@@ -51,13 +51,6 @@ cbuffer cb_scene : register(b0)
   float4x4 viewInv_g       : packoffset(c4);
   float4x4 proj_g          : packoffset(c8);
   float4x4 projInv_g       : packoffset(c12);
-#ifdef RENODX_KAI
-  float4x4 prevViewProj_g  : packoffset(c85);   // Kai: prevViewProj_g at c85
-#elif defined(RENODX_SORA2ND)
-  float4x4 prevViewProj_g  : packoffset(c75);   // Sora 2nd: prevViewProj_g at c75
-#else
-  float4x4 prevViewProj_g  : packoffset(c74);   // Sora 1st: prevViewProj_g at c74
-#endif
 };
 
 // ── User settings via push_constants (b13) ──
@@ -110,9 +103,9 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_isfast_spatial_scale;    // c[39] - IS-FAST spatial scale [0.25..4]
   float GTVBAO_isfast_temporal_speed;   // c[40] - IS-FAST temporal speed [0..5]
   float GTVBAO_isfast_seed;             // c[41] - IS-FAST seed offset [0..64]
-  // - Denoiser -
-  float GTVBAO_denoise_leak_threshold;  // c[42] - edge leak threshold [1..4], default 2.5
-  float GTVBAO_denoise_leak_strength;   // c[43] - edge leak strength [0..1], default 0.5
+  // - Denoiser (unused, removed in M3) -
+  float GTVBAO_denoise_leak_threshold;  // c[42] - unused, removed in M3
+  float GTVBAO_denoise_leak_strength;   // c[43] - unused, removed in M3
   float GTVBAO_temporal_blend;          // c[44] - always 0 (spatial only)
   float GTVBAO_disocclusion_threshold;  // c[45] - unused (spatial only)
   float GTVBAO_noise_type;              // c[46] - 0=IS-FAST, 1=IGN, 2=Hilbert
@@ -127,7 +120,7 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_foliage_ao_value;        // c[53] - [0..1] - AO value for excluded foliage
   float GTVBAO_foliage_channel_mode;    // c[54] - 0=o1.w (Sora), 1=o1.z (Kai)
   float GTVBAO_foliage_mask_valid;      // c[55] - 1 = mask pre-pass ran this frame (mask is fresh)
-  float GTVBAO_denoise_stage;           // c[56] - denoise_last dispatch mode: 0=spatial combined, 2=spatial-final-no-temporal, 4=GI-only tail
+  float GTVBAO_denoise_stage;           // c[56] - unused, removed in M3
   // - a-trous wavelet filter -
   float GTVBAO_atrous_enabled;          // c[57] - 0=Off, 1=On - wavelet spatial filter
   float GTVBAO_atrous_depth_sigma;      // c[58] - [0.05..4] relative depth edge-stop strength

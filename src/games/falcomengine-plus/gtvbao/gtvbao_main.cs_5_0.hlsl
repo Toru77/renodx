@@ -11,13 +11,12 @@ Texture2D<lpfloat>     g_srcWorkingDepth   : register(t0);
 Texture2D<uint4>       g_srcMrtNormal      : register(t1);
 SamplerState           g_samplerPointClamp : register(s0);
 
-// ── IS-FAST noise (t3 = 3D noise texture / unused when off) ──
-Texture3D<float2>      g_isfastNoiseTexture : register(t3);
-Texture2D<uint>        g_srcFoliageMask    : register(t4);
+// ── IS-FAST noise (t2 = 3D noise texture / unused when off) ──
+Texture3D<float2>      g_isfastNoiseTexture : register(t2);
+Texture2D<uint>        g_srcFoliageMask    : register(t3);
 
 RWTexture2D<uint>          g_outWorkingAOTerm : register(u0);
-RWTexture2D<float>         g_outWorkingEdges  : register(u1);
-RWTexture2D<float4>        g_outDebug         : register(u3);
+RWTexture2D<float4>        g_outDebug         : register(u1);
 
 // ── Interleaved Gradient Noise (IGN) — IS-FAST fallback ──
 static float IGN(float2 p) {
@@ -270,7 +269,7 @@ void main(uint2 p : SV_DispatchThreadID)
 
   GTVBAO_MainPass(p, slice_count, steps_per_slice, n, normal,
       consts, g_srcWorkingDepth, g_samplerPointClamp,
-      g_outWorkingAOTerm, g_outWorkingEdges,
+      g_outWorkingAOTerm,
       g_srcMrtNormal,
       g_srcFoliageMask,
       g_outDebug);

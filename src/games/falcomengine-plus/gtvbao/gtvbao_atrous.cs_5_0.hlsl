@@ -1,8 +1,9 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // falcomengine-plus GTVBAO — À-trous wavelet spatial filter (R3 + perf pass)
 //
-// SVGF-lite: edge-preserving wavelet blur with doubling stride. Replaces the
-// XeGTAO bilateral chain when GTVBAO_atrous_enabled is on. Each dispatch is one
+// SVGF-lite: edge-preserving wavelet blur with doubling stride. This is the only spatial filter until the Spatial Filter
+// work replaces it. With GTVBAO_atrous_enabled Off, the filter runs one pass-through
+// dispatch. Each dispatch is one
 // iteration; the addon runs 1 to 3 iterations with strides 1, 2, 4, so this shader
 // needs no pass-count uniform -- the host just issues fewer dispatches.
 //
@@ -35,6 +36,13 @@ void main(uint2 dt : SV_DispatchThreadID)
   uint width, height;
   g_srcAtrousAO.GetDimensions(width, height);
   if (dt.x >= width || dt.y >= height) return;
+
+  if (GTVBAO_atrous_enabled < 0.5f)
+  {
+    float v = saturate((float)g_srcAtrousAO.Load(int3(dt, 0)) * (1.0f / 255.0f) * GT_VBAO_OCCLUSION_TERM_SCALE);
+    g_outAtrousAO[dt] = (uint)(v * 255.0f + 0.5f);
+    return;
+  }
 
   uint nw, nh;
   g_srcAtrousNormal.GetDimensions(nw, nh);
