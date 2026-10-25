@@ -250,7 +250,7 @@ inline std::string BuildRtSunJson(const RtSunJsonInput& in) {
       << ", \"trace_characters\": " << g_rtsun_trace_characters << ", \"samples\": " << g_rtsun_samples
       << ", \"max_ray_m\": " << g_rtsun_ray_max << ", \"light_size_deg\": " << g_rtsun_light_size
       << ", \"normal_bias_m\": " << g_rtsun_normal_bias << ", \"isfast\": " << g_rtsun_isfast
-      << ", \"trace_resolution\": " << g_rtsun_trace_resolution << "},\n";
+      << ", \"trace_resolution\": " << g_rtsun_trace_resolution << ", \"foliage_intensity\": " << g_rtsun_foliage_intensity << "},\n";
   out << "  \"stats\": {\"unit\": \"per trace pixel\", \"pixels\": " << v[kRtSunStatPixels] << ", \"traced\": " << v[kRtSunStatTraced]
       << ", \"sky\": " << v[kRtSunStatSky] << ", \"normal\": " << v[kRtSunStatNormal]
       << ", \"region\": " << v[kRtSunStatRegion] << ", \"beyond_range\": " << v[kRtSunStatBeyondRange]
@@ -261,6 +261,7 @@ inline std::string BuildRtSunJson(const RtSunJsonInput& in) {
       << ", \"invalid_refs\": " << v[kRtSunStatInvalidRefs] << ", \"stack_overflow\": " << v[kRtSunStatStackOverflow]
       << ", \"temporal_pixels\": " << v[rtgi::kRtgiStatTemporalPixels] << ", \"temporal_no_history\": " << v[rtgi::kRtgiStatNoHistory]
       << ", \"temporal_reset_pixels\": " << v[rtgi::kRtgiStatResetPixels]
+      << ", \"foliage_first_hits\": " << v[kRtSunStatFoliageFirstHits] << ", \"foliage_opaque_behind\": " << v[kRtSunStatFoliageOpaqueBehind]
       << "},\n";
   float gpu_scaling[2] = {};
   std::memcpy(gpu_scaling, &v[kRtSunStatGateScalingX], sizeof(gpu_scaling));

@@ -22,6 +22,7 @@ inline float g_rtsun_receive_characters = 1.f;      // Receive on characters: ch
 inline float g_rtsun_character_normal_bias = 0.02f; // Character Normal Bias (m): origin offset of character pixels (R4)
 inline float g_rtsun_character_intensity = 1.f;    // Character Intensity [0..1]: scales the character RT term; not in the snapshot (R4)
 inline float g_rtsun_character_max_darkening = 1.f; // Character Max Darkening [0..1]: hard cap on the character RT darkening (min form); not in the snapshot
+inline float g_rtsun_foliage_intensity = 1.f; // Foliage Shadow Intensity [0..1]: sun light that cutout foliage blocks (1 = full shadow); in the snapshot
 inline float g_rtsun_samples = 1.f;           // Samples per pixel
 inline float g_rtsun_ray_max = 100.f;         // Max Ray Distance (m)
 inline float g_rtsun_light_size = 0.53f;      // Light Size (degrees)
@@ -67,7 +68,7 @@ inline constexpr uint32_t kRtSunFlagReceive = 2u;
 struct ParameterSnapshot {
   float cascade_range, samples, ray_max, light_size, normal_bias, trace_characters, isfast, trace_resolution;
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug;
-  float receive_characters, character_normal_bias;
+  float receive_characters, character_normal_bias, foliage_intensity;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 

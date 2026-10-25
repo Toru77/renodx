@@ -122,6 +122,17 @@ static void TestRtSunTrace() {
   CHECK(rtsun::kRtSunStatRaysBlocked == 9u && rtsun::kRtSunStatCharacterRays == 10u && rtsun::kRtSunStatSelfBlocked == 11u, "stats 9, 10, 11");
   CHECK(rtsun::kRtSunStatCharactersTraced == 14u && rtsun::kRtSunStatCharactersSelfBlocked == 15u && rtsun::kRtSunStatCharactersSelfBlocked < rtsun::kRtSunStatsCount, "R4 character stats 14, 15 inside the 32-uint buffer");
   CHECK(rtsun::kRtSunStatsCount == 32u, "stats buffer 32 uints");
+  CHECK(rtsun::kRtSunStatFoliageFirstHits == 23u && rtsun::kRtSunStatFoliageOpaqueBehind == 24u, "F1 stats 23 and 24");
+  {
+    const std::string resources = ReadText("src/games/falcomengine-plus/world/rtsun/rtsun_resources.hpp");
+    size_t bad = 0u;
+    for (size_t at = resources.find("inline constexpr uint32_t kRtSunStat"); at != std::string::npos;
+         at = resources.find("inline constexpr uint32_t kRtSunStat", at + 1)) {
+      const std::string decl = resources.substr(at, resources.find(';', at) - at);
+      if (decl.find("= 20u") != std::string::npos || decl.find("= 21u") != std::string::npos || decl.find("= 22u") != std::string::npos) ++bad;
+    }
+    CHECK(bad == 0u, "F1: no rtsun stat constant is 20, 21 or 22 (slots 20-22 intentionally left empty)");
+  }
   const std::string text = ReadText("src/games/falcomengine-plus/world/shaders/world_rtsun.cs_5_0.hlsl");
   CHECK(!text.empty(), "shader copy readable (run refresh_world.ps1 first)");
   CHECK(Count(text, "#define WORLD_TRACE_DYNAMIC_INSTANCES\n") == 1, "character casters: WORLD_TRACE_DYNAMIC_INSTANCES defined once");
@@ -131,6 +142,21 @@ static void TestRtSunTrace() {
   CHECK(Count(text, "#define RTSUN_STAT_RAYS_BLOCKED 9u") == 1 && Count(text, "#define RTSUN_STAT_CHARACTER_RAYS 10u") == 1
             && Count(text, "#define RTSUN_STAT_SELF_BLOCKED 11u") == 1, "stat defines match the C++ indices");
   CHECK(Count(text, "#define RTSUN_STAT_COUNT 32u") == 1, "stat count define 32");
+  CHECK(Count(text, "#define RTSUN_STAT_FOLIAGE_FIRST_HITS 23u") == 1 && Count(text, "#define RTSUN_STAT_FOLIAGE_OPAQUE_BEHIND 24u") == 1,
+        "F1: foliage stat defines are 23 and 24");
+  CHECK(Count(text, " 20u\n") == 0 && Count(text, " 21u\n") == 0 && Count(text, " 22u\n") == 0,
+        "F1: no stat define is 20, 21 or 22");
+  CHECK(Count(text, "{false, 1.0, INSTANCE_ALPHA_TESTED, 0u}") == 1, "F1: second any-hit view skips the alpha-tested mask");
+  {
+    const size_t fb = text.find("if (hit.material != 0u)");
+    const size_t fe = text.find("lit += 1.0 - foliage;", fb == std::string::npos ? 0 : fb);
+    CHECK(fb != std::string::npos && fe != std::string::npos && Count(text, "if (foliage < 1.0)") == 1
+              && text.substr(fb, fe - fb).find("hit.t") == std::string::npos,
+          "F1: foliage block tests material and intensity once, with no hit.t reference");
+  }
+  CHECK(Count(text, "if (hit.material != 0u)") == 1 && Count(text, "if (foliage < 1.0)") == 1, "F1: foliage branch on the first hit's material and intensity");
+  CHECK(Count(text, "const WorldCameraView opaque_view = {false, 1.0, INSTANCE_ALPHA_TESTED, 0u};") == 1, "F1: second any-hit skips cutout instances");
+  CHECK(Count(text, "const float shadow = 1.0 - lit / float(spp);") == 1, "F1: shadow from the float lit sum");
   CHECK(Count(text, "g_trace_dynamic_count = (uint)g_rtsun_sun.y;") == 1, "character object count from c2.y");
   CHECK(Count(text, "raw = float4(shadow * w, 0.0, w, 1.0);") == 1, "raw output (shadow * w, 0, w, 1)");
   CHECK(Count(text, "float2 g_rtsun_character : packoffset(c5);") == 1, "R4: cb_rtsun c5 holds the receive flag and character bias");
@@ -160,10 +186,10 @@ static void TestSunParameterSnapshot() {
   CHECK(!SunSnapshotHasMaxDarkening<rtsun::ParameterSnapshot>, "Max Darkening is not in the snapshot (no history reset)");
   CHECK(!SunSnapshotHasSpatial<rtsun::ParameterSnapshot>, "no spatial filter field or edge stop is in the snapshot");
   // Exactly the 14 float fields listed in rtsun_state.hpp; each one takes part in the comparison.
-  CHECK(sizeof(rtsun::ParameterSnapshot) == 16u * sizeof(float), "snapshot is 16 floats (%zu bytes)", sizeof(rtsun::ParameterSnapshot));
-  for (size_t i = 0u; i < 16u; ++i) {
+  CHECK(sizeof(rtsun::ParameterSnapshot) == 17u * sizeof(float), "snapshot is 17 floats (%zu bytes)", sizeof(rtsun::ParameterSnapshot));
+  for (size_t i = 0u; i < 17u; ++i) {
     rtsun::ParameterSnapshot changed = {};
-    float fields[16] = {};
+    float fields[17] = {};
     std::memcpy(fields, &changed, sizeof(fields));
     fields[i] = 1.f;
     std::memcpy(&changed, fields, sizeof(fields));
@@ -207,6 +233,7 @@ static void TestSunDenoiseText() {
   CHECK(Count(sun_block, "data.denoise.output.srv[data.denoise.output_index]") == 1, "lighting binds the denoised output");
   CHECK(Count(sun_block, "shader_injection.rtsun_spare = rtsun::g_rtsun_character_intensity;") == 1, "R4: Character Intensity goes to the rtsun_spare slot");
   CHECK(Count(sun_block, "shader_injection.rtsun_char_max_darkening = rtsun::g_rtsun_character_max_darkening;") == 1, "MC: Character Max Darkening goes to the rtsun_char_max_darkening slot");
+  CHECK(Count(sun_block, ".size = {0.f, 0.f, falcom_world::bvh::kPoolRegionRayMargin, rtsun::g_rtsun_foliage_intensity},") == 1, "F1: Foliage Shadow Intensity goes to push size[3]");
   const std::string shared_header = ReadText("../../src/games/falcomengine-plus/shared.h");
   CHECK(Count(shared_header, "float rtsun_char_max_darkening;") == 1 && Count(shared_header, "local_sss_light_fade_start") == 0,
         "MC: shared.h slot is rtsun_char_max_darkening and local_sss_light_fade_start is gone");
@@ -219,12 +246,14 @@ static void TestSunDenoiseText() {
     CHECK(Count(block, "g_rtsun_strength") == 0 && Count(block, "g_rtsun_max_darkening") == 0, "snapshot block excludes Strength and Max Darkening");
     CHECK(Count(block, "g_rtsun_character_intensity") == 0, "R4: snapshot block excludes Character Intensity");
     CHECK(Count(block, "g_rtsun_character_max_darkening") == 0, "MC: snapshot block excludes Character Max Darkening");
+    CHECK(Count(block, "rtsun::g_rtsun_foliage_intensity") == 1, "F1: snapshot block has Foliage Shadow Intensity");
     CHECK(Count(block, "g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias") == 1 || Count(block, "rtsun::g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias") == 1, "R4: snapshot block has receive and character bias");
   }
   const std::string settings = ReadText("src/games/falcomengine-plus/world/world_settings.hpp");
   CHECK(Count(settings, "\"RtSunReceiveCharacters\"") == 1 && Count(settings, "\"RtSunCharacterNormalBias\"") == 1 && Count(settings, "\"RtSunCharacterIntensity\"") == 1, "R4 rows: receive, character bias, character intensity");
   CHECK(Count(settings, "\"RtSunFilterValueStop\"") == 1 && Count(settings, "\"RtSunTraceResolution\"") == 1, "RT sun rows: edge stop and trace resolution");
   CHECK(Count(settings, "\"RtSunCharacterMaxDarkening\"") == 1, "MC row: RtSunCharacterMaxDarkening");
+  CHECK(Count(settings, "\"RtSunFoliageIntensity\"") == 1, "F1 row: RtSunFoliageIntensity");
   // R5: Performance rows (RTLS pattern) and the GPU column sum by role.
   const std::string perf = ReadText("src/games/falcomengine-plus/world/bvh/perf_run.hpp");
   CHECK(Count(perf, "{\"gpu_rtsun\", true, kPerfGpu, true, nullptr}") == 1 && Count(perf, "{\"gpu_rtsun_denoise\", true, kPerfGpu, true, nullptr}") == 1,

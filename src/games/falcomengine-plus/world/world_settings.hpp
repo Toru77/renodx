@@ -1633,6 +1633,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtSunFoliageIntensity",
+      .binding = &rtsun::g_rtsun_foliage_intensity,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Foliage Shadow Intensity",
+      .section = "RT Sun Shadows",
+      .tooltip = "How much sun light cutout foliage (leaves, grass, fences) blocks. 1 = full shadow as before; lower lets part of the sun through, like light through leaves. Characters, buildings and trunks are unchanged.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtSunSamples",
       .binding = &rtsun::g_rtsun_samples,
       .value_type = SettingValueType::INTEGER,

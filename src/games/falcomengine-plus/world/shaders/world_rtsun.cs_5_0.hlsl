@@ -43,7 +43,7 @@ cbuffer cb_rtsun : register(b12)
     float4 g_rtsun_sampling : packoffset(c1); // IS-FAST flag (1 loaded), slice base, IGN seed, debug mode
     float4 g_rtsun_sun : packoffset(c2);      // light size (degrees), character object count, P2b record count (z, uint bits), trace divisor (w)
     float4 g_rtsun_region : packoffset(c3);   // BVH region min xyz, region size
-    float4 g_rtsun_size : packoffset(c4);     // full width, full height, region margin (m; kPoolRegionRayMargin), 0
+    float4 g_rtsun_size : packoffset(c4);     // full width, full height, region margin (m; kPoolRegionRayMargin), foliage intensity [0..1]
     float2 g_rtsun_character : packoffset(c5); // Receive on characters (x, 1 on), Character Normal Bias (y, m)
 };
 
@@ -67,6 +67,8 @@ cbuffer cb_rtsun : register(b12)
 #define RTSUN_STAT_GATE_SCALING_Y 17u
 #define RTSUN_STAT_GATE_CASCADE_COUNT 18u
 #define RTSUN_STAT_GATE_CAMERA_X 19u
+#define RTSUN_STAT_FOLIAGE_FIRST_HITS 23u
+#define RTSUN_STAT_FOLIAGE_OPAQUE_BEHIND 24u
 #define RTSUN_STAT_COUNT 32u
 
 groupshared uint gs_stats[RTSUN_STAT_COUNT];
@@ -155,13 +157,16 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 const float3 B = cross(sun, T);
                 const float disk = tan(radians(g_rtsun_sun.x * 0.5));
                 const uint spp = max((uint)g_rtsun_params.z, 1u);
+                const float foliage = saturate(g_rtsun_size.w);
 
-                uint visible = 0u;
+                float lit = 0.0;
                 uint rays = 0u;
                 uint blocked_rays = 0u;
                 uint character_rays = 0u;
                 uint self_blocked = 0u;
                 uint characters_self_blocked = 0u;
+                uint foliage_first = 0u;
+                uint foliage_behind = 0u;
                 uint invalid = 0u;
                 uint overflow = 0u;
                 [loop] for (uint smp = 0u; smp < spp; ++smp)
@@ -194,14 +199,26 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             self_blocked++;
                             if (receiver_character) characters_self_blocked++;
                         }
+                        if (hit.material != 0u)
+                        {
+                            foliage_first++;
+                            if (foliage < 1.0)
+                            {
+                                const WorldCameraView opaque_view = {false, 1.0, INSTANCE_ALPHA_TESTED, 0u};
+                                WorldTraceCounters opaque_counters;
+                                const WorldTraceHit behind = TraceWorldAny(origin, dir, 1e-3, ray_max, opaque_view, opaque_counters);
+                                if (behind.prim != 0xFFFFFFFFu) foliage_behind++;
+                                else lit += 1.0 - foliage;
+                            }
+                        }
                     }
                     else
                     {
-                        visible++;
+                        lit += 1.0;
                     }
                 }
 
-                const float shadow = 1.0 - float(visible) / float(spp);
+                const float shadow = 1.0 - lit / float(spp);
                 raw = float4(shadow * w, 0.0, w, 1.0);
                 cls = float3(1.0, 1.0, 1.0);
 
@@ -209,6 +226,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 InterlockedAdd(gs_stats[RTSUN_STAT_RAYS_BLOCKED], blocked_rays);
                 InterlockedAdd(gs_stats[RTSUN_STAT_CHARACTER_RAYS], character_rays);
                 InterlockedAdd(gs_stats[RTSUN_STAT_SELF_BLOCKED], self_blocked);
+                InterlockedAdd(gs_stats[RTSUN_STAT_FOLIAGE_FIRST_HITS], foliage_first);
+                InterlockedAdd(gs_stats[RTSUN_STAT_FOLIAGE_OPAQUE_BEHIND], foliage_behind);
                 if (receiver_character)
                 {
                     InterlockedAdd(gs_stats[RTSUN_STAT_CHARACTERS_TRACED], 1u);

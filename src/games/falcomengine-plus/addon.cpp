@@ -9600,7 +9600,7 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
       rtsun::g_rtsun_normal_bias, rtsun::g_rtsun_trace_characters, rtsun::g_rtsun_isfast, rtsun::g_rtsun_trace_resolution,
       rtsun::g_rtsun_temporal_enabled, rtsun::g_rtsun_history_weight, rtsun::g_rtsun_depth_rejection,
       rtsun::g_rtsun_normal_rejection, rtsun::g_rtsun_history_clamp, rtsun::g_rtsun_debug,
-      rtsun::g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias};
+      rtsun::g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias, rtsun::g_rtsun_foliage_intensity};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;
@@ -9636,7 +9636,7 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
           .sun = {rtsun::g_rtsun_light_size, 0.f, 0.f, static_cast<float>(divisor)},
           .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
                      bvh_data->tlas_region_size},
-          .size = {0.f, 0.f, falcom_world::bvh::kPoolRegionRayMargin, 0.f},
+          .size = {0.f, 0.f, falcom_world::bvh::kPoolRegionRayMargin, rtsun::g_rtsun_foliage_intensity},
           .character = {rtsun::g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias}},
       .debug_mode = static_cast<int>(rtsun::g_rtsun_debug),
       .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},

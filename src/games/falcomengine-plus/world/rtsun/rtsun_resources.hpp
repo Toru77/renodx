@@ -40,6 +40,8 @@ inline constexpr uint32_t kRtSunStatGateScalingX = 16u;          // gate: resolu
 inline constexpr uint32_t kRtSunStatGateScalingY = 17u;          // gate: resolutionScaling_g.y (float bits)
 inline constexpr uint32_t kRtSunStatGateCascadeCount = 18u;      // gate: shadowmapCascadeCount_g (int bits)
 inline constexpr uint32_t kRtSunStatGateCameraX = 19u;           // gate: viewInv_g._m30, camera x (float bits)
+inline constexpr uint32_t kRtSunStatFoliageFirstHits = 23u;      // rays whose first any-hit is a cutout instance (material != 0)
+inline constexpr uint32_t kRtSunStatFoliageOpaqueBehind = 24u;   // cutout first hits with an opaque hit behind them (full shadow)
 
 #if defined(__world_rtsun_EMBED_FILE)
 inline constexpr std::span<const std::uint8_t> kRtSunTraceShader = __world_rtsun;
@@ -53,7 +55,7 @@ struct RtSunPushConstants {
   float sampling[4];  // c1: IS-FAST flag (1 loaded), slice base, IGN seed, debug mode
   float sun[4];       // c2: light size (degrees), character object count, P2b record count (z, uint bits), trace divisor (w)
   float region[4];    // c3: BVH region min xyz, region size
-  float size[4];      // c4: full width, full height, region margin (m; kPoolRegionRayMargin), 0
+  float size[4];      // c4: full width, full height, region margin (m; kPoolRegionRayMargin), foliage intensity [0..1]
   float character[2]; // c5: Receive on characters (x, 1 on), Character Normal Bias (y, m)
 };
 static_assert(sizeof(RtSunPushConstants) == kRtSunPushConstantCount * sizeof(float), "b12 must be 22 floats");
