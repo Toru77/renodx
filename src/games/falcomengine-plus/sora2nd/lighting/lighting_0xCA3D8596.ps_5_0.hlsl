@@ -449,7 +449,7 @@ void main(
       // the applied and the Receive bits of rtsun_flags. Character Intensity (rtsun_spare) lerps from the CSM visibility (0) to the RT one (1).
       if (((uint)shader_injection_data.rtsun_flags & (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) == (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) {
         const float rtsunCharTerm = rtsunTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
-        const float rtsunCharVisibility = 1.0 - min(rtsunCharTerm * shader_injection_data.rtsun_strength, shader_injection_data.rtsun_max_darkening);
+        const float rtsunCharVisibility = 1.0 - min(rtsunCharTerm * shader_injection_data.rtsun_strength, shader_injection_data.rtsun_char_max_darkening);
         r3.z *= lerp(1.0, rtsunCharVisibility, saturate(shader_injection_data.rtsun_spare));
       }
       r5.yzw = -r9.xyz * r8.xyz + r0.xyz;

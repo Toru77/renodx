@@ -36,6 +36,10 @@ inline constexpr uint32_t kRtSunStatInvalidRefs = 12u;
 inline constexpr uint32_t kRtSunStatStackOverflow = 13u;
 inline constexpr uint32_t kRtSunStatCharactersTraced = 14u;      // character pixels traced (Receive on characters)
 inline constexpr uint32_t kRtSunStatCharactersSelfBlocked = 15u; // rays of character pixels with the hit within 0.1 m of the origin
+inline constexpr uint32_t kRtSunStatGateScalingX = 16u;          // gate: resolutionScaling_g.x (float bits), written by the trace group (0,0)
+inline constexpr uint32_t kRtSunStatGateScalingY = 17u;          // gate: resolutionScaling_g.y (float bits)
+inline constexpr uint32_t kRtSunStatGateCascadeCount = 18u;      // gate: shadowmapCascadeCount_g (int bits)
+inline constexpr uint32_t kRtSunStatGateCameraX = 19u;           // gate: viewInv_g._m30, camera x (float bits)
 
 #if defined(__world_rtsun_EMBED_FILE)
 inline constexpr std::span<const std::uint8_t> kRtSunTraceShader = __world_rtsun;

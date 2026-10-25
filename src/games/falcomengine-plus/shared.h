@@ -80,8 +80,8 @@ struct ShaderInjectData {
   // These eleven slots were allocated for a per-local-light screen-space shadow that
   // was never implemented; that feature is covered by the Contact Shadows local-light
   // march (cs_contact_local_*). The first four are reused by RT Local Shadows
-  // (rtls_flags, rtls_strength, rtls_max_darkening, rtls_char_lamp); the next four by RT Sun Shadows (rtsun_flags,
-  // rtsun_strength, rtsun_max_darkening, rtsun_spare); the other three are RETIRED and unread. All eleven stay in place
+  // (rtls_flags, rtls_strength, rtls_max_darkening, rtls_char_lamp); the next five by RT Sun Shadows (rtsun_flags,
+  // rtsun_strength, rtsun_max_darkening, rtsun_spare, rtsun_char_max_darkening); the other two are RETIRED and unread. All eleven stay in place
   // so the packoffset of every later field is unchanged.
   float rtls_flags;                    // RT Local Shadows: RTLS_FLAG_* bits for this lighting draw (RunRtlsInline); 0 = game behaviour
   float rtls_strength;                 // RTLS Strength [0..1]; read only while rtls_flags has RTLS_FLAG_BOUND
@@ -91,7 +91,7 @@ struct ShaderInjectData {
   float rtsun_strength;                // RTSUN Strength [0..1]; read only while rtsun_flags is 1
   float rtsun_max_darkening;           // RTSUN Max Darkening [0..1]: the RT sun darkening is capped at this
   float rtsun_spare;                   // RT Sun Character Intensity [0..1]: scales the character RT term; read only while rtsun_flags is 1
-  float local_sss_light_fade_start;    // RETIRED: unread
+  float rtsun_char_max_darkening;      // RT Sun Character Max Darkening [0..1]: hard cap on the character RT darkening (min form); read only while rtsun_flags has the receive bit
   float local_sss_light_fade_end;      // RETIRED: unread
   float local_sss_occluder_depth_scale;// RETIRED: unread
 

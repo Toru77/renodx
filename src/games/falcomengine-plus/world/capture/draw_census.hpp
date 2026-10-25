@@ -20,6 +20,7 @@
 
 #include "../world_state.hpp"
 #include "../rtao/rtao_state.hpp"
+#include "../rtsun/rtsun_state.hpp"
 #include "../bvh/bvh_pool.hpp"
 #include "../bvh/bvh_live.hpp"
 #include "../bvh/deform_live.hpp"
@@ -622,7 +623,7 @@ struct WorldDrawCallback {
         if (IsShadowSizedTexture(device, resource) && device->get_resource_desc(resource).texture.depth_or_layers == 4u) {
           const auto view = device->get_resource_view_desc(dsv).texture;
           LogRtSunCascadeDsv(view.first_layer, view.layer_count);
-          skip_cascade_draw = view.layer_count == 1u && view.first_layer < static_cast<uint32_t>(rt_sun_cascades);
+          skip_cascade_draw = rtsun::g_rtsun_keep_cascade_maps < 0.5f && view.layer_count == 1u && view.first_layer < static_cast<uint32_t>(rt_sun_cascades);
           if (skip_cascade_draw) {
             auto& cleared_frame = g_state.rt_sun_cleared_frame[view.first_layer];
             const uint32_t frame_index = g_state.frame.load(std::memory_order_relaxed);

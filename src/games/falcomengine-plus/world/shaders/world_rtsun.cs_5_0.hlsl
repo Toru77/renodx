@@ -63,6 +63,10 @@ cbuffer cb_rtsun : register(b12)
 #define RTSUN_STAT_STACK_OVERFLOW 13u
 #define RTSUN_STAT_CHARACTERS_TRACED 14u
 #define RTSUN_STAT_CHARACTERS_SELF_BLOCKED 15u
+#define RTSUN_STAT_GATE_SCALING_X 16u
+#define RTSUN_STAT_GATE_SCALING_Y 17u
+#define RTSUN_STAT_GATE_CASCADE_COUNT 18u
+#define RTSUN_STAT_GATE_CAMERA_X 19u
 #define RTSUN_STAT_COUNT 32u
 
 groupshared uint gs_stats[RTSUN_STAT_COUNT];
@@ -235,5 +239,13 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
     for (uint s = group_index; s < RTSUN_STAT_COUNT; s += 64u)
     {
         if (gs_stats[s] != 0u) InterlockedAdd(g_rtsun_stats[s], gs_stats[s]);
+    }
+
+    if (all(id.xy == uint2(0u, 0u)))
+    {
+        g_rtsun_stats[RTSUN_STAT_GATE_SCALING_X] = asuint(resolutionScaling_g.x);
+        g_rtsun_stats[RTSUN_STAT_GATE_SCALING_Y] = asuint(resolutionScaling_g.y);
+        g_rtsun_stats[RTSUN_STAT_GATE_CASCADE_COUNT] = asuint(shadowmapCascadeCount_g);
+        g_rtsun_stats[RTSUN_STAT_GATE_CAMERA_X] = asuint(viewInv_g._m30);
     }
 }

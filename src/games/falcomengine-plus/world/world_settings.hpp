@@ -1539,6 +1539,16 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtSunKeepCascadeMaps",
+      .binding = &rtsun::g_rtsun_keep_cascade_maps,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Keep Cascade Maps For Fog",
+      .section = "RT Sun Shadows",
+      .tooltip = "The game's volumetric fog reads the sun cascade maps. On keeps those maps drawn so fog matches no-RT-sun, at the cost of drawing the RT-owned cascades. Off saves that cost but fog gets thicker. The sun shadow resolve is skipped either way.",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtSunStrength",
       .binding = &rtsun::g_rtsun_strength,
       .value_type = SettingValueType::FLOAT,
@@ -1604,6 +1614,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 1.f,
       .label = "Character Intensity",
       .section = "RT Sun Shadows",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunCharacterMaxDarkening",
+      .binding = &rtsun::g_rtsun_character_max_darkening,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Character Max Darkening",
+      .section = "RT Sun Shadows",
+      .tooltip = "Caps the darkest RT sun shadow on characters when Receive on characters is on. Characters lose no more than this share of sun light. Lighter shadows are unchanged, unlike Character Intensity. 1 = no cap. Environment shadows use Max Darkening.",
       .min = 0.f,
       .max = 1.f,
       .format = "%.2f",

@@ -98,7 +98,7 @@ ShaderInjectData shader_injection = {
   .rtsun_strength = 1.f,
   .rtsun_max_darkening = 1.f,
   .rtsun_spare = 0.f,
-  .local_sss_light_fade_start = 0.f,
+  .rtsun_char_max_darkening = 1.f,
   .local_sss_light_fade_end = 1.f,
   .local_sss_occluder_depth_scale = 0.f,
   .gtvbao_mode = 1.f,
@@ -9512,6 +9512,18 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
     frame.input_reason = rtao::Reason::NoDepth;
     return;
   }
+  // World_rtsun.json gate block: the camera's lighting constants and the depth sizes, for the GPU values read back with them.
+  const auto& gate_camera = falcom_world::g_state.camera;
+  frame.cpu_has_scaling = gate_camera.has_scaling;
+  std::memcpy(frame.cpu_scaling, gate_camera.resolution_scaling, sizeof(frame.cpu_scaling));
+  frame.cpu_camera_x = gate_camera.view_inv[3];
+  frame.cached_w = dd->captured_depth_w;
+  frame.cached_h = dd->captured_depth_h;
+  if (dd->captured_depth_srv.handle != 0u) {
+    const auto depth_desc = dev->get_resource_desc(dev->get_resource_from_view(dd->captured_depth_srv));
+    frame.actual_w = depth_desc.texture.width;
+    frame.actual_h = depth_desc.texture.height;
+  }
   const auto* bvh_data = falcom_world::bvh::GetBvhDeviceData(dev);
   if (!RtBvhReady(bvh_data, &frame.input_reason)) {
     frame.reason = rtsun::Reason::InputsMissing;
@@ -9544,6 +9556,7 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
     shader_injection.rtsun_strength = rtsun::g_rtsun_strength;
     shader_injection.rtsun_max_darkening = rtsun::g_rtsun_max_darkening;
     shader_injection.rtsun_spare = rtsun::g_rtsun_character_intensity;
+    shader_injection.rtsun_char_max_darkening = rtsun::g_rtsun_character_max_darkening;
   };
   if (frame.dispatched_frame == dd->frame_index) {
     frame.producing = true;

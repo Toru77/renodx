@@ -38,6 +38,13 @@ struct RtSunFrameState {
   float built_range = 0.f;     // BVH region range (m) the effective count was limited by
   uint32_t character_objects = 0u;
   uint64_t texture_bytes = 0u;
+  bool cpu_has_scaling = false;        // gate: camera snapshot of the lighting constants (set in RunRtSunInline)
+  float cpu_scaling[2] = {};
+  float cpu_camera_x = 0.f;
+  uint32_t cached_w = 0u;              // gate: depth size the trace was sized from (captured_depth_w/h)
+  uint32_t cached_h = 0u;
+  uint32_t actual_w = 0u;              // gate: the captured depth texture's size
+  uint32_t actual_h = 0u;
   uint32_t divisor = 1u;               // trace divisor (1 Full, 2 Half, 4 Quarter); width and height are the trace size
   float denoise_gpu_ms = -1.f;         // temporal, filter and upsample (negative: none yet)
   bool temporal_ran = false;
@@ -251,7 +258,28 @@ inline std::string BuildRtSunJson(const RtSunJsonInput& in) {
       << ", \"character_rays\": " << v[kRtSunStatCharacterRays] << ", \"self_blocked\": " << v[kRtSunStatSelfBlocked]
       << ", \"characters_traced\": " << v[kRtSunStatCharactersTraced] << ", \"characters_self_blocked\": " << v[kRtSunStatCharactersSelfBlocked]
       << ", \"invalid_refs\": " << v[kRtSunStatInvalidRefs] << ", \"stack_overflow\": " << v[kRtSunStatStackOverflow]
+      << ", \"temporal_pixels\": " << v[rtgi::kRtgiStatTemporalPixels] << ", \"temporal_no_history\": " << v[rtgi::kRtgiStatNoHistory]
+      << ", \"temporal_reset_pixels\": " << v[rtgi::kRtgiStatResetPixels]
       << "},\n";
+  float gpu_scaling[2] = {};
+  std::memcpy(gpu_scaling, &v[kRtSunStatGateScalingX], sizeof(gpu_scaling));
+  int32_t gpu_cascade_count = 0;
+  std::memcpy(&gpu_cascade_count, &v[kRtSunStatGateCascadeCount], sizeof(gpu_cascade_count));
+  float gpu_camera_x = 0.f;
+  std::memcpy(&gpu_camera_x, &v[kRtSunStatGateCameraX], sizeof(gpu_camera_x));
+  out << "  \"gate\": {\n";
+  out << "    \"reason\": \"" << (f.producing ? "ok" : ReasonName(f.reason)) << "\",\n";
+  out << "    \"latch\": " << g_state.rt_sun_cascades.load(std::memory_order_relaxed) << ",\n";
+  out << "    \"cascades_effective\": " << f.cascades_effective << ",\n";
+  out << "    \"gpu_scene\": {\"scaling_x\": " << gpu_scaling[0] << ", \"scaling_y\": " << gpu_scaling[1]
+      << ", \"cascade_count\": " << gpu_cascade_count << ", \"camera_x\": " << gpu_camera_x << "},\n";
+  out << "    \"cpu_scene\": {\"has_scaling\": " << (f.cpu_has_scaling ? "true" : "false") << ", \"scaling_x\": " << f.cpu_scaling[0]
+      << ", \"scaling_y\": " << f.cpu_scaling[1] << ", \"camera_x\": " << f.cpu_camera_x << "},\n";
+  out << "    \"depth\": {\"cached_w\": " << f.cached_w << ", \"cached_h\": " << f.cached_h << ", \"actual_w\": " << f.actual_w
+      << ", \"actual_h\": " << f.actual_h << "},\n";
+  out << "    \"dispatched_frame\": " << f.dispatched_frame << ",\n";
+  out << "    \"generated_frame\": " << in.generated_frame << "\n";
+  out << "  },\n";
   out << "  \"texture_bytes\": " << f.texture_bytes << "\n";
   out << "}\n";
   return out.str();

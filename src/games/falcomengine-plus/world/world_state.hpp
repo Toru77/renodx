@@ -144,6 +144,8 @@ struct CameraSnapshot {
   float shadow_split_distance[3] = {};  // shadowSplitDistance_g (c57)
   float shadow_fade_near = 0.f;         // shadowFadeNear_g (c50.w)
   float shadow_fade_range_inv = 0.f;    // shadowFadeRangeInv_g (c57.w)
+  bool has_scaling = false;
+  float resolution_scaling[2] = {};     // resolutionScaling_g (c49.xy), when the captured constants reach them
 };
 
 struct FamilyStats {

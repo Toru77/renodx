@@ -27,6 +27,7 @@ inline constexpr size_t kSceneCascadeCountFloat = 27u * 4u + 3u;
 inline constexpr size_t kSceneShadowSplitFloat = 57u * 4u;
 inline constexpr size_t kSceneShadowFadeNearFloat = 50u * 4u + 3u;
 inline constexpr size_t kSceneShadowFadeRangeInvFloat = 57u * 4u + 3u;
+inline constexpr size_t kSceneResolutionScalingFloat = 49u * 4u;
 
 inline void CaptureCameraFromBytes(const std::vector<uint8_t>& bytes, uint32_t frame, uint8_t source = 1u) {
   const size_t float_count = bytes.size() / sizeof(float);
@@ -59,6 +60,10 @@ inline void CaptureCameraFromBytes(const std::vector<uint8_t>& bytes, uint32_t f
     std::memcpy(camera.shadow_split_distance, data + kSceneShadowSplitFloat, sizeof(float) * 3u);
     camera.shadow_fade_near = data[kSceneShadowFadeNearFloat];
     camera.shadow_fade_range_inv = data[kSceneShadowFadeRangeInvFloat];
+  }
+  camera.has_scaling = float_count > kSceneResolutionScalingFloat + 1u;
+  if (camera.has_scaling) {
+    std::memcpy(camera.resolution_scaling, data + kSceneResolutionScalingFloat, sizeof(float) * 2u);
   }
   camera.valid = true;
   camera.frame = frame;

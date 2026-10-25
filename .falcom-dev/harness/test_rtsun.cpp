@@ -205,6 +205,10 @@ static void TestSunDenoiseText() {
   CHECK(Count(sun_block, "rtao::RtgiTraceExtent(dd->captured_depth_w, divisor)") == 1, "addon trace width from the divisor");
   CHECK(Count(sun_block, "data.denoise.output.srv[data.denoise.output_index]") == 1, "lighting binds the denoised output");
   CHECK(Count(sun_block, "shader_injection.rtsun_spare = rtsun::g_rtsun_character_intensity;") == 1, "R4: Character Intensity goes to the rtsun_spare slot");
+  CHECK(Count(sun_block, "shader_injection.rtsun_char_max_darkening = rtsun::g_rtsun_character_max_darkening;") == 1, "MC: Character Max Darkening goes to the rtsun_char_max_darkening slot");
+  const std::string shared_header = ReadText("../../src/games/falcomengine-plus/shared.h");
+  CHECK(Count(shared_header, "float rtsun_char_max_darkening;") == 1 && Count(shared_header, "local_sss_light_fade_start") == 0,
+        "MC: shared.h slot is rtsun_char_max_darkening and local_sss_light_fade_start is gone");
   // The snapshot block of RunRtSunInline must not read Strength or Max Darkening.
   const size_t begin = sun_block.find("const rtsun::ParameterSnapshot params = {");
   const size_t end = sun_block.find("const bool params_changed", begin);
@@ -213,11 +217,13 @@ static void TestSunDenoiseText() {
     const std::string block = sun_block.substr(begin, end - begin);
     CHECK(Count(block, "g_rtsun_strength") == 0 && Count(block, "g_rtsun_max_darkening") == 0, "snapshot block excludes Strength and Max Darkening");
     CHECK(Count(block, "g_rtsun_character_intensity") == 0, "R4: snapshot block excludes Character Intensity");
+    CHECK(Count(block, "g_rtsun_character_max_darkening") == 0, "MC: snapshot block excludes Character Max Darkening");
     CHECK(Count(block, "g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias") == 1 || Count(block, "rtsun::g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias") == 1, "R4: snapshot block has receive and character bias");
   }
   const std::string settings = ReadText("src/games/falcomengine-plus/world/world_settings.hpp");
   CHECK(Count(settings, "\"RtSunReceiveCharacters\"") == 1 && Count(settings, "\"RtSunCharacterNormalBias\"") == 1 && Count(settings, "\"RtSunCharacterIntensity\"") == 1, "R4 rows: receive, character bias, character intensity");
   CHECK(Count(settings, "\"RtSunFilterValueStop\"") == 1 && Count(settings, "\"RtSunTraceResolution\"") == 1, "RT sun rows: edge stop and trace resolution");
+  CHECK(Count(settings, "\"RtSunCharacterMaxDarkening\"") == 1, "MC row: RtSunCharacterMaxDarkening");
   // R5: Performance rows (RTLS pattern) and the GPU column sum by role.
   const std::string perf = ReadText("src/games/falcomengine-plus/world/bvh/perf_run.hpp");
   CHECK(Count(perf, "{\"gpu_rtsun\", true, kPerfGpu, true, nullptr}") == 1 && Count(perf, "{\"gpu_rtsun_denoise\", true, kPerfGpu, true, nullptr}") == 1,
@@ -242,8 +248,8 @@ static void TestCharacterReceiveText() {
   CHECK(Count(lit, "if (((uint)shader_injection_data.rtsun_flags & RTSUN_FLAG_APPLIED) != 0u) {") == 1, "R4: environment path gated by the applied bit only");
   CHECK(Count(lit, "if (((uint)shader_injection_data.rtsun_flags & (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) == (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) {") == 1,
         "R4: character path runs only with the applied and receive bits");
-  CHECK(Count(lit, "const float rtsunCharVisibility = 1.0 - min(rtsunCharTerm * shader_injection_data.rtsun_strength, shader_injection_data.rtsun_max_darkening);") == 1,
-        "R4: character visibility = 1 - min(term x Strength, Max Darkening)");
+  CHECK(Count(lit, "const float rtsunCharVisibility = 1.0 - min(rtsunCharTerm * shader_injection_data.rtsun_strength, shader_injection_data.rtsun_char_max_darkening);") == 1,
+        "MC: character visibility = 1 - min(term x Strength, Character Max Darkening)");
   CHECK(Count(lit, "r3.z *= lerp(1.0, rtsunCharVisibility, saturate(shader_injection_data.rtsun_spare));") == 1, "R4: Character Intensity lerps from CSM (0) to RT (1)");
   CHECK(Count(lit, "rtsunTexture.SampleLevel(samPoint_s, v1.xy, 0)") == 2, "R4: both RT sun samples use samPoint at v1.xy");
   // Transcription of the character visibility (lighting shader) and the character lerp.
