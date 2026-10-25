@@ -196,13 +196,6 @@ lpfloat GTVBAO_FastACos( lpfloat inX )
 
 #define GT_VBAO_BITMASK_SECTOR_COUNT 32u
 
-// Texel offset for the depth-derived SAMPLE normal used by the GI's
-// (n_j . -l_j) term when MRT g-buffer normals are unavailable. 2 rather than 1
-// because the depth chain is already prefiltered, so a single-texel difference
-// is too noisy to build a stable normal from.
-#ifndef GT_VBAO_GI_NORMAL_TAP
-#define GT_VBAO_GI_NORMAL_TAP 2.0f
-#endif
 
 // Population count (count set bits in uint).
 uint GTVBAO_CountBits(uint v)
@@ -369,22 +362,12 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     Texture2D<lpfloat> sourceViewspaceDepth, SamplerState depthSampler, RWTexture2D<uint> outWorkingAOTerm, RWTexture2D<float> outWorkingEdges,
     Texture2D<uint4> mrtNormalTexture,
     Texture2D<uint> foliageMaskTexture,
-    Texture2D<float4> preppedNormalTexture
-#ifdef GT_VBAO_COMPUTE_GI
-    , bool enableGI, float giIntensity,
-    Texture2D<float4> lightBuffer, SamplerState lightSampler,
-    RWTexture2D<float4> outGI
-    , RWTexture2D<float4> outDebug
-#endif
+    RWTexture2D<float4> outDebug
     )
 {                                                                       
     float2 normalizedScreenPos = (pixCoord + float2( 0.5, 0.5 )) * consts.ViewportPixelSize;
 
-    // Debug accumulation is only observable through the GTVBAO debug modes
-    // (6-8, 22-29) or the VBGI sample-activity view (5). When neither is
-    // selected the counters and the full-res debug write are dead.
-    const bool g_trackDebug = GTVBAO_debug_mode > 0.5f
-        || g_vbgi_debug_view > 0.5f;
+    const bool g_trackDebug = GTVBAO_debug_mode > 0.5f;
 
     // ── Half-res mode: output domain is half, depth input stays full. ──
     // Full path below is untouched; Half uses block-center point loads
@@ -425,17 +408,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     uint g_maskW = 1, g_maskH = 1;
     if (GTVBAO_exclude_foliage > 0.5f && GTVBAO_foliage_mask_valid > 0.5f)
         foliageMaskTexture.GetDimensions(g_maskW, g_maskH);
-
-    // ── GI pre-decoded normals ──
-    // c[70] plus the domain/transform match guarantee the à-trous normal
-    // pre-decode is exactly what the per-sample decode would produce. Any
-    // mismatch falls back to the per-sample decode below.
-    uint g_prepW = 0, g_prepH = 0;
-    if (GTVBAO_gi_prepped_normal > 0.5f)
-        preppedNormalTexture.GetDimensions(g_prepW, g_prepH);
-    const bool g_giUsePrepped = (GTVBAO_gi_prepped_normal > 0.5f)
-        && all(int2(g_prepW, g_prepH) == g_workDims)
-        && all(int2(g_mrtW, g_mrtH) == g_workDims);
 
     lpfloat4 edgesLRTB  = GTVBAO_CalculateEdges( (lpfloat)viewspaceZ, (lpfloat)pixLZ, (lpfloat)pixRZ, (lpfloat)pixTZ, (lpfloat)pixBZ );
     // The à-trous chain never reads the edge texture (it edge-stops on depth
@@ -520,9 +492,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 #else
     lpfloat3 bentNormal = viewspaceNormal;
 #endif
-#ifdef GT_VBAO_COMPUTE_GI
-    float3 giAccum = float3(0, 0, 0);
-#endif
     // ── Per-pixel constants hoisted out of the slice/sample loops ──
     // viewspaceNormal and viewVec are per-pixel, so NdotV, the CDF horizon
     // remap terms and the Mode-3 slice-sampler terms are all invariant
@@ -544,9 +513,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     uint debugTotalSamples = 0u;
     uint debugFirstSliceBitmask = 0u;
     bool debugFirstSliceSaved = false;
-    // ── SSGI debug view 5: sample activity counters ──
-    uint activityContributed = 0u;  // samples that added GI
-    uint activityRejected = 0u;     // samples valid but newCount==0
     // ── Horizon-term accumulators for MRT/horizon diagnostics (26-29) ──
     // These are the per-slice intermediates of the NON-bitmask horizon path,
     // averaged over slices. They are the terms that decide occlusion, so
@@ -660,16 +626,13 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
 #ifdef GT_VBAO_USE_BITMASK
             // ═══════════════════════════════════════════════════════════════
-            // Visibility Bitmask AO + optional GI
+            // Visibility Bitmask AO
             // Replaces GTAO horizon angles with a uint bitmask.
             // Therrien/Levesque/Gilet 2023, Algorithm 1.
             // ═══════════════════════════════════════════════════════════════
 
             // Bitmask for this slice (0 = unoccluded, 1 = occluded).
             uint sliceBitmask = 0u;
-#ifdef GT_VBAO_COMPUTE_GI
-            float3 sliceGI = float3(0, 0, 0);
-#endif
             // One decorrelated draw per slice, shared by min and max so the arc
             // width survives. The reference dithers the sector index this way
             // (bufferc.txt:767) to break up the 32 hard bands; without it the
@@ -780,130 +743,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                         debugTotalSamples += 1u;
                     }
 
-#ifdef GT_VBAO_COMPUTE_GI
-                    // ── GI contribution (paper Algorithm 1, line 23) ──
-                    // b_j & ~b_i: sectors this sample covers that are NOT yet occluded.
-                    // GI-only sector work: skipped when GI is off (result discarded).
-                    uint newCount = 0u;
-                    if (enableGI) {
-                      uint newSectors = sampleMask & ~sliceBitmask;
-                      newCount = GTVBAO_CountBits(newSectors);
-                    }
-                    if (newCount > 0u && enableGI)
-                    {
-                        // Read HDR light color at sample position (with exposure scale).
-                        float3 lightColor = lightBuffer.SampleLevel(lightSampler, sampleScreenPos, 0).rgb * g_gi_light_exposure;
-
-                        // Light direction from pixel to sample (== sampleHorizonVec).
-                        float3 lightDir = (float3)sampleHorizonVec;
-                        float NdotL = saturate(dot((float3)viewspaceNormal, lightDir));
-
-                        // Sample normal for the (n_j . -l_j) weighting.
-                        //
-                        // MRT g-buffer normal is the accurate source, used
-                        // whenever available. The fallback must NOT be the
-                        // pixel normal: that makes this term the exact
-                        // complement of NdotL above, because with
-                        // sampleNormal == viewspaceNormal and
-                        //     NdotL  = saturate( dot(N,  L))
-                        //     NsDotL = saturate( dot(N, -L))
-                        // the product is saturate(x) * saturate(-x), which is
-                        // zero for EVERY x -- positive, negative or zero. So
-                        // it is identically zero across the whole image and
-                        // VBGI rendered black whenever MRT normals were off.
-                        // It only ever produced light because on the MRT path
-                        // the sample's own normal genuinely differs from the
-                        // pixel's.
-                        //
-                        // So reconstruct the sample's surface normal from the
-                        // depth buffer instead. The centre is already in hand
-                        // (SZ / samplePos), so this costs two extra taps and
-                        // runs only for samples that already pass newCount > 0.
-                        float3 sampleNormal = (float3)viewspaceNormal;
-                        // VBGI's normal source and shaping are INDEPENDENT of
-                        // the AO settings above. Both are push-constant scalars,
-                        // so this is a uniform branch across the whole
-                        // dispatch -- no divergence, and only one of the MRT /
-                        // depth paths ever runs. Texel mapping, decode and
-                        // transform arithmetic are shared deliberately.
-                        //
-                        // Reuse the à-trous normal pre-decode (fp16). The host
-                        // only enables c[70] when that pass ran and the GI/AO
-                        // transforms and scaling match, so this equals the
-                        // decode+transform+tune below.
-                        if (g_giUsePrepped)
-                        {
-                            int2 prepTc = GTVBAO_MrtTexel(sampleScreenPos * float2(g_mrtW, g_mrtH),
-                                                          float2(g_mrtW, g_mrtH));
-                            float3 prepped = preppedNormalTexture.Load(int3(prepTc, 0)).xyz;
-                            if (FalcomNormalValid(prepped))
-                                sampleNormal = (float3)prepped;
-                        }
-                        else if (GTVBAO_gi_normal_input_mode > 0.5 && GTVBAO_mrt_normal_available > 0.5)
-                        {
-                            // Dimensions were cached once above; do not re-query
-                            // them per sample.
-                            uint mw2 = g_mrtW, mh2 = g_mrtH;
-                            if (mw2 > 0 && mh2 > 0)
-                            {
-                                // GTVBAO_MrtTexel, the same mapping the main
-                                // pass uses for the centre pixel. Truncating
-                                // `sampleScreenPos * dims` directly (as this
-                                // did) has no texel-centre offset, so a sample
-                                // could read a different normal than the pixel
-                                // it is contributing to.
-                                int2 mrtTc = GTVBAO_MrtTexel(sampleScreenPos * float2(mw2, mh2),
-                                                         float2(mw2, mh2));
-                                // Keep the pixel normal when the texel is one the
-                                // G-buffer never wrote: a zero normal would make
-                                // NsDotL zero and silently drop this sample's GI.
-                                float3 decoded = DecodeMrtNormalAsIs((uint2)mrtTc);
-                                if (FalcomNormalValid(decoded))
-                                    sampleNormal = GTVBAO_TuneNormal(
-                                        TransformNormalToView(decoded, GTVBAO_gi_normal_transform_mode),
-                                        GTVBAO_gi_normal_influence,
-                                        GTVBAO_gi_normal_z_preservation);
-                            }
-                        }
-                        else
-                        {
-                            // Depth-derived sample normal. Same mip as the
-                            // sample, so the reconstructed geometry matches the
-                            // one the horizon was taken from.
-                            float2 giTexel = (float2)consts.ViewportPixelSize * (float)GT_VBAO_GI_NORMAL_TAP;
-                            float2 uR = sampleScreenPos + float2( giTexel.x, 0.0 );
-                            float2 uD = sampleScreenPos + float2( 0.0, giTexel.y );
-                            float  zR = sourceViewspaceDepth.SampleLevel( depthSampler, uR, mipLevel ).x;
-                            float  zD = sourceViewspaceDepth.SampleLevel( depthSampler, uD, mipLevel ).x;
-                            float3 pR = GTVBAO_ComputeViewspacePosition( uR, zR, consts );
-                            float3 pD = GTVBAO_ComputeViewspacePosition( uD, zD, consts );
-                            // samplePos is already the centre view position.
-                            float3 nrm  = cross( pR - samplePos, pD - samplePos );
-                            float  nlen = length( nrm );
-                            if (nlen > 1e-8) {
-                                sampleNormal = nrm / nlen;
-                                // Do not trust the cross product's handedness --
-                                // it depends on the NDC->view basis. Orient
-                                // toward the camera, or this term collapses to
-                                // zero for the same reason the fallback did.
-                                if (dot( sampleNormal, (float3)viewVec ) < 0.0)
-                                    sampleNormal = -sampleNormal;
-                            }
-                            // nlen <= 1e-8: flat or clamped-border sample. Keep
-                            // the pixel normal, costing that one sample its GI
-                            // weight rather than producing a NaN.
-                        }
-                        float NsDotL = saturate(dot(sampleNormal, -lightDir));
-
-                        float weight = (float)newCount / (float)GT_VBAO_BITMASK_SECTOR_COUNT;
-                        // vbgi_intensity is applied here only; the lighting
-                        // composite does not re-apply it to this term.
-                        sliceGI += weight * lightColor * NdotL * NsDotL * giIntensity;
-                        if (g_trackDebug) activityContributed += 1u;
-                    } else if (enableGI) {
-                        if (g_trackDebug) activityRejected += 1u;
-                    }
-#endif // GT_VBAO_COMPUTE_GI
 
                     sliceBitmask |= sampleMask;
                 }
@@ -941,9 +780,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             }
             visibility += sliceAO;
 
-#ifdef GT_VBAO_COMPUTE_GI
-            giAccum += sliceGI;
-#endif
 
 #else // !GT_VBAO_USE_BITMASK — original GTAO horizon-angle path (preserved)
             // this is a lower weight target; not using -1 as in the original paper because it is under horizon, so a 'weight' has different meaning based on the normal
@@ -1110,37 +946,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         visibility = pow( visibility, (lpfloat)consts.FinalValuePower );
         visibility = max( (lpfloat)0.03, visibility ); // disallow total occlusion (which wouldn't make any sense anyhow since pixel is visible but also helps with packing bent normals)
 
-#ifdef GT_VBAO_COMPUTE_GI
-        giAccum /= max((float)sliceCount, 1.0);
-
-        // ── RGB Adaptive Boost: amplify channels proportional to dominance ──
-        // Mode 0 (GI Color): boost based on GI's own per-channel strength.
-        // Mode 1 (Albedo): boost based on surface color at pixel center.
-        float3 adaptiveWeights;
-        if (g_gi_adaptive_mode < 0.5f) {
-            // Mode 0: GI's own color determines dominance.
-            float giMaxChan = max(max(giAccum.r, giAccum.g), giAccum.b) + 0.001;
-            adaptiveWeights = saturate(giAccum / giMaxChan);
-        } else {
-            // Mode 1: sample surface albedo at pixel center for dominance.
-            float3 albedo = lightBuffer.SampleLevel(lightSampler, normalizedScreenPos, 0).rgb;
-            float albedoMax = max(max(albedo.r, albedo.g), albedo.b) + 0.001;
-            adaptiveWeights = saturate(albedo / albedoMax);
-        }
-        giAccum.r *= 1.0 + adaptiveWeights.r * g_gi_adaptive_r;
-        giAccum.g *= 1.0 + adaptiveWeights.g * g_gi_adaptive_g;
-        giAccum.b *= 1.0 + adaptiveWeights.b * g_gi_adaptive_b;
-
-        // ── Adaptive Luma Normalization: boost dim GI toward target brightness ──
-        // Evens out indoor/outdoor GI so both respond to the same settings.
-        if (g_gi_adaptive_luma_strength > 0.001f) {
-            float giLuma = dot(giAccum, float3(0.299, 0.587, 0.114));
-            float target = g_gi_adaptive_luma_strength;
-            // Only boost dim GI up; don't crush bright GI down.
-            float scale = (giLuma > 0.001f && giLuma < target) ? (target / giLuma) : 1.0;
-            giAccum *= lerp(1.0, scale, g_gi_adaptive_luma_blend);
-        }
-#endif
 
 #ifdef GT_VBAO_COMPUTE_BENT_NORMALS
         bentNormal = normalize(bentNormal) ;
@@ -1170,20 +975,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
       outWorkingAOTerm[pixCoord] = blended;
     }
 
-#ifdef GT_VBAO_COMPUTE_GI
     // When no debug view is active, skip the whole debug write (previously a
     // full-res float4 write for every pixel).
     if (g_trackDebug) {
-    // ── SSGI debug view 5: sample activity heatmap ──
-    // Red = rejected samples (valid but newCount==0), Green = contributed, Yellow = mix
-    int vbgiDbgMode = (int)g_vbgi_debug_view;
-    if (vbgiDbgMode == 5) {
-        float totalActivity = (float)max(activityContributed + activityRejected, 1u);
-        float r = (float)activityRejected / totalActivity;
-        float g = (float)activityContributed / totalActivity;
-        outDebug[pixCoord] = float4(r, g, 0.0, 1.0);
-    } else {
-    // ── Debug views 6-8: bitmask visualizations (dedicated UAV, independent of GI) ──
+    // ── Debug views 6-8: bitmask visualizations (dedicated UAV) ──
     int dbgMode = (int)GTVBAO_debug_mode;
     if (dbgMode == 6) {
         float avgCoverage = (debugTotalSamples > 0u)
@@ -1307,14 +1102,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     } else {
         outDebug[pixCoord] = float4(0, 0, 0, 0);
     }
-    } // end vbgiDbgMode==5 vs bitmask debug
     } // end g_trackDebug
-
-    if (enableGI)
-        outGI[pixCoord] = float4(giAccum, (float)visibility);
-    else
-        outGI[pixCoord] = float4(0, 0, 0, 0);
-#endif
 }
 
 // weighted average depth filter
@@ -1344,7 +1132,7 @@ lpfloat GTVBAO_DepthMIPFilter( lpfloat depth0, lpfloat depth1, lpfloat depth2, l
     return (weight0 * depth0 + weight1 * depth1 + weight2 * depth2 + weight3 * depth3) / weightSum;
 }
 
-// This is also a good place to do non-linear depth conversion for cases where one wants the 'radius' (effectively the threshold between near-field and far-field GI), 
+// This is also a good place to do non-linear depth conversion for cases where one wants the 'radius' (effectively the threshold between near-field and far-field AO), 
 // is required to be non-linear (i.e. very large outdoors environments).
 lpfloat GTVBAO_ClampDepth( float depth )
 {

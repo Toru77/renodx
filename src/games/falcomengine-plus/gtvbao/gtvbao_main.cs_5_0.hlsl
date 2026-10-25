@@ -1,30 +1,22 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// falcomengine-plus GTVBAO — Pass 2: Main GTAO (Medium quality — 18 spp)
+// falcomengine-plus GTVBAO — Pass 2: Main (visibility bitmask AO)
 //
-// Kai-style: builds GTAOConstants in-shader, MRT normal from game g-buffer.
-// Visibility Bitmask AO + optional GI (Therrien/Levesque/Gilet 2023).
+// Kai-style: builds GTAOConstants in-shader, gets quality from push_constants.
+// Quality is determined by GTVBAO_quality push constant, not hardcoded slices.
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#define GT_VBAO_COMPUTE_GI
 #include "gtvbao_common.hlsl"
 
 Texture2D<lpfloat>     g_srcWorkingDepth   : register(t0);
 Texture2D<uint4>       g_srcMrtNormal      : register(t1);
 SamplerState           g_samplerPointClamp : register(s0);
 
-// ── GI bindings (main pass: t2 = HDR light buffer) ──
-Texture2D<float4>      g_srcLightBuffer    : register(t2);
-SamplerState           g_samplerLightBuffer : register(s1);
-
 // ── IS-FAST noise (t3 = 3D noise texture / unused when off) ──
 Texture3D<float2>      g_isfastNoiseTexture : register(t3);
 Texture2D<uint>        g_srcFoliageMask    : register(t4);
-// ── à-trous pre-decoded normals (t5) — optimized GI sample path ──
-Texture2D<float4>      g_srcPreppedNormal  : register(t5);
 
 RWTexture2D<uint>          g_outWorkingAOTerm : register(u0);
 RWTexture2D<float>         g_outWorkingEdges  : register(u1);
-RWTexture2D<float4>        g_outGI            : register(u2);
 RWTexture2D<float4>        g_outDebug         : register(u3);
 
 // ── Interleaved Gradient Noise (IGN) — IS-FAST fallback ──
@@ -32,16 +24,10 @@ static float IGN(float2 p) {
   return frac(52.9829189 * frac(0.06711056 * p.x + 0.00583715 * p.y));
 }
 
-static lpfloat2 SpatioTemporalNoise_Hilbert(uint2 p, uint t)
-{
-  uint i = HilbertIndex(p.x % XE_HILBERT_WIDTH, p.y % XE_HILBERT_WIDTH) + 288u * (t % 64u);
-  return lpfloat2(frac(0.5 + (float)i * 0.75487766624669276005),
-                  frac(0.5 + (float)i * 0.5698402909980532659114));
-}
-
 static lpfloat2 SpatioTemporalNoise_ISFAST(uint2 p, uint t)
 {
   if (g_isfast_texture_loaded > 0.5f) {
+    // Sample pre-computed 128×128×32 RG8 noise volume
     float3 uvw = float3(
       (float)(p.x % 128u) / 128.0,
       (float)(p.y % 128u) / 128.0,
@@ -51,6 +37,7 @@ static lpfloat2 SpatioTemporalNoise_ISFAST(uint2 p, uint t)
     float2 s = g_isfastNoiseTexture.SampleLevel(g_samplerPointClamp, uvw, 0);
     return (lpfloat2)(s * g_isfast_strength);
   } else {
+    // IGN fallback — Interleaved Gradient Noise + R2 temporal
     static const float R2_A1 = 0.7548776662466927;
     static const float R2_A2 = 0.5698402909980532;
     float b1 = IGN(float2(p) * g_isfast_spatial_scale + g_isfast_seed_offset);
@@ -73,6 +60,14 @@ static lpfloat2 SpatioTemporalNoise_IGN(uint2 p, uint t)
        * g_isfast_strength;
 }
 
+static lpfloat2 SpatioTemporalNoise_Hilbert(uint2 p, uint t)
+{
+  uint i = HilbertIndex(p.x % XE_HILBERT_WIDTH, p.y % XE_HILBERT_WIDTH) + 288u * (t % 64u);
+  return lpfloat2(frac(0.5 + (float)i * 0.75487766624669276005),
+                  frac(0.5 + (float)i * 0.5698402909980532659114));
+}
+
+// ── Depth-derived normal (fallback) ──
 float3 DepthNormal(uint2 p, float2 u, lpfloat z, lpfloat l, lpfloat r,
                    lpfloat t, lpfloat b, lpfloat4 e, GTAOConstants consts)
 {
@@ -84,6 +79,10 @@ float3 DepthNormal(uint2 p, float2 u, lpfloat z, lpfloat l, lpfloat r,
   return (float3)GTVBAO_CalculateNormal(e, C, L, R, T, B);
 }
 
+// ── MRT normal helpers (from kai-vanillaplus) ──
+// FalcomSafeNormalize3 / FalcomNormalValid / DecodeFalcomMrtNormal live in
+// ../include/mrt_normal.hlsli, shared with the shadow compute passes.
+// TransformNormalToView still lives in gtvbao_common.hlsl.
 float ComputeDepthEdgeMetric(uint2 pix, GTAOConstants consts)
 {
   if (GTVBAO_resolution < 0.5f) {
@@ -195,7 +194,7 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
   g_srcMrtNormal.GetDimensions(mw, mh);
   if (mw == 0 || mh == 0) return selected;
 
-  // Same texel mapping the GI path uses (GTVBAO_MrtTexel), so a pixel and a
+  // Same texel mapping every MRT reader uses (GTVBAO_MrtTexel), so a pixel and a
   // sample at the same UV cannot read different normals. The scale is applied
   // here so the helper sees texel-space coordinates, exactly as before.
   int2 mrt_tc = GTVBAO_MrtTexel((float2(pix) + 0.5) * (float2(mw, mh) / max(float2(working_size), 1.0.xx)),
@@ -204,8 +203,8 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
   float3 decoded = DecodeMrtNormalAsIs((uint2)mrt_tc);
   if (!FalcomNormalValid(decoded)) return selected;
 
-  // Shaping lives in GTVBAO_TuneNormal so the GI per-sample path applies the
-  // identical MRT normal tuning.
+  // Shaping lives in GTVBAO_TuneNormal so every MRT reader applies the
+  // identical tuning.
   float3 mrt_normal = TransformNormalToView(decoded, GTVBAO_normal_transform_mode);
   float3 tuned = GTVBAO_TuneNormal(mrt_normal, GTVBAO_normal_influence, GTVBAO_normal_z_preservation);
 
@@ -233,12 +232,12 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
 }
 
 [numthreads(GT_VBAO_NUMTHREADS_X, GT_VBAO_NUMTHREADS_Y, 1)]
-void main(uint2 pixCoord : SV_DispatchThreadID)
+void main(uint2 p : SV_DispatchThreadID)
 {
   // Output domain drives the constants: half-res output in Half mode (depth stays full).
   uint width, height;
   g_outWorkingAOTerm.GetDimensions(width, height);
-  if (pixCoord.x >= width || pixCoord.y >= height) return;
+  if (p.x >= width || p.y >= height) return;
 
   GTAOConstants consts = BuildGTAOConstants(uint2(width, height));
 
@@ -248,7 +247,7 @@ void main(uint2 pixCoord : SV_DispatchThreadID)
   // pattern 2x on screen (the Hilbert 64x64 tile would cover 128x128 full-res
   // pixels), which reads as coarse mottling on flat surfaces rather than the
   // fine dither it is meant to be.
-  const uint2 noiseP = (GTVBAO_resolution > 0.5f) ? (pixCoord * 2u) : pixCoord;
+  const uint2 noiseP = (GTVBAO_resolution > 0.5f) ? (p * 2u) : p;
   lpfloat2 n;
   if (g_isfast_enabled > 0.5f) {
     if (GTVBAO_noise_type < 0.5f)      n = SpatioTemporalNoise_ISFAST(noiseP, noise_idx);
@@ -258,7 +257,7 @@ void main(uint2 pixCoord : SV_DispatchThreadID)
     n = SpatioTemporalNoise_Hilbert(noiseP, noise_idx);
   }
 
-  lpfloat3 normal = (lpfloat3)BuildSelectedInputNormal(pixCoord, uint2(width, height), consts);
+  lpfloat3 normal = (lpfloat3)BuildSelectedInputNormal(p, uint2(width, height), consts);
 
   // Quality from push constant
   lpfloat slice_count = 3.0;
@@ -269,14 +268,10 @@ void main(uint2 pixCoord : SV_DispatchThreadID)
   else if (q == 2u) { slice_count = 6.0; steps_per_slice = 3.0; }  // High
   else              { slice_count = 9.0; steps_per_slice = 3.0; }  // Ultra
 
-  GTVBAO_MainPass(pixCoord, slice_count, steps_per_slice, n, normal,
+  GTVBAO_MainPass(p, slice_count, steps_per_slice, n, normal,
       consts, g_srcWorkingDepth, g_samplerPointClamp,
       g_outWorkingAOTerm, g_outWorkingEdges,
       g_srcMrtNormal,
       g_srcFoliageMask,
-      g_srcPreppedNormal,
-      (g_gi_enabled > 0.5f), g_gi_intensity,
-      g_srcLightBuffer, g_samplerLightBuffer,
-      g_outGI,
       g_outDebug);
 }

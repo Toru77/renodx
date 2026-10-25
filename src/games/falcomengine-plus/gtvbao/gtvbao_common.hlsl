@@ -39,9 +39,6 @@
 // We do NOT compute bent normals (AO visibility only).
 // #define GT_VBAO_COMPUTE_BENT_NORMALS
 
-// GI is enabled per-shader-variant via GT_VBAO_COMPUTE_GI.
-// This common header provides the bindings used when it is defined.
-
 // Falcom MRT world-normal decode, shared with the shadow compute passes.
 // Must come first: the helpers below and GTVBAO.hlsli both call it.
 #include "../include/mrt_normal.hlsli"
@@ -64,7 +61,7 @@ cbuffer cb_scene : register(b0)
 };
 
 // ── User settings via push_constants (b13) ──
-// Must be declared BEFORE GTVBAO.hlsli so GTVBAO_MainPass GI path can reference it.
+// Must be declared BEFORE GTVBAO.hlsli so GTVBAO_MainPass can reference it.
 cbuffer cb_gtvbao : register(b13)
 {
   float GTVBAO_quality;
@@ -185,24 +182,12 @@ float GTVBAO_LoadMappedDepth(Texture2D<float> depthTex, int2 halfTC, int2 halfDi
   return depthTex.Load(int3(GTVBAO_HalfToFullCenter(htc, fullDims), 0));
 }
 
-// ── GI parameters are native cb_gtvbao fields (c[25]-c[33]) — no aliases needed.
 #define g_isfast_enabled        GTVBAO_isfast_enabled            // IS-FAST enable (0/1)
 #define g_isfast_strength       GTVBAO_isfast_strength           // IS-FAST noise strength
 #define g_isfast_texture_loaded GTVBAO_isfast_debug              // IS-FAST: 1=texture loaded
 #define g_isfast_spatial_scale GTVBAO_isfast_spatial_scale        // IS-FAST spatial scale [0.25..4]
 #define g_isfast_temporal_speed GTVBAO_isfast_temporal_speed      // IS-FAST temporal speed [0..5]
 #define g_isfast_seed_offset   GTVBAO_isfast_seed                 // IS-FAST seed offset [0..64]
-// Legacy adaptive macros — hardcoded to 0 (no effect), slots repurposed for IS-FAST
-#define g_gi_adaptive_r         0.f
-#define g_gi_adaptive_g         0.f
-#define g_gi_adaptive_b         0.f
-#define g_gi_adaptive_mode      GTVBAO_adaptive_mode             // 0=GI color, 1=albedo
-#define g_gi_adaptive_luma_strength GTVBAO_adaptive_luma_strength // [0..5] target luma
-#define g_gi_adaptive_luma_blend GTVBAO_adaptive_luma_blend       // [0..1] blend
-// g_gi_light_exposure (c[25]) is a native field.
-// ── GI resources are passed as function parameters to GTVBAO_MainPass ──
-// (avoids fxc X3003 redefinition errors from forward declarations).
-// The wrapper .cs_5_0.hlsl files declare and pass them.
 
 // ── MRT normal helpers ──
 // The encode/decode itself lives in include/mrt_normal.hlsli, shared with the
@@ -214,11 +199,9 @@ float GTVBAO_LoadMappedDepth(Texture2D<float> depthTex, int2 halfTC, int2 halfDi
 // that pass's own `g_srcMrtNormal`, which is a per-pass resource.
 
 // Texel address for a screen UV in a source whose resolution differs from the
-// AO working domain. Both the main pass and the GI per-sample path must land on
+// AO working domain. Every MRT normal reader must land on
 // the SAME texel for the same UV, or the two read different normals for one
-// pixel. Previously the GI path truncated `uv * dims` with no texel-centre
-// offset while the main pass used `floor((pix + 0.5) * scale)`, which could
-// disagree by up to a texel.
+// pixel.
 //
 // The caller passes the already-scaled texel-space coordinate (i.e.
 // `uv * dims`), NOT a normalized UV, and that scaling is done ONCE by the
@@ -269,15 +252,13 @@ bool GTVBAO_FoliageMarked(Texture2D<uint4> mrtNormal, uint2 workTC, uint2 workDi
 }
 
 // The normal-tuning shaping that BuildSelectedInputNormal applies, extracted so
-// the GI path can apply exactly the same shaping to its per-sample normal.
-// Without this, the GI term silently ignored every MRT normal tuning setting
-// and AO and VBGI diverged as soon as a knob was moved. At the neutral defaults
+// every MRT normal reader applies the same shaping. At the neutral defaults
 // (influence 1, z_preservation 1) this is the identity, so it does not change
-// current output -- it only keeps the two paths from drifting apart later.
+// current output.
 //
 // `viewNormal` must already be in GTVBAO view space (i.e. post
 // TransformNormalToView). `influence` and `zPreservation` are passed in rather
-// than read from the AO constants so VBGI can apply its own independent values
+// than read from the AO constants so callers can apply their own values
 // through the same code. Returns a unit vector.
 float3 GTVBAO_TuneNormal(float3 viewNormal, float influence, float zPreservation)
 {
@@ -322,8 +303,8 @@ float3 GTVBAO_TuneNormal(float3 viewNormal, float influence, float zPreservation
 //   2 = passthrough
 //   3 = view_g    (no flip)
 //   4 = viewInv_g + flip Z
-// `transformMode` is passed in rather than read from the AO constant so VBGI
-// can select a different matrix through the same code.
+// `transformMode` is passed in rather than read from the AO constant so callers
+// can select a matrix through the same code.
 float3 TransformNormalToView(float3 decoded, float transformMode)
 {
   if (!FalcomNormalValid(decoded)) return float3(0.0, 0.0, 0.0);
@@ -354,86 +335,6 @@ float3 DecodeMrtNormalAsIs(uint2 texel);
 #include "GTVBAO.h"
 #include "GTVBAO.hlsli"
 
-// ── GI denoise (3×3 edge-stopped bilateral) ──
-// Shared by the spatial denoise path (stage 0) and the à-trous GI tail (stage
-// 4) so the two can never diverge. The two pixels a thread owns are filtered
-// from one shared 4×3 fetch grid (12 depth + 12 GI loads instead of 16 + 16),
-// Full mode uses a point Load for the depth tap (identical to the point
-// SampleLevel at a texel centre; Half mode keeps the SampleLevel block-centre
-// mapping), the per-pixel GI length is hoisted out of the tap loop, and the
-// depth/colour exponentials are evaluated as one exp of the summed exponent.
-void GTVBAO_DenoiseGI(uint2 pixCoordBase, GTAOConstants consts,
-    Texture2D<float4> srcGI, Texture2D<float> srcDepth,
-    SamplerState samp, RWTexture2D<float4> outGI)
-{
-    uint w, h;
-    srcGI.GetDimensions(w, h);
-
-    const int2 maxTC = int2(max((int)w - 1, 0), max((int)h - 1, 0));
-    // Grid: columns cover leftPixel.x-1 .. leftPixel.x+2, rows cover
-    // leftPixel.y-1 .. leftPixel.y+1, which is both side pixels' 3×3.
-    const int2 gridBase = clamp(int2(pixCoordBase), int2(0, 0), maxTC) - int2(1, 1);
-    const bool halfDepth = GTVBAO_resolution > 0.5f;
-
-    float4 giGrid[4][3];
-    float depthGrid[4][3];
-    [unroll]
-    for (int gy = 0; gy < 3; ++gy)
-    {
-        [unroll]
-        for (int gx = 0; gx < 4; ++gx)
-        {
-            int2 tc = clamp(gridBase + int2(gx, gy), int2(0, 0), maxTC);
-            giGrid[gx][gy] = srcGI.Load(int3(tc, 0));
-            if (halfDepth)
-            {
-                float2 uv = (float2(tc) + 0.5) * consts.ViewportPixelSize;
-                depthGrid[gx][gy] = srcDepth.SampleLevel(samp, uv, 0);
-            }
-            else
-            {
-                depthGrid[gx][gy] = srcDepth.Load(int3(tc, 0));
-            }
-        }
-    }
-
-    const int2 offsets[8] = {
-        int2(-1,-1), int2(0,-1), int2(1,-1),
-        int2(-1, 0),            int2(1, 0),
-        int2(-1, 1), int2(0, 1), int2(1, 1)
-    };
-
-    [unroll]
-    for (int side = 0; side < 2; ++side)
-    {
-        int2 pixCoord = int2(pixCoordBase) + int2(side, 0);
-        if (pixCoord.x >= (int)w || pixCoord.y >= (int)h) continue;
-
-        float4 centerGI = giGrid[side + 1][1];
-        float centerDepth = depthGrid[side + 1][1];
-        float invCenterLen = 1.0 / max(length(centerGI.rgb), 0.001);
-
-        float4 sum = centerGI;
-        float weightSum = 1.0;
-
-        [unroll]
-        for (uint i = 0; i < 8; ++i)
-        {
-            int2 off = offsets[i];
-            float4 neighborGI = giGrid[side + 1 + off.x][1 + off.y];
-            float neighborDepth = depthGrid[side + 1 + off.x][1 + off.y];
-
-            float depthDiff = abs(centerDepth - neighborDepth);
-            float colorDiff = length(neighborGI.rgb - centerGI.rgb) * invCenterLen;
-            float weight = exp(-(depthDiff * 10.0 + colorDiff * 2.0));
-
-            sum += neighborGI * weight;
-            weightSum += weight;
-        }
-
-        outGI[pixCoord] = sum / max(weightSum, 0.001);
-    }
-}
 
 // ── Build GTAOConstants from scene CB + push constants ──
 GTAOConstants BuildGTAOConstants(uint2 viewport_size)

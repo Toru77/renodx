@@ -4,7 +4,7 @@
 // Per full-res pixel, the four surrounding half-res texels are combined with
 // ordinary bilinear spatial weights multiplied by geometry-aware terms
 // (plane/depth compatibility, normal compatibility), normalized, with shared
-// weights for AO and GI.
+// weights for AO.
 //
 //   weight = bilinearWeight * exp(-|dot(Nf, Plow-Pf)| * sigma)
 //                             * pow(saturate(dot(Nf, Nlow)), power)
@@ -17,13 +17,11 @@
 #include "gtvbao_common.hlsl"
 
 Texture2D<uint>      g_srcHalfAO      : register(t0);
-Texture2D<float4>    g_srcHalfGI      : register(t1);
 Texture2D<float>     g_srcFullDepth   : register(t2);
 Texture2D<uint4>     g_srcFullMrt     : register(t3);
 Texture2D<float4>    g_srcFullNormal  : register(t4);
 SamplerState         g_samplerPointClamp : register(s0);
 RWTexture2D<uint>    g_outFullAO      : register(u0);
-RWTexture2D<float4>  g_outFullGI      : register(u1);
 RWTexture2D<float4>  g_outFullDebug   : register(u2);
 
 // Depth-derived full-res normal at a full texel (fallback when pre-decoded
@@ -88,11 +86,9 @@ void main(uint2 dt : SV_DispatchThreadID) {
   int2 hc0 = clamp(int2(floor(hpos + 0.5f)), int2(0, 0), hmax);
 
   float aoSum = 0.0f, wSum = 0.0f;
-  float4 giSum = float4(0, 0, 0, 0);
   float dwAcc = 0.0f, nwAcc = 0.0f;
   const bool wantDbg = GTVBAO_upscale_debug > 0.5f;
   float nearestAO = (float)g_srcHalfAO.Load(int3(hc0, 0)) * (1.0f / 255.0f);
-  float4 nearestGI = g_srcHalfGI.Load(int3(hc0, 0));
 
   [unroll]
   for (int by = 0; by <= 1; ++by) {
@@ -102,7 +98,6 @@ void main(uint2 dt : SV_DispatchThreadID) {
       float bw = ((bx == 0) ? (1.0f - hfrac.x) : hfrac.x)
                * ((by == 0) ? (1.0f - hfrac.y) : hfrac.y);
       float aoLow = (float)g_srcHalfAO.Load(int3(htc, 0)) * (1.0f / 255.0f);
-      float4 giLow = g_srcHalfGI.Load(int3(htc, 0));
 
       // Geometry representative: full-res block center for this half tap.
       int2 fcc = GTVBAO_HalfToFullCenter(htc, fullDims);
@@ -126,11 +121,10 @@ void main(uint2 dt : SV_DispatchThreadID) {
       // No floor on the geometry term: when every tap is rejected the weighted
       // sum collapses to the nearest-tap fallback, which is correct here —
       // bilinear across taps that straddle a depth discontinuity would bleed
-      // AO/GI over the silhouette instead.
+      // AO over the silhouette instead.
       float w = bw * depthW * normalW;
 
       aoSum += aoLow * w;
-      giSum += giLow * w;
       wSum += w;
       if (wantDbg) {
         dwAcc += depthW;
@@ -140,19 +134,15 @@ void main(uint2 dt : SV_DispatchThreadID) {
   }
 
   float aoOut;
-  float4 giOut;
   if (wSum > 1e-5f) {
     aoOut = aoSum / wSum;
-    giOut = giSum / wSum;
   } else {
     // Fallback hierarchy: weighted -> nearest half tap -> (hc0 == center tap).
     aoOut = nearestAO;
-    giOut = nearestGI;
   }
   aoOut = saturate(aoOut);
 
   g_outFullAO[dt] = (uint)(aoOut * 255.0f + 0.5f);
-  g_outFullGI[dt] = giOut;
 
   // ── Diagnostics ──
   if (wantDbg) {
@@ -173,10 +163,6 @@ void main(uint2 dt : SV_DispatchThreadID) {
     } else if (dbg == 6) {
       float wAvg = wSum / 4.0f;
       dbgOut = float4(wAvg, wAvg, wAvg, 1);
-    } else if (dbg == 7 || dbg == 8) {
-      dbgOut = float4(saturate(nearestGI.rgb * 4.0f), 1);
-    } else if (dbg == 9) {
-      dbgOut = float4(saturate(giOut.rgb * 4.0f), 1);
     }
     g_outFullDebug[dt] = dbgOut;
   }

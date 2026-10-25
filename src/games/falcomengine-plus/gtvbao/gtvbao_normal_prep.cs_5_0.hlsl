@@ -25,7 +25,7 @@ void main(uint2 dt : SV_DispatchThreadID)
   // upscale consumers read as "no g-buffer normal here" and fall back to
   // depth-only weighting for.
   // This texture feeds the AO-side filters (à-trous, upscale), so it uses the
-  // AO transform mode, not the independent VBGI one.
+  // AO transform mode.
   g_outPrepNormal[dt] = float4(
       TransformNormalToView(
           DecodeFalcomMrtNormal(g_srcPrepMrtNormal.Load(int3(dt, 0)).xy),
