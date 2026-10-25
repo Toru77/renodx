@@ -317,6 +317,11 @@ inline bool CreateRtaoTexture(
       && device->create_resource_view(*texture, reshade::api::resource_usage::unordered_access, view, uav);
 }
 
+// update_descriptor_tables reads a constant_buffer descriptor as api::buffer_range (3 words), never as a resource_view.
+inline reshade::api::buffer_range SceneCbvRange(reshade::api::resource_view view) {
+  return {reshade::api::resource{view.handle}, 0u, UINT64_MAX};
+}
+
 inline void DestroyRtaoTraceTarget(reshade::api::device* device, RtaoDeviceData* data) {
   bvh::DestroyBuffer(device, &data->trace_srv, &data->trace_texture);
   bvh::DestroyBuffer(device, &data->trace_uav, nullptr);

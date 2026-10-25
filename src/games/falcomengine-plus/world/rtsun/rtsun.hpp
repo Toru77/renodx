@@ -148,8 +148,9 @@ inline RtSunDispatchResult Dispatch(reshade::api::device* device, reshade::api::
   const reshade::api::descriptor_type kCbv = reshade::api::descriptor_type::constant_buffer;
   const reshade::api::descriptor_type kSrv = reshade::api::descriptor_type::shader_resource_view;
   const reshade::api::descriptor_type kUav = reshade::api::descriptor_type::unordered_access_view;
+  const reshade::api::buffer_range scene_cbv = rtao::SceneCbvRange(in.scene_cbv_view);
   reshade::api::descriptor_table_update updates[3] = {
-      {trace.cbv_table, 0, 0, 1, kCbv, &in.scene_cbv_view},
+      {trace.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
       {trace.srv_table, 0, 0, kRtSunSrvCount, kSrv, srvs},
       {trace.uav_table, 0, 0, kRtSunUavCount, kUav, uavs},
   };

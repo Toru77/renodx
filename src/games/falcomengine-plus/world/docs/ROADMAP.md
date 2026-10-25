@@ -99,6 +99,7 @@ Game facts: all world VS read `StructuredBuffer<InstanceParam> instances_g : t15
 
 - Lock rule (root cause of the 2026-10-06 crashes): no graphics call while holding `g_pool.mutex`, `g_deform.mutex`, `g_deform_live.mutex`... Reserve under the lock, record after it; resources moved out under the lock and destroyed after.
 - ReShade D3D11: `update_buffer_region` with offset 0 passes no box (writes the whole buffer, over-reads the source) -> `WriteBufferRange`; `get_resource_desc` buffer stride is 0 -> pass strides explicitly; `create_pipeline` returns failure for stream-output state; ReShade 6.8.0 (API 20) added a `query_type` parameter to `device::get_query_heap_results` with no compat path for API-18 add-ons -> use native D3D11 queries.
+- `constant_buffer` descriptors in `update_descriptor_tables` are `api::buffer_range {buffer, offset, size}`, not a `resource_view`. Passing a view makes ReShade read the next struct members as offset and size; a window that passes D3D11.1 alignment points at the wrong constants (RT sun Full at 1280x720 and 2560x1440 depth). Use `SceneCbvRange` (`rtao_resources.hpp`). The legacy `addon.cpp` sites (15, `captured_scene_cbv_view`) use the same pattern and are deferred.
 - A render target is bound in shadow passes too: decide camera vs light from the VS (`contract::ClassifyVertexView`), not from bindings.
 - Pool copies only on the immediate context (deferred lists may run after their slot is read).
 - Mesh capture: two identical captures before admission (`verify_meshes`), GPU-written VB/IB contents can change unseen.

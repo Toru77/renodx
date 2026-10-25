@@ -195,6 +195,7 @@ static void TestSunDenoiseText() {
   const std::string sun = ReadText("src/games/falcomengine-plus/world/rtsun/rtsun.hpp");
   CHECK(Count(sun, "in.debug_mode >= 4 && in.debug_mode <= 6 ? in.debug_mode : 0") == 1, "denoise views 4 to 6 map to the chain");
   CHECK(Count(sun, "debug_mode == 3") == 0, "debug view 3 is unused in the C++");
+  CHECK(Count(sun, "rtao::SceneCbvRange(in.scene_cbv_view)") == 1 && Count(sun, "&in.scene_cbv_view") == 0, "scene CBV is a buffer_range (SceneCbvRange), never a resource_view pointer");
   CHECK(Count(sun, "rtls::kRtlsFilterShader") == 1, "the spatial filter source is the RTLS filter (edge stop)");
   const std::string addon = ReadText("../../src/games/falcomengine-plus/addon.cpp");  // the harness copy has no addon.cpp
   // Scoped to RunRtSunInline (RTLS and RTGI have the same expressions).

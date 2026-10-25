@@ -239,8 +239,9 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
         set->history_color.uav[write], in.stats_uav, set->history_normal.uav[write],
         temporal_debug ? in.debug_uav : reshade::api::resource_view{0u}};
     const reshade::api::sampler samplers[kRtgiTemporalSamplerCount] = {set->point_sampler, set->linear_sampler};
+    const reshade::api::buffer_range scene_cbv = rtao::SceneCbvRange(in.scene_cbv_view);
     reshade::api::descriptor_table_update temporal_updates[4] = {
-        {temporal.cbv_table, 0, 0, 1, kCbv, &in.scene_cbv_view},
+        {temporal.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
         {temporal.srv_table, 0, 0, kRtgiTemporalSrvCount, kSrv, temporal_srvs},
         {temporal.uav_table, 0, 0, kRtgiTemporalUavCount, kUav, temporal_uavs},
         {temporal.sampler_table, 0, 0, kRtgiTemporalSamplerCount, reshade::api::descriptor_type::sampler, samplers},
@@ -286,8 +287,9 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
           in.depth_view, in.mrt_normal_view,
           pass.input == rtao::FilterSlot::A ? input : set->filter.srv[static_cast<uint32_t>(pass.input) - 1u]};
       const reshade::api::resource_view filter_uavs[kRtgiFilterUavCount] = {set->filter.uav[out_index]};
+      const reshade::api::buffer_range scene_cbv = rtao::SceneCbvRange(in.scene_cbv_view);
       reshade::api::descriptor_table_update filter_updates[3] = {
-          {filter.cbv_table, 0, 0, 1, kCbv, &in.scene_cbv_view},
+          {filter.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
           {filter.srv_table, 0, 0, kRtgiFilterSrvCount, kSrv, filter_srvs},
           {filter.uav_table, 0, 0, kRtgiFilterUavCount, kUav, filter_uavs},
       };
@@ -315,8 +317,9 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
   const reshade::api::resource_view upsample_srvs[kRtgiUpsampleSrvCount] = {in.depth_view, in.mrt_normal_view, input, in.albedo_view};
   const reshade::api::resource_view upsample_uavs[kRtgiUpsampleUavCount] = {
       set->output.uav[final_write], upsample_debug ? in.debug_uav : reshade::api::resource_view{0u}};
+  const reshade::api::buffer_range scene_cbv = rtao::SceneCbvRange(in.scene_cbv_view);
   reshade::api::descriptor_table_update upsample_updates[3] = {
-      {upsample.cbv_table, 0, 0, 1, kCbv, &in.scene_cbv_view},
+      {upsample.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
       {upsample.srv_table, 0, 0, kRtgiUpsampleSrvCount, kSrv, upsample_srvs},
       {upsample.uav_table, 0, 0, kRtgiUpsampleUavCount, kUav, upsample_uavs},
   };
@@ -484,8 +487,9 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   srvs[28] = in.deferred_view;
   const reshade::api::resource_view uavs[kRtgiUavCount] = {
       trace_debug ? data.debug.uav[0] : reshade::api::resource_view{0u}, data.stats_uav, data.raw.uav[0]};
+  const reshade::api::buffer_range scene_cbv = rtao::SceneCbvRange(in.scene_cbv_view);
   reshade::api::descriptor_table_update updates[3] = {
-      {trace.cbv_table, 0, 0, 1, kCbv, &in.scene_cbv_view},
+      {trace.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
       {trace.srv_table, 0, 0, kRtgiSrvCount, kSrv, srvs},
       {trace.uav_table, 0, 0, kRtgiUavCount, kUav, uavs},
   };
