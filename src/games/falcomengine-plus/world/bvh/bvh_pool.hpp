@@ -6446,10 +6446,14 @@ inline void WritePoolDynamic(std::ostringstream& out, const std::vector<PoolDyna
         << ", \"retired_instances\": " << entry.retired_instances << ", \"retired_orphans\": " << entry.retired_orphans
         << ", \"blocked\": " << entry.blocked << ", \"follows\": " << entry.follows
         << ", \"moving_now\": " << (entry.moving_now ? "true" : "false") << ", \"released\": " << entry.released
-        << ", \"camera_visible_instances\": " << item.camera_visible_instances;
+        << ", \"camera_visible_instances\": " << item.camera_visible_instances << ", \"records_from_camera\": " << entry.records_from_camera
+        << ", \"records_from_light\": " << entry.records_from_light << ", \"last_camera_record_frame\": " << entry.last_camera_record_frame
+        << ", \"last_light_record_frame\": " << entry.last_light_record_frame << ", \"refused_unflagged\": " << entry.refused_unflagged
+        << ", \"refused_deferred\": " << entry.refused_deferred << ", \"refused_cap\": " << entry.refused_cap
+        << ", \"refused_alpha\": " << entry.refused_alpha;
     if (item.has_mesh) {
       out << ", \"mesh_id\": " << item.mesh_id << ", \"mesh_uid\": " << item.mesh_uid
-          << ", \"mesh_flagged\": " << (item.mesh_dynamic ? "true" : "false") << ", \"triangles\": " << item.triangles
+          << ", \"mesh_flagged\": " << (item.mesh_dynamic ? "true" : "false") << ", \"triangles\": " << item.triangles << ", \"light_draws\": " << item.light_draws
           << ", \"bbox_min\": [" << PoolJsonFloat{item.bbox_min[0]} << ", " << PoolJsonFloat{item.bbox_min[1]} << ", "
           << PoolJsonFloat{item.bbox_min[2]} << "], \"bbox_max\": [" << PoolJsonFloat{item.bbox_max[0]} << ", "
           << PoolJsonFloat{item.bbox_max[1]} << ", " << PoolJsonFloat{item.bbox_max[2]} << "]";
