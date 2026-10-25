@@ -160,6 +160,7 @@ inline constexpr size_t kPoolDumpMaxMeshDetail = 256u;  // mesh_failed[], failed
 inline constexpr size_t kPoolDumpMaxNoMeshKeys = 32u;  // alpha_no_mesh_keys[] in world_pool.json
 inline constexpr size_t kPoolDumpMaxStaleDynamic = 256u;  // stale_dynamic[] in world_pool.json
 inline constexpr size_t kPoolDumpMaxDynamicCandidates = 12u;  // dynamic_candidates[] in world_pool.json
+inline constexpr size_t kPoolDumpMaxShadowCoverage = 15u;     // shadow_coverage[] in world_pool.json
 inline constexpr uint32_t kPoolDumpStaleFrames = 30u;     // stale_dynamic: camera-visible, not followed for more frames than this
 inline constexpr size_t kPoolNoMeshKeysMax = 4096u;  // alpha keys with no mesh tracked by frame and count (diagnostic)
 inline constexpr size_t kPoolFirstRawCount = 16u;  // raw index values kept per read (first_raw)
@@ -6335,6 +6336,73 @@ inline std::vector<PoolDynamicDumpEntry> SnapshotPoolDynamic() {
   return entries;
 }
 
+// One mesh with a light draw seen in the last 600 frames, for the dump (shadow_coverage).
+struct PoolShadowRow {
+  uint64_t mesh_key = 0u;
+  bool has_mesh = false;
+  uint64_t mesh_uid = 0u;
+  uint32_t vs_hash = 0u;
+  uint32_t triangles = 0u;
+  float bbox_min[3] = {};
+  float bbox_max[3] = {};
+  bool flagged = false;
+  bool alpha = false;
+  uint32_t last_light_frame = 0u;      // the last light sighting of its observations
+  bool has_world = false;
+  float world[kPoolWorldFloats] = {};  // observed translation: the matrix of that sighting (dynamic keys: entry.world)
+  std::string failed_reason;
+  uint32_t static_instance_count = 0u;
+  bool has_dynamic = false;
+  uint64_t records_from_light = 0u;
+  uint32_t last_light_record_frame = 0u;
+};
+
+// Caller holds g_pool.mutex.
+inline std::vector<PoolShadowRow> SnapshotPoolShadowCoverage(uint32_t frame) {
+  std::unordered_map<uint64_t, PoolShadowRow> rows;
+  for (const auto& [key, observed] : g_pool.observations) {
+    if (observed.light_frames == 0u || observed.last_light_frame + 600u < frame) continue;
+    PoolShadowRow& row = rows[key.mesh_key];
+    row.mesh_key = key.mesh_key;
+    if (!row.has_world || observed.last_light_frame > row.last_light_frame) {
+      row.has_world = true;
+      row.last_light_frame = observed.last_light_frame;
+      row.vs_hash = observed.vs_hash;
+      std::memcpy(row.world, observed.matrix, sizeof(row.world));
+    }
+  }
+  for (const WorldInstance& instance : g_pool.instances) {
+    const auto row = rows.find(instance.mesh_key);
+    if (row != rows.end()) row->second.static_instance_count += 1u;
+  }
+  std::vector<PoolShadowRow> out;
+  out.reserve(rows.size());
+  for (auto& [key, row] : rows) {
+    const auto mesh_it = g_pool.mesh_by_key.find(key);
+    if (mesh_it != g_pool.mesh_by_key.end() && mesh_it->second < g_pool.meshes.size()) {
+      const WorldMesh& mesh = g_pool.meshes[mesh_it->second];
+      row.has_mesh = true;
+      row.mesh_uid = mesh.uid;
+      row.triangles = mesh.triangle_count;
+      std::memcpy(row.bbox_min, mesh.bbox_min, sizeof(row.bbox_min));
+      std::memcpy(row.bbox_max, mesh.bbox_max, sizeof(row.bbox_max));
+      row.flagged = mesh.dynamic;
+      row.alpha = mesh.alpha;
+    }
+    const auto failed = g_pool.failed_meshes.find(key);
+    if (failed != g_pool.failed_meshes.end()) row.failed_reason = failed->second.reason;
+    const auto dynamic_entry = g_pool.dynamic_keys.find(key);
+    if (dynamic_entry != g_pool.dynamic_keys.end()) {
+      row.has_dynamic = true;
+      row.records_from_light = dynamic_entry->second.records_from_light;
+      row.last_light_record_frame = dynamic_entry->second.last_light_record_frame;
+      std::memcpy(row.world, dynamic_entry->second.world, sizeof(row.world));
+    }
+    out.push_back(row);
+  }
+  return out;
+}
+
 // P2b: the per-frame path of moving meshes. The record counts are reserved slots (validity is not read back).
 inline void WritePoolP2b(std::ostringstream& out, const PoolStats& stats) {
   out << "  \"p2b\": {\"per_frame\": " << (g_pool.dynamic_per_frame.load() ? "true" : "false")
@@ -6705,6 +6773,100 @@ inline std::string PoolJsonEscape(const std::string& text) {
   return escaped;
 }
 
+// world_pool.json "shadow_coverage": meshes with a light draw seen in the last 600 frames, nearest the camera first. The
+// verdict is the first rule that matches (diagnostic only).
+inline void WritePoolShadowCoverage(std::ostream& out, const std::vector<PoolShadowRow>& rows, const PoolCameraInfo& camera,
+                                    uint32_t frame) {
+  struct Candidate {
+    const PoolShadowRow* row = nullptr;
+    float translation[3] = {};
+    float distance = 0.f;
+    std::string verdict;
+  };
+  std::vector<Candidate> candidates;
+  for (const PoolShadowRow& row : rows) {
+    Candidate& candidate = candidates.emplace_back();
+    candidate.row = &row;
+    float offset_sq = 0.f;
+    if (row.has_world) {
+      PoolMatrixTranslation(row.world, candidate.translation);
+      for (int k = 0; k < 3; ++k) {
+        const float d = candidate.translation[k] - camera.position[k];
+        offset_sq += d * d;
+      }
+    }
+    candidate.distance = std::sqrt(offset_sq);
+    if (!row.has_mesh) {
+      candidate.verdict = "no_mesh";
+    } else if (!row.failed_reason.empty()) {
+      candidate.verdict = "mesh_failed:" + row.failed_reason;
+    } else if (row.alpha && row.flagged) {
+      candidate.verdict = "alpha_dynamic_skipped";
+    } else if (row.static_instance_count > 0u) {
+      candidate.verdict = "covered_static";
+    } else if (row.has_dynamic && row.records_from_light > 0u && row.last_light_record_frame + kPoolMovingHoldFrames >= frame) {
+      candidate.verdict = "covered_p2b";
+    } else if (!row.flagged) {
+      candidate.verdict = "no_admitted_instance";
+    } else {
+      candidate.verdict = "no_light_records_since_frame " + std::to_string(row.last_light_record_frame);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+    if (a.row->has_world != b.row->has_world) return a.row->has_world;
+    return a.distance != b.distance ? a.distance < b.distance : a.row->mesh_key < b.row->mesh_key;
+  });
+  const size_t shown = (std::min)(candidates.size(), kPoolDumpMaxShadowCoverage);
+  out << "  \"shadow_coverage\": [";
+  for (size_t i = 0; i < shown; ++i) {
+    const Candidate& c = candidates[i];
+    const PoolShadowRow& row = *c.row;
+    // Mesh fields print null while the mesh does not exist (verdict no_mesh); the translation while no sighting exists.
+    const auto mesh_value = [&](auto value) {
+      if (row.has_mesh) {
+        out << value;
+      } else {
+        out << "null";
+      }
+    };
+    out << (i != 0u ? ",\n    " : "\n    ") << "{\"mesh_uid\": ";
+    mesh_value(row.mesh_uid);
+    out << ", \"mesh_key\": \"" << renodx::utils::log::AsHex(row.mesh_key) << "\", \"vs_hash\": \"" << PoolHashText(row.vs_hash)
+        << "\", \"triangles\": ";
+    mesh_value(row.triangles);
+    out << ", \"bbox_size\": ";
+    if (row.has_mesh) {
+      float size_sq = 0.f;
+      for (int k = 0; k < 3; ++k) {
+        const float s = row.bbox_max[k] - row.bbox_min[k];
+        size_sq += s * s;
+      }
+      out << PoolJsonFloat{std::sqrt(size_sq)};
+    } else {
+      out << "null";
+    }
+    out << ", \"observed_world_translation\": ";
+    if (row.has_world) {
+      out << "[" << PoolJsonFloat{c.translation[0]} << ", " << PoolJsonFloat{c.translation[1]} << ", " << PoolJsonFloat{c.translation[2]} << "]";
+    } else {
+      out << "null";
+    }
+    out << ", \"distance_m\": ";
+    if (row.has_world) {
+      out << PoolJsonFloat{c.distance};
+    } else {
+      out << "null";
+    }
+    out << ", \"last_light_draw_frame\": " << row.last_light_frame << ", \"static_instance_count\": " << row.static_instance_count
+        << ", \"flagged_now\": ";
+    mesh_value(row.flagged ? "true" : "false");
+    out << ", \"alpha\": ";
+    mesh_value(row.alpha ? "true" : "false");
+    out << ", \"verdict\": \"" << PoolJsonEscape(c.verdict) << "\"}";
+  }
+  out << "\n  ],\n";
+}
+
 struct PoolAlphaKeyDump {
   uint64_t key = 0u;
   int64_t mesh_id = -1;  // -1: no mesh yet
@@ -6876,6 +7038,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   std::vector<uint8_t> instance_alpha, instance_wind;        // per instance (the instance order of the dump)
   PoolMotionDetail motion_detail;
   std::vector<PoolDynamicDumpEntry> dynamic;
+  std::vector<PoolShadowRow> shadow;
   std::vector<PoolStaleDynamicDump> stale_dynamic;
   std::unordered_map<uint64_t, PoolMeshFailure> failed_meshes;
   std::unordered_map<uint64_t, PoolMeshMismatch> mismatch_meshes;
@@ -6982,6 +7145,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
     }
     motion_detail = g_pool.motion_detail;
     dynamic = SnapshotPoolDynamic();
+    shadow = SnapshotPoolShadowCoverage(frame);
     region = CurrentPoolRegion();
     inspect = g_pool.inspect;
     dynamic_applied = g_pool.dynamic_applied;
@@ -7344,6 +7508,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   WritePoolMotion(out, stats.motion, motion_detail, instances);
   WritePoolDynamic(out, dynamic, stats);
   WritePoolDynamicCandidates(out, dynamic, camera, alpha_maps, frame);
+  WritePoolShadowCoverage(out, shadow, camera, frame);
   WritePoolP2b(out, stats);
   out << "  \"tlas_timing\": {\"rebuilds\": " << tlas_timing.rebuilds
       << ", \"rebuilds_refit_quality\": " << tlas_timing.rebuilds_refit_quality

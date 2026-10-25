@@ -918,6 +918,21 @@ int main() {
       CHECK(known, "world_pool.json dynamic_candidates verdict is a known string (at %zu)", at);
     }
   }
+  {
+    const std::vector<uint8_t> bytes = ReadFile((bvh::PoolOutputDir() / "world_pool.json").string());
+    const std::string text(bytes.begin(), bytes.end());
+    const size_t list = text.find("\"shadow_coverage\": [");
+    const size_t list_end = list == std::string::npos ? std::string::npos : text.find("\n  ],", list);
+    CHECK(list != std::string::npos && list_end != std::string::npos, "world_pool.json shadow_coverage list present");
+    const char* verdicts[] = {"\"no_mesh\"", "\"mesh_failed:", "\"alpha_dynamic_skipped\"", "\"covered_static\"", "\"covered_p2b\"",
+                              "\"no_admitted_instance\"", "\"no_light_records_since_frame "};
+    for (size_t at = text.find("\"verdict\": ", list); list != std::string::npos && at != std::string::npos && at < list_end;
+         at = text.find("\"verdict\": ", at + 1)) {
+      bool known = false;
+      for (const char* verdict : verdicts) known = known || text.compare(at + 11, std::strlen(verdict), verdict) == 0;
+      CHECK(known, "world_pool.json shadow_coverage verdict is a known string (at %zu)", at);
+    }
+  }
   bvh::OnDestroyDevicePool(&dev);
   std::printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAILED", g_failures);
   Golden("end");
