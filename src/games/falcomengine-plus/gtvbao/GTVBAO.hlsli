@@ -14,18 +14,12 @@
 // Version history: see GTVBAO.h
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#ifdef GT_VBAO_SHOW_DEBUG_VIZ
-#include "vaShared.hlsl"
-#endif
-
-#if defined( GT_VBAO_SHOW_NORMALS ) || defined( GT_VBAO_SHOW_EDGES ) || defined( GT_VBAO_SHOW_BENT_NORMALS )
-RWTexture2D<float4>         g_outputDbgImage    : register( u2 );
-#endif
-
 #include "GTVBAO.h"
 
 #define GT_VBAO_PI               	(3.1415926535897932384626433832795)
 #define GT_VBAO_PI_HALF             (1.5707963267948966192313216916398)
+#define GT_VBAO_RCP_PI              (0.31830988618379067153776752674503)
+#define GT_VBAO_RCP_PI_HALF         (0.63661977236758134307553505349006)
 
 #ifndef GT_VBAO_USE_HALF_FLOAT_PRECISION
 #define GT_VBAO_USE_HALF_FLOAT_PRECISION 1
@@ -61,42 +55,6 @@ RWTexture2D<float4>         g_outputDbgImage    : register( u2 );
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// R11G11B10_UNORM <-> float3
-float3 GTVBAO_R11G11B10_UNORM_to_FLOAT3( uint packedInput )
-{
-    float3 unpackedOutput;
-    unpackedOutput.x = (float)( ( packedInput       ) & 0x000007ff ) / 2047.0f;
-    unpackedOutput.y = (float)( ( packedInput >> 11 ) & 0x000007ff ) / 2047.0f;
-    unpackedOutput.z = (float)( ( packedInput >> 22 ) & 0x000003ff ) / 1023.0f;
-    return unpackedOutput;
-}
-// 'unpackedInput' is float3 and not float3 on purpose as half float lacks precision for below!
-uint GTVBAO_FLOAT3_to_R11G11B10_UNORM( float3 unpackedInput )
-{
-    uint packedOutput;
-    packedOutput =( ( uint( VA_SATURATE( unpackedInput.x ) * 2047 + 0.5f ) ) |
-        ( uint( VA_SATURATE( unpackedInput.y ) * 2047 + 0.5f ) << 11 ) |
-        ( uint( VA_SATURATE( unpackedInput.z ) * 1023 + 0.5f ) << 22 ) );
-    return packedOutput;
-}
-//
-lpfloat4 GTVBAO_R8G8B8A8_UNORM_to_FLOAT4( uint packedInput )
-{
-    lpfloat4 unpackedOutput;
-    unpackedOutput.x = (lpfloat)( packedInput & 0x000000ff ) / (lpfloat)255;
-    unpackedOutput.y = (lpfloat)( ( ( packedInput >> 8 ) & 0x000000ff ) ) / (lpfloat)255;
-    unpackedOutput.z = (lpfloat)( ( ( packedInput >> 16 ) & 0x000000ff ) ) / (lpfloat)255;
-    unpackedOutput.w = (lpfloat)( packedInput >> 24 ) / (lpfloat)255;
-    return unpackedOutput;
-}
-//
-uint GTVBAO_FLOAT4_to_R8G8B8A8_UNORM( lpfloat4 unpackedInput )
-{
-    return (( uint( saturate( unpackedInput.x ) * (lpfloat)255 + (lpfloat)0.5 ) ) |
-            ( uint( saturate( unpackedInput.y ) * (lpfloat)255 + (lpfloat)0.5 ) << 8 ) |
-            ( uint( saturate( unpackedInput.z ) * (lpfloat)255 + (lpfloat)0.5 ) << 16 ) |
-            ( uint( saturate( unpackedInput.w ) * (lpfloat)255 + (lpfloat)0.5 ) << 24 ) );
-}
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -107,12 +65,6 @@ float3 GTVBAO_ComputeViewspacePosition( const float2 screenPos, const float view
     ret.xy = (consts.NDCToViewMul * screenPos.xy + consts.NDCToViewAdd) * viewspaceDepth;
     ret.z = viewspaceDepth;
     return ret;
-}
-
-// ── Inverse of GTVBAO_ComputeViewspacePosition: view-space → screen-space UV ──
-float2 GTVBAO_ProjectViewToScreen(float3 viewPos, GTAOConstants consts) {
-    float2 ndc = viewPos.xy / max(viewPos.z, 1e-5f);
-    return (ndc - consts.NDCToViewAdd) / consts.NDCToViewMul;
 }
 
 float GTVBAO_ScreenSpaceToViewSpaceDepth( const float screenDepth, const GTAOConstants consts )
@@ -153,30 +105,6 @@ float3 GTVBAO_CalculateNormal( const float4 edgesLRTB, float3 pixCenterPos, floa
     return pixelNormal;
 }
 
-#ifdef GT_VBAO_SHOW_DEBUG_VIZ
-float4 DbgGetSliceColor(int slice, int sliceCount, bool mirror)
-{
-    float red = (float)slice / (float)sliceCount; float green = 0.01; float blue = 1.0 - (float)slice / (float)sliceCount;
-    return (mirror)?(float4(blue, green, red, 0.9)):(float4(red, green, blue, 0.9));
-}
-#endif
-
-// http://h14s.p5r.org/2012/09/0x5f3759df.html, [Drobot2014a] Low Level Optimizations for GCN, https://blog.selfshadow.com/publications/s2016-shading-course/activision/s2016_pbs_activision_occlusion.pdf slide 63
-lpfloat GTVBAO_FastSqrt( float x )
-{
-    return (lpfloat)(asfloat( 0x1fbd1df5 + ( asint( x ) >> 1 ) ));
-}
-// input [-1, 1] and output [0, PI], from https://seblagarde.wordpress.com/2014/12/01/inverse-trigonometric-functions-gpu-optimization-for-amd-gcn-architecture/
-lpfloat GTVBAO_FastACos( lpfloat inX )
-{ 
-    const lpfloat PI = 3.141593;
-    const lpfloat HALF_PI = 1.570796;
-    lpfloat x = abs(inX); 
-    lpfloat res = -0.156583 * x + HALF_PI; 
-    res *= GTVBAO_FastSqrt(1.0 - x); 
-    return (inX >= 0) ? res : PI - res; 
-}
-
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Visibility Bitmask helpers (Therrien/Levesque/Gilet 2023)
 // Replaces GTAO's two horizon angles with a uint bitmask of N_b sectors.
@@ -185,165 +113,130 @@ lpfloat GTVBAO_FastACos( lpfloat inX )
 #define GT_VBAO_BITMASK_SECTOR_COUNT 32u
 
 
-// Population count (count set bits in uint).
-uint GTVBAO_CountBits(uint v)
-{
-    v = v - ((v >> 1u) & 0x55555555u);
-    v = (v & 0x33333333u) + ((v >> 2u) & 0x33333333u);
-    v = (v + (v >> 4u)) & 0x0F0F0F0Fu;
-    v = v + (v >> 8u);
-    v = v + (v >> 16u);
-    return v & 0x3Fu;
-}
-
-// Mark sectors between minHorizon and maxHorizon as occluded.
-// minHorizon, maxHorizon: normalized [0, 1] across the hemisphere slice.
-// Half-coverage criterion (paper: "we used the round criterion which requires
-// the sector to be half covered"), plus the range guards the reference carries
-// (bufferc.txt:787-788). Without the guards a start index of 32 or a width above
-// 32 makes the shift count leave [0,31] and the top sectors are silently dropped.
-uint GTVBAO_UpdateSectors(float minHorizon, float maxHorizon, uint globalOccludedBitfield)
-{
-    uint startHorizonInt = min((uint)(minHorizon * GT_VBAO_BITMASK_SECTOR_COUNT), GT_VBAO_BITMASK_SECTOR_COUNT - 1u);
-    uint angleHorizonInt = (uint)round(saturate(maxHorizon - minHorizon) * GT_VBAO_BITMASK_SECTOR_COUNT);
-    if (angleHorizonInt == 0u) return globalOccludedBitfield;
-    uint angleHorizonBitfield = 0xFFFFFFFFu >> (GT_VBAO_BITMASK_SECTOR_COUNT - min(angleHorizonInt, GT_VBAO_BITMASK_SECTOR_COUNT));
-    return globalOccludedBitfield | (angleHorizonBitfield << startHorizonInt);
-}
-
 // ═══════════════════════════════════════════════════════════════
 // GTVBAO helpers — Ground Truth Visibility Bitmask AO upgrades
 // ═══════════════════════════════════════════════════════════════
 
-// ── SinStep: C1-continuous sinusoid s-curve (reference implementation) ──
-float GTVBAO_SinStep(float x) {
-    return 0.5f - 0.5f * cos(x * GT_VBAO_PI);
+// bufferc.txt:490-504
+float GTVBAO_SliceRelCDF_Uniform(float x, float angN, bool isPhiLargerThanAngN)
+{
+    if (x <= 0.0f || x >= 1.0f) return x;
+
+    float phi = x * GT_VBAO_PI - GT_VBAO_PI_HALF;
+
+    bool c = isPhiLargerThanAngN;
+
+    float m0 = c ? 2.0f : 0.0f;
+    float m1 = c ? -1.0f : 1.0f;
+
+    float d0 = 0.5f * (m0 + m1 * cos(angN - phi) + sin(angN));
+
+    return d0;
 }
 
-// ── InvSinStep: analytic inverse (reference implementation) ──
-float GTVBAO_InvSinStep(float y) {
-    return acos(1.0f - 2.0f * saturate(y)) * (1.0f / GT_VBAO_PI);
+// bufferc.txt:506-522
+float GTVBAO_SliceRelCDF_Cos(float x, float angN, float cosN, bool isPhiLargerThanAngN)
+{
+    if (x <= 0.0f || x >= 1.0f) return x;
+
+    float phi = x * GT_VBAO_PI - GT_VBAO_PI_HALF;
+
+    bool c = isPhiLargerThanAngN;
+
+    float n0 = c ? 3.0f : 1.0f;
+    float n1 = c ? -1.0f : 1.0f;
+    float n2 = c ? 4.0f : 0.0f;
+
+    float t0 = n0 * cosN + n1 * cos(angN - 2.0f * phi) + (n2 * angN + (n1 * 2.0f) * phi + GT_VBAO_PI) * sin(angN);
+    float t1 = 4.0f * (cosN + angN * sin(angN));
+
+    return t0 / (abs(t1) > 1e-6f ? t1 : 1e-6f);
 }
 
-// ── QBias: quadratic bias for CDF morphing (reference implementation) ──
-float GTVBAO_QBias(float x, float b) {
-    return x + (x - x * x) * b;
+// bufferc.txt:339-359
+float4 GTVBAO_GetQuaternion(float3 to)
+{
+    float3 xyz = float3(to.y, -to.x, 0.0f);
+    float s = -to.z;
+
+    float u = rsqrt(max(0.0f, s * 0.5f + 0.5f));
+    s = 1.0f / u;
+    xyz *= u * 0.5f;
+
+    return float4(xyz, s);
 }
 
-// ── Cosine-weighted slice sampling (Mode 3: CDF importance sampling, optimized) ──
-// Maps uniform [0,1] to phi angle [0, PI] from cosine-weighted lobe.
-// Per doc.txt: outer SinStep/InvSinStep cancelled by working in mapped space.
-//
-// The stretch factor s = QBias(sqrt(1 - NdotV^2), 0.15) and everything derived
-// from it are per-pixel (they depend only on NdotV), so the caller evaluates
-// them once via GTVBAO_CdfSinK / GTVBAO_CdfInvPiS / GTVBAO_CdfDegenerate and
-// calls the sampler below per slice. This keeps only the asin() in the loop.
-float GTVBAO_SampleSliceCosine_Mode3(float rnd, float sinK, float invPiS, bool degenerate) {
-    // s -> 0 when the normal points straight at the viewer; the reference
-    // analytic form is the identity there, so preserve that.
-    if (degenerate) return rnd * GT_VBAO_PI;
-    float u = asin(sinK * (1.0f - 2.0f * rnd));
-    return (0.5f - u * invPiS) * GT_VBAO_PI;
+// bufferc.txt:372-382
+float3 GTVBAO_Transform_Qz0(float3 v, float4 q)
+{
+    float k = v.y * q.x - v.x * q.y;
+    float g = 2.0f * (v.z * q.w + k);
+
+    float3 r;
+    r.xy = v.xy + q.yx * float2(g, -g);
+    r.z = v.z + 2.0f * (q.w * k - v.z * dot(q.xy, q.xy));
+
+    return r;
 }
 
-// ── Cosine-weighted slice sampling (Mode 2: Ray projection) ──
-// Samples direction from cosine lobe around N, projects to screen-space slice angle
-// with perspective correction (matching research paper reference implementation).
-float GTVBAO_SampleSliceCosine_Mode2(float rnd0, float rnd1, float3 N_view,
-    float3 pixCenterPos, float2 normalizedScreenPos, GTAOConstants consts) {
-    // Sample from cosine lobe around N in view space
-    float phi_lobe = 6.283185307f * rnd0;
-    float cosTheta = sqrt(rnd1);
-    float sinTheta = sqrt(saturate(1.0f - cosTheta * cosTheta));
-    // Build orthonormal basis around N_view
-    float3 T, B;
-    if (abs(N_view.z) < 0.999f) {
-        T = normalize(cross(float3(0, 0, 1), N_view));
-    } else {
-        T = float3(1, 0, 0);
+// bufferc.txt:385-395
+float3 GTVBAO_Transform_Vz0Qz0(float2 v, float4 q)
+{
+    float o = q.x * v.y;
+    float c = q.y * v.x;
+
+    float3 b = float3(o - c, -o + c, o - c);
+
+    return float3(v, 0.0f) + 2.0f * (b * float3(q.y, q.x, q.w));
+}
+
+// bufferc.txt:170-236 (HQ branch, 196-198)
+float2 GTVBAO_SampleSliceDir(float3 vvsN, float rnd01)
+{
+    float ang0 = rnd01 * GT_VBAO_PI;
+
+    float2 dir0 = float2(cos(ang0), sin(ang0));
+
+    float l = length(vvsN.xy);
+
+    if (l == 0.0f) return dir0;
+
+    // flip dir0 into hemi-circle of rsN.xy
+    dir0 *= dot(dir0, vvsN.xy) < 0.0f ? -1.0f : 1.0f;
+
+    float2 n = vvsN.xy / l;
+
+    float2 dir;
+    {
+        float x = dir0.x * n.y - dir0.y * n.x;
+
+        float s = l;
+        s += (s - s * s) * 0.15f;
+
+        float y = acos(clamp(x * sin(s * GT_VBAO_PI_HALF), -1.0f, 1.0f)) * GT_VBAO_RCP_PI_HALF;
+
+        float ys = 1.0f / max(s, 1e-6f);
+        dir.y = ys - ys * y;
+        dir.x = sqrt(clamp(1.0f - dir.y * dir.y, 0.0f, 1.0f));
     }
-    B = cross(N_view, T);
-    // Cosine-lobe direction in view space
-    float3 lobeDirVS = T * (sinTheta * cos(phi_lobe))
-                     + B * (sinTheta * sin(phi_lobe))
-                     + N_view * cosTheta;
-    // Project lobe direction to screen space with perspective correction
-    // (matches reference: SPos_from_VPos(positionVS + smplDirVS * nearZ*0.5) - SPos_from_VPos(positionVS))
-    float viewOffset = abs(pixCenterPos.z) * 0.01f;
-    float3 offsetPosVS = pixCenterPos + lobeDirVS * viewOffset;
-    float2 screenOffset = GTVBAO_ProjectViewToScreen(offsetPosVS, consts);
-    float2 screenDir = screenOffset - normalizedScreenPos;
-    // Convert screen-space direction to phi (matching omega = (cosPhi, -sinPhi) convention)
-    float phi = atan2(-screenDir.y, screenDir.x);
-    if (phi < 0.0f) phi += GT_VBAO_PI;
-    return phi;
+
+    return float2(dir.x * n.x - dir.y * n.y,
+                  dir.y * n.x + dir.x * n.y);
 }
 
-// ── CDF remapping of horizon angles ──
-// Accounts for non-uniform sample density near the view pole. sinNV and blend
-// depend only on NdotV, so GTVBAO_MainPass hoists them (and the resulting
-// t*mul+add coefficients) once per pixel.
-float GTVBAO_CdfRemapSinNV(float NdotV) {
-    return sqrt(saturate(1.0f - NdotV * NdotV));
-}
-
-uint GTVBAO_EncodeVisibilityBentNormal( lpfloat visibility, lpfloat3 bentNormal )
+// Screen-space direction (pixels, unit length) of the view-space direction D at P.
+float2 GTVBAO_ScreenDirFromViewDir(float3 P, float3 D, GTAOConstants consts)
 {
-    return GTVBAO_FLOAT4_to_R8G8B8A8_UNORM( lpfloat4( bentNormal * 0.5 + 0.5, visibility ) );
+    float2 dNdc = (D.xy - (P.xy / P.z) * D.z) / P.z;
+    float2 dUv = dNdc / consts.NDCToViewMul;
+    float2 dPx = dUv / consts.ViewportPixelSize;
+    return dPx * rsqrt(max(dot(dPx, dPx), 1e-12f));
 }
 
-void GTVBAO_DecodeVisibilityBentNormal( const uint packedValue, out lpfloat visibility, out lpfloat3 bentNormal )
-{
-    lpfloat4 decoded = GTVBAO_R8G8B8A8_UNORM_to_FLOAT4( packedValue );
-    bentNormal = decoded.xyz * lpfloat3( 2.0, 2.0, 2.0 ) - lpfloat3( 1.0, 1.0, 1.0 );   // could normalize - don't want to since it's done so many times, better to do it at the final step only
-    visibility = decoded.w;
-}
-
-void GTVBAO_OutputWorkingTerm( const uint2 pixCoord, lpfloat visibility, lpfloat3 bentNormal, RWTexture2D<uint> outWorkingAOTerm )
+void GTVBAO_OutputWorkingTerm( const uint2 pixCoord, lpfloat visibility, RWTexture2D<uint> outWorkingAOTerm )
 {
     visibility = saturate( visibility / lpfloat(GT_VBAO_OCCLUSION_TERM_SCALE) );
-#ifdef GT_VBAO_COMPUTE_BENT_NORMALS
-    outWorkingAOTerm[pixCoord] = GTVBAO_EncodeVisibilityBentNormal( visibility, bentNormal );
-#else
     outWorkingAOTerm[pixCoord] = uint(visibility * 255.0 + 0.5);
-#endif
-}
-
-// "Efficiently building a matrix to rotate one vector to another"
-// http://cs.brown.edu/research/pubs/pdfs/1999/Moller-1999-EBA.pdf / https://dl.acm.org/doi/10.1080/10867651.1999.10487509
-// (using https://github.com/assimp/assimp/blob/master/include/assimp/matrix3x3.inl#L275 as a code reference as it seems to be best)
-lpfloat3x3 GTVBAO_RotFromToMatrix( lpfloat3 from, lpfloat3 to )
-{
-    const lpfloat e       = dot(from, to);
-    const lpfloat f       = abs(e); //(e < 0)? -e:e;
-
-    // WARNING: This has not been tested/worked through, especially not for 16bit floats; seems to work in our special use case (from is always {0, 0, -1}) but wouldn't use it in general
-    if( f > lpfloat( 1.0 - 0.0003 ) )
-        return lpfloat3x3( 1, 0, 0, 0, 1, 0, 0, 0, 1 );
-
-    const lpfloat3 v      = cross( from, to );
-    /* ... use this hand optimized version (9 mults less) */
-    const lpfloat h       = (1.0)/(1.0 + e);      /* optimization by Gottfried Chen */
-    const lpfloat hvx     = h * v.x;
-    const lpfloat hvz     = h * v.z;
-    const lpfloat hvxy    = hvx * v.y;
-    const lpfloat hvxz    = hvx * v.z;
-    const lpfloat hvyz    = hvz * v.y;
-
-    lpfloat3x3 mtx;
-    mtx[0][0] = e + hvx * v.x;
-    mtx[0][1] = hvxy - v.z;
-    mtx[0][2] = hvxz + v.y;
-
-    mtx[1][0] = hvxy + v.z;
-    mtx[1][1] = e + h * v.y * v.y;
-    mtx[1][2] = hvyz - v.x;
-
-    mtx[2][0] = hvxz - v.y;
-    mtx[2][1] = hvyz + v.x;
-    mtx[2][2] = e + hvz * v.z;
-
-    return mtx;
 }
 
 void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPerSlice, const lpfloat2 localNoise, lpfloat3 viewspaceNormal, const GTAOConstants consts, 
@@ -414,20 +307,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
           uint2(g_mrtW, g_mrtH), GTVBAO_foliage_channel_mode >= 0.5f, g_halfRes);
     }
 
-	// Generating screen space normals in-place is faster than generating normals in a separate pass but requires
-	// use of 32bit depth buffer (16bit works but visibly degrades quality) which in turn slows everything down. So to
-	// reduce complexity and allow for screen space normal reuse by other effects, we've pulled it out into a separate
-	// pass.
-	// However, we leave this code in, in case anyone has a use-case where it fits better.
-#ifdef GT_VBAO_GENERATE_NORMALS_INPLACE
-    float3 CENTER   = GTVBAO_ComputeViewspacePosition( normalizedScreenPos, viewspaceZ, consts );
-    float3 LEFT     = GTVBAO_ComputeViewspacePosition( normalizedScreenPos + float2(-1,  0) * consts.ViewportPixelSize, pixLZ, consts );
-    float3 RIGHT    = GTVBAO_ComputeViewspacePosition( normalizedScreenPos + float2( 1,  0) * consts.ViewportPixelSize, pixRZ, consts );
-    float3 TOP      = GTVBAO_ComputeViewspacePosition( normalizedScreenPos + float2( 0, -1) * consts.ViewportPixelSize, pixTZ, consts );
-    float3 BOTTOM   = GTVBAO_ComputeViewspacePosition( normalizedScreenPos + float2( 0,  1) * consts.ViewportPixelSize, pixBZ, consts );
-    viewspaceNormal = (lpfloat3)GTVBAO_CalculateNormal( edgesLRTB, CENTER, LEFT, RIGHT, TOP, BOTTOM );
-#endif
-
     // Move center pixel slightly towards camera to avoid imprecision artifacts due to depth buffer imprecision; offset depends on depth texture format used
 #ifdef GT_VBAO_FP32_DEPTHS
     viewspaceZ *= 0.99999;     // this is good for FP32 depth buffer
@@ -441,41 +320,22 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     // prevents normals that are facing away from the view vector - GTVBAO struggles with extreme cases, but in Vanilla it seems rare so it's disabled by default
     // viewspaceNormal = normalize( viewspaceNormal + max( 0, -dot( viewspaceNormal, viewVec ) ) * viewVec );
 
-#ifdef GT_VBAO_SHOW_NORMALS
-    g_outputDbgImage[pixCoord] = float4( DisplayNormalSRGB( viewspaceNormal.xyz ), 1 );
-#endif
-
-#ifdef GT_VBAO_SHOW_EDGES
-    g_outputDbgImage[pixCoord] = 1.0 - float4( edgesLRTB.x, edgesLRTB.y * 0.5 + edgesLRTB.w * 0.5, edgesLRTB.z, 1.0 );
-#endif
-
     const lpfloat effectRadius              = (lpfloat)consts.EffectRadius * (lpfloat)consts.RadiusMultiplier;
     const lpfloat sampleDistributionPower   = (lpfloat)consts.SampleDistributionPower;
     const lpfloat bitmaskThickness          = (lpfloat)consts.BitmaskThickness;
 
     lpfloat visibility = 0;
-    lpfloat totalWeight = 0.0; // GTVBAO cosine mode 0: accumulate actual weight sum
-#ifdef GT_VBAO_COMPUTE_BENT_NORMALS
-    lpfloat3 bentNormal = 0;
-#else
-    lpfloat3 bentNormal = viewspaceNormal;
-#endif
-    // ── Per-pixel constants hoisted out of the slice/sample loops ──
-    // viewspaceNormal and viewVec are per-pixel, so NdotV, the CDF horizon
-    // remap terms and the Mode-3 slice-sampler terms are all invariant
-    // across every slice and sample of this pixel. Evaluating them once here
-    // removes ~108 sqrt and ~18 transcendental ops per pixel at Ultra.
-    const float g_sliceNdotV = saturate(dot((float3)viewspaceNormal, (float3)viewVec));
-    const float g_remapSinNV = GTVBAO_CdfRemapSinNV(g_sliceNdotV);
-    const float g_remapBlend = 1.0f - g_remapSinNV;
-    const float sCdf = GTVBAO_QBias(g_remapSinNV, 0.15f);
-    const bool  g_cdfDegen  = sCdf < 0.00001f;
-    const float g_cdfSinK   = g_cdfDegen ? 0.0f : sin(sCdf * GT_VBAO_PI * 0.5f);
-    const float g_cdfInvPiS = g_cdfDegen ? 0.0f : 1.0f / (GT_VBAO_PI * sCdf);
-    // RemapHorizonCDF(t) = lerp(t, 0.5 + (t - 0.5) * sinNV, blend) reduces to
-    // t * mul + add with these per-pixel coefficients.
-    const float g_cdfRemapMul = 1.0f - g_remapBlend + g_remapBlend * g_remapSinNV;
-    const float g_cdfRemapAdd = 0.5f * g_remapBlend * (1.0f - g_remapSinNV);
+    // ── Per-pixel setup (bufferc.txt:628-633) ──
+    const float3 V          = (float3)viewVec;
+    const float3 N          = (float3)viewspaceNormal;
+    const float3 positionVS = pixCenterPos;
+    const int  cosineMode   = (int)GTVBAO_gtvbao_cosine_mode;
+    const bool useUniform   = GTVBAO_hemisphere_weighting > 0.5f;
+    const float4 Q_toV      = GTVBAO_GetQuaternion(V);
+    const float4 Q_fromV    = Q_toV * float4(-1.0f, -1.0f, -1.0f, 1.0f);
+    float3 normalVVS        = N;
+    if (!useUniform && cosineMode == 2) normalVVS = GTVBAO_Transform_Qz0(N, Q_fromV);
+    bool degenerate = false;
     // ── Debug accumulators for bitmask viz (modes 6-8) ──
     uint debugTotalSectorCoverage = 0u;
     uint debugTotalSamples = 0u;
@@ -491,15 +351,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     float dbgSliceAOSum = 0.0f;        // sum of per-slice unweighted sliceAO
     float dbgSliceN = 0.0f;            // number of slices accumulated
 
-#ifdef GT_VBAO_SHOW_DEBUG_VIZ
-    float3 dbgWorldPos          = mul(g_globals.ViewInv, float4(pixCenterPos, 1)).xyz;
-#endif
-
-    // see "Algorithm 1" in https://www.activision.com/cdn/research/Practical_Real_Time_Strategies_for_Accurate_Indirect_Occlusion_NEW%20VERSION_COLOR.pdf
     {
-        const lpfloat noiseSlice  = (lpfloat)localNoise.x;
-        const lpfloat noiseSample = (lpfloat)localNoise.y;
-
         // quality settings / tweaks / hacks
         const lpfloat pixelTooCloseThreshold  = 1.3;      // if the offset is under approx pixel size (pixelTooCloseThreshold), push it out to the minimum distance
 
@@ -508,141 +360,99 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
         lpfloat screenspaceRadius   = effectRadius / (lpfloat)pixelDirRBViewspaceSizeAtCenterZ.x;
 
-        // fade out for small screen radii 
+        // fade out for small screen radii
         visibility += saturate((10 - screenspaceRadius)/100)*0.5;
 
 #if 0   // sensible early-out for even more performance; disabled because not yet tested
         [branch]
         if( screenspaceRadius < pixelTooCloseThreshold )
         {
-            GTVBAO_OutputWorkingTerm( pixCoord, 1, viewspaceNormal, outWorkingAOTerm );
+            GTVBAO_OutputWorkingTerm( pixCoord, 1, outWorkingAOTerm );
             return;
-        }
-#endif
-
-#ifdef GT_VBAO_SHOW_DEBUG_VIZ
-        [branch] if (IsUnderCursorRange(pixCoord, int2(1, 1)))
-        {
-            float3 dbgWorldNorm     = mul((float3x3)g_globals.ViewInv, viewspaceNormal).xyz;
-            float3 dbgWorldViewVec  = mul((float3x3)g_globals.ViewInv, viewVec).xyz;
-            //DebugDraw3DArrow(dbgWorldPos, dbgWorldPos + 0.5 * dbgWorldViewVec, 0.02, float4(0, 1, 0, 0.95));
-            //DebugDraw2DCircle(pixCoord, screenspaceRadius, float4(1, 0, 0.2, 1));
-            DebugDraw3DSphere(dbgWorldPos, effectRadius, float4(1, 0.2, 0, 0.1));
-            //DebugDraw3DText(dbgWorldPos, float2(0, 0), float4(0.6, 0.3, 0.3, 1), float4( pixelDirRBViewspaceSizeAtCenterZ.xy, 0, screenspaceRadius) );
         }
 #endif
 
         // this is the min distance to start sampling from to avoid sampling from the center pixel (no useful data obtained from sampling center pixel)
         const lpfloat minS = (lpfloat)pixelTooCloseThreshold / screenspaceRadius;
 
-        //[unroll]
-        for( lpfloat slice = 0; slice < sliceCount; slice++ )
+        for (int slice = 0; slice < (int)sliceCount; slice++)
         {
-            lpfloat sliceK = (slice+noiseSlice) / sliceCount;
-            // lines 5, 6 from the paper
-            lpfloat phi;
-            // Cosine sampling: always On (UI toggle removed). Mode selects the method.
-            {
-                float rnd0 = frac(noiseSample + sliceK * 0.618034f);
-                int mode = (int)GTVBAO_gtvbao_cosine_mode;
-                if (mode == 0) {
-                    // Mode 1: uniform, weight applied later
-                    phi = sliceK * GT_VBAO_PI;
-                } else if (mode == 1) {
-                    // Mode 2: ray projection from cosine lobe with perspective correction
-                    float rnd1 = frac(noiseSample + sliceK * 0.381966f);
-                    phi = GTVBAO_SampleSliceCosine_Mode2(rnd0, rnd1, (float3)viewspaceNormal,
-                        pixCenterPos, normalizedScreenPos, consts);
-                } else {
-                    // Mode 3 (default): CDF importance sampling, per-pixel
-                    // constants supplied from the hoist above.
-                    phi = GTVBAO_SampleSliceCosine_Mode3(rnd0, g_cdfSinK, g_cdfInvPiS, g_cdfDegen);
-                }
+            // Random numbers (deviation 1)
+            const float2 nz  = (float2)localNoise;
+            const float  k   = (float)slice;
+            const float2 p   = frac(float2(nz.x + k * 0.7548776662466927f, nz.y + k * 0.5698402909980532f));
+            const float4 rnd = float4(p.x, p.y, frac(p.x + 2.0f * p.y), frac(2.0f * p.x + p.y));
+
+            // ── Slice direction ──
+            float3 smplDirVS;
+            if (useUniform || cosineMode == 0) {
+                // bufferc.txt:547-569 (mode 1), 654-677 (uniform)
+                float2 dir0 = float2(cos(rnd.x * GT_VBAO_PI), sin(rnd.x * GT_VBAO_PI));
+                smplDirVS = GTVBAO_Transform_Vz0Qz0(dir0, Q_toV);
+            } else if (cosineMode == 1) {
+                // bufferc.txt:571-622
+                float2 s2 = rnd.xy * 2.0f - 1.0f;
+                float ang = GT_VBAO_PI * s2.x;
+                float s1p = sqrt(saturate(1.0f - s2.y * s2.y));
+                float3 sph = GTVBAO_Transform_Qz0(float3(float2(cos(ang), sin(ang)) * s1p, s2.y), Q_toV);
+                float3 cosDirVS = normalize(sph + N);
+                smplDirVS = normalize(cosDirVS - V * dot(V, cosDirVS));
+            } else {
+                // bufferc.txt:624-651
+                float2 dir0 = GTVBAO_SampleSliceDir(normalVVS, rnd.x);
+                smplDirVS = GTVBAO_Transform_Vz0Qz0(dir0, Q_toV);
             }
-            lpfloat cosPhi = cos(phi);
-            lpfloat sinPhi = sin(phi);
-            lpfloat2 omega = lpfloat2(cosPhi, -sinPhi);       //lpfloat2 on omega causes issues with big radii
+            const float2 screenDir = GTVBAO_ScreenDirFromViewDir(positionVS, smplDirVS, consts);
 
-            // convert to screen units (pixels) for later use
-            omega *= screenspaceRadius;
+            // ── Slice construction ──
+            // bufferc.txt:681-701
+            const float3 sliceN      = cross(V, smplDirVS);
+            const float3 projN       = N - sliceN * dot(N, sliceN);
+            const float  projNSqrLen = dot(projN, projN);
+            if (projNSqrLen < 1e-12f) {
+                degenerate = true;
+                continue;
+            }
+            const float  projNRcpLen = rsqrt(projNSqrLen);
+            const float  cosN        = dot(projN, V) * projNRcpLen;
+            const float3 T           = cross(sliceN, projN);
+            const float  sgn         = dot(V, T) < 0.0f ? -1.0f : 1.0f;
+            const float  angN        = sgn * acos(clamp(cosN, -1.0f, 1.0f));
+            const float  angOff      = angN * GT_VBAO_RCP_PI + 0.5f;
 
-            // line 8 from the paper
-            const lpfloat3 directionVec = lpfloat3(cosPhi, sinPhi, 0);
-
-            // line 9 from the paper
-            const lpfloat3 orthoDirectionVec = directionVec - (dot(directionVec, viewVec) * viewVec);
-
-            // line 10 from the paper
-            //axisVec is orthogonal to directionVec and viewVec, used to define projectedNormal
-            const lpfloat3 axisVec = normalize( cross(orthoDirectionVec, viewVec) );
-
-            // alternative line 9 from the paper
-            // float3 orthoDirectionVec = cross( viewVec, axisVec );
-
-            // line 11 from the paper
-            lpfloat3 projectedNormalVec = viewspaceNormal - axisVec * dot(viewspaceNormal, axisVec);
-
-            // line 13 from the paper
-            lpfloat signNorm = (lpfloat)sign( dot( orthoDirectionVec, projectedNormalVec ) );
-
-            // line 14 from the paper
-            lpfloat projectedNormalVecLength = length(projectedNormalVec);
-            lpfloat cosNorm = (lpfloat)saturate(dot(projectedNormalVec, viewVec) / projectedNormalVecLength);
-
-            // line 15 from the paper
-            lpfloat n = signNorm * GTVBAO_FastACos(cosNorm);
-
-            // ═══════════════════════════════════════════════════════════════
-            // Visibility Bitmask AO
-            // Replaces GTAO horizon angles with a uint bitmask.
-            // Therrien/Levesque/Gilet 2023, Algorithm 1.
-            // ═══════════════════════════════════════════════════════════════
-
-            // Bitmask for this slice (0 = unoccluded, 1 = occluded).
-            uint sliceBitmask = 0u;
-            // One decorrelated draw per slice, shared by min and max so the arc
-            // width survives. The reference dithers the sector index this way
-            // (bufferc.txt:767) to break up the 32 hard bands; without it the
-            // quantiser staircase is fixed in screen space and there is no
-            // temporal accumulation here to average it away.
-            const float sliceJitter =
-                frac(noiseSample + sliceK * 0.75487766624669276) * (1.0f / (float)GT_VBAO_BITMASK_SECTOR_COUNT);
-
-            [loop]
-            for( lpfloat step = 0; step < stepsPerSlice; step++ )
+            // ── Horizons (bufferc.txt:705-795) ──
+            uint occBits = 0u;
+            for (int side = 0; side < 2; side++)
             {
-                // R1 sequence (http://extremelearning.com.au/unreasonable-effectiveness-of-quasirandom-sequences/)
-                const lpfloat stepBaseNoise = lpfloat(slice + step * stepsPerSlice) * 0.6180339887498948482;
-                lpfloat stepNoise = frac(noiseSample + stepBaseNoise);
+                // d = -1 first with jitter rnd.z, then d = +1 with 1 - rnd.z (bufferc.txt:715-717)
+                const float d = side == 0 ? -1.0f : 1.0f;
+                const float z = side == 0 ? rnd.z : 1.0f - rnd.z;
+                const bool  isPhiLargerThanAngN = d > 0.0f;
 
-                lpfloat s = (step+stepNoise) / (stepsPerSlice);
-                // pow(s,1)==s: skip the pow when distribution is exactly 1.0.
-                if (sampleDistributionPower != 1.0f) {
-                  // Closed forms for the exponents reachable from the UI's
-                  // common values: one sqrt / one multiply instead of the
-                  // log2+exp2 pair a generic pow() needs.
-                  if (sampleDistributionPower == 1.5f)      s = (lpfloat)(s * sqrt(s));
-                  else if (sampleDistributionPower == 2.0f) s = (lpfloat)(s * s);
-                  else if (sampleDistributionPower == 3.0f) s = (lpfloat)(s * s * s);
-                  else                                      s = (lpfloat)pow( s, (lpfloat)sampleDistributionPower );
-                }
-                s += minS;
-
-                lpfloat2 sampleOffset = s * omega;
-                // |omega| == screenspaceRadius by construction (unit direction
-                // scaled by it), so the length is s * screenspaceRadius.
-                lpfloat sampleOffsetLength = (lpfloat)(s * screenspaceRadius);
-                const lpfloat mipLevel = (lpfloat)clamp( log2( sampleOffsetLength ) - consts.DepthMIPSamplingOffset, 0, GT_VBAO_DEPTH_MIP_LEVELS );
-                sampleOffset = round(sampleOffset) * (lpfloat2)consts.ViewportPixelSize;
-
-                // ── Sample both sides along the slice ──
-                // Unroll the two sides: side 0 = +offset, side 1 = -offset.
-                [unroll]
-                for( int side = 0; side < 2; side++ )
+                [loop]
+                for (int i = 0; i < (int)stepsPerSlice; i++)
                 {
-                    float sideSign = (side == 0) ? 1.0 : -1.0;
-                    float2 sampleScreenPos = normalizedScreenPos + sampleOffset * sideSign;
-                    float  SZ = sourceViewspaceDepth.SampleLevel( depthSampler, sampleScreenPos, mipLevel ).x;
+                    lpfloat s = (lpfloat)(((float)i + z) / (float)stepsPerSlice);
+                    // pow(s,1)==s: skip the pow when distribution is exactly 1.0.
+                    if (sampleDistributionPower != 1.0f) {
+                      // Closed forms for the exponents reachable from the UI's
+                      // common values: one sqrt / one multiply instead of the
+                      // log2+exp2 pair a generic pow() needs.
+                      if (sampleDistributionPower == 1.5f)      s = (lpfloat)(s * sqrt(s));
+                      else if (sampleDistributionPower == 2.0f) s = (lpfloat)(s * s);
+                      else if (sampleDistributionPower == 3.0f) s = (lpfloat)(s * s * s);
+                      else                                      s = (lpfloat)pow( s, (lpfloat)sampleDistributionPower );
+                    }
+                    s += minS;
+
+                    const lpfloat sampleOffsetLength = (lpfloat)(s * screenspaceRadius);
+                    const lpfloat mipLevel = (lpfloat)clamp( log2( sampleOffsetLength ) - consts.DepthMIPSamplingOffset, 0, GT_VBAO_DEPTH_MIP_LEVELS );
+                    const float2 sampleOffset = round(d * sampleOffsetLength * screenDir) * consts.ViewportPixelSize;
+                    const float2 sampleScreenPos = normalizedScreenPos + sampleOffset;
+                    // Samples outside the screen contribute nothing (bufferc.txt:726)
+                    if (sampleScreenPos.x < 0.0f || sampleScreenPos.x > 1.0f || sampleScreenPos.y < 0.0f || sampleScreenPos.y > 1.0f) continue;
+
+                    float SZ = sourceViewspaceDepth.SampleLevel( depthSampler, sampleScreenPos, mipLevel ).x;
                     // ── Foliage cast-AO prevention: skip samples that land on foliage ──
                     // Only when the mask is fresh (pre-pass dispatched this frame).
                     if (GTVBAO_exclude_foliage > 0.5f && GTVBAO_foliage_mask_valid > 0.5f && !gtvbao_foliage_pixel) {
@@ -651,137 +461,72 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     }
                     float3 samplePos = GTVBAO_ComputeViewspacePosition( sampleScreenPos, SZ, consts );
 
-                    float3 sampleDelta = samplePos - float3(pixCenterPos);
-                    lpfloat sampleDist = (lpfloat)length( sampleDelta );
+                    // bufferc.txt:732-740 (constant thickness in view depth, deviation 5)
+                    float3 deltaPosFront = samplePos - positionVS;
+                    float3 deltaPosBack  = GTVBAO_ComputeViewspacePosition( sampleScreenPos, SZ + bitmaskThickness, consts ) - positionVS;
 
-                    // Skip samples beyond the effect radius.
-                    if (sampleDist > effectRadius) continue;
+                    // bufferc.txt:749-758
+                    float2 horCos = float2(dot(normalize(deltaPosFront), V), dot(normalize(deltaPosBack), V));
+                    float2 horAng = acos(clamp(horCos, -1.0f, 1.0f)) * d;
+                    float2 hor01  = saturate(horAng * GT_VBAO_RCP_PI + angOff);
+                    if (d < 0.0f) hor01 = hor01.yx;
 
-                    // Effective thickness. The paper's distance ramp ("we give
-                    // the option to increase t linearly over the distance") stands
-                    // in for the GTAO radial falloff the bitmask branch never
-                    // had: the sector arc grows as t/distance, so a flat t
-                    // starves distant occluders.
-                    float thickness = (float)bitmaskThickness
-                        * (1.0f + (float)sampleDist / max((float)effectRadius, 0.001f));
+                    // bufferc.txt:760-767 (cosine) / 769-779 (uniform)
+                    if (useUniform) {
+                        hor01.x = GTVBAO_SliceRelCDF_Uniform(hor01.x, angN, isPhiLargerThanAngN);
+                        hor01.y = GTVBAO_SliceRelCDF_Uniform(hor01.y, angN, isPhiLargerThanAngN);
+                    } else {
+                        hor01.x = GTVBAO_SliceRelCDF_Cos(hor01.x, angN, cosN, isPhiLargerThanAngN);
+                        hor01.y = GTVBAO_SliceRelCDF_Cos(hor01.y, angN, cosN, isPhiLargerThanAngN);
+                    }
+                    hor01 = saturate(hor01 + rnd.w * (1.0f / 32.0f));
 
-                    // ── Front-face and back-face (per-sample thickness offset, always On) ──
-                    float3 sampleHorizonVec = (float3)(sampleDelta / sampleDist);
-                    // Offset along the sample direction, reusing the direction
-                    // already computed above instead of dividing a second time.
-                    float3 sampleDeltaBack = sampleDelta - sampleHorizonVec * thickness;
-                    float3 sampleHorizonVecBack = normalize( sampleDeltaBack );
+                    // bufferc.txt:783-791
+                    uint2 horInt = uint2(floor(hor01 * 32.0f));
+                    uint mX = horInt.x < 32u ? (0xFFFFFFFFu << horInt.x) : 0u;
+                    uint mY = horInt.y != 0u ? (0xFFFFFFFFu >> (32u - horInt.y)) : 0u;
+                    uint sampleMask = mX & mY;
 
-                    // Horizon cosines relative to viewVec (same as GTAO's shc).
-                    float shc_front = dot(sampleHorizonVec, (float3)viewVec);
-                    float shc_back  = dot(sampleHorizonVecBack, (float3)viewVec);
+                    occBits |= sampleMask;
 
-                    // Convert to angles, shift from viewVec to projected normal, map to [0,1].
-                    // From authors' supplemental code (bitmask_tips.txt).
-                    float2 frontBackHorizon = float2(shc_front, shc_back);
-                    frontBackHorizon.x = (float)GTVBAO_FastACos((lpfloat)frontBackHorizon.x);  // [0, π]
-                    frontBackHorizon.y = (float)GTVBAO_FastACos((lpfloat)frontBackHorizon.y);
-
-                    // Shift: authors' N = -sign(...)*acos = -n (GTAO convention).
-                    // Substituting N = -n: mapped = (sd*-angle + n + π/2)/π
-                    float sd = sideSign;  // samplingDirection: +1 right, -1 left
-                    frontBackHorizon = saturate(((sd * -frontBackHorizon) + (float)n + GT_VBAO_PI_HALF) / GT_VBAO_PI);
-
-                    // ── GTVBAO: CDF remap horizon angles (always On) ──
-                    // sinNV / blend are per-pixel; apply the hoisted
-                    // t*mul+add form of the CDF remap.
-                    frontBackHorizon.x = saturate(frontBackHorizon.x * g_cdfRemapMul + g_cdfRemapAdd);
-                    frontBackHorizon.y = saturate(frontBackHorizon.y * g_cdfRemapMul + g_cdfRemapAdd);
-
-                    // samplingDirection inverts min/max ordering.
-                    frontBackHorizon = (sd >= 0.0) ? frontBackHorizon.yx : frontBackHorizon.xy;
-
-                    // Dither both ends by the same offset, preserving arc width.
-                    frontBackHorizon = saturate(frontBackHorizon + sliceJitter);
-
-                    // Compute sample bitmask and update global bitmask.
-                    uint sampleMask = GTVBAO_UpdateSectors(frontBackHorizon.x, frontBackHorizon.y, 0u);
-
-                    // ── Debug: track per-sample sector coverage ──
-                    // Read by Bitmask debug views 6-8; skipped when no debug
-                    // view consumes it.
                     if (g_trackDebug) {
-                        debugTotalSectorCoverage += GTVBAO_CountBits(sampleMask);
+                        debugTotalSectorCoverage += countbits(sampleMask);
                         debugTotalSamples += 1u;
                     }
-
-
-                    sliceBitmask |= sampleMask;
                 }
             }
 
             // ── Debug: save first slice's final bitmask ──
             if (g_trackDebug && !debugFirstSliceSaved) {
-                debugFirstSliceBitmask = sliceBitmask;
+                debugFirstSliceBitmask = occBits;
                 debugFirstSliceSaved = true;
             }
 
-            // ── AO for this slice: fraction of unoccluded sectors ──
-            lpfloat sliceAO = (lpfloat)1.0 - (lpfloat)GTVBAO_CountBits(sliceBitmask) / (lpfloat)GT_VBAO_BITMASK_SECTOR_COUNT;
+            // ── Slice AO and weight (bufferc.txt:797-809) ──
+            const float occ = (float)countbits(occBits) / (float)GT_VBAO_BITMASK_SECTOR_COUNT;
+            float sliceWeight = 1.0f;
+            if (!useUniform && cosineMode == 0) {
+                sliceWeight = max(0.0f, (1.0f / projNRcpLen) * (cosN + angN * sin(angN)));
+            }
+            visibility += sliceWeight - sliceWeight * occ;
 
             // ── Horizon-term accumulation for diagnostics (26-29) ──
-            // Captured before the cosine weighting below so mode 27 shows the
-            // raw unoccluded fraction. `n` is the signed angle between the
-            // projected normal and the slice direction: near +-PI/2 means the
-            // slice is tangential to the normal, near 0 means the normal
-            // points straight along the slice.
             if (g_trackDebug) {
-                dbgCosNormSum += (float)cosNorm;
-                dbgProjLenSum += (float)projectedNormalVecLength;
-                dbgSliceAOSum  += (float)sliceAO;
+                dbgCosNormSum += cosN;
+                dbgProjLenSum += 1.0f / projNRcpLen;
+                dbgSliceAOSum  += 1.0f - occ;
                 dbgSliceN      += 1.0f;
             }
-
-            // ── GTVBAO Mode 0: cosine weight per slice (cosine sampling always On) ──
-            if ((int)GTVBAO_gtvbao_cosine_mode == 0) {
-                // Weight by cosine falloff from projected normal direction
-                float angN = GT_VBAO_PI_HALF - (float)n; // projected normal angle
-                float cosWeight = saturate(cos((float)phi - angN));
-                sliceAO *= cosWeight;
-                totalWeight += cosWeight;
-            }
-            visibility += sliceAO;
-
-
-
-#ifdef GT_VBAO_COMPUTE_BENT_NORMALS
-            // see "Algorithm 2 Extension that computes bent normals b."
-            lpfloat t0 = (6*sin(h0-n)-sin(3*h0-n)+6*sin(h1-n)-sin(3*h1-n)+16*sin(n)-3*(sin(h0+n)+sin(h1+n)))/12;
-            lpfloat t1 = (-cos(3 * h0-n)-cos(3 * h1-n) +8 * cos(n)-3 * (cos(h0+n) +cos(h1+n)))/12;
-            lpfloat3 localBentNormal = lpfloat3( directionVec.x * (lpfloat)t0, directionVec.y * (lpfloat)t0, -lpfloat(t1) );
-            localBentNormal = (lpfloat3)mul( GTVBAO_RotFromToMatrix( lpfloat3(0,0,-1), viewVec ), localBentNormal ) * projectedNormalVecLength;
-            bentNormal += localBentNormal;
-#endif
         }
-        // Normalize: use sum of cosine weights (Mode 0) or uniform slice count
-        visibility /= ((int)GTVBAO_gtvbao_cosine_mode == 0)
-                        ? max(totalWeight, (lpfloat)1e-5)
-                        : (lpfloat)sliceCount;
+
+        // bufferc.txt:812 (a degenerate slice makes the pixel fully visible, bufferc.txt:689)
+        if (degenerate) visibility = 1.0f;
+        else visibility /= (lpfloat)sliceCount;
         visibility = pow( visibility, (lpfloat)consts.FinalValuePower );
         visibility = max( (lpfloat)0.03, visibility ); // disallow total occlusion (which wouldn't make any sense anyhow since pixel is visible but also helps with packing bent normals)
-
-
-#ifdef GT_VBAO_COMPUTE_BENT_NORMALS
-        bentNormal = normalize(bentNormal) ;
-#endif
     }
 
-#if defined(GT_VBAO_SHOW_DEBUG_VIZ) && defined(GT_VBAO_COMPUTE_BENT_NORMALS)
-    [branch] if (IsUnderCursorRange(pixCoord, int2(1, 1)))
-    {
-        float3 dbgWorldViewNorm = mul((float3x3)g_globals.ViewInv, viewspaceNormal).xyz;
-        float3 dbgWorldBentNorm = mul((float3x3)g_globals.ViewInv, bentNormal).xyz;
-        DebugDraw3DSphereCone( dbgWorldPos, dbgWorldViewNorm, 0.3, VA_PI*0.5 - acos(saturate(visibility)), float4( 0.2, 0.2, 0.2, 0.5 ) );
-        DebugDraw3DSphereCone( dbgWorldPos, dbgWorldBentNorm, 0.3, VA_PI*0.5 - acos(saturate(visibility)), float4( 0.0, 1.0, 0.0, 0.7 ) );
-    }
-#endif
-
-    GTVBAO_OutputWorkingTerm( pixCoord, visibility, bentNormal, outWorkingAOTerm );
+    GTVBAO_OutputWorkingTerm( pixCoord, visibility, outWorkingAOTerm );
 
     // ── Foliage post-blend (no early-out, normal AO computed first) ──
     // Blend written AO toward 255 (fully visible) based on foliage_ao_value.

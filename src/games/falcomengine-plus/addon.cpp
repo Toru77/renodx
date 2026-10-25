@@ -517,7 +517,7 @@ constexpr uint32_t kGtvbaoPushConstantsLayoutParam = 4u;   // push_constants at 
 // Must match the cbuffer declared in gtvbao_common.hlsl. Named so the builder,
 // the layout range and all nine push sites cannot drift apart -- a mismatch
 // here silently truncates the tail of the block rather than failing loudly.
-constexpr uint32_t kGtvbaoPushConstantFloats = 39;
+constexpr uint32_t kGtvbaoPushConstantFloats = 40;
 constexpr uint32_t kLightingMrtNormalRegister = 1u;  // t1 = mrtTexture0 (g-buffer normals)
 constexpr uint64_t kGTVBAOStartupGuardFrames = 8u;
 constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
@@ -696,6 +696,7 @@ static float g_gtvbao_normal_sharpness      = 1.f;   // gamma: 1 = passthrough
 static float g_gtvbao_normal_edge_rejection = 0.f;   // 0 = no silhouette rejection
 static float g_gtvbao_normal_detail_response = 0.f; // 0 = no disagreement reweight
 static float g_gtvbao_normal_max_darkening  = 1.f;   // cap: 1 = uncapped
+static float g_gtvbao_hemisphere_weighting = 0.f;
 // -- VBGI (GI) normal settings: independent copies of the four that shape the
 // GI sample normal (input mode, influence, z preservation, transform mode) --
 // Defaults match the AO neutral values, so enabling VBGI changes nothing until
@@ -3430,8 +3431,17 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAOGTVBAOCosineMode", .binding = &shader_injection.gtvbao_cosine_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 1.f, .label = "Cosine Sampling Mode", .section = "GTVBAO",
-      .tooltip = "Mode 1: Uniform slices with per-slice weight. Mode 2: Ray projection from world-space lobe. Mode 3: CDF importance sampling (best quality/speed).",
+      .tooltip = "Weight = uniform slices with a per-slice weight (reference mode 1). Project = cosine-lobe projection (mode 2, default). CDF = approximate inverse-CDF sampling (mode 3). Only used with Cosine weighting.",
       .labels = {"Weight", "Project", "CDF"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_hemisphere_weighting < 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOHemisphereWeighting", .binding = &g_gtvbao_hemisphere_weighting,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Hemisphere Weighting", .section = "GTVBAO",
+      .tooltip = "Cosine = ground-truth cosine-weighted AO (default). Uniform = uniform-weighted hemisphere.",
+      .labels = {"Cosine", "Uniform"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -12336,6 +12346,7 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   c[36] = std::clamp(shader_injection.gtvbao_upscale_plane_sigma, 1.f, 400.f);
   c[37] = std::clamp(shader_injection.gtvbao_upscale_normal_power, 1.f, 64.f);
   c[38] = shader_injection.gtvbao_upscale_debug;
+  c[39] = g_gtvbao_hemisphere_weighting;       // hemisphere weighting 0=Cosine, 1=Uniform
   return c;
 }
 

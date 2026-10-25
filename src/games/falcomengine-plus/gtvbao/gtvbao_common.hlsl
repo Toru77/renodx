@@ -15,11 +15,6 @@
 #ifndef SRC_GAMES_SORA_VANILLAPLUS_GTVBAO_COMMON_HLSL_
 #define SRC_GAMES_SORA_VANILLAPLUS_GTVBAO_COMMON_HLSL_
 
-// Provide the VA_SATURATE macro that GTVBAO.hlsli expects.
-#ifndef VA_SATURATE
-#define VA_SATURATE(x) saturate(x)
-#endif
-
 // Use fp32 math for fxc / cs_5_0 compatibility.
 #define GT_VBAO_USE_HALF_FLOAT_PRECISION 0
 
@@ -29,9 +24,6 @@
 // horizontal vector for every pixel. Clamp the weight instead of the result so
 // the knob stays usable without ever producing a degenerate normal.
 #define GT_VBAO_MIN_NORMAL_Z_SCALE 0.05
-
-// We do NOT compute bent normals (AO visibility only).
-// #define GT_VBAO_COMPUTE_BENT_NORMALS
 
 // Falcom MRT world-normal decode, shared with the shadow compute passes.
 // Must come first: the helpers below and GTVBAO.hlsli both call it.
@@ -95,6 +87,7 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_upscale_plane_sigma;      // c[36] - reconstruction plane edge-stop sigma
   float GTVBAO_upscale_normal_power;     // c[37] - reconstruction normal weight power
   float GTVBAO_upscale_debug;            // c[38] - reconstruction diagnostics mode
+  float GTVBAO_hemisphere_weighting;     // c[39] - 0=Cosine, 1=Uniform
 };
 
 // ── Half-res → full-res block-center mapping (odd-dimension safe) ──
