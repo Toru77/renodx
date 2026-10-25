@@ -165,11 +165,11 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     float2 u;
                     if (g_rtsun_sampling.x > 0.5)
                     {
-                        u = g_isfast_noise.Load(int4(px.x % 128u, px.y % 128u, ((uint)g_rtsun_sampling.y + smp) % 32u, 0));
+                        u = g_isfast_noise.Load(int4(tp.x % 128u, tp.y % 128u, ((uint)g_rtsun_sampling.y + smp) % 32u, 0));
                     }
                     else
                     {
-                        const float2 q = float2(px) + g_rtsun_sampling.z + float(smp) * 7.0;
+                        const float2 q = float2(tp) + g_rtsun_sampling.z + float(smp) * 7.0;
                         u = TraceIgnNoise2(q);
                     }
                     const float r = disk * sqrt(u.x);

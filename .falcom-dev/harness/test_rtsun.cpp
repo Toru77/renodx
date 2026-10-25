@@ -185,6 +185,9 @@ static void TestSunDenoiseText() {
   CHECK(Count(shader, "const uint2 trace = (full + d - 1u) / d;") == 1, "shader trace extent uses (full + d - 1) / d");
   CHECK(Count(shader, "const uint d = max((uint)g_rtsun_sun.w, 1u);") == 1, "divisor from sun.w, at least 1");
   CHECK(Count(shader, "g_rtsun_raw[tp] = raw;") == 1, "raw written at the trace pixel");
+  CHECK(Count(shader, "g_isfast_noise.Load(int4(tp.x % 128u, tp.y % 128u, ((uint)g_rtsun_sampling.y + smp) % 32u, 0))") == 1, "IS-FAST noise indexed by the trace pixel");
+  CHECK(Count(shader, "float2(tp) + g_rtsun_sampling.z") == 1, "IGN seed indexed by the trace pixel");
+  CHECK(Count(shader, "px.x % 128u") == 0 && Count(shader, "float2(px) + g_rtsun_sampling.z") == 0, "noise not indexed by the representative pixel");
   CHECK(Count(shader, "if (debug_mode == 1 || debug_mode == 2)") == 1, "debug views 1 and 2 are written per block");
   CHECK(Count(shader, "debug_mode == 3") == 0, "debug view 3 is unused in the shader");
   const std::string rtao_state = ReadText("src/games/falcomengine-plus/world/rtao/rtao_state.hpp");
