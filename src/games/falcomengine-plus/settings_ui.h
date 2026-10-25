@@ -82,6 +82,9 @@ static const std::unordered_map<std::string_view, std::string_view> kSectionCate
     {"RTLS Temporal Accumulation", "Ray Tracing"},
     {"RTLS Denoising", "Ray Tracing"},
     {"RTLS Distance Fade", "Ray Tracing"},
+    {"RT Sun Shadows", "Ray Tracing"},
+    {"RT Sun Temporal Accumulation", "Ray Tracing"},
+    {"RT Sun Denoising", "Ray Tracing"},
     {"Info", "General"},
 };
 
