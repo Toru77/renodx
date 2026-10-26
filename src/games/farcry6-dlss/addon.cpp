@@ -101,6 +101,25 @@ renodx::utils::settings::Settings settings = {
         },
     },
     new renodx::utils::settings::Setting{
+        .key = "DLSSCaptureCamera",
+        .binding = nullptr,
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .default_value = 0.f,
+        .label = "Capture Camera Buffer",
+        .section = "Antialiasing",
+        .tooltip = "Compare a scene camera buffer's CPU and GPU contents once. Then use Copy Report.",
+        .on_click = [] {
+          using namespace farcry6_dlss::dlss;
+          std::unique_lock lock(scene_buffer_capture.mutex);
+          if (scene_buffer_capture.state == SceneBufferCapture::State::idle
+              || scene_buffer_capture.state == SceneBufferCapture::State::complete
+              || scene_buffer_capture.state == SceneBufferCapture::State::failed) {
+            scene_buffer_capture.state = SceneBufferCapture::State::requested;
+          }
+          return true;
+        },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLSSCaptureMotion",
         .binding = nullptr,
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,

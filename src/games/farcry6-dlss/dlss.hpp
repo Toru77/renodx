@@ -1229,7 +1229,8 @@ inline uint32_t FindTablesForRegister(
     reshade::api::descriptor_type wanted,
     uint32_t* out_params,
     uint32_t* out_bindings,
-    uint32_t max_out) {
+    uint32_t max_out,
+    reshade::api::shader_stage stage = reshade::api::shader_stage::all) {
   uint32_t n = 0u;
   const auto* layout_data = renodx::utils::pipeline_layout::GetPipelineLayoutData(layout);
   if (layout_data == nullptr || out_params == nullptr || out_bindings == nullptr || max_out == 0u) return 0u;
@@ -1241,6 +1242,7 @@ inline uint32_t FindTablesForRegister(
     }
     for (const auto& range : layout_data->ranges[param_index]) {
       if (range.type != wanted) continue;
+      if ((static_cast<uint32_t>(range.visibility) & static_cast<uint32_t>(stage)) == 0u) continue;
       if (range.dx_register_space != dx_register_space) continue;
       if (dx_register_index < range.dx_register_index) continue;
       const uint32_t offset = dx_register_index - range.dx_register_index;
@@ -1260,6 +1262,7 @@ struct __declspec(uuid("7f3e2a1c-9b4d-4e8f-a6c2-d5f1b0e98341")) CommandListData 
   // Depth attribution: draws are counted against whichever depth-stencil was
   // bound when they were issued, and flushed into the shared map at every bind.
   reshade::api::resource dsv = {};
+  bool in_render_pass = false;
   uint32_t dsv_draws = 0u;
   // Memoized pixel-shader hash: refreshed per pipeline bind instead of per draw.
   uint32_t cached_ps_hash = 0u;
@@ -1669,6 +1672,10 @@ inline constexpr uint32_t kSceneShaders[] = {
     0x1BC1D314u, 0x48D5181Cu,
 };
 static constexpr uint32_t kSceneShaderCount = sizeof(kSceneShaders) / sizeof(kSceneShaders[0]);
+inline constexpr uint32_t kSceneMatrixShaders[] = {
+    0x4FD91E70u, 0xCB08A564u, 0xA38182D8u, 0x949755FAu,
+    0x459A3A3Eu, 0x2CF40AE1u, 0xABDFA78Eu, 0x1BC1D314u,
+};
 // A handful of draws per frame: one is enough once the pass is known, and the budget
 // is what keeps a frame whose first candidates are shadow passes from costing
 // anything.
@@ -1704,6 +1711,51 @@ struct SceneJitter {
 };
 inline SceneJitter scene_jitter;
 inline uint64_t frame_counter = 0u;
+
+struct SceneMatrixSample {
+  uint64_t frame = 0u;
+  uint32_t shader = 0u;
+  uint32_t layout_param = 0u;
+  uint32_t binding = 0u;
+  uint64_t buffer = 0u;
+  uint64_t buffer_offset = 0u;
+  uint64_t buffer_size = 0u;
+  uint32_t jitter_frame = 0u;
+  uint32_t offscreen = 0u;
+  float viewport[2] = {};
+  float projection[16] = {};
+  float matrix[16] = {};
+  float previous_matrix[16] = {};
+  float temporal[2] = {};
+  bool temporal_valid = false;
+};
+inline std::mutex scene_matrix_mutex;
+inline SceneMatrixSample scene_matrix_samples[4];
+inline uint32_t scene_matrix_count = 0u;
+inline std::atomic<uint64_t> scene_matrix_frame{UINT64_MAX};
+inline std::atomic<uint64_t> scene_matrix_wrong_size{0u};
+inline std::atomic<uint64_t> scene_matrix_wrong_projection{0u};
+
+struct SceneBufferCapture {
+  std::shared_mutex mutex;
+  static constexpr uint32_t kBytes = 0x33Cu;
+  enum class State { idle, requested, armed, recorded, submitted, reading, complete, failed } state = State::idle;
+  Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+  reshade::api::device* device = nullptr;
+  reshade::api::command_list* command_list = nullptr;
+  reshade::api::command_queue* queue = nullptr;
+  DWORD submit_thread = 0u;
+  uint64_t frame = 0u;
+  uint64_t buffer = 0u;
+  uint64_t offset = 0u;
+  uint32_t shader = 0u;
+  uint32_t different_bytes = 0u;
+  float temporal[2] = {};
+  bool temporal_valid = false;
+  std::array<uint8_t, kBytes> cpu = {};
+  std::array<uint8_t, kBytes> gpu = {};
+};
+inline SceneBufferCapture scene_buffer_capture;
 
 // Where the matrix was found inside the buffer, relative to the buffer's start. The
 // ring relocates the contents every frame, so only the relative position is stable
@@ -1775,7 +1827,8 @@ inline void PairToPixels(
 // Reads one constant buffer of a scene draw: the projection that carries the offset
 // first, and the sub-pixel pairs only while no projection has been found.
 inline void ProbeSceneConstantBuffer(
-    const reshade::api::buffer_range& range, uint32_t cb, uint32_t shader, uint32_t stage) {
+    reshade::api::command_list* cmd_list, const reshade::api::buffer_range& range, uint32_t cb, uint32_t shader, uint32_t stage,
+    uint32_t layout_param, uint32_t binding, bool matrix_only = false) {
   if (range.buffer.handle == 0u || range.offset == UINT64_MAX) return;
   const uint8_t* mapped = MappedRingData(range.buffer.handle);
   if (mapped == nullptr) return;
@@ -1785,6 +1838,97 @@ inline void ProbeSceneConstantBuffer(
   if (bytes == 0u || bytes > kSceneProbeMaxBytes) bytes = kSceneProbeMaxBytes;
   if (begin + bytes > mapped_ring.size) bytes = mapped_ring.size - begin;
   if (bytes < 16u * sizeof(float)) return;
+  // These vertex shaders use viewport cb0 registers 20-23 for clip position.
+  // Keep the original bytes for comparison with the game's jitter in Copy Report.
+  bool matrix_shader = false;
+  for (uint32_t candidate : kSceneMatrixShaders) {
+    if (shader == candidate) {
+      matrix_shader = true;
+      break;
+    }
+  }
+  if (stage == 0u && cb == 0u && matrix_shader && bytes >= 0x33Cu) {
+    float viewport[2] = {};
+    std::memcpy(viewport, mapped + begin + 0x200u, sizeof(viewport));
+    const uint32_t width = last_render_width.load();
+    const uint32_t height = last_render_height.load();
+    if (width == 0u || height == 0u || viewport[0] != static_cast<float>(width)
+        || viewport[1] != static_cast<float>(height)) {
+      scene_matrix_wrong_size.fetch_add(1u, std::memory_order_relaxed);
+      if (matrix_only) return;
+    } else {
+      float projection[16] = {};
+      float current[16] = {};
+      float previous[16] = {};
+      std::memcpy(projection, mapped + begin + 0x80u, sizeof(projection));
+      std::memcpy(current, mapped + begin + 0x140u, sizeof(current));
+      std::memcpy(previous, mapped + begin + 0x180u, sizeof(previous));
+      float norm = 0.f;
+      float previous_norm = 0.f;
+      for (uint32_t i = 12u; i < 15u; ++i) {
+        norm += current[i] * current[i];
+        previous_norm += previous[i] * previous[i];
+      }
+      if (projection[14] != -1.f || projection[15] != 0.f
+          || !std::isfinite(norm) || norm < 0.9f || norm > 1.1f
+          || !std::isfinite(previous_norm) || previous_norm < 0.9f || previous_norm > 1.1f) {
+        scene_matrix_wrong_projection.fetch_add(1u, std::memory_order_relaxed);
+        if (matrix_only) return;
+      } else {
+        bool sampled = false;
+        {
+          const std::lock_guard<std::mutex> lock(scene_matrix_mutex);
+          if (scene_matrix_count == 0u || scene_matrix_samples[(scene_matrix_count - 1u) % 4u].frame != frame_counter) {
+            auto& sample = scene_matrix_samples[scene_matrix_count++ % 4u];
+            sample.frame = frame_counter;
+            sample.shader = shader;
+            sample.layout_param = layout_param;
+            sample.binding = binding;
+            sample.buffer = range.buffer.handle;
+            sample.buffer_offset = range.offset;
+            sample.buffer_size = bytes;
+            std::memcpy(&sample.jitter_frame, mapped + begin + 0x334u, sizeof(sample.jitter_frame));
+            std::memcpy(&sample.offscreen, mapped + begin + 0x338u, sizeof(sample.offscreen));
+            sample.temporal_valid = false;
+            std::memcpy(sample.viewport, mapped + begin + 0x200u, sizeof(sample.viewport));
+            std::memcpy(sample.projection, mapped + begin + 8u * 4u * sizeof(float), sizeof(sample.projection));
+            std::memcpy(sample.matrix, mapped + begin + 20u * 4u * sizeof(float), sizeof(sample.matrix));
+            std::memcpy(sample.previous_matrix, mapped + begin + 0x180u, sizeof(sample.previous_matrix));
+            scene_matrix_frame.store(frame_counter);
+            sampled = true;
+          }
+        }
+        if (sampled) {
+          auto* command_data = cmd_list->get_private_data<CommandListData>();
+          auto* native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+          auto* source = reinterpret_cast<ID3D12Resource*>(range.buffer.handle);
+          Microsoft::WRL::ComPtr<ID3D12Resource> destination;
+          {
+            std::unique_lock capture_lock(scene_buffer_capture.mutex);
+            if (scene_buffer_capture.state == SceneBufferCapture::State::armed && scene_buffer_capture.device == cmd_list->get_device() && scene_buffer_capture.readback != nullptr && command_data != nullptr && !command_data->in_render_pass && native != nullptr && native->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT && source != nullptr) {
+              D3D12_HEAP_PROPERTIES heap = {};
+              D3D12_HEAP_FLAGS heap_flags = {};
+              if (SUCCEEDED(source->GetHeapProperties(&heap, &heap_flags)) && heap.Type == D3D12_HEAP_TYPE_UPLOAD) {
+                scene_buffer_capture.frame = frame_counter;
+                scene_buffer_capture.buffer = range.buffer.handle;
+                scene_buffer_capture.offset = range.offset;
+                scene_buffer_capture.shader = shader;
+                scene_buffer_capture.temporal_valid = false;
+                std::memcpy(scene_buffer_capture.cpu.data(), mapped + begin, SceneBufferCapture::kBytes);
+                scene_buffer_capture.command_list = cmd_list;
+                scene_buffer_capture.state = SceneBufferCapture::State::recorded;
+                destination = scene_buffer_capture.readback;
+              }
+            }
+          }
+          if (destination != nullptr) {
+            native->CopyBufferRegion(destination.Get(), 0u, source, begin, SceneBufferCapture::kBytes);
+          }
+        }
+      }
+    }
+  }
+  if (matrix_only) return;
   const auto* floats = reinterpret_cast<const float*>(mapped + begin);
   const uint32_t count = static_cast<uint32_t>(bytes / sizeof(float));
 
@@ -1877,7 +2021,8 @@ inline void ProbeSceneConstantBuffer(
 // The entry point from the draw hooks: identifies the scene passes and reads their
 // constant buffers, at a handful of draws per frame.
 inline void ProbeSceneDraw(reshade::api::command_list* cmd_list) {
-  if (scene_probe_attempts_left == 0u || scene_projected_this_frame) return;
+  const bool probe_jitter = scene_probe_attempts_left != 0u && !scene_projected_this_frame;
+  if (!probe_jitter && scene_matrix_frame.load() == frame_counter) return;
   if (cmd_list == nullptr) return;
   auto* data = Get(cmd_list);
   if (data == nullptr) return;
@@ -1890,6 +2035,16 @@ inline void ProbeSceneDraw(reshade::api::command_list* cmd_list) {
   }
   const uint32_t vertex_hash = data->cached_scene_vs_hash;
   const uint32_t pixel_hash = data->cached_scene_ps_hash;
+  bool probe_matrix = false;
+  if (scene_matrix_frame.load() != frame_counter) {
+    for (uint32_t candidate : kSceneMatrixShaders) {
+      if (vertex_hash == candidate) {
+        probe_matrix = true;
+        break;
+      }
+    }
+  }
+  if (!probe_jitter && !probe_matrix) return;
   uint32_t shader = 0u;
   uint32_t stage = 0u;
   for (uint32_t i = 0u; i + 1u < kSceneShaderCount; i += 2u) {
@@ -1906,21 +2061,39 @@ inline void ProbeSceneDraw(reshade::api::command_list* cmd_list) {
       break;
     }
   }
+  const bool use_jitter_probe = probe_jitter && shader != 0u && !probe_matrix;
+  if (probe_matrix) {
+    shader = vertex_hash;
+    stage = 0u;
+  }
   if (shader == 0u) return;
-  --scene_probe_attempts_left;
-  ++scene_attempts_made;
+  if (use_jitter_probe) {
+    --scene_probe_attempts_left;
+    ++scene_attempts_made;
+  }
   reshade::api::pipeline_layout layout = {};
-  if (!CurrentPixelLayout(cmd_list, layout)) return;
+  if (!use_jitter_probe) {
+    auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+    if (shader_state == nullptr) return;
+    auto* vertex_state = renodx::utils::shader::GetCurrentVertexState(shader_state);
+    if (vertex_state == nullptr) return;
+    renodx::utils::shader::PopulateStageState(vertex_state);
+    if (vertex_state->pipeline_details == nullptr) return;
+    layout = vertex_state->pipeline_details->layout;
+  } else if (!CurrentPixelLayout(cmd_list, layout)) {
+    return;
+  }
   auto* device = cmd_list->get_device();
   if (device == nullptr) return;
   // The camera's constants sit at b0 in every scene pass measured; the registers
   // after it are per-material, and they are checked too so a pass that moves the
   // camera's block is still read. One camera buffer per frame is enough.
-  for (uint32_t reg = 0u; reg < 4u && !scene_projected_this_frame; ++reg) {
+  for (uint32_t reg = 0u; reg < (use_jitter_probe ? 4u : 1u); ++reg) {
     uint32_t params[2] = {};
     uint32_t bindings[2] = {};
     const uint32_t n = FindTablesForRegister(
-        layout, reg, 0u, reshade::api::descriptor_type::constant_buffer, params, bindings, 2u);
+        layout, reg, 0u, reshade::api::descriptor_type::constant_buffer, params, bindings, 2u,
+        use_jitter_probe ? reshade::api::shader_stage::all : reshade::api::shader_stage::vertex);
     for (uint32_t k = 0u; k < n; ++k) {
       if (params[k] >= data->descriptor_tables.size()) continue;
       const auto table = data->descriptor_tables[params[k]];
@@ -1930,10 +2103,12 @@ inline void ProbeSceneDraw(reshade::api::command_list* cmd_list) {
       RecordedDescriptor record;
       if (!LookupFingerprint(key, record)) continue;
       if (!record.has_range || record.type != reshade::api::descriptor_type::constant_buffer) continue;
-      ProbeSceneConstantBuffer(record.range, reg, shader, stage);
-      if (scene_projected_this_frame) break;
+      ProbeSceneConstantBuffer(cmd_list, record.range, reg, shader, stage, params[k], bindings[k], !use_jitter_probe);
+      if (scene_projected_this_frame && (!probe_matrix || scene_matrix_frame.load() == frame_counter)) break;
     }
+    if (scene_projected_this_frame && (!probe_matrix || scene_matrix_frame.load() == frame_counter)) break;
   }
+  if (!use_jitter_probe) return;
   // A matrix that never moves is not the jitter: after thirty readings with no
   // change, the offset is being applied elsewhere and the sub-pixel pair that does
   // move is the source. If the matrix starts moving, it takes the source back.
@@ -3028,6 +3203,26 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       temporal_jitter_valid = std::isfinite(temporal_jitter[0]) && std::isfinite(temporal_jitter[1])
           && temporal_jitter[0] >= 0.f && temporal_jitter[0] <= 1.f
           && temporal_jitter[1] >= 0.f && temporal_jitter[1] <= 1.f;
+      if (temporal_jitter_valid) {
+        {
+          const std::lock_guard<std::mutex> lock(scene_matrix_mutex);
+          for (auto& sample : scene_matrix_samples) {
+            if (sample.frame != frame_counter) continue;
+            sample.temporal[0] = temporal_jitter[0] - 0.5f;
+            sample.temporal[1] = temporal_jitter[1] - 0.5f;
+            sample.temporal_valid = true;
+          }
+        }
+        {
+          std::unique_lock lock(scene_buffer_capture.mutex);
+          if (scene_buffer_capture.frame == frame_counter
+              && scene_buffer_capture.state != SceneBufferCapture::State::idle) {
+            scene_buffer_capture.temporal[0] = temporal_jitter[0] - 0.5f;
+            scene_buffer_capture.temporal[1] = temporal_jitter[1] - 0.5f;
+            scene_buffer_capture.temporal_valid = true;
+          }
+        }
+      }
       const std::lock_guard<std::mutex> lock(report_mutex);
       const uint32_t index = deploy_report.temporal_jitter_count++ % 4u;
       std::memcpy(deploy_report.temporal_jitter_params[index], temporal_jitter, kTemporalJitterBytes);
@@ -3997,6 +4192,126 @@ inline std::string BuildDebugReport() {
     out += pairs.empty() ? "none" : pairs;
     out += "\n";
   }
+  {
+    const std::lock_guard<std::mutex> lock(scene_matrix_mutex);
+    char line[512];
+    snprintf(line, sizeof(line), "  scene clip matrix: %u samples, viewport cb0 candidates (unverified; ring order)\n", scene_matrix_count);
+    out += line;
+    snprintf(line, sizeof(line), "    rejected viewport size=%llu projection=%llu\n",
+             static_cast<unsigned long long>(scene_matrix_wrong_size.load()),
+             static_cast<unsigned long long>(scene_matrix_wrong_projection.load()));
+    out += line;
+    const uint32_t count = (std::min)(scene_matrix_count, 4u);
+    for (uint32_t i = 0u; i < count; ++i) {
+      const auto& sample = scene_matrix_samples[i];
+      snprintf(line, sizeof(line), "    frame=%llu vs=0x%08X param=%u binding=%u buffer=0x%llX offset=%llu bytes=%llu temporal=(%.4f,%.4f) %s\n",
+               static_cast<unsigned long long>(sample.frame), sample.shader,
+               sample.layout_param, sample.binding, static_cast<unsigned long long>(sample.buffer),
+               static_cast<unsigned long long>(sample.buffer_offset), static_cast<unsigned long long>(sample.buffer_size),
+               sample.temporal[0], sample.temporal[1], sample.temporal_valid ? "same present interval" : "unavailable");
+      out += line;
+      snprintf(line, sizeof(line), "      viewport cb0+0x334 jitter-frame=%u offscreen-flag=%u (unverified)\n",
+               sample.jitter_frame, sample.offscreen);
+      out += line;
+      double shifts[2][2] = {};
+      double norms[2] = {};
+      const float* matrices[] = {sample.matrix, sample.previous_matrix};
+      for (uint32_t matrix_index = 0u; matrix_index < 2u; ++matrix_index) {
+        const float* m = matrices[matrix_index];
+        for (uint32_t component = 0u; component < 3u; ++component) {
+          norms[matrix_index] += static_cast<double>(m[12u + component]) * m[12u + component];
+          shifts[matrix_index][0] += static_cast<double>(m[component]) * m[12u + component];
+          shifts[matrix_index][1] += static_cast<double>(m[4u + component]) * m[12u + component];
+        }
+      }
+      const bool matrix_valid = std::isfinite(sample.viewport[0]) && std::isfinite(sample.viewport[1])
+          && sample.viewport[0] >= 1.f && sample.viewport[0] <= 16384.f
+          && sample.viewport[1] >= 1.f && sample.viewport[1] <= 16384.f
+          && std::isfinite(norms[0]) && norms[0] >= 0.9 && norms[0] <= 1.1
+          && std::isfinite(norms[1]) && norms[1] >= 0.9 && norms[1] <= 1.1
+          && std::isfinite(shifts[0][0]) && std::isfinite(shifts[0][1])
+          && std::isfinite(shifts[1][0]) && std::isfinite(shifts[1][1])
+          && sample.projection[14] == -1.f && sample.projection[15] == 0.f;
+      if (matrix_valid) {
+        const double current_x = shifts[0][0] / norms[0] * sample.viewport[0] * 0.5;
+        const double current_y = -shifts[0][1] / norms[0] * sample.viewport[1] * 0.5;
+        const double previous_x = shifts[1][0] / norms[1] * sample.viewport[0] * 0.5;
+        const double previous_y = -shifts[1][1] / norms[1] * sample.viewport[1] * 0.5;
+        snprintf(line, sizeof(line),
+                 "      viewport=%.0fx%.0f norms=(%.6g,%.6g) current=(%.5g,%.5g) previous=(%.5g,%.5g) delta=(%.5g,%.5g) px; GPU unverified\n",
+                 sample.viewport[0], sample.viewport[1], norms[0], norms[1], current_x, current_y,
+                 previous_x, previous_y, current_x - previous_x, current_y - previous_y);
+      } else {
+        snprintf(line, sizeof(line), "      viewport=%.5g x %.5g norms=(%.6g,%.6g) invalid; GPU unverified\n",
+                 sample.viewport[0], sample.viewport[1], norms[0], norms[1]);
+      }
+      out += line;
+      out += "      cb0+0x80 (projection candidate):\n";
+      for (uint32_t row = 0u; row < 4u; ++row) {
+        const float* m = sample.projection + row * 4u;
+        snprintf(line, sizeof(line), "      [%u] %.9g %.9g %.9g %.9g\n", row, m[0], m[1], m[2], m[3]);
+        out += line;
+      }
+      out += "      cb0+0x140 (clip matrix candidate):\n";
+      for (uint32_t row = 0u; row < 4u; ++row) {
+        const float* m = sample.matrix + row * 4u;
+        snprintf(line, sizeof(line), "      [%u] %.9g %.9g %.9g %.9g\n", row, m[0], m[1], m[2], m[3]);
+        out += line;
+      }
+      out += "      cb0+0x180 (previous rotation-projection):\n";
+      for (uint32_t row = 0u; row < 4u; ++row) {
+        const float* m = sample.previous_matrix + row * 4u;
+        snprintf(line, sizeof(line), "      [%u] %.9g %.9g %.9g %.9g\n", row, m[0], m[1], m[2], m[3]);
+        out += line;
+      }
+    }
+  }
+  {
+    std::shared_lock lock(scene_buffer_capture.mutex);
+    const char* state = "unknown";
+    switch (scene_buffer_capture.state) {
+      case SceneBufferCapture::State::idle: state = "idle"; break;
+      case SceneBufferCapture::State::requested: state = "requested"; break;
+      case SceneBufferCapture::State::armed: state = "waiting for eligible draw"; break;
+      case SceneBufferCapture::State::recorded: state = "recorded"; break;
+      case SceneBufferCapture::State::submitted: state = "submitted"; break;
+      case SceneBufferCapture::State::reading: state = "reading"; break;
+      case SceneBufferCapture::State::complete: state = "complete"; break;
+      case SceneBufferCapture::State::failed: state = "failed"; break;
+    }
+    char line[320];
+    snprintf(line, sizeof(line), "  camera GPU check : %s frame=%llu vs=0x%08X buffer=0x%llX offset=%llu differing=%u/%u bytes\n",
+             state, static_cast<unsigned long long>(scene_buffer_capture.frame), scene_buffer_capture.shader,
+             static_cast<unsigned long long>(scene_buffer_capture.buffer),
+             static_cast<unsigned long long>(scene_buffer_capture.offset), scene_buffer_capture.different_bytes,
+             SceneBufferCapture::kBytes);
+    out += line;
+    if (scene_buffer_capture.state == SceneBufferCapture::State::complete) {
+      snprintf(line, sizeof(line), "    captured temporal=(%.4f,%.4f) %s\n", scene_buffer_capture.temporal[0],
+               scene_buffer_capture.temporal[1], scene_buffer_capture.temporal_valid ? "same present interval" : "unavailable");
+      out += line;
+      for (uint32_t offset : {0x80u, 0x140u, 0x180u, 0x200u, 0x334u}) {
+        const uint32_t bytes = offset == 0x200u || offset == 0x334u ? 8u : 64u;
+        uint32_t different = 0u;
+        for (uint32_t i = 0u; i < bytes; ++i) {
+          if (scene_buffer_capture.cpu[offset + i] != scene_buffer_capture.gpu[offset + i]) ++different;
+        }
+        snprintf(line, sizeof(line), "    cb0+0x%X CPU/GPU different=%u/%u bytes\n", offset, different, bytes);
+        out += line;
+        if (offset == 0x140u || offset == 0x180u) {
+          for (uint32_t row = 0u; row < 4u; ++row) {
+            float cpu[4] = {};
+            float gpu[4] = {};
+            std::memcpy(cpu, scene_buffer_capture.cpu.data() + offset + row * 16u, sizeof(cpu));
+            std::memcpy(gpu, scene_buffer_capture.gpu.data() + offset + row * 16u, sizeof(gpu));
+            snprintf(line, sizeof(line), "      [%u] CPU %.7g %.7g %.7g %.7g / GPU %.7g %.7g %.7g %.7g\n",
+                     row, cpu[0], cpu[1], cpu[2], cpu[3], gpu[0], gpu[1], gpu[2], gpu[3]);
+            out += line;
+          }
+        }
+      }
+    }
+  }
   // NGX's own words, oldest first. It is the component we cannot see into, and it
   // is the one that knows the runtime version and whether it disliked anything.
   {
@@ -4050,6 +4365,14 @@ inline std::string BuildDebugReport() {
 
 // ── Event handlers ──
 inline void OnExecuteCommandList(reshade::api::command_queue* queue, reshade::api::command_list* cmd_list) {
+  {
+    std::unique_lock lock(scene_buffer_capture.mutex);
+    if (scene_buffer_capture.state == SceneBufferCapture::State::recorded && scene_buffer_capture.command_list == cmd_list) {
+      scene_buffer_capture.queue = queue;
+      scene_buffer_capture.submit_thread = GetCurrentThreadId();
+      scene_buffer_capture.state = SceneBufferCapture::State::submitted;
+    }
+  }
   std::unique_lock lock(motion_capture.mutex);
   if (motion_capture.state == MotionCapture::State::recorded && motion_capture.command_list == cmd_list) {
     motion_capture.queue = queue;
@@ -4059,6 +4382,14 @@ inline void OnExecuteCommandList(reshade::api::command_queue* queue, reshade::ap
 }
 
 inline void OnResetCommandList(reshade::api::command_list* cmd_list) {
+  if (auto* data = cmd_list->get_private_data<CommandListData>()) data->in_render_pass = false;
+  {
+    std::unique_lock lock(scene_buffer_capture.mutex);
+    if (scene_buffer_capture.state == SceneBufferCapture::State::recorded && scene_buffer_capture.command_list == cmd_list) {
+      scene_buffer_capture.command_list = nullptr;
+      scene_buffer_capture.state = SceneBufferCapture::State::armed;
+    }
+  }
   std::unique_lock lock(motion_capture.mutex);
   if (motion_capture.state == MotionCapture::State::recorded && motion_capture.command_list == cmd_list) {
     motion_capture.command_list = nullptr;
@@ -4070,6 +4401,16 @@ inline void OnInitCommandList(reshade::api::command_list* cmd_list) { cmd_list->
 inline void OnDestroyCommandList(reshade::api::command_list* cmd_list) {
   OnResetCommandList(cmd_list);
   cmd_list->destroy_private_data<CommandListData>();
+}
+
+inline void OnBeginRenderPass(reshade::api::command_list* cmd_list, uint32_t,
+                              const reshade::api::render_pass_render_target_desc*,
+                              const reshade::api::render_pass_depth_stencil_desc*) {
+  if (auto* data = Get(cmd_list)) data->in_render_pass = true;
+}
+
+inline void OnEndRenderPass(reshade::api::command_list* cmd_list) {
+  if (auto* data = Get(cmd_list)) data->in_render_pass = false;
 }
 
 // Any pipeline bind may change the pixel shader: mark the memoized hash dirty.
@@ -4231,6 +4572,69 @@ inline void OnPresent(
     uint32_t, const reshade::api::rect*) {
   ++stat_presents;
   if (queue != nullptr) {
+    bool create_scene_capture = false;
+    bool read_scene_capture = false;
+    {
+      std::unique_lock lock(scene_buffer_capture.mutex);
+      if (scene_buffer_capture.state == SceneBufferCapture::State::requested
+          && IsKnownNvidiaNative(queue->get_device()->get_native())) {
+        scene_buffer_capture.state = SceneBufferCapture::State::reading;
+        create_scene_capture = true;
+      } else if (scene_buffer_capture.state == SceneBufferCapture::State::submitted
+                 && scene_buffer_capture.queue == queue && scene_buffer_capture.device == queue->get_device()
+                 && scene_buffer_capture.submit_thread == GetCurrentThreadId()) {
+        scene_buffer_capture.state = SceneBufferCapture::State::reading;
+        read_scene_capture = true;
+      }
+    }
+    if (create_scene_capture) {
+      auto* device = queue->get_device();
+      auto* native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+      Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+      D3D12_HEAP_PROPERTIES heap = {};
+      heap.Type = D3D12_HEAP_TYPE_READBACK;
+      heap.CreationNodeMask = 1u;
+      heap.VisibleNodeMask = 1u;
+      D3D12_RESOURCE_DESC desc = {};
+      desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+      desc.Width = SceneBufferCapture::kBytes;
+      desc.Height = 1u;
+      desc.DepthOrArraySize = 1u;
+      desc.MipLevels = 1u;
+      desc.SampleDesc.Count = 1u;
+      desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      const HRESULT hr = native_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(buffer.GetAddressOf()));
+      std::unique_lock lock(scene_buffer_capture.mutex);
+      scene_buffer_capture.device = device;
+      scene_buffer_capture.readback = buffer;
+      scene_buffer_capture.state = SUCCEEDED(hr) ? SceneBufferCapture::State::armed : SceneBufferCapture::State::failed;
+    }
+    if (read_scene_capture) {
+      queue->wait_idle();
+      Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+      {
+        std::shared_lock lock(scene_buffer_capture.mutex);
+        buffer = scene_buffer_capture.readback;
+      }
+      void* mapped = nullptr;
+      const D3D12_RANGE read_range{0u, SceneBufferCapture::kBytes};
+      const bool ok = buffer != nullptr && SUCCEEDED(buffer->Map(0u, &read_range, &mapped)) && mapped != nullptr;
+      std::unique_lock lock(scene_buffer_capture.mutex);
+      if (ok) {
+        const auto* gpu = static_cast<const uint8_t*>(mapped);
+        std::memcpy(scene_buffer_capture.gpu.data(), gpu, SceneBufferCapture::kBytes);
+        scene_buffer_capture.different_bytes = 0u;
+        for (uint32_t i = 0u; i < SceneBufferCapture::kBytes; ++i) {
+          if (gpu[i] != scene_buffer_capture.cpu[i]) ++scene_buffer_capture.different_bytes;
+        }
+        const D3D12_RANGE written{0u, 0u};
+        buffer->Unmap(0u, &written);
+      }
+      scene_buffer_capture.command_list = nullptr;
+      scene_buffer_capture.queue = nullptr;
+      scene_buffer_capture.state = ok ? SceneBufferCapture::State::complete : SceneBufferCapture::State::failed;
+    }
     bool create_capture = false;
     bool read_capture = false;
     {
@@ -4370,6 +4774,16 @@ inline void OnInitDevice(reshade::api::device* device) {
 
 inline void OnDestroyDevice(reshade::api::device* device) {
   if (device == nullptr) return;
+  {
+    std::unique_lock lock(scene_buffer_capture.mutex);
+    if (scene_buffer_capture.device == device) {
+      scene_buffer_capture.readback.Reset();
+      scene_buffer_capture.device = nullptr;
+      scene_buffer_capture.command_list = nullptr;
+      scene_buffer_capture.queue = nullptr;
+      scene_buffer_capture.state = SceneBufferCapture::State::idle;
+    }
+  }
   bool was_ours = false;
   {
     std::lock_guard<std::mutex> lock(device_mutex);
@@ -4414,6 +4828,8 @@ inline void Use(DWORD fdw_reason) {
       reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
+      reshade::register_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
+      reshade::register_event<reshade::addon_event::end_render_pass>(OnEndRenderPass);
       reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
       reshade::register_event<reshade::addon_event::draw>(OnDraw);
@@ -4433,6 +4849,8 @@ inline void Use(DWORD fdw_reason) {
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
       reshade::unregister_event<reshade::addon_event::barrier>(OnBarrier);
       reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
+      reshade::unregister_event<reshade::addon_event::end_render_pass>(OnEndRenderPass);
+      reshade::unregister_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
       reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       reshade::unregister_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
