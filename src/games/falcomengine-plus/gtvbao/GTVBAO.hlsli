@@ -359,7 +359,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     float dbgSliceN = 0.0f;            // number of slices accumulated
 #ifdef GTVBAO_GI
     float3 giSum = 0.0f;               // sum of per-slice GI
-    float occSum = 0.0f;               // sum of per-slice occluded fraction (for view 31)
 #endif
 
     {
@@ -509,7 +508,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 #ifdef GTVBAO_GI
                     uint visBits0 = sampleMask & ~occBits;
                     if (visBits0 != 0u) {
-                        const float3 sampleRad = 1.0f;
+                        const float3 sampleRad = g_srcRadiance.SampleLevel(depthSampler, sampleScreenPos, max(mipLevel - GTVBAO_resolution, 0.0f)).rgb;
                         float vis0 = 1.0f;
                         if (GTVBAO_vbgi_backface_mode > 0.5f && GTVBAO_mrt_normal_available > 0.5f) {
                             const float3 D0 = DecodeFalcomMrtNormal(
@@ -557,7 +556,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             const float occ = (float)countbits(occBits) / (float)GT_VBAO_BITMASK_SECTOR_COUNT;
 #ifdef GTVBAO_GI
             giSum += gi0;
-            occSum += occ;
 #else
             float sliceWeight = 1.0f;
             if (!useUniform && cosineMode == 0) {
@@ -583,14 +581,13 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 #ifdef GTVBAO_GI
     const float3 giAvg = giSum / (float)sliceCount;
     outWorkingAOTerm[pixCoord] = float4(giAvg, 1.0f);
-    // GI debug views 30-31 (32-35 stay zero until implemented). Same full-res block write as the AO views.
+    // GI debug views 30-32 (33-35 stay zero until implemented). Same full-res block write as the AO views.
     if (g_trackDebug) {
         float4 dbgValue = float4(0.0f, 0.0f, 0.0f, 1.0f);
-        if ((int)GTVBAO_debug_mode == 30) {
+        if ((int)GTVBAO_debug_mode == 30 || (int)GTVBAO_debug_mode == 31) {
             dbgValue = float4(giAvg, 1.0f);
-        } else if ((int)GTVBAO_debug_mode == 31) {
-            float rawGI = giAvg.r + (1.0f - occSum / (float)sliceCount);
-            dbgValue = float4(rawGI, rawGI, rawGI, 1.0f);
+        } else if ((int)GTVBAO_debug_mode == 32) {
+            dbgValue = float4(g_srcRadiance.Load(int3(pixCoord, 0)).rgb, 1.0f);
         }
         GTVBAO_WriteDebug(outDebug, pixCoord, dbgValue);
     }

@@ -978,6 +978,13 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline prefilter_pipeline = {};
   reshade::api::pipeline main_pipeline = {};
   reshade::api::pipeline vbgi_main_pipeline = {};
+  reshade::api::pipeline_layout vbgi_main_layout = {};
+  reshade::api::pipeline_layout vbgi_radiance_layout = {};
+  reshade::api::pipeline vbgi_radiance_pipeline = {};
+  reshade::api::pipeline_layout vbgi_mips_layout = {};
+  reshade::api::pipeline vbgi_mips_pipeline = {};
+  GTVBAODescriptorTableSet vbgi_radiance_tables = {};
+  GTVBAODescriptorTableSet vbgi_mips_tables = {};
   // -- �-trous wavelet spatial filter (R3) --
   reshade::api::pipeline_layout temporal_layout = {};
   reshade::api::pipeline temporal_pipeline = {};
@@ -1010,6 +1017,14 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource vbgi_raw_texture = {};
   reshade::api::resource_view vbgi_raw_srv = {}, vbgi_raw_uav = {};
   uint32_t vbgi_width = 0u, vbgi_height = 0u;
+  // VBGI radiance inputs (lighting draw): 0 mrt1 t2, 1 mrt2 t3, 2 deferredParams t6, 3 shadow t7 (Sora 2nd) / t9 (Sora 1st), 4 dynamicLights t11, 5 lightIndices t12.
+  reshade::api::resource_view vbgi_in_srv[6] = {};
+  uint64_t vbgi_in_frame[6] = {UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
+  reshade::api::resource vbgi_radiance_texture = {};
+  reshade::api::resource_view vbgi_radiance_srv = {};
+  reshade::api::resource_view vbgi_radiance_mip_srv[4] = {};
+  reshade::api::resource_view vbgi_radiance_mip_uav[5] = {};
+  uint64_t vbgi_radiance_frame = UINT64_MAX;
 
   reshade::api::resource_view captured_depth_srv = {};
   std::atomic<bool> captured_depth_live{true};  // destroy-event driven; false = target freed since capture
@@ -1487,6 +1502,7 @@ static void DestroyGTVBAOResources(reshade::api::device* device, DeviceData* dat
 static bool CreateComputePipelinesIfNeeded(reshade::api::device* device, DeviceData* data);
 static bool RunGTVBAO(reshade::api::command_list* cmd_list, DeviceData* data);
 static bool RunVBGI(reshade::api::command_list* cmd_list, DeviceData* data, bool prefilter_done);
+static bool RunVbgiRadiance(reshade::api::command_list* cmd_list, DeviceData* data);
 static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d);
 // -- Contact / Micro Shadows -- forward decls
 static void CreateShadowsResources(reshade::api::device* dev, DeviceData* d,
@@ -5714,6 +5730,31 @@ static void OnPushDescriptorsCapture(
         }
       }
     }
+    // VBGI radiance inputs: only from the Sora lighting shaders while VBGI runs. The binding is the array base, so each
+    // slot of the update is matched by its own number (shadow t9 on Sora 1st, t7 on Sora 2nd).
+    if (VbgiRunning() && update.count >= 1) {
+      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
+      if (ss) {
+        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
+        if (hash == 0xFDAAF80Eu || hash == 0xCA3D8596u) {
+          const uint32_t shadow_slot = IsSora1st() ? 9u : 7u;
+          for (uint32_t i = 0; i < update.count; ++i) {
+            if (views[i].handle == 0u) continue;
+            const uint32_t slot = update.binding + i;
+            int k = -1;
+            if (slot == 2u) k = 0;
+            else if (slot == 3u) k = 1;
+            else if (slot == 6u) k = 2;
+            else if (slot == shadow_slot) k = 3;
+            else if (slot == 11u) k = 4;
+            else if (slot == 12u) k = 5;
+            if (k < 0) continue;
+            d->vbgi_in_srv[k] = views[i];
+            d->vbgi_in_frame[k] = d->frame_index;
+          }
+        }
+      }
+    }
     // Capture ssr2-draw t0 (vanilla ssr1 march result) for the SSR replacement
     // debug view. ONLY from the ssr2 pixel shader � same over-capture rationale
     // as the color capture above.
@@ -9750,6 +9791,15 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
   if (!dd) return true;
 
+  // -- VBGI radiance prepass: at this draw in every dispatch mode (the lighting inputs are only alive here). --
+  if (vbgi_active && dd->captured_depth_srv.handle && dd->captured_scene_cbv_valid) {
+    auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
+    renodx::utils::state::CommandListState prev = {};
+    if (cs) prev = *cs;
+    RunVbgiRadiance(cmd_list, dd);
+    ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
+  }
+
   // -- Deferred dispatch path: capture snapshots for OnPresent (kai-style). --
   // Plain copies only (no queries): resource pairs + live flags travel with the views.
   // GTVBAO/VBGI: with both off there is nothing to defer to.
@@ -10223,6 +10273,29 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
   d->vbgi_width = vw; d->vbgi_height = vh;
   d->last_created_vbgi_resolution = std::log2((float)vdiv);
   mk(vw, vh, reshade::api::format::r16g16b16a16_float, &d->vbgi_raw_texture, &d->vbgi_raw_srv, &d->vbgi_raw_uav);
+  // VBGI radiance chain: r11g11b10_float over the VBGI domain, 5 mips (mip 0 written by the prepass, 1-4 by the box filter).
+  {
+    reshade::api::resource_desc rd = {};
+    rd.type = reshade::api::resource_type::texture_2d;
+    rd.texture = {vw, vh, 1, (uint16_t)5, reshade::api::format::r11g11b10_float, 1};
+    rd.heap = reshade::api::memory_heap::gpu_only;
+    rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+    dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &d->vbgi_radiance_texture);
+    dev->create_resource_view(d->vbgi_radiance_texture, reshade::api::resource_usage::shader_resource,
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
+                                                                reshade::api::format::r11g11b10_float, 0, 5, 0, 1),
+                              &d->vbgi_radiance_srv);
+    for (uint32_t m = 0; m < 4; ++m)
+      dev->create_resource_view(d->vbgi_radiance_texture, reshade::api::resource_usage::shader_resource,
+                                reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
+                                                                  reshade::api::format::r11g11b10_float, m, 1, 0, 1),
+                                &d->vbgi_radiance_mip_srv[m]);
+    for (uint32_t m = 0; m < 5; ++m)
+      dev->create_resource_view(d->vbgi_radiance_texture, reshade::api::resource_usage::unordered_access,
+                                reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
+                                                                  reshade::api::format::r11g11b10_float, m, 1, 0, 1),
+                                &d->vbgi_radiance_mip_uav[m]);
+  }
 
   if (div > 1u) {
     mk(w, h, reshade::api::format::r32_uint,
@@ -10263,6 +10336,13 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   dl(d->prefilter_layout); dl(d->main_layout);
   dp(d->vbgi_main_pipeline); DestroyGTVBAODescriptorTables(dev, &d->vbgi_main_tables);
   dv(d->vbgi_raw_srv); dv(d->vbgi_raw_uav); dr(d->vbgi_raw_texture);
+  dl(d->vbgi_main_layout);
+  dp(d->vbgi_radiance_pipeline); dp(d->vbgi_mips_pipeline);
+  dl(d->vbgi_radiance_layout); dl(d->vbgi_mips_layout);
+  DestroyGTVBAODescriptorTables(dev, &d->vbgi_radiance_tables); DestroyGTVBAODescriptorTables(dev, &d->vbgi_mips_tables);
+  for (auto& v : d->vbgi_radiance_mip_srv) dv(v);
+  for (auto& u : d->vbgi_radiance_mip_uav) dv(u);
+  dv(d->vbgi_radiance_srv); dr(d->vbgi_radiance_texture);
   DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
   DestroyGTVBAODescriptorTables(dev, &d->main_tables);
   DestroyGTVBAODescriptorTables(dev, &d->foliage_mask_tables);
@@ -12290,10 +12370,14 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   dp(d->normal_prep_pipeline);
   dp(d->upscale_pipeline);
   dp(d->vbgi_main_pipeline);
+  dp(d->vbgi_radiance_pipeline); dp(d->vbgi_mips_pipeline);
+  dl(d->vbgi_main_layout); dl(d->vbgi_radiance_layout); dl(d->vbgi_mips_layout);
   if (g_cpuopt_ensure_pipelines < 0.5f) {
     DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
     DestroyGTVBAODescriptorTables(dev, &d->main_tables);
     DestroyGTVBAODescriptorTables(dev, &d->vbgi_main_tables);
+    DestroyGTVBAODescriptorTables(dev, &d->vbgi_radiance_tables);
+    DestroyGTVBAODescriptorTables(dev, &d->vbgi_mips_tables);
     DestroyGTVBAODescriptorTables(dev, &d->temporal_tables);
     DestroyGTVBAODescriptorTables(dev, &d->filter_tables);
     DestroyGTVBAODescriptorTables(dev, &d->normal_prep_tables);
@@ -12351,6 +12435,13 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     mkcs(__gtvbao_foliage_mask, "main", d->foliage_mask_layout, &d->foliage_mask_pipeline);
   // Main: 4 SRVs (t0 depth MIPs, t1 MRT normal, t2 IS-FAST noise, t3 foliage mask) + 2 UAVs (u0 AO, u1 debug)
   if (!make_layout(4u, 2u, &d->main_layout)) return false;
+  // VBGI gather: the main pass's 4 SRVs plus t4 radiance (5 SRVs) and 2 UAVs.
+  if (!make_layout(5u, 2u, &d->vbgi_main_layout)) return false;
+  // VBGI radiance prepass: 9 SRVs + 1 UAV. Radiance mip chain: 1 SRV + 1 UAV.
+  if (!make_layout(9u, 1u, &d->vbgi_radiance_layout)) return false;
+  EnsureGTVBAODescriptorTables(dev, d->vbgi_radiance_layout, &d->vbgi_radiance_tables);
+  if (!make_layout(1u, 1u, &d->vbgi_mips_layout)) return false;
+  EnsureGTVBAODescriptorTables(dev, d->vbgi_mips_layout, &d->vbgi_mips_tables);
   // �-trous: 3 SRVs (AO src, depth MIP0, pre-decoded normals) + 1 UAV (AO dst)
   if (!make_layout(3u, 1u, &d->filter_layout)) return false;
   EnsureGTVBAODescriptorTables(dev, d->filter_layout, &d->filter_tables);
@@ -12362,7 +12453,9 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   EnsureGTVBAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables);
   if (!d->prefilter_pipeline.handle) mkcs(__gtvbao_prefilter, "main", d->prefilter_layout, &d->prefilter_pipeline);
   if (!d->main_pipeline.handle)         mkcs(__gtvbao_main, "main", d->main_layout, &d->main_pipeline);
-  if (!d->vbgi_main_pipeline.handle) mkcs(__gtvbao_vbgi_main, "main", d->main_layout, &d->vbgi_main_pipeline);
+  if (!d->vbgi_main_pipeline.handle) mkcs(__gtvbao_vbgi_main, "main", d->vbgi_main_layout, &d->vbgi_main_pipeline);
+  if (!d->vbgi_radiance_pipeline.handle) mkcs(__vbgi_radiance, "main", d->vbgi_radiance_layout, &d->vbgi_radiance_pipeline);
+  if (!d->vbgi_mips_pipeline.handle) mkcs(__vbgi_radiance_mips, "main", d->vbgi_mips_layout, &d->vbgi_mips_pipeline);
   // �-trous wavelet spatial filter (R3)
   if (!d->filter_pipeline.handle) mkcs(__gtvbao_filter, "main", d->filter_layout, &d->filter_pipeline);
   if (!d->temporal_pipeline.handle) mkcs(__gtvbao_temporal, "main", d->temporal_layout, &d->temporal_pipeline);
@@ -12845,21 +12938,108 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   return true;
 }
 
+// VBGI radiance prepass (M7.4 step 3): sender radiance and its mip chain, once per frame, from the lighting draw.
+constexpr float kVbgiRadianceClamp = 16.f;  // HDR cap per channel
+static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
+  if (d->vbgi_radiance_frame == d->frame_index) return true;
+  if (!VbgiRunning() || !d->captured_depth_srv.handle || !d->captured_mrt_normal_srv.handle
+      || !d->captured_scene_cbv_valid || !d->captured_color_srv.handle || d->captured_color_frame != d->frame_index) return false;
+  for (uint32_t k = 0; k < 6; ++k) {
+    if (!d->vbgi_in_srv[k].handle || d->vbgi_in_frame[k] != d->frame_index) {
+      static bool s_inputs_logged = false;
+      if (!s_inputs_logged) {
+        s_inputs_logged = true;
+        CSLog("vbgi", "radiance skipped: lighting input " + std::to_string(k) + " not captured", true);
+      }
+      return false;
+    }
+  }
+  if (!d->vbgi_radiance_texture.handle || !d->vbgi_radiance_srv.handle || !d->vbgi_radiance_mip_uav[0].handle) return false;
+
+  auto* dev = cl->get_device();
+  if (!d->vbgi_radiance_pipeline.handle || !d->vbgi_mips_pipeline.handle) CreateComputePipelinesIfNeeded(dev, d);
+  if (!d->vbgi_radiance_pipeline.handle || !d->vbgi_mips_pipeline.handle) return false;
+  if (!EnsureGTVBAODescriptorTables(dev, d->vbgi_radiance_layout, &d->vbgi_radiance_tables)) return false;
+  if (!EnsureGTVBAODescriptorTables(dev, d->vbgi_mips_layout, &d->vbgi_mips_tables)) return false;
+
+  const auto UA = reshade::api::resource_usage::unordered_access;
+  const auto SR = reshade::api::resource_usage::shader_resource;
+  const uint32_t w = d->vbgi_width, h = d->vbgi_height;
+  const uint32_t div = 1u << std::clamp((int)std::lround(g_vbgi_resolution), 0, 1);
+
+  // Mip 0: the radiance itself.
+  GtvbaoBindPipeline(cl, d->vbgi_radiance_pipeline);
+  {
+    reshade::api::resource_view srvs[9] = {
+        d->captured_color_srv,
+        d->captured_mrt_normal_srv,
+        d->vbgi_in_srv[0], d->vbgi_in_srv[1],
+        d->captured_depth_srv,
+        d->vbgi_in_srv[2], d->vbgi_in_srv[3], d->vbgi_in_srv[4], d->vbgi_in_srv[5]
+    };
+    reshade::api::descriptor_table_update u[4] = {
+      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
+      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
+      {{},0,0,9,reshade::api::descriptor_type::texture_shader_resource_view,srvs},
+      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->vbgi_radiance_mip_uav[0]},
+    };
+    GtvbaoApplyDescriptors(dev, cl, d->vbgi_radiance_layout, &d->vbgi_radiance_tables, 4, u);
+    std::array<float, kGtvbaoPushConstantFloats> pc = {};
+    pc[0] = g_vbgi_ambient;
+    pc[1] = g_vbgi_lights;
+    pc[2] = g_vbgi_sun;
+    pc[3] = g_vbgi_emissive;
+    pc[4] = kVbgiRadianceClamp;
+    pc[5] = (float)div;
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->vbgi_radiance_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
+  }
+  cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+
+  // Mips 1-4: 2x2 box filter of the level above.
+  for (uint32_t m = 1; m < 5; ++m) {
+    GtvbaoBindPipeline(cl, d->vbgi_mips_pipeline);
+    reshade::api::resource_view src = d->vbgi_radiance_mip_srv[m - 1];
+    reshade::api::resource_view dst = d->vbgi_radiance_mip_uav[m];
+    reshade::api::descriptor_table_update u[4] = {
+      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
+      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
+      {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&src},
+      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&dst},
+    };
+    GtvbaoApplyDescriptors(dev, cl, d->vbgi_mips_layout, &d->vbgi_mips_tables, 4, u);
+    cl->dispatch((std::max(1u, w >> m) + 7u) / 8u, (std::max(1u, h >> m) + 7u) / 8u, 1);
+  }
+
+  falcom_world::rtao::NullComputeSlots(cl, 9, 1, 1);
+  GtvbaoBarrier(cl, d->vbgi_radiance_texture, UA, SR);
+  d->vbgi_radiance_frame = d->frame_index;
+  static bool s_logged = false;
+  if (!s_logged) {
+    CSLog("vbgi", "radiance dispatched " + std::to_string(w) + "x" + std::to_string(h));
+    s_logged = true;
+  }
+  return true;
+}
+
 static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilter_done) {
   if (!d->captured_depth_srv.handle) return false;
   auto* dev = cl->get_device();
 
   if (g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, d);
 
-  if (!d->prefilter_pipeline.handle || !d->vbgi_main_pipeline.handle || !d->main_layout.handle) CreateComputePipelinesIfNeeded(dev, d);
+  if (!d->prefilter_pipeline.handle || !d->vbgi_main_pipeline.handle || !d->vbgi_main_layout.handle) CreateComputePipelinesIfNeeded(dev, d);
   if (!d->prefilter_pipeline.handle || !d->vbgi_main_pipeline.handle) return false;
 
   if (!prefilter_done && !EnsureGTVBAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables)) return false;
-  if (!EnsureGTVBAODescriptorTables(dev, d->main_layout, &d->vbgi_main_tables)) return false;
+  if (!EnsureGTVBAODescriptorTables(dev, d->vbgi_main_layout, &d->vbgi_main_tables)) return false;
 
   const uint32_t w = d->working_width, h = d->working_height;
   if (w < 64 || h < 64 || !d->vbgi_raw_texture.handle || !d->vbgi_raw_uav.handle || d->vbgi_width < 32u || d->vbgi_height < 32u) {
     CSLog("vbgi", "run ABORT: resources not ready", true);
+    return false;
+  }
+  if (d->vbgi_radiance_frame == UINT64_MAX || d->frame_index - d->vbgi_radiance_frame > ((g_cpuopt_deferred_dispatch > 0.5f) ? 1u : 0u)) {
+    CSLog("vbgi", "run ABORT: radiance not produced", true);
     return false;
   }
   const bool vbgi_dbg = VbgiGtvbaoDebugMode() != 0 && d->debug_uav.handle;
@@ -12869,11 +13049,12 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
   if (vbgi_dbg) GtvbaoBarrier(cl, d->debug_texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
   GtvbaoBindPipeline(cl, d->vbgi_main_pipeline);
   {
-    reshade::api::resource_view main_srvs[4] = {
+    reshade::api::resource_view main_srvs[5] = {
         d->depth_mips_srv,
         d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
         d->isfast_noise_srv.handle ? d->isfast_noise_srv : d->fallback_srv,
-        d->foliage_mask_srv.handle ? d->foliage_mask_srv : d->fallback_srv
+        d->foliage_mask_srv.handle ? d->foliage_mask_srv : d->fallback_srv,
+        d->vbgi_radiance_srv
     };
     reshade::api::resource_view main_uavs[2] = {
         d->vbgi_raw_uav,
@@ -12882,12 +13063,12 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     reshade::api::descriptor_table_update u[4] = {
       {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
       {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,4,reshade::api::descriptor_type::texture_shader_resource_view,main_srvs},
+      {{},0,0,5,reshade::api::descriptor_type::texture_shader_resource_view,main_srvs},
       {{},0,0,2,reshade::api::descriptor_type::texture_unordered_access_view,main_uavs},
     };
-    GtvbaoApplyDescriptors(dev, cl, d->main_layout, &d->vbgi_main_tables, 4, u);
+    GtvbaoApplyDescriptors(dev, cl, d->vbgi_main_layout, &d->vbgi_main_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, {.vbgi = true});
-    cl->push_constants(reshade::api::shader_stage::all_compute, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->vbgi_main_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
   }
   cl->dispatch((d->vbgi_width + 7) / 8, (d->vbgi_height + 7) / 8, 1);
   GtvbaoBarrier(cl, d->vbgi_raw_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);

@@ -101,6 +101,10 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_vbgi_backface_mode;       // c[47] - 0=Off, 1=Simple, 2=Exact
 };
 
+#ifdef GTVBAO_GI
+Texture2D<float4> g_srcRadiance : register(t4);
+#endif
+
 // ── Low-res → full-res block-center mapping (odd-dimension safe) ──
 // AO texel tq covers the full block {d*tq .. d*tq + d-1} (d = 1 Full, 2 Half); its representative
 // pixel is the block centre, clamped for odd full dims (e.g. full=5, d=2, ao=3: tq=2 -> min(5,4)=4).
