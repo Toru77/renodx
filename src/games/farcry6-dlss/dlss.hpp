@@ -74,7 +74,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -98,6 +100,8 @@ namespace farcry6_dlss::dlss {
 
 static constexpr uint32_t kTaaMainHash = 0xFF0AF25Bu;
 static constexpr uint32_t kTaaPauseHash = 0x4AD8172Au;
+static constexpr uint32_t kSceneUpscaleHash = 0x944489F5u;
+static constexpr uint32_t kMotionProducerHash = 0xD9289B6Au;
 
 static constexpr uint32_t kTrackedTableCount = 32u;
 static constexpr uint32_t kTrackedRtvCount = 4u;
@@ -202,6 +206,13 @@ inline std::atomic<uint64_t> stat_fail_counts[kFailCodeCount];
 
 inline std::atomic<uint64_t> stat_taa_draws{0};
 inline std::atomic<uint64_t> stat_dlss_ok{0};
+inline std::atomic<uint64_t> stat_scene_handoffs{0};
+inline std::atomic<uint64_t> stat_scene_handoff_misses{0};
+inline std::atomic<uint64_t> stat_jitter_scene{0};
+inline std::atomic<uint64_t> stat_jitter_fallback{0};
+inline std::atomic<uint64_t> stat_jitter_zero{0};
+inline std::atomic<uint64_t> stat_jitter_synthetic{0};
+inline std::atomic<uint64_t> stat_jitter_temporal{0};
 inline std::atomic<uint64_t> stat_presents{0};
 inline std::atomic<int> stat_fail_code{kFailNone};
 // Per-slot resolve result of the last TAA draw: 0=miss, 1=real, read by the UI.
@@ -1259,6 +1270,8 @@ struct __declspec(uuid("7f3e2a1c-9b4d-4e8f-a6c2-d5f1b0e98341")) CommandListData 
   uint32_t cached_scene_vs_hash = 0u;
   uint32_t cached_scene_ps_hash = 0u;
   bool scene_hash_valid = false;
+  uint64_t dlss_taa_resource = 0u;
+  uint64_t dlss_frame = UINT64_MAX;
 };
 
 inline CommandListData* Get(reshade::api::command_list* cmd_list) {
@@ -1795,7 +1808,7 @@ inline void ProbeSceneConstantBuffer(
     // that carries an offset: an unjittered one proves nothing about the jitter, and
     // a frame's constants hold several matrices.
     float best = -1.0f;
-    for (uint32_t candidate = 0u; candidate + 16u <= count; ++candidate) {
+    for (uint32_t candidate = 0u; candidate * 4u + 16u <= count; ++candidate) {
       const float* m = floats + static_cast<size_t>(candidate) * 4u;
       for (uint32_t candidate_order = 0u; candidate_order < 2u; ++candidate_order) {
         float nx = 0.f, ny = 0.f, xx = 0.f, yy = 0.f, zz = 0.f, zw = 0.f;
@@ -1969,7 +1982,7 @@ inline bool ResolveSlot(
 
   reshade::api::pipeline_layout layout = {};
   if (!CurrentPixelLayout(cmd_list, layout)) {
-    slot_hit[li].store(0);
+    if (probe_index < 4u) slot_hit[li].store(0);
     return false;
   }
   uint32_t params[4] = {};
@@ -1995,10 +2008,10 @@ inline bool ResolveSlot(
     if (desc.type != reshade::api::resource_type::texture_2d) continue;
     out.resource = record.resource;
     out.format = record.format != reshade::api::format::unknown ? record.format : desc.texture.format;
-    slot_hit[li].store(1);
+    if (probe_index < 4u) slot_hit[li].store(1);
     return true;
   }
-  slot_hit[li].store(0);
+  if (probe_index < 4u) slot_hit[li].store(0);
   return false;
 }
 
@@ -2101,6 +2114,30 @@ struct InstanceData {
 };
 
 inline InstanceData ngx;
+
+// One capture owns its readback until the submitting queue has retired the copy.
+struct MotionCapture {
+  std::shared_mutex mutex;
+  Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+  reshade::api::device* device = nullptr;
+  reshade::api::command_list* command_list = nullptr;
+  reshade::api::command_queue* queue = nullptr;
+  DWORD submit_thread = 0u;
+  enum class State { idle, requested, armed, recorded, submitted, reading, complete, failed } state = State::idle;
+  struct Sample {
+    float x = 0.f, y = 0.f, jitter_x = 0.f, jitter_y = 0.f;
+    float matrix_x = 0.f, matrix_y = 0.f;
+    float matrix_near_x = 0.f, matrix_near_y = 0.f;
+    bool matrix_valid = false;
+    uint64_t frame = 0u;
+  };
+  std::array<Sample, 4> samples = {};
+  uint32_t count = 0u;
+  uint32_t x = 0u, y = 0u;
+  Sample pending = {};
+};
+inline MotionCapture motion_capture;
+
 
 inline std::wstring GetProcessDirectory() {
   std::array<wchar_t, MAX_PATH> path = {};
@@ -2298,9 +2335,9 @@ inline int GetRenderPresetValue() {
 }
 
 inline int GetFeatureFlags() {
-  // The unpack pass decodes packed MVs to pixel units, so MVLowRes must NOT be
-  // set. The scene is rendered jittered, so MVs span jittered frames.
-  int flags = 0;
+  // Both decoded and placeholder motion textures use the render resolution.
+  // MVLowRes describes texture dimensions, independently of vector units.
+  int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
   if (dlss_depth_inverted != 0.f) flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
   if (dlss_flag_is_hdr != 0.f) flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
   if (dlss_motion_vectors_jittered != 0.f) flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
@@ -2645,6 +2682,18 @@ struct DeployReport {
   int flags = 0;
   float jitter_x = 0.f;
   float jitter_y = 0.f;
+  float scene_jitter_at_eval[2] = {};
+  float temporal_jitter_at_eval[2] = {};
+  bool scene_jitter_fresh_at_eval = false;
+  bool temporal_jitter_valid_at_eval = false;
+  float motion_constants[24] = {};
+  float previous_motion_constants[24] = {};
+  uint64_t previous_motion_constants_frame = UINT64_MAX;
+  uint64_t motion_constants_frame = UINT64_MAX;
+  uint64_t motion_constants_reads = 0u;
+  uint64_t motion_eval_frame = UINT64_MAX;
+  float temporal_jitter_params[4][4] = {};
+  uint32_t temporal_jitter_count = 0u;
   uint32_t depth_state_before = 0u;
   bool depth_transitioned = false;
   uint64_t evals = 0u;
@@ -2768,6 +2817,8 @@ inline void RestoreGameDescriptorState(reshade::api::command_list* cmd_list) {
 inline constexpr uint32_t kFsr1EasuHash = 0x4E927DB0u;
 inline std::atomic<bool> fsr1_active{false};   // seen last frame, so this one too
 inline bool fsr1_seen_this_frame = false;
+inline std::atomic<uint32_t> display_width{0u};
+inline std::atomic<uint32_t> display_height{0u};
 inline std::atomic<uint32_t> fsr1_target_width{0u};
 inline std::atomic<uint32_t> fsr1_target_height{0u};
 inline std::atomic<uint32_t> fsr1_target_format{0u};
@@ -2857,7 +2908,47 @@ inline bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
   if (cmd_list == nullptr) return false;
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
   if (shader_state == nullptr) return false;
-  if (renodx::utils::shader::GetCurrentComputeShaderHash(shader_state) != kFsr1EasuHash) return false;
+  const uint32_t compute_hash = renodx::utils::shader::GetCurrentComputeShaderHash(shader_state);
+  if (compute_hash == kMotionProducerHash) {
+    auto* data = Get(cmd_list);
+    auto* device = cmd_list->get_device();
+    auto* compute_state = renodx::utils::shader::GetCurrentComputeState(shader_state);
+    if (data == nullptr || device == nullptr || compute_state == nullptr) return false;
+    renodx::utils::shader::PopulateStageState(compute_state);
+    if (compute_state->pipeline_details == nullptr) return false;
+    const auto layout = compute_state->pipeline_details->layout;
+    uint32_t params[4] = {};
+    uint32_t bindings[4] = {};
+    const uint32_t count = FindTablesForRegister(
+        layout, 0u, 0u, reshade::api::descriptor_type::constant_buffer, params, bindings, 4u);
+    for (uint32_t i = 0u; i < count; ++i) {
+      if (params[i] >= data->descriptor_tables.size()) continue;
+      DescriptorFingerprint key;
+      if (!ReadSlotFingerprint(device, data->descriptor_tables[params[i]], bindings[i], key)) continue;
+      RecordedDescriptor record;
+      if (!LookupFingerprint(key, record) || !record.has_range
+          || record.type != reshade::api::descriptor_type::constant_buffer) continue;
+      const auto& range = record.range;
+      constexpr uint64_t kOffset = 0x10u;
+      constexpr uint64_t kBytes = 24u * sizeof(float);
+      if (range.offset == UINT64_MAX || range.size < kOffset + kBytes) continue;
+      const uint8_t* mapped = MappedRingData(range.buffer.handle);
+      if (mapped == nullptr || range.offset > mapped_ring.size
+          || mapped_ring.size - range.offset < kOffset + kBytes) continue;
+      const std::lock_guard<std::mutex> lock(report_mutex);
+      if (deploy_report.motion_constants_frame != frame_counter
+          && deploy_report.motion_constants_frame != UINT64_MAX) {
+        std::memcpy(deploy_report.previous_motion_constants, deploy_report.motion_constants, kBytes);
+        deploy_report.previous_motion_constants_frame = deploy_report.motion_constants_frame;
+      }
+      std::memcpy(deploy_report.motion_constants, mapped + range.offset + kOffset, kBytes);
+      deploy_report.motion_constants_frame = frame_counter;
+      ++deploy_report.motion_constants_reads;
+      break;
+    }
+    return false;
+  }
+  if (compute_hash != kFsr1EasuHash) return false;
   // Seeing the dispatch is what tells the frame that the game has an upscaler to
   // hand over - without this the evaluation never targets the display resolution
   // and the dispatch is never prevented, each waiting on the other.
@@ -2920,7 +3011,28 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   const bool depth_b_ok = ResolveSlot(cmd_list, data, kSlotDepthB, 3u, depth_b_in);
   reshade::api::buffer_range b0_range = {};
   const bool b0_ok = ResolveB0(cmd_list, data, b0_range);
-  if (b0_ok && b0_range.offset != UINT64_MAX) last_b0_offset.store(b0_range.offset);
+  float temporal_jitter[4] = {};
+  bool temporal_jitter_valid = false;
+  if (b0_ok && b0_range.offset != UINT64_MAX) {
+    last_b0_offset.store(b0_range.offset);
+    // FC_m64d3d12.dll registers JitterParameters at byte offset 0x60 in
+    // CTemporalEffectsProvider. Record the TAA buffer bytes as a candidate;
+    // their identity, units and frame association still require validation.
+    constexpr uint64_t kTemporalJitterOffset = 0x60u;
+    constexpr uint64_t kTemporalJitterBytes = 4u * sizeof(float);
+    const uint8_t* mapped = MappedRingData(b0_range.buffer.handle);
+    if (mapped != nullptr && b0_range.size >= kTemporalJitterOffset + kTemporalJitterBytes
+        && b0_range.offset <= mapped_ring.size
+        && mapped_ring.size - b0_range.offset >= kTemporalJitterOffset + kTemporalJitterBytes) {
+      std::memcpy(temporal_jitter, mapped + b0_range.offset + kTemporalJitterOffset, kTemporalJitterBytes);
+      temporal_jitter_valid = std::isfinite(temporal_jitter[0]) && std::isfinite(temporal_jitter[1])
+          && temporal_jitter[0] >= 0.f && temporal_jitter[0] <= 1.f
+          && temporal_jitter[1] >= 0.f && temporal_jitter[1] <= 1.f;
+      const std::lock_guard<std::mutex> lock(report_mutex);
+      const uint32_t index = deploy_report.temporal_jitter_count++ % 4u;
+      std::memcpy(deploy_report.temporal_jitter_params[index], temporal_jitter, kTemporalJitterBytes);
+    }
+  }
   if (!b0_ok && !logged_missing_constants) {
     logged_missing_constants = true;
     reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: TAA draw found, but b0 was not resolved");
@@ -3016,8 +3128,8 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   const bool fsr1_needs_write_transition = fsr1_mode
       && (static_cast<uint32_t>(fsr1_target_state)
           & static_cast<uint32_t>(reshade::api::resource_usage::unordered_access)) == 0u;
-  const uint32_t target_width = fsr1_mode ? fsr1_target_width.load() : input_width;
-  const uint32_t target_height = fsr1_mode ? fsr1_target_height.load() : input_height;
+  const uint32_t target_width = fsr1_mode ? fsr1_target_width.load() : display_width.load();
+  const uint32_t target_height = fsr1_mode ? fsr1_target_height.load() : display_height.load();
   if (input_width == 0u || input_height == 0u) {
     NoteFail(kFailSize);
     return false;
@@ -3141,6 +3253,8 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     return false;
   }
 
+  if (!fsr1_mode && (hash != kTaaMainHash || use_bypass)) return false;
+
   // Bypass: a known-good image (flat grey) written through the same transitions
   // and copy the DLSS path uses, with NGX not involved at all. Artifacts that
   // survive this are ours — the barrier/copy plumbing — and not DLSS's, and the
@@ -3211,16 +3325,6 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     return false;
   }
   if (!EnsureOutputTexture(ngx.device.Get(), target_width, target_height, output_format)) return false;
-
-  // Without the game's upscaler there is nowhere for the evaluation's output to go:
-  // it writes a display-resolution target, and the internal-resolution TAA target
-  // is about to be written by the draw itself - which now runs. The inputs are
-  // resolved above, so the report keeps reporting them either way, and nothing is
-  // dispatched to the GPU for a result the game would immediately overwrite.
-  if (!use_bypass && (!fsr1_active.load() || fsr1_target_width.load() == 0u)) {
-    stat_fail_code.store(kFailNone);
-    return false;
-  }
 
   const uint32_t motion_src_width = use_motion_placeholder
       ? placeholders.width
@@ -3294,7 +3398,13 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   // changes the image, DLSS is consuming the jitter and the real value is worth
   // wiring; if it changes nothing, the jitter is not reaching its reprojection at
   // all and neither is the history.
-  if (dlss_jitter_source >= 1.5f) {
+  if (dlss_jitter_source >= 2.5f) {
+    if (temporal_jitter_valid) {
+      const float jitter_sign = dlss_jitter_flip != 0.f ? -1.f : 1.f;
+      jitter_x = (temporal_jitter[0] - 0.5f) * jitter_sign;
+      jitter_y = (temporal_jitter[1] - 0.5f) * jitter_sign;
+    }
+  } else if (dlss_jitter_source >= 1.5f) {
     // A finite cycled pattern: the first 21 values of a Halton(2,3) sequence, wrapped.
     // That is the shape a renderer's own jitter table has - a fixed set of offsets
     // reused every cycle - so the debug overlay holds a steady set of points instead
@@ -3319,6 +3429,99 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       || fabsf(jitter_x) > 0.5f || fabsf(jitter_y) > 0.5f) {
     jitter_x = 0.f;
     jitter_y = 0.f;
+  }
+
+  if (dlss_jitter_source >= 2.5f && temporal_jitter_valid) {
+    ++stat_jitter_temporal;
+  } else if (dlss_jitter_source >= 2.5f) {
+    ++stat_jitter_zero;
+  } else if (dlss_jitter_source >= 1.5f) {
+    ++stat_jitter_synthetic;
+  } else if (dlss_jitter_source > 0.5f && scene_fresh) {
+    ++stat_jitter_scene;
+  } else if (dlss_jitter_source > 0.5f && projection_jitter.valid) {
+    ++stat_jitter_fallback;
+  } else {
+    ++stat_jitter_zero;
+  }
+
+  static int previous_jitter_source = -1;
+  static bool previous_jitter_flip = false;
+  const int current_jitter_source = static_cast<int>(dlss_jitter_source);
+  const bool current_jitter_flip = dlss_jitter_flip != 0.f;
+  if (current_jitter_source != previous_jitter_source || current_jitter_flip != previous_jitter_flip) {
+    ngx.reset = true;
+    previous_jitter_source = current_jitter_source;
+    previous_jitter_flip = current_jitter_flip;
+  }
+
+  // Record the copy after unpack and before NGX on the same command list.
+  // Only a command list observed being submitted can be read back.
+  ID3D12Resource* capture_buffer = nullptr;
+  bool want_motion_sample = false;
+  {
+    std::shared_lock lock(motion_capture.mutex);
+    want_motion_sample = motion_capture.state == MotionCapture::State::armed;
+  }
+  DeployReport motion_producer_report;
+  if (want_motion_sample) {
+    const std::lock_guard<std::mutex> lock(report_mutex);
+    motion_producer_report = deploy_report;
+  }
+  {
+    std::unique_lock lock(motion_capture.mutex);
+    if (!use_motion_placeholder && motion_capture.state == MotionCapture::State::armed
+        && motion_capture.device == device && motion_capture.readback != nullptr) {
+      motion_capture.state = MotionCapture::State::recorded;
+      motion_capture.command_list = cmd_list;
+      motion_capture.x = input_width / 2u;
+      motion_capture.y = input_height / 2u;
+      motion_capture.pending = {.jitter_x = jitter_x, .jitter_y = jitter_y, .frame = frame_counter};
+      const float* matrix = motion_producer_report.motion_constants;
+      // The producer selects a depth-neighborhood location and the unpack
+      // filters packed values. Evaluate two hypothetical depth terms at the
+      // center; neither is the sampled depth or proof of object motion.
+      if (motion_producer_report.motion_constants_reads != 0u
+          && motion_producer_report.motion_constants_frame == frame_counter) {
+        const float ndc_x = (static_cast<float>(input_width / 2u) + 0.5f) * 2.f / input_width - 1.f;
+        const float ndc_y = 1.f - (static_cast<float>(input_height / 2u) + 0.5f) * 2.f / input_height;
+        const float scale = dlss_mv_scale * (dlss_mv_flip != 0.f ? -1.f : 1.f);
+        const auto estimate = [&](float depth_term, float* x, float* y) {
+          const float w = ndc_x * matrix[16] + ndc_y * matrix[17] + depth_term * matrix[18] + matrix[19];
+          if (!std::isfinite(w) || std::fabs(w) <= 1e-6f) return false;
+          const float prev_x = (ndc_x * matrix[4] + ndc_y * matrix[5] + depth_term * matrix[6] + matrix[7]) / w;
+          const float prev_y = (ndc_x * matrix[8] + ndc_y * matrix[9] + depth_term * matrix[10] + matrix[11]) / w;
+          *x = (prev_x - ndc_x) * 0.5f * input_width * scale;
+          *y = (ndc_y - prev_y) * 0.5f * input_height * scale;
+          return std::isfinite(*x) && std::isfinite(*y);
+        };
+        motion_capture.pending.matrix_valid =
+            estimate(0.f, &motion_capture.pending.matrix_x, &motion_capture.pending.matrix_y)
+            && estimate(0.01f, &motion_capture.pending.matrix_near_x, &motion_capture.pending.matrix_near_y);
+      }
+      capture_buffer = motion_capture.readback.Get();
+    }
+  }
+  if (capture_buffer != nullptr) {
+    const reshade::api::resource motion_resource{reinterpret_cast<uint64_t>(motion_vectors)};
+    cmd_list->barrier(motion_resource, reshade::api::resource_usage::shader_resource,
+                      reshade::api::resource_usage::copy_source);
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource = motion_vectors;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = capture_buffer;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16_FLOAT;
+    dst.PlacedFootprint.Footprint.Width = 1u;
+    dst.PlacedFootprint.Footprint.Height = 1u;
+    dst.PlacedFootprint.Footprint.Depth = 1u;
+    dst.PlacedFootprint.Footprint.RowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    const D3D12_BOX box{input_width / 2u, input_height / 2u, 0u,
+                        input_width / 2u + 1u, input_height / 2u + 1u, 1u};
+    command_list->CopyTextureRegion(&dst, 0u, 0u, 0u, &src, &box);
+    cmd_list->barrier(motion_resource, reshade::api::resource_usage::copy_source,
+                      reshade::api::resource_usage::shader_resource);
   }
 
   NVSDK_NGX_D3D12_DLSS_Eval_Params eval = {};
@@ -3421,6 +3624,13 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     deploy_report.flags = feature_flags;
     deploy_report.jitter_x = jitter_x;
     deploy_report.jitter_y = jitter_y;
+    deploy_report.motion_eval_frame = frame_counter;
+    deploy_report.scene_jitter_fresh_at_eval = scene_fresh;
+    deploy_report.temporal_jitter_valid_at_eval = temporal_jitter_valid;
+    deploy_report.scene_jitter_at_eval[0] = scene_jitter.pixels_x;
+    deploy_report.scene_jitter_at_eval[1] = scene_jitter.pixels_y;
+    deploy_report.temporal_jitter_at_eval[0] = temporal_jitter[0] - 0.5f;
+    deploy_report.temporal_jitter_at_eval[1] = temporal_jitter[1] - 0.5f;
     deploy_report.depth_state_before = static_cast<uint32_t>(depth_state);
     deploy_report.depth_transitioned = depth_needs_read_transition;
     ++deploy_report.evals;
@@ -3433,19 +3643,13 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     return false;
   }
 
-  // DLSS wrote the target; move it into the TAA output so the game keeps
-  // running its own pipeline on top. With the game's upscaler doing that step,
-  // the dispatch moves DLSS's output into the resource it would have written
-  // instead, so nothing is copied here.
-  if (!fsr1_mode) {
-    CopyThroughTaaTarget(cmd_list, command_list, output_target, ngx.output_texture.Get(),
-                         reshade::api::resource_usage::unordered_access);
-  }
+  // The full-resolution scene pass consumes our output on the same command list.
+  // Keep the game TAA draw intact until that pass is reached.
 
   if (!ngx.logged_success) {
     ngx.logged_success = true;
     std::stringstream s;
-    s << "Far Cry 6 DLSS: replacing TAA 0x" << std::hex << hash << std::dec
+    s << "Far Cry 6 DLSS: evaluated at TAA 0x" << std::hex << hash << std::dec
       << " at in=" << input_width << "x" << input_height
       << " target=" << target_width << "x" << target_height;
     reshade::log::message(reshade::log::level::info, s.str().c_str());
@@ -3460,9 +3664,6 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       << " reset=" << eval.InReset;
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
-  // NOTE: the pause variant writes a second target (alpha/coverage history).
-  // DLSS replaces RTV0; RTV1 is left untouched so downstream passes keep
-  // reading a valid buffer.
   return true;
 }
 
@@ -3477,7 +3678,7 @@ inline std::string BuildDebugReport() {
       "Far Cry 6 DLSS report\n"
       "  addon version    : %s\n"
       "  devices          : %s\n"
-      "  draws / replaced : %llu / %llu\n"
+      "  taa draws / evals: %llu / %llu\n"
       "  state            : %s\n"
       "  presents         : %llu\n"
       "  inputs           : colour=%s motion=%s depth=%s bypass=%s\n"
@@ -3490,6 +3691,7 @@ inline std::string BuildDebugReport() {
       "  evals/resets/bypass : %llu / %llu / %llu\n"
       "  jitter ngx px    : (%.4f, %.4f)\n"
       "  mv scale / flip  : %.3f / %s   mv jittered=%s   depth inverted=%s   reset-every-frame=%s\n"
+      "  mv resolution   : %s\n"
       "  hdr / restore    : %s / %s\n"
       "  depth transition : %s\n"
       "  upscaler         : %s   replaced=%llu misses=%llu target=%ux%u fmt=%u res=0x%llX\n",
@@ -3525,15 +3727,127 @@ inline std::string BuildDebugReport() {
       dlss_motion_vectors_jittered != 0.f ? "on" : "off",
       dlss_depth_inverted != 0.f ? "on" : "off",
       dlss_reset_every_frame != 0.f ? "on" : "off",
+      (report.flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0 ? "render resolution" : "display resolution",
       dlss_flag_is_hdr != 0.f ? "on" : "off",
       dlss_restore_state != 0.f ? "on" : "off",
       dlss_transition_depth != 0.f ? "on" : "off",
-      fsr1_active.load() ? "game upscaler (DLSS upscales there)" : "game (DLSS at the TAA, internal res)",
+      fsr1_active.load() ? "game upscaler (DLSS upscales there)" : "TAA evaluation, scene upscale handoff",
       static_cast<unsigned long long>(stat_fsr1_replaced.load()),
       static_cast<unsigned long long>(stat_fsr1_misses.load()),
       fsr1_target_width.load(), fsr1_target_height.load(), fsr1_target_format.load(),
       static_cast<unsigned long long>(fsr1_output_resource.load()));
   std::string out(buf);
+  {
+    char line[512];
+    if (report.temporal_jitter_count == 0u) {
+      snprintf(line, sizeof(line), "  taa b0+0x60     : unavailable (candidate JitterParameters)\n");
+    } else {
+      snprintf(line, sizeof(line),
+               "  taa b0+0x60     : candidate JitterParameters, %u samples, latest four (ring order)\n"
+               "    [0] %.6g %.6g %.6g %.6g\n    [1] %.6g %.6g %.6g %.6g\n"
+               "    [2] %.6g %.6g %.6g %.6g\n    [3] %.6g %.6g %.6g %.6g\n",
+               report.temporal_jitter_count,
+               report.temporal_jitter_params[0][0], report.temporal_jitter_params[0][1], report.temporal_jitter_params[0][2], report.temporal_jitter_params[0][3],
+               report.temporal_jitter_params[1][0], report.temporal_jitter_params[1][1], report.temporal_jitter_params[1][2], report.temporal_jitter_params[1][3],
+               report.temporal_jitter_params[2][0], report.temporal_jitter_params[2][1], report.temporal_jitter_params[2][2], report.temporal_jitter_params[2][3],
+               report.temporal_jitter_params[3][0], report.temporal_jitter_params[3][1], report.temporal_jitter_params[3][2], report.temporal_jitter_params[3][3]);
+    }
+    out += line;
+  }
+  {
+    char line[256];
+    snprintf(line, sizeof(line),
+             "  scene handoff    : %llu copied, %llu rejected after shader match\n"
+             "  jitter attempts  : scene=%llu fallback=%llu zero=%llu synthetic=%llu temporal=%llu\n",
+             static_cast<unsigned long long>(stat_scene_handoffs.load()),
+             static_cast<unsigned long long>(stat_scene_handoff_misses.load()),
+             static_cast<unsigned long long>(stat_jitter_scene.load()),
+             static_cast<unsigned long long>(stat_jitter_fallback.load()),
+             static_cast<unsigned long long>(stat_jitter_zero.load()),
+             static_cast<unsigned long long>(stat_jitter_synthetic.load()),
+             static_cast<unsigned long long>(stat_jitter_temporal.load()));
+    out += line;
+  }
+  {
+    char line[256];
+    snprintf(line, sizeof(line),
+             "  jitter at eval   : temporal centered=(%.4f, %.4f) %s; scene probe=(%.4f, %.4f) %s\n",
+             static_cast<double>(report.temporal_jitter_at_eval[0]), static_cast<double>(report.temporal_jitter_at_eval[1]),
+             report.temporal_jitter_valid_at_eval ? "valid" : "unavailable",
+             static_cast<double>(report.scene_jitter_at_eval[0]), static_cast<double>(report.scene_jitter_at_eval[1]),
+             report.scene_jitter_fresh_at_eval ? "same present interval" : "stale/unavailable");
+    out += line;
+  }
+  {
+    char line[800];
+    if (report.motion_constants_reads == 0u) {
+      snprintf(line, sizeof(line), "  motion producer  : constants unavailable (0xD9289B6A)\n");
+    } else {
+      const float* c = report.motion_constants;
+      snprintf(line, sizeof(line),
+               "  motion producer  : 0xD9289B6A reads=%llu producer frame=%llu eval frame=%llu %s\n"
+               "    depth c1       : %.7g %.7g %.7g %.7g\n"
+               "    matrix c2      : %.7g %.7g %.7g %.7g\n"
+               "    matrix c3      : %.7g %.7g %.7g %.7g\n"
+               "    matrix c4      : %.7g %.7g %.7g %.7g\n"
+               "    matrix c5      : %.7g %.7g %.7g %.7g\n"
+               "    unused c6 raw  : %.7g %.7g %.7g %.7g (not read by shader)\n",
+               static_cast<unsigned long long>(report.motion_constants_reads),
+               static_cast<unsigned long long>(report.motion_constants_frame),
+               static_cast<unsigned long long>(report.motion_eval_frame),
+               report.motion_constants_frame == report.motion_eval_frame ? "same present interval" : "different interval",
+               c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
+               c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15],
+               c[16], c[17], c[18], c[19], c[20], c[21], c[22], c[23]);
+    }
+    out += line;
+    if (report.previous_motion_constants_frame != UINT64_MAX) {
+      const float* p = report.previous_motion_constants;
+      snprintf(line, sizeof(line),
+               "  previous producer: frame=%llu (present intervals; gaps are possible)\n"
+               "    matrix c2      : %.7g %.7g %.7g %.7g\n"
+               "    matrix c3      : %.7g %.7g %.7g %.7g\n"
+               "    matrix c5      : %.7g %.7g %.7g %.7g\n"
+               "    unused c6 raw  : %.7g %.7g %.7g %.7g (not read by shader)\n",
+               static_cast<unsigned long long>(report.previous_motion_constants_frame),
+               p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11],
+               p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23]);
+      out += line;
+    }
+  }
+  {
+    std::shared_lock lock(motion_capture.mutex);
+    const char* state = "idle";
+    switch (motion_capture.state) {
+      case MotionCapture::State::requested: state = "requested"; break;
+      case MotionCapture::State::armed: state = "waiting for evaluation"; break;
+      case MotionCapture::State::recorded: state = "waiting for submission"; break;
+      case MotionCapture::State::submitted: state = "waiting for matching queue and submission thread"; break;
+      case MotionCapture::State::reading: state = "reading"; break;
+      case MotionCapture::State::complete: state = "complete"; break;
+      case MotionCapture::State::failed: state = "failed"; break;
+      default: break;
+    }
+    char line[256];
+    snprintf(line, sizeof(line), "  motion samples   : %s %u/4, center=(%u,%u) input pixels\n",
+             state, motion_capture.count, motion_capture.x, motion_capture.y);
+    out += line;
+    for (uint32_t i = 0u; i < motion_capture.count; ++i) {
+      const auto& sample = motion_capture.samples[i];
+      snprintf(line, sizeof(line), "    frame=%llu mv=(%.5f,%.5f) px jitter=(%.4f,%.4f) px\n",
+               static_cast<unsigned long long>(sample.frame), sample.x, sample.y,
+               sample.jitter_x, sample.jitter_y);
+      out += line;
+      if (sample.matrix_valid) {
+        snprintf(line, sizeof(line),
+                 "      camera estimates=(%.5f,%.5f)/(%.5f,%.5f) px; depth terms 0/0.01 hypothetical\n",
+                 sample.matrix_x, sample.matrix_y, sample.matrix_near_x, sample.matrix_near_y);
+      } else {
+        snprintf(line, sizeof(line), "      camera matrix comparison unavailable (interval or invalid transform)\n");
+      }
+      out += line;
+    }
+  }
   // What actually feeds NGX as depth, and how it was found: the scene depth is
   // identified by usage, so its resource, size, format and bind count are the
   // evidence that the right texture was picked rather than a half-res effect's.
@@ -3599,6 +3913,8 @@ inline std::string BuildDebugReport() {
     const auto& js = projection_jitter;
     if (dlss_jitter_source <= 0.5f) {
       snprintf(line, sizeof(line), "  jitter source    : zero (manual)\n");
+    } else if (dlss_jitter_source >= 2.5f) {
+      snprintf(line, sizeof(line), "  jitter source    : TAA temporal buffer (test; centered xy)\n");
     } else if (dlss_jitter_source >= 1.5f) {
       snprintf(line, sizeof(line),
                "  jitter source    : synthetic test ramp (px=(%.2f, %.2f))\n",
@@ -3733,8 +4049,28 @@ inline std::string BuildDebugReport() {
 }
 
 // ── Event handlers ──
+inline void OnExecuteCommandList(reshade::api::command_queue* queue, reshade::api::command_list* cmd_list) {
+  std::unique_lock lock(motion_capture.mutex);
+  if (motion_capture.state == MotionCapture::State::recorded && motion_capture.command_list == cmd_list) {
+    motion_capture.queue = queue;
+    motion_capture.submit_thread = GetCurrentThreadId();
+    motion_capture.state = MotionCapture::State::submitted;
+  }
+}
+
+inline void OnResetCommandList(reshade::api::command_list* cmd_list) {
+  std::unique_lock lock(motion_capture.mutex);
+  if (motion_capture.state == MotionCapture::State::recorded && motion_capture.command_list == cmd_list) {
+    motion_capture.command_list = nullptr;
+    motion_capture.state = MotionCapture::State::armed;
+  }
+}
+
 inline void OnInitCommandList(reshade::api::command_list* cmd_list) { cmd_list->create_private_data<CommandListData>(); }
-inline void OnDestroyCommandList(reshade::api::command_list* cmd_list) { cmd_list->destroy_private_data<CommandListData>(); }
+inline void OnDestroyCommandList(reshade::api::command_list* cmd_list) {
+  OnResetCommandList(cmd_list);
+  cmd_list->destroy_private_data<CommandListData>();
+}
 
 // Any pipeline bind may change the pixel shader: mark the memoized hash dirty.
 // Never creates private data.
@@ -3790,9 +4126,49 @@ inline void NoteDrawForDepth(reshade::api::command_list* cmd_list) {
   if (data != nullptr && data->dsv.handle != 0u) ++data->dsv_draws;
 }
 
+// First test path: replace the scene upscale draw with the DLSS image. The
+// original TAA draw remains available as a fallback if this exact handoff fails.
+inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
+  if (cmd_list == nullptr) return false;
+  auto* data = cmd_list->get_private_data<CommandListData>();
+  if (data == nullptr || data->dlss_frame != frame_counter || data->dlss_taa_resource == 0u) return false;
+  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  if (shader_state == nullptr || renodx::utils::shader::GetCurrentPixelShaderHash(shader_state) != kSceneUpscaleHash) return false;
+  SlotInput input;
+  if (!ResolveSlot(cmd_list, data, 0u, 4u, input) || input.resource.handle != data->dlss_taa_resource) {
+    ++stat_scene_handoff_misses;
+    return false;
+  }
+  auto* target = GetNativeResource(cmd_list->get_device(), data->rtvs[0]);
+  auto* source = ngx.output_texture.Get();
+  if (target == nullptr || source == nullptr) {
+    ++stat_scene_handoff_misses;
+    return false;
+  }
+  const auto dst = target->GetDesc();
+  const auto src = source->GetDesc();
+  if (dst.Dimension != src.Dimension || dst.Width != src.Width || dst.Height != src.Height
+      || dst.Format != src.Format || dst.DepthOrArraySize != src.DepthOrArraySize
+      || dst.MipLevels != src.MipLevels || dst.SampleDesc.Count != src.SampleDesc.Count) {
+    ++stat_scene_handoff_misses;
+    return false;
+  }
+  auto* native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  if (!CopyThroughTaaTarget(cmd_list, native, target, source, reshade::api::resource_usage::unordered_access)) return false;
+  data->dlss_taa_resource = 0u;
+  ++stat_scene_handoffs;
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    reshade::log::message(reshade::log::level::info, "Far Cry 6 DLSS: replaced 0x944489F5 with display-resolution DLSS output");
+  }
+  return true;
+}
+
 inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
   if (dlss_enabled == 0.f || !any_nvidia.load()) return false;
   NoteDrawForDepth(cmd_list);
+  if (ReplaceSceneUpscale(cmd_list)) return true;
   CommandListData* data = nullptr;
   uint32_t hash = 0u;
   if (!CheckTaaDraw(cmd_list, data, hash)) {
@@ -3808,17 +4184,21 @@ inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uin
     s << "Far Cry 6 DLSS: detected TAA draw 0x" << std::hex << hash;
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
-  // The game's TAA is left to run - DLSS no longer replaces it, only the game's
-  // upscaler. The evaluation happens at this draw because this is where the
-  // scene's colour, depth and motion vectors are bound; the draw itself is not
-  // taken out, so the game's pipeline is complete whether or not DLSS deploys.
-  EvaluateDLSS(cmd_list, data, hash);
+  // Keep TAA running as a fallback. A successful evaluation is handed to the
+  // matching scene upscale draw or the game's FSR1 dispatch.
+  data->dlss_taa_resource = 0u;
+  if (EvaluateDLSS(cmd_list, data, hash) && !fsr1_active.load()
+      && hash == kTaaMainHash && dlss_output_mode < 0.5f && dlss_bypass_ngx == 0.f) {
+    data->dlss_taa_resource = cmd_list->get_device()->get_resource_from_view(data->rtvs[0]).handle;
+    data->dlss_frame = frame_counter;
+  }
   return false;
 }
 
 inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
   if (dlss_enabled == 0.f || !any_nvidia.load()) return false;
   NoteDrawForDepth(cmd_list);
+  if (ReplaceSceneUpscale(cmd_list)) return true;
   CommandListData* data = nullptr;
   uint32_t hash = 0u;
   if (!CheckTaaDraw(cmd_list, data, hash)) {
@@ -3834,19 +4214,108 @@ inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32
     s << "Far Cry 6 DLSS: detected TAA draw 0x" << std::hex << hash;
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
-  // The game's TAA is left to run - DLSS no longer replaces it, only the game's
-  // upscaler. The evaluation happens at this draw because this is where the
-  // scene's colour, depth and motion vectors are bound; the draw itself is not
-  // taken out, so the game's pipeline is complete whether or not DLSS deploys.
-  EvaluateDLSS(cmd_list, data, hash);
+  // Keep TAA running as a fallback. A successful evaluation is handed to the
+  // matching scene upscale draw or the game's FSR1 dispatch.
+  data->dlss_taa_resource = 0u;
+  if (EvaluateDLSS(cmd_list, data, hash) && !fsr1_active.load()
+      && hash == kTaaMainHash && dlss_output_mode < 0.5f && dlss_bypass_ngx == 0.f) {
+    data->dlss_taa_resource = cmd_list->get_device()->get_resource_from_view(data->rtvs[0]).handle;
+    data->dlss_frame = frame_counter;
+  }
   return false;
 }
 
 inline void OnPresent(
-    reshade::api::command_queue* queue, reshade::api::swapchain*,
+    reshade::api::command_queue* queue, reshade::api::swapchain* swapchain,
     const reshade::api::rect*, const reshade::api::rect*,
     uint32_t, const reshade::api::rect*) {
   ++stat_presents;
+  if (queue != nullptr) {
+    bool create_capture = false;
+    bool read_capture = false;
+    {
+      std::unique_lock lock(motion_capture.mutex);
+      if (motion_capture.state == MotionCapture::State::requested
+          && IsKnownNvidiaNative(queue->get_device()->get_native())) {
+        motion_capture.state = MotionCapture::State::reading;
+        create_capture = true;
+      } else if (motion_capture.state == MotionCapture::State::submitted && motion_capture.queue == queue
+                 && motion_capture.submit_thread == GetCurrentThreadId()
+                 && motion_capture.device == queue->get_device()) {
+        motion_capture.state = MotionCapture::State::reading;
+        read_capture = true;
+      }
+    }
+    if (create_capture) {
+      auto* device = queue->get_device();
+      auto* native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+      Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+      D3D12_HEAP_PROPERTIES heap = {};
+      heap.Type = D3D12_HEAP_TYPE_READBACK;
+      heap.CreationNodeMask = 1u;
+      heap.VisibleNodeMask = 1u;
+      D3D12_RESOURCE_DESC desc = {};
+      desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+      desc.Width = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+      desc.Height = 1u;
+      desc.DepthOrArraySize = 1u;
+      desc.MipLevels = 1u;
+      desc.SampleDesc.Count = 1u;
+      desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      const HRESULT hr = native_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(buffer.GetAddressOf()));
+      std::unique_lock lock(motion_capture.mutex);
+      motion_capture.device = device;
+      motion_capture.readback = buffer;
+      motion_capture.count = 0u;
+      motion_capture.state = SUCCEEDED(hr) ? MotionCapture::State::armed : MotionCapture::State::failed;
+    }
+    if (read_capture) {
+      // OnExecuteCommandList identifies the submitting queue; Present occurs
+      // after submission. Waiting here is limited to the four requested samples.
+      queue->wait_idle();
+      uint16_t values[2] = {};
+      void* mapped = nullptr;
+      D3D12_RANGE read_range{0u, sizeof(values)};
+      ID3D12Resource* buffer = nullptr;
+      {
+        std::shared_lock lock(motion_capture.mutex);
+        buffer = motion_capture.readback.Get();
+      }
+      const bool mapped_ok = buffer != nullptr && SUCCEEDED(buffer->Map(0u, &read_range, &mapped)) && mapped != nullptr;
+      if (mapped_ok) {
+        std::memcpy(values, mapped, sizeof(values));
+        const D3D12_RANGE written{0u, 0u};
+        buffer->Unmap(0u, &written);
+      }
+      const auto half_to_float = [](uint16_t value) {
+        const int exponent = (value >> 10u) & 31u;
+        const int mantissa = value & 1023u;
+        const float sign = (value & 0x8000u) != 0u ? -1.f : 1.f;
+        if (exponent == 31) return std::numeric_limits<float>::quiet_NaN();
+        if (exponent == 0) return sign * std::ldexp(static_cast<float>(mantissa), -24);
+        return sign * std::ldexp(1.f + static_cast<float>(mantissa) / 1024.f, exponent - 15);
+      };
+      std::unique_lock lock(motion_capture.mutex);
+      if (mapped_ok) {
+        motion_capture.pending.x = half_to_float(values[0]);
+        motion_capture.pending.y = half_to_float(values[1]);
+        motion_capture.samples[motion_capture.count++] = motion_capture.pending;
+        motion_capture.state = (motion_capture.count == motion_capture.samples.size())
+            ? MotionCapture::State::complete : MotionCapture::State::armed;
+      } else {
+        motion_capture.state = MotionCapture::State::failed;
+      }
+      motion_capture.command_list = nullptr;
+      motion_capture.queue = nullptr;
+      motion_capture.submit_thread = 0u;
+    }
+  }
+  if (queue != nullptr && swapchain != nullptr) {
+    const auto desc = queue->get_device()->get_resource_desc(swapchain->get_back_buffer(0));
+    display_width.store(desc.texture.width);
+    display_height.store(desc.texture.height);
+  }
   if (queue != nullptr) SelectSceneDepth(queue->get_device());
   // Whether the game's own upscaler runs is decided by what the last frame showed:
   // with it, DLSS deploys at the upscaler; without it, at the TAA draw.
@@ -3940,6 +4409,8 @@ inline void Use(DWORD fdw_reason) {
       reshade::register_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
+      reshade::register_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
+      reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
@@ -3963,6 +4434,8 @@ inline void Use(DWORD fdw_reason) {
       reshade::unregister_event<reshade::addon_event::barrier>(OnBarrier);
       reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+      reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
+      reshade::unregister_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
       reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::unregister_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);

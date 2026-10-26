@@ -101,6 +101,25 @@ renodx::utils::settings::Settings settings = {
         },
     },
     new renodx::utils::settings::Setting{
+        .key = "DLSSCaptureMotion",
+        .binding = nullptr,
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .default_value = 0.f,
+        .label = "Capture Motion Samples",
+        .section = "Antialiasing",
+        .tooltip = "Captures four synchronized center-pixel motion samples. Hold the camera still, then use Copy Report.",
+        .on_click = [] {
+          using namespace farcry6_dlss::dlss;
+          std::unique_lock lock(motion_capture.mutex);
+          if (motion_capture.state == MotionCapture::State::idle
+              || motion_capture.state == MotionCapture::State::complete
+              || motion_capture.state == MotionCapture::State::failed) {
+            motion_capture.state = MotionCapture::State::requested;
+          }
+          return true;
+        },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLSSStatus",
         .binding = nullptr,
         .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
@@ -150,8 +169,8 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Jitter Source",
         .section = "Antialiasing",
-        .tooltip = "What DLSS is told about the game's render jitter. Zero passes none. Extracted reads the scene geometry passes' own view constants - the draws that apply the jitter - preferring the projection that carries an offset and falling back to the sub-pixel pair that moves between frames; it is read, never inferred from a value's size. Cycled pattern feeds a synthetic never-repeating sequence for A/B testing.",
-        .labels = {"Zero", "Extracted", "Cycled pattern (synthetic)"},
+        .tooltip = "What DLSS is told about the game's render jitter. Zero passes none. Extracted reads the scene geometry passes' own view constants - the draws that apply the jitter - preferring the projection that carries an offset and falling back to the sub-pixel pair that moves between frames; it is read, never inferred from a value's size. Cycled pattern is synthetic. TAA temporal buffer centers the observed JitterParameters xy values as an experimental per-frame source; use Flip Jitter Sign to compare conventions.",
+        .labels = {"Zero", "Extracted", "Cycled pattern (synthetic)", "TAA temporal buffer (test)"},
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
