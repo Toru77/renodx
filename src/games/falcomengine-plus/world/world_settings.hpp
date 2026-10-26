@@ -82,6 +82,9 @@ struct SpatialRows {
   float taps_atrous_default;
   const char* enabled_key = nullptr;
   const char* passes_key = nullptr;
+  float* filter_passes_lowres = nullptr;
+  float filter_passes_lowres_default = 1.f;
+  const char* passes_lowres_key = nullptr;
 };
 // Adds the five Temporal Accumulation rows for RTAO or RTGI. A plain function: MSVC rejects (C2326) the Setting
 // aggregate initialisation inside a lambda, because Setting's default member initialisers are lambdas.
@@ -210,6 +213,21 @@ inline void AddSpatialRows(renodx::utils::settings::Settings* settings, const st
       .format = "%d",
       .is_visible = visible,
   });
+  if (rows.filter_passes_lowres != nullptr) {
+    settings->push_back(new Setting{
+        .key = rows.passes_lowres_key ? std::string(rows.passes_lowres_key) : prefix + "FilterPassesLowRes",
+        .binding = rows.filter_passes_lowres,
+        .value_type = SettingValueType::INTEGER,
+        .default_value = rows.filter_passes_lowres_default,
+        .label = "Filter Passes (Low Res)",
+        .section = rows.section,
+        .tooltip = "Number of filter passes (1 to 4) when the AO resolution is Half or Quarter. Filter Passes applies at Full. Same pass behaviour as Filter Passes; the Radius and Taps rows are shared by both. More passes smooth more and cost more.",
+        .min = 1.f,
+        .max = static_cast<float>(rtao::kFilterMaxPasses),
+        .format = "%d",
+        .is_visible = visible,
+    });
+  }
   settings->push_back(new Setting{
       .key = prefix + "FilterTapsSeparable",
       .binding = rows.taps_separable,

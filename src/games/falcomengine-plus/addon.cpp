@@ -901,6 +901,7 @@ static float g_gtvbao_filter_type = 1.f;
 static float g_gtvbao_filter_radius = 8.f;
 static float g_gtvbao_filter_taps_separable = 5.f;
 static float g_gtvbao_filter_taps_atrous = 5.f;
+static float g_gtvbao_filter_passes_lowres = 1.f;
 static float g_gtvbao_debug_ui = 0.f;  // GTVBAODebugMode index into kGtvbaoDebugModes
 constexpr int kGtvbaoDebugModes[7] = {0, 1, 22, 23, 24, 25, 26};
 static int GtvbaoDebugMode() { return kGtvbaoDebugModes[std::clamp((int)g_gtvbao_debug_ui, 0, 6)]; }
@@ -12722,7 +12723,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   const int filter_type = g_gtvbao_filter_type > 0.5f ? 1 : 0;
   const bool spatial_run = shader_injection.gtvbao_atrous_enabled > 0.5f;
   const rtao::FilterPlan filter_plan = rtao::MakeFilterPlan(filter_type, (int)g_gtvbao_filter_radius,
-      (int)shader_injection.gtvbao_atrous_passes,
+      (int)(low_res ? g_gtvbao_filter_passes_lowres : shader_injection.gtvbao_atrous_passes),
       (int)(filter_type == 1 ? g_gtvbao_filter_taps_atrous : g_gtvbao_filter_taps_separable));
   const bool main_final = !temporal_run && !spatial_run;
 
@@ -12946,7 +12947,10 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                  .taps_atrous = &g_gtvbao_filter_taps_atrous,
                                  .taps_atrous_default = 5.f,
                                  .enabled_key = "GTVBAOAtrousEnabled",
-                                 .passes_key = "GTVBAOAtrousPasses"});
+                                 .passes_key = "GTVBAOAtrousPasses",
+                                 .filter_passes_lowres = &g_gtvbao_filter_passes_lowres,
+                                 .filter_passes_lowres_default = 1.f,
+                                 .passes_lowres_key = "GTVBAOAtrousPassesLowRes"});
     falcom_world::AddSettings(&settings, IsSora2nd(), IsAdvancedSettingsMode);
   }
   falcom_world::Use(fdw_reason, IsSora2nd());
