@@ -145,7 +145,7 @@ struct ShaderInjectData {
   float vbgi_reduce_ao;             // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGIReduceAO), kept for the layout
   float vbgi_reduce_ao_strength;    // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGIReduceAOStrength), kept for the layout
   float vbgi_debug_logging;         // RETIRED: no setting drives it (was SSGIDebugLogging), kept for the layout
-  float vbgi_debug_view;            // RETIRED: no UI. The lighting hook zeroes it every frame; legacy PS debug blocks still read it. The new VBGI debug views use gtvbao_debug_view modes 30-35 (wired in M7.3).
+  float vbgi_debug_view;            // RETIRED: no UI. The lighting hook zeroes it every frame; legacy PS debug blocks still read it. The new VBGI debug views use gtvbao_debug_view modes 30-35 (wired in M7.4).
   float vbgi_affect_lights;         // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGIAffectLights), kept for the layout
   float vbgi_lights_strength;       // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGILightsStrength), kept for the layout
   float vbgi_lights_saturation;     // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGILightsSaturation), kept for the layout

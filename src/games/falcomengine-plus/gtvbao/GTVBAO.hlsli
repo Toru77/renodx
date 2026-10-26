@@ -21,6 +21,12 @@
 #define GT_VBAO_RCP_PI              (0.31830988618379067153776752674503)
 #define GT_VBAO_RCP_PI_HALF         (0.63661977236758134307553505349006)
 
+#ifdef GTVBAO_GI
+#define GTVBAO_AO_OUT_TYPE RWTexture2D<float4>
+#else
+#define GTVBAO_AO_OUT_TYPE RWTexture2D<uint>
+#endif
+
 #ifndef GT_VBAO_USE_HALF_FLOAT_PRECISION
 #define GT_VBAO_USE_HALF_FLOAT_PRECISION 1
 #endif
@@ -233,7 +239,7 @@ float2 GTVBAO_ScreenDirFromViewDir(float3 P, float3 D, GTAOConstants consts)
     return dPx * rsqrt(max(dot(dPx, dPx), 1e-12f));
 }
 
-void GTVBAO_OutputWorkingTerm( const uint2 pixCoord, lpfloat visibility, RWTexture2D<uint> outWorkingAOTerm )
+void GTVBAO_OutputWorkingTerm( const uint2 pixCoord, lpfloat visibility, GTVBAO_AO_OUT_TYPE outWorkingAOTerm )
 {
     if (GTVBAO_final_pass < 0.5f)
         visibility = visibility / lpfloat(GT_VBAO_OCCLUSION_TERM_SCALE);
@@ -242,7 +248,7 @@ void GTVBAO_OutputWorkingTerm( const uint2 pixCoord, lpfloat visibility, RWTextu
 }
 
 void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPerSlice, const lpfloat2 localNoise, lpfloat3 viewspaceNormal, const GTAOConstants consts, 
-    Texture2D<lpfloat> sourceViewspaceDepth, SamplerState depthSampler, RWTexture2D<uint> outWorkingAOTerm,
+    Texture2D<lpfloat> sourceViewspaceDepth, SamplerState depthSampler, GTVBAO_AO_OUT_TYPE outWorkingAOTerm,
     Texture2D<uint4> mrtNormalTexture,
     Texture2D<uint> foliageMaskTexture,
     RWTexture2D<float4> outDebug
@@ -284,6 +290,13 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
       pixTZ = (lpfloat)sourceViewspaceDepth.Load(int3(clamp(ftc + int2( 0,-1), int2(0, 0), fmax), 0));
       pixBZ = (lpfloat)sourceViewspaceDepth.Load(int3(clamp(ftc + int2( 0, 1), int2(0, 0), fmax), 0));
     }
+
+#ifdef GTVBAO_GI
+    if (viewspaceZ >= 60000.0) {
+        outWorkingAOTerm[pixCoord] = float4(0.0f, 0.0f, 0.0f, -1.0f);
+        return;
+    }
+#endif
 
     // Cache texture dimensions for foliage mask checks (only when mask is fresh this frame).
     uint g_mrtW, g_mrtH;
@@ -344,6 +357,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     // float, not lpfloat, so the accumulation stays in fp32.
     float dbgSliceAOSum = 0.0f;        // sum of per-slice unweighted sliceAO
     float dbgSliceN = 0.0f;            // number of slices accumulated
+#ifdef GTVBAO_GI
+    float3 giSum = 0.0f;               // sum of per-slice GI
+    float occSum = 0.0f;               // sum of per-slice occluded fraction (for view 31)
+#endif
 
     {
         // quality settings / tweaks / hacks
@@ -404,8 +421,13 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             const float3 projN       = N - sliceN * dot(N, sliceN);
             const float  projNSqrLen = dot(projN, projN);
             if (projNSqrLen < 1e-12f) {
+#ifdef GTVBAO_GI
+                outWorkingAOTerm[pixCoord] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+                return;
+#else
                 degenerate = true;
                 continue;
+#endif
             }
             const float  projNRcpLen = rsqrt(projNSqrLen);
             const float  cosN        = dot(projN, V) * projNRcpLen;
@@ -415,6 +437,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             const float  angOff      = angN * GT_VBAO_RCP_PI + 0.5f;
 
             // ── Horizons (bufferc.txt:705-795) ──
+#ifdef GTVBAO_GI
+            float3 gi0 = 0.0f;
+#endif
             uint occBits = 0u;
             for (int side = 0; side < 2; side++)
             {
@@ -481,7 +506,44 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     uint mY = horInt.y != 0u ? (0xFFFFFFFFu >> (32u - horInt.y)) : 0u;
                     uint sampleMask = mX & mY;
 
+#ifdef GTVBAO_GI
+                    uint visBits0 = sampleMask & ~occBits;
+                    if (visBits0 != 0u) {
+                        const float3 sampleRad = 1.0f;
+                        float vis0 = 1.0f;
+                        if (GTVBAO_vbgi_backface_mode > 0.5f && GTVBAO_mrt_normal_available > 0.5f) {
+                            const float3 D0 = DecodeFalcomMrtNormal(
+                                mrtNormalTexture.Load(int3(GTVBAO_MrtTexel(sampleScreenPos * float2(g_mrtW, g_mrtH), float2(g_mrtW, g_mrtH)), 0)).xy);
+                            if (FalcomNormalValid(D0)) {
+                                const float3 N0 = TransformNormalToView(D0);
+                                const float3 projN0 = N0 - sliceN * dot(N0, sliceN);
+                                const float projN0SqrLen = dot(projN0, projN0);
+                                if (projN0SqrLen != 0.0f) {
+                                    const float u = dot(projN, projN0) * projNRcpLen * rsqrt(projN0SqrLen);
+                                    if (GTVBAO_vbgi_backface_mode < 1.5f) {
+                                        vis0 = clamp((1.0f - u) * 2.0f, 0.0f, 1.0f);
+                                    } else {
+                                        const bool flipT = dot(T, N0) < 0.0f;
+                                        float hor = acos(clamp(u, -1.0f, 1.0f)) * GT_VBAO_RCP_PI;
+                                        if (flipT) hor = 1.0f - hor;
+                                        const bool isPhiLargerThanAngN = hor * GT_VBAO_PI - GT_VBAO_PI_HALF > angN;
+                                        if (useUniform) hor = GTVBAO_SliceRelCDF_Uniform(hor, angN, isPhiLargerThanAngN);
+                                        else            hor = GTVBAO_SliceRelCDF_Cos(hor, angN, cosN, isPhiLargerThanAngN);
+                                        hor = saturate(hor + rnd.w * (1.0f / 32.0f));
+                                        uint horInt = (uint)floor(hor * 32.0f);
+                                        uint visBitsN = horInt < 32u ? (0xFFFFFFFFu << horInt) : 0u;
+                                        if (!flipT) visBitsN = ~visBitsN;
+                                        visBits0 &= visBitsN;
+                                    }
+                                }
+                            }
+                        }
+                        gi0 += sampleRad * ((float)countbits(visBits0) / (float)GT_VBAO_BITMASK_SECTOR_COUNT * vis0);
+                    }
                     occBits |= sampleMask;
+#else
+                    occBits |= sampleMask;
+#endif
                 }
             }
 
@@ -493,11 +555,16 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
             // ── Slice AO and weight (bufferc.txt:797-809) ──
             const float occ = (float)countbits(occBits) / (float)GT_VBAO_BITMASK_SECTOR_COUNT;
+#ifdef GTVBAO_GI
+            giSum += gi0;
+            occSum += occ;
+#else
             float sliceWeight = 1.0f;
             if (!useUniform && cosineMode == 0) {
                 sliceWeight = max(0.0f, (1.0f / projNRcpLen) * (cosN + angN * sin(angN)));
             }
             visibility += sliceWeight - sliceWeight * occ;
+#endif
 
             // ── Slice AO accumulation for the debug view (24) ──
             if (g_trackDebug) {
@@ -513,6 +580,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         visibility = max( (lpfloat)0.03, visibility ); // disallow total occlusion (which wouldn't make any sense anyhow since pixel is visible but also helps with packing bent normals)
     }
 
+#ifdef GTVBAO_GI
+    outWorkingAOTerm[pixCoord] = float4(giSum / (float)sliceCount, 1.0f);
+#else
     GTVBAO_OutputWorkingTerm( pixCoord, visibility, outWorkingAOTerm );
 
     // ── Foliage post-blend (no early-out, normal AO computed first) ──
@@ -557,6 +627,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         }
         GTVBAO_WriteDebug(outDebug, pixCoord, dbgValue);
     }
+#endif
 }
 
 static const float GTVBAO_DEPTH_MIP_RANGE = 0.31875f;   // 0.75 * radius 0.25 * multiplier 1.7 (shipped defaults)

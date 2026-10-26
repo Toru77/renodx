@@ -15,7 +15,11 @@ SamplerState           g_samplerPointClamp : register(s0);
 Texture3D<float2>      g_isfastNoiseTexture : register(t2);
 Texture2D<uint>        g_srcFoliageMask    : register(t3);
 
+#ifdef GTVBAO_GI
+RWTexture2D<float4>        g_outWorkingAOTerm : register(u0);  // raw GI in the GI flavour
+#else
 RWTexture2D<uint>          g_outWorkingAOTerm : register(u0);
+#endif
 RWTexture2D<float4>        g_outDebug         : register(u1);
 
 // ── Interleaved Gradient Noise (IGN) — IS-FAST fallback ──

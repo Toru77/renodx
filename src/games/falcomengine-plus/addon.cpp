@@ -517,7 +517,7 @@ constexpr uint32_t kGtvbaoPushConstantsLayoutParam = 4u;   // push_constants at 
 // Must match the cbuffer declared in gtvbao_common.hlsl. Named so the builder,
 // the layout range and all nine push sites cannot drift apart -- a mismatch
 // here silently truncates the tail of the block rather than failing loudly.
-constexpr uint32_t kGtvbaoPushConstantFloats = 43;
+constexpr uint32_t kGtvbaoPushConstantFloats = 48;
 constexpr uint32_t kGtvbaoSnapshotFloats = 32;
 constexpr uint32_t kLightingMrtNormalRegister = 1u;  // t1 = mrtTexture0 (g-buffer normals)
 constexpr uint64_t kGTVBAOStartupGuardFrames = 8u;
@@ -740,6 +740,7 @@ static float g_vbgi_sun = 1.f;
 static float g_vbgi_emissive = 1.f;
 static float g_vbgi_multibounce_strength = 0.5f;
 static float g_vbgi_debug_mode = 0.f;
+static float g_vbgi_backface_mode = 0.f;
 
 // -- IS-FAST noise --
 static float g_isfast_enabled       = 0.f;
@@ -876,7 +877,9 @@ static bool IsDaybreak2() {
 static bool IsKyoto() {
   return !IsKai() && !IsSora1st() && !IsSora2nd() && !IsDaybreak2();
 }
-static bool VbgiRowVisible() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2() && !IsKai(); }
+static bool VbgiGameSupported() { return !IsKyoto() && !IsDaybreak2() && !IsKai(); }  // M7.7 drops !IsKai()
+static bool VbgiRowVisible() { return IsAdvancedSettingsMode() && VbgiGameSupported(); }
+static bool VbgiRunning() { return g_vbgi_enabled > 0.5f && VbgiGameSupported() && !falcom_world::rtao::RtaoRequested(); }
 
 // -- Lighting shader identification (Sora + Kai) --
 static bool IsLightingShader(uint32_t hash) {
@@ -950,6 +953,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t ao_width = 0u;
   uint32_t ao_height = 0u;
   float last_created_gtvbao_resolution = -1.f;
+  float last_created_vbgi_resolution = -1.f;
   reshade::api::resource upscale_ao_texture = {};
   reshade::api::resource_view upscale_ao_srv = {};
   reshade::api::resource_view upscale_ao_uav = {};
@@ -959,6 +963,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline_layout main_layout = {};
   reshade::api::pipeline prefilter_pipeline = {};
   reshade::api::pipeline main_pipeline = {};
+  reshade::api::pipeline vbgi_main_pipeline = {};
   // -- �-trous wavelet spatial filter (R3) --
   reshade::api::pipeline_layout temporal_layout = {};
   reshade::api::pipeline temporal_pipeline = {};
@@ -987,6 +992,10 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // Descriptor tables � pre-allocated per pass.
   GTVBAODescriptorTableSet prefilter_tables = {};
   GTVBAODescriptorTableSet main_tables = {};
+  GTVBAODescriptorTableSet vbgi_main_tables = {};
+  reshade::api::resource vbgi_raw_texture = {};
+  reshade::api::resource_view vbgi_raw_srv = {}, vbgi_raw_uav = {};
+  uint32_t vbgi_width = 0u, vbgi_height = 0u;
 
   reshade::api::resource_view captured_depth_srv = {};
   std::atomic<bool> captured_depth_live{true};  // destroy-event driven; false = target freed since capture
@@ -1463,6 +1472,7 @@ static void CreateGTVBAOResources(reshade::api::device* device, DeviceData* data
 static void DestroyGTVBAOResources(reshade::api::device* device, DeviceData* data);
 static bool CreateComputePipelinesIfNeeded(reshade::api::device* device, DeviceData* data);
 static bool RunGTVBAO(reshade::api::command_list* cmd_list, DeviceData* data);
+static bool RunVBGI(reshade::api::command_list* cmd_list, DeviceData* data, bool prefilter_done);
 static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d);
 // -- Contact / Micro Shadows -- forward decls
 static void CreateShadowsResources(reshade::api::device* dev, DeviceData* d,
@@ -1493,7 +1503,7 @@ static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool
 static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d);
 
-// VBGI is now integrated into GTVBAO main pass � no separate RunVBGI needed.
+// VBGI gather: see RunVBGI
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
 // Defined with RunRtgiInline below; the CustomShader table needs it first.
 static void OnDrawnLightingShader(reshade::api::command_list* cmd_list);
@@ -3732,6 +3742,14 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.30f, .label = "Bitmask Thickness", .section = "VBGI",
       .tooltip = "World-space thickness for visibility bitmask. Higher = more light passes behind surfaces.",
       .min = 0.01f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIBackfaceMode", .binding = &g_vbgi_backface_mode,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Backface Rejection", .section = "VBGI",
+      .labels = {"Off", "Simple", "Exact"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
     },
@@ -6391,11 +6409,13 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     }
     const bool too_small = d->working_width < 320u || d->working_height < 320u;
     const float want_res = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 1.f);
+    const float want_vbgi_res = std::clamp(std::round(g_vbgi_resolution), 0.f, 1.f);
     if (gw > 0u && gh > 0u
         && (!d->resources_created || too_small
             || gw != d->last_created_game_width
             || gh != d->last_created_game_height
-            || want_res != d->last_created_gtvbao_resolution)) {
+            || want_res != d->last_created_gtvbao_resolution
+            || want_vbgi_res != d->last_created_vbgi_resolution)) {
       CreateGTVBAOResources(dev, d, gw, gh);
       d->last_created_game_width = gw;
       d->last_created_game_height = gh;
@@ -6564,6 +6584,11 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
       " cbv=" + (d->captured_scene_cbv_valid ? "ok" : "MISSING"), dimMismatch || !d->captured_scene_cbv_valid);
     ok = RunGTVBAO(cl, d);
     CSLog("gtvbao", std::string("invoke exit") + (ok ? " ok" : " FAILED"), !ok);
+  }
+  const bool ao_ok = (shader_injection.gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested()) && ok;
+  if (VbgiRunning()) {
+    const bool ok_vbgi = RunVBGI(cl, d, ao_ok);
+    CSLog("vbgi", std::string("invoke exit") + (ok_vbgi ? " ok" : " FAILED"), !ok_vbgi);
   }
 
   // Restore: apply dispatch fix, then restore previous state.
@@ -9679,6 +9704,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // Dynamic Cubemaps � standalone, must run even when GTVBAO/SSR off (any Falcom title)
   const bool dyncube_active = shader_injection.dynCube_enabled > 0.5f;
   const bool gtvbao_active = shader_injection.gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested();
+  const bool vbgi_active = VbgiRunning();
   // RTAO on: GTVBAO's t23 block is skipped (and the early-out below may return), so its flags are cleared here.
   if (falcom_world::rtao::RtaoRequested()) {
     shader_injection.gtvbao_vbgi_bound = 0.f;
@@ -9702,7 +9728,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     }
      dd0->dyncube_was_enabled = dyncube_active;
   }
-  if (!gtvbao_active && !dyncube_active) return true;
+  if (!gtvbao_active && !vbgi_active && !dyncube_active) return true;
   if (!cmd_list) return true;
 
   auto* dev = cmd_list->get_device();
@@ -9711,8 +9737,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
   // -- Deferred dispatch path: capture snapshots for OnPresent (kai-style). --
   // Plain copies only (no queries): resource pairs + live flags travel with the views.
-  // GTVBAO-only: with the mode off there is nothing to defer to.
-  if (g_cpuopt_deferred_dispatch > 0.5f && shader_injection.gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested()) {
+  // GTVBAO/VBGI: with both off there is nothing to defer to.
+  if (g_cpuopt_deferred_dispatch > 0.5f && (gtvbao_active || vbgi_active)) {
     dd->deferred_depth_srv = dd->captured_depth_srv;
     dd->deferred_depth_res = dd->captured_depth_res;
     dd->defDepthLive = dd->captured_depth_live.load();
@@ -9732,23 +9758,28 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     dd->deferred_pending = true;
   }
 
-  // -- Inline dispatch: Run GTVBAO on this frame's command list (only when NOT deferred). --
-  if (gtvbao_active && g_cpuopt_deferred_dispatch < 0.5f) {
-    if (dd->captured_depth_srv.handle && dd->captured_scene_cbv_valid
-        && dd->ao_term_a_srv.handle) {
+  // -- Inline dispatch: Run GTVBAO/VBGI on this frame's command list (only when NOT deferred). --
+  if ((gtvbao_active || vbgi_active) && g_cpuopt_deferred_dispatch < 0.5f) {
+    if (dd->captured_depth_srv.handle && dd->captured_scene_cbv_valid) {
       auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
       renodx::utils::state::CommandListState prev = {};
       if (cs) prev = *cs;
 
-      const std::string liveDepth = dd->captured_depth_srv.handle ? dd->captured_depth_dims : "none";
-      const std::string wantDims = std::to_string(dd->working_width) + "x" + std::to_string(dd->working_height);
-      CSLog("gtvbao", std::string("inline invoke working=") + wantDims + " liveDepth=" + liveDepth,
-        liveDepth != wantDims);
-      bool ok = RunGTVBAO(cmd_list, dd);
-      CSLog("gtvbao", std::string("inline invoke exit") + (ok ? " ok" : " FAILED"), !ok);
+      bool ao_ok = false;
+      if (gtvbao_active && dd->ao_term_a_srv.handle) {
+        const std::string liveDepth = dd->captured_depth_srv.handle ? dd->captured_depth_dims : "none";
+        const std::string wantDims = std::to_string(dd->working_width) + "x" + std::to_string(dd->working_height);
+        CSLog("gtvbao", std::string("inline invoke working=") + wantDims + " liveDepth=" + liveDepth,
+          liveDepth != wantDims);
+        ao_ok = RunGTVBAO(cmd_list, dd);
+        CSLog("gtvbao", std::string("inline invoke exit") + (ao_ok ? " ok" : " FAILED"), !ao_ok);
+      }
+      if (vbgi_active) {
+        const bool ok_vbgi = RunVBGI(cmd_list, dd, ao_ok);
+        CSLog("vbgi", std::string("inline invoke exit") + (ok_vbgi ? " ok" : " FAILED"), !ok_vbgi);
+      }
 
       ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
-      (void)ok;
     }
   }
 
@@ -10170,6 +10201,13 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
   for (int i = 0; i < 2; ++i)
     mk(aw, ah, reshade::api::format::r16g16b16a16_float,
        &d->temporal_history_texture[i], &d->temporal_history_srv[i], &d->temporal_history_uav[i]);
+  // VBGI raw gather target: always allocated; RunVBGI never resizes it.
+  const uint32_t vdiv = 1u << std::clamp((int)std::lround(g_vbgi_resolution), 0, 1);
+  const uint32_t vw = (w + vdiv - 1u) / vdiv;
+  const uint32_t vh = (h + vdiv - 1u) / vdiv;
+  d->vbgi_width = vw; d->vbgi_height = vh;
+  d->last_created_vbgi_resolution = std::log2((float)vdiv);
+  mk(vw, vh, reshade::api::format::r16g16b16a16_float, &d->vbgi_raw_texture, &d->vbgi_raw_srv, &d->vbgi_raw_uav);
 
   if (div > 1u) {
     mk(w, h, reshade::api::format::r32_uint,
@@ -10208,6 +10246,8 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   if (d->point_clamp_sampler.handle) { dev->destroy_sampler(d->point_clamp_sampler); d->point_clamp_sampler = {}; }
   dp(d->prefilter_pipeline); dp(d->main_pipeline);
   dl(d->prefilter_layout); dl(d->main_layout);
+  dp(d->vbgi_main_pipeline); DestroyGTVBAODescriptorTables(dev, &d->vbgi_main_tables);
+  dv(d->vbgi_raw_srv); dv(d->vbgi_raw_uav); dr(d->vbgi_raw_texture);
   DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
   DestroyGTVBAODescriptorTables(dev, &d->main_tables);
   DestroyGTVBAODescriptorTables(dev, &d->foliage_mask_tables);
@@ -12122,6 +12162,7 @@ struct GtvbaoPassPush {
   int filter_step = 1;
   int filter_taps = 1;
   bool history_valid = false;
+  bool vbgi = false;
 };
 
 // Push indices that make up the temporal reset snapshot (settings that shape the AO; not debug, filter or per-frame values).
@@ -12180,6 +12221,37 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   c[40] = g_gtvbao_normal_rejection;
   c[41] = g_gtvbao_history_clamp;
   c[42] = pass.history_valid ? 1.f : 0.f;
+  if (pass.vbgi) {
+    c[0] = g_vbgi_quality_level;
+    c[1] = std::max(0.001f, g_vbgi_radius);
+    c[2] = 1.f;
+    c[3] = 1.f;
+    c[4] = 1.5f;
+    c[5] = std::clamp(g_vbgi_bitmask_thickness, 0.01f, 2.f);
+    c[6] = std::clamp(g_vbgi_depth_mip_offset, 0.f, 30.f);
+    c[7] = (float)(((data ? data->frame_index : 0u) % 64u) + 32u);
+    c[8] = 0.f;
+    c[9] = 0.f;
+    c[10] = g_vbgi_mrt_normal;
+    c[12] = 1.f;
+    c[13] = 1.f;
+    c[14] = 1.f;
+    c[15] = 0.f;
+    c[16] = 1.f;
+    c[17] = 0.f;
+    c[18] = 1.f;
+    c[25] = g_vbgi_noise_type;
+    c[26] = 2.f;
+    c[27] = 0.f;
+    c[30] = 0.f;
+    c[35] = std::clamp(std::round(g_vbgi_resolution), 0.f, 1.f);
+    c[36] = 0.f;
+    c[43] = 1.f;
+    c[44] = IsSora1st() ? 0.f : (IsSora2nd() ? 1.f : 2.f);
+    c[45] = 0.f;
+    c[46] = 65504.f;
+    c[47] = g_vbgi_backface_mode;
+  }
   return c;
 }
 
@@ -12203,9 +12275,11 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   dp(d->temporal_pipeline); dp(d->filter_pipeline);
   dp(d->normal_prep_pipeline);
   dp(d->upscale_pipeline);
+  dp(d->vbgi_main_pipeline);
   if (g_cpuopt_ensure_pipelines < 0.5f) {
     DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
     DestroyGTVBAODescriptorTables(dev, &d->main_tables);
+    DestroyGTVBAODescriptorTables(dev, &d->vbgi_main_tables);
     DestroyGTVBAODescriptorTables(dev, &d->temporal_tables);
     DestroyGTVBAODescriptorTables(dev, &d->filter_tables);
     DestroyGTVBAODescriptorTables(dev, &d->normal_prep_tables);
@@ -12274,6 +12348,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   EnsureGTVBAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables);
   if (!d->prefilter_pipeline.handle) mkcs(__gtvbao_prefilter, "main", d->prefilter_layout, &d->prefilter_pipeline);
   if (!d->main_pipeline.handle)         mkcs(__gtvbao_main, "main", d->main_layout, &d->main_pipeline);
+  if (!d->vbgi_main_pipeline.handle) mkcs(__gtvbao_vbgi_main, "main", d->main_layout, &d->vbgi_main_pipeline);
   // �-trous wavelet spatial filter (R3)
   if (!d->filter_pipeline.handle) mkcs(__gtvbao_filter, "main", d->filter_layout, &d->filter_pipeline);
   if (!d->temporal_pipeline.handle) mkcs(__gtvbao_temporal, "main", d->temporal_layout, &d->temporal_pipeline);
@@ -12753,6 +12828,56 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   d->gtvbao_prev_params_valid = temporal_wanted;
   if (temporal_wanted) d->gtvbao_prev_params = snapshot;
   CSLog("gtvbao", "run exit ok");
+  return true;
+}
+
+static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilter_done) {
+  if (!d->captured_depth_srv.handle) return false;
+  auto* dev = cl->get_device();
+
+  if (g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, d);
+
+  if (!d->prefilter_pipeline.handle || !d->vbgi_main_pipeline.handle || !d->main_layout.handle) CreateComputePipelinesIfNeeded(dev, d);
+  if (!d->prefilter_pipeline.handle || !d->vbgi_main_pipeline.handle) return false;
+
+  if (!prefilter_done && !EnsureGTVBAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables)) return false;
+  if (!EnsureGTVBAODescriptorTables(dev, d->main_layout, &d->vbgi_main_tables)) return false;
+
+  const uint32_t w = d->working_width, h = d->working_height;
+  if (w < 64 || h < 64 || !d->vbgi_raw_texture.handle || !d->vbgi_raw_uav.handle || d->vbgi_width < 32u || d->vbgi_height < 32u) {
+    CSLog("vbgi", "run ABORT: resources not ready", true);
+    return false;
+  }
+
+  if (!prefilter_done) RunGTVBAOSharedPrep(cl, d, false);
+
+  GtvbaoBindPipeline(cl, d->vbgi_main_pipeline);
+  {
+    reshade::api::resource_view main_srvs[4] = {
+        d->depth_mips_srv,
+        d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
+        d->isfast_noise_srv.handle ? d->isfast_noise_srv : d->fallback_srv,
+        d->foliage_mask_srv.handle ? d->foliage_mask_srv : d->fallback_srv
+    };
+    reshade::api::resource_view main_uavs[2] = {d->vbgi_raw_uav, d->fallback_uav};
+    reshade::api::descriptor_table_update u[4] = {
+      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
+      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
+      {{},0,0,4,reshade::api::descriptor_type::texture_shader_resource_view,main_srvs},
+      {{},0,0,2,reshade::api::descriptor_type::texture_unordered_access_view,main_uavs},
+    };
+    GtvbaoApplyDescriptors(dev, cl, d->main_layout, &d->vbgi_main_tables, 4, u);
+    auto pc = BuildGTVBAOPushConstants(d, {.vbgi = true});
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
+  }
+  cl->dispatch((d->vbgi_width + 7) / 8, (d->vbgi_height + 7) / 8, 1);
+  GtvbaoBarrier(cl, d->vbgi_raw_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+
+  static bool s_logged = false;
+  if (!s_logged) {
+    s_logged = true;
+    CSLog("vbgi", "gather dispatched " + std::to_string(d->vbgi_width) + "x" + std::to_string(d->vbgi_height));
+  }
   return true;
 }
 

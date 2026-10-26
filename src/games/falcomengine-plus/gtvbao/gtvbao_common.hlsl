@@ -93,6 +93,12 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_temporal_normal_rejection;// c[40] - normal dot product below which history taps fade out
   float GTVBAO_temporal_history_clamp;   // c[41] - 3x3 neighbourhood clamp, k sigma (0 = off)
   float GTVBAO_temporal_history_valid;   // c[42] - 1 when the history may be used (reset == None)
+  // - VBGI (appended; the AO path leaves these at 0) -
+  float GTVBAO_vbgi_mode;                // c[43] - 1 = GI
+  float GTVBAO_game_profile;             // c[44] - 0=Sora 1st, 1=Sora 2nd, 2=Kai
+  float GTVBAO_radiance_mip_shift;       // c[45]
+  float GTVBAO_radiance_clamp;           // c[46]
+  float GTVBAO_vbgi_backface_mode;       // c[47] - 0=Off, 1=Simple, 2=Exact
 };
 
 // ── Low-res → full-res block-center mapping (odd-dimension safe) ──
