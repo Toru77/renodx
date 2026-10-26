@@ -3694,7 +3694,7 @@ renodx::utils::settings::Settings settings = {
       .key = "SSGIEnable", .binding = &g_vbgi_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "VBGI Enable", .section = "VBGI",
-      .tooltip = "Visibility bitmask indirect diffuse GI. Not active yet: this build does not output VBGI.",
+      .tooltip = "Visibility bitmask indirect diffuse GI. Enables the VBGI gather. Off by default. GI is not composited into the lit image until the composite step; use VBGI Debug View to inspect it.",
       .labels = {"Off", "On"},
       .is_visible = []() { return VbgiRowVisible(); },
     },
@@ -5573,6 +5573,7 @@ static void OnPushDescriptorsCapture(
   const bool wantMotionBlurPush = shader_injection.mb_mode > 0.5f;
   if (shader_injection.gtvbao_mode < 0.5f
       && !falcom_world::rtao::RtaoRequested()
+      && !VbgiRunning()
       && shader_injection.dynCube_enabled < 0.5f
       && !wantTAAMotionPush
       && !wantMotionBlurPush) {
@@ -5870,7 +5871,7 @@ static void OnPushDescriptorsCapture(
     }
   }
   // -- Per-draw gating (only when GTVBAO, SSGI or RTAO is on). --
-  if (shader_injection.gtvbao_mode < 0.5f && !falcom_world::rtao::RtaoRequested()) return;
+  if (shader_injection.gtvbao_mode < 0.5f && !falcom_world::rtao::RtaoRequested() && !VbgiRunning()) return;
   if (!(static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) return;
 }
 
@@ -5883,7 +5884,7 @@ static void OnBindDescriptorTables(
     uint32_t first, uint32_t count,
     const reshade::api::descriptor_table* tables) {
   // Fast path: GTVBAO and RTAO are the consumers of these captures (depth, scene CBV).
-  if (shader_injection.gtvbao_mode < 0.5f && !falcom_world::rtao::RtaoRequested()) return;
+  if (shader_injection.gtvbao_mode < 0.5f && !falcom_world::rtao::RtaoRequested() && !VbgiRunning()) return;
   if (!cmd_list || !tables || count == 0u) return;
   auto* device = cmd_list->get_device();
   auto* d = device->get_private_data<DeviceData>();
@@ -6358,7 +6359,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
 
   // DynCube can dispatch independently of GTVBAO � must not early-out
   const bool dynCube_present_active = shader_injection.dynCube_enabled > 0.5f;
-  if (shader_injection.gtvbao_mode < 0.5f && !dynCube_present_active) return;
+  if (shader_injection.gtvbao_mode < 0.5f && !dynCube_present_active && !VbgiRunning()) return;
 
   // Liveness checkpoint (region marker only): input liveness is maintained by
   // capture edges (bind = live) and destroy events (free = dead) � no view
