@@ -12490,6 +12490,80 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
   return true;
 }
 
+static void GtvbaoBarrier(reshade::api::command_list* cl, reshade::api::resource r,
+                          reshade::api::resource_usage o, reshade::api::resource_usage n) {
+  if (r.handle) cl->barrier(r, o, n);
+}
+
+static void GtvbaoBindPipeline(reshade::api::command_list* cl, reshade::api::pipeline p) {
+  cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, p);
+}
+
+static void GtvbaoApplyDescriptors(reshade::api::device* dev, reshade::api::command_list* cl,
+                                   reshade::api::pipeline_layout lo,
+                                   GTVBAODescriptorTableSet* tbl,
+                                   uint32_t count,
+                                   const reshade::api::descriptor_table_update* updates) {
+  std::array<reshade::api::descriptor_table_update, kGtvbaoDescriptorTableParamCount> u = {};
+  for (uint32_t i = 0; i < count; ++i) { u[i] = updates[i]; u[i].table = (*tbl)[i]; }
+  dev->update_descriptor_tables(count, u.data());
+  std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount> b = {};
+  for (uint32_t i = 0; i < count; ++i) b[i] = (*tbl)[i];
+  cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, lo, 0, count, b.data());
+}
+
+// Depth prefilter and, when requested, the normal pre-decode.
+static void RunGTVBAOSharedPrep(reshade::api::command_list* cl, DeviceData* d, bool want_normals) {
+  auto* dev = cl->get_device();
+  const uint32_t w = d->working_width, h = d->working_height;
+  const auto UA = reshade::api::resource_usage::unordered_access;
+  const auto SR = reshade::api::resource_usage::shader_resource;
+  const auto CS = reshade::api::shader_stage::all_compute;
+
+  // Pass 1: Prefilter
+  if (shader_injection.gtvbao_debug_logging > 0.5f)
+    reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 1: binding pipeline...");
+  GtvbaoBindPipeline(cl, d->prefilter_pipeline);
+  if (shader_injection.gtvbao_debug_logging > 0.5f)
+    reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 1: updating descriptors...");
+  {
+    reshade::api::descriptor_table_update u[4] = {
+      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
+      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
+      {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&d->captured_depth_srv},
+      {{},0,0,kGTVBAODepthMipLevels,reshade::api::descriptor_type::texture_unordered_access_view,d->depth_mips_uavs.data()},
+    };
+    GtvbaoApplyDescriptors(dev, cl, d->prefilter_layout, &d->prefilter_tables, 4, u);
+    auto pc = BuildGTVBAOPushConstants(d);
+    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
+  }
+  cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
+  GtvbaoBarrier(cl, d->depth_mips_texture, UA, SR);
+  if (shader_injection.gtvbao_debug_logging > 0.5f)
+    reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 1 (prefilter) done.");
+
+  if (want_normals) {
+    // Pre-decode MRT normals once so the à-trous taps skip the sincos/sqrt
+    // decode. Defined before the atrous and upscale call sites that read it.
+    // texture is consumed by the atrous taps and the half-mode upscale.
+    GtvbaoBindPipeline(cl, d->normal_prep_pipeline);
+    reshade::api::resource_view np_srvs[2] = {
+        d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
+        d->depth_mips_srv};
+    reshade::api::descriptor_table_update nu[4] = {
+      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
+      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
+      {{},0,0,2,reshade::api::descriptor_type::texture_shader_resource_view,np_srvs},
+      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->normal_prep_uav},
+    };
+    GtvbaoApplyDescriptors(dev, cl, d->normal_prep_layout, &d->normal_prep_tables, 4, nu);
+    auto pc_np = BuildGTVBAOPushConstants(d);
+    cl->push_constants(CS, d->normal_prep_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_np.data());
+    cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    GtvbaoBarrier(cl, d->normal_prep_texture, UA, SR);
+  }
+}
+
 // -- Dispatch --
 
 static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
@@ -12552,78 +12626,16 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       (std::string("[GTVBAO] RunGTVBAO: dispatching pass 1 (") +
        std::to_string(w) + "x" + std::to_string(h) + ")").c_str());
 
-  auto bar = [&](reshade::api::resource r, reshade::api::resource_usage o, reshade::api::resource_usage n) {
-    if (r.handle) cl->barrier(r, o, n);
-  };
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
   const auto CS = reshade::api::shader_stage::all_compute;
-  const auto AC = reshade::api::pipeline_stage::all_compute;
-
-  // Helper: build & apply descriptor updates.
-  auto apply_descriptors = [&](reshade::api::pipeline_layout lo,
-                                GTVBAODescriptorTableSet* tbl,
-                                uint32_t count,
-                                const reshade::api::descriptor_table_update* updates) {
-    std::array<reshade::api::descriptor_table_update, kGtvbaoDescriptorTableParamCount> u = {};
-    for (uint32_t i = 0; i < count; ++i) { u[i] = updates[i]; u[i].table = (*tbl)[i]; }
-    dev->update_descriptor_tables(count, u.data());
-    std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount> b = {};
-    for (uint32_t i = 0; i < count; ++i) b[i] = (*tbl)[i];
-    cl->bind_descriptor_tables(CS, lo, 0, count, b.data());
-  };
-
-  auto bind_pipe = [&](reshade::api::pipeline p) {
-    cl->bind_pipeline(AC, p);
-  };
-
-  // Pre-decode MRT normals once so the à-trous taps skip the sincos/sqrt
-  // decode. Defined before the atrous and upscale call sites that read it.
-  // texture is consumed by the atrous taps and the half-mode upscale.
-  auto run_normal_prep = [&]() {
-    bind_pipe(d->normal_prep_pipeline);
-    reshade::api::resource_view np_srvs[2] = {
-        d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
-        d->depth_mips_srv};
-    reshade::api::descriptor_table_update nu[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,2,reshade::api::descriptor_type::texture_shader_resource_view,np_srvs},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->normal_prep_uav},
-    };
-    apply_descriptors(d->normal_prep_layout, &d->normal_prep_tables, 4, nu);
-    auto pc_np = BuildGTVBAOPushConstants(d);
-    cl->push_constants(CS, d->normal_prep_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_np.data());
-    cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
-    bar(d->normal_prep_texture, UA, SR);
-  };
-
-  // Pass 1: Prefilter
-  if (shader_injection.gtvbao_debug_logging > 0.5f)
-    reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 1: binding pipeline...");
-  bind_pipe(d->prefilter_pipeline);
-  if (shader_injection.gtvbao_debug_logging > 0.5f)
-    reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 1: updating descriptors...");
-  {
-    reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&d->captured_depth_srv},
-      {{},0,0,kGTVBAODepthMipLevels,reshade::api::descriptor_type::texture_unordered_access_view,d->depth_mips_uavs.data()},
-    };
-    apply_descriptors(d->prefilter_layout, &d->prefilter_tables, 4, u);
-    auto pc = BuildGTVBAOPushConstants(d);
-    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
-  }
-  cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
-  bar(d->depth_mips_texture, UA, SR);
-  if (shader_injection.gtvbao_debug_logging > 0.5f)
-    reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 1 (prefilter) done.");
+  const bool spatial_run = shader_injection.gtvbao_atrous_enabled > 0.5f;
+  RunGTVBAOSharedPrep(cl, d, spatial_run || low_res);
 
   // -- Foliage mask pre-pass (AO working domain, reads MRT normal, writes R8_UINT) --
   if (foliage_mask_valid) {
     uint32_t mkW = aw, mkH = ah;
-    bind_pipe(d->foliage_mask_pipeline);
+    GtvbaoBindPipeline(cl, d->foliage_mask_pipeline);
     reshade::api::resource_view fm_srvs[2] = {
         d->depth_mips_srv,                          // t0 � working depth (GetDimensions)
         d->captured_mrt_normal_srv                  // t1 � G-buffer normal (bit 15 test)
@@ -12634,11 +12646,11 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       {{},0,0,2,reshade::api::descriptor_type::texture_shader_resource_view,fm_srvs},
       {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->foliage_mask_uav},
     };
-    apply_descriptors(d->foliage_mask_layout, &d->foliage_mask_tables, 4, fu);
+    GtvbaoApplyDescriptors(dev, cl, d->foliage_mask_layout, &d->foliage_mask_tables, 4, fu);
     auto pc = BuildGTVBAOPushConstants(d);
     cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
     cl->dispatch((mkW + 7) / 8, (mkH + 7) / 8, 1);
-    bar(d->foliage_mask_texture, UA, SR);
+    GtvbaoBarrier(cl, d->foliage_mask_texture, UA, SR);
   }
 
   // Temporal accumulation: the reset rule shared with RTAO and RTGI over this pass's own state.
@@ -12668,7 +12680,6 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   }
   const bool history_valid = reset == rtao::ResetReason::None;
   const int filter_type = g_gtvbao_filter_type > 0.5f ? 1 : 0;
-  const bool spatial_run = shader_injection.gtvbao_atrous_enabled > 0.5f;
   const rtao::FilterPlan filter_plan = rtao::MakeFilterPlan(filter_type, (int)g_gtvbao_filter_radius,
       (int)(low_res ? g_gtvbao_filter_passes_lowres : shader_injection.gtvbao_atrous_passes),
       (int)(filter_type == 1 ? g_gtvbao_filter_taps_atrous : g_gtvbao_filter_taps_separable));
@@ -12677,7 +12688,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   // Pass 2: Main
   reshade::api::pipeline mp = d->main_pipeline;
   if (!mp.handle) return false;
-  bind_pipe(mp);
+  GtvbaoBindPipeline(cl, mp);
   {
     reshade::api::resource_view main_srvs[4] = {
         d->depth_mips_srv,
@@ -12699,12 +12710,12 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       {{},0,0,4,reshade::api::descriptor_type::texture_shader_resource_view,main_srvs},
       {{},0,0,2,reshade::api::descriptor_type::texture_unordered_access_view,main_uavs},
     };
-    apply_descriptors(d->main_layout, &d->main_tables, 4, u);
+    GtvbaoApplyDescriptors(dev, cl, d->main_layout, &d->main_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, {.final_pass = main_final, .foliage_mask_valid = foliage_mask_valid});
     cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
   }
   cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
-  bar(d->ao_term_a_texture, UA, SR);
+  GtvbaoBarrier(cl, d->ao_term_a_texture, UA, SR);
   if (IsGtvbaoComputeDebug(GtvbaoDebugMode())) {
     d->gtvbao_debug_frame = d->frame_index;
     d->gtvbao_debug_mode_written = (float)GtvbaoDebugMode();
@@ -12714,19 +12725,18 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   {
     const bool dbgRead = IsGtvbaoComputeDebug(GtvbaoDebugMode()) && !(GtvbaoDebugMode() == 23 && temporal_run);
     if (dbgRead)
-      bar(d->debug_texture, UA, SR);         // Debug output ready for read
+      GtvbaoBarrier(cl, d->debug_texture, UA, SR);         // Debug output ready for read
   }
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 2 (main) done.");
 
   {
     bool cur_b = false;  // false = ao_term_a, true = ao_term_b
-    if (spatial_run || low_res) run_normal_prep();
     if (temporal_run) {
       const uint32_t read_i = d->temporal_history_index & 1u;
       const uint32_t write_i = read_i ^ 1u;
       const bool temporal_dbg = GtvbaoDebugMode() == 23;
-      bind_pipe(d->temporal_pipeline);
+      GtvbaoBindPipeline(cl, d->temporal_pipeline);
       reshade::api::resource_view t_srvs[5] = {
           d->ao_term_a_srv, d->captured_depth_srv, d->captured_mrt_normal_srv,
           d->mb_rtv4_owned_srv, d->temporal_history_srv[read_i]};
@@ -12740,14 +12750,14 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         {{},0,0,5,reshade::api::descriptor_type::texture_shader_resource_view,t_srvs},
         {{},0,0,3,reshade::api::descriptor_type::texture_unordered_access_view,t_uavs},
       };
-      apply_descriptors(d->temporal_layout, &d->temporal_tables, 4, tu);
+      GtvbaoApplyDescriptors(dev, cl, d->temporal_layout, &d->temporal_tables, 4, tu);
       auto pc_t = BuildGTVBAOPushConstants(d, {.final_pass = temporal_run && !spatial_run, .history_valid = history_valid});
       cl->push_constants(CS, d->temporal_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_t.data());
       cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
       rtao::NullComputeSlots(cl, 5, 3, 2);
-      bar(d->temporal_history_texture[write_i], UA, SR);
-      bar(d->ao_term_b_texture, UA, SR);
-      if (temporal_dbg) bar(d->debug_texture, UA, SR);
+      GtvbaoBarrier(cl, d->temporal_history_texture[write_i], UA, SR);
+      GtvbaoBarrier(cl, d->ao_term_b_texture, UA, SR);
+      if (temporal_dbg) GtvbaoBarrier(cl, d->debug_texture, UA, SR);
       d->temporal_history_index = write_i;
       cur_b = true;
     }
@@ -12755,7 +12765,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       for (uint32_t i = 0; i < filter_plan.pass_count; ++i) {
         const rtao::FilterPass& fp = filter_plan.passes[i];
         const bool last = i + 1u == filter_plan.pass_count;
-        bind_pipe(d->filter_pipeline);
+        GtvbaoBindPipeline(cl, d->filter_pipeline);
         reshade::api::resource_view f_srvs[3] = {
             cur_b ? d->ao_term_b_srv : d->ao_term_a_srv, d->depth_mips_srv,
             d->normal_prep_srv.handle ? d->normal_prep_srv : d->fallback_srv};
@@ -12767,14 +12777,14 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
           {{},0,0,3,reshade::api::descriptor_type::texture_shader_resource_view,f_srvs},
           {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&f_uav},
         };
-        apply_descriptors(d->filter_layout, &d->filter_tables, 4, fu);
+        GtvbaoApplyDescriptors(dev, cl, d->filter_layout, &d->filter_tables, 4, fu);
         auto pc_f = BuildGTVBAOPushConstants(d, {.final_pass = last, .filter_kind = filter_type,
             .filter_direction = static_cast<int>(fp.direction), .filter_step = static_cast<int>(fp.step),
             .filter_taps = static_cast<int>(filter_plan.taps_side)});
         cl->push_constants(CS, d->filter_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_f.data());
         cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
         rtao::NullComputeSlots(cl, 3, 1, 1);
-        bar(f_dst, UA, SR);
+        GtvbaoBarrier(cl, f_dst, UA, SR);
         cur_b = !cur_b;
       }
     }
@@ -12785,7 +12795,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     // Low-res AO (+ denoise above) -> full AO for t22/t23.
     reshade::api::pipeline up_pipe = d->upscale_pipeline;
     if (low_res && up_pipe.handle && d->upscale_ao_uav.handle) {
-      bind_pipe(up_pipe);
+      GtvbaoBindPipeline(cl, up_pipe);
       reshade::api::resource_view up_ao_src = d->gtvbao_final_in_b
           ? d->ao_term_b_srv : d->ao_term_a_srv;
       reshade::api::resource_view up_srvs[3] = {
@@ -12799,12 +12809,12 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         {{},0,0,3,reshade::api::descriptor_type::texture_shader_resource_view,up_srvs},
         {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,up_uavs},
       };
-      apply_descriptors(d->filter_layout, &d->filter_tables, 4, uu);
+      GtvbaoApplyDescriptors(dev, cl, d->filter_layout, &d->filter_tables, 4, uu);
       auto pc_u = BuildGTVBAOPushConstants(d, {});
       cl->push_constants(CS, d->filter_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_u.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       rtao::NullComputeSlots(cl, 3, 1, 1);
-      bar(d->upscale_ao_texture, UA, SR);
+      GtvbaoBarrier(cl, d->upscale_ao_texture, UA, SR);
     }
   }
   if (shader_injection.gtvbao_debug_logging > 0.5f)
