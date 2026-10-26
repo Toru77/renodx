@@ -698,16 +698,6 @@ static float g_gtvbao_normal_edge_rejection = 0.f;   // 0 = no silhouette reject
 static float g_gtvbao_normal_detail_response = 0.f; // 0 = no disagreement reweight
 static float g_gtvbao_normal_max_darkening  = 1.f;   // cap: 1 = uncapped
 static float g_gtvbao_hemisphere_weighting = 0.f;
-// -- VBGI (GI) normal settings: independent copies of the four that shape the
-// GI sample normal (input mode, influence, z preservation, transform mode) --
-// Defaults match the AO neutral values, so enabling VBGI changes nothing until
-// a knob moves. Deliberately NOT split: texel mapping, the packed decode, and
-// the transform arithmetic. Those are correctness surfaces, and letting AO and
-// GI read different texels or decode differently is how the two drift apart.
-static float g_gtvbao_gi_normal_input_mode     = 1.f;
-static float g_gtvbao_gi_normal_influence      = 1.f;
-static float g_gtvbao_gi_normal_z_preservation = 1.f;
-static float g_gtvbao_gi_normal_transform_mode = 0.f;
 
 // -- Dynamic Cubemaps (Sora 2nd) � standalone t17 replacement --
 constexpr uint32_t kDynCubeRegister = 17u; // t17 texEnvMap_g
@@ -3310,13 +3300,6 @@ renodx::utils::settings::Settings settings = {
       .parse = [](float v) { return v * 0.01f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    new renodx::utils::settings::Setting{
-      .key = "CharGTVBGIMaskStr", .binding = &shader_injection.char_gtvbgi_mask_strength,
-      .default_value = 0.f, .label = "GTVBGI Char Mask", .section = "GTVBAO",
-      .min = 0.f, .max = 100.f,
-      .parse = [](float v) { return v * 0.01f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
     
     
     
@@ -3517,40 +3500,6 @@ renodx::utils::settings::Settings settings = {
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOGINormalInputMode", .binding = &g_gtvbao_gi_normal_input_mode,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "VBGI Normal Input", .section = "GTVBAO",
-      .tooltip = "VBGI's own normal source, independent of the AO one above. Off = depth-derived sample normals, which are softer and produce fewer fireflies. On = the same g-buffer normals AO uses.",
-      .labels = {"Off (Depth)", "On (MRT)"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOGINormalInfluence", .binding = &g_gtvbao_gi_normal_influence,
-      .default_value = 1.f, .label = "VBGI Normal Influence", .section = "GTVBAO",
-      .tooltip = "Scales the XY of VBGI's sample normal. 1.0 (neutral) leaves it untouched.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOGINormalZPreservation", .binding = &g_gtvbao_gi_normal_z_preservation,
-      .default_value = 1.f, .label = "VBGI Normal Z Preservation", .section = "GTVBAO",
-      .tooltip = "Scales the view-space n.z of VBGI's sample normal. 1.0 (neutral) keeps it intact; the shader floors this so it can never flatten the normal.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOGINormalTransformMode", .binding = &g_gtvbao_gi_normal_transform_mode,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 3.f, .label = "VBGI Normal Transform Mode", .section = "GTVBAO",
-      .tooltip = "Same encoding as the AO transform mode, applied independently. Use this only if VBGI's normals look rotated while AO's are correct.",
-      .labels = {"view_g + flip Z (default)", "viewInv_g", "Passthrough", "view_g (no flip)", "viewInv_g + flip Z"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
       .key = "GTVBAODebugMode", .binding = &g_gtvbao_debug_ui,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Debug View", .section = "GTVBAO",
@@ -3720,13 +3669,11 @@ renodx::utils::settings::Settings settings = {
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGICharMaskStrength", .binding = &shader_injection.vbgi_char_mask_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Character Mask Strength", .section = "VBGI",
-      .tooltip = "Reduce SSGI on character models. 0 = full GI on characters, 1 = fully masked.",
-      .min = 0.5f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+      .key = "CharGTVBGIMaskStr", .binding = &shader_injection.char_gtvbgi_mask_strength,
+      .default_value = 0.f, .label = "Character Mask Strength", .section = "VBGI",
+      .min = 0.f, .max = 100.f,
+      .parse = [](float v) { return v * 0.01f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIMultiBounce", .binding = &shader_injection.vbgi_multibounce,

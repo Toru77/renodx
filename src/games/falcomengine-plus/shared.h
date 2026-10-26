@@ -124,7 +124,7 @@ struct ShaderInjectData {
   float vbgi_enabled;               // 0=Off, 1=On (requires gtvbao_mode >= 1)
   float vbgi_intensity;             // [0..5], default 1.0
   float vbgi_saturation;            // [0..2], default 1.0
-  float vbgi_char_mask_strength;    // [0..1], default 0 — reduce VBGI on characters (0=off, 1=fully masked)
+  float vbgi_char_mask_strength;    // RETIRED: no setting drives it (was SSGICharMaskStrength), kept for the layout
   float vbgi_multibounce;           // 0=Off, 1=On
   float vbgi_multibounce_strength;  // [0..10], default 1.0 — extra gain on the normalized bounce
   // Fraction of the local direct light re-emitted per bounce (a diffuse
