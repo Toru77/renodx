@@ -581,7 +581,19 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     }
 
 #ifdef GTVBAO_GI
-    outWorkingAOTerm[pixCoord] = float4(giSum / (float)sliceCount, 1.0f);
+    const float3 giAvg = giSum / (float)sliceCount;
+    outWorkingAOTerm[pixCoord] = float4(giAvg, 1.0f);
+    // GI debug views 30-31 (32-35 stay zero until implemented). Same full-res block write as the AO views.
+    if (g_trackDebug) {
+        float4 dbgValue = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        if ((int)GTVBAO_debug_mode == 30) {
+            dbgValue = float4(giAvg, 1.0f);
+        } else if ((int)GTVBAO_debug_mode == 31) {
+            float rawGI = giAvg.r + (1.0f - occSum / (float)sliceCount);
+            dbgValue = float4(rawGI, rawGI, rawGI, 1.0f);
+        }
+        GTVBAO_WriteDebug(outDebug, pixCoord, dbgValue);
+    }
 #else
     GTVBAO_OutputWorkingTerm( pixCoord, visibility, outWorkingAOTerm );
 

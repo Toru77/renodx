@@ -348,7 +348,7 @@ void main(
       o0.rgb = float3(raw_ao, raw_ao, raw_ao) * hdr_scale;
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
-    if (mode >= 22 && mode <= 29) {
+    if (mode >= 22 && mode <= 35) {
       // GTVBAO compute debug views: the compute pass wrote them into the debug UAV, pushed to t23.
       // Magenta when that push did not happen this frame.
       if (shader_injection_data.gtvbao_mrt_normal_debug < 0.5f) {

@@ -918,8 +918,22 @@ static float g_vbgi_filter_taps_separable = 5.f;
 static float g_vbgi_filter_taps_atrous = 5.f;
 static float g_gtvbao_debug_ui = 0.f;  // GTVBAODebugMode index into kGtvbaoDebugModes
 constexpr int kGtvbaoDebugModes[7] = {0, 1, 22, 23, 24, 25, 26};
-static int GtvbaoDebugMode() { return kGtvbaoDebugModes[std::clamp((int)g_gtvbao_debug_ui, 0, 6)]; }
-static bool IsGtvbaoComputeDebug(int mode) { return mode >= 22 && mode <= 29; }
+// VBGI Debug View row (0=Off, 1..6) maps to GTVBAO debug modes 30..35 while g_vbgi_enabled.
+static int VbgiGtvbaoDebugMode() {
+  if (!VbgiRunning()) return 0;
+  const int row = std::clamp((int)g_vbgi_debug_mode, 0, 6);
+  return row == 0 ? 0 : 29 + row;
+}
+// AO-only: the VBGI row replaces the AO debug view, never mixes with it.
+static int GtvbaoDebugMode() {
+  return VbgiGtvbaoDebugMode() != 0 ? 0 : kGtvbaoDebugModes[std::clamp((int)g_gtvbao_debug_ui, 0, 6)];
+}
+// What the lighting shaders show: VBGI wins when its row is set.
+static int ActiveGtvbaoDebugMode() {
+  const int v = VbgiGtvbaoDebugMode();
+  return v != 0 ? v : GtvbaoDebugMode();
+}
+static bool IsGtvbaoComputeDebug(int mode) { return mode >= 22 && mode <= 35; }
 
 using GTVBAODescriptorTableSet =
     std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount>;
@@ -3824,7 +3838,7 @@ renodx::utils::settings::Settings settings = {
       .key = "VBGIDebugMode", .binding = &g_vbgi_debug_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "VBGI Debug View", .section = "VBGI",
-      .tooltip = "Replace scene with VBGI debug textures.",
+      .tooltip = "Replace scene with VBGI debug textures. While not Off this replaces the GTVBAO debug view.",
       .labels = {"Off", "Final GI", "Raw GI", "Radiance Input", "Bitmask", "Temporal Confidence", "Term Split"},
       .is_visible = []() { return VbgiRowVisible(); },
     },
@@ -9641,7 +9655,7 @@ static void OnDrawnLightingShader(reshade::api::command_list* cmd_list) {
 
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // IMPORTANT: returning false would BYPASS the draw (skip it entirely).
-  shader_injection.gtvbao_debug_view = (float)GtvbaoDebugMode();
+  shader_injection.gtvbao_debug_view = (float)ActiveGtvbaoDebugMode();
   shader_injection.gtvbao_dedicated_bound = 0.f;
   SyncISFASTToShaderInjection(cmd_list);  // keep IS-FAST mirrors in sync
   // Push IS-FAST noise texture for PCSS shadow jitter (t24 only � NO sampler push,
@@ -9808,8 +9822,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     }
   }
 
-  // -- SSGI push t23 (GI is produced by RunGTVBAO) --
-  if (gtvbao_active) {
+  // -- SSGI push t23 (GI is produced by RunGTVBAO or RunVBGI) --
+  if (gtvbao_active || vbgi_active) {
   shader_injection.gtvbao_vbgi_bound = 0.f;
   shader_injection.gtvbao_vbgi_debug = 0.f;
 
@@ -9819,10 +9833,10 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
   // Compute debug views 22-29: push the GTVBAO debug UAV output to the lighting shader's t23 slot.
   const uint64_t max_age = (g_cpuopt_deferred_dispatch > 0.5f) ? 1u : 0u;
-  if (IsGtvbaoComputeDebug(GtvbaoDebugMode())
+  if (IsGtvbaoComputeDebug(ActiveGtvbaoDebugMode())
       && dd->gtvbao_debug_frame != UINT64_MAX
       && (dd->frame_index - dd->gtvbao_debug_frame) <= max_age
-      && dd->gtvbao_debug_mode_written == (float)GtvbaoDebugMode()) {
+      && dd->gtvbao_debug_mode_written == (float)ActiveGtvbaoDebugMode()) {
     push_srv = dd->debug_srv;
     do_push = true;
   }
@@ -9843,7 +9857,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       shader_injection.gtvbao_mrt_normal_debug = 1.f;
     }
   }
-  }  // gtvbao_active (t23 section)
+  }  // gtvbao_active || vbgi_active (t23 section)
 
   // -- Dynamic Cubemaps (Sora2nd): t17 override � Phase 0A/B + Phase 1/2 standalone --
   // D3D11 hazard: capture writes UAV, then lighting reads SRV. RunDynCube* does
@@ -12180,7 +12194,7 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   c[5]  = std::clamp(shader_injection.gtvbao_bitmask_thickness, 0.01f, 2.f);
   c[6]  = std::clamp(shader_injection.gtvbao_depth_mip_offset, 0.f, 30.f);
   c[7]  = (float)((data ? data->frame_index : 0u) % 64u);
-  c[8]  = (float)GtvbaoDebugMode();
+  c[8]  = pass.vbgi ? (float)VbgiGtvbaoDebugMode() : (float)GtvbaoDebugMode();
   c[9]  = pass.final_pass ? 1.f : 0.f;
   // Normal input: use game MRT normals when available, depth fallback otherwise.
   c[10] = g_gtvbao_normal_input_mode;
@@ -12848,9 +12862,11 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     CSLog("vbgi", "run ABORT: resources not ready", true);
     return false;
   }
+  const bool vbgi_dbg = VbgiGtvbaoDebugMode() != 0 && d->debug_uav.handle;
 
   if (!prefilter_done) RunGTVBAOSharedPrep(cl, d, false);
 
+  if (vbgi_dbg) GtvbaoBarrier(cl, d->debug_texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
   GtvbaoBindPipeline(cl, d->vbgi_main_pipeline);
   {
     reshade::api::resource_view main_srvs[4] = {
@@ -12859,7 +12875,10 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
         d->isfast_noise_srv.handle ? d->isfast_noise_srv : d->fallback_srv,
         d->foliage_mask_srv.handle ? d->foliage_mask_srv : d->fallback_srv
     };
-    reshade::api::resource_view main_uavs[2] = {d->vbgi_raw_uav, d->fallback_uav};
+    reshade::api::resource_view main_uavs[2] = {
+        d->vbgi_raw_uav,
+        vbgi_dbg ? d->debug_uav : d->fallback_uav
+    };
     reshade::api::descriptor_table_update u[4] = {
       {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
       {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
@@ -12872,6 +12891,11 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
   }
   cl->dispatch((d->vbgi_width + 7) / 8, (d->vbgi_height + 7) / 8, 1);
   GtvbaoBarrier(cl, d->vbgi_raw_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  if (vbgi_dbg) {
+    d->gtvbao_debug_frame = d->frame_index;
+    d->gtvbao_debug_mode_written = (float)VbgiGtvbaoDebugMode();
+    GtvbaoBarrier(cl, d->debug_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  }
 
   static bool s_logged = false;
   if (!s_logged) {

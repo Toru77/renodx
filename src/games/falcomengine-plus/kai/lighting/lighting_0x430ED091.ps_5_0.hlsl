@@ -483,7 +483,7 @@ void main(
     // question is whether a given pixel has a G-buffer normal at all, and
     // characters are forward-shaded so they typically never get one. Blacking
     // them out here would hide exactly the case worth inspecting.
-    if (is_character_pixel && !(GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 29u)) {
+    if (is_character_pixel && !(GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 35u)) {
       o0 = float4(0.0, 0.0, 0.0, 1.0);
       o1 = r1;
       return;
@@ -610,7 +610,7 @@ void main(
           is_foliage_pixel_t1_broad ? 1.0 : 0.0,
           is_foliage_pixel_t1_sss ? 1.0 : 0.0,
           t10_debug);
-    } else if (GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 29u) {
+    } else if (GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 35u) {
       // ── MRT normal / horizon diagnostics (22-29) ──
       // The compute pass wrote these into its debug UAV, which the host pushed
       // to t23 (see the debug_replace branch of the t23 push). Reading them
