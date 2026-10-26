@@ -354,8 +354,8 @@ ShaderInjectData shader_injection = {
   .fxaa_subpix = 0.75f,
   .fxaa_edge_threshold = 0.166f,
   .fxaa_edge_threshold_min = 0.0625f,
-  // �� GTVBAO half-resolution spatial pipeline defaults: Full = existing behavior ��
-  .gtvbao_resolution = 1.f,
+  // �� GTVBAO low-resolution spatial pipeline defaults: Full = existing behavior ��
+  .gtvbao_resolution = 0.f,
   .gtvbao_upscale_plane_sigma = 40.f,
   .gtvbao_upscale_normal_power = 16.f,
   .gtvbao_upscale_debug = 0.f,
@@ -517,7 +517,7 @@ constexpr uint32_t kGtvbaoPushConstantsLayoutParam = 4u;   // push_constants at 
 // Must match the cbuffer declared in gtvbao_common.hlsl. Named so the builder,
 // the layout range and all nine push sites cannot drift apart -- a mismatch
 // here silently truncates the tail of the block rather than failing loudly.
-constexpr uint32_t kGtvbaoPushConstantFloats = 45;
+constexpr uint32_t kGtvbaoPushConstantFloats = 43;
 constexpr uint32_t kGtvbaoSnapshotFloats = 32;
 constexpr uint32_t kLightingMrtNormalRegister = 1u;  // t1 = mrtTexture0 (g-buffer normals)
 constexpr uint64_t kGTVBAOStartupGuardFrames = 8u;
@@ -934,16 +934,14 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // Resolution-change guard.
   uint32_t last_created_game_width = 0u;
   uint32_t last_created_game_height = 0u;
-  // Half-resolution spatial pipeline (0=Full existing behavior, 1=Half).
-  uint32_t half_width = 0u;
-  uint32_t half_height = 0u;
+  // Low-resolution spatial pipeline (0=Full existing behavior, 1=Half, 2=Quarter).
+  uint32_t ao_width = 0u;
+  uint32_t ao_height = 0u;
   float last_created_gtvbao_resolution = -1.f;
   reshade::api::resource upscale_ao_texture = {};
   reshade::api::resource_view upscale_ao_srv = {};
   reshade::api::resource_view upscale_ao_uav = {};
-  reshade::api::pipeline_layout upscale_layout = {};
-  reshade::api::pipeline upscale_pipeline = {};  // 4-Tap joint reconstruction (Half mode)
-  GTVBAODescriptorTableSet upscale_tables = {};
+  reshade::api::pipeline upscale_pipeline = {};  // joint reconstruction (low-res modes)
 
   reshade::api::pipeline_layout prefilter_layout = {};
   reshade::api::pipeline_layout main_layout = {};
@@ -3374,27 +3372,11 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOResolution", .binding = &shader_injection.gtvbao_resolution,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "GTVBAO Resolution", .section = "GTVBAO",
-      .tooltip = "Half is recommended at high or native resolutions, but it halves whatever resolution you render at, so it can get very low when upscaling is enabled.",
-      .labels = {"Full", "Half"},
+      .tooltip = "Full = native. Half = half size per axis (a quarter of the pixels). Quarter = a quarter size per axis (a sixteenth of the pixels). Lower resolutions are upsampled with depth and normal aware weights and are softer. The size is relative to the render resolution, so in-game upscaling makes it smaller.",
+      .labels = {"Full", "Half", "Quarter"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOUpscalePlaneSigma", .binding = &shader_injection.gtvbao_upscale_plane_sigma,
-      .default_value = 40.f, .label = "Upscale Plane Sigma", .section = "GTVBAO",
-      .tooltip = "Half-mode reconstruction plane edge-stop sigma. Higher = smoother across depth steps.",
-      .min = 1.f, .max = 400.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_resolution > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOUpscaleNormalPower", .binding = &shader_injection.gtvbao_upscale_normal_power,
-      .default_value = 16.f, .label = "Upscale Normal Power", .section = "GTVBAO",
-      .tooltip = "Half-mode reconstruction normal weight power.",
-      .min = 1.f, .max = 64.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_resolution > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAONoiseType", .binding = &shader_injection.gtvbao_noise_type,
@@ -6533,7 +6515,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
       }
     }
     const bool too_small = d->working_width < 320u || d->working_height < 320u;
-    const float want_res = shader_injection.gtvbao_resolution > 0.5f ? 1.f : 0.f;
+    const float want_res = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 2.f);
     if (gw > 0u && gh > 0u
         && (!d->resources_created || too_small
             || gw != d->last_created_game_width
@@ -9901,7 +9883,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // The buffer is tracked by RunGTVBAO (gtvbao_final_in_b) � parity depends on
   // the active denoiser path (legacy / R2 two-stage / �-trous).
   if (gtvbao_active) {
-    // Half mode: lighting sees the reconstructed full-res AO (same t22 slot).
+    // Low-res mode: lighting sees the reconstructed full-res AO (same t22 slot).
     const bool half_active = shader_injection.gtvbao_resolution > 0.5f
         && dd->upscale_ao_srv.handle;
     reshade::api::resource_view srv = half_active
@@ -10300,33 +10282,32 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
     if (uav) dev->create_resource_view(*res, reshade::api::resource_usage::unordered_access, vd, uav);
   };
 
-  // �� Half-resolution spatial pipeline: ao/edges/raw-GI follow the AO evaluation
+  // �� Low-resolution spatial pipeline: ao/edges/raw-GI follow the AO evaluation
   // resolution; everything else stays full. Ceiling division (odd-safe).
-  const bool half_mode = shader_injection.gtvbao_resolution > 0.5f;
-  const uint32_t hw = (w + 1u) / 2u;
-  const uint32_t hh = (h + 1u) / 2u;
-  d->half_width = hw; d->half_height = hh;
-  d->last_created_gtvbao_resolution = half_mode ? 1.f : 0.f;
-  const uint32_t aw = half_mode ? hw : w;
-  const uint32_t ah = half_mode ? hh : h;
+  const int res_index = std::clamp((int)std::lround(shader_injection.gtvbao_resolution), 0, 2);
+  const uint32_t div = 1u << res_index;
+  const uint32_t aw = (w + div - 1u) / div;
+  const uint32_t ah = (h + div - 1u) / div;
+  d->ao_width = aw; d->ao_height = ah;
+  d->last_created_gtvbao_resolution = std::log2((float)div);
   mk(aw, ah, reshade::api::format::r32_uint, &d->ao_term_a_texture, &d->ao_term_a_srv, &d->ao_term_a_uav);
   mk(aw, ah, reshade::api::format::r32_uint, &d->ao_term_b_texture, &d->ao_term_b_srv, &d->ao_term_b_uav);
   for (int i = 0; i < 2; ++i)
     mk(aw, ah, reshade::api::format::r16g16b16a16_float,
        &d->temporal_history_texture[i], &d->temporal_history_srv[i], &d->temporal_history_uav[i]);
 
-  if (half_mode) {
+  if (div > 1u) {
     mk(w, h, reshade::api::format::r32_uint,
        &d->upscale_ao_texture, &d->upscale_ao_srv, &d->upscale_ao_uav);
     // Texture/SRV/UAV are separate create calls; report partial failure
     // explicitly instead of letting the GI chain degrade silently later.
     if (!d->upscale_ao_uav.handle) {
       reshade::log::message(reshade::log::level::error,
-          "[GTVBAO] Half-res reconstruction resources incomplete � "
-          "reconstruction will be unavailable in Half mode.");
+          "[GTVBAO] Low-res reconstruction resources incomplete � "
+          "reconstruction will be unavailable in low-resolution mode.");
     }
   }
-  // Foliage mask (AO working domain R8_UINT: full in Full, half in Half)
+  // Foliage mask (AO working domain R8_UINT: full in Full, AO-sized in low-res modes)
   mk(aw, ah, reshade::api::format::r8_uint,
      &d->foliage_mask_texture, &d->foliage_mask_srv, &d->foliage_mask_uav);
   mk(w, h, reshade::api::format::r8g8b8a8_unorm,
@@ -10357,8 +10338,7 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   DestroyGTVBAODescriptorTables(dev, &d->foliage_mask_tables);
   // GI resources (now integrated � no separate VBGI pipeline)
   dv(d->upscale_ao_srv); dv(d->upscale_ao_uav); dr(d->upscale_ao_texture);
-  dp(d->upscale_pipeline); dl(d->upscale_layout);
-  DestroyGTVBAODescriptorTables(dev, &d->upscale_tables);
+  dp(d->upscale_pipeline);
   dv(d->captured_light_buffer_srv); dr(d->captured_light_buffer_texture);
   dv(d->foliage_mask_srv); dv(d->foliage_mask_uav); dr(d->foliage_mask_texture);
   dp(d->foliage_mask_pipeline); dl(d->foliage_mask_layout);
@@ -10614,7 +10594,7 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
   //
   // GTVBAO is resolved with exactly the same expression the t22 push uses, so the
   // AO the pass reads and the AO a user can compare against are guaranteed to be
-  // the same buffer, in Full and in Half mode alike.
+  // the same buffer, in Full and in low-res modes alike.
   reshade::api::resource_view ao_gtvbao = {};
   if (falcom_world::rtao::g_rtao_frame.producing) {
     ao_gtvbao = falcom_world::rtao::OutputSrv(falcom_world::rtao::GetRtaoDeviceData(dev));
@@ -12271,8 +12251,8 @@ struct GtvbaoPassPush {
 
 // Push indices that make up the temporal reset snapshot (settings that shape the AO; not debug, filter or per-frame values).
 constexpr uint32_t kGtvbaoSnapshotIndex[kGtvbaoSnapshotFloats] = {
-    0, 35, 1, 2, 3, 4, 5, 6, 26, 38, 25, 19, 20, 21, 22, 23, 24, 27, 28,
-    10, 11, 12, 13, 14, 15, 16, 17, 18, 40, 41, 42, 43};
+    0, 35, 1, 2, 3, 4, 5, 6, 26, 36, 25, 19, 20, 21, 22, 23, 24, 27, 28,
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 38, 39, 40, 41};
 
 static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(DeviceData* data, const GtvbaoPassPush& pass = {}) {
   std::array<float, kGtvbaoPushConstantFloats> c = {};
@@ -12316,17 +12296,15 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   c[32] = std::clamp(g_gtvbao_filter_radius, 1.f, 8.f);
   c[33] = (float)pass.filter_taps;
   c[34] = std::clamp((float)pass.filter_step, 1.f, 8.f);                           // �-trous stride (1/2/4)
-  // �� Half-resolution spatial pipeline (appended; Full path ignores these) ��
-  c[35] = shader_injection.gtvbao_resolution > 0.5f ? 1.f : 0.f;
-  c[36] = std::clamp(shader_injection.gtvbao_upscale_plane_sigma, 1.f, 400.f);
-  c[37] = std::clamp(shader_injection.gtvbao_upscale_normal_power, 1.f, 64.f);
-  c[38] = g_gtvbao_hemisphere_weighting;       // hemisphere weighting 0=Cosine, 1=Uniform
-  c[39] = (float)pass.filter_direction;
-  c[40] = g_gtvbao_history_weight;
-  c[41] = g_gtvbao_depth_rejection;
-  c[42] = g_gtvbao_normal_rejection;
-  c[43] = g_gtvbao_history_clamp;
-  c[44] = pass.history_valid ? 1.f : 0.f;
+  // �� Low-resolution spatial pipeline (appended; Full path ignores these) ��
+  c[35] = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 2.f);
+  c[36] = g_gtvbao_hemisphere_weighting;       // hemisphere weighting 0=Cosine, 1=Uniform
+  c[37] = (float)pass.filter_direction;
+  c[38] = g_gtvbao_history_weight;
+  c[39] = g_gtvbao_depth_rejection;
+  c[40] = g_gtvbao_normal_rejection;
+  c[41] = g_gtvbao_history_clamp;
+  c[42] = pass.history_valid ? 1.f : 0.f;
   return c;
 }
 
@@ -12346,7 +12324,6 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   dl(d->prefilter_layout); dl(d->main_layout);
   dl(d->temporal_layout); dl(d->filter_layout);
   dl(d->normal_prep_layout);
-  dl(d->upscale_layout);
   dp(d->prefilter_pipeline); dp(d->main_pipeline);
   dp(d->temporal_pipeline); dp(d->filter_pipeline);
   dp(d->normal_prep_pipeline);
@@ -12357,7 +12334,6 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     DestroyGTVBAODescriptorTables(dev, &d->temporal_tables);
     DestroyGTVBAODescriptorTables(dev, &d->filter_tables);
     DestroyGTVBAODescriptorTables(dev, &d->normal_prep_tables);
-    DestroyGTVBAODescriptorTables(dev, &d->upscale_tables);
   }
 
   auto mkcs = [&](std::span<const uint8_t> bc, const char* ep,
@@ -12420,12 +12396,6 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   // Normal prep: 1 SRV (MRT normal) + 1 UAV (decoded normals)
   if (!make_layout(1u, 1u, &d->normal_prep_layout)) return false;
   EnsureGTVBAODescriptorTables(dev, d->normal_prep_layout, &d->normal_prep_tables);
-  // Upscale (half->full joint reconstruction):
-  // t0=half AO, t1=half GI denoised, t2=full depth MIPs, t3=full MRT normal,
-  // t4=full pre-decoded normals -> u0=full AO, u1=full GI, u2=full debug
-  if (!make_layout(5u, 3u, &d->upscale_layout)) return false;
-  EnsureGTVBAODescriptorTables(dev, d->upscale_layout, &d->upscale_tables);
-
   EnsureGTVBAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables);
   if (!d->prefilter_pipeline.handle) mkcs(__gtvbao_prefilter, "main", d->prefilter_layout, &d->prefilter_pipeline);
   if (!d->main_pipeline.handle)         mkcs(__gtvbao_main, "main", d->main_layout, &d->main_pipeline);
@@ -12434,7 +12404,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!d->temporal_pipeline.handle) mkcs(__gtvbao_temporal, "main", d->temporal_layout, &d->temporal_pipeline);
   // Normal pre-decode (�-trous perf)
   if (!d->normal_prep_pipeline.handle) mkcs(__gtvbao_normal_prep, "main", d->normal_prep_layout, &d->normal_prep_pipeline);
-  if (!d->upscale_pipeline.handle) mkcs(__gtvbao_upscale, "main", d->upscale_layout, &d->upscale_pipeline);
+  if (!d->upscale_pipeline.handle) mkcs(__gtvbao_upscale, "main", d->filter_layout, &d->upscale_pipeline);
 
   // -- Main pass: visibility bitmask AO only (GI removed; VBGI inactive). --
   return d->prefilter_pipeline.handle && d->main_pipeline.handle
@@ -12594,7 +12564,6 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   if (!EnsureGTVBAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables)) return false;
   if (!EnsureGTVBAODescriptorTables(dev, d->main_layout, &d->main_tables)) return false;
   if (!EnsureGTVBAODescriptorTables(dev, d->foliage_mask_layout, &d->foliage_mask_tables)) return false;
-  if (!EnsureGTVBAODescriptorTables(dev, d->upscale_layout, &d->upscale_tables)) return false;
   if (!EnsureGTVBAODescriptorTables(dev, d->filter_layout, &d->filter_tables)) return false;
   const bool temporal_tables_ok = d->temporal_layout.handle != 0u
       && EnsureGTVBAODescriptorTables(dev, d->temporal_layout, &d->temporal_tables);
@@ -12604,14 +12573,14 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     CSLog("gtvbao", "run entry ABORT: working too small", true);
     return false;
   }
-  // �� Half-resolution spatial pipeline: AO evaluation domain. Full path
-  // uses w/h everywhere (existing behavior); Half uses hw/hh for main,
+  // �� Low-resolution spatial pipeline: AO evaluation domain. Full path
+  // uses w/h everywhere (existing behavior); low-res uses aw/ah for main,
   // denoise, and �-trous while depth/MRT/light stay full.
-  const bool half_mode = shader_injection.gtvbao_resolution > 0.5f
-      && d->half_width >= 32u && d->half_height >= 32u
+  const bool low_res = shader_injection.gtvbao_resolution > 0.5f
+      && d->ao_width >= 32u && d->ao_height >= 32u
       && d->ao_term_a_texture.handle && d->upscale_ao_texture.handle;
-  const uint32_t aw = half_mode ? d->half_width : w;
-  const uint32_t ah = half_mode ? d->half_height : h;
+  const uint32_t aw = low_res ? d->ao_width : w;
+  const uint32_t ah = low_res ? d->ao_height : h;
   {
     const std::string liveDepth = d->captured_depth_srv.handle ? d->captured_depth_dims : "none";
     const std::string wantDims = std::to_string(w) + "x" + std::to_string(h);
@@ -12803,7 +12772,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
 
   {
     bool cur_b = false;  // false = ao_term_a, true = ao_term_b
-    if (spatial_run || half_mode) run_normal_prep();
+    if (spatial_run || low_res) run_normal_prep();
     if (temporal_run) {
       const uint32_t read_i = d->temporal_history_index & 1u;
       const uint32_t write_i = read_i ^ 1u;
@@ -12863,35 +12832,29 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     d->gtvbao_final_in_b = cur_b;
 
 
-    // �� Half mode: full-resolution joint reconstruction (4-Tap) ��
-    // Half AO (+ half denoise above) -> full AO for t22/t23.
+    // �� Low-res mode: full-resolution joint reconstruction (RTGI structure) ��
+    // Low-res AO (+ denoise above) -> full AO for t22/t23.
     reshade::api::pipeline up_pipe = d->upscale_pipeline;
-    if (half_mode && up_pipe.handle && d->upscale_ao_uav.handle) {
+    if (low_res && up_pipe.handle && d->upscale_ao_uav.handle) {
       bind_pipe(up_pipe);
       reshade::api::resource_view up_ao_src = d->gtvbao_final_in_b
           ? d->ao_term_b_srv : d->ao_term_a_srv;
-      reshade::api::resource_view up_gi_src = d->fallback_srv;
-      reshade::api::resource_view up_srvs[5] = {
-          up_ao_src.handle ? up_ao_src : d->fallback_srv,                    // t0 half AO denoised
-          up_gi_src.handle ? up_gi_src : d->fallback_srv,                    // t1 half GI denoised
-          d->depth_mips_srv,                                                // t2 full depth MIPs
-          d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv    // t3 full MRT
-              : d->fallback_srv,
-          d->normal_prep_srv.handle ? d->normal_prep_srv : d->fallback_srv}; // t4 full normals
-      reshade::api::resource_view up_uavs[3] = {
-          d->upscale_ao_uav,
-          d->fallback_uav,
-          d->fallback_uav};
+      reshade::api::resource_view up_srvs[3] = {
+          up_ao_src.handle ? up_ao_src : d->fallback_srv,                    // t0 final AO
+          d->depth_mips_srv,                                                 // t1 depth mip 0
+          d->normal_prep_srv.handle ? d->normal_prep_srv : d->fallback_srv}; // t2 view-space normals
+      reshade::api::resource_view up_uavs[1] = {d->upscale_ao_uav};
       reshade::api::descriptor_table_update uu[4] = {
         {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
         {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-        {{},0,0,5,reshade::api::descriptor_type::texture_shader_resource_view,up_srvs},
-        {{},0,0,3,reshade::api::descriptor_type::texture_unordered_access_view,up_uavs},
+        {{},0,0,3,reshade::api::descriptor_type::texture_shader_resource_view,up_srvs},
+        {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,up_uavs},
       };
-      apply_descriptors(d->upscale_layout, &d->upscale_tables, 4, uu);
+      apply_descriptors(d->filter_layout, &d->filter_tables, 4, uu);
       auto pc_u = BuildGTVBAOPushConstants(d, {});
-      cl->push_constants(CS, d->upscale_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_u.data());
+      cl->push_constants(CS, d->filter_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_u.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+      rtao::NullComputeSlots(cl, 3, 1, 1);
       bar(d->upscale_ao_texture, UA, SR);
     }
   }

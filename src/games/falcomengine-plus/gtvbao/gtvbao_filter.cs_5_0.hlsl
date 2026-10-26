@@ -16,18 +16,6 @@ RWTexture2D<uint> g_out_ao : register(u0);
 
 SamplerState g_samp_point : register(s0);
 
-// World-space (view) position and normal of AO texel tq at its representative pixel; false for sky or invalid normal.
-bool RepresentativeSurface(int2 tq, uint2 full_size, GTAOConstants consts, out float3 P, out float3 N)
-{
-  const uint d = (uint)GTVBAO_Divisor();
-  const uint2 px = min(uint2(tq) * d + d / 2u, full_size - 1u);
-  const float z = g_depth.Load(int3(px, 0));
-  N = g_normal.Load(int3(px, 0)).xyz;
-  const float2 uv = (float2(px) + 0.5) / float2(full_size);
-  P = GTVBAO_ComputeViewspacePosition(uv, z, consts);
-  return z > 0.0 && FalcomNormalValid(N);
-}
-
 // One tap: kernel weight times the edge stop (1 at the centre). Taps outside the image or not a surface contribute 0.
 void FilterTap(int2 q, float kernel_w, bool centre, int2 size, uint2 full_size, GTAOConstants consts,
                float3 Pc, float3 Nc, float dist_c, inout float sum_w, inout float sum_v)
@@ -38,7 +26,7 @@ void FilterTap(int2 q, float kernel_w, bool centre, int2 size, uint2 full_size, 
   {
     float3 Pt;
     float3 Nt;
-    edge = RepresentativeSurface(q, full_size, consts, Pt, Nt) ? FilterPlaneNormalWeight(Pc, Nc, dist_c, Pt, Nt) : 0.0;
+    edge = GTVBAO_RepresentativeSurface(g_depth, g_normal, q, full_size, consts, Pt, Nt) ? FilterPlaneNormalWeight(Pc, Nc, dist_c, Pt, Nt) : 0.0;
   }
   sum_w += kernel_w * edge;
   sum_v += kernel_w * edge * ((float)g_in_ao[q] * (1.0f / 255.0f));
@@ -63,7 +51,7 @@ void main(uint3 id : SV_DispatchThreadID)
   float result = (float)g_in_ao[px] * (1.0f / 255.0f);
   float3 Pc;
   float3 Nc;
-  if (RepresentativeSurface(px, full_size, consts, Pc, Nc))
+  if (GTVBAO_RepresentativeSurface(g_depth, g_normal, px, full_size, consts, Pc, Nc))
   {
     const float dist_c = length(Pc);
     const int taps = (int)GTVBAO_filter_taps;

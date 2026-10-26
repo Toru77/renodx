@@ -24,11 +24,11 @@ if (p.x >= maskW || p.y >= maskH) return;
         uint mrtW, mrtH, fullW, fullH;
         g_srcMrtNormal.GetDimensions(mrtW, mrtH);
         g_srcWorkingDepth.GetDimensions(fullW, fullH);
-        // Same predicate the main pass uses, so the mask marks a half texel
+        // Same predicate the main pass uses, so the mask marks an AO texel
         // exactly when the pixel detection would mark it.
         if (GTVBAO_FoliageMarked(g_srcMrtNormal, p, uint2(maskW, maskH), uint2(fullW, fullH),
                                  uint2(mrtW, mrtH), GTVBAO_foliage_channel_mode >= 0.5f,
-                                 GTVBAO_resolution > 0.5f)) {
+                                 (uint)GTVBAO_Divisor())) {
             g_outFoliageMask[p] = 1u;
             return;
         }

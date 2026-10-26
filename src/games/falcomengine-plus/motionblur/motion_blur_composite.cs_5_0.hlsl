@@ -38,8 +38,7 @@
 //
 // GTVBAO does the analogous thing for its half-res AO: evaluate the low-frequency
 // term on a half-res grid, keep inputs and the final image full-res, and map
-// between the two by block centre (GTVBAO_HalfToFullCenter in gtvbao_common.hlsl:108,
-// gtvbao_common.hlsl:139). Here the blur accumulation is the low-frequency term
+// between the two by block centre (GTVBAO_RepresentativePixel in gtvbao_common.hlsl). Here the blur accumulation is the low-frequency term
 // and the base colour is the full-res detail.
 //
 // Load-only, no sampler, and it derives both resolutions from the push block:

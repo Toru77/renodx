@@ -252,21 +252,21 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
     const bool g_trackDebug = GTVBAO_debug_mode > 21.5f;
 
-    // ── Half-res mode: output domain is half, depth input stays full. ──
-    // Full path below is untouched; Half uses block-center point loads
-    // (fullTexel = min(half*2+1, full-1), odd-safe) instead of Gather.
+    // ── Low-resolution mode: output domain is 1/d per axis, depth input stays full. ──
+    // Full path below is untouched; low-res uses block-center point loads
+    // (GTVBAO_RepresentativePixel, odd-safe) instead of Gather.
     // The point loads are deliberate: GatherRed's centre component is a
     // *neighbour* of its anchor texel, so gathering here would feed a 2x2
     // block-edge depth in as the pixel centre and corrupt pixCenterPos and
     // the edge term.
     uint g_fullDepthW, g_fullDepthH;
     sourceViewspaceDepth.GetDimensions(g_fullDepthW, g_fullDepthH);
-    const bool g_halfRes = GTVBAO_resolution > 0.5f;
-    const int2 g_workDims = g_halfRes ? consts.ViewportSize : int2(g_fullDepthW, g_fullDepthH);
+    const bool g_lowRes = GTVBAO_resolution > 0.5f;
+    const int2 g_workDims = g_lowRes ? consts.ViewportSize : int2(g_fullDepthW, g_fullDepthH);
 
     lpfloat viewspaceZ;
     lpfloat pixLZ, pixTZ, pixRZ, pixBZ;
-    if (!g_halfRes) {
+    if (!g_lowRes) {
       lpfloat4 valuesUL   = sourceViewspaceDepth.GatherRed( depthSampler, float2( pixCoord * consts.ViewportPixelSize )               );
       lpfloat4 valuesBR   = sourceViewspaceDepth.GatherRed( depthSampler, float2( pixCoord * consts.ViewportPixelSize ), int2( 1, 1 ) );
       viewspaceZ  = valuesUL.y;
@@ -276,7 +276,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
       pixBZ = valuesBR.x;
     } else {
       int2 htc = clamp(int2(pixCoord), int2(0, 0), max(g_workDims - 1, int2(0, 0)));
-      int2 ftc = GTVBAO_HalfToFullCenter(htc, int2(g_fullDepthW, g_fullDepthH));
+      int2 ftc = GTVBAO_RepresentativePixel(htc, int2(g_fullDepthW, g_fullDepthH));
       int2 fmax = int2(max((int)g_fullDepthW - 1, 0), max((int)g_fullDepthH - 1, 0));
       viewspaceZ = (lpfloat)sourceViewspaceDepth.Load(int3(ftc, 0));
       pixLZ = (lpfloat)sourceViewspaceDepth.Load(int3(clamp(ftc + int2(-1, 0), int2(0, 0), fmax), 0));
@@ -302,11 +302,11 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     bool gtvbao_foliage_pixel = false;
     bool checkFoliage = GTVBAO_exclude_foliage > 0.5f;
     if (checkFoliage) {
-      // Half mode tests the whole {2t, 2t+1} block, so the mark cannot be
+      // Low-resolution modes test the whole d x d block, so the mark cannot be
       // missed by the parity the single-texel ratio mapping happens to select.
       gtvbao_foliage_pixel = GTVBAO_FoliageMarked(
           mrtNormalTexture, pixCoord, (uint2)g_workDims, uint2(g_fullDepthW, g_fullDepthH),
-          uint2(g_mrtW, g_mrtH), GTVBAO_foliage_channel_mode >= 0.5f, g_halfRes);
+          uint2(g_mrtW, g_mrtH), GTVBAO_foliage_channel_mode >= 0.5f, (uint)GTVBAO_Divisor());
     }
 
     // Move center pixel slightly towards camera to avoid imprecision artifacts due to depth buffer imprecision; offset depends on depth texture format used
@@ -528,7 +528,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
     // ── Debug views 22-26 (written last, after the AO and the foliage blend) ──
     // Each view fills the full-res d x d block that this AO pixel covers, so
-    // Half mode has no holes. The write never changes the AO.
+    // Low-resolution mode has no holes. The write never changes the AO.
     if (g_trackDebug) {
         int dbgMode = (int)GTVBAO_debug_mode;
         float4 dbgValue = float4(0.0f, 0.0f, 0.0f, 1.0f);

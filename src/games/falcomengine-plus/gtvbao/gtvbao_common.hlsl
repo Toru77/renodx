@@ -83,25 +83,23 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_filter_radius;            // c[32] - pixel radius
   float GTVBAO_filter_taps;              // c[33] - taps per axis (separable) or square kernel side (a-trous)
   float GTVBAO_filter_step;              // c[34] - a-trous stride for this dispatch (1, 2, 4)
-  // - Half-resolution spatial pipeline (appended; Full path ignores these) -
-  float GTVBAO_resolution;               // c[35] - 0=Full, 1=Half
-  float GTVBAO_upscale_plane_sigma;      // c[36] - reconstruction plane edge-stop sigma
-  float GTVBAO_upscale_normal_power;     // c[37] - reconstruction normal weight power
-  float GTVBAO_hemisphere_weighting;     // c[38] - 0=Cosine, 1=Uniform
+  // - Low-resolution spatial pipeline (appended; Full path ignores these) -
+  float GTVBAO_resolution;               // c[35] - 0=Full, 1=Half, 2=Quarter
+  float GTVBAO_hemisphere_weighting;     // c[36] - 0=Cosine, 1=Uniform
   // - Spatial filter direction and temporal accumulation (appended) -
-  float GTVBAO_filter_direction;         // c[39] - separable pass: 0=Horizontal, 1=Vertical, 2=Both (a-trous)
-  float GTVBAO_temporal_history_weight;  // c[40] - maximum blend toward validated history
-  float GTVBAO_temporal_depth_rejection; // c[41] - relative depth difference allowed between history and current
-  float GTVBAO_temporal_normal_rejection;// c[42] - normal dot product below which history taps fade out
-  float GTVBAO_temporal_history_clamp;   // c[43] - 3x3 neighbourhood clamp, k sigma (0 = off)
-  float GTVBAO_temporal_history_valid;   // c[44] - 1 when the history may be used (reset == None)
+  float GTVBAO_filter_direction;         // c[37] - separable pass: 0=Horizontal, 1=Vertical, 2=Both (a-trous)
+  float GTVBAO_temporal_history_weight;  // c[38] - maximum blend toward validated history
+  float GTVBAO_temporal_depth_rejection; // c[39] - relative depth difference allowed between history and current
+  float GTVBAO_temporal_normal_rejection;// c[40] - normal dot product below which history taps fade out
+  float GTVBAO_temporal_history_clamp;   // c[41] - 3x3 neighbourhood clamp, k sigma (0 = off)
+  float GTVBAO_temporal_history_valid;   // c[42] - 1 when the history may be used (reset == None)
 };
 
-// ── Half-res → full-res block-center mapping (odd-dimension safe) ──
-// halfTexel covers full block {2*h, 2*h+1}; center representative is 2*h+1,
-// clamped for odd full dims (e.g. full=5, half=3: h=2 -> min(5,4)=4).
+// ── Low-res → full-res block-center mapping (odd-dimension safe) ──
+// AO texel tq covers the full block {d*tq .. d*tq + d-1} (d = 1 Full, 2 Half, 4 Quarter); its representative
+// pixel is the block centre, clamped for odd full dims (e.g. full=5, d=2, ao=3: tq=2 -> min(5,4)=4).
 float GTVBAO_Divisor() {
-  return GTVBAO_resolution > 0.5f ? 2.f : 1.f;
+  return exp2(round(clamp(GTVBAO_resolution, 0.f, 2.f)));
 }
 
 // Debug view modes (GTVBAO_debug_mode). 27 is reserved.
@@ -125,23 +123,10 @@ void GTVBAO_WriteDebug(RWTexture2D<float4> outDebug, uint2 pixCoord, float4 valu
   }
 }
 
-int2 GTVBAO_HalfToFullCenter(int2 halfTC, int2 fullDims) {
-  return min(halfTC * 2 + 1, max(fullDims - 1, int2(0, 0)));
-}
-float2 GTVBAO_HalfToFullCenterUV(int2 halfTC, int2 halfDims, int2 fullDims) {
-  int2 fullTC = GTVBAO_HalfToFullCenter(
-      clamp(halfTC, int2(0, 0), max(halfDims - 1, int2(0, 0))), fullDims);
-  return (float2(fullTC) + 0.5) / max(float2(fullDims), float2(1, 1));
-}
-
-// Point-load full-res depth at the block center for a half-res texel
-// (odd-safe). halfDims = denoiser/AO working domain.
-float GTVBAO_LoadMappedDepth(Texture2D<float> depthTex, int2 halfTC, int2 halfDims) {
-  uint fw, fh;
-  depthTex.GetDimensions(fw, fh);
-  int2 fullDims = int2(max(fw, 1u), max(fh, 1u));
-  int2 htc = clamp(halfTC, int2(0, 0), max(halfDims - 1, int2(0, 0)));
-  return depthTex.Load(int3(GTVBAO_HalfToFullCenter(htc, fullDims), 0));
+// AO texel -> representative full-res pixel (block centre, odd-safe).
+int2 GTVBAO_RepresentativePixel(int2 tc, int2 fullDims) {
+  const int d = (int)GTVBAO_Divisor();
+  return min(tc * d + d / 2, max(fullDims - 1, int2(0, 0)));
 }
 
 #define g_isfast_enabled        GTVBAO_isfast_enabled            // IS-FAST enable (0/1)
@@ -179,16 +164,16 @@ int2 GTVBAO_MrtTexel(float2 uvTexelSpace, float2 mrtDims)
 }
 
 // ── Foliage mark test (bit 15 of the MRT normal's Sora .w / Kai .z) ──
-// Full mode tests the single texel the work->MRT ratio selects, which is the
-// exact expression the main pass always used. Half mode tests the whole
-// full-res footprint of the half texel: the {2t, 2t+1} block, mapped through
+// Full mode (d == 1) tests the single texel the work->MRT ratio selects, which is the
+// exact expression the main pass always used. Low-resolution modes (d = 2, 4) test the whole
+// full-res footprint of the AO texel: the {d*t .. d*t+d-1} block, mapped through
 // the full->MRT ratio. A single representative texel is insufficient because
-// alpha-tested foliage marks only the leaf texels, so a block's other texel can
+// alpha-tested foliage marks only the leaf texels, so a block's other texels can
 // hold the mark the representative misses.
 bool GTVBAO_FoliageMarked(Texture2D<uint4> mrtNormal, uint2 workTC, uint2 workDims,
-                          uint2 fullDims, uint2 mrtDims, bool useZ, bool halfRes)
+                          uint2 fullDims, uint2 mrtDims, bool useZ, uint d)
 {
-  if (!halfRes)
+  if (d == 1u)
   {
     const float2 scale = float2(mrtDims) / max(float2(workDims), 1.0.xx);
     uint4 mrtV = mrtNormal.Load(int3(GTVBAO_MrtTexel((float2(workTC) + 0.5) * scale, float2(mrtDims)), 0));
@@ -197,12 +182,12 @@ bool GTVBAO_FoliageMarked(Texture2D<uint4> mrtNormal, uint2 workTC, uint2 workDi
   }
 
   const float2 scaleFull = float2(mrtDims) / max(float2(fullDims), 1.0.xx);
-  const int2 blockBase = int2(workTC) * 2;
-  [unroll]
-  for (int by = 0; by < 2; ++by)
+  const int2 blockBase = int2(workTC * d);
+  [loop]
+  for (int by = 0; by < (int)d; ++by)
   {
-    [unroll]
-    for (int bx = 0; bx < 2; ++bx)
+    [loop]
+    for (int bx = 0; bx < (int)d; ++bx)
     {
       uint4 mrtV = mrtNormal.Load(int3(
           GTVBAO_MrtTexel((float2(blockBase + int2(bx, by)) + 0.5) * scaleFull, float2(mrtDims)), 0));
@@ -272,6 +257,23 @@ float3 DecodeMrtNormalAsIs(uint2 texel);
 #include "GTVBAO.h"
 #include "GTVBAO.hlsli"
 
+// World-space (view) position and normal at full-res pixel px; false for sky or an invalid normal.
+bool GTVBAO_SurfaceAt(Texture2D<float> depth, Texture2D<float4> normals, int2 px, uint2 fullSize,
+                      GTAOConstants consts, out float3 P, out float3 N)
+{
+  const float z = depth.Load(int3(px, 0));
+  N = normals.Load(int3(px, 0)).xyz;
+  const float2 uv = (float2(px) + 0.5) / float2(fullSize);
+  P = GTVBAO_ComputeViewspacePosition(uv, z, consts);
+  return z > 0.0 && FalcomNormalValid(N);
+}
+
+// World-space (view) position and normal of AO texel tq at its representative pixel.
+bool GTVBAO_RepresentativeSurface(Texture2D<float> depth, Texture2D<float4> normals, int2 tq, uint2 fullSize,
+                                  GTAOConstants consts, out float3 P, out float3 N)
+{
+  return GTVBAO_SurfaceAt(depth, normals, GTVBAO_RepresentativePixel(tq, int2(fullSize)), fullSize, consts, P, N);
+}
 
 // ── Build GTAOConstants from scene CB + push constants ──
 GTAOConstants BuildGTAOConstants(uint2 viewport_size)
