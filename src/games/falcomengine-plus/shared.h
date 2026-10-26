@@ -121,7 +121,7 @@ struct ShaderInjectData {
   float gtvbao_vbgi_debug;          // 0=Off (add GI), 1=On (replace scene with GI)
 
   // —— VBGI (Visibility-Based Global Illumination) ——
-  float vbgi_enabled;               // RETIRED: no UI and nothing assigns it. No shader reads it. Only the dead light-buffer capture gate in addon.cpp (removed in M7.5) still tests it.
+  float vbgi_enabled;               // RETIRED: no UI and nothing assigns or reads it. Kept for the layout.
   float vbgi_intensity;             // [0..5], default 1.0
   float vbgi_saturation;            // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGISaturation), kept for the layout
   float vbgi_char_mask_strength;    // RETIRED: no setting drives it (was SSGICharMaskStrength), kept for the layout

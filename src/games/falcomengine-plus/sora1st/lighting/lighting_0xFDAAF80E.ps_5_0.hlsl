@@ -291,20 +291,7 @@ void main(
   float3 cachedVBGI = float3(0, 0, 0);
   float cachedVBGILuma = 0;
   if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
-    float3 giRaw = vbgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
-    float giLuma = dot(giRaw, float3(0.299, 0.587, 0.114));
-    float3 giColor = lerp(giLuma.xxx, giRaw, shader_injection_data.vbgi_saturation);
-    giColor *= shader_injection_data.vbgi_intensity;
-    if (shader_injection_data.vbgi_max_clamp > 0.0) {
-      giColor = min(giColor, shader_injection_data.vbgi_max_clamp);
-    }
-    if (shader_injection_data.vbgi_affect_lights > 0.5f) {
-      float lightLuma = dot(lightColor_g.xyz, float3(0.299f, 0.587f, 0.114f));
-      float3 lightContrib = lerp(lightLuma.xxx, lightColor_g.xyz, shader_injection_data.vbgi_lights_saturation);
-      lightContrib = saturate(lightContrib);
-      giColor += lightContrib * shader_injection_data.vbgi_lights_strength * 0.2f;
-    }
-    cachedVBGI = giColor;
+    cachedVBGI = vbgiTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb * r0.xyz * shader_injection_data.vbgi_intensity;
     cachedVBGILuma = dot(cachedVBGI, float3(0.333, 0.333, 0.333));
   }
 
@@ -608,30 +595,6 @@ void main(
       return;
     }
 
-    if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
-      float3 giColor = cachedVBGI;
-
-      // Light Color debug view — shows sun color uniformly
-      if ((int)shader_injection_data.vbgi_debug_view == 6) {
-        r6.xyz = lightColor_g.xyz * 0.05;
-        r6.w = r0.w;
-        o0.xyzw = r6.xyzw;
-        o1.xyzw = r2.xyzw;
-        o2.xy = r3.xy;
-        return;
-      }
-
-      // Character mask: reduce GI on characters by configured amount.
-      if (is_character_pixel) {
-        giColor *= (1.0 - saturate(shader_injection_data.char_gtvbgi_mask_strength));
-      }
-      
-      if (shader_injection_data.gtvbao_vbgi_debug > 0.5f) {
-        r6.xyz = giColor;  // Debug: replace scene with GI texture
-      } else {
-        r6.xyz += giColor;  // Normal: add GI to scene
-      }
-    }
     r6.w = r0.w;
     // Early return BEFORE the sun composite at 1152, and r6.xyz is built from the
     // character/SSGI/GI terms with no isolable sun contribution. Contact is
@@ -639,6 +602,10 @@ void main(
     // bug that put contact shadows in interiors. Micro still applies.
     o0.xyz = FalcomApplyShadowTerms(r6.xyz, v1.xy, csIsCharacter > 0.5, samPoint_s,
                                     microShadowTex, contactShadowTex);
+    // VBGI (M7.5): added after the shadow terms; Character Mask Strength scales it on this (character) path.
+    if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
+      o0.xyz += cachedVBGI * (1.0 - saturate(shader_injection_data.char_gtvbgi_mask_strength));
+    }
     o0.w = r6.w;
     o1.xyzw = r2.xyzw;
     o2.xy = r3.xy;
@@ -1596,6 +1563,7 @@ void main(
   r1.z = r1.z ? r1.w : 1;
   r1.y = r1.y * r13.x;
   r1.y = r1.y * r1.z;
+  const float vbgiFogKeep = 1.0 - r1.y;
   r2.xyz = fogColor_g.xyz + -r0.yzw;
   r0.yzw = r1.yyy * r2.xyz + r0.yzw;
   r1.y = -r3.x / skyLutCameraFarClip_g;
@@ -1605,6 +1573,7 @@ void main(
   r2.z = r1.y / r1.z;
   r1.yzw = atmosphereInscatterLUT.SampleLevel(samLinear_s, r2.xyz, 0).xyz;
   r2.xyz = atmosphereExtinctionLUT.SampleLevel(samLinear_s, r2.xyz, 0).xyz;
+  const float3 vbgiTransmittance = vbgiFogKeep * r2.xyz;
   r0.yzw = r0.yzw * r2.xyz + r1.yzw;
   if (outlineShapeCount_g != 0) {
     r1.yz = -outlineShapeMaskUVParam_g.xy + r5.xz;
@@ -1768,23 +1737,7 @@ void main(
   }
 
   if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
-    float3 giColor = cachedVBGI;
-
-    // Light Color debug view — shows sun color uniformly
-    if ((int)shader_injection_data.vbgi_debug_view == 6) {
-      o0.xyz = lightColor_g.xyz * 0.05;
-      o0.w = 1;
-      o1.xyzw = r2.xyzw;
-      o2.xy = r3.xy;
-      o2.x = 0;
-      return;
-    }
-
-    if (shader_injection_data.gtvbao_vbgi_debug > 0.5f) {
-      o0.xyz = giColor;  // Debug: replace scene with GI texture
-    } else {
-      o0.xyz += giColor;  // Normal: add GI to scene
-    }
+    o0.xyz += cachedVBGI * vbgiTransmittance;
   }
   // SSR replacement debug views (read-only overrides, evaluated first).
   // Visualize SSR chain stages fullscreen on lit surfaces: 1 = scene color,

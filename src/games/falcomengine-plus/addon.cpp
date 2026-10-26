@@ -1025,6 +1025,14 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view vbgi_radiance_mip_srv[4] = {};
   reshade::api::resource_view vbgi_radiance_mip_uav[5] = {};
   uint64_t vbgi_radiance_frame = UINT64_MAX;
+  falcom_world::rtgi::RtgiDenoiseSet vbgi_denoise = {};
+  reshade::api::resource vbgi_stats_buffer = {};
+  reshade::api::resource_view vbgi_stats_uav = {};
+  uint64_t vbgi_gi_frame = UINT64_MAX;
+  bool vbgi_temporal_last = false;
+  uint64_t vbgi_last_frame = UINT64_MAX;
+  bool vbgi_prev_params_valid = false;
+  std::array<float, 16> vbgi_prev_params = {};
 
   reshade::api::resource_view captured_depth_srv = {};
   std::atomic<bool> captured_depth_live{true};  // destroy-event driven; false = target freed since capture
@@ -1082,9 +1090,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint64_t deferred_scene_cbv_frame = UINT64_MAX;
   bool deferred_pending = false;
 
-  reshade::api::resource captured_light_buffer_texture = {};
-  reshade::api::resource_view captured_light_buffer_srv = {};
-  bool captured_light_buffer_valid = false;   // true after first frame's capture
   reshade::api::resource_view fallback_uav = {};  // 1x1 UAV fallback
   // -- Foliage mask (AO-domain R8_UINT, pre-pass) --
   reshade::api::resource foliage_mask_texture = {};
@@ -1495,6 +1500,15 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // whatever the slot held before, so force one reset on the next TAA draw.
   std::unordered_set<uint64_t> taa_pending_resets = {};
 };
+
+// The newest denoised VBGI output is usable when the last denoise is recent enough (same age rule as the debug push).
+static bool VbgiGiFresh(const DeviceData* d) {
+  const auto& out = d->vbgi_denoise.output;
+  return d->vbgi_gi_frame != UINT64_MAX
+      && d->frame_index - d->vbgi_gi_frame <= ((g_cpuopt_deferred_dispatch > 0.5f) ? 1u : 0u)
+      && out.srv[d->vbgi_denoise.output_index].handle != 0u
+      && out.width == d->captured_depth_w && out.height == d->captured_depth_h;
+}
 
 static void CreateGTVBAOResources(reshade::api::device* device, DeviceData* data,
                                    uint32_t gw, uint32_t gh);
@@ -3710,7 +3724,7 @@ renodx::utils::settings::Settings settings = {
       .key = "SSGIEnable", .binding = &g_vbgi_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "VBGI Enable", .section = "VBGI",
-      .tooltip = "Visibility bitmask indirect diffuse GI. Enables the VBGI gather. Off by default. GI is not composited into the lit image until the composite step; use VBGI Debug View to inspect it.",
+      .tooltip = "Visibility bitmask indirect diffuse GI (Sora 1st and Sora 2nd). Added to the lit image after the shadow terms. Off by default.",
       .labels = {"Off", "On"},
       .is_visible = []() { return VbgiRowVisible(); },
     },
@@ -6487,54 +6501,6 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     }
   }
   // Use deferred snapshots from lighting draw (kai-style) � deferred dispatch only.
-  // -- Light-buffer capture helper (runs after GTVBAO) --
-  auto capture_light_buffer_for_next_frame = [&]() {
-    if (shader_injection.vbgi_enabled < 0.5f || !d->captured_light_buffer_texture.handle) return;
-    // Skip when captured color is live: the light-buffer consumers prefer it and touch the light buffer only as
-    // fallback (terminal fallback_srv preserved).
-    if (d->captured_color_srv.handle) return;
-    auto bb = sc->get_back_buffer(0);
-    if (!bb.handle) return;
-    // Recreate capture texture if back buffer format changed (e.g. HDR vs SDR mismatch).
-    auto bb_desc = dev->get_resource_desc(bb);
-    auto cap_desc = dev->get_resource_desc(d->captured_light_buffer_texture);
-    if (bb_desc.texture.format != cap_desc.texture.format
-        || bb_desc.texture.width != cap_desc.texture.width
-        || bb_desc.texture.height != cap_desc.texture.height) {
-      if (d->captured_light_buffer_srv.handle) dev->destroy_resource_view(d->captured_light_buffer_srv);
-      if (d->captured_light_buffer_texture.handle) dev->destroy_resource(d->captured_light_buffer_texture);
-      d->captured_light_buffer_srv = {};
-      d->captured_light_buffer_texture = {};
-      d->captured_light_buffer_valid = false;
-      reshade::api::resource_desc rd = {};
-      rd.type = reshade::api::resource_type::texture_2d;
-      rd.texture = {bb_desc.texture.width, bb_desc.texture.height, 1, 1, bb_desc.texture.format, 1};
-      rd.heap = reshade::api::memory_heap::gpu_only;
-      rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest;
-      dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource,
-                           &d->captured_light_buffer_texture);
-      dev->create_resource_view(d->captured_light_buffer_texture,
-                                 reshade::api::resource_usage::shader_resource,
-                                 reshade::api::resource_view_desc(
-                                     reshade::api::resource_view_type::texture_2d,
-                                     bb_desc.texture.format, 0, 1, 0, 1),
-                                 &d->captured_light_buffer_srv);
-    }
-    cl->barrier(bb, reshade::api::resource_usage::present,
-                reshade::api::resource_usage::copy_source);
-    cl->barrier(d->captured_light_buffer_texture,
-                reshade::api::resource_usage::shader_resource,
-                reshade::api::resource_usage::copy_dest);
-    cl->copy_texture_region(bb, 0, nullptr,
-                            d->captured_light_buffer_texture, 0, nullptr);
-    cl->barrier(d->captured_light_buffer_texture,
-                reshade::api::resource_usage::copy_dest,
-                reshade::api::resource_usage::shader_resource);
-    cl->barrier(bb, reshade::api::resource_usage::copy_source,
-                reshade::api::resource_usage::present);
-    d->captured_light_buffer_valid = true;
-  };
-
   // Inline dispatch active (deferred off) � GTVBAO runs during lighting pass, not here.
   // Drop snapshots whose targets died since capture (destroy events flip the flags;
   // no queries here). Dispatching on them is never correct.
@@ -6544,7 +6510,6 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     d->deferred_pending = false;
   }
   if (!d->deferred_pending || !d->deferred_depth_srv.handle) {
-    capture_light_buffer_for_next_frame();
     // DynCube debug face preview � must run even when GTVBAO deferred off
     if (d->dyncube_resources_created && d->dyncube_srv.handle && shader_injection.dynCube_enabled >0.5f
         && (shader_injection.dynCube_debug == 1.f || shader_injection.dynCube_debug == 2.f
@@ -6586,7 +6551,6 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   }
   if (!d->deferred_scene_cbv_valid
       || (d->frame_index - d->deferred_scene_cbv_frame) > 1u) {
-    capture_light_buffer_for_next_frame();
     if (shader_injection.gtvbao_debug_logging > 0.5f) {
       reshade::log::message(reshade::log::level::warning,
                             "[GTVBAO] Dispatch skipped: no deferred scene CBV.");
@@ -6659,8 +6623,6 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     reshade::log::message(reshade::log::level::warning, "[GTVBAO] Dispatch failed.");
   }
 
-  // -- Capture light buffer for next frame's multi-bounce (after GI applied) --
-  capture_light_buffer_for_next_frame();
 
   // -- DynCube debug face preview � samples capture resources directly (not t17) --
   if (d->dyncube_resources_created && d->dyncube_srv.handle && shader_injection.dynCube_enabled >0.5f
@@ -9699,6 +9661,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // IMPORTANT: returning false would BYPASS the draw (skip it entirely).
   shader_injection.gtvbao_debug_view = (float)ActiveGtvbaoDebugMode();
   shader_injection.gtvbao_dedicated_bound = 0.f;
+  shader_injection.gtvbao_vbgi_bound = 0.f;
   SyncISFASTToShaderInjection(cmd_list);  // keep IS-FAST mirrors in sync
   // Push IS-FAST noise texture for PCSS shadow jitter (t24 only � NO sampler push,
   // uses game's samPoint_s at s0 with manual wrap in shader to avoid heap corruption)
@@ -9882,14 +9845,24 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   reshade::api::resource_view push_srv = {};
   bool do_push = false;
 
-  // Compute debug views 22-29: push the GTVBAO debug UAV output to the lighting shader's t23 slot.
+  // Compute debug views 22-35: push the GTVBAO debug UAV output to the lighting shader's t23 slot. VBGI "Final GI"
+  // (mode 30) shows the denoised output instead, so it reflects temporal and spatial filtering.
   const uint64_t max_age = (g_cpuopt_deferred_dispatch > 0.5f) ? 1u : 0u;
-  if (IsGtvbaoComputeDebug(ActiveGtvbaoDebugMode())
+  bool gi_push = false;
+  if (vbgi_active && ActiveGtvbaoDebugMode() == 30 && VbgiGiFresh(dd)) {
+    push_srv = dd->vbgi_denoise.output.srv[dd->vbgi_denoise.output_index];
+    do_push = true;
+  } else if (IsGtvbaoComputeDebug(ActiveGtvbaoDebugMode())
       && dd->gtvbao_debug_frame != UINT64_MAX
       && (dd->frame_index - dd->gtvbao_debug_frame) <= max_age
       && dd->gtvbao_debug_mode_written == (float)ActiveGtvbaoDebugMode()) {
     push_srv = dd->debug_srv;
     do_push = true;
+  } else if (vbgi_active && !IsGtvbaoComputeDebug(ActiveGtvbaoDebugMode()) && VbgiGiFresh(dd)) {
+    // VBGI composite: the newest denoised output, bound for the lighting shader's cachedVBGI.
+    push_srv = dd->vbgi_denoise.output.srv[dd->vbgi_denoise.output_index];
+    do_push = true;
+    gi_push = true;
   }
 
   if (do_push) {
@@ -9905,7 +9878,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               reshade::api::descriptor_type::texture_shader_resource_view,
               &push_srv,
           });
-      shader_injection.gtvbao_mrt_normal_debug = 1.f;
+      if (gi_push) shader_injection.gtvbao_vbgi_bound = 1.f;
+      else shader_injection.gtvbao_mrt_normal_debug = 1.f;
     }
   }
   }  // gtvbao_active || vbgi_active (t23 section)
@@ -10316,9 +10290,6 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
   // �-trous normal pre-decode target (full-res RGBA16F)
   mk(w, h, reshade::api::format::r16g16b16a16_float,
      &d->normal_prep_texture, &d->normal_prep_srv, &d->normal_prep_uav);
-  // Light buffer capture at full back-buffer resolution
-  mk(gw, gh, reshade::api::format::r16g16b16a16_float,
-     &d->captured_light_buffer_texture, &d->captured_light_buffer_srv, nullptr);
 }
 
 static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
@@ -10343,13 +10314,18 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   for (auto& v : d->vbgi_radiance_mip_srv) dv(v);
   for (auto& u : d->vbgi_radiance_mip_uav) dv(u);
   dv(d->vbgi_radiance_srv); dr(d->vbgi_radiance_texture);
+  falcom_world::rtgi::DestroyRtgiDenoiseSet(dev, &d->vbgi_denoise);
+  falcom_world::bvh::DestroyBuffer(dev, &d->vbgi_stats_uav, &d->vbgi_stats_buffer);
+  d->vbgi_gi_frame = UINT64_MAX;
+  d->vbgi_temporal_last = false;
+  d->vbgi_last_frame = UINT64_MAX;
+  d->vbgi_prev_params_valid = false;
   DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
   DestroyGTVBAODescriptorTables(dev, &d->main_tables);
   DestroyGTVBAODescriptorTables(dev, &d->foliage_mask_tables);
   // GI resources (now integrated � no separate VBGI pipeline)
   dv(d->upscale_ao_srv); dv(d->upscale_ao_uav); dr(d->upscale_ao_texture);
   dp(d->upscale_pipeline);
-  dv(d->captured_light_buffer_srv); dr(d->captured_light_buffer_texture);
   dv(d->foliage_mask_srv); dv(d->foliage_mask_uav); dr(d->foliage_mask_texture);
   dp(d->foliage_mask_pipeline); dl(d->foliage_mask_layout);
   dv(d->debug_srv); dv(d->debug_uav); dr(d->debug_texture);
@@ -13072,10 +13048,102 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
   }
   cl->dispatch((d->vbgi_width + 7) / 8, (d->vbgi_height + 7) / 8, 1);
   GtvbaoBarrier(cl, d->vbgi_raw_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  falcom_world::rtao::NullComputeSlots(cl, 5, 2, 1);
   if (vbgi_dbg) {
     d->gtvbao_debug_frame = d->frame_index;
     d->gtvbao_debug_mode_written = (float)VbgiGtvbaoDebugMode();
     GtvbaoBarrier(cl, d->debug_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  }
+
+  // VBGI denoise (M7.5): the shared RTGI chain (temporal, spatial filter, upsample) on the raw GI, into VBGI's own set.
+  {
+    namespace rtgi = falcom_world::rtgi;
+    namespace rtao = falcom_world::rtao;
+    const uint32_t divisor = 1u << static_cast<uint32_t>(std::clamp(static_cast<int>(std::lround(g_vbgi_resolution)), 0, 1));
+    const uint32_t full_w = d->captured_depth_w, full_h = d->captured_depth_h;
+    bool denoise_ok = full_w != 0u && full_h != 0u
+        && d->vbgi_width == rtao::RtgiTraceExtent(full_w, divisor) && d->vbgi_height == rtao::RtgiTraceExtent(full_h, divisor);
+    if (!denoise_ok) CSLog("vbgi", "denoise skipped: size mismatch", true);
+    if (denoise_ok && !rtgi::EnsureRtgiPipeline(dev, &d->vbgi_denoise.upsample_pipeline, rtgi::kRtgiUpsamplePipelineDesc)) {
+      denoise_ok = false;
+      CSLog("vbgi", "denoise skipped: upsample pipeline", true);
+    }
+    if (denoise_ok && d->vbgi_stats_buffer.handle == 0u) {
+      const uint32_t zeros[rtgi::kRtgiStatsCount] = {};
+      denoise_ok = falcom_world::bvh::CreatePoolBuffer(dev, zeros, sizeof(zeros), sizeof(uint32_t),
+          &d->vbgi_stats_buffer, &d->vbgi_stats_uav,
+          reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::copy_source);
+      if (!denoise_ok) CSLog("vbgi", "denoise skipped: stats buffer", true);
+    }
+    if (denoise_ok) {
+      const bool temporal_on = g_vbgi_temporal_enabled > 0.5f && g_cpuopt_deferred_dispatch < 0.5f;
+      const bool motion_ok = temporal_on && UpdateRtMotion(dev, d, true);
+      const std::array<float, 16> params = {g_vbgi_quality_level, g_vbgi_resolution, g_vbgi_radius, g_vbgi_bitmask_thickness,
+          g_vbgi_depth_mip_offset, g_vbgi_noise_type, g_vbgi_mrt_normal, g_vbgi_ambient, g_vbgi_lights, g_vbgi_sun,
+          g_vbgi_emissive, g_vbgi_backface_mode, g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
+          g_vbgi_history_clamp};
+      const bool params_changed = d->vbgi_prev_params_valid && !(params == d->vbgi_prev_params);
+      d->vbgi_prev_params = params;
+      d->vbgi_prev_params_valid = true;
+      const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
+          .temporal_on = temporal_on,
+          .was_on = d->vbgi_temporal_last,
+          .resized = d->vbgi_denoise.history_color.width != 0u
+              && (d->vbgi_denoise.history_color.width != d->vbgi_width || d->vbgi_denoise.history_color.height != d->vbgi_height),
+          .frame = d->frame_index,
+          .last_frame = d->vbgi_last_frame,
+          .guard = d->dyncube_loadingWipePending || d->frame_index < d->resize_guard_until_frame,
+          .scaled = false,
+          .params_changed = params_changed,
+          .motion_ok = motion_ok});
+      const rtgi::RtgiDenoiseReady ready = rtgi::EnsureRtgiDenoise(dev, &d->vbgi_denoise,
+          {.output_format = reshade::api::format::r11g11b10_float,
+           .output_bytes_per_pixel = 4u,
+           .trace_width = d->vbgi_width,
+           .trace_height = d->vbgi_height,
+           .full_width = full_w,
+           .full_height = full_h,
+           .temporal = motion_ok,
+           .spatial = g_vbgi_spatial_enabled > 0.5f,
+           .filter_code = rtgi::kRtgiFilterShader,
+           .log_prefix = "[vbgi]"});
+      if (!ready.ok) {
+        CSLog("vbgi", "denoise skipped: chain not ready", true);
+      } else {
+        std::vector<reshade::api::descriptor_table_update> table_nulls;
+        rtgi::DispatchRtgiDenoise(dev, cl, &d->vbgi_denoise,
+            {.raw_view = d->vbgi_raw_srv,
+             .depth_view = d->captured_depth_srv,
+             .mrt_normal_view = d->captured_mrt_normal_srv,
+             .scene_cbv_view = d->captured_scene_cbv_view,
+             .motion_view = d->mb_rtv4_owned_srv,
+             .albedo_view = reshade::api::resource_view{0u},
+             .stats_uav = d->vbgi_stats_uav,
+             .debug_uav = reshade::api::resource_view{0u},
+             .debug_texture = reshade::api::resource{0u},
+             .trace_width = d->vbgi_width,
+             .trace_height = d->vbgi_height,
+             .full_width = full_w,
+             .full_height = full_h,
+             .divisor = static_cast<float>(divisor),
+             .debug_mode = 0,
+             .temporal_push = {.params = {g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection, g_vbgi_history_clamp},
+                               .size = {0.f, 0.f, 0.f, reset == rtao::ResetReason::None ? 1.f : 0.f}},
+             .filter_type = g_vbgi_filter_type > 0.5f ? 1 : 0,
+             .filter_radius = static_cast<int>(g_vbgi_filter_radius),
+             .filter_passes = static_cast<int>(g_vbgi_filter_passes),
+             .filter_taps = static_cast<int>(g_vbgi_filter_type > 0.5f ? g_vbgi_filter_taps_atrous : g_vbgi_filter_taps_separable),
+             .filter_value_stop = 0.f,
+             .upsample_intensity = 1.f,
+             .upsample_char_intensity = 1.f,
+             .upsample_saturation = 1.f},
+            ready, &table_nulls);
+        dev->update_descriptor_tables(static_cast<uint32_t>(table_nulls.size()), table_nulls.data());
+        d->vbgi_temporal_last = temporal_on && ready.temporal;
+        d->vbgi_last_frame = d->frame_index;
+        d->vbgi_gi_frame = d->frame_index;
+      }
+    }
   }
 
   static bool s_logged = false;
