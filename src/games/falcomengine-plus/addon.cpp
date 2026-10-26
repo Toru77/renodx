@@ -1032,7 +1032,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool vbgi_temporal_last = false;
   uint64_t vbgi_last_frame = UINT64_MAX;
   bool vbgi_prev_params_valid = false;
-  std::array<float, 16> vbgi_prev_params = {};
+  std::array<float, 18> vbgi_prev_params = {};
 
   reshade::api::resource_view captured_depth_srv = {};
   std::atomic<bool> captured_depth_live{true};  // destroy-event driven; false = target freed since capture
@@ -1501,11 +1501,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   std::unordered_set<uint64_t> taa_pending_resets = {};
 };
 
-// The newest denoised VBGI output is usable when the last denoise is recent enough (same age rule as the debug push).
-static bool VbgiGiFresh(const DeviceData* d) {
+// The newest denoised VBGI output is usable when the last denoise is at most max_age frames old.
+static bool VbgiGiFresh(const DeviceData* d, uint64_t max_age) {
   const auto& out = d->vbgi_denoise.output;
   return d->vbgi_gi_frame != UINT64_MAX
-      && d->frame_index - d->vbgi_gi_frame <= ((g_cpuopt_deferred_dispatch > 0.5f) ? 1u : 0u)
+      && d->frame_index - d->vbgi_gi_frame <= max_age
       && out.srv[d->vbgi_denoise.output_index].handle != 0u
       && out.width == d->captured_depth_w && out.height == d->captured_depth_h;
 }
@@ -3723,15 +3723,15 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIEnable", .binding = &g_vbgi_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "VBGI Enable", .section = "VBGI",
-      .tooltip = "Visibility bitmask indirect diffuse GI (Sora 1st and Sora 2nd). Added to the lit image after the shadow terms. Off by default.",
+      .default_value = 0.f, .label = "GTVBGI Enabled", .section = "GTVBGI",
+      .tooltip = "GTVBGI: ground-truth visibility bitmask indirect diffuse GI (Sora 1st and Sora 2nd). Added to the lit image after the shadow terms. Off by default.",
       .labels = {"Off", "On"},
       .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
       .key = "VBGIQuality", .binding = &g_vbgi_quality_level,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Quality Level", .section = "VBGI",
+      .default_value = 1.f, .label = "Quality Level", .section = "GTVBGI",
       .tooltip = "Slices x steps per side. Low 2x4, Medium 3x4, High 3x6, Ultra 4x10.",
       .labels = {"Low", "Medium", "High", "Ultra"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
@@ -3740,16 +3740,16 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIResolution", .binding = &g_vbgi_resolution,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "VBGI Resolution", .section = "VBGI",
-      .tooltip = "Full = native. Half = half size per axis (a quarter of the pixels).",
-      .labels = {"Full", "Half"},
+      .default_value = 1.f, .label = "GTVBGI Resolution", .section = "GTVBGI",
+      .tooltip = "Full = native. Half = half size per axis (a quarter of the pixels). Quarter = a quarter size per axis (one per 4 x 4 block); fastest, softest. Default Half.",
+      .labels = {"Full", "Half", "Quarter"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
       .key = "VBGINoiseType", .binding = &g_vbgi_noise_type,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Noise Type", .section = "VBGI",
+      .default_value = 2.f, .label = "Noise Type", .section = "GTVBGI",
       .tooltip = "IS-FAST = pre-computed blue noise (baked into the addon). IGN = Interleaved Gradient Noise. Hilbert = Hilbert curve noise. Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
       .labels = {"IS-FAST", "IGN", "Hilbert"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_isfast_enabled > 0.5f; },
@@ -3758,14 +3758,14 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIIntensity", .binding = &shader_injection.vbgi_intensity,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Intensity", .section = "VBGI",
+      .default_value = 1.0f, .label = "Intensity", .section = "GTVBGI",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharGTVBGIMaskStr", .binding = &shader_injection.char_gtvbgi_mask_strength,
-      .default_value = 0.f, .label = "Character Mask Strength", .section = "VBGI",
+      .default_value = 0.f, .label = "Character Mask Strength", .section = "GTVBGI",
       .min = 0.f, .max = 100.f,
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .parse = [](float v) { return v * 0.01f; },
@@ -3774,7 +3774,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIRadius", .binding = &g_vbgi_radius,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.5f, .label = "Radius", .section = "VBGI",
+      .default_value = 1.5f, .label = "Radius", .section = "GTVBGI",
       .tooltip = "World-space radius of the visibility search.",
       .min = 0.1f, .max = 10.0f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
@@ -3783,7 +3783,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIThickness", .binding = &g_vbgi_bitmask_thickness,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.30f, .label = "Bitmask Thickness", .section = "VBGI",
+      .default_value = 0.30f, .label = "Bitmask Thickness", .section = "GTVBGI",
       .tooltip = "World-space thickness for visibility bitmask. Higher = more light passes behind surfaces.",
       .min = 0.01f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
@@ -3792,7 +3792,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIBackfaceMode", .binding = &g_vbgi_backface_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Backface Rejection", .section = "VBGI",
+      .default_value = 0.f, .label = "Backface Rejection", .section = "GTVBGI",
       .labels = {"Off", "Simple", "Exact"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
@@ -3800,7 +3800,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIDepthMipOffset", .binding = &g_vbgi_depth_mip_offset,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 3.5f, .label = "Depth MIP Offset", .section = "VBGI",
+      .default_value = 3.5f, .label = "Depth MIP Offset", .section = "GTVBGI",
       .min = 2.0f, .max = 6.0f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
@@ -3808,7 +3808,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIMrtNormal", .binding = &g_vbgi_mrt_normal,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "MRT Normal Input", .section = "VBGI",
+      .default_value = 1.f, .label = "MRT Normal Input", .section = "GTVBGI",
       .tooltip = "Off = depth normals only. On = use game g-buffer normals.",
       .labels = {"Off (Depth)", "On (MRT)"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
@@ -3817,7 +3817,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIAmbient", .binding = &g_vbgi_ambient,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Ambient Contribution", .section = "VBGI",
+      .default_value = 0.5f, .label = "Ambient Contribution", .section = "GTVBGI",
       .min = 0.0f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
@@ -3825,7 +3825,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGILights", .binding = &g_vbgi_lights,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Light Contribution", .section = "VBGI",
+      .default_value = 1.0f, .label = "Light Contribution", .section = "GTVBGI",
       .min = 0.0f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
@@ -3833,7 +3833,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGISun", .binding = &g_vbgi_sun,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Sun Contribution", .section = "VBGI",
+      .default_value = 1.0f, .label = "Sun Contribution", .section = "GTVBGI",
       .min = 0.0f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
@@ -3841,7 +3841,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIEmissive", .binding = &g_vbgi_emissive,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Emissive Contribution", .section = "VBGI",
+      .default_value = 1.0f, .label = "Emissive Contribution", .section = "GTVBGI",
       .min = 0.0f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
@@ -3849,7 +3849,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIMultiBounce", .binding = &shader_injection.vbgi_multibounce,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Multi-Bounce", .section = "VBGI",
+      .default_value = 0.f, .label = "Multi-Bounce", .section = "GTVBGI",
       .tooltip = "Enables multi-bounce GI: previous frame's indirect light feeds back into the GI computation.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
@@ -3858,7 +3858,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIMultiBounceStrength", .binding = &g_vbgi_multibounce_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Multi-Bounce Strength", .section = "VBGI",
+      .default_value = 0.5f, .label = "Multi-Bounce Strength", .section = "GTVBGI",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
@@ -3867,8 +3867,8 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIDebugMode", .binding = &g_vbgi_debug_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "VBGI Debug View", .section = "VBGI",
-      .tooltip = "Replace scene with VBGI debug textures. While not Off this replaces the GTVBAO debug view.",
+      .default_value = 0.f, .label = "GTVBGI Debug View", .section = "GTVBGI",
+      .tooltip = "Replace scene with GTVBGI debug textures. While not Off this replaces the GTVBAO debug view.",
       .labels = {"Off", "Final GI", "Raw GI", "Radiance Input", "Bitmask", "Temporal Confidence", "Term Split"},
       .is_visible = []() { return VbgiRowVisible(); },
     },
@@ -3876,7 +3876,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIKaiConsumeFalcom", .binding = &shader_injection.vbgi_kai_consume_falcom,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Consume Falcom SSGI (Kai)", .section = "VBGI",
+      .default_value = 0.f, .label = "Consume Falcom SSGI (Kai)", .section = "GTVBGI",
       .tooltip = "When ON, Falcom's SSGI color modulates GTVBAO VBGI before blending. Creates a multiplicative interaction between the two GI sources.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
@@ -3884,7 +3884,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIKaiFalcomBlend", .binding = &shader_injection.vbgi_kai_falcom_blend,
-      .default_value = 0.5f, .label = "Falcom SSGI Blend (Kai)", .section = "VBGI",
+      .default_value = 0.5f, .label = "Falcom SSGI Blend (Kai)", .section = "GTVBGI",
       .tooltip = "How much Falcom SSGI color modulates GTVBAO VBGI. 0 = no modulation (additive only), 1 = full multiplicative blend.",
       .min = 0.f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && shader_injection.vbgi_kai_consume_falcom > 0.5f; },
@@ -3893,7 +3893,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIKaiGTVBAOOnly", .binding = &shader_injection.vbgi_kai_gtvbao_only,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "GTVBAO VBGI Only (Kai)", .section = "VBGI",
+      .default_value = 0.f, .label = "GTVBAO VBGI Only (Kai)", .section = "GTVBGI",
       .tooltip = "When ON, Falcom SSGI is suppressed from output and only GTVBAO VBGI is visible. GTVBAO can still consume Falcom SSGI internally for modulation.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
@@ -6479,7 +6479,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     }
     const bool too_small = d->working_width < 320u || d->working_height < 320u;
     const float want_res = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 1.f);
-    const float want_vbgi_res = std::clamp(std::round(g_vbgi_resolution), 0.f, 1.f);
+    const float want_vbgi_res = std::clamp(std::round(g_vbgi_resolution), 0.f, 2.f);
     if (gw > 0u && gh > 0u
         && (!d->resources_created || too_small
             || gw != d->last_created_game_width
@@ -9849,7 +9849,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // (mode 30) shows the denoised output instead, so it reflects temporal and spatial filtering.
   const uint64_t max_age = (g_cpuopt_deferred_dispatch > 0.5f) ? 1u : 0u;
   bool gi_push = false;
-  if (vbgi_active && ActiveGtvbaoDebugMode() == 30 && VbgiGiFresh(dd)) {
+  if (vbgi_active && ActiveGtvbaoDebugMode() == 30 && VbgiGiFresh(dd, max_age)) {
     push_srv = dd->vbgi_denoise.output.srv[dd->vbgi_denoise.output_index];
     do_push = true;
   } else if (IsGtvbaoComputeDebug(ActiveGtvbaoDebugMode())
@@ -9858,7 +9858,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       && dd->gtvbao_debug_mode_written == (float)ActiveGtvbaoDebugMode()) {
     push_srv = dd->debug_srv;
     do_push = true;
-  } else if (vbgi_active && !IsGtvbaoComputeDebug(ActiveGtvbaoDebugMode()) && VbgiGiFresh(dd)) {
+  } else if (vbgi_active && !IsGtvbaoComputeDebug(ActiveGtvbaoDebugMode()) && VbgiGiFresh(dd, max_age)) {
     // VBGI composite: the newest denoised output, bound for the lighting shader's cachedVBGI.
     push_srv = dd->vbgi_denoise.output.srv[dd->vbgi_denoise.output_index];
     do_push = true;
@@ -10241,7 +10241,7 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
     mk(aw, ah, reshade::api::format::r16g16b16a16_float,
        &d->temporal_history_texture[i], &d->temporal_history_srv[i], &d->temporal_history_uav[i]);
   // VBGI raw gather target: always allocated; RunVBGI never resizes it.
-  const uint32_t vdiv = 1u << std::clamp((int)std::lround(g_vbgi_resolution), 0, 1);
+  const uint32_t vdiv = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution);
   const uint32_t vw = (w + vdiv - 1u) / vdiv;
   const uint32_t vh = (h + vdiv - 1u) / vdiv;
   d->vbgi_width = vw; d->vbgi_height = vh;
@@ -10315,6 +10315,7 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   for (auto& u : d->vbgi_radiance_mip_uav) dv(u);
   dv(d->vbgi_radiance_srv); dr(d->vbgi_radiance_texture);
   falcom_world::rtgi::DestroyRtgiDenoiseSet(dev, &d->vbgi_denoise);
+  d->vbgi_denoise = falcom_world::rtgi::RtgiDenoiseSet{};
   falcom_world::bvh::DestroyBuffer(dev, &d->vbgi_stats_uav, &d->vbgi_stats_buffer);
   d->vbgi_gi_frame = UINT64_MAX;
   d->vbgi_temporal_last = false;
@@ -12314,7 +12315,7 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
     c[26] = 2.f;
     c[27] = 0.f;
     c[30] = 0.f;
-    c[35] = std::clamp(std::round(g_vbgi_resolution), 0.f, 1.f);
+    c[35] = std::clamp(std::round(g_vbgi_resolution), 0.f, 2.f);
     c[36] = 0.f;
     c[43] = 1.f;
     c[44] = IsSora1st() ? 0.f : (IsSora2nd() ? 1.f : 2.f);
@@ -12414,7 +12415,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   // VBGI gather: the main pass's 4 SRVs plus t4 radiance (5 SRVs) and 2 UAVs.
   if (!make_layout(5u, 2u, &d->vbgi_main_layout)) return false;
   // VBGI radiance prepass: 9 SRVs + 1 UAV. Radiance mip chain: 1 SRV + 1 UAV.
-  if (!make_layout(9u, 1u, &d->vbgi_radiance_layout)) return false;
+  if (!make_layout(11u, 1u, &d->vbgi_radiance_layout)) return false;
   EnsureGTVBAODescriptorTables(dev, d->vbgi_radiance_layout, &d->vbgi_radiance_tables);
   if (!make_layout(1u, 1u, &d->vbgi_mips_layout)) return false;
   EnsureGTVBAODescriptorTables(dev, d->vbgi_mips_layout, &d->vbgi_mips_tables);
@@ -12916,6 +12917,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
 
 // VBGI radiance prepass (M7.4 step 3): sender radiance and its mip chain, once per frame, from the lighting draw.
 constexpr float kVbgiRadianceClamp = 16.f;  // HDR cap per channel
+constexpr float kVbgiFeedbackMax = 0.9f;  // Multi-Bounce Strength x Intensity limit (RTGI rule)
 static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
   if (d->vbgi_radiance_frame == d->frame_index) return true;
   if (!VbgiRunning() || !d->captured_depth_srv.handle || !d->captured_mrt_normal_srv.handle
@@ -12941,22 +12943,38 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
   const uint32_t w = d->vbgi_width, h = d->vbgi_height;
-  const uint32_t div = 1u << std::clamp((int)std::lround(g_vbgi_resolution), 0, 1);
+  const uint32_t div = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution);
+
+  // Multi-Bounce (M7.6): last frame's denoised GI (the newest output, not written until this frame's denoise) re-enters as
+  // sender light. Off, stale or without valid motion: weight 0 and the two extra slots stay on the fallback view.
+  float feedback_w = 0.f;
+  reshade::api::resource_view prev_gi_srv = d->fallback_srv;
+  reshade::api::resource_view motion_srv = d->fallback_srv;
+  // Feedback reads the PREVIOUS frame's denoise (this frame's runs after the prepass), so the age is 1, not the composite's 0.
+  if (shader_injection.vbgi_multibounce > 0.5f
+      && VbgiGiFresh(d, 1u)
+      && d->frame_index >= d->resize_guard_until_frame && !d->dyncube_loadingWipePending
+      && UpdateRtMotion(dev, d, true)) {
+    feedback_w = std::min(g_vbgi_multibounce_strength * shader_injection.vbgi_intensity, kVbgiFeedbackMax);
+    prev_gi_srv = d->vbgi_denoise.output.srv[d->vbgi_denoise.output_index];
+    motion_srv = d->mb_rtv4_owned_srv;
+  }
 
   // Mip 0: the radiance itself.
   GtvbaoBindPipeline(cl, d->vbgi_radiance_pipeline);
   {
-    reshade::api::resource_view srvs[9] = {
+    reshade::api::resource_view srvs[11] = {
         d->captured_color_srv,
         d->captured_mrt_normal_srv,
         d->vbgi_in_srv[0], d->vbgi_in_srv[1],
         d->captured_depth_srv,
-        d->vbgi_in_srv[2], d->vbgi_in_srv[3], d->vbgi_in_srv[4], d->vbgi_in_srv[5]
+        d->vbgi_in_srv[2], d->vbgi_in_srv[3], d->vbgi_in_srv[4], d->vbgi_in_srv[5],
+        prev_gi_srv, motion_srv
     };
     reshade::api::descriptor_table_update u[4] = {
       {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
       {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,9,reshade::api::descriptor_type::texture_shader_resource_view,srvs},
+      {{},0,0,11,reshade::api::descriptor_type::texture_shader_resource_view,srvs},
       {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->vbgi_radiance_mip_uav[0]},
     };
     GtvbaoApplyDescriptors(dev, cl, d->vbgi_radiance_layout, &d->vbgi_radiance_tables, 4, u);
@@ -12967,6 +12985,7 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
     pc[3] = g_vbgi_emissive;
     pc[4] = kVbgiRadianceClamp;
     pc[5] = (float)div;
+    pc[6] = feedback_w;
     cl->push_constants(reshade::api::shader_stage::all_compute, d->vbgi_radiance_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
   }
   cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
@@ -12986,7 +13005,7 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
     cl->dispatch((std::max(1u, w >> m) + 7u) / 8u, (std::max(1u, h >> m) + 7u) / 8u, 1);
   }
 
-  falcom_world::rtao::NullComputeSlots(cl, 9, 1, 1);
+  falcom_world::rtao::NullComputeSlots(cl, 11, 1, 1);
   GtvbaoBarrier(cl, d->vbgi_radiance_texture, UA, SR);
   d->vbgi_radiance_frame = d->frame_index;
   static bool s_logged = false;
@@ -13059,7 +13078,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
   {
     namespace rtgi = falcom_world::rtgi;
     namespace rtao = falcom_world::rtao;
-    const uint32_t divisor = 1u << static_cast<uint32_t>(std::clamp(static_cast<int>(std::lround(g_vbgi_resolution)), 0, 1));
+    const uint32_t divisor = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution);
     const uint32_t full_w = d->captured_depth_w, full_h = d->captured_depth_h;
     bool denoise_ok = full_w != 0u && full_h != 0u
         && d->vbgi_width == rtao::RtgiTraceExtent(full_w, divisor) && d->vbgi_height == rtao::RtgiTraceExtent(full_h, divisor);
@@ -13078,10 +13097,10 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     if (denoise_ok) {
       const bool temporal_on = g_vbgi_temporal_enabled > 0.5f && g_cpuopt_deferred_dispatch < 0.5f;
       const bool motion_ok = temporal_on && UpdateRtMotion(dev, d, true);
-      const std::array<float, 16> params = {g_vbgi_quality_level, g_vbgi_resolution, g_vbgi_radius, g_vbgi_bitmask_thickness,
+      const std::array<float, 18> params = {g_vbgi_quality_level, g_vbgi_resolution, g_vbgi_radius, g_vbgi_bitmask_thickness,
           g_vbgi_depth_mip_offset, g_vbgi_noise_type, g_vbgi_mrt_normal, g_vbgi_ambient, g_vbgi_lights, g_vbgi_sun,
           g_vbgi_emissive, g_vbgi_backface_mode, g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
-          g_vbgi_history_clamp};
+          g_vbgi_history_clamp, shader_injection.vbgi_multibounce, g_vbgi_multibounce_strength};
       const bool params_changed = d->vbgi_prev_params_valid && !(params == d->vbgi_prev_params);
       d->vbgi_prev_params = params;
       d->vbgi_prev_params_valid = true;
@@ -13234,8 +13253,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                  .filter_passes_lowres_default = 4.f,
                                  .passes_lowres_key = "GTVBAOAtrousPassesLowRes"});
     falcom_world::AddTemporalRows(&settings, []() { return VbgiRowVisible(); }, {.prefix = "Vbgi",
-                                  .section = "VBGI Temporal Accumulation",
-                                  .enabled_tooltip = "Reprojects the previous frame VBGI with the game motion and blends it in after validation. Inert until VBGI output is enabled.",
+                                  .section = "GTVBGI Temporal Accumulation",
+                                  .enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.",
                                   .enabled = &g_vbgi_temporal_enabled,
                                   .enabled_default = 1.f,
                                   .history_weight = &g_vbgi_history_weight,
@@ -13247,8 +13266,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                   .history_clamp = &g_vbgi_history_clamp,
                                   .history_clamp_default = 1.f});
     falcom_world::AddSpatialRows(&settings, []() { return VbgiRowVisible(); }, {.prefix = "Vbgi",
-                                 .section = "VBGI Spatial Filter",
-                                 .enabled_tooltip = "Denoises the final VBGI output with edge-aware weights (depth plane and normal). Off = no filter.",
+                                 .section = "GTVBGI Spatial Filter",
+                                 .enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.",
                                  .enabled = &g_vbgi_spatial_enabled,
                                  .enabled_default = 1.f,
                                  .filter_type = &g_vbgi_filter_type,

@@ -109,7 +109,11 @@ Texture2D<float4> g_srcRadiance : register(t4);
 // AO texel tq covers the full block {d*tq .. d*tq + d-1} (d = 1 Full, 2 Half); its representative
 // pixel is the block centre, clamped for odd full dims (e.g. full=5, d=2, ao=3: tq=2 -> min(5,4)=4).
 float GTVBAO_Divisor() {
+#ifdef GTVBAO_GI
+  return exp2(round(clamp(GTVBAO_resolution, 0.f, 2.f)));   // GI: Full, Half, Quarter
+#else
   return exp2(round(clamp(GTVBAO_resolution, 0.f, 1.f)));
+#endif
 }
 
 // Debug view modes (GTVBAO_debug_mode). 27 is reserved.

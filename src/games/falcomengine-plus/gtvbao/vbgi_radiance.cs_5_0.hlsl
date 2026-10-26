@@ -1,11 +1,12 @@
 // falcomengine-plus VBGI - Radiance prepass (M7.4 step 3).
 // One thread per radiance texel. Writes the sender radiance L_j = albedo * (ambient + lights + sun) with the emissive
-// term, which the VBGI gather samples at the same texel. Sky writes 0. Multi-bounce is not included yet.
+// term, which the VBGI gather samples at the same texel. Sky writes 0. Multi-bounce (M7.6): last frame's denoised GI, reprojected with the game motion, is added as sender light when g_feedback_w > 0.
 // Inputs are the lighting-draw captures (Sora 1st and Sora 2nd): see addon.cpp RunVbgiRadiance.
 // Lamps follow the game's lamp tile lists (lightIndices_g) through world_rt_lamps.hlsli; shadow maps and specular are ignored.
 
 #include "../include/mrt_normal.hlsli"
 #include "../world/shaders/world_rt_lamps.hlsli"
+#include "../taa/taa_reproject.hlsli"
 
 // The game's DeferredParam (144 bytes): emissive is head[0].w (byte 12), dynamicLightIntensity is mid.w (byte 76).
 struct VbgiDeferredParam
@@ -24,6 +25,9 @@ StructuredBuffer<VbgiDeferredParam> g_deferred   : register(t5);  // deferredPar
 Texture2D<float4>                   g_shadow     : register(t6);  // shadowTexture (Sora 2nd t7, Sora 1st t9)
 StructuredBuffer<LightParam>        g_lamps      : register(t7);  // dynamicLights_g
 StructuredBuffer<LightIndexData>    g_lamp_tiles : register(t8);  // lightIndices_g
+Texture2D<float4>                   g_prev_gi    : register(t9);   // previous frame's denoised VBGI (depth size)
+Texture2D<float4>                   g_motion     : register(t10);  // RTV4 motion, texel units
+SamplerState                        g_samp_point : register(s0);
 
 RWTexture2D<float4> g_radiance : register(u0);
 
@@ -46,6 +50,7 @@ cbuffer cb_vbgi_radiance : register(b13)
   float g_emissive_w;     // c3
   float g_radiance_clamp; // c4
   float g_divisor;        // c5 - domain divisor (1 Full, 2 Half)
+  float g_feedback_w;     // c6 - Multi-Bounce Strength x Intensity capped at 0.9; 0 = off
 };
 
 uint2 VbgiTexel(float2 uv, uint2 size)
@@ -136,8 +141,21 @@ void main(uint2 p : SV_DispatchThreadID)
   }
   lamps *= mat.mid.w;
 
+  // Multi-bounce: last frame's GI at this sender (reprojected), re-emitted as light.
+  float3 prev_gi = float3(0.0f, 0.0f, 0.0f);
+  if (g_feedback_w > 0.0f) {
+    float motion_px, depth_spread;
+    const float2 hist_uv = CustomTAA_Reproject(uv, g_depth, g_samp_point, g_motion, g_samp_point,
+                                               1.0f / float2(dw, dh), float2(1.0f, 1.0f), motion_px, depth_spread);
+    if (all(hist_uv >= 0.0f) && all(hist_uv <= 1.0f)) {
+      uint gw, gh;
+      g_prev_gi.GetDimensions(gw, gh);
+      prev_gi = g_prev_gi.Load(int3(VbgiTexel(hist_uv, uint2(gw, gh)), 0)).rgb;
+    }
+  }
+
   const float3 light = g_ambient_w * probe + g_lights_w * lamps + g_sun_w * sun;
   const float3 lit = light + g_emissive_w * e * (1.0f - light);
-  const float3 radiance = clamp(albedo * lit, 0.0f, g_radiance_clamp);
+  const float3 radiance = clamp(albedo * (lit + g_feedback_w * prev_gi), 0.0f, g_radiance_clamp);
   g_radiance[p] = float4(radiance, 1.0f);
 }
