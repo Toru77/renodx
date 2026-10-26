@@ -12244,7 +12244,6 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
     c[5] = std::clamp(g_vbgi_bitmask_thickness, 0.01f, 2.f);
     c[6] = std::clamp(g_vbgi_depth_mip_offset, 0.f, 30.f);
     c[7] = (float)(((data ? data->frame_index : 0u) % 64u) + 32u);
-    c[8] = 0.f;
     c[9] = 0.f;
     c[10] = g_vbgi_mrt_normal;
     c[12] = 1.f;
