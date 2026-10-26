@@ -430,7 +430,7 @@ struct ShaderInjectData {
   float fxaa_edge_threshold;                 // default 0.166 — local-contrast gate (reference: 0.333 faster .. 0.063 overkill)
   float fxaa_edge_threshold_min;             // default 0.0625 — dark trim (0 = process darks fully)
   // —— GTVBAO low-resolution spatial pipeline (appended last: do not insert above) ——
-  float gtvbao_resolution;                   // 0=Full (existing behavior), 1=Half, 2=Quarter (low-res AO/GI + full-res reconstruction)
+  float gtvbao_resolution;                   // 0=Full (existing behavior), 1=Half (low-res AO/GI + full-res reconstruction)
   float gtvbao_upscale_plane_sigma;          // RETIRED: unread (the upscale uses the shared RTGI-structured weights)
   float gtvbao_upscale_normal_power;         // RETIRED: unread (the upscale uses the shared RTGI-structured weights)
   float gtvbao_upscale_debug;                // RETIRED: never set by the host; the upscale diagnostics are removed

@@ -935,7 +935,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // Resolution-change guard.
   uint32_t last_created_game_width = 0u;
   uint32_t last_created_game_height = 0u;
-  // Low-resolution spatial pipeline (0=Full existing behavior, 1=Half, 2=Quarter).
+  // Low-resolution spatial pipeline (0=Full existing behavior, 1=Half).
   uint32_t ao_width = 0u;
   uint32_t ao_height = 0u;
   float last_created_gtvbao_resolution = -1.f;
@@ -3297,14 +3297,14 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CharGTVBAOMode", .binding = &shader_injection.char_gtvbao_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Allow GTVBAO", .section = "GTVBAO",
+      .default_value = 2.f, .label = "Allow GTVBAO", .section = "GTVBAO",
       .labels = {"Off", "On", "Combined"},
       .is_enabled = []() { return !falcom_world::rtao::RtaoRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharGTVBAOMaskStr", .binding = &shader_injection.char_gtvbao_mask_strength,
-      .default_value = 75.f, .label = "GTVBAO Char Mask", .section = "GTVBAO",
+      .default_value = 50.f, .label = "GTVBAO Char Mask", .section = "GTVBAO",
       .min = 0.f, .max = 100.f,
       .is_enabled = []() { return shader_injection.char_gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested(); },
       .parse = [](float v) { return v * 0.01f; },
@@ -3366,7 +3366,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOQuality", .binding = &shader_injection.gtvbao_quality_level,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Quality Level", .section = "GTVBAO",
+      .default_value = 1.f, .label = "Quality Level", .section = "GTVBAO",
       .tooltip = "Slices x steps per side. Low 2x4, Medium 3x4, High 3x6, Ultra 4x10.",
       .labels = {"Low", "Medium", "High", "Ultra"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
@@ -3375,14 +3375,14 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAOResolution", .binding = &shader_injection.gtvbao_resolution,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "GTVBAO Resolution", .section = "GTVBAO",
-      .tooltip = "Full = native. Half = half size per axis (a quarter of the pixels). Quarter = a quarter size per axis (a sixteenth of the pixels). Lower resolutions are upsampled with depth and normal aware weights and are softer. The size is relative to the render resolution, so in-game upscaling makes it smaller.",
-      .labels = {"Full", "Half", "Quarter"},
+      .tooltip = "Full = native. Half = half size per axis (a quarter of the pixels). Lower resolutions are upsampled with depth and normal aware weights and are softer. The size is relative to the render resolution, so in-game upscaling makes it smaller.",
+      .labels = {"Full", "Half"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAONoiseType", .binding = &shader_injection.gtvbao_noise_type,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Noise Type", .section = "GTVBAO",
+      .default_value = 2.f, .label = "Noise Type", .section = "GTVBAO",
       .tooltip = "IS-FAST = pre-computed blue noise (baked into the addon). "
                  "IGN = Interleaved Gradient Noise. Hilbert = Hilbert curve noise. "
                  "Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
@@ -3392,21 +3392,21 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAORadius", .binding = &shader_injection.gtvbao_radius,
-      .default_value = 0.25f, .label = "Radius", .section = "GTVBAO",
+      .default_value = 0.4f, .label = "Radius", .section = "GTVBAO",
       .min = 0.01f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAORadiusMultiplier", .binding = &shader_injection.gtvbao_radius_multiplier,
-      .default_value = 1.7f, .label = "Radius Multiplier", .section = "GTVBAO",
+      .default_value = 1.f, .label = "Radius Multiplier", .section = "GTVBAO",
       .min = 0.3f, .max = 3.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOFinalPower", .binding = &shader_injection.gtvbao_final_power,
-      .default_value = 1.8f, .label = "Final Power", .section = "GTVBAO",
+      .default_value = 1.f, .label = "Final Power", .section = "GTVBAO",
       .min = 0.5f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3430,7 +3430,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOGTVBAOCosineMode", .binding = &shader_injection.gtvbao_cosine_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Cosine Sampling Mode", .section = "GTVBAO",
+      .default_value = 2.f, .label = "Cosine Sampling Mode", .section = "GTVBAO",
       .tooltip = "Weight = uniform slices with a per-slice weight (reference mode 1). Project = cosine-lobe projection (mode 2, default). CDF = approximate inverse-CDF sampling (mode 3). Only used with Cosine weighting.",
       .labels = {"Weight", "Project", "CDF"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_hemisphere_weighting < 0.5f; },
@@ -6516,7 +6516,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
       }
     }
     const bool too_small = d->working_width < 320u || d->working_height < 320u;
-    const float want_res = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 2.f);
+    const float want_res = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 1.f);
     if (gw > 0u && gh > 0u
         && (!d->resources_created || too_small
             || gw != d->last_created_game_width
@@ -10285,7 +10285,7 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
 
   // �� Low-resolution spatial pipeline: ao/edges/raw-GI follow the AO evaluation
   // resolution; everything else stays full. Ceiling division (odd-safe).
-  const int res_index = std::clamp((int)std::lround(shader_injection.gtvbao_resolution), 0, 2);
+  const int res_index = std::clamp((int)std::lround(shader_injection.gtvbao_resolution), 0, 1);
   const uint32_t div = 1u << res_index;
   const uint32_t aw = (w + div - 1u) / div;
   const uint32_t ah = (h + div - 1u) / div;
@@ -12298,7 +12298,7 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   c[33] = (float)pass.filter_taps;
   c[34] = std::clamp((float)pass.filter_step, 1.f, 8.f);                           // �-trous stride (1/2/4)
   // �� Low-resolution spatial pipeline (appended; Full path ignores these) ��
-  c[35] = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 2.f);
+  c[35] = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 1.f);
   c[36] = g_gtvbao_hemisphere_weighting;       // hemisphere weighting 0=Cosine, 1=Uniform
   c[37] = (float)pass.filter_direction;
   c[38] = g_gtvbao_history_weight;
@@ -12924,32 +12924,32 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                   .enabled = &g_gtvbao_temporal_enabled,
                                   .enabled_default = 1.f,
                                   .history_weight = &g_gtvbao_history_weight,
-                                  .history_weight_default = 0.9f,
+                                  .history_weight_default = 0.99f,
                                   .depth_rejection = &g_gtvbao_depth_rejection,
                                   .depth_rejection_default = 0.2f,
                                   .normal_rejection = &g_gtvbao_normal_rejection,
                                   .normal_rejection_default = 0.f,
                                   .history_clamp = &g_gtvbao_history_clamp,
-                                  .history_clamp_default = 0.1f});
+                                  .history_clamp_default = 0.3f});
     falcom_world::AddSpatialRows(&settings, IsAdvancedSettingsMode, {.prefix = "Gtvbao",
                                  .section = "GTVBAO Spatial Filter",
                                  .enabled_tooltip = "Denoises the final GTVBAO output with edge-aware weights (depth plane and normal). The temporal history keeps the unfiltered AO. Off = no filter.",
                                  .enabled = &shader_injection.gtvbao_atrous_enabled,
                                  .enabled_default = 1.f,
                                  .filter_type = &g_gtvbao_filter_type,
-                                 .filter_type_default = 1.f,
+                                 .filter_type_default = 0.f,
                                  .filter_radius = &g_gtvbao_filter_radius,
                                  .filter_radius_default = 8.f,
                                  .filter_passes = &shader_injection.gtvbao_atrous_passes,
-                                 .filter_passes_default = 1.f,
+                                 .filter_passes_default = 2.f,
                                  .taps_separable = &g_gtvbao_filter_taps_separable,
-                                 .taps_separable_default = 5.f,
+                                 .taps_separable_default = 8.f,
                                  .taps_atrous = &g_gtvbao_filter_taps_atrous,
-                                 .taps_atrous_default = 5.f,
+                                 .taps_atrous_default = 8.f,
                                  .enabled_key = "GTVBAOAtrousEnabled",
                                  .passes_key = "GTVBAOAtrousPasses",
                                  .filter_passes_lowres = &g_gtvbao_filter_passes_lowres,
-                                 .filter_passes_lowres_default = 1.f,
+                                 .filter_passes_lowres_default = 4.f,
                                  .passes_lowres_key = "GTVBAOAtrousPassesLowRes"});
     falcom_world::AddSettings(&settings, IsSora2nd(), IsAdvancedSettingsMode);
   }

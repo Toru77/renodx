@@ -84,7 +84,7 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_filter_taps;              // c[33] - taps per axis (separable) or square kernel side (a-trous)
   float GTVBAO_filter_step;              // c[34] - a-trous stride for this dispatch (1, 2, 4)
   // - Low-resolution spatial pipeline (appended; Full path ignores these) -
-  float GTVBAO_resolution;               // c[35] - 0=Full, 1=Half, 2=Quarter
+  float GTVBAO_resolution;               // c[35] - 0=Full, 1=Half
   float GTVBAO_hemisphere_weighting;     // c[36] - 0=Cosine, 1=Uniform
   // - Spatial filter direction and temporal accumulation (appended) -
   float GTVBAO_filter_direction;         // c[37] - separable pass: 0=Horizontal, 1=Vertical, 2=Both (a-trous)
@@ -96,10 +96,10 @@ cbuffer cb_gtvbao : register(b13)
 };
 
 // ── Low-res → full-res block-center mapping (odd-dimension safe) ──
-// AO texel tq covers the full block {d*tq .. d*tq + d-1} (d = 1 Full, 2 Half, 4 Quarter); its representative
+// AO texel tq covers the full block {d*tq .. d*tq + d-1} (d = 1 Full, 2 Half); its representative
 // pixel is the block centre, clamped for odd full dims (e.g. full=5, d=2, ao=3: tq=2 -> min(5,4)=4).
 float GTVBAO_Divisor() {
-  return exp2(round(clamp(GTVBAO_resolution, 0.f, 2.f)));
+  return exp2(round(clamp(GTVBAO_resolution, 0.f, 1.f)));
 }
 
 // Debug view modes (GTVBAO_debug_mode). 27 is reserved.
