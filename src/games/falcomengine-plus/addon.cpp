@@ -725,10 +725,21 @@ static reshade::api::format RCASLinearFormat(reshade::api::format fmt) {
 constexpr uint32_t kDynCubeDefaultSize = 128u;
 static uint32_t DynCubeResolveSize(float v);
 
-// -- VBGI globals removed � now controlled via ShaderInjectData fields (shared.h). --
-// vbgi_enabled, vbgi_intensity, vbgi_saturation, vbgi_multibounce, vbgi_gi_power
-// are all part of shader_injection and pushed via BuildGTVBAOPushConstants.
-static float g_vbgi_light_exposure = 0.05f;  // HDR light buffer exposure scale (lower = dimmer GI)
+// -- VBGI settings and state (inert until the VBGI pass lands) --
+static float g_vbgi_enabled = 0.f;
+static float g_vbgi_quality_level = 1.f;
+static float g_vbgi_resolution = 1.f;
+static float g_vbgi_noise_type = 2.f;
+static float g_vbgi_radius = 1.5f;
+static float g_vbgi_bitmask_thickness = 0.30f;
+static float g_vbgi_depth_mip_offset = 3.5f;
+static float g_vbgi_mrt_normal = 1.f;
+static float g_vbgi_ambient = 0.5f;
+static float g_vbgi_lights = 1.f;
+static float g_vbgi_sun = 1.f;
+static float g_vbgi_emissive = 1.f;
+static float g_vbgi_multibounce_strength = 0.5f;
+static float g_vbgi_debug_mode = 0.f;
 
 // -- IS-FAST noise --
 static float g_isfast_enabled       = 0.f;
@@ -865,6 +876,7 @@ static bool IsDaybreak2() {
 static bool IsKyoto() {
   return !IsKai() && !IsSora1st() && !IsSora2nd() && !IsDaybreak2();
 }
+static bool VbgiRowVisible() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2() && !IsKai(); }
 
 // -- Lighting shader identification (Sora + Kai) --
 static bool IsLightingShader(uint32_t hash) {
@@ -877,8 +889,6 @@ static bool IsLightingShader(uint32_t hash) {
 
 // -- CPU optimization toggles --
 static float g_gtvbao_cs_dispatch_fix    = 0.f;  // 0=Off, 1=Restore, 2=Null, 3=Null+Restore
-static float g_vbgi_frame_skip           = 0.f;
-static float g_multibounce_frame_skip    = 0.f;
 static float g_cpuopt_deferred_dispatch   = 1.f;  // dispatch GTVBAO/VBGI in OnPresent, not inline (default ON for Kai)
 static float g_cpuopt_ensure_pipelines    = 0.f;  // kai-style: don't destroy/recreate pipelines every frame
 
@@ -892,6 +902,17 @@ static float g_gtvbao_filter_radius = 8.f;
 static float g_gtvbao_filter_taps_separable = 5.f;
 static float g_gtvbao_filter_taps_atrous = 5.f;
 static float g_gtvbao_filter_passes_lowres = 1.f;
+static float g_vbgi_temporal_enabled = 1.f;
+static float g_vbgi_history_weight = 0.9f;
+static float g_vbgi_depth_rejection = 0.05f;
+static float g_vbgi_normal_rejection = 0.9f;
+static float g_vbgi_history_clamp = 1.f;
+static float g_vbgi_spatial_enabled = 1.f;
+static float g_vbgi_filter_type = 1.f;
+static float g_vbgi_filter_radius = 2.f;
+static float g_vbgi_filter_passes = 1.f;
+static float g_vbgi_filter_taps_separable = 5.f;
+static float g_vbgi_filter_taps_atrous = 5.f;
 static float g_gtvbao_debug_ui = 0.f;  // GTVBAODebugMode index into kGtvbaoDebugModes
 constexpr int kGtvbaoDebugModes[7] = {0, 1, 22, 23, 24, 25, 26};
 static int GtvbaoDebugMode() { return kGtvbaoDebugModes[std::clamp((int)g_gtvbao_debug_ui, 0, 6)]; }
@@ -3644,36 +3665,124 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "Fix 1: Restore State", "Fix 2: Null Compute", "Fix 3: Null + Restore"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // �� SSGI (Screen Space Global Illumination � integrated into GTVBAO) ��
+    // -- VBGI --
     new renodx::utils::settings::Setting{
-      .key = "SSGIEnable", .binding = &shader_injection.vbgi_enabled,
+      .key = "SSGIEnable", .binding = &g_vbgi_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "VBGI Enable", .section = "VBGI",
-      .tooltip = "Visibility bitmask indirect diffuse GI. Requires GTVBAO mode = On. Temporarily inactive: VBGI is being reworked.",
+      .default_value = 0.f, .label = "VBGI Enable", .section = "VBGI",
+      .tooltip = "Visibility bitmask indirect diffuse GI. Not active yet: this build does not output VBGI.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return false; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIQuality", .binding = &g_vbgi_quality_level,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Quality Level", .section = "VBGI",
+      .tooltip = "Slices x steps per side. Low 2x4, Medium 3x4, High 3x6, Ultra 4x10.",
+      .labels = {"Low", "Medium", "High", "Ultra"},
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIResolution", .binding = &g_vbgi_resolution,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "VBGI Resolution", .section = "VBGI",
+      .tooltip = "Full = native. Half = half size per axis (a quarter of the pixels).",
+      .labels = {"Full", "Half"},
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGINoiseType", .binding = &g_vbgi_noise_type,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 2.f, .label = "Noise Type", .section = "VBGI",
+      .tooltip = "IS-FAST = pre-computed blue noise (baked into the addon). IGN = Interleaved Gradient Noise. Hilbert = Hilbert curve noise. Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
+      .labels = {"IS-FAST", "IGN", "Hilbert"},
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_isfast_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIIntensity", .binding = &shader_injection.vbgi_intensity,
-      .default_value = 0.75f, .label = "Intensity", .section = "VBGI",
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.0f, .label = "Intensity", .section = "VBGI",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGISaturation", .binding = &shader_injection.vbgi_saturation,
-      .default_value = 1.0f, .label = "Saturation", .section = "VBGI",
-      .tooltip = "0 = grayscale GI, 1 = full color GI.",
-      .min = 0.0f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharGTVBGIMaskStr", .binding = &shader_injection.char_gtvbgi_mask_strength,
       .default_value = 0.f, .label = "Character Mask Strength", .section = "VBGI",
       .min = 0.f, .max = 100.f,
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .parse = [](float v) { return v * 0.01f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIRadius", .binding = &g_vbgi_radius,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.5f, .label = "Radius", .section = "VBGI",
+      .tooltip = "World-space radius of the visibility search.",
+      .min = 0.1f, .max = 10.0f, .format = "%.2f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIThickness", .binding = &g_vbgi_bitmask_thickness,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.30f, .label = "Bitmask Thickness", .section = "VBGI",
+      .tooltip = "World-space thickness for visibility bitmask. Higher = more light passes behind surfaces.",
+      .min = 0.01f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIDepthMipOffset", .binding = &g_vbgi_depth_mip_offset,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 3.5f, .label = "Depth MIP Offset", .section = "VBGI",
+      .min = 2.0f, .max = 6.0f, .format = "%.2f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIMrtNormal", .binding = &g_vbgi_mrt_normal,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "MRT Normal Input", .section = "VBGI",
+      .tooltip = "Off = depth normals only. On = use game g-buffer normals.",
+      .labels = {"Off (Depth)", "On (MRT)"},
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIAmbient", .binding = &g_vbgi_ambient,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.5f, .label = "Ambient Contribution", .section = "VBGI",
+      .min = 0.0f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGILights", .binding = &g_vbgi_lights,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.0f, .label = "Light Contribution", .section = "VBGI",
+      .min = 0.0f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGISun", .binding = &g_vbgi_sun,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.0f, .label = "Sun Contribution", .section = "VBGI",
+      .min = 0.0f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIEmissive", .binding = &g_vbgi_emissive,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.0f, .label = "Emissive Contribution", .section = "VBGI",
+      .min = 0.0f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIMultiBounce", .binding = &shader_injection.vbgi_multibounce,
@@ -3681,167 +3790,25 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Multi-Bounce", .section = "VBGI",
       .tooltip = "Enables multi-bounce GI: previous frame's indirect light feeds back into the GI computation.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIMultiBounceStrength", .binding = &shader_injection.vbgi_multibounce_strength,
+      .key = "VBGIMultiBounceStrength", .binding = &g_vbgi_multibounce_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Multi-Bounce Strength", .section = "VBGI",
-      .tooltip = "Extra gain on top of the bounce fraction. 1.0 = use the fraction as-is. The feedback is already normalised per pixel, so this is only a trim; the pair is capped at 1.0.",
-      .min = 0.0f, .max = 10.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIMultiBounceBounceFraction", .binding = &shader_injection.vbgi_multibounce_bounce_fraction,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.15f, .label = "Multi-Bounce Bounce Fraction", .section = "VBGI",
-      .tooltip = "Fraction of local direct light re-emitted per bounce (diffuse albedo). The feedback is normalised per pixel, so this is the fraction actually added everywhere instead of only in bright, unoccluded pockets. 0.15 = subtle, 0.3 = strong, 0.5 = very strong.",
-      .min = 0.0f, .max = 0.5f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIMultiBounceSaturation", .binding = &shader_injection.vbgi_multibounce_saturation,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Multi-Bounce Saturation", .section = "VBGI",
-      .tooltip = "Color saturation of the multi-bounce feedback. 0 = grayscale, 1 = full color.",
-      .min = 0.0f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIMultiBounceMaxClamp", .binding = &shader_injection.vbgi_multibounce_max_clamp,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Multi-Bounce Max Clamp", .section = "VBGI",
-      .tooltip = "Clamp multi-bounce feedback per-channel to prevent over-brightening. 0 = off.",
-      .min = 0.0f, .max = 20.0f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIAdaptiveR", .binding = &shader_injection.vbgi_adaptive_r,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Red Adaptive Strength", .section = "VBGI",
-      .tooltip = "Per-channel adaptive boost: amplifies a color channel more when it's dominant. 0=off, 1=max.",
+      .default_value = 0.5f, .label = "Multi-Bounce Strength", .section = "VBGI",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIAdaptiveG", .binding = &shader_injection.vbgi_adaptive_g,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Green Adaptive Strength", .section = "VBGI",
-      .tooltip = "Per-channel adaptive boost: amplifies a color channel more when it's dominant. 0=off, 1=max.",
-      .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIAdaptiveB", .binding = &shader_injection.vbgi_adaptive_b,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Blue Adaptive Strength", .section = "VBGI",
-      .tooltip = "Per-channel adaptive boost: amplifies a color channel more when it's dominant. 0=off, 1=max.",
-      .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIAdaptiveMode", .binding = &shader_injection.vbgi_adaptive_mode,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Adaptive Mode", .section = "VBGI",
-      .tooltip = "GI Color = boost channels based on GI's own color. Albedo = boost based on surface color at pixel.",
-      .labels = {"GI Color", "Surface Albedo"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIAdaptiveLumaStrength", .binding = &shader_injection.vbgi_adaptive_luma_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.0f, .label = "Adaptive Luma Strength", .section = "VBGI",
-      .tooltip = "Target brightness for GI normalization. 0=off. Higher = brighter target. Evens out indoor/outdoor GI.",
-      .min = 0.0f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIAdaptiveLumaBlend", .binding = &shader_injection.vbgi_adaptive_luma_blend,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.0f, .label = "Adaptive Luma Blend", .section = "VBGI",
-      .tooltip = "Blend between original GI (0) and luma-normalized GI (1).",
-      .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIMaxClamp", .binding = &shader_injection.vbgi_max_clamp,
-      .default_value = 0.0f, .label = "GI Max Clamp", .section = "VBGI",
-      .tooltip = "Clamp GI per-channel to this maximum. 0 = off.",
-      .min = 0.0f, .max = 20.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIReduceAO", .binding = &shader_injection.vbgi_reduce_ao,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Reduce AO with GI", .section = "VBGI",
-      .tooltip = "Reduce GTVBAO occlusion where indirect light is strong. Keeps dark crevices dark while brightening lit surfaces.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIReduceAOStrength", .binding = &shader_injection.vbgi_reduce_ao_strength,
-      .default_value = 2.f, .label = "Reduce AO Strength", .section = "VBGI",
-      .tooltip = "How strongly indirect light reduces AO. 0=no change, 1=full reduction.",
-      .min = 0.0f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_reduce_ao > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGILightExposure", .binding = &g_vbgi_light_exposure,
-      .default_value = 1.0f, .label = "Light Exposure", .section = "VBGI",
-      .tooltip = "Exposure scale for HDR light buffer. Start at 0.05. Lower = dimmer GI.",
-      .min = 0.001f, .max = 5.0f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIFrameSkip", .binding = &g_vbgi_frame_skip,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "SSGI Frame Skip", .section = "VBGI",
-      .tooltip = "Skip GI computation every N frames. AO still runs every frame.",
-      .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "MultiBounceFrameSkip", .binding = &g_multibounce_frame_skip,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Multi-Bounce Frame Skip", .section = "VBGI",
-      .tooltip = "Skip multi-bounce accumulation every N frames.",
-      .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
     },
     // �� VBGI debug ��
     new renodx::utils::settings::Setting{
-      .key = "SSGIDebugView", .binding = &shader_injection.vbgi_debug_view,
+      .key = "VBGIDebugMode", .binding = &g_vbgi_debug_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "VBGI debug View", .section = "VBGI",
+      .default_value = 0.f, .label = "VBGI Debug View", .section = "VBGI",
       .tooltip = "Replace scene with VBGI debug textures.",
-      .labels = {"Off", "Raw GI", "Denoised GI", "Light Buffer", "Accumulated", "5:Sample Activity", "Light Color", "Final GI"},
-      .is_enabled = []() { return false; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIDebugLogging", .binding = &shader_injection.vbgi_debug_logging,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "VBGI debug Logging", .section = "VBGI",
-      .tooltip = "Log VBGI dispatch, push, and texture binding to console.",
-      .labels = {"Off", "On"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+      .labels = {"Off", "Final GI", "Raw GI", "Radiance Input", "Bitmask", "Temporal Confidence", "Term Split"},
+      .is_visible = []() { return VbgiRowVisible(); },
     },
     // -- Kai: GTVBAO VBGI Falcom SSGI consumption --
     new renodx::utils::settings::Setting{
@@ -3850,7 +3817,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Consume Falcom SSGI (Kai)", .section = "VBGI",
       .tooltip = "When ON, Falcom's SSGI color modulates GTVBAO VBGI before blending. Creates a multiplicative interaction between the two GI sources.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.vbgi_enabled > 0.5f; },
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3858,7 +3825,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.5f, .label = "Falcom SSGI Blend (Kai)", .section = "VBGI",
       .tooltip = "How much Falcom SSGI color modulates GTVBAO VBGI. 0 = no modulation (additive only), 1 = full multiplicative blend.",
       .min = 0.f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_kai_consume_falcom > 0.5f; },
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && shader_injection.vbgi_kai_consume_falcom > 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3867,48 +3834,8 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "GTVBAO VBGI Only (Kai)", .section = "VBGI",
       .tooltip = "When ON, Falcom SSGI is suppressed from output and only GTVBAO VBGI is visible. GTVBAO can still consume Falcom SSGI internally for modulation.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.vbgi_enabled > 0.5f; },
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
-    },
-    // �� SSGI Affect Lights ��
-    new renodx::utils::settings::Setting{
-      .key = "SSGIAffectLights", .binding = &shader_injection.vbgi_affect_lights,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Affect Lights", .section = "VBGI",
-      .tooltip = "Additively blend the sun's lightColor into the GI contribution, tinting indirect light.",
-      .labels = {"Off", "On"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGILightsStrength", .binding = &shader_injection.vbgi_lights_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Lights Strength", .section = "VBGI",
-      .tooltip = "How much lightColor to add. 0=no effect, 1=full sun color, >1=boosted.",
-      .min = 0.f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.vbgi_affect_lights > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGILightsSaturation", .binding = &shader_injection.vbgi_lights_saturation,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Lights Saturation", .section = "VBGI",
-      .tooltip = "Vibrance applied to lightColor before adding. 0=grayscale, 1=neutral, >1=vivid.",
-      .min = 0.f, .max = 100.0f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.vbgi_affect_lights > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGICascadeDebug", .binding = &shader_injection.vbgi_cascade_debug,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "CascadeCount Debug", .section = "VBGI",
-      .tooltip = "Color overlay by shadowmapCascadeCount_g: 0=red, 1=yellow, 2=green, 3=cyan, 4=blue.",
-      .labels = {"Off", "On"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .value_type = renodx::utils::settings::SettingValueType::TEXT,
-      .label = "Requires GTVBAO on.",
-      .section = "VBGI",
     },
     new renodx::utils::settings::Setting{
       .key = "CPUOptDeferredDispatch", .binding = &g_cpuopt_deferred_dispatch,
@@ -12908,6 +12835,34 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                  .filter_passes_lowres = &g_gtvbao_filter_passes_lowres,
                                  .filter_passes_lowres_default = 4.f,
                                  .passes_lowres_key = "GTVBAOAtrousPassesLowRes"});
+    falcom_world::AddTemporalRows(&settings, []() { return VbgiRowVisible(); }, {.prefix = "Vbgi",
+                                  .section = "VBGI Temporal Accumulation",
+                                  .enabled_tooltip = "Reprojects the previous frame VBGI with the game motion and blends it in after validation. Inert until VBGI output is enabled.",
+                                  .enabled = &g_vbgi_temporal_enabled,
+                                  .enabled_default = 1.f,
+                                  .history_weight = &g_vbgi_history_weight,
+                                  .history_weight_default = 0.9f,
+                                  .depth_rejection = &g_vbgi_depth_rejection,
+                                  .depth_rejection_default = 0.05f,
+                                  .normal_rejection = &g_vbgi_normal_rejection,
+                                  .normal_rejection_default = 0.9f,
+                                  .history_clamp = &g_vbgi_history_clamp,
+                                  .history_clamp_default = 1.f});
+    falcom_world::AddSpatialRows(&settings, []() { return VbgiRowVisible(); }, {.prefix = "Vbgi",
+                                 .section = "VBGI Spatial Filter",
+                                 .enabled_tooltip = "Denoises the final VBGI output with edge-aware weights (depth plane and normal). Off = no filter.",
+                                 .enabled = &g_vbgi_spatial_enabled,
+                                 .enabled_default = 1.f,
+                                 .filter_type = &g_vbgi_filter_type,
+                                 .filter_type_default = 1.f,
+                                 .filter_radius = &g_vbgi_filter_radius,
+                                 .filter_radius_default = 2.f,
+                                 .filter_passes = &g_vbgi_filter_passes,
+                                 .filter_passes_default = 1.f,
+                                 .taps_separable = &g_vbgi_filter_taps_separable,
+                                 .taps_separable_default = 5.f,
+                                 .taps_atrous = &g_vbgi_filter_taps_atrous,
+                                 .taps_atrous_default = 5.f});
     falcom_world::AddSettings(&settings, IsSora2nd(), IsAdvancedSettingsMode);
   }
   falcom_world::Use(fdw_reason, IsSora2nd());

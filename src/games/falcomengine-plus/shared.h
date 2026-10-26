@@ -121,35 +121,35 @@ struct ShaderInjectData {
   float gtvbao_vbgi_debug;          // 0=Off (add GI), 1=On (replace scene with GI)
 
   // —— VBGI (Visibility-Based Global Illumination) ——
-  float vbgi_enabled;               // 0=Off, 1=On (requires gtvbao_mode >= 1)
+  float vbgi_enabled;               // RETIRED: no UI and nothing assigns it. No shader reads it. Only the dead light-buffer capture gate in addon.cpp (removed in M7.5) still tests it.
   float vbgi_intensity;             // [0..5], default 1.0
-  float vbgi_saturation;            // [0..2], default 1.0
+  float vbgi_saturation;            // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGISaturation), kept for the layout
   float vbgi_char_mask_strength;    // RETIRED: no setting drives it (was SSGICharMaskStrength), kept for the layout
   float vbgi_multibounce;           // 0=Off, 1=On
-  float vbgi_multibounce_strength;  // [0..10], default 1.0 — extra gain on the normalized bounce
+  float vbgi_multibounce_strength;  // RETIRED: no setting drives it (was SSGIMultiBounceStrength), kept for the layout
   // Fraction of the local direct light re-emitted per bounce (a diffuse
   // albedo). The accumulate pass normalises the feedback against the pixel's
   // own light, so this is the fraction actually added regardless of how much
   // the gather attenuated the GI, instead of a blind multiplier over an
   // unknown and highly geometry-dependent gain.
-  float vbgi_multibounce_bounce_fraction; // [0..0.5], default 0.15
-  float vbgi_multibounce_saturation;// [0..2], default 1.0 — color saturation of feedback
-  float vbgi_multibounce_max_clamp; // [0..20], default 0 — max multi-bounce per-channel (0=off)
-  float vbgi_adaptive_r;            // [0..1], default 0 — per-channel red adaptive boost
-  float vbgi_adaptive_g;            // [0..1], default 0 — per-channel green adaptive boost
-  float vbgi_adaptive_b;            // [0..1], default 0 — per-channel blue adaptive boost
-  float vbgi_adaptive_mode;         // 0=GI color, 1=surface albedo
-  float vbgi_adaptive_luma_strength;// [0..5], default 0 — target luma for normalization (0=off)
-  float vbgi_adaptive_luma_blend;   // [0..1], default 0.5 — blend between original and normalized
-  float vbgi_max_clamp;             // [0..20], default 0 — max GI per-channel (0=off)
-  float vbgi_reduce_ao;             // 0=Off, 1=On — reduce AO where indirect light exists
-  float vbgi_reduce_ao_strength;    // [0..5], default 1.0 — strength of AO reduction by indirect light
-  float vbgi_debug_logging;         // 0=Off, 1=On — VBGI debug logging
-  float vbgi_debug_view;            // 0=Off, 1=RawGI, 2=Denoised, 3=LightBuf, 4=Accum, 5=Samples, 6=LightColor
-  float vbgi_affect_lights;         // 0=Off, 1=On — additively blend lightColor into GI
-  float vbgi_lights_strength;       // [0..5], default 1.0 — multiplier for lightColor contribution
-  float vbgi_lights_saturation;     // [0..100], default 1.0 — vibrance for lightColor: 0=gray, 1=neutral
-  float vbgi_cascade_debug;         // 0=Off, 1=On — show shadowmapCascadeCount_g as color overlay
+  float vbgi_multibounce_bounce_fraction; // RETIRED: no setting drives it (was SSGIMultiBounceBounceFraction), kept for the layout
+  float vbgi_multibounce_saturation;// RETIRED: no setting drives it (was SSGIMultiBounceSaturation), kept for the layout
+  float vbgi_multibounce_max_clamp; // RETIRED: no setting drives it (was SSGIMultiBounceMaxClamp), kept for the layout
+  float vbgi_adaptive_r;            // RETIRED: no setting drives it (was SSGIAdaptiveR), kept for the layout
+  float vbgi_adaptive_g;            // RETIRED: no setting drives it (was SSGIAdaptiveG), kept for the layout
+  float vbgi_adaptive_b;            // RETIRED: no setting drives it (was SSGIAdaptiveB), kept for the layout
+  float vbgi_adaptive_mode;         // RETIRED: no setting drives it (was SSGIAdaptiveMode), kept for the layout
+  float vbgi_adaptive_luma_strength;// RETIRED: no setting drives it (was SSGIAdaptiveLumaStrength), kept for the layout
+  float vbgi_adaptive_luma_blend;   // RETIRED: no setting drives it (was SSGIAdaptiveLumaBlend), kept for the layout
+  float vbgi_max_clamp;             // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGIMaxClamp), kept for the layout
+  float vbgi_reduce_ao;             // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGIReduceAO), kept for the layout
+  float vbgi_reduce_ao_strength;    // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGIReduceAOStrength), kept for the layout
+  float vbgi_debug_logging;         // RETIRED: no setting drives it (was SSGIDebugLogging), kept for the layout
+  float vbgi_debug_view;            // RETIRED: no UI. The lighting hook zeroes it every frame; legacy PS debug blocks still read it. The new VBGI debug views use gtvbao_debug_view modes 30-35 (wired in M7.3).
+  float vbgi_affect_lights;         // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGIAffectLights), kept for the layout
+  float vbgi_lights_strength;       // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGILightsStrength), kept for the layout
+  float vbgi_lights_saturation;     // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGILightsSaturation), kept for the layout
+  float vbgi_cascade_debug;         // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGICascadeDebug), kept for the layout
   float shadow_filter_method;       // 0=Off (single sample), 1=Falcom (10-tap PCF), 2=CHSS
   float shadow_edge_tint;           // 0=Off, 1=Falcom (vanilla red tint), 2=Improved (vibrancy)
   // —— CHSS (Contact-Hardening Soft Shadows) + shared jitter ——
@@ -573,7 +573,7 @@ struct ShaderInjectData {
    // MRT/horizon diagnostic views into the debug UAV, which the host pushes to
    // t23 for the lighting shader to display. That display is gated on this flag
    // rather than on vbgi_debug_view, because that field is a persistent user
-   // setting (SSGIDebugView) and reusing it would clobber the user's choice --
+   // setting (the removed SSGIDebugView, read only by legacy PS blocks until M7.5/M7.7) and reusing it would clobber the user's choice --
    // which is why the earlier 22-25 views pushed the texture but rendered the
    // fallback instead. Set only while the push is active; reset every frame.
   float gtvbao_mrt_normal_debug;
