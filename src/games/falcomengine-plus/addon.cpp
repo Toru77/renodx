@@ -3553,7 +3553,7 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAODebugMode", .binding = &g_gtvbao_debug_ui,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Debug View", .section = "GTVBAO",
-      .tooltip = "Off: normal output.\nAO Only: the final AO on the lighting pass.\nRaw AO: this frame's AO before temporal and filter.\nTemporal Confidence: valid history fraction (blue when temporal does not run).\nSlice AO: mean unoccluded slice fraction (flat surface ~1.0).\nBitmask: first slice's horizon mask (R popcount, G first set bit, B last set bit).\nAO Normal: the view-space normal the AO uses.\nKyoto and Daybreak 2 do not support the compute views (Raw AO, Temporal Confidence, Slice AO, Bitmask, AO Normal).",
+      .tooltip = "Off: normal output.\nAO Only: the final AO on the lighting pass.\nRaw AO: this frame's AO before temporal and filter.\nTemporal Confidence: valid history fraction (blue when temporal does not run). Purple = sky, orange = no MRT normal (depth normal used), cyan = foliage, black = history rejected, gray = history weight.\nSlice AO: mean unoccluded slice fraction (flat surface ~1.0).\nBitmask: first slice's horizon mask (R popcount, G first set bit, B last set bit).\nAO Normal: the view-space normal the AO uses.\nKyoto and Daybreak 2 do not support the compute views (Raw AO, Temporal Confidence, Slice AO, Bitmask, AO Normal).",
       .labels = {"Off", "AO Only", "Raw AO", "Temporal Confidence", "Slice AO", "Bitmask", "AO Normal"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -12393,8 +12393,8 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   EnsureGTVBAODescriptorTables(dev, d->filter_layout, &d->filter_tables);
   // Temporal (optional): 5 SRVs + 3 UAVs + 2 samplers. A failure turns temporal off for the frame, not AO.
   if (make_layout(5u, 3u, &d->temporal_layout, 2u)) EnsureGTVBAODescriptorTables(dev, d->temporal_layout, &d->temporal_tables);
-  // Normal prep: 1 SRV (MRT normal) + 1 UAV (decoded normals)
-  if (!make_layout(1u, 1u, &d->normal_prep_layout)) return false;
+  // Normal prep: 2 SRVs (MRT normal, depth mip 0) + 1 UAV (decoded normals)
+  if (!make_layout(2u, 1u, &d->normal_prep_layout)) return false;
   EnsureGTVBAODescriptorTables(dev, d->normal_prep_layout, &d->normal_prep_tables);
   EnsureGTVBAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables);
   if (!d->prefilter_pipeline.handle) mkcs(__gtvbao_prefilter, "main", d->prefilter_layout, &d->prefilter_pipeline);
@@ -12634,12 +12634,13 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   // texture is consumed by the atrous taps and the half-mode upscale.
   auto run_normal_prep = [&]() {
     bind_pipe(d->normal_prep_pipeline);
-    reshade::api::resource_view np_srvs[1] = {
-        d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv};
+    reshade::api::resource_view np_srvs[2] = {
+        d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
+        d->depth_mips_srv};
     reshade::api::descriptor_table_update nu[4] = {
       {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
       {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,np_srvs},
+      {{},0,0,2,reshade::api::descriptor_type::texture_shader_resource_view,np_srvs},
       {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->normal_prep_uav},
     };
     apply_descriptors(d->normal_prep_layout, &d->normal_prep_tables, 4, nu);

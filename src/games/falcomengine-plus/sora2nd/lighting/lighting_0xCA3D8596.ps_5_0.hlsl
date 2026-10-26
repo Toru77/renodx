@@ -334,8 +334,8 @@ void main(
     int mode = shader_injection_data.rtao_debug_show > 0.5f ? 2 : (int)shader_injection_data.gtvbao_debug_view;
     float hdr_scale = 0.3;
     if (mode == 1) {
-      // AO Only: red tint for visibility
-      o0.rgb = float3(ao_sample.x * hdr_scale, 0.0, 0.0);
+      // AO Only: gray for visibility
+      o0.rgb = float3(ao_sample.x * hdr_scale, ao_sample.x * hdr_scale, ao_sample.x * hdr_scale);
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
     if (mode == 2) {

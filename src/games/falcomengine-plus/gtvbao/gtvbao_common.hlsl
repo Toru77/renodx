@@ -275,6 +275,28 @@ bool GTVBAO_RepresentativeSurface(Texture2D<float> depth, Texture2D<float4> norm
   return GTVBAO_SurfaceAt(depth, normals, GTVBAO_RepresentativePixel(tq, int2(fullSize)), fullSize, consts, P, N);
 }
 
+// Depth-derived view-space normal at full-res pixel px: block-centre cross of the depth texture (clamped).
+float3 GTVBAO_DepthNormalAt(Texture2D<lpfloat> depth, int2 px, uint2 full_size, GTAOConstants consts)
+{
+  const int2 fullDims = int2(max(full_size, 1u));
+  const int2 fmax = max(fullDims - 1, int2(0, 0));
+  const float2 fullPx = 1.0 / max(float2(fullDims), float2(1, 1));
+  const float2 uC = (float2(px) + 0.5) * fullPx;
+  const float z = depth.Load(int3(px, 0));
+  const float l = depth.Load(int3(clamp(px + int2(-1, 0), int2(0, 0), fmax), 0));
+  const float r = depth.Load(int3(clamp(px + int2( 1, 0), int2(0, 0), fmax), 0));
+  const float t = depth.Load(int3(clamp(px + int2( 0,-1), int2(0, 0), fmax), 0));
+  const float b = depth.Load(int3(clamp(px + int2( 0, 1), int2(0, 0), fmax), 0));
+  float3 C = GTVBAO_ComputeViewspacePosition(uC, z, consts);
+  float3 L = GTVBAO_ComputeViewspacePosition(uC + float2(-1, 0) * fullPx, l, consts);
+  float3 R = GTVBAO_ComputeViewspacePosition(uC + float2( 1, 0) * fullPx, r, consts);
+  float3 T = GTVBAO_ComputeViewspacePosition(uC + float2( 0,-1) * fullPx, t, consts);
+  float3 B = GTVBAO_ComputeViewspacePosition(uC + float2( 0, 1) * fullPx, b, consts);
+  return (float3)GTVBAO_CalculateNormal(
+      GTVBAO_CalculateEdges((lpfloat)z, (lpfloat)l, (lpfloat)r, (lpfloat)t, (lpfloat)b),
+      C, L, R, T, B);
+}
+
 // ── Build GTAOConstants from scene CB + push constants ──
 GTAOConstants BuildGTAOConstants(uint2 viewport_size)
 {

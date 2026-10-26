@@ -130,28 +130,13 @@ float3 BuildDepthFallbackNormal(uint2 pix, GTAOConstants consts)
     return DepthNormal(pix, u, ul.y, ul.x, br.z, ul.z, br.x,
         GTVBAO_CalculateEdges(ul.y, ul.x, br.z, ul.z, br.x), consts);
   }
-  // Low-res modes: point-load the representative-pixel cross on the full-res depth.
+  // Low-res modes: block-centre cross on the full-res depth.
   uint fw, fh;
   g_srcWorkingDepth.GetDimensions(fw, fh);
   int2 fullDims = int2(max(fw, 1u), max(fh, 1u));
   int2 aoDims = max(consts.ViewportSize, int2(1, 1));
-  int2 fmax = max(fullDims - 1, int2(0, 0));
   int2 fc = GTVBAO_RepresentativePixel(clamp(int2(pix), int2(0, 0), aoDims - 1), fullDims);
-  float2 fullPx = 1.0 / max(float2(fullDims), float2(1, 1));
-  float2 uC = (float2(fc) + 0.5) * fullPx;
-  float z = g_srcWorkingDepth.Load(int3(fc, 0));
-  float l = g_srcWorkingDepth.Load(int3(clamp(fc + int2(-1, 0), int2(0, 0), fmax), 0));
-  float r = g_srcWorkingDepth.Load(int3(clamp(fc + int2( 1, 0), int2(0, 0), fmax), 0));
-  float t = g_srcWorkingDepth.Load(int3(clamp(fc + int2( 0,-1), int2(0, 0), fmax), 0));
-  float b = g_srcWorkingDepth.Load(int3(clamp(fc + int2( 0, 1), int2(0, 0), fmax), 0));
-  float3 C = GTVBAO_ComputeViewspacePosition(uC, z, consts);
-  float3 L = GTVBAO_ComputeViewspacePosition(uC + float2(-1, 0) * fullPx, l, consts);
-  float3 R = GTVBAO_ComputeViewspacePosition(uC + float2( 1, 0) * fullPx, r, consts);
-  float3 T = GTVBAO_ComputeViewspacePosition(uC + float2( 0,-1) * fullPx, t, consts);
-  float3 B = GTVBAO_ComputeViewspacePosition(uC + float2( 0, 1) * fullPx, b, consts);
-  return (float3)GTVBAO_CalculateNormal(
-      GTVBAO_CalculateEdges((lpfloat)z, (lpfloat)l, (lpfloat)r, (lpfloat)t, (lpfloat)b),
-      C, L, R, T, B);
+  return GTVBAO_DepthNormalAt(g_srcWorkingDepth, fc, uint2(fw, fh), consts);
 }
 
 float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants consts)

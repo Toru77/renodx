@@ -43,15 +43,16 @@ void main(uint3 id : SV_DispatchThreadID)
 
   const float depth = g_game_depth.Load(int3(px, 0)).x;
   const uint4 mrt = g_mrt_normal.Load(int3(px, 0));
-  if (!(depth > 0.0 && any(mrt.xy != 0u)))
+  const bool has_normal = any(mrt.xy != 0u);
+  if (!(depth > 0.0))
   {
     g_history_write[tp] = float4(0.0, 0.0, 0.0, 0.0);
     g_ao_out[tp] = (uint)(saturate(raw * output_scale) * 255.0 + 0.5);
-    if ((int)GTVBAO_debug_mode == GTVBAO_DEBUG_TEMPORAL) GTVBAO_WriteDebug(g_debug, tp, float4(0.0, 0.0, 0.0, 1.0));
+    if ((int)GTVBAO_debug_mode == GTVBAO_DEBUG_TEMPORAL) GTVBAO_WriteDebug(g_debug, tp, float4(0.25, 0.0, 0.25, 1.0));
     return;
   }
 
-  const float3 N = DecodeFalcomMrtNormalAsGame(mrt.xy);
+  const float3 N = has_normal ? DecodeFalcomMrtNormalAsGame(mrt.xy) : float3(0.0, 0.0, 0.0);
   const float2 uv = (float2(px) + 0.5) / float2(full_size);
   const float4 world_h = mul(float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0), viewProjInv_g);
   const float3 P = world_h.xyz / world_h.w;
@@ -81,7 +82,8 @@ void main(uint3 id : SV_DispatchThreadID)
     const float4 h = g_history_read.Load(int3(tap, 0));
     if (h.g <= 0.0) continue;
     if (!TemporalDepthAccept(h.g, dist_cur, GTVBAO_temporal_depth_rejection)) continue;
-    const float wn = TemporalNormalWeight(dot(OctDecode(h.ba), N), GTVBAO_temporal_normal_rejection);
+    const float wn = (!has_normal || h.b > 1.5) ? 1.0
+        : TemporalNormalWeight(dot(OctDecode(h.ba), N), GTVBAO_temporal_normal_rejection);
     weight_accepted += w * wn;
     history_sum += w * wn * h.r;
   }
@@ -113,11 +115,16 @@ void main(uint3 id : SV_DispatchThreadID)
   }
 
   const float ao = lerp(raw, history_ao, GTVBAO_temporal_history_weight * valid_fraction);
-  g_history_write[tp] = float4(ao, dist_cur, OctEncode(N));
+  g_history_write[tp] = float4(ao, dist_cur, has_normal ? OctEncode(N) : float2(2.0, 2.0));
   g_ao_out[tp] = (uint)(saturate(ao * output_scale) * 255.0 + 0.5);
 
   if ((int)GTVBAO_debug_mode == GTVBAO_DEBUG_TEMPORAL)
   {
-    GTVBAO_WriteDebug(g_debug, tp, float4(valid_fraction, valid_fraction, valid_fraction, 1.0));
+    const bool foliage = GTVBAO_exclude_foliage > 0.5f
+        && (((GTVBAO_foliage_channel_mode >= 0.5f) ? mrt.z : mrt.w) & 0x8000u) != 0u;
+    const float3 dbg = foliage ? float3(0.0, 0.6, 0.6)
+        : (!has_normal ? float3(valid_fraction, 0.5 * valid_fraction, 0.0)
+        : float3(valid_fraction, valid_fraction, valid_fraction));
+    GTVBAO_WriteDebug(g_debug, tp, float4(dbg, 1.0));
   }
 }
