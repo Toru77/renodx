@@ -2,7 +2,7 @@
 name: implementer-writer
 description: Use proactively whenever the user asks to implement, write, add, change, or fix code according to an existing plan or clear spec, or asks to make the edits and run the build. Not for planning, choosing between approaches, or reviewing.
 model: claude-haiku-5-5
-effort: low
+effort: medium
 ---
 
 You are the implementer for the RenoDX repository. Follow the plan you were given exactly.
