@@ -426,6 +426,17 @@ void main(
   if (GTVBAO_bound) {
     // GTVBAO policy: replace AO.X only. Preserve legacy AO.YZ for SSS/material compatibility.
     ao_sample.x = GTVBAO_sample.x;
+    // Character GTVBAO control (Sora parity, same as lighting_0x430ED091)
+    if (is_character_pixel) {
+      if (shader_injection_data.char_gtvbao_mode < 0.5f) {
+        ao_sample.x = ssao_sample.x;  // Off: use vanilla SSAO for characters
+      } else {
+        float charMask = saturate(shader_injection_data.char_gtvbao_mask_strength);
+        ao_sample.x = lerp(GTVBAO_sample.x, ssao_sample.x, charMask);
+        // Kai character shading reads AO .y (engine character AO), not .x: apply GTVBAO there too (Sora parity: mask 1 = none).
+        ao_sample.y *= lerp(GTVBAO_sample.x, 1.0, charMask);
+      }
+    }
     if (GTVBAO_bent_normals_enabled && is_environment_pixel) {
       ao_sample.x = ApplyGTVBAOBentVisibility(ao_sample.x, GTVBAO_sample.yz);
     }
@@ -618,10 +629,9 @@ void main(
     r24.xyz = gtvbaoVBGITexture.SampleLevel(samPoint_s, v1.xy, 0).rgb * r0.xyz * shader_injection_data.vbgi_intensity;
     r24.w = saturate(dot(r24.xyz, float3(0.333, 0.333, 0.333)));
   }
-  // Character pixels: the Character SSGI composite consumes the GI when it is on (mask applied there); otherwise a plain masked add.
-  const bool vbgi_char_comp = shader_injection_data.gtvbao_vbgi_bound >= 0.5 && shader_injection_data.char_gi_enabled >= 0.5;
+  // Character pixels: plain add scaled by GTVBGI Character Mask Strength; the Character SSGI composite keeps the Falcom SSGI.
   const float vbgi_char_mask = 1.0 - saturate(shader_injection_data.char_gtvbgi_mask_strength);
-  const float vbgi_plain_scale = is_character_pixel ? (vbgi_char_comp ? 0.0 : vbgi_char_mask) : 1.0;
+  const float vbgi_plain_scale = is_character_pixel ? vbgi_char_mask : 1.0;
   r3.x = (int)r0.w & 8;
   if (r3.x == 0) {
     r6.y = (uint)r1.y >> 8;
@@ -790,18 +800,13 @@ void main(
       uint er_dbg = (uint)(max(shader_injection_data.char_gi_debug_mode, 0.0) + 0.5);
 
       if (er_gi_on && er_is_char) {
-        float4 er_ssgi;
-        if (vbgi_char_comp) {
-          er_ssgi = float4(r24.xyz * vbgi_char_mask, 1.0);
-        } else {
-          er_ssgi = ssgiTexture.SampleLevel(samLinear_s, v1.zw, 0);
-          if (shader_injection_data.ssgi_mod_enabled >= 0.5) {
-            er_ssgi.xyz = pow(abs(er_ssgi.xyz * max(shader_injection_data.ssgi_color_boost, 0.0)),
+        float4 er_ssgi = ssgiTexture.SampleLevel(samLinear_s, v1.zw, 0);
+        if (shader_injection_data.ssgi_mod_enabled >= 0.5) {
+          er_ssgi.xyz = pow(abs(er_ssgi.xyz * max(shader_injection_data.ssgi_color_boost, 0.0)),
                              max(shader_injection_data.ssgi_pow, 0.01));
-            er_ssgi.w = saturate(er_ssgi.w * max(shader_injection_data.ssgi_alpha_boost, 0.0));
-          } else {
-            er_ssgi = float4(0, 0, 0, 0);
-          }
+          er_ssgi.w = saturate(er_ssgi.w * max(shader_injection_data.ssgi_alpha_boost, 0.0));
+        } else {
+          er_ssgi = float4(0, 0, 0, 0);
         }
 
         static const float3 ER_LUMA = float3(0.299, 0.587, 0.114);
@@ -1068,7 +1073,7 @@ void main(
   }
 
   // Save SSGI and character mask for in-shader character GI composite
-  float4 chargi_ssgi_saved = vbgi_char_comp ? float4(r24.xyz * vbgi_char_mask, 1.0) : r15;
+  float4 chargi_ssgi_saved = r15;
   // Use mrt0z_raw from mrtTexture0 (t1) which already has the character bit
   bool chargi_is_character = ((mrt0z_raw >> 8u) & 1u) != 0u;
   // Was max(r4.x, r4.y * sss_shadow_sample). r4.y is the AO's .y channel, already
