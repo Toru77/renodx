@@ -101,6 +101,26 @@ renodx::utils::settings::Settings settings = {
         },
     },
     new renodx::utils::settings::Setting{
+        .key = "DLSSCpuTiming",
+        .binding = &farcry6_dlss::dlss::dlss_cpu_timing,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "CPU Stutter Probe (test)",
+        .section = "Antialiasing",
+        .tooltip = "Sample addon callback elapsed times, including waits, for Copy Report. Disable after testing. Counts accumulate until restart.",
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLSSDetailedDiagnostics",
+        .binding = &farcry6_dlss::dlss::dlss_detailed_diagnostics,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Detailed Diagnostics",
+        .section = "Antialiasing",
+        .tooltip = "Collect extra camera and motion details in Copy Report. Leave off during normal play. Capture buttons turn it on when needed.",
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLSSCameraCoverage",
         .binding = nullptr,
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
@@ -110,6 +130,7 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Observe camera bindings for four present intervals. Then use Copy Report.",
         .on_click = [] {
           using namespace farcry6_dlss::dlss;
+          dlss_detailed_diagnostics = 1.f;
           std::unique_lock lock(camera_coverage.mutex);
           if (camera_coverage.state != CameraCoverage::State::active) {
             camera_coverage.state = CameraCoverage::State::requested;
@@ -149,6 +170,7 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Compare a scene camera buffer's CPU and GPU contents once. Then use Copy Report.",
         .on_click = [] {
           using namespace farcry6_dlss::dlss;
+          dlss_detailed_diagnostics = 1.f;
           std::unique_lock lock(scene_buffer_capture.mutex);
           if (scene_buffer_capture.state == SceneBufferCapture::State::idle
               || scene_buffer_capture.state == SceneBufferCapture::State::complete
@@ -168,6 +190,7 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Captures four synchronized center-pixel motion samples. Hold the camera still, then use Copy Report.",
         .on_click = [] {
           using namespace farcry6_dlss::dlss;
+          dlss_detailed_diagnostics = 1.f;
           std::unique_lock lock(motion_capture.mutex);
           if (motion_capture.state == MotionCapture::State::idle
               || motion_capture.state == MotionCapture::State::complete

@@ -166,6 +166,51 @@ inline float dlss_reset_every_frame = 0.f;
 // of correcting it, which is a visible failure rather than a subtle one.
 inline float dlss_jitter_flip = 0.f;
 inline float dlss_debug_logging = 0.f;
+inline float dlss_cpu_timing = 0.f;
+inline float dlss_detailed_diagnostics = 0.f;
+inline std::atomic<bool> cpu_timing_enabled{false};
+
+enum class CpuTimingCategory : uint32_t {
+  descriptor_update, resource_destroy, scene_probe, draw, dispatch, evaluate, present, count
+};
+struct CpuTimingStats {
+  std::atomic<uint64_t> samples{0u};
+  std::atomic<uint64_t> total_ticks{0u};
+  std::atomic<uint64_t> max_ticks{0u};
+  std::atomic<uint64_t> over_2ms{0u};
+  std::atomic<uint64_t> over_10ms{0u};
+};
+inline std::array<CpuTimingStats, static_cast<size_t>(CpuTimingCategory::count)> cpu_timing_stats;
+
+struct CpuTimingScope {
+  CpuTimingStats* stats = nullptr;
+  LARGE_INTEGER start = {};
+  CpuTimingScope(CpuTimingCategory category, uint32_t sample_mask) {
+    if (!cpu_timing_enabled.load(std::memory_order_relaxed)) return;
+    thread_local uint32_t sequences[static_cast<size_t>(CpuTimingCategory::count)] = {};
+    const auto index = static_cast<size_t>(category);
+    if ((++sequences[index] & sample_mask) != 0u) return;
+    if (!QueryPerformanceCounter(&start)) return;
+    stats = &cpu_timing_stats[index];
+  }
+  ~CpuTimingScope() {
+    if (stats == nullptr) return;
+    LARGE_INTEGER end = {};
+    if (!QueryPerformanceCounter(&end) || end.QuadPart < start.QuadPart) return;
+    const uint64_t ticks = static_cast<uint64_t>(end.QuadPart - start.QuadPart);
+    stats->samples.fetch_add(1u, std::memory_order_relaxed);
+    stats->total_ticks.fetch_add(ticks, std::memory_order_relaxed);
+    static const int64_t frequency = [] { LARGE_INTEGER value = {}; QueryPerformanceFrequency(&value); return value.QuadPart; }();
+    if (frequency > 0 && ticks >= static_cast<uint64_t>(frequency / 500)) {
+      stats->over_2ms.fetch_add(1u, std::memory_order_relaxed);
+      if (ticks >= static_cast<uint64_t>(frequency / 100)) {
+        stats->over_10ms.fetch_add(1u, std::memory_order_relaxed);
+      }
+    }
+    uint64_t maximum = stats->max_ticks.load(std::memory_order_relaxed);
+    while (maximum < ticks && !stats->max_ticks.compare_exchange_weak(maximum, ticks, std::memory_order_relaxed)) {}
+  }
+};
 // What DLSS is allowed to replace, for isolating a rendering fault:
 //   0 = Replace         skip the TAA draw and copy DLSS output into its target
 //   1 = Evaluate only   run the whole chain, keep the game's own TAA output
@@ -346,6 +391,7 @@ struct FingerprintCollision {
 
 inline std::mutex fingerprint_mutex;
 inline std::unordered_map<DescriptorFingerprint, RecordedDescriptor, DescriptorFingerprintHash> fingerprints;
+inline std::atomic<bool> camera_override_enabled{false};
 inline std::shared_mutex camera_cbv_source_mutex;
 inline std::unordered_map<uint64_t, reshade::api::buffer_range> camera_cbv_sources;
 static constexpr uint32_t kCameraSourceSlots = 4096u;
@@ -662,8 +708,9 @@ inline const uint8_t* MappedRingData(uint64_t handle) {
 
 
 inline void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource) {
+  CpuTimingScope timing(CpuTimingCategory::resource_destroy, 63u);
   if (device == nullptr || resource.handle == 0u) return;
-  {
+  if (camera_override_enabled.load(std::memory_order_acquire)) {
     std::unique_lock lock(camera_cbv_source_mutex);
     for (auto it = camera_cbv_sources.begin(); it != camera_cbv_sources.end();) {
       if (it->second.buffer.handle == resource.handle) {
@@ -1186,6 +1233,7 @@ inline bool OnUpdateDescriptorTables(
     reshade::api::device* device,
     uint32_t count,
     const reshade::api::descriptor_table_update* updates) {
+  CpuTimingScope timing(CpuTimingCategory::descriptor_update, 63u);
   if (dlss_enabled == 0.f || !any_nvidia.load()) return false;
   if (device == nullptr || count == 0u || updates == nullptr) return false;
   if (device->get_api() != reshade::api::device_api::d3d12) return false;
@@ -1194,12 +1242,12 @@ inline bool OnUpdateDescriptorTables(
     const auto& update = updates[u];
     if (update.table.handle == 0u || update.count == 0u) continue;
     const bool is_cbv = update.type == reshade::api::descriptor_type::constant_buffer;
+    // The TAA and upscaler resources resolved by this addon are textures;
+    // buffer views cannot supply those inputs or outputs.
     const bool is_view = update.type == reshade::api::descriptor_type::texture_shader_resource_view
-        || update.type == reshade::api::descriptor_type::buffer_shader_resource_view
-        || update.type == reshade::api::descriptor_type::texture_unordered_access_view
-        || update.type == reshade::api::descriptor_type::buffer_unordered_access_view
-        || update.type == reshade::api::descriptor_type::sampler_with_resource_view;
-    if (update.binding == 0u && update.array_offset == 0u && update.count == 1u && update.descriptors != nullptr) {
+        || update.type == reshade::api::descriptor_type::texture_unordered_access_view;
+    if (camera_override_enabled.load(std::memory_order_acquire)
+        && update.binding == 0u && update.array_offset == 0u && update.count == 1u && update.descriptors != nullptr) {
       std::unique_lock lock(camera_cbv_source_mutex);
       if (is_cbv) {
         const auto& range = *static_cast<const reshade::api::buffer_range*>(update.descriptors);
@@ -1228,12 +1276,13 @@ inline bool OnUpdateDescriptorTables(
         record.range = static_cast<const reshade::api::buffer_range*>(update.descriptors)[k];
         record.has_range = record.range.buffer.handle != 0u;
         if (!record.has_range) continue;
-        ProbeConstantBufferForProjection(record.range);
+        // The projection scan is only used as a fallback for the scene jitter source.
+        if (dlss_jitter_source > 0.5f && dlss_jitter_source < 1.5f) {
+          ProbeConstantBufferForProjection(record.range);
+        }
       } else {
         const reshade::api::resource_view view =
-            update.type == reshade::api::descriptor_type::sampler_with_resource_view
-                ? static_cast<const reshade::api::sampler_with_resource_view*>(update.descriptors)[k].view
-                : static_cast<const reshade::api::resource_view*>(update.descriptors)[k];
+            static_cast<const reshade::api::resource_view*>(update.descriptors)[k];
         if (view.handle == 0u) continue;
         // Resolve now, while this slot still holds this view.
         record.resource = device->get_resource_from_view(view);
@@ -2008,7 +2057,6 @@ struct CameraOverrideTest {
   uint64_t failed = 0u;
 };
 inline CameraOverrideTest camera_override_test;
-inline std::atomic<bool> camera_override_enabled{false};
 inline std::atomic<uint64_t> camera_override_multi_copies{0u};
 inline std::atomic<uint64_t> camera_override_camera_candidates{0u};
 inline std::atomic<uint64_t> camera_override_rejected{0u};
@@ -2496,6 +2544,7 @@ inline void ProbeSceneConstantBuffer(
 // The entry point from the draw hooks: identifies the scene passes and reads their
 // constant buffers, at a handful of draws per frame.
 inline void ProbeSceneDraw(reshade::api::command_list* cmd_list) {
+  CpuTimingScope timing(CpuTimingCategory::scene_probe, 63u);
   const bool probe_jitter = scene_probe_attempts_left != 0u && !scene_projected_this_frame;
   if (!probe_jitter && scene_matrix_frame.load() == frame_counter) return;
   if (cmd_list == nullptr) return;
@@ -2606,7 +2655,7 @@ inline void ProbeSceneDraw(reshade::api::command_list* cmd_list) {
             }
           }
         }
-        if (new_range) {
+        if (new_range && camera_override_enabled.load(std::memory_order_acquire)) {
           std::shared_lock lock(camera_cbv_source_mutex);
           for (const auto& [source, range] : camera_cbv_sources) {
             if (range.buffer.handle == record.range.buffer.handle && range.offset == record.range.offset) {
@@ -3709,12 +3758,15 @@ inline bool ResolveDispatchOutput(
 // image this frame, so it is moved into the resource the dispatch would have
 // written and the dispatch itself is prevented.
 inline bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
+  CpuTimingScope timing(CpuTimingCategory::dispatch, 63u);
   if (dlss_enabled == 0.f || !any_nvidia.load()) return false;
   if (cmd_list == nullptr) return false;
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
   if (shader_state == nullptr) return false;
   const uint32_t compute_hash = renodx::utils::shader::GetCurrentComputeShaderHash(shader_state);
   if (compute_hash == kMotionProducerHash) {
+    if (dlss_detailed_diagnostics == 0.f && dlss_motion_pair_probe == 0.f
+        && dlss_object_motion_correction == 0.f) return false;
     auto* data = Get(cmd_list);
     auto* device = cmd_list->get_device();
     auto* compute_state = renodx::utils::shader::GetCurrentComputeState(shader_state);
@@ -4000,6 +4052,7 @@ inline bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
 }
 
 inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandListData* data, uint32_t hash) {
+  CpuTimingScope timing(CpuTimingCategory::evaluate, 0u);
   if (cmd_list == nullptr || data == nullptr || dlss_enabled == 0.f || !IsSupported()) return false;
   auto* device = cmd_list->get_device();
   if (device == nullptr || device->get_api() != reshade::api::device_api::d3d12) return false;
@@ -4984,6 +5037,36 @@ inline std::string BuildDebugReport() {
       static_cast<unsigned long long>(fsr1_output_resource.load()));
   std::string out(buf);
   {
+    char build_line[256];
+    snprintf(build_line, sizeof(build_line), "  build marker     : %s %s; detailed diagnostics=%s (older values may be retained)\n",
+             __DATE__, __TIME__, dlss_detailed_diagnostics != 0.f ? "on" : "off");
+    out += build_line;
+  }
+  {
+    LARGE_INTEGER frequency = {};
+    QueryPerformanceFrequency(&frequency);
+    char line[256];
+    snprintf(line, sizeof(line), "  CPU timing      : %s; output mode=%s; sampled elapsed time includes waiting/preemption; nested scopes overlap\n",
+             cpu_timing_enabled.load(std::memory_order_relaxed) ? "on" : "off",
+             dlss_output_mode >= 1.5f ? "resolve only" : (dlss_output_mode >= 0.5f ? "evaluate only" : "replace"));
+    out += line;
+    constexpr const char* names[] = {"descriptor update", "resource destroy", "scene probe", "draw callback",
+                                     "dispatch callback", "DLSS evaluation", "present callback"};
+    for (size_t i = 0u; i < cpu_timing_stats.size(); ++i) {
+      const auto& stats = cpu_timing_stats[i];
+      const uint64_t samples = stats.samples.load(std::memory_order_relaxed);
+      const uint64_t ticks = stats.total_ticks.load(std::memory_order_relaxed);
+      const uint64_t maximum = stats.max_ticks.load(std::memory_order_relaxed);
+      const double to_ms = (frequency.QuadPart > 0 ? 1000.0 / static_cast<double>(frequency.QuadPart) : 0.0);
+      snprintf(line, sizeof(line), "    %s: samples=%llu avg=%.4f ms max=%.3f ms >=2ms=%llu >=10ms=%llu\n",
+               names[i], static_cast<unsigned long long>(samples), samples != 0u ? ticks * to_ms / samples : 0.0,
+               maximum * to_ms, static_cast<unsigned long long>(stats.over_2ms.load(std::memory_order_relaxed)),
+               static_cast<unsigned long long>(stats.over_10ms.load(std::memory_order_relaxed)));
+      out += line;
+    }
+    out += "    descriptor/resource/scene/dispatch sampled 1/64; draw 1/128; evaluation/present every call\n";
+  }
+  {
     char line[512];
     if (report.temporal_jitter_count == 0u) {
       snprintf(line, sizeof(line), "  taa b0+0x60     : unavailable (candidate JitterParameters)\n");
@@ -5910,6 +5993,7 @@ inline void CaptureCameraCoverage(reshade::api::command_list* cmd_list) {
 }
 
 inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
+  CpuTimingScope timing(CpuTimingCategory::draw, 127u);
   if (dlss_enabled == 0.f || !any_nvidia.load()) return false;
   NoteDrawForDepth(cmd_list);
   CaptureCameraCoverage(cmd_list);
@@ -5919,7 +6003,9 @@ inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uin
   if (!CheckTaaDraw(cmd_list, data, hash)) {
     // The scene's own view constants are read at its geometry draws, which is where
     // the jitter is applied and therefore where it exists as data.
-    ProbeSceneDraw(cmd_list);
+    if (dlss_detailed_diagnostics != 0.f || (dlss_jitter_source > 0.5f && dlss_jitter_source < 1.5f)) {
+      ProbeSceneDraw(cmd_list);
+    }
     return false;
   }
   ++stat_taa_draws;
@@ -5941,6 +6027,7 @@ inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uin
 }
 
 inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
+  CpuTimingScope timing(CpuTimingCategory::draw, 127u);
   if (dlss_enabled == 0.f || !any_nvidia.load()) return false;
   NoteDrawForDepth(cmd_list);
   CaptureCameraCoverage(cmd_list);
@@ -5950,7 +6037,9 @@ inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32
   if (!CheckTaaDraw(cmd_list, data, hash)) {
     // The scene's own view constants are read at its geometry draws, which is where
     // the jitter is applied and therefore where it exists as data.
-    ProbeSceneDraw(cmd_list);
+    if (dlss_detailed_diagnostics != 0.f || (dlss_jitter_source > 0.5f && dlss_jitter_source < 1.5f)) {
+      ProbeSceneDraw(cmd_list);
+    }
     return false;
   }
   ++stat_taa_draws;
@@ -5975,6 +6064,8 @@ inline void OnPresent(
     reshade::api::command_queue* queue, reshade::api::swapchain* swapchain,
     const reshade::api::rect*, const reshade::api::rect*,
     uint32_t, const reshade::api::rect*) {
+  cpu_timing_enabled.store(dlss_cpu_timing != 0.f, std::memory_order_relaxed);
+  CpuTimingScope timing(CpuTimingCategory::present, 0u);
   ++stat_presents;
   if (queue != nullptr) {
     bool create_scene_capture = false;
