@@ -101,6 +101,34 @@ renodx::utils::settings::Settings settings = {
         },
     },
     new renodx::utils::settings::Setting{
+        .key = "DLSSCameraCoverage",
+        .binding = nullptr,
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .default_value = 0.f,
+        .label = "Capture Camera Coverage",
+        .section = "Antialiasing",
+        .tooltip = "Observe camera bindings for four present intervals. Then use Copy Report.",
+        .on_click = [] {
+          using namespace farcry6_dlss::dlss;
+          std::unique_lock lock(camera_coverage.mutex);
+          if (camera_coverage.state != CameraCoverage::State::active) {
+            camera_coverage.state = CameraCoverage::State::requested;
+          }
+          return true;
+        },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLSSHaltonJitter",
+        .binding = &farcry6_dlss::dlss::dlss_halton_jitter,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Halton Jitter",
+        .section = "Antialiasing",
+        .tooltip = "Experimental: replace the game camera's jitter with a 16-step Halton pattern and send the matching offset to DLSS. Off keeps the game's original jitter. Copy Report shows camera and scene matching.",
+        .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLSSCaptureCamera",
         .binding = nullptr,
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
@@ -137,6 +165,17 @@ renodx::utils::settings::Settings settings = {
           }
           return true;
         },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLSSMotionPairingProbe",
+        .binding = &farcry6_dlss::dlss::dlss_motion_pair_probe,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Motion Pairing Probe",
+        .section = "Antialiasing",
+        .tooltip = "Experimental diagnostic: checks whether the game motion producer and DLSS use the same texture and command list. Copy Report shows the results.",
+        .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
     new renodx::utils::settings::Setting{
         .key = "DLSSStatus",
@@ -336,7 +375,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Flip Jitter Sign",
         .section = "Antialiasing",
-        .tooltip = "Negates the jitter handed to DLSS. Engines often store the offset to undo rather than the one applied - the same trap the motion vectors had - and a wrong sign doubles the reprojection error instead of correcting it.",
+        .tooltip = "Negates the original game jitter handed to DLSS. Halton jitter ignores this setting and uses its own sign.",
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },

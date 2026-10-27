@@ -93,8 +93,10 @@
 
 #include "../../utils/bitwise.hpp"
 #include "../../utils/build_info.hpp"
+#include "../../utils/minhook.hpp"
 #include "../../utils/pipeline_layout.hpp"
 #include "../../utils/shader.hpp"
+#include "./camera_jitter.hpp"
 
 namespace farcry6_dlss::dlss {
 
@@ -342,6 +344,29 @@ struct FingerprintCollision {
 
 inline std::mutex fingerprint_mutex;
 inline std::unordered_map<DescriptorFingerprint, RecordedDescriptor, DescriptorFingerprintHash> fingerprints;
+inline std::shared_mutex camera_cbv_source_mutex;
+inline std::unordered_map<uint64_t, reshade::api::buffer_range> camera_cbv_sources;
+static constexpr uint32_t kCameraSourceSlots = 4096u;
+inline std::array<std::atomic<uint64_t>, kCameraSourceSlots> camera_source_filter{};
+inline std::atomic<uint64_t> camera_source_filter_overflow{0u};
+struct CameraKnownRange {
+  std::atomic<uint64_t> buffer{0u};
+  std::atomic<uint64_t> offset{UINT64_MAX};
+};
+inline std::array<CameraKnownRange, 4> camera_known_ranges;
+
+inline void RememberCameraCopySource(uint64_t source) {
+  if (source == 0u) return;
+  const uint32_t start = static_cast<uint32_t>((source * 11400714819323198485ull) >> 52u);
+  for (uint32_t i = 0u; i < kCameraSourceSlots; ++i) {
+    auto& slot = camera_source_filter[(start + i) % kCameraSourceSlots];
+    uint64_t value = slot.load(std::memory_order_acquire);
+    if (value == source) return;
+    if (value == 0u && slot.compare_exchange_strong(value, source, std::memory_order_release)) return;
+    if (value == source) return;
+  }
+  camera_source_filter_overflow.fetch_add(1u, std::memory_order_relaxed);
+}
 // Reverse index: which fingerprints name a given resource. Needed because a
 // stored resource handle outlives its resource — a renderer rebuild (a
 // fullscreen transition does this) destroys render targets, and a fingerprint
@@ -636,6 +661,16 @@ inline const uint8_t* MappedRingData(uint64_t handle) {
 
 inline void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource) {
   if (device == nullptr || resource.handle == 0u) return;
+  {
+    std::unique_lock lock(camera_cbv_source_mutex);
+    for (auto it = camera_cbv_sources.begin(); it != camera_cbv_sources.end();) {
+      if (it->second.buffer.handle == resource.handle) {
+        it = camera_cbv_sources.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
   {
     const std::lock_guard<std::mutex> lock(initial_state_mutex);
     initial_states.erase(resource.handle);
@@ -1162,6 +1197,26 @@ inline bool OnUpdateDescriptorTables(
         || update.type == reshade::api::descriptor_type::texture_unordered_access_view
         || update.type == reshade::api::descriptor_type::buffer_unordered_access_view
         || update.type == reshade::api::descriptor_type::sampler_with_resource_view;
+    if (update.binding == 0u && update.array_offset == 0u && update.count == 1u && update.descriptors != nullptr) {
+      std::unique_lock lock(camera_cbv_source_mutex);
+      if (is_cbv) {
+        const auto& range = *static_cast<const reshade::api::buffer_range*>(update.descriptors);
+        if (range.buffer.handle != 0u && range.size == 1024u) {
+          camera_cbv_sources[update.table.handle] = range;
+          for (const auto& known : camera_known_ranges) {
+            if (known.buffer.load(std::memory_order_acquire) == range.buffer.handle
+                && known.offset.load(std::memory_order_relaxed) == range.offset) {
+              RememberCameraCopySource(update.table.handle);
+              break;
+            }
+          }
+        } else {
+          camera_cbv_sources.erase(update.table.handle);
+        }
+      } else {
+        camera_cbv_sources.erase(update.table.handle);
+      }
+    }
     if (!is_cbv && !is_view) continue;
 
     for (uint32_t k = 0u; k < update.count; ++k) {
@@ -1259,6 +1314,8 @@ inline uint32_t FindTablesForRegister(
 struct __declspec(uuid("7f3e2a1c-9b4d-4e8f-a6c2-d5f1b0e98341")) CommandListData {
   std::array<reshade::api::descriptor_table, kTrackedTableCount> descriptor_tables = {};
   std::array<reshade::api::resource_view, kTrackedRtvCount> rtvs = {};
+  reshade::api::resource_view coverage_pass_rtv = {};
+  reshade::api::resource coverage_pass_dsv = {};
   // Depth attribution: draws are counted against whichever depth-stencil was
   // bound when they were issued, and flushed into the shared map at every bind.
   reshade::api::resource dsv = {};
@@ -1728,6 +1785,8 @@ struct SceneMatrixSample {
   float previous_matrix[16] = {};
   float temporal[2] = {};
   bool temporal_valid = false;
+  DescriptorFingerprint fingerprint = {};
+  bool fingerprint_valid = false;
 };
 inline std::mutex scene_matrix_mutex;
 inline SceneMatrixSample scene_matrix_samples[4];
@@ -1735,6 +1794,316 @@ inline uint32_t scene_matrix_count = 0u;
 inline std::atomic<uint64_t> scene_matrix_frame{UINT64_MAX};
 inline std::atomic<uint64_t> scene_matrix_wrong_size{0u};
 inline std::atomic<uint64_t> scene_matrix_wrong_projection{0u};
+
+using CameraBuilder = void (*)(void*, void*, void*, void*, void*, void*, void*, const float*, uint32_t);
+struct CameraBuilderTest {
+  std::shared_mutex mutex;
+  CameraBuilder original = nullptr;
+  void* target = nullptr;
+  enum class State { idle, unavailable, unsupported, install_failed, active } state = State::idle;
+  uint64_t calls = 0u;
+  uint64_t candidates = 0u;
+  uint64_t halton_verified = 0u;
+  uint64_t halton_frame = UINT64_MAX;
+  float halton_pixels[2] = {};
+  uint32_t halton_step = 0u;
+  uint32_t input_count = 0u;
+  float inputs[4][2] = {};
+  uint32_t input_frames[4] = {};
+  float last_input[2] = {};
+  float last_projection[2] = {};
+  uint32_t last_frame = 0u;
+};
+inline CameraBuilderTest camera_builder_test;
+inline float dlss_halton_jitter = 0.f;
+inline std::atomic<bool> camera_builder_halton_enabled{false};
+inline std::atomic<uint64_t> camera_builder_frame{0u};
+
+inline void HookCameraBuilder(void* provider, void* view, void* previous_view, void* parameters,
+                              void* arg5, void* arg6, void* arg7, const float* offset, uint32_t jitter_frame) {
+  if (!camera_builder_halton_enabled.load(std::memory_order_acquire)) {
+    camera_builder_test.original(provider, view, previous_view, parameters, arg5, arg6, arg7, offset, jitter_frame);
+    return;
+  }
+  const uint32_t width = last_render_width.load();
+  const uint32_t height = last_render_height.load();
+  const float x = (offset != nullptr ? offset[0] : 0.f);
+  const float y = (offset != nullptr ? offset[1] : 0.f);
+  const bool candidate = width != 0u && height != 0u && jitter_frame <= 1u && std::isfinite(x) && std::isfinite(y)
+      && std::abs(std::abs(x) * static_cast<float>(width) - 0.5f) < 0.01f
+      && std::abs(std::abs(y) * static_cast<float>(height) - 0.5f) < 0.01f;
+  const bool halton = candidate;
+  const uint64_t frame = camera_builder_frame.load(std::memory_order_acquire);
+  const uint32_t step = static_cast<uint32_t>(frame % 16u) + 1u;
+  const float replacement[2] = {
+      -2.f * (HaltonValue(step, 2u) - 0.5f) / static_cast<float>(width != 0u ? width : 1u),
+      2.f * (HaltonValue(step, 3u) - 0.5f) / static_cast<float>(height != 0u ? height : 1u),
+  };
+  camera_builder_test.original(provider, view, previous_view, parameters, arg5, arg6, arg7,
+                               halton ? replacement : offset, jitter_frame);
+  float projection[16] = {};
+  if (halton && provider != nullptr) {
+    std::memcpy(projection, static_cast<const uint8_t*>(provider) + 0xa0u, sizeof(projection));
+  }
+  const bool verified = halton && projection[14] == -1.f && projection[15] == 0.f
+      && std::isfinite(projection[2]) && std::isfinite(projection[6])
+      && std::abs(projection[2] * static_cast<float>(width)) <= 1.01f
+      && std::abs(projection[6] * static_cast<float>(height)) <= 1.01f;
+  {
+    std::unique_lock lock(camera_builder_test.mutex);
+    ++camera_builder_test.calls;
+    if (offset != nullptr && std::isfinite(x) && std::isfinite(y) && (x != 0.f || y != 0.f)) {
+      const uint32_t slot = camera_builder_test.input_count++ % 4u;
+      camera_builder_test.inputs[slot][0] = x;
+      camera_builder_test.inputs[slot][1] = y;
+      camera_builder_test.input_frames[slot] = jitter_frame;
+    }
+    if (halton) {
+      ++camera_builder_test.candidates;
+      camera_builder_test.last_input[0] = x;
+      camera_builder_test.last_input[1] = y;
+      camera_builder_test.last_projection[0] = projection[2];
+      camera_builder_test.last_projection[1] = projection[6];
+      camera_builder_test.last_frame = jitter_frame;
+      if (verified) {
+        ++camera_builder_test.halton_verified;
+        camera_builder_test.halton_frame = frame;
+        camera_builder_test.halton_step = step;
+        camera_builder_test.halton_pixels[0] = -projection[2] * static_cast<float>(width) * 0.5f;
+        camera_builder_test.halton_pixels[1] = projection[6] * static_cast<float>(height) * 0.5f;
+      }
+    }
+  }
+}
+
+inline void StartCameraBuilderTest() {
+  std::unique_lock lock(camera_builder_test.mutex);
+  if (camera_builder_test.state == CameraBuilderTest::State::active
+      || camera_builder_test.state == CameraBuilderTest::State::unsupported
+      || camera_builder_test.state == CameraBuilderTest::State::install_failed) return;
+  const auto module = GetModuleHandleW(L"FC_m64d3d12.dll");
+  if (module == nullptr) {
+    camera_builder_test.state = CameraBuilderTest::State::unavailable;
+    return;
+  }
+  const auto* base = reinterpret_cast<const uint8_t*>(module);
+  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 0x1000) {
+    camera_builder_test.state = CameraBuilderTest::State::unsupported;
+    return;
+  }
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+  constexpr uint8_t signature[] = {0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x48,
+                                   0x89, 0x70, 0x18, 0x48, 0x89, 0x78, 0x20};
+  constexpr uint32_t rva = 0x8a7b90u;
+  if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.TimeDateStamp != 0x6824d119u
+      || nt->OptionalHeader.SizeOfImage != 0x1fb64000u || std::memcmp(base + rva, signature, sizeof(signature)) != 0) {
+    camera_builder_test.state = CameraBuilderTest::State::unsupported;
+    return;
+  }
+  const auto target = reinterpret_cast<CameraBuilder>(const_cast<uint8_t*>(base + rva));
+  try {
+    renodx::utils::minhook::Initialize();
+    const renodx::utils::minhook::Function hook(target, &HookCameraBuilder, &camera_builder_test.original);
+    renodx::utils::minhook::Create(hook);
+    HMODULE owner = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                            reinterpret_cast<LPCWSTR>(&HookCameraBuilder), &owner)) {
+      renodx::utils::minhook::Remove(hook);
+      renodx::utils::minhook::Uninitialize();
+      camera_builder_test.state = CameraBuilderTest::State::install_failed;
+      return;
+    }
+    renodx::utils::minhook::Enable(hook);
+    camera_builder_test.target = reinterpret_cast<void*>(target);
+    camera_builder_test.state = CameraBuilderTest::State::active;
+  } catch (const std::exception&) {
+    camera_builder_test.state = CameraBuilderTest::State::install_failed;
+  }
+}
+
+struct CameraOverrideTest {
+  std::shared_mutex mutex;
+  static constexpr uint32_t kBytes = 1024u;
+  static constexpr uint32_t kMaxSlots = 8192u;
+  reshade::api::device* device = nullptr;
+  Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+  uint8_t* mapped = nullptr;
+  std::unordered_map<uint64_t, std::vector<uint32_t>> slots;
+  uint32_t used = 0u;
+  uint64_t substitutions = 0u;
+  uint64_t failed = 0u;
+};
+inline CameraOverrideTest camera_override_test;
+inline std::atomic<bool> camera_override_enabled{false};
+inline std::atomic<uint64_t> camera_override_multi_copies{0u};
+inline std::atomic<uint64_t> camera_override_camera_candidates{0u};
+inline std::atomic<uint64_t> camera_override_rejected{0u};
+inline std::atomic<uint64_t> camera_override_other_offsets{0u};
+inline std::atomic<uint64_t> camera_override_untracked_sources{0u};
+
+// One descriptor at a time can be replaced without changing the game's heap.
+// All other copy operations continue through the original API unchanged.
+inline bool OnCopyCameraDescriptor(
+    reshade::api::device* device, uint32_t count, const reshade::api::descriptor_table_copy* copies) {
+  if (!camera_override_enabled.load(std::memory_order_acquire) || device == nullptr || copies == nullptr) return false;
+  if (count != 1u || copies[0].count != 1u) {
+    camera_override_multi_copies.fetch_add(1u, std::memory_order_relaxed);
+    return false;
+  }
+  if (copies[0].source_array_offset != 0u
+      || copies[0].dest_array_offset != 0u || device->get_api() != reshade::api::device_api::d3d12) return false;
+  if (copies[0].source_binding != 0u) return false;
+  const uint64_t source_handle = copies[0].source_table.handle;
+  const uint32_t start = static_cast<uint32_t>((source_handle * 11400714819323198485ull) >> 52u);
+  bool possible_camera = false;
+  for (uint32_t i = 0u; i < kCameraSourceSlots; ++i) {
+    const uint64_t value = camera_source_filter[(start + i) % kCameraSourceSlots].load(std::memory_order_acquire);
+    if (value == source_handle && value != 0u) {
+      possible_camera = true;
+      break;
+    }
+    if (value == 0u) break;
+  }
+  if (!possible_camera) return false;
+  reshade::api::buffer_range recorded_range = {};
+  {
+    std::shared_lock lock(camera_cbv_source_mutex);
+    const auto it = camera_cbv_sources.find(copies[0].source_table.handle);
+    if (it == camera_cbv_sources.end()) {
+      camera_override_untracked_sources.fetch_add(1u, std::memory_order_relaxed);
+      return false;
+    }
+    recorded_range = it->second;
+  }
+  bool known_range = false;
+  {
+    const std::lock_guard<std::mutex> lock(scene_matrix_mutex);
+    for (const auto& sample : scene_matrix_samples) {
+      if (sample.fingerprint_valid && sample.buffer == recorded_range.buffer.handle
+          && sample.buffer_offset == recorded_range.offset) {
+        known_range = true;
+        break;
+      }
+    }
+  }
+  if (!known_range) {
+    camera_override_other_offsets.fetch_add(1u, std::memory_order_relaxed);
+    return false;
+  }
+  DescriptorFingerprint fingerprint;
+  if (!ReadSlotFingerprint(device, copies[0].source_table, copies[0].source_binding, fingerprint)) return false;
+  reshade::api::buffer_range camera_range = {};
+  {
+    const std::lock_guard<std::mutex> lock(scene_matrix_mutex);
+    for (const auto& sample : scene_matrix_samples) {
+      if (sample.buffer != 0u && sample.buffer_size == CameraOverrideTest::kBytes
+          && sample.fingerprint_valid && sample.fingerprint == fingerprint) {
+        camera_range = {reshade::api::resource{sample.buffer}, sample.buffer_offset, sample.buffer_size};
+        break;
+      }
+    }
+  }
+  if (camera_range.buffer.handle == 0u) {
+    camera_override_other_offsets.fetch_add(1u, std::memory_order_relaxed);
+    return false;
+  }
+  camera_override_camera_candidates.fetch_add(1u, std::memory_order_relaxed);
+  auto* source = reinterpret_cast<ID3D12Resource*>(camera_range.buffer.handle);
+  if (source == nullptr || camera_range.offset == UINT64_MAX) return false;
+  const auto source_desc = source->GetDesc();
+  D3D12_HEAP_PROPERTIES source_heap = {};
+  D3D12_HEAP_FLAGS source_flags = {};
+  if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || camera_range.offset > source_desc.Width
+      || source_desc.Width - camera_range.offset < CameraOverrideTest::kBytes
+      || FAILED(source->GetHeapProperties(&source_heap, &source_flags)) || source_heap.Type != D3D12_HEAP_TYPE_UPLOAD) return false;
+  const D3D12_RANGE read_range = {static_cast<SIZE_T>(camera_range.offset),
+                                  static_cast<SIZE_T>(camera_range.offset + CameraOverrideTest::kBytes)};
+  void* source_map = nullptr;
+  if (FAILED(source->Map(0u, &read_range, &source_map)) || source_map == nullptr) return false;
+  std::array<uint8_t, CameraOverrideTest::kBytes> contents = {};
+  std::memcpy(contents.data(), static_cast<const uint8_t*>(source_map) + camera_range.offset, contents.size());
+  const D3D12_RANGE no_writes = {0u, 0u};
+  source->Unmap(0u, &no_writes);
+  std::array<float, 16> projection = {};
+  std::array<float, 16> clip = {};
+  float viewport[2] = {};
+  std::memcpy(projection.data(), contents.data() + 0x80u, sizeof(projection));
+  std::memcpy(clip.data(), contents.data() + 0x140u, sizeof(clip));
+  std::memcpy(viewport, contents.data() + 0x200u, sizeof(viewport));
+  if (viewport[0] != static_cast<float>(last_render_width.load())
+      || viewport[1] != static_cast<float>(last_render_height.load())
+      || !AdjustCameraJitter(&projection, &clip, viewport[0], viewport[1], 0.f, 0.f)) {
+    camera_override_rejected.fetch_add(1u, std::memory_order_relaxed);
+    return false;
+  }
+  std::memcpy(contents.data() + 0x80u, projection.data(), sizeof(projection));
+  std::memcpy(contents.data() + 0x140u, clip.data(), sizeof(clip));
+  uint64_t dest_heap = 0u;
+  uint32_t dest_offset = 0u;
+  if (!CanonicalBinding(device, copies[0].dest_table, copies[0].dest_binding, dest_heap, dest_offset)) return false;
+  auto* native_heap = reinterpret_cast<ID3D12DescriptorHeap*>(dest_heap);
+  auto* native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+  const auto heap_desc = native_heap->GetDesc();
+  if (heap_desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || dest_offset >= heap_desc.NumDescriptors) return false;
+  uint64_t hash = 14695981039346656037ull;
+  for (uint8_t byte : contents) hash = (hash ^ byte) * 1099511628211ull;
+  std::unique_lock lock(camera_override_test.mutex);
+  if (camera_override_test.device != nullptr && camera_override_test.device != device) return false;
+  if (camera_override_test.upload == nullptr) {
+    D3D12_HEAP_PROPERTIES properties = {};
+    properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = static_cast<uint64_t>(CameraOverrideTest::kBytes) * CameraOverrideTest::kMaxSlots;
+    desc.Height = 1u;
+    desc.DepthOrArraySize = 1u;
+    desc.MipLevels = 1u;
+    desc.SampleDesc.Count = 1u;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+    if (FAILED(native_device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc,
+              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload)))) {
+      ++camera_override_test.failed;
+      return false;
+    }
+    void* mapped = nullptr;
+    if (FAILED(upload->Map(0u, &no_writes, &mapped)) || mapped == nullptr) {
+      ++camera_override_test.failed;
+      return false;
+    }
+    camera_override_test.device = device;
+    camera_override_test.upload = upload;
+    camera_override_test.mapped = static_cast<uint8_t*>(mapped);
+  }
+  uint32_t slot = UINT32_MAX;
+  const auto existing = camera_override_test.slots.find(hash);
+  if (existing != camera_override_test.slots.end()) {
+    for (uint32_t index : existing->second) {
+      if (std::memcmp(camera_override_test.mapped + static_cast<size_t>(index) * contents.size(), contents.data(), contents.size()) == 0) {
+        slot = index;
+        break;
+      }
+    }
+  }
+  if (slot == UINT32_MAX) {
+    if (camera_override_test.used == CameraOverrideTest::kMaxSlots) {
+      ++camera_override_test.failed;
+      return false;
+    }
+    slot = camera_override_test.used++;
+    std::memcpy(camera_override_test.mapped + static_cast<size_t>(slot) * contents.size(), contents.data(), contents.size());
+    camera_override_test.slots[hash].push_back(slot);
+  }
+  D3D12_CONSTANT_BUFFER_VIEW_DESC cbv = {};
+  cbv.BufferLocation = camera_override_test.upload->GetGPUVirtualAddress() + static_cast<uint64_t>(slot) * contents.size();
+  cbv.SizeInBytes = CameraOverrideTest::kBytes;
+  auto destination = native_heap->GetCPUDescriptorHandleForHeapStart();
+  destination.ptr += static_cast<SIZE_T>(dest_offset) * native_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  native_device->CreateConstantBufferView(&cbv, destination);
+  ++camera_override_test.substitutions;
+  return true;
+}
 
 struct SceneBufferCapture {
   std::shared_mutex mutex;
@@ -1756,6 +2125,37 @@ struct SceneBufferCapture {
   std::array<uint8_t, kBytes> gpu = {};
 };
 inline SceneBufferCapture scene_buffer_capture;
+
+struct CameraCoverage {
+  static constexpr uint32_t kIntervals = 4u;
+  std::shared_mutex mutex;
+  enum class State { idle, requested, active, complete } state = State::idle;
+  struct Entry {
+    uint64_t buffer = 0u;
+    uint64_t offset = 0u;
+    uint32_t shader = 0u;
+    uint32_t draws = 0u;
+    uint32_t classification = 0u;
+    uint32_t scene_depth = 0u;
+    uint32_t interval = 0u;
+    bool render_pass = false;
+    bool target_missing = false;
+    float viewport[2] = {};
+    float jitter[2] = {};
+  };
+  std::array<Entry, 1024> entries = {};
+  uint64_t frame = 0u;
+  uint32_t candidates = 0u;
+  uint32_t unresolved = 0u;
+  uint32_t overflow = 0u;
+  uint32_t count = 0u;
+  uint32_t intervals = 0u;
+  std::array<uint32_t, kIntervals> terrain_draws = {};
+  std::array<uint32_t, kIntervals> terrain_no_target = {};
+  std::array<uint32_t, kIntervals> terrain_wrong_size = {};
+};
+inline CameraCoverage camera_coverage;
+inline std::atomic<bool> camera_coverage_active{false};
 
 // Where the matrix was found inside the buffer, relative to the buffer's start. The
 // ring relocates the contents every frame, so only the relative position is stable
@@ -1890,6 +2290,7 @@ inline void ProbeSceneConstantBuffer(
             std::memcpy(&sample.jitter_frame, mapped + begin + 0x334u, sizeof(sample.jitter_frame));
             std::memcpy(&sample.offscreen, mapped + begin + 0x338u, sizeof(sample.offscreen));
             sample.temporal_valid = false;
+            sample.fingerprint_valid = false;
             std::memcpy(sample.viewport, mapped + begin + 0x200u, sizeof(sample.viewport));
             std::memcpy(sample.projection, mapped + begin + 8u * 4u * sizeof(float), sizeof(sample.projection));
             std::memcpy(sample.matrix, mapped + begin + 20u * 4u * sizeof(float), sizeof(sample.matrix));
@@ -2104,6 +2505,42 @@ inline void ProbeSceneDraw(reshade::api::command_list* cmd_list) {
       if (!LookupFingerprint(key, record)) continue;
       if (!record.has_range || record.type != reshade::api::descriptor_type::constant_buffer) continue;
       ProbeSceneConstantBuffer(cmd_list, record.range, reg, shader, stage, params[k], bindings[k], !use_jitter_probe);
+      if (probe_matrix) {
+        bool new_range = false;
+        {
+          const std::lock_guard<std::mutex> lock(scene_matrix_mutex);
+          for (auto& sample : scene_matrix_samples) {
+            if (sample.frame == frame_counter && sample.buffer == record.range.buffer.handle
+                && sample.buffer_offset == record.range.offset && sample.shader == shader) {
+              sample.fingerprint = key;
+              sample.fingerprint_valid = true;
+              bool known = false;
+              for (const auto& range : camera_known_ranges) {
+                if (range.buffer.load(std::memory_order_acquire) == sample.buffer
+                    && range.offset.load(std::memory_order_relaxed) == sample.buffer_offset) {
+                  known = true;
+                  break;
+                }
+              }
+              if (!known) {
+                auto& range = camera_known_ranges[scene_matrix_count % camera_known_ranges.size()];
+                range.buffer.store(0u, std::memory_order_release);
+                range.offset.store(sample.buffer_offset, std::memory_order_relaxed);
+                range.buffer.store(sample.buffer, std::memory_order_release);
+                new_range = true;
+              }
+            }
+          }
+        }
+        if (new_range) {
+          std::shared_lock lock(camera_cbv_source_mutex);
+          for (const auto& [source, range] : camera_cbv_sources) {
+            if (range.buffer.handle == record.range.buffer.handle && range.offset == record.range.offset) {
+              RememberCameraCopySource(source);
+            }
+          }
+        }
+      }
       if (scene_projected_this_frame && (!probe_matrix || scene_matrix_frame.load() == frame_counter)) break;
     }
     if (scene_projected_this_frame && (!probe_matrix || scene_matrix_frame.load() == frame_counter)) break;
@@ -2842,6 +3279,23 @@ inline bool logged_unsupported_output = false;
 inline bool logged_bypass_format = false;
 inline bool logged_size_guard = false;
 
+struct MotionProducerTrace {
+  std::shared_mutex mutex;
+  struct Entry {
+    uint64_t resource = 0u;
+    uint64_t interval = UINT64_MAX;
+    reshade::api::command_list* command_list = nullptr;
+  };
+  std::array<Entry, 8> entries = {};
+  uint64_t writes = 0u;
+  uint64_t unresolved = 0u;
+  uint64_t matched_same_list = 0u;
+  uint64_t matched_other_list = 0u;
+  uint64_t unmatched = 0u;
+};
+inline MotionProducerTrace motion_producer_trace;
+inline float dlss_motion_pair_probe = 0.f;
+
 // Last deployment snapshot, for the Status readout and the report.
 struct DeployReport {
   uint32_t input_width = 0u;
@@ -2861,6 +3315,16 @@ struct DeployReport {
   float temporal_jitter_at_eval[2] = {};
   bool scene_jitter_fresh_at_eval = false;
   bool temporal_jitter_valid_at_eval = false;
+  bool builder_halton_at_eval = false;
+  bool builder_scene_matches_at_eval = false;
+  uint32_t builder_halton_step_at_eval = 0u;
+  float builder_halton_pixels_at_eval[2] = {};
+  uint64_t builder_halton_evals = 0u;
+  uint64_t builder_halton_scene_matches = 0u;
+  uint64_t builder_halton_scene_mismatches = 0u;
+  uint64_t builder_halton_missing = 0u;
+  uint32_t builder_halton_steps[4] = {};
+  uint32_t builder_halton_step_count = 0u;
   float motion_constants[24] = {};
   float previous_motion_constants[24] = {};
   uint64_t previous_motion_constants_frame = UINT64_MAX;
@@ -3092,6 +3556,34 @@ inline bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
     renodx::utils::shader::PopulateStageState(compute_state);
     if (compute_state->pipeline_details == nullptr) return false;
     const auto layout = compute_state->pipeline_details->layout;
+    if (dlss_motion_pair_probe != 0.f) {
+      uint32_t output_params[4] = {};
+      uint32_t output_bindings[4] = {};
+      const uint32_t output_count = FindTablesForRegister(
+          layout, 0u, 0u, reshade::api::descriptor_type::texture_unordered_access_view,
+          output_params, output_bindings, 4u, reshade::api::shader_stage::all_compute);
+      uint64_t output_resource = 0u;
+      for (uint32_t i = 0u; i < output_count; ++i) {
+        if (output_params[i] >= data->descriptor_tables.size()) continue;
+        DescriptorFingerprint key;
+        RecordedDescriptor record;
+        if (!ReadSlotFingerprint(device, data->descriptor_tables[output_params[i]], output_bindings[i], key)
+            || !LookupFingerprint(key, record) || !record.has_resource
+            || record.type != reshade::api::descriptor_type::texture_unordered_access_view) continue;
+        if (record.width * 2u != last_render_width.load() || record.height * 2u != last_render_height.load()) continue;
+        output_resource = record.resource.handle;
+        break;
+      }
+      std::unique_lock lock(motion_producer_trace.mutex);
+      if (output_resource != 0u) {
+        auto& entry = motion_producer_trace.entries[motion_producer_trace.writes++ % motion_producer_trace.entries.size()];
+        entry = {.resource = output_resource,
+                 .interval = camera_builder_frame.load(std::memory_order_acquire),
+                 .command_list = cmd_list};
+      } else {
+        ++motion_producer_trace.unresolved;
+      }
+    }
     uint32_t params[4] = {};
     uint32_t bindings[4] = {};
     const uint32_t count = FindTablesForRegister(
@@ -3527,6 +4019,24 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   const uint32_t motion_src_height = use_motion_placeholder
       ? placeholders.height
       : static_cast<uint32_t>(motion->GetDesc().Height);
+  if (!use_motion_placeholder && dlss_motion_pair_probe != 0.f) {
+    const uint64_t interval = camera_builder_frame.load(std::memory_order_acquire);
+    std::unique_lock lock(motion_producer_trace.mutex);
+    const MotionProducerTrace::Entry* match = nullptr;
+    for (const auto& entry : motion_producer_trace.entries) {
+      if (entry.resource == motion_in.resource.handle && entry.interval == interval) {
+        match = &entry;
+        break;
+      }
+    }
+    if (match == nullptr) {
+      ++motion_producer_trace.unmatched;
+    } else if (match->command_list == cmd_list) {
+      ++motion_producer_trace.matched_same_list;
+    } else {
+      ++motion_producer_trace.matched_other_list;
+    }
+  }
   ID3D12Resource* motion_vectors = nullptr;
   if (use_motion_placeholder) {
     // A substituted motion input is used as-is: it is already pixel-space zero
@@ -3589,13 +4099,14 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
   float jitter_x = 0.f;
   float jitter_y = 0.f;
+  const bool flip_game_jitter = dlss_jitter_flip != 0.f && !camera_builder_halton_enabled.load(std::memory_order_acquire);
   // A sub-pixel offset that cycles through a handful of phases: if feeding this
   // changes the image, DLSS is consuming the jitter and the real value is worth
   // wiring; if it changes nothing, the jitter is not reaching its reprojection at
   // all and neither is the history.
   if (dlss_jitter_source >= 2.5f) {
     if (temporal_jitter_valid) {
-      const float jitter_sign = dlss_jitter_flip != 0.f ? -1.f : 1.f;
+      const float jitter_sign = flip_game_jitter ? -1.f : 1.f;
       jitter_x = (temporal_jitter[0] - 0.5f) * jitter_sign;
       jitter_y = (temporal_jitter[1] - 0.5f) * jitter_sign;
     }
@@ -3609,13 +4120,40 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     jitter_x = HaltonValue(step, 2u) - 0.5f;
     jitter_y = HaltonValue(step, 3u) - 0.5f;
   } else if (dlss_jitter_source > 0.5f && scene_fresh) {
-    const float jitter_sign = dlss_jitter_flip != 0.f ? -1.f : 1.f;
+    const float jitter_sign = flip_game_jitter ? -1.f : 1.f;
     jitter_x = scene_jitter.pixels_x * jitter_sign;
     jitter_y = scene_jitter.pixels_y * jitter_sign;
   } else if (dlss_jitter_source > 0.5f && projection_jitter.valid) {
-    const float jitter_sign = dlss_jitter_flip != 0.f ? -1.f : 1.f;
+    const float jitter_sign = flip_game_jitter ? -1.f : 1.f;
     jitter_x = projection_jitter.pixels_x * jitter_sign;
     jitter_y = projection_jitter.pixels_y * jitter_sign;
+  }
+  bool camera_override_applied = false;
+  if (camera_override_enabled.load(std::memory_order_acquire)) {
+    std::shared_lock lock(camera_override_test.mutex);
+    camera_override_applied = camera_override_test.substitutions != 0u;
+  }
+  bool builder_halton = false;
+  bool builder_scene_matches = false;
+  uint32_t builder_halton_step = 0u;
+  float builder_pixels[2] = {};
+  if (camera_builder_halton_enabled.load(std::memory_order_acquire)) {
+    std::shared_lock lock(camera_builder_test.mutex);
+    builder_halton = camera_builder_test.halton_frame == frame_counter;
+    if (builder_halton) {
+      builder_pixels[0] = camera_builder_test.halton_pixels[0];
+      builder_pixels[1] = camera_builder_test.halton_pixels[1];
+      builder_halton_step = camera_builder_test.halton_step;
+      builder_scene_matches = scene_fresh && scene_jitter.from_projection
+          && std::abs(scene_jitter.pixels_x - builder_pixels[0]) < 0.01f
+          && std::abs(scene_jitter.pixels_y - builder_pixels[1]) < 0.01f;
+      jitter_x = builder_pixels[0];
+      jitter_y = builder_pixels[1];
+    }
+  }
+  if (camera_override_applied) {
+    jitter_x = 0.f;
+    jitter_y = 0.f;
   }
   // Nothing that is not a finite number reaches NGX, and nothing outside
   // sub-pixel range either: a jitter is a sub-pixel offset, so a larger value can
@@ -3642,12 +4180,17 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
 
   static int previous_jitter_source = -1;
   static bool previous_jitter_flip = false;
+  static bool previous_camera_override = false;
+  static bool previous_builder_halton = false;
   const int current_jitter_source = static_cast<int>(dlss_jitter_source);
-  const bool current_jitter_flip = dlss_jitter_flip != 0.f;
-  if (current_jitter_source != previous_jitter_source || current_jitter_flip != previous_jitter_flip) {
+  const bool current_jitter_flip = flip_game_jitter;
+  if (current_jitter_source != previous_jitter_source || current_jitter_flip != previous_jitter_flip
+      || camera_override_applied != previous_camera_override || builder_halton != previous_builder_halton) {
     ngx.reset = true;
     previous_jitter_source = current_jitter_source;
     previous_jitter_flip = current_jitter_flip;
+    previous_camera_override = camera_override_applied;
+    previous_builder_halton = builder_halton;
   }
 
   // Record the copy after unpack and before NGX on the same command list.
@@ -3819,6 +4362,23 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     deploy_report.flags = feature_flags;
     deploy_report.jitter_x = jitter_x;
     deploy_report.jitter_y = jitter_y;
+    deploy_report.builder_halton_at_eval = builder_halton;
+    deploy_report.builder_scene_matches_at_eval = builder_scene_matches;
+    deploy_report.builder_halton_step_at_eval = builder_halton_step;
+    deploy_report.builder_halton_pixels_at_eval[0] = builder_pixels[0];
+    deploy_report.builder_halton_pixels_at_eval[1] = builder_pixels[1];
+    if (camera_builder_halton_enabled.load(std::memory_order_acquire)) {
+      if (builder_halton) {
+        ++deploy_report.builder_halton_evals;
+        deploy_report.builder_halton_steps[deploy_report.builder_halton_step_count++ % 4u] = builder_halton_step;
+        if (scene_fresh && scene_jitter.from_projection) {
+          if (builder_scene_matches) ++deploy_report.builder_halton_scene_matches;
+          else ++deploy_report.builder_halton_scene_mismatches;
+        }
+      } else {
+        ++deploy_report.builder_halton_missing;
+      }
+    }
     deploy_report.motion_eval_frame = frame_counter;
     deploy_report.scene_jitter_fresh_at_eval = scene_fresh;
     deploy_report.temporal_jitter_valid_at_eval = temporal_jitter_valid;
@@ -4009,6 +4569,19 @@ inline std::string BuildDebugReport() {
                p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23]);
       out += line;
     }
+  }
+  {
+    std::shared_lock lock(motion_producer_trace.mutex);
+    char line[256];
+    snprintf(line, sizeof(line),
+             "  motion pairing   : %s producer=%llu unresolved=%llu same-list=%llu other-list=%llu unmatched=%llu (CPU recording intervals; not GPU ordering)\n",
+             dlss_motion_pair_probe != 0.f ? "on" : "off",
+             static_cast<unsigned long long>(motion_producer_trace.writes),
+             static_cast<unsigned long long>(motion_producer_trace.unresolved),
+             static_cast<unsigned long long>(motion_producer_trace.matched_same_list),
+             static_cast<unsigned long long>(motion_producer_trace.matched_other_list),
+             static_cast<unsigned long long>(motion_producer_trace.unmatched));
+    out += line;
   }
   {
     std::shared_lock lock(motion_capture.mutex);
@@ -4267,6 +4840,105 @@ inline std::string BuildDebugReport() {
     }
   }
   {
+    std::shared_lock lock(camera_builder_test.mutex);
+    const char* state = "idle";
+    switch (camera_builder_test.state) {
+      case CameraBuilderTest::State::idle: break;
+      case CameraBuilderTest::State::unavailable: state = "game DLL unavailable"; break;
+      case CameraBuilderTest::State::unsupported: state = "game DLL version mismatch"; break;
+      case CameraBuilderTest::State::install_failed: state = "hook installation failed"; break;
+      case CameraBuilderTest::State::active: state = "active"; break;
+    }
+    char line[320];
+    snprintf(line, sizeof(line), "  camera builder   : %s halton=%s calls=%llu candidates=%llu verified=%llu last-input=(%.9g,%.9g) last-projection=(%.9g,%.9g) frame=%u\n",
+             state, camera_builder_halton_enabled.load() ? "on" : "off",
+             static_cast<unsigned long long>(camera_builder_test.calls),
+             static_cast<unsigned long long>(camera_builder_test.candidates),
+             static_cast<unsigned long long>(camera_builder_test.halton_verified),
+             camera_builder_test.last_input[0], camera_builder_test.last_input[1],
+             camera_builder_test.last_projection[0], camera_builder_test.last_projection[1], camera_builder_test.last_frame);
+    out += line;
+    snprintf(line, sizeof(line), "    halton at eval : %s step=%u camera px=(%.4f,%.4f) scene matches=%s; flip ignored; NGX px shown above\n",
+             report.builder_halton_at_eval ? "yes" : "no", report.builder_halton_step_at_eval,
+             report.builder_halton_pixels_at_eval[0], report.builder_halton_pixels_at_eval[1],
+             report.builder_scene_matches_at_eval ? "yes" : "no/unavailable");
+    out += line;
+    snprintf(line, sizeof(line), "    halton history : evals=%llu scene-matches=%llu mismatches=%llu missing=%llu recent steps=%u,%u,%u,%u (ring order)\n",
+             static_cast<unsigned long long>(report.builder_halton_evals),
+             static_cast<unsigned long long>(report.builder_halton_scene_matches),
+             static_cast<unsigned long long>(report.builder_halton_scene_mismatches),
+             static_cast<unsigned long long>(report.builder_halton_missing),
+             report.builder_halton_steps[0], report.builder_halton_steps[1],
+             report.builder_halton_steps[2], report.builder_halton_steps[3]);
+    out += line;
+    snprintf(line, sizeof(line), "    camera builder input samples=%u render=%ux%u (ring order)\n",
+             camera_builder_test.input_count, last_render_width.load(), last_render_height.load());
+    out += line;
+    for (uint32_t i = 0u; i < (std::min)(camera_builder_test.input_count, 4u); ++i) {
+      snprintf(line, sizeof(line), "    [%u] input=(%.9g,%.9g) frame=%u\n", i,
+               camera_builder_test.inputs[i][0], camera_builder_test.inputs[i][1], camera_builder_test.input_frames[i]);
+      out += line;
+    }
+  }
+  {
+    std::shared_lock lock(camera_override_test.mutex);
+    char line[256];
+    snprintf(line, sizeof(line), "  camera override  : %s target=(0,0) substitutions=%llu failures=%llu immutable slots=%u/%u; restart to end\n",
+             camera_override_enabled.load(std::memory_order_acquire) ? "test enabled" : "off",
+             static_cast<unsigned long long>(camera_override_test.substitutions),
+             static_cast<unsigned long long>(camera_override_test.failed), camera_override_test.used,
+             CameraOverrideTest::kMaxSlots);
+    out += line;
+    snprintf(line, sizeof(line), "    camera candidates=%llu other offsets=%llu stale sources=%llu rejected=%llu multi-copy calls=%llu filter overflow=%llu\n",
+             static_cast<unsigned long long>(camera_override_camera_candidates.load()),
+             static_cast<unsigned long long>(camera_override_other_offsets.load()),
+             static_cast<unsigned long long>(camera_override_untracked_sources.load()),
+             static_cast<unsigned long long>(camera_override_rejected.load()),
+             static_cast<unsigned long long>(camera_override_multi_copies.load()),
+             static_cast<unsigned long long>(camera_source_filter_overflow.load()));
+    out += line;
+  }
+  {
+    std::shared_lock lock(camera_coverage.mutex);
+    const char* state = "idle";
+    switch (camera_coverage.state) {
+      case CameraCoverage::State::idle: break;
+      case CameraCoverage::State::requested: state = "requested"; break;
+      case CameraCoverage::State::active: state = "recording"; break;
+      case CameraCoverage::State::complete: state = "complete"; break;
+    }
+    char line[320];
+    snprintf(line, sizeof(line), "  camera coverage  : %s first interval=%llu intervals=%u/%u candidates=%u unresolved=%u entries=%u overflow draws=%u\n",
+             state, static_cast<unsigned long long>(camera_coverage.frame), camera_coverage.intervals,
+             CameraCoverage::kIntervals, camera_coverage.candidates, camera_coverage.unresolved,
+             camera_coverage.count, camera_coverage.overflow);
+    out += line;
+    out += "    CPU recording intervals; render-size RTV0 or target-missing terrain vertex b0 candidates are not GPU-verified\n";
+    for (uint32_t i = 0u; i < camera_coverage.intervals && i < CameraCoverage::kIntervals; ++i) {
+      snprintf(line, sizeof(line), "    interval %u terrain=0xA38182D8 draws=%u no-target=%u wrong-size=%u\n",
+               i + 1u, camera_coverage.terrain_draws[i], camera_coverage.terrain_no_target[i],
+               camera_coverage.terrain_wrong_size[i]);
+      out += line;
+    }
+    for (uint32_t i = 0u; i < camera_coverage.count; ++i) {
+      const auto& entry = camera_coverage.entries[i];
+      const char* kind = "unresolved";
+      switch (entry.classification) {
+        case 1u: kind = "main-size perspective"; break;
+        case 2u: kind = "other-size perspective"; break;
+        case 3u: kind = "other data"; break;
+      }
+      snprintf(line, sizeof(line),
+               "    interval=%u %s vs=0x%08X buffer=0x%llX offset=%llu draws=%u pass=%s target=%s scene-depth=%s viewport=(%.0f,%.0f) projection-px=(%.4f,%.4f)\n",
+               entry.interval + 1u, kind, entry.shader, static_cast<unsigned long long>(entry.buffer),
+               static_cast<unsigned long long>(entry.offset), entry.draws, entry.render_pass ? "render-pass" : "bound",
+               entry.target_missing ? "unknown" : "render-size",
+               entry.scene_depth ? "yes" : "no/unknown",
+               entry.viewport[0], entry.viewport[1], entry.jitter[0], entry.jitter[1]);
+      out += line;
+    }
+  }
+  {
     std::shared_lock lock(scene_buffer_capture.mutex);
     const char* state = "unknown";
     switch (scene_buffer_capture.state) {
@@ -4287,6 +4959,16 @@ inline std::string BuildDebugReport() {
              SceneBufferCapture::kBytes);
     out += line;
     if (scene_buffer_capture.state == SceneBufferCapture::State::complete) {
+      std::array<float, 16> dry_projection = {};
+      std::array<float, 16> dry_clip = {};
+      float dry_viewport[2] = {};
+      std::memcpy(dry_projection.data(), scene_buffer_capture.cpu.data() + 0x80u, sizeof(dry_projection));
+      std::memcpy(dry_clip.data(), scene_buffer_capture.cpu.data() + 0x140u, sizeof(dry_clip));
+      std::memcpy(dry_viewport, scene_buffer_capture.cpu.data() + 0x200u, sizeof(dry_viewport));
+      const bool dry_ok = AdjustCameraJitter(&dry_projection, &dry_clip, dry_viewport[0], dry_viewport[1], 0.125f, -1.f / 6.f);
+      snprintf(line, sizeof(line), "    private camera math: %s (test target 0.1250,-0.1667 px; no binding changed)\n",
+               dry_ok ? "valid" : "rejected");
+      out += line;
       snprintf(line, sizeof(line), "    captured temporal=(%.4f,%.4f) %s\n", scene_buffer_capture.temporal[0],
                scene_buffer_capture.temporal[1], scene_buffer_capture.temporal_valid ? "same present interval" : "unavailable");
       out += line;
@@ -4382,7 +5064,11 @@ inline void OnExecuteCommandList(reshade::api::command_queue* queue, reshade::ap
 }
 
 inline void OnResetCommandList(reshade::api::command_list* cmd_list) {
-  if (auto* data = cmd_list->get_private_data<CommandListData>()) data->in_render_pass = false;
+  if (auto* data = cmd_list->get_private_data<CommandListData>()) {
+    data->in_render_pass = false;
+    data->coverage_pass_rtv = {};
+    data->coverage_pass_dsv = {};
+  }
   {
     std::unique_lock lock(scene_buffer_capture.mutex);
     if (scene_buffer_capture.state == SceneBufferCapture::State::recorded && scene_buffer_capture.command_list == cmd_list) {
@@ -4403,14 +5089,24 @@ inline void OnDestroyCommandList(reshade::api::command_list* cmd_list) {
   cmd_list->destroy_private_data<CommandListData>();
 }
 
-inline void OnBeginRenderPass(reshade::api::command_list* cmd_list, uint32_t,
-                              const reshade::api::render_pass_render_target_desc*,
-                              const reshade::api::render_pass_depth_stencil_desc*) {
-  if (auto* data = Get(cmd_list)) data->in_render_pass = true;
+inline void OnBeginRenderPass(reshade::api::command_list* cmd_list, uint32_t count,
+                              const reshade::api::render_pass_render_target_desc* targets,
+                              const reshade::api::render_pass_depth_stencil_desc* depth) {
+  if (auto* data = Get(cmd_list)) {
+    data->in_render_pass = true;
+    data->coverage_pass_rtv = (count != 0u && targets != nullptr ? targets[0].view : reshade::api::resource_view{});
+    data->coverage_pass_dsv = (depth != nullptr && depth->view.handle != 0u
+                                  ? cmd_list->get_device()->get_resource_from_view(depth->view)
+                                  : reshade::api::resource{});
+  }
 }
 
 inline void OnEndRenderPass(reshade::api::command_list* cmd_list) {
-  if (auto* data = Get(cmd_list)) data->in_render_pass = false;
+  if (auto* data = Get(cmd_list)) {
+    data->in_render_pass = false;
+    data->coverage_pass_rtv = {};
+    data->coverage_pass_dsv = {};
+  }
 }
 
 // Any pipeline bind may change the pixel shader: mark the memoized hash dirty.
@@ -4506,9 +5202,124 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
   return true;
 }
 
+inline void CaptureCameraCoverage(reshade::api::command_list* cmd_list) {
+  if (!camera_coverage_active.load(std::memory_order_acquire) || cmd_list == nullptr) return;
+  auto* data = Get(cmd_list);
+  auto* device = cmd_list->get_device();
+  if (data == nullptr || device == nullptr) return;
+  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  auto* vertex_state = shader_state == nullptr ? nullptr : renodx::utils::shader::GetCurrentVertexState(shader_state);
+  uint32_t shader = 0u;
+  reshade::api::pipeline_layout layout = {};
+  if (vertex_state != nullptr) {
+    shader = renodx::utils::shader::GetCurrentVertexShaderHash(shader_state);
+  }
+  const auto view = (data->in_render_pass ? data->coverage_pass_rtv : data->rtvs[0]);
+  const auto target = (view.handle != 0u ? device->get_resource_from_view(view) : reshade::api::resource{});
+  bool right_size = false;
+  if (target.handle != 0u) {
+    const auto desc = device->get_resource_desc(target);
+    right_size = desc.type == reshade::api::resource_type::texture_2d
+        && desc.texture.width == last_render_width.load() && desc.texture.height == last_render_height.load();
+  }
+  if (shader == 0xA38182D8u) {
+    std::unique_lock lock(camera_coverage.mutex);
+    if (camera_coverage.state == CameraCoverage::State::active && camera_coverage.intervals < CameraCoverage::kIntervals) {
+      ++camera_coverage.terrain_draws[camera_coverage.intervals];
+      if (target.handle == 0u) {
+        ++camera_coverage.terrain_no_target[camera_coverage.intervals];
+      } else if (!right_size) {
+        ++camera_coverage.terrain_wrong_size[camera_coverage.intervals];
+      }
+    }
+  }
+  // Terrain can be recorded on a command list whose target binding is not visible
+  // to this tracker. Keep it separate from draws with a confirmed render-size RTV.
+  if (!right_size && !(shader == 0xA38182D8u && target.handle == 0u)) return;
+  if (vertex_state != nullptr) {
+    renodx::utils::shader::PopulateStageState(vertex_state);
+    if (vertex_state->pipeline_details != nullptr) layout = vertex_state->pipeline_details->layout;
+  }
+  uint32_t params[2] = {};
+  uint32_t bindings[2] = {};
+  const uint32_t tables = FindTablesForRegister(layout, 0u, 0u, reshade::api::descriptor_type::constant_buffer,
+                                                params, bindings, 2u, reshade::api::shader_stage::vertex);
+  RecordedDescriptor record;
+  bool resolved = false;
+  for (uint32_t i = 0u; i < tables; ++i) {
+    if (params[i] >= data->descriptor_tables.size()) continue;
+    DescriptorFingerprint key;
+    if (!ReadSlotFingerprint(device, data->descriptor_tables[params[i]], bindings[i], key)
+        || !LookupFingerprint(key, record) || !record.has_range
+        || record.type != reshade::api::descriptor_type::constant_buffer) continue;
+    resolved = true;
+    break;
+  }
+  CameraCoverage::Entry entry = {};
+  entry.shader = shader;
+  const auto depth = (data->in_render_pass ? data->coverage_pass_dsv : data->dsv);
+  entry.scene_depth = (depth.handle != 0u && depth.handle == scene_depth_resource ? 1u : 0u);
+  entry.render_pass = data->in_render_pass;
+  entry.target_missing = target.handle == 0u;
+  if (resolved && record.range.buffer.handle != 0u && record.range.offset != UINT64_MAX) {
+    entry.buffer = record.range.buffer.handle;
+    entry.offset = record.range.offset;
+    auto* resource = reinterpret_cast<ID3D12Resource*>(record.range.buffer.handle);
+    const auto resource_desc = resource->GetDesc();
+    D3D12_HEAP_PROPERTIES heap = {};
+    D3D12_HEAP_FLAGS flags = {};
+    constexpr uint64_t bytes = 0x33Cu;
+    if (resource_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+        && record.range.offset <= resource_desc.Width && resource_desc.Width - record.range.offset >= bytes
+        && (record.range.size == UINT64_MAX || record.range.size >= bytes)
+        && SUCCEEDED(resource->GetHeapProperties(&heap, &flags)) && heap.Type == D3D12_HEAP_TYPE_UPLOAD) {
+      void* mapped = nullptr;
+      const D3D12_RANGE read_range = {static_cast<SIZE_T>(record.range.offset), static_cast<SIZE_T>(record.range.offset + bytes)};
+      if (SUCCEEDED(resource->Map(0u, &read_range, &mapped)) && mapped != nullptr) {
+        const auto* camera = static_cast<const uint8_t*>(mapped) + record.range.offset;
+        float projection[16] = {};
+        std::memcpy(projection, camera + 0x80u, sizeof(projection));
+        std::memcpy(entry.viewport, camera + 0x200u, sizeof(entry.viewport));
+        const bool perspective = projection[14] == -1.f && projection[15] == 0.f;
+        const bool main_size = entry.viewport[0] == static_cast<float>(last_render_width.load())
+            && entry.viewport[1] == static_cast<float>(last_render_height.load());
+        entry.classification = perspective ? (main_size ? 1u : 2u) : 3u;
+        if (perspective && std::isfinite(projection[2]) && std::isfinite(projection[6])) {
+          entry.jitter[0] = -projection[2] * entry.viewport[0] * 0.5f;
+          entry.jitter[1] = projection[6] * entry.viewport[1] * 0.5f;
+        }
+        const D3D12_RANGE written = {0u, 0u};
+        resource->Unmap(0u, &written);
+      }
+    }
+  }
+  std::unique_lock lock(camera_coverage.mutex);
+  if (camera_coverage.state != CameraCoverage::State::active) return;
+  entry.interval = camera_coverage.intervals;
+  ++camera_coverage.candidates;
+  if (entry.classification == 0u) ++camera_coverage.unresolved;
+  for (uint32_t i = 0u; i < camera_coverage.count; ++i) {
+    auto& existing = camera_coverage.entries[i];
+    if (existing.buffer == entry.buffer && existing.offset == entry.offset && existing.shader == entry.shader
+        && existing.classification == entry.classification && existing.scene_depth == entry.scene_depth
+        && existing.interval == entry.interval && existing.render_pass == entry.render_pass
+        && existing.target_missing == entry.target_missing) {
+      ++existing.draws;
+      return;
+    }
+  }
+  if (camera_coverage.count == camera_coverage.entries.size()) {
+    ++camera_coverage.overflow;
+    return;
+  }
+  entry.draws = 1u;
+  camera_coverage.entries[camera_coverage.count++] = entry;
+}
+
 inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
   if (dlss_enabled == 0.f || !any_nvidia.load()) return false;
   NoteDrawForDepth(cmd_list);
+  CaptureCameraCoverage(cmd_list);
   if (ReplaceSceneUpscale(cmd_list)) return true;
   CommandListData* data = nullptr;
   uint32_t hash = 0u;
@@ -4539,6 +5350,7 @@ inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uin
 inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
   if (dlss_enabled == 0.f || !any_nvidia.load()) return false;
   NoteDrawForDepth(cmd_list);
+  CaptureCameraCoverage(cmd_list);
   if (ReplaceSceneUpscale(cmd_list)) return true;
   CommandListData* data = nullptr;
   uint32_t hash = 0u;
@@ -4731,7 +5543,38 @@ inline void OnPresent(
   scene_probe_attempts_left = kSceneProbeAttemptsPerFrame;
   scene_attempts_made = 0u;
   scene_projected_this_frame = false;
+  {
+    std::unique_lock lock(camera_coverage.mutex);
+    if (camera_coverage.state == CameraCoverage::State::requested) {
+      camera_coverage.entries = {};
+      camera_coverage.count = 0u;
+      camera_coverage.candidates = 0u;
+      camera_coverage.unresolved = 0u;
+      camera_coverage.overflow = 0u;
+      camera_coverage.intervals = 0u;
+      camera_coverage.terrain_draws = {};
+      camera_coverage.terrain_no_target = {};
+      camera_coverage.terrain_wrong_size = {};
+      camera_coverage.frame = frame_counter + 1u;
+      camera_coverage.state = CameraCoverage::State::active;
+      camera_coverage_active.store(true, std::memory_order_release);
+    } else if (camera_coverage.state == CameraCoverage::State::active) {
+      ++camera_coverage.intervals;
+      if (camera_coverage.intervals >= CameraCoverage::kIntervals) {
+        camera_coverage_active.store(false, std::memory_order_release);
+        camera_coverage.state = CameraCoverage::State::complete;
+      }
+    }
+  }
   ++frame_counter;
+  camera_builder_frame.store(frame_counter, std::memory_order_release);
+  const bool want_halton = dlss_halton_jitter != 0.f && dlss_enabled != 0.f;
+  if (want_halton) StartCameraBuilderTest();
+  {
+    std::shared_lock lock(camera_builder_test.mutex);
+    camera_builder_halton_enabled.store(want_halton && camera_builder_test.state == CameraBuilderTest::State::active,
+                                        std::memory_order_release);
+  }
   // The probe budget belongs to the frame, not to the evaluation: resetting it at the
   // TAA draw meant every batch was spent on constant buffers written after that draw,
   // and the camera's own buffer - written in the frame setup, before it - was never
@@ -4775,6 +5618,21 @@ inline void OnInitDevice(reshade::api::device* device) {
 inline void OnDestroyDevice(reshade::api::device* device) {
   if (device == nullptr) return;
   {
+    std::unique_lock lock(camera_override_test.mutex);
+    if (camera_override_test.device == device) {
+      if (camera_override_test.upload != nullptr && camera_override_test.mapped != nullptr) {
+        camera_override_test.upload->Unmap(0u, nullptr);
+      }
+      camera_override_test.upload.Reset();
+      camera_override_test.mapped = nullptr;
+      camera_override_test.device = nullptr;
+      camera_override_test.slots.clear();
+      camera_override_test.used = 0u;
+      camera_override_test.substitutions = 0u;
+      camera_override_test.failed = 0u;
+    }
+  }
+  {
     std::unique_lock lock(scene_buffer_capture.mutex);
     if (scene_buffer_capture.device == device) {
       scene_buffer_capture.readback.Reset();
@@ -4807,10 +5665,8 @@ inline void Use(DWORD fdw_reason) {
   // (GetCurrentState, GetCurrentPixelShaderHash, PopulateStageState) and pulls
   // utils::pipeline_layout with it.
   //
-  // Descriptor writes are recorded (update_descriptor_tables). Descriptor
-  // *copies* are deliberately not subscribed: the engine issues ~117M of them a
-  // session and ReShade builds the copy array before the event reaches us, which
-  // is where the earlier per-frame cost came from.
+  // Descriptor copies are subscribed only when the experimental test is started,
+  // because the engine issues enough copies for interception to be expensive.
   renodx::utils::shader::Use(fdw_reason);
   renodx::utils::pipeline_layout::Use(fdw_reason);
 
@@ -4839,6 +5695,13 @@ inline void Use(DWORD fdw_reason) {
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       break;
     case DLL_PROCESS_DETACH:
+      if (camera_override_enabled.exchange(false)) {
+        reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(OnCopyCameraDescriptor);
+        // Game-owned descriptor tables may still refer to this upload allocation.
+        // If the addon unloads before the device, retain it until process exit.
+        std::unique_lock lock(camera_override_test.mutex);
+        if (camera_override_test.device != nullptr) (void)camera_override_test.upload.Detach();
+      }
       if (!attached) return;
       attached = false;
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
