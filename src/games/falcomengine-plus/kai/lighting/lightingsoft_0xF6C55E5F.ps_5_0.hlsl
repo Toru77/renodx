@@ -472,7 +472,7 @@ void main(
       o1 = r1;
       return;
     }
-    if (is_character_pixel && !(GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 35u)) {
+    if (is_character_pixel && GTVBAO_debug_mode_ui != 1u && !(GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 35u)) {
       o0 = float4(0.0, 0.0, 0.0, 1.0);
       o1 = r1;
       return;
@@ -522,7 +522,7 @@ void main(
 
     float3 debug_color = GTVBAO_ao.xxx;
     if (GTVBAO_debug_mode_ui == 1u) {
-      debug_color = GTVBAO_ao.xxx;
+      debug_color = is_character_pixel ? saturate(ao_sample.y).xxx : GTVBAO_ao.xxx;
     } else if (GTVBAO_debug_mode_ui == 2u) {
       debug_color = vanilla_ao.xxx;
     } else if (GTVBAO_debug_mode_ui == 3u) {

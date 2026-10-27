@@ -485,7 +485,7 @@ void main(
     // question is whether a given pixel has a G-buffer normal at all, and
     // characters are forward-shaded so they typically never get one. Blacking
     // them out here would hide exactly the case worth inspecting.
-    if (is_character_pixel && !(GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 35u)) {
+    if (is_character_pixel && GTVBAO_debug_mode_ui != 1u && !(GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 35u)) {
       o0 = float4(0.0, 0.0, 0.0, 1.0);
       o1 = r1;
       return;
@@ -535,7 +535,7 @@ void main(
 
     float3 debug_color = GTVBAO_ao.xxx;
     if (GTVBAO_debug_mode_ui == 1u) {
-      debug_color = GTVBAO_ao.xxx;
+      debug_color = is_character_pixel ? saturate(ao_sample.y).xxx : GTVBAO_ao.xxx;
     } else if (GTVBAO_debug_mode_ui == 2u) {
       debug_color = vanilla_ao.xxx;
     } else if (GTVBAO_debug_mode_ui == 3u) {
