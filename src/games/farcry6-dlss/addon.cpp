@@ -15,6 +15,12 @@
 
 #define DEBUG_LEVEL_0
 
+// gpu_fence uses NTSTATUS definitions that must precede Windows headers.
+#include <ntstatus.h>
+#define WIN32_NO_STATUS
+#include <Windows.h>
+#undef WIN32_NO_STATUS
+
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
 

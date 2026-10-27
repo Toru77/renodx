@@ -75,12 +75,14 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <Windows.h>
@@ -94,6 +96,7 @@
 #include "../../utils/bitwise.hpp"
 #include "../../utils/build_info.hpp"
 #include "../../utils/descriptor.hpp"
+#include "../../utils/gpu_fence.hpp"
 #include "../../utils/minhook.hpp"
 #include "../../utils/pipeline_layout.hpp"
 #include "../../utils/shader.hpp"
@@ -254,6 +257,10 @@ static constexpr uint32_t kFailCodeCount = 11u;
 inline std::atomic<uint64_t> stat_fail_counts[kFailCodeCount];
 
 inline std::atomic<uint64_t> stat_taa_draws{0};
+inline std::atomic<uint64_t> stat_pause_taa_skipped{0};
+inline std::atomic<uint64_t> stat_menu_gameplay_skipped{0};
+inline std::atomic<uint64_t> pause_taa_last_frame{UINT64_MAX};
+inline std::atomic<uint64_t> stat_render_size_changes{0};
 inline std::atomic<uint64_t> stat_dlss_ok{0};
 inline std::atomic<uint64_t> stat_scene_handoffs{0};
 inline std::atomic<uint64_t> stat_scene_handoff_misses{0};
@@ -683,6 +690,29 @@ struct MappedRing {
 inline MappedRing mapped_ring;
 inline std::mutex mapped_ring_mutex;
 
+struct DepthCandidate {
+  uint32_t draws = 0u;
+  uint32_t width = 0u;
+  uint32_t height = 0u;
+};
+inline std::mutex depth_mutex;
+inline std::unordered_map<uint64_t, DepthCandidate> depth_candidates;
+inline uint64_t scene_depth_resource = 0u;
+inline uint32_t scene_depth_draws = 0u;
+inline uint32_t scene_depth_width = 0u;
+inline uint32_t scene_depth_height = 0u;
+inline reshade::api::format scene_depth_format = reshade::api::format::unknown;
+inline std::atomic<uint64_t> stat_scene_depth_invalidated{0u};
+inline std::atomic<uint32_t> stat_depth_best_draws{0u};
+inline std::atomic<uint64_t> stat_depth_submission_flushes{0u};
+static constexpr uint32_t kViewCacheSize = 8u;
+inline std::mutex view_cache_mutex;
+inline reshade::api::resource_view view_cache[kViewCacheSize] = {};
+inline reshade::api::resource view_cache_resource[kViewCacheSize] = {};
+inline reshade::api::format view_cache_format[kViewCacheSize] = {};
+inline std::atomic<uint64_t> stat_cached_views_invalidated{0u};
+inline std::atomic<uint64_t> fsr1_output_resource{0u};
+
 inline const uint8_t* MappedRingData(uint64_t handle) {
   // Fast path without the lock: the ring is one long-lived buffer, so this hits
   // almost always, and a mutex per constant-buffer write was measurable.
@@ -725,6 +755,31 @@ inline void OnDestroyResource(reshade::api::device* device, reshade::api::resour
     initial_states.erase(resource.handle);
   }
   if (mapped_ring.handle == resource.handle) mapped_ring = {};
+  {
+    const std::lock_guard<std::mutex> lock(depth_mutex);
+    depth_candidates.erase(resource.handle);
+    if (scene_depth_resource == resource.handle) {
+      scene_depth_resource = 0u;
+      scene_depth_draws = 0u;
+      scene_depth_width = 0u;
+      scene_depth_height = 0u;
+      scene_depth_format = reshade::api::format::unknown;
+      ++stat_scene_depth_invalidated;
+    }
+  }
+  {
+    const std::lock_guard<std::mutex> lock(view_cache_mutex);
+    for (uint32_t i = 0u; i < kViewCacheSize; ++i) {
+      if (view_cache_resource[i].handle != resource.handle) continue;
+      if (view_cache[i].handle != 0u) device->destroy_resource_view(view_cache[i]);
+      view_cache[i] = {};
+      view_cache_resource[i] = {};
+      view_cache_format[i] = reshade::api::format::unknown;
+      ++stat_cached_views_invalidated;
+    }
+  }
+  uint64_t expected_fsr1 = resource.handle;
+  fsr1_output_resource.compare_exchange_strong(expected_fsr1, 0u);
   // A recycled handle must not inherit the state of the resource that used to
   // live at that address.
   for (uint32_t slot = 0u; slot < kTrackedDepthSlots; ++slot) {
@@ -1383,6 +1438,7 @@ struct __declspec(uuid("7f3e2a1c-9b4d-4e8f-a6c2-d5f1b0e98341")) CommandListData 
   bool scene_hash_valid = false;
   uint64_t dlss_taa_resource = 0u;
   uint64_t dlss_frame = UINT64_MAX;
+  bool gpu_tracked = false;
 };
 
 inline CommandListData* Get(reshade::api::command_list* cmd_list) {
@@ -1391,16 +1447,53 @@ inline CommandListData* Get(reshade::api::command_list* cmd_list) {
   return data != nullptr ? data : cmd_list->create_private_data<CommandListData>();
 }
 
+// ReShade's execute callback runs before the native submission. A retirement
+// fence is therefore only signalled later on the submitting thread at Present,
+// after every recorded list which could reference the resource was reset.
+struct GpuRetirementTicket {
+  std::unordered_set<reshade::api::command_list*> pending_lists;
+  reshade::api::command_queue* queue = nullptr;
+  DWORD submit_thread = 0u;
+  uint64_t fence_value = 0u;
+  bool conflicting_submission = false;
+  bool complete = false;
+};
+struct GpuRetirementState {
+  std::shared_mutex mutex;
+  std::unordered_set<reshade::api::command_list*> recorded_lists;
+  std::vector<std::weak_ptr<GpuRetirementTicket>> tickets;
+  std::unique_ptr<renodx::utils::gpu_fence::Fence> fence;
+  reshade::api::command_queue* queue = nullptr;
+  DWORD submit_thread = 0u;
+  bool conflicting_submission = false;
+  std::atomic<uint64_t> reclaimed{0u};
+  uint64_t fence_failures = 0u;
+};
+inline GpuRetirementState gpu_retirement;
+
+inline void TrackGpuCommands(reshade::api::command_list* cmd_list) {
+  auto* data = Get(cmd_list);
+  if (data == nullptr || data->gpu_tracked) return;
+  std::unique_lock lock(gpu_retirement.mutex);
+  gpu_retirement.recorded_lists.insert(cmd_list);
+  data->gpu_tracked = true;
+}
+
+inline std::shared_ptr<GpuRetirementTicket> RetireGpuCommands() {
+  auto ticket = std::make_shared<GpuRetirementTicket>();
+  std::unique_lock lock(gpu_retirement.mutex);
+  ticket->pending_lists = gpu_retirement.recorded_lists;
+  ticket->queue = gpu_retirement.queue;
+  ticket->submit_thread = gpu_retirement.submit_thread;
+  ticket->conflicting_submission = gpu_retirement.conflicting_submission;
+  gpu_retirement.tickets.emplace_back(ticket);
+  return ticket;
+}
+
 // ── View cache ──
 // The unpack pass needs a ReShade view of the motion resource. It is created
 // from the resource we resolved, never from a recorded handle, and reused:
 // creating one per draw would leak a view every frame.
-static constexpr uint32_t kViewCacheSize = 8u;
-inline std::mutex view_cache_mutex;
-inline reshade::api::resource_view view_cache[kViewCacheSize] = {};
-inline reshade::api::resource view_cache_resource[kViewCacheSize] = {};
-inline reshade::api::format view_cache_format[kViewCacheSize] = {};
-
 inline void ReleaseViewCache(reshade::api::device* device) {
   if (device == nullptr) return;
   const std::lock_guard<std::mutex> lock(view_cache_mutex);
@@ -1428,7 +1521,12 @@ inline reshade::api::resource_view GetOrCreateTextureView(
     }
   }
   if (empty == kViewCacheSize) empty = 0u;  // cache full: recycle slot 0
-  if (view_cache[empty].handle != 0u) device->destroy_resource_view(view_cache[empty]);
+  if (view_cache[empty].handle != 0u) {
+    device->destroy_resource_view(view_cache[empty]);
+    view_cache[empty] = {};
+    view_cache_resource[empty] = {};
+    view_cache_format[empty] = reshade::api::format::unknown;
+  }
   reshade::api::resource_view_desc view_desc(
       reshade::api::resource_view_type::texture_2d, format, 0, 1, 0, 1);
   reshade::api::resource_view view = {};
@@ -1686,18 +1784,6 @@ inline bool EnsurePlaceholders(reshade::api::device* device, uint32_t width, uin
 // depth-stencil was bound when they were issued. A per-command-list counter does
 // that for free: it increments in the draw handler and is flushed into the shared
 // map whenever the render targets change.
-inline std::mutex depth_mutex;
-struct DepthCandidate {
-  uint32_t draws = 0u;
-  uint32_t width = 0u;
-  uint32_t height = 0u;
-};
-inline std::unordered_map<uint64_t, DepthCandidate> depth_candidates;
-inline uint64_t scene_depth_resource = 0u;
-inline uint32_t scene_depth_draws = 0u;
-inline uint32_t scene_depth_width = 0u;
-inline uint32_t scene_depth_height = 0u;
-inline reshade::api::format scene_depth_format = reshade::api::format::unknown;
 // Render size of the last TAA target. Used to exclude depth candidates that
 // cannot be the scene depth: the previous build ranked purely by draw count and
 // picked a 1536x1536 D16 shadow cascade, which the geometry passes draw into more
@@ -1743,16 +1829,17 @@ inline void SelectSceneDepth(reshade::api::device* device) {
       }
     }
     depth_candidates.clear();
+    stat_depth_best_draws.store(best_count, std::memory_order_relaxed);
+    // A handful of draws is a full-screen effect's depth, not the scene's.
+    if (best == 0u || best_count < 100u) return;
+    const reshade::api::resource_desc desc = device->get_resource_desc(reshade::api::resource{best});
+    if (desc.type != reshade::api::resource_type::texture_2d) return;
+    scene_depth_resource = best;
+    scene_depth_draws = best_count;
+    scene_depth_width = desc.texture.width;
+    scene_depth_height = desc.texture.height;
+    scene_depth_format = desc.texture.format;
   }
-  // A handful of draws is a full-screen effect's depth, not the scene's.
-  if (best == 0u || best_count < 100u) return;
-  const reshade::api::resource_desc desc = device->get_resource_desc(reshade::api::resource{best});
-  if (desc.type != reshade::api::resource_type::texture_2d) return;
-  scene_depth_resource = best;
-  scene_depth_draws = best_count;
-  scene_depth_width = desc.texture.width;
-  scene_depth_height = desc.texture.height;
-  scene_depth_format = desc.texture.format;
   // Its state has to be known to read it as a shader resource. Registering it
   // here, at the frame boundary, means the engine's transitions during the next
   // frame are recorded before NGX needs them.
@@ -1885,6 +1972,14 @@ inline float dlss_halton_motion_offsets = 0.f;
 inline std::atomic<bool> camera_builder_motion_offsets_enabled{false};
 inline std::atomic<bool> camera_builder_halton_enabled{false};
 inline std::atomic<uint64_t> camera_builder_frame{0u};
+
+// The pause shader can appear after the gameplay TAA draw was recorded. Keep
+// the following present interval on the game's path too, and then resume DLSS.
+inline bool PauseTaaRecentlySeen() {
+  const uint64_t pause_frame = pause_taa_last_frame.load(std::memory_order_acquire);
+  const uint64_t frame = camera_builder_frame.load(std::memory_order_acquire);
+  return pause_frame != UINT64_MAX && (pause_frame == frame || (frame != 0u && pause_frame == frame - 1u));
+}
 
 inline void HookCameraBuilder(void* provider, void* view, void* previous_view, void* parameters,
                               void* arg5, void* arg6, void* arg7, const float* offset, uint32_t jitter_frame) {
@@ -2850,6 +2945,21 @@ struct InstanceData {
 
 inline InstanceData ngx;
 
+// Retired allocations stay alive until their recorded lists and GPU fence finish.
+static constexpr size_t kRetiredGenerationLimit = 8u;
+struct RetiredNgxFeature {
+  NVSDK_NGX_Handle* feature = nullptr;
+  NVSDK_NGX_Parameter* parameters = nullptr;
+  std::shared_ptr<GpuRetirementTicket> ticket;
+};
+struct RetiredNgxOutput {
+  Microsoft::WRL::ComPtr<ID3D12Resource> texture;
+  std::shared_ptr<GpuRetirementTicket> ticket;
+};
+inline std::vector<RetiredNgxFeature> retired_ngx_features;
+inline std::vector<RetiredNgxOutput> retired_ngx_outputs;
+inline std::atomic<uint64_t> stat_retirement_limit{0u};
+
 // One capture owns its readback until the submitting queue has retired the copy.
 struct MotionCapture {
   std::shared_mutex mutex;
@@ -2914,14 +3024,20 @@ inline const char* ResultToString(NVSDK_NGX_Result result) {
 
 inline bool IsSupported() { return any_nvidia.load() && (!ngx.initialized || ngx.supported); }
 
-inline void ReleaseFeatureHandleOnly() {
-  if (ngx.feature != nullptr) {
-    NVSDK_NGX_D3D12_ReleaseFeature(ngx.feature);
+inline void ReleaseFeatureHandleOnly(bool retire = false) {
+  if (retire && (ngx.feature != nullptr || ngx.runtime_parameters != nullptr)) {
+    retired_ngx_features.push_back({.feature = ngx.feature, .parameters = ngx.runtime_parameters, .ticket = RetireGpuCommands()});
     ngx.feature = nullptr;
-  }
-  if (ngx.runtime_parameters != nullptr) {
-    NVSDK_NGX_D3D12_DestroyParameters(ngx.runtime_parameters);
     ngx.runtime_parameters = nullptr;
+  } else {
+    if (ngx.feature != nullptr) {
+      NVSDK_NGX_D3D12_ReleaseFeature(ngx.feature);
+      ngx.feature = nullptr;
+    }
+    if (ngx.runtime_parameters != nullptr) {
+      NVSDK_NGX_D3D12_DestroyParameters(ngx.runtime_parameters);
+      ngx.runtime_parameters = nullptr;
+    }
   }
   ngx.requested_render_preset = -1;
   ngx.render_preset = -1;
@@ -2934,9 +3050,13 @@ inline void ReleaseFeatureHandleOnly() {
   ngx.logged_jitter = false;
 }
 
-inline void ReleaseFeature() {
-  ReleaseFeatureHandleOnly();
-  ngx.output_texture.Reset();
+inline void ReleaseFeature(bool retire = false) {
+  ReleaseFeatureHandleOnly(retire);
+  if (retire && ngx.output_texture != nullptr) {
+    retired_ngx_outputs.push_back({.texture = std::move(ngx.output_texture), .ticket = RetireGpuCommands()});
+  } else {
+    ngx.output_texture.Reset();
+  }
   ngx.width = 0u;
   ngx.height = 0u;
   ngx.input_width = 0u;
@@ -2946,6 +3066,12 @@ inline void ReleaseFeature() {
 
 inline void ReleaseNgx() {
   ReleaseFeature();
+  for (const auto& retired : retired_ngx_features) {
+    if (retired.feature != nullptr) NVSDK_NGX_D3D12_ReleaseFeature(retired.feature);
+    if (retired.parameters != nullptr) NVSDK_NGX_D3D12_DestroyParameters(retired.parameters);
+  }
+  retired_ngx_features.clear();
+  retired_ngx_outputs.clear();
   if (ngx.capability_parameters != nullptr) {
     NVSDK_NGX_D3D12_DestroyParameters(ngx.capability_parameters);
     ngx.capability_parameters = nullptr;
@@ -3024,7 +3150,12 @@ inline bool EnsureOutputTexture(ID3D12Device* device, uint32_t width, uint32_t h
   if (device == nullptr || width == 0u || height == 0u || format == DXGI_FORMAT_UNKNOWN) return false;
   if (ngx.output_texture != nullptr && ngx.width == width && ngx.height == height && ngx.output_format == format) return true;
 
-  ReleaseFeature();
+  if ((ngx.output_texture != nullptr && retired_ngx_outputs.size() >= kRetiredGenerationLimit)
+      || (ngx.feature != nullptr && retired_ngx_features.size() >= kRetiredGenerationLimit)) {
+    ++stat_retirement_limit;
+    return false;
+  }
+  ReleaseFeature(true);
 
   D3D12_HEAP_PROPERTIES heap_props = {};
   heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -3170,7 +3301,13 @@ inline bool EnsureFeature(
       && ngx.feature_flags == feature_flags) {
     return true;
   }
-  if (ngx.feature != nullptr) ReleaseFeatureHandleOnly();
+  if (ngx.feature != nullptr) {
+    if (retired_ngx_features.size() >= kRetiredGenerationLimit) {
+      ++stat_retirement_limit;
+      return false;
+    }
+    ReleaseFeatureHandleOnly(true);
+  }
   if (ngx.create_failed) return false;
 
   const NVSDK_NGX_Result params_result = NVSDK_NGX_D3D12_AllocateParameters(&ngx.runtime_parameters);
@@ -3254,19 +3391,29 @@ struct UnpackData {
 };
 
 inline UnpackData unpack;
+struct RetiredUnpack {
+  UnpackData data;
+  std::shared_ptr<GpuRetirementTicket> ticket;
+};
+inline std::vector<RetiredUnpack> retired_unpack;
 inline reshade::api::device* unpack_device = nullptr;
 
 inline void ReleaseUnpack(reshade::api::device* device) {
   if (device == nullptr) return;
-  if (unpack.uav.handle) device->destroy_resource_view(unpack.uav);
-  if (unpack.srv.handle) device->destroy_resource_view(unpack.srv);
-  if (unpack.texture.handle) device->destroy_resource(unpack.texture);
-  if (unpack.pipeline.handle) device->destroy_pipeline(unpack.pipeline);
-  if (unpack.masked_pipeline.handle) device->destroy_pipeline(unpack.masked_pipeline);
-  for (auto& table : unpack.tables) {
-    if (table.handle) device->free_descriptor_table(table);
+  retired_unpack.push_back({.data = unpack});
+  for (auto& retired : retired_unpack) {
+    auto& generation = retired.data;
+    if (generation.uav.handle) device->destroy_resource_view(generation.uav);
+    if (generation.srv.handle) device->destroy_resource_view(generation.srv);
+    if (generation.texture.handle) device->destroy_resource(generation.texture);
+    if (generation.pipeline.handle) device->destroy_pipeline(generation.pipeline);
+    if (generation.masked_pipeline.handle) device->destroy_pipeline(generation.masked_pipeline);
+    for (auto& table : generation.tables) {
+      if (table.handle) device->free_descriptor_table(table);
+    }
+    if (generation.layout.handle) device->destroy_pipeline_layout(generation.layout);
   }
-  if (unpack.layout.handle) device->destroy_pipeline_layout(unpack.layout);
+  retired_unpack.clear();
   unpack = {};
 }
 
@@ -3315,26 +3462,15 @@ inline bool EnsureUnpackResources(reshade::api::device* device, uint32_t width, 
   if (device == nullptr || width == 0u || height == 0u) return false;
   if (unpack.texture.handle != 0u && unpack.width == width && unpack.height == height) return unpack.pipeline.handle != 0u;
   if (unpack_device != device) {
-    // Statics are single-device; a device change releases everything.
     ReleaseUnpack(unpack_device);
     unpack_device = device;
-  } else {
-    if (unpack.texture.handle) {
-      if (unpack.uav.handle) device->destroy_resource_view(unpack.uav);
-      if (unpack.srv.handle) device->destroy_resource_view(unpack.srv);
-      device->destroy_resource(unpack.texture);
-      unpack.texture = {};
-      unpack.srv = {};
-      unpack.uav = {};
+  } else if (unpack.texture.handle != 0u || unpack.layout.handle != 0u) {
+    if (retired_unpack.size() >= kRetiredGenerationLimit) {
+      ++stat_retirement_limit;
+      return false;
     }
-    if (unpack.pipeline.handle) {
-      device->destroy_pipeline(unpack.pipeline);
-      unpack.pipeline = {};
-    }
-    if (unpack.masked_pipeline.handle) {
-      device->destroy_pipeline(unpack.masked_pipeline);
-      unpack.masked_pipeline = {};
-    }
+    retired_unpack.push_back({.data = unpack, .ticket = RetireGpuCommands()});
+    unpack = {};
   }
   unpack.width = 0u;
   unpack.height = 0u;
@@ -3676,7 +3812,6 @@ inline std::atomic<uint32_t> display_height{0u};
 inline std::atomic<uint32_t> fsr1_target_width{0u};
 inline std::atomic<uint32_t> fsr1_target_height{0u};
 inline std::atomic<uint32_t> fsr1_target_format{0u};
-inline std::atomic<uint64_t> fsr1_output_resource{0u};
 inline std::atomic<uint64_t> stat_fsr1_replaced{0u};
 inline std::atomic<uint64_t> stat_fsr1_misses{0u};
 // Set when the evaluation wrote the game's upscale resource this frame, which is
@@ -4046,7 +4181,7 @@ inline bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
   // NGX writes into this resource directly, at the evaluation point, so there is
   // nothing to copy: this only takes the game's dispatch out of the way once that
   // write has actually happened. A frame where it did not keeps the game's upscale.
-  if (!fsr1_wrote_this_frame.load()) return false;
+  if (!fsr1_wrote_this_frame.load() || PauseTaaRecentlySeen()) return false;
   stat_fsr1_replaced.fetch_add(1u, std::memory_order_relaxed);
   return true;
 }
@@ -4059,7 +4194,20 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
 
   auto* command_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
   if (command_list == nullptr) return false;
-  if (ngx.eval_failed) return false;
+  // The pause variant has a separate history output. Leave its TAA to the game
+  // and resume DLSS with fresh history when gameplay returns.
+  if (hash == kTaaPauseHash) {
+    pause_taa_last_frame.store(camera_builder_frame.load(std::memory_order_acquire), std::memory_order_release);
+    ++stat_pause_taa_skipped;
+    ngx.reset = true;
+    return false;
+  }
+  if (PauseTaaRecentlySeen()) {
+    ++stat_menu_gameplay_skipped;
+    ngx.reset = true;
+    return false;
+  }
+  TrackGpuCommands(cmd_list);
 
   for (auto& hit : slot_hit) hit.store(0);
 
@@ -4148,6 +4296,21 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   const D3D12_RESOURCE_DESC taa_desc = output_target->GetDesc();
   const uint32_t taa_width = static_cast<uint32_t>(taa_desc.Width);
   const uint32_t taa_height = taa_desc.Height;
+  // Publish the new gameplay extent before resolving depth: depth selection
+  // runs at Present and must be able to discover the new-size resource even
+  // while the previous frame's depth is still selected.
+  if (taa_width >= 256u && taa_height >= 256u && taa_width <= 7680u && taa_height <= 4320u) {
+    const uint32_t previous_width = last_render_width.exchange(taa_width);
+    const uint32_t previous_height = last_render_height.exchange(taa_height);
+    if (previous_width != 0u && previous_height != 0u
+        && (previous_width != taa_width || previous_height != taa_height)) {
+      ++stat_render_size_changes;
+      ngx.create_failed = false;
+      ngx.eval_failed = false;
+      ngx.reset = true;
+    }
+  }
+  if (ngx.eval_failed) return false;
 
   if ((use_color_placeholder || use_motion_placeholder || use_depth_placeholder || use_bypass)
       && !EnsurePlaceholders(device, taa_width, taa_height)) {
@@ -4163,15 +4326,14 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       : (motion_ok ? reinterpret_cast<ID3D12Resource*>(motion_in.resource.handle) : nullptr);
 
   // Scene depth: only usable when it matches this frame's render size.
-  ID3D12Resource* scene_depth = nullptr;
-  if (!use_depth_mask && !use_depth_placeholder && scene_depth_resource != 0u) {
-    const reshade::api::resource_desc scene_desc =
-        device->get_resource_desc(reshade::api::resource{scene_depth_resource});
-    if (scene_desc.type == reshade::api::resource_type::texture_2d
-        && scene_desc.texture.width == taa_width && scene_desc.texture.height == taa_height) {
-      scene_depth = reinterpret_cast<ID3D12Resource*>(scene_depth_resource);
+  Microsoft::WRL::ComPtr<ID3D12Resource> scene_depth_owned;
+  if (!use_depth_mask && !use_depth_placeholder) {
+    const std::lock_guard<std::mutex> lock(depth_mutex);
+    if (scene_depth_resource != 0u && scene_depth_width == taa_width && scene_depth_height == taa_height) {
+      scene_depth_owned = reinterpret_cast<ID3D12Resource*>(scene_depth_resource);
     }
   }
+  auto* scene_depth = scene_depth_owned.Get();
   SlotInput depth_in = use_depth_mask ? (use_depth_mask_b ? depth_b_in : depth_a_in) : SlotInput{};
   auto* depth = use_depth_placeholder
       ? reinterpret_cast<ID3D12Resource*>(placeholders.depth.handle)
@@ -4843,10 +5005,10 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   // a black depth view in DLSS's own debug overlay. It is put back into the state
   // the engine's tracking believes it is in afterwards, because the engine writes
   // its next barrier against that belief and not against what actually happened.
-  const reshade::api::resource depth_resource{scene_depth_resource};
+  const reshade::api::resource depth_resource{reinterpret_cast<uint64_t>(scene_depth)};
   reshade::api::resource_usage depth_state = reshade::api::resource_usage::undefined;
   if (!use_depth_mask && !use_depth_placeholder && scene_depth != nullptr) {
-    depth_state = TrackedDepthState(scene_depth_resource);
+    depth_state = TrackedDepthState(depth_resource.handle);
     // Bound as a depth-stencil view, so that is what it is while the tracker has
     // not seen a barrier for it yet.
     if (depth_state == reshade::api::resource_usage::undefined) {
@@ -5036,6 +5198,57 @@ inline std::string BuildDebugReport() {
       fsr1_target_width.load(), fsr1_target_height.load(), fsr1_target_format.load(),
       static_cast<unsigned long long>(fsr1_output_resource.load()));
   std::string out(buf);
+  {
+    char line[256];
+    snprintf(line, sizeof(line), "  GPU retirement: features=%zu outputs=%zu unpack=%zu; reclaimed=%llu; limit=%zu each; fallback hits=%llu\n",
+             retired_ngx_features.size(), retired_ngx_outputs.size(), retired_unpack.size(),
+             static_cast<unsigned long long>(gpu_retirement.reclaimed.load()),
+             kRetiredGenerationLimit,
+             static_cast<unsigned long long>(stat_retirement_limit.load()));
+    out += line;
+  }
+  {
+    std::shared_lock lock(gpu_retirement.mutex);
+    size_t waiting_lists = 0u;
+    size_t waiting_submission = 0u;
+    size_t waiting_fence = 0u;
+    size_t conflicting = 0u;
+    for (const auto& weak : gpu_retirement.tickets) {
+      const auto ticket = weak.lock();
+      if (!ticket || ticket->complete) continue;
+      if (ticket->conflicting_submission) {
+        ++conflicting;
+      } else if (!ticket->pending_lists.empty()) {
+        ++waiting_lists;
+      } else if (ticket->queue == nullptr) {
+        ++waiting_submission;
+      } else {
+        ++waiting_fence;
+      }
+    }
+    char line[256];
+    snprintf(line, sizeof(line), "  GPU cleanup: lists=%zu; tickets waiting on lists=%zu submission=%zu fence=%zu conflicting=%zu; mixed queue/thread=%s; fence errors=%llu\n",
+             gpu_retirement.recorded_lists.size(), waiting_lists, waiting_submission, waiting_fence, conflicting,
+             gpu_retirement.conflicting_submission ? "yes" : "no",
+             static_cast<unsigned long long>(gpu_retirement.fence_failures));
+    out += line;
+  }
+  {
+    char line[256];
+    const uint32_t observed_width = last_render_width.load();
+    const uint32_t observed_height = last_render_height.load();
+    const uint32_t display_w = display_width.load();
+    const uint32_t display_h = display_height.load();
+    snprintf(line, sizeof(line),
+             "  gameplay extent  : %ux%u; display=%ux%u; desired quality=%s; size changes=%llu; pause TAA skipped=%llu; menu gameplay skipped=%llu\n",
+             observed_width, observed_height, display_w, display_h,
+             (observed_width != 0u && observed_height != 0u && display_w != 0u && display_h != 0u)
+                 ? GetPerfQualityName(GetPerfQualityValue(observed_width, observed_height, display_w, display_h)) : "unknown",
+             static_cast<unsigned long long>(stat_render_size_changes.load()),
+             static_cast<unsigned long long>(stat_pause_taa_skipped.load()),
+             static_cast<unsigned long long>(stat_menu_gameplay_skipped.load()));
+    out += line;
+  }
   {
     char build_line[256];
     snprintf(build_line, sizeof(build_line), "  build marker     : %s %s; detailed diagnostics=%s (older values may be retained)\n",
@@ -5263,6 +5476,7 @@ inline std::string BuildDebugReport() {
   // evidence that the right texture was picked rather than a half-res effect's.
   {
     char line[256];
+    const std::lock_guard<std::mutex> lock(depth_mutex);
     if (scene_depth_resource != 0u) {
       snprintf(line, sizeof(line),
                "  scene depth      : 0x%llX %ux%u fmt=%d bound by %u draws\n",
@@ -5272,6 +5486,14 @@ inline std::string BuildDebugReport() {
     } else {
       snprintf(line, sizeof(line), "  scene depth      : not identified\n");
     }
+    out += line;
+    snprintf(line, sizeof(line), "  destroyed resources cleared: scene depth=%llu cached views=%llu\n",
+             static_cast<unsigned long long>(stat_scene_depth_invalidated.load()),
+             static_cast<unsigned long long>(stat_cached_views_invalidated.load()));
+    out += line;
+    snprintf(line, sizeof(line), "  depth detection  : last best=%u draws (minimum=100); submission flushes=%llu\n",
+             stat_depth_best_draws.load(std::memory_order_relaxed),
+             static_cast<unsigned long long>(stat_depth_submission_flushes.load(std::memory_order_relaxed)));
     out += line;
   }
   // The TAA's own constant slot, in the engine's per-draw ring.
@@ -5700,6 +5922,36 @@ inline std::string BuildDebugReport() {
 
 // ── Event handlers ──
 inline void OnExecuteCommandList(reshade::api::command_queue* queue, reshade::api::command_list* cmd_list) {
+  if (queue != nullptr && cmd_list != nullptr) {
+    auto* data = cmd_list->get_private_data<CommandListData>();
+    if (data != nullptr && data->dsv.handle != 0u && data->dsv_draws != 0u) {
+      FlushDepthDraws(queue->get_device(), data);
+      stat_depth_submission_flushes.fetch_add(1u, std::memory_order_relaxed);
+    }
+  }
+  if (cmd_list != nullptr && cmd_list->get_private_data<CommandListData>() != nullptr
+      && cmd_list->get_private_data<CommandListData>()->gpu_tracked) {
+    std::unique_lock lock(gpu_retirement.mutex);
+    if (gpu_retirement.recorded_lists.contains(cmd_list)) {
+      const DWORD thread = GetCurrentThreadId();
+      if (gpu_retirement.queue == nullptr) {
+        gpu_retirement.queue = queue;
+        gpu_retirement.submit_thread = thread;
+      } else if (gpu_retirement.queue != queue || gpu_retirement.submit_thread != thread) {
+        gpu_retirement.conflicting_submission = true;
+      }
+      for (auto& weak : gpu_retirement.tickets) {
+        if (auto ticket = weak.lock(); ticket && ticket->pending_lists.contains(cmd_list)) {
+          if (ticket->queue == nullptr) {
+            ticket->queue = queue;
+            ticket->submit_thread = thread;
+          } else if (ticket->queue != queue || ticket->submit_thread != thread) {
+            ticket->conflicting_submission = true;
+          }
+        }
+      }
+    }
+  }
   if ((dlss_motion_pair_probe != 0.f || dlss_object_motion_correction != 0.f) && queue != nullptr && cmd_list != nullptr) {
     std::unique_lock lock(motion_producer_trace.mutex);
     const uint64_t serial = ++motion_producer_trace.submit_serial;
@@ -5740,10 +5992,20 @@ inline void OnExecuteCommandList(reshade::api::command_queue* queue, reshade::ap
 }
 
 inline void OnResetCommandList(reshade::api::command_list* cmd_list) {
+  if (auto* data = cmd_list->get_private_data<CommandListData>(); data != nullptr && data->gpu_tracked) {
+    std::unique_lock lock(gpu_retirement.mutex);
+    gpu_retirement.recorded_lists.erase(cmd_list);
+    for (auto& weak : gpu_retirement.tickets) {
+      if (auto ticket = weak.lock()) ticket->pending_lists.erase(cmd_list);
+    }
+    data->gpu_tracked = false;
+  }
   if (auto* data = cmd_list->get_private_data<CommandListData>()) {
     data->in_render_pass = false;
     data->coverage_pass_rtv = {};
     data->coverage_pass_dsv = {};
+    data->dsv = {};
+    data->dsv_draws = 0u;
   }
   {
     std::unique_lock lock(scene_buffer_capture.mutex);
@@ -5842,7 +6104,7 @@ inline void NoteDrawForDepth(reshade::api::command_list* cmd_list) {
 // First test path: replace the scene upscale draw with the DLSS image. The
 // original TAA draw remains available as a fallback if this exact handoff fails.
 inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
-  if (cmd_list == nullptr) return false;
+  if (cmd_list == nullptr || PauseTaaRecentlySeen()) return false;
   auto* data = cmd_list->get_private_data<CommandListData>();
   if (data == nullptr || data->dlss_frame != frame_counter || data->dlss_taa_resource == 0u) return false;
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
@@ -5934,7 +6196,10 @@ inline void CaptureCameraCoverage(reshade::api::command_list* cmd_list) {
   CameraCoverage::Entry entry = {};
   entry.shader = shader;
   const auto depth = (data->in_render_pass ? data->coverage_pass_dsv : data->dsv);
-  entry.scene_depth = (depth.handle != 0u && depth.handle == scene_depth_resource ? 1u : 0u);
+  {
+    const std::lock_guard<std::mutex> lock(depth_mutex);
+    entry.scene_depth = (depth.handle != 0u && depth.handle == scene_depth_resource ? 1u : 0u);
+  }
   entry.render_pass = data->in_render_pass;
   entry.target_missing = target.handle == 0u;
   if (resolved && record.range.buffer.handle != 0u && record.range.offset != UINT64_MAX) {
@@ -6067,6 +6332,66 @@ inline void OnPresent(
   cpu_timing_enabled.store(dlss_cpu_timing != 0.f, std::memory_order_relaxed);
   CpuTimingScope timing(CpuTimingCategory::present, 0u);
   ++stat_presents;
+  if (queue != nullptr) {
+    {
+      std::unique_lock lock(gpu_retirement.mutex);
+      for (auto it = gpu_retirement.tickets.begin(); it != gpu_retirement.tickets.end();) {
+        auto ticket = it->lock();
+        if (!ticket) {
+          it = gpu_retirement.tickets.erase(it);
+          continue;
+        }
+        ++it;
+        if (ticket->complete || !ticket->pending_lists.empty() || ticket->conflicting_submission) continue;
+        // An unobserved submission cannot establish a safe fence point.
+        if (ticket->queue == nullptr) continue;
+        if (ticket->queue != queue || ticket->submit_thread != GetCurrentThreadId()) continue;
+        try {
+          if (gpu_retirement.fence == nullptr) {
+            gpu_retirement.fence = std::make_unique<renodx::utils::gpu_fence::Fence>(queue->get_device());
+          }
+          if (ticket->fence_value == renodx::utils::gpu_fence::NO_SIGNAL) {
+            ticket->fence_value = renodx::utils::gpu_fence::QueueSignal(queue, gpu_retirement.fence.get());
+            if (ticket->fence_value == renodx::utils::gpu_fence::NO_SIGNAL) {
+              ++gpu_retirement.fence_failures;
+              continue;
+            }
+          }
+          const uint64_t completed = gpu_retirement.fence->GetCompletedValue();
+          ticket->complete = completed != UINT64_MAX && completed >= ticket->fence_value;
+        } catch (const std::exception&) {
+          ++gpu_retirement.fence_failures;
+        }
+      }
+    }
+    for (auto it = retired_ngx_features.begin(); it != retired_ngx_features.end();) {
+      if (!it->ticket->complete) { ++it; continue; }
+      if (it->feature != nullptr) NVSDK_NGX_D3D12_ReleaseFeature(it->feature);
+      if (it->parameters != nullptr) NVSDK_NGX_D3D12_DestroyParameters(it->parameters);
+      it = retired_ngx_features.erase(it);
+      ++gpu_retirement.reclaimed;
+    }
+    for (auto it = retired_ngx_outputs.begin(); it != retired_ngx_outputs.end();) {
+      if (!it->ticket->complete) { ++it; continue; }
+      it = retired_ngx_outputs.erase(it);
+      ++gpu_retirement.reclaimed;
+    }
+    for (auto it = retired_unpack.begin(); it != retired_unpack.end();) {
+      if (!it->ticket->complete || unpack_device != queue->get_device()) { ++it; continue; }
+      auto& generation = it->data;
+      if (generation.uav.handle) unpack_device->destroy_resource_view(generation.uav);
+      if (generation.srv.handle) unpack_device->destroy_resource_view(generation.srv);
+      if (generation.texture.handle) unpack_device->destroy_resource(generation.texture);
+      if (generation.pipeline.handle) unpack_device->destroy_pipeline(generation.pipeline);
+      if (generation.masked_pipeline.handle) unpack_device->destroy_pipeline(generation.masked_pipeline);
+      for (auto& table : generation.tables) {
+        if (table.handle) unpack_device->free_descriptor_table(table);
+      }
+      if (generation.layout.handle) unpack_device->destroy_pipeline_layout(generation.layout);
+      it = retired_unpack.erase(it);
+      ++gpu_retirement.reclaimed;
+    }
+  }
   if (queue != nullptr) {
     bool create_scene_capture = false;
     bool read_scene_capture = false;
@@ -6343,6 +6668,16 @@ inline void OnDestroyDevice(reshade::api::device* device) {
       scene_buffer_capture.state = SceneBufferCapture::State::idle;
     }
   }
+  {
+    std::unique_lock lock(motion_capture.mutex);
+    if (motion_capture.device == device) {
+      motion_capture.readback.Reset();
+      motion_capture.device = nullptr;
+      motion_capture.command_list = nullptr;
+      motion_capture.queue = nullptr;
+      motion_capture.state = MotionCapture::State::idle;
+    }
+  }
   bool was_ours = false;
   {
     std::lock_guard<std::mutex> lock(device_mutex);
@@ -6357,6 +6692,13 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     unpack_device = nullptr;
     ReleasePlaceholders(device);
     ReleaseViewCache(device);
+    std::unique_lock lock(gpu_retirement.mutex);
+    gpu_retirement.recorded_lists.clear();
+    gpu_retirement.tickets.clear();
+    gpu_retirement.fence.reset();
+    gpu_retirement.queue = nullptr;
+    gpu_retirement.submit_thread = 0u;
+    gpu_retirement.conflicting_submission = false;
   }
   RemoveNvidiaNative(device->get_native());
   reshade::log::message(reshade::log::level::info, "Far Cry 6 DLSS: device destroyed");
