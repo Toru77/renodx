@@ -80,6 +80,7 @@ R1b-0 (diagnostic, startup hook-off mask), implemented, not validated in game: `
 | Wind sway range slider | Slider check and dumps | HISTORY: Wind sway range slider |
 | Diagnostics round 3b and the M0 to M3 switches | Dump split checks | HISTORY: Round: diagnostics (2026-10-08) |
 | DX12 probe (M2a, diagnostic) | Run DX12 probe; send dx12_probe_f<frame>.json from renodx-dev\falcomengine-plus\world | world/rt12/rt12_probe.hpp |
+| DX12 probe M2b (DXR round trip, transfer paths) | Run DX12 probe, send dx12_probe_f<frame>.json | world/rt12/rt12_probe.hpp, world/shaders/world_rt12_probe.cs_6_5.hlsl |
 
 ## Reference
 
