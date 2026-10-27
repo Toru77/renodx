@@ -877,7 +877,7 @@ static bool IsDaybreak2() {
 static bool IsKyoto() {
   return !IsKai() && !IsSora1st() && !IsSora2nd() && !IsDaybreak2();
 }
-static bool VbgiGameSupported() { return !IsKyoto() && !IsDaybreak2() && !IsKai(); }  // M7.7 drops !IsKai()
+static bool VbgiGameSupported() { return !IsKyoto() && !IsDaybreak2(); }
 static bool VbgiRowVisible() { return IsAdvancedSettingsMode() && VbgiGameSupported(); }
 static bool VbgiRunning() { return g_vbgi_enabled > 0.5f && VbgiGameSupported() && !falcom_world::rtao::RtaoRequested(); }
 
@@ -3877,7 +3877,7 @@ renodx::utils::settings::Settings settings = {
       .key = "SSGIKaiConsumeFalcom", .binding = &shader_injection.vbgi_kai_consume_falcom,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Consume Falcom SSGI (Kai)", .section = "GTVBGI",
-      .tooltip = "When ON, Falcom's SSGI color modulates GTVBAO VBGI before blending. Creates a multiplicative interaction between the two GI sources.",
+      .tooltip = "When ON, Falcom's SSGI color modulates the GTVBGI contribution (main path) before it is added. Multiplicative and not energy preserving.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
@@ -3885,7 +3885,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIKaiFalcomBlend", .binding = &shader_injection.vbgi_kai_falcom_blend,
       .default_value = 0.5f, .label = "Falcom SSGI Blend (Kai)", .section = "GTVBGI",
-      .tooltip = "How much Falcom SSGI color modulates GTVBAO VBGI. 0 = no modulation (additive only), 1 = full multiplicative blend.",
+      .tooltip = "How much Falcom SSGI color modulates GTVBGI. 0 = no modulation (additive only), 1 = full multiplicative blend.",
       .min = 0.f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && shader_injection.vbgi_kai_consume_falcom > 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
@@ -3894,7 +3894,7 @@ renodx::utils::settings::Settings settings = {
       .key = "SSGIKaiGTVBAOOnly", .binding = &shader_injection.vbgi_kai_gtvbao_only,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "GTVBAO VBGI Only (Kai)", .section = "GTVBGI",
-      .tooltip = "When ON, Falcom SSGI is suppressed from output and only GTVBAO VBGI is visible. GTVBAO can still consume Falcom SSGI internally for modulation.",
+      .tooltip = "When ON, Falcom's own SSGI is suppressed (its ambient and shadow-colour terms) and only GTVBGI provides indirect light. OFF keeps both.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
@@ -5744,21 +5744,24 @@ static void OnPushDescriptorsCapture(
         }
       }
     }
-    // VBGI radiance inputs: only from the Sora lighting shaders while VBGI runs. The binding is the array base, so each
-    // slot of the update is matched by its own number (shadow t9 on Sora 1st, t7 on Sora 2nd).
+    // VBGI radiance inputs: only from the Sora and Kai lighting shaders while VBGI runs. The binding is the array base, so each
+    // slot of the update is matched by its own number (shadow t9 on Sora 1st, t7 on Sora 2nd, t16 cascade array on Kai; slot 3 is
+    // the depth on Kai, so it is not captured there).
     if (VbgiRunning() && update.count >= 1) {
       auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (hash == 0xFDAAF80Eu || hash == 0xCA3D8596u) {
-          const uint32_t shadow_slot = IsSora1st() ? 9u : 7u;
+        if (hash == 0xFDAAF80Eu || hash == 0xCA3D8596u || (IsKai() && (hash == 0x430ED091u || hash == 0xF6C55E5Fu))) {
+          const bool kai = IsKai();
+          const uint32_t shadow_slot = kai ? 16u : (IsSora1st() ? 9u : 7u);
+          const uint32_t deferred_slot = kai ? 5u : 6u;
           for (uint32_t i = 0; i < update.count; ++i) {
             if (views[i].handle == 0u) continue;
             const uint32_t slot = update.binding + i;
             int k = -1;
             if (slot == 2u) k = 0;
-            else if (slot == 3u) k = 1;
-            else if (slot == 6u) k = 2;
+            else if (slot == 3u && !kai) k = 1;
+            else if (slot == deferred_slot) k = 2;
             else if (slot == shadow_slot) k = 3;
             else if (slot == 11u) k = 4;
             else if (slot == 12u) k = 5;
@@ -12415,7 +12418,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   // VBGI gather: the main pass's 4 SRVs plus t4 radiance (5 SRVs) and 2 UAVs.
   if (!make_layout(5u, 2u, &d->vbgi_main_layout)) return false;
   // VBGI radiance prepass: 9 SRVs + 1 UAV. Radiance mip chain: 1 SRV + 1 UAV.
-  if (!make_layout(11u, 1u, &d->vbgi_radiance_layout)) return false;
+  if (!make_layout(12u, 1u, &d->vbgi_radiance_layout)) return false;
   EnsureGTVBAODescriptorTables(dev, d->vbgi_radiance_layout, &d->vbgi_radiance_tables);
   if (!make_layout(1u, 1u, &d->vbgi_mips_layout)) return false;
   EnsureGTVBAODescriptorTables(dev, d->vbgi_mips_layout, &d->vbgi_mips_tables);
@@ -12923,6 +12926,7 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
   if (!VbgiRunning() || !d->captured_depth_srv.handle || !d->captured_mrt_normal_srv.handle
       || !d->captured_scene_cbv_valid || !d->captured_color_srv.handle || d->captured_color_frame != d->frame_index) return false;
   for (uint32_t k = 0; k < 6; ++k) {
+    if (k == 1 && IsKai()) continue;
     if (!d->vbgi_in_srv[k].handle || d->vbgi_in_frame[k] != d->frame_index) {
       static bool s_inputs_logged = false;
       if (!s_inputs_logged) {
@@ -12944,6 +12948,7 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
   const auto SR = reshade::api::resource_usage::shader_resource;
   const uint32_t w = d->vbgi_width, h = d->vbgi_height;
   const uint32_t div = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution);
+  const bool kai = IsKai();
 
   // Multi-Bounce (M7.6): last frame's denoised GI (the newest output, not written until this frame's denoise) re-enters as
   // sender light. Off, stale or without valid motion: weight 0 and the two extra slots stay on the fallback view.
@@ -12963,18 +12968,22 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
   // Mip 0: the radiance itself.
   GtvbaoBindPipeline(cl, d->vbgi_radiance_pipeline);
   {
-    reshade::api::resource_view srvs[11] = {
+    reshade::api::resource_view srvs[12] = {
         d->captured_color_srv,
         d->captured_mrt_normal_srv,
-        d->vbgi_in_srv[0], d->vbgi_in_srv[1],
+        d->vbgi_in_srv[0],
+        kai ? d->fallback_srv : d->vbgi_in_srv[1],
         d->captured_depth_srv,
-        d->vbgi_in_srv[2], d->vbgi_in_srv[3], d->vbgi_in_srv[4], d->vbgi_in_srv[5],
-        prev_gi_srv, motion_srv
+        d->vbgi_in_srv[2],
+        kai ? d->fallback_srv : d->vbgi_in_srv[3],
+        d->vbgi_in_srv[4], d->vbgi_in_srv[5],
+        prev_gi_srv, motion_srv,
+        kai ? d->vbgi_in_srv[3] : d->fallback_srv
     };
     reshade::api::descriptor_table_update u[4] = {
       {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
       {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,11,reshade::api::descriptor_type::texture_shader_resource_view,srvs},
+      {{},0,0,12,reshade::api::descriptor_type::texture_shader_resource_view,srvs},
       {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->vbgi_radiance_mip_uav[0]},
     };
     GtvbaoApplyDescriptors(dev, cl, d->vbgi_radiance_layout, &d->vbgi_radiance_tables, 4, u);
@@ -12986,6 +12995,7 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
     pc[4] = kVbgiRadianceClamp;
     pc[5] = (float)div;
     pc[6] = feedback_w;
+    pc[7] = IsSora1st() ? 0.f : (IsSora2nd() ? 1.f : 2.f);
     cl->push_constants(reshade::api::shader_stage::all_compute, d->vbgi_radiance_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
   }
   cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
@@ -13005,7 +13015,7 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
     cl->dispatch((std::max(1u, w >> m) + 7u) / 8u, (std::max(1u, h >> m) + 7u) / 8u, 1);
   }
 
-  falcom_world::rtao::NullComputeSlots(cl, 11, 1, 1);
+  falcom_world::rtao::NullComputeSlots(cl, 12, 1, 1);
   GtvbaoBarrier(cl, d->vbgi_radiance_texture, UA, SR);
   d->vbgi_radiance_frame = d->frame_index;
   static bool s_logged = false;

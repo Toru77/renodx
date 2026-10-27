@@ -612,18 +612,16 @@ void main(
   r3.w = sqrt(r3.w);
   r5.x = r6.x * r3.w;
   r5.y = r3.x * r3.w;
-  // ── GTVBAO VBGI: sample & process once for both early-return and main paths ──
+  // ── GTVBGI (M7.7): denoised GI (t23, depth size) x the G-buffer colour x Intensity, as the Sora lighting shaders. ──
   r24.xyzw = float4(0, 0, 0, 0);
   if (shader_injection_data.gtvbao_vbgi_bound >= 0.5) {
-    r24.xyzw = gtvbaoVBGITexture.SampleLevel(samLinear_s, v1.zw, 0).xyzw;
-    r24.xyz *= shader_injection_data.vbgi_intensity;
-    float giLuma = dot(r24.xyz, float3(0.333, 0.333, 0.333));
-    r24.xyz = lerp(giLuma.xxx, r24.xyz, shader_injection_data.vbgi_saturation);
-    if (shader_injection_data.vbgi_max_clamp > 0.0) {
-      r24.xyz = min(r24.xyz, shader_injection_data.vbgi_max_clamp);
-    }
-    r24.w = saturate(giLuma);
+    r24.xyz = gtvbaoVBGITexture.SampleLevel(samPoint_s, v1.xy, 0).rgb * r0.xyz * shader_injection_data.vbgi_intensity;
+    r24.w = saturate(dot(r24.xyz, float3(0.333, 0.333, 0.333)));
   }
+  // Character pixels: the Character SSGI composite consumes the GI when it is on (mask applied there); otherwise a plain masked add.
+  const bool vbgi_char_comp = shader_injection_data.gtvbao_vbgi_bound >= 0.5 && shader_injection_data.char_gi_enabled >= 0.5;
+  const float vbgi_char_mask = 1.0 - saturate(shader_injection_data.char_gtvbgi_mask_strength);
+  const float vbgi_plain_scale = is_character_pixel ? (vbgi_char_comp ? 0.0 : vbgi_char_mask) : 1.0;
   r3.x = (int)r0.w & 8;
   if (r3.x == 0) {
     r6.y = (uint)r1.y >> 8;
@@ -792,13 +790,18 @@ void main(
       uint er_dbg = (uint)(max(shader_injection_data.char_gi_debug_mode, 0.0) + 0.5);
 
       if (er_gi_on && er_is_char) {
-        float4 er_ssgi = ssgiTexture.SampleLevel(samLinear_s, v1.zw, 0);
-        if (shader_injection_data.ssgi_mod_enabled >= 0.5) {
-          er_ssgi.xyz = pow(abs(er_ssgi.xyz * max(shader_injection_data.ssgi_color_boost, 0.0)),
-                           max(shader_injection_data.ssgi_pow, 0.01));
-          er_ssgi.w = saturate(er_ssgi.w * max(shader_injection_data.ssgi_alpha_boost, 0.0));
+        float4 er_ssgi;
+        if (vbgi_char_comp) {
+          er_ssgi = float4(r24.xyz * vbgi_char_mask, 1.0);
         } else {
-          er_ssgi = float4(0, 0, 0, 0);
+          er_ssgi = ssgiTexture.SampleLevel(samLinear_s, v1.zw, 0);
+          if (shader_injection_data.ssgi_mod_enabled >= 0.5) {
+            er_ssgi.xyz = pow(abs(er_ssgi.xyz * max(shader_injection_data.ssgi_color_boost, 0.0)),
+                             max(shader_injection_data.ssgi_pow, 0.01));
+            er_ssgi.w = saturate(er_ssgi.w * max(shader_injection_data.ssgi_alpha_boost, 0.0));
+          } else {
+            er_ssgi = float4(0, 0, 0, 0);
+          }
         }
 
         static const float3 ER_LUMA = float3(0.299, 0.587, 0.114);
@@ -852,14 +855,14 @@ void main(
     }
     // --- End early-return Character SSGI Composite ---
 
-    // Add GTVBAO VBGI to early-return output (bypassing game's SSGI formula)
-    r4.yzw = r4.yzw + r24.xyz;
     // Early return BEFORE the sun composite at 1498, and r4.yzw is built from the
     // character/SSGI terms with no isolable sun contribution. Contact is therefore
     // not applied here: attaching it to the final colour instead is the bug that put
     // contact shadows in interiors. Micro still applies.
     o0.xyz = FalcomApplyShadowTerms(r4.yzw, v1.xy, is_character_pixel, samPoint_s,
                                     microShadowTex, contactShadowTex);
+    // GTVBGI (M7.7): added after the shadow terms like the Sora composite; no fog on this path.
+    o0.xyz += r24.xyz * vbgi_plain_scale;
     o0.w = 1;
     o1.xyzw = r1.xyzw;
     return;
@@ -1065,7 +1068,7 @@ void main(
   }
 
   // Save SSGI and character mask for in-shader character GI composite
-  float4 chargi_ssgi_saved = r15;
+  float4 chargi_ssgi_saved = vbgi_char_comp ? float4(r24.xyz * vbgi_char_mask, 1.0) : r15;
   // Use mrt0z_raw from mrtTexture0 (t1) which already has the character bit
   bool chargi_is_character = ((mrt0z_raw >> 8u) & 1u) != 0u;
   // Was max(r4.x, r4.y * sss_shadow_sample). r4.y is the AO's .y channel, already
@@ -1983,6 +1986,7 @@ void main(
   r0.w = r0.w ? r1.y : 1;
   r0.z = r0.z * r13.x;
   r0.z = r0.z * r0.w;
+  const float kaiFogKeep = 1.0 - r0.z;
   r3.xyz = fogColor_g.xyz + -r4.xyz;
   r3.xyz = r0.zzz * r3.xyz + r4.xyz;
   if (exp_fog_color_correction_enabled) {
@@ -2000,6 +2004,7 @@ void main(
           exp_fog_lightness_strength,
         exp_fog_color_correction_strength) * exp_fog_hdr_norm;
   }
+  float3 kaiExtinction = float3(1, 1, 1);
   r0.z = (int)r1.x & 64;
   r0.z = cmp((int)r0.z == 0);
   r0.w = cmp(0 != isEnableSky_g);
@@ -2012,6 +2017,7 @@ void main(
     r1.z = r0.z / r0.w;
     r4.xyz = atmosphereInscatterLUT.SampleLevel(samLinear_s, r1.xyz, 0).xyz;
     r1.xyz = atmosphereExtinctionLUT.SampleLevel(samLinear_s, r1.xyz, 0).xyz;
+    kaiExtinction = r1.xyz;
     r3.xyz = r3.xyz * r1.xyz + r4.xyz;
   }
   if (outlineShapeCount_g != 0) {
@@ -2307,8 +2313,6 @@ void main(
     r3.xyz = float3((raw_z & 0xFFu) / 255.0, ((raw_z >> 8u) & 0xFFu) / 255.0, ((raw_z >> 16u) & 0xFFu) / 255.0);
   }
   // --- End Foliage Debug ---
-  // Add GTVBAO VBGI directly to final scene (bypasses game's SSGI formula)
-  r3.xyz = r3.xyz + r24.xyz;
   // ── SSGI Debug Views: replace scene with debug texture ──
   // gtvbao_upscale_debug also triggers (t23 then carries upscale diagnostics).
   if (shader_injection_data.vbgi_debug_view > 0.5
@@ -2354,6 +2358,8 @@ void main(
   }
   o0.xyz = FalcomApplyShadowTerms(r3.xyz, v1.xy, is_character_pixel, samPoint_s,
                                   microShadowTex, contactShadowTex);
+  // GTVBGI (M7.7): after the shadow terms, attenuated by the fog and haze transmittance like the Sora RTGI bounce.
+  o0.xyz += r24.xyz * vbgi_plain_scale * kaiFogKeep * kaiExtinction;
   o0.w = 1;
   o1.z = r0.y;
   return;
