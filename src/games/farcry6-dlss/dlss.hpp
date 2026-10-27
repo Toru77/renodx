@@ -1782,6 +1782,7 @@ struct SceneMatrixSample {
   uint32_t jitter_frame = 0u;
   uint32_t offscreen = 0u;
   float viewport[2] = {};
+  float motion_vector_offsets[4] = {};
   float projection[16] = {};
   float matrix[16] = {};
   float previous_matrix[16] = {};
@@ -1798,16 +1799,29 @@ inline std::atomic<uint64_t> scene_matrix_wrong_size{0u};
 inline std::atomic<uint64_t> scene_matrix_wrong_projection{0u};
 
 using CameraBuilder = void (*)(void*, void*, void*, void*, void*, void*, void*, const float*, uint32_t);
+using CameraParametersWriter = void (*)(void*, void*, void*);
 struct CameraBuilderTest {
   std::shared_mutex mutex;
   CameraBuilder original = nullptr;
+  CameraParametersWriter offsets_original = nullptr;
+  bool offsets_hook_installed = false;
   void* target = nullptr;
   enum class State { idle, unavailable, unsupported, install_failed, active } state = State::idle;
   uint64_t calls = 0u;
   uint64_t candidates = 0u;
   uint64_t halton_verified = 0u;
+  uint64_t motion_offset_patched = 0u;
+  uint64_t motion_offset_rejected = 0u;
+  float motion_offset_before[2] = {};
   uint64_t halton_frame = UINT64_MAX;
   float halton_pixels[2] = {};
+  struct HaltonSample {
+    uint64_t frame = UINT64_MAX;
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    float pixels[2] = {};
+  };
+  std::array<HaltonSample, 8> halton_history = {};
   uint32_t halton_step = 0u;
   uint32_t input_count = 0u;
   float inputs[4][2] = {};
@@ -1818,6 +1832,8 @@ struct CameraBuilderTest {
 };
 inline CameraBuilderTest camera_builder_test;
 inline float dlss_halton_jitter = 0.f;
+inline float dlss_halton_motion_offsets = 0.f;
+inline std::atomic<bool> camera_builder_motion_offsets_enabled{false};
 inline std::atomic<bool> camera_builder_halton_enabled{false};
 inline std::atomic<uint64_t> camera_builder_frame{0u};
 
@@ -1873,8 +1889,48 @@ inline void HookCameraBuilder(void* provider, void* view, void* previous_view, v
         camera_builder_test.halton_step = step;
         camera_builder_test.halton_pixels[0] = -projection[2] * static_cast<float>(width) * 0.5f;
         camera_builder_test.halton_pixels[1] = projection[6] * static_cast<float>(height) * 0.5f;
+        auto& sample = camera_builder_test.halton_history[frame % camera_builder_test.halton_history.size()];
+        sample.frame = frame;
+        sample.width = width;
+        sample.height = height;
+        sample.pixels[0] = camera_builder_test.halton_pixels[0];
+        sample.pixels[1] = camera_builder_test.halton_pixels[1];
       }
     }
+  }
+}
+
+// This writer copies the game's original two-phase offsets into the provider.
+// Only modify a render-sized camera whose projection matches this frame's Halton sample.
+inline void HookCameraParametersWriter(void* provider, void* view, void* parameters) {
+  camera_builder_test.offsets_original(provider, view, parameters);
+  if (provider == nullptr || !camera_builder_motion_offsets_enabled.load(std::memory_order_acquire)) return;
+  const uint64_t frame = camera_builder_frame.load(std::memory_order_acquire);
+  const uint32_t width = last_render_width.load();
+  const uint32_t height = last_render_height.load();
+  float projection[16] = {};
+  float viewport[2] = {};
+  float old_offsets[2] = {};
+  auto* camera = static_cast<uint8_t*>(provider);
+  std::memcpy(projection, camera + 0xa0u, sizeof(projection));
+  std::memcpy(viewport, camera + 0x220u, sizeof(viewport));
+  std::memcpy(old_offsets, camera + 0x2e0u, sizeof(old_offsets));
+  std::unique_lock lock(camera_builder_test.mutex);
+  const auto& sample = camera_builder_test.halton_history[frame % camera_builder_test.halton_history.size()];
+  const bool recognized = width != 0u && height != 0u && sample.frame == frame
+      && sample.width == width && sample.height == height
+      && viewport[0] == static_cast<float>(width) && viewport[1] == static_cast<float>(height)
+      && projection[14] == -1.f && projection[15] == 0.f
+      && std::abs(-projection[2] * width * 0.5f - sample.pixels[0]) < 0.01f
+      && std::abs(projection[6] * height * 0.5f - sample.pixels[1]) < 0.01f
+      && std::abs(std::abs(old_offsets[0]) - 0.25f) < 0.001f
+      && std::abs(std::abs(old_offsets[1]) - 0.25f) < 0.001f;
+  std::copy(std::begin(old_offsets), std::end(old_offsets), camera_builder_test.motion_offset_before);
+  if (recognized) {
+    std::memcpy(camera + 0x2e0u, sample.pixels, sizeof(sample.pixels));
+    ++camera_builder_test.motion_offset_patched;
+  } else {
+    ++camera_builder_test.motion_offset_rejected;
   }
 }
 
@@ -1917,6 +1973,21 @@ inline void StartCameraBuilderTest() {
       return;
     }
     renodx::utils::minhook::Enable(hook);
+    // A separate guarded hook handles the later offset copy; failure leaves
+    // the established Halton camera hook active without changing offsets.
+    constexpr uint32_t offsets_rva = 0x6cbe10u;
+    constexpr uint8_t offsets_signature[] = {0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x56, 0x48, 0x81, 0xec, 0x80, 0x00, 0x00, 0x00};
+    if (std::memcmp(base + offsets_rva, offsets_signature, sizeof(offsets_signature)) == 0) {
+      try {
+        const auto offsets_target = reinterpret_cast<CameraParametersWriter>(const_cast<uint8_t*>(base + offsets_rva));
+        const renodx::utils::minhook::Function offsets_hook(offsets_target, &HookCameraParametersWriter, &camera_builder_test.offsets_original);
+        renodx::utils::minhook::Create(offsets_hook);
+        renodx::utils::minhook::Enable(offsets_hook);
+        camera_builder_test.offsets_hook_installed = true;
+      } catch (const std::exception&) {
+        camera_builder_test.offsets_hook_installed = false;
+      }
+    }
     camera_builder_test.target = reinterpret_cast<void*>(target);
     camera_builder_test.state = CameraBuilderTest::State::active;
   } catch (const std::exception&) {
@@ -2294,6 +2365,7 @@ inline void ProbeSceneConstantBuffer(
             sample.temporal_valid = false;
             sample.fingerprint_valid = false;
             std::memcpy(sample.viewport, mapped + begin + 0x200u, sizeof(sample.viewport));
+            std::memcpy(sample.motion_vector_offsets, mapped + begin + 0x2c0u, sizeof(sample.motion_vector_offsets));
             std::memcpy(sample.projection, mapped + begin + 8u * 4u * sizeof(float), sizeof(sample.projection));
             std::memcpy(sample.matrix, mapped + begin + 20u * 4u * sizeof(float), sizeof(sample.matrix));
             std::memcpy(sample.previous_matrix, mapped + begin + 0x180u, sizeof(sample.previous_matrix));
@@ -2743,6 +2815,14 @@ struct MotionCapture {
     float matrix_x = 0.f, matrix_y = 0.f;
     float matrix_near_x = 0.f, matrix_near_y = 0.f;
     bool matrix_valid = false;
+    bool mask_valid = false;
+    bool packed_valid = false;
+    uint8_t mask[4] = {};
+    uint8_t packed[8] = {};
+    float motion_scale = 1.f;
+    uint32_t input_width = 0u, input_height = 0u;
+    float mask_fraction[2] = {};
+    float correction_delta[2] = {};
     uint64_t frame = 0u;
   };
   std::array<Sample, 4> samples = {};
@@ -3115,6 +3195,7 @@ struct UnpackData {
   reshade::api::pipeline_layout layout = {};
   reshade::api::descriptor_table tables[2] = {};
   reshade::api::pipeline pipeline = {};
+  reshade::api::pipeline masked_pipeline = {};
   reshade::api::resource texture = {};
   reshade::api::resource_view srv = {};
   reshade::api::resource_view uav = {};
@@ -3132,6 +3213,7 @@ inline void ReleaseUnpack(reshade::api::device* device) {
   if (unpack.srv.handle) device->destroy_resource_view(unpack.srv);
   if (unpack.texture.handle) device->destroy_resource(unpack.texture);
   if (unpack.pipeline.handle) device->destroy_pipeline(unpack.pipeline);
+  if (unpack.masked_pipeline.handle) device->destroy_pipeline(unpack.masked_pipeline);
   for (auto& table : unpack.tables) {
     if (table.handle) device->free_descriptor_table(table);
   }
@@ -3150,7 +3232,7 @@ inline bool EnsureUnpackLayout(reshade::api::device* device) {
   using P = reshade::api::pipeline_layout_param;
   using PT = reshade::api::pipeline_layout_param_type;
 
-  DR srv_r = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_shader_resource_view};  // t0 (packed MV)
+  DR srv_r = {0, 0, 0, 2, DS::all_compute, 1, DT::texture_shader_resource_view};  // t0 motion, t1 mask
   DR uav_r = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};  // u0 (pixel MV)
   reshade::api::constant_range pc_range = {};
   pc_range.binding = 0;
@@ -3200,6 +3282,10 @@ inline bool EnsureUnpackResources(reshade::api::device* device, uint32_t width, 
       device->destroy_pipeline(unpack.pipeline);
       unpack.pipeline = {};
     }
+    if (unpack.masked_pipeline.handle) {
+      device->destroy_pipeline(unpack.masked_pipeline);
+      unpack.masked_pipeline = {};
+    }
   }
   unpack.width = 0u;
   unpack.height = 0u;
@@ -3236,6 +3322,12 @@ inline bool EnsureUnpackResources(reshade::api::device* device, uint32_t width, 
     return false;
   }
 
+  cs_desc.code = __dlss_mv_masked_unpack.data();
+  cs_desc.code_size = __dlss_mv_masked_unpack.size();
+  if (!device->create_pipeline(unpack.layout, 1, &so, &unpack.masked_pipeline)) {
+    unpack.masked_pipeline = {};
+  }
+
   unpack.width = width;
   unpack.height = height;
   return true;
@@ -3245,7 +3337,9 @@ inline bool DispatchUnpack(
     reshade::api::device* device,
     reshade::api::command_list* cmd_list,
     reshade::api::resource_view packed_mv_srv,
-    uint32_t width, uint32_t height, uint32_t src_width, uint32_t src_height) {
+    uint32_t width, uint32_t height, uint32_t src_width, uint32_t src_height,
+    reshade::api::resource_view object_mask = {}, float jitter_delta_x = 0.f, float jitter_delta_y = 0.f,
+    float correction_scale = 1.f) {
   if (!EnsureUnpackResources(device, width, height)) return false;
   if (packed_mv_srv.handle == 0u || unpack.srv.handle == 0u || unpack.uav.handle == 0u) return false;
   // The packed buffer is half the input resolution; the output is input
@@ -3255,19 +3349,26 @@ inline bool DispatchUnpack(
 
   const auto AC = reshade::api::pipeline_stage::all_compute;
   const auto CS = reshade::api::shader_stage::all_compute;
-  cmd_list->bind_pipeline(AC, unpack.pipeline);
+  const bool masked = object_mask.handle != 0u && unpack.masked_pipeline.handle != 0u;
+  cmd_list->bind_pipeline(AC, masked ? unpack.masked_pipeline : unpack.pipeline);
 
   reshade::api::descriptor_table_update updates[2] = {
       {unpack.tables[0], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &packed_mv_srv},
       {unpack.tables[1], 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &unpack.uav},
   };
   device->update_descriptor_tables(2, updates);
+  if (masked) {
+    const reshade::api::descriptor_table_update mask_update = {
+        unpack.tables[0], 1, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &object_mask};
+    device->update_descriptor_tables(1, &mask_update);
+  }
   cmd_list->bind_descriptor_tables(CS, unpack.layout, 0, 2, unpack.tables);
 
   const float pc[8] = {static_cast<float>(width), static_cast<float>(height),
-                       dlss_mv_scale * (dlss_mv_flip != 0.f ? -1.f : 1.f), 0.f,
-                       static_cast<float>(src_width), static_cast<float>(src_height), 0.f, 0.f};
+                       dlss_mv_scale * (dlss_mv_flip != 0.f ? -1.f : 1.f), masked ? correction_scale : 0.f,
+                       static_cast<float>(src_width), static_cast<float>(src_height), jitter_delta_x, jitter_delta_y};
   cmd_list->push_constants(CS, unpack.layout, 2, 0, 8, pc);
+  cmd_list->barrier(unpack.texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
   cmd_list->dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1);
   cmd_list->barrier(unpack.texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   return true;
@@ -3312,6 +3413,54 @@ struct MotionProducerTrace {
 };
 inline MotionProducerTrace motion_producer_trace;
 inline float dlss_motion_pair_probe = 0.f;
+inline float dlss_object_motion_correction = 0.f;
+inline float dlss_object_motion_strength = 0.f;
+
+struct ObjectMaskState {
+  std::shared_mutex mutex;
+  struct Slot {
+    reshade::api::resource packed = {};
+    reshade::api::resource depth = {};
+    reshade::api::resource flags = {};
+    reshade::api::resource texture = {};
+    reshade::api::resource_view srv = {};
+    reshade::api::resource_view uav = {};
+    reshade::api::descriptor_table tables[2] = {};
+    uint64_t interval = UINT64_MAX;
+  };
+  reshade::api::device* device = nullptr;
+  reshade::api::pipeline_layout layout = {};
+  reshade::api::pipeline pipeline = {};
+  std::array<Slot, 8> slots = {};
+  uint64_t generated = 0u;
+  uint64_t unavailable = 0u;
+  uint64_t applied = 0u;
+  uint64_t missing_snapshot = 0u;
+  uint64_t missing_inputs = 0u;
+  uint64_t queue_not_ready = 0u;
+  uint64_t mask_not_ready = 0u;
+};
+inline ObjectMaskState object_mask_state;
+
+inline void ReleaseObjectMasks(reshade::api::device* device) {
+  if (device == nullptr) return;
+  std::unique_lock lock(object_mask_state.mutex);
+  if (object_mask_state.device != device) return;
+  for (auto& slot : object_mask_state.slots) {
+    for (auto& table : slot.tables) {
+      if (table.handle != 0u) device->free_descriptor_table(table);
+    }
+    if (slot.uav.handle != 0u) device->destroy_resource_view(slot.uav);
+    if (slot.srv.handle != 0u) device->destroy_resource_view(slot.srv);
+    if (slot.texture.handle != 0u) device->destroy_resource(slot.texture);
+    slot = {};
+  }
+  if (object_mask_state.pipeline.handle != 0u) device->destroy_pipeline(object_mask_state.pipeline);
+  if (object_mask_state.layout.handle != 0u) device->destroy_pipeline_layout(object_mask_state.layout);
+  object_mask_state.pipeline = {};
+  object_mask_state.layout = {};
+  object_mask_state.device = nullptr;
+}
 
 // Last deployment snapshot, for the Status readout and the report.
 struct DeployReport {
@@ -3573,7 +3722,7 @@ inline bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
     renodx::utils::shader::PopulateStageState(compute_state);
     if (compute_state->pipeline_details == nullptr) return false;
     const auto layout = compute_state->pipeline_details->layout;
-    if (dlss_motion_pair_probe != 0.f) {
+    if (dlss_motion_pair_probe != 0.f || dlss_object_motion_correction != 0.f) {
       uint32_t output_params[4] = {};
       uint32_t output_bindings[4] = {};
       const uint32_t output_count = FindTablesForRegister(
@@ -3632,6 +3781,144 @@ inline bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
         }
         output_resource = record.resource.handle;
         break;
+      }
+      if (dlss_object_motion_correction != 0.f && output_resource != 0u
+          && camera_builder_halton_enabled.load(std::memory_order_acquire) && bound.has_value()
+          && bound->known && bound->layout == layout) {
+        // The producer's inputs are already shader-readable here. Preserve the
+        // game's compute state before using a separate mask pipeline.
+        auto snapshot = renodx::utils::state::GetSnapshot(cmd_list);
+        reshade::api::resource inputs[2] = {};
+        reshade::api::format formats[2] = {};
+        auto* descriptors = renodx::utils::data::Get<renodx::utils::descriptor::DeviceData>(device);
+        const uint32_t registers[2] = {0u, 2u};
+        for (uint32_t j = 0u; j < 2u && descriptors != nullptr; ++j) {
+          uint32_t parameters[4] = {};
+          uint32_t slots[4] = {};
+          const uint32_t count = FindTablesForRegister(layout, registers[j], 0u,
+              reshade::api::descriptor_type::texture_shader_resource_view, parameters, slots, 4u,
+              reshade::api::shader_stage::all_compute);
+          for (uint32_t k = 0u; k < count; ++k) {
+            if (parameters[k] >= bound->tables.size()) continue;
+            const auto table = bound->tables[parameters[k]];
+            if (table.handle == 0u) continue;
+            reshade::api::descriptor_heap heap = {};
+            uint32_t offset = 0u;
+            device->get_descriptor_heap_offset(table, slots[k], 0u, &heap, &offset);
+            reshade::api::resource_view view = {};
+            {
+              std::shared_lock descriptor_lock(descriptors->mutex);
+              const auto it = descriptors->heaps.find(heap.handle);
+              if (it != descriptors->heaps.end() && offset < it->second.size()) {
+                const auto& slot = it->second[offset];
+                if (slot.type == reshade::api::descriptor_type::texture_shader_resource_view) view = slot.resource_view;
+              }
+            }
+            if (view.handle == 0u) continue;
+            inputs[j] = device->get_resource_from_view(view);
+            if (inputs[j].handle == 0u) continue;
+            formats[j] = device->get_resource_view_desc(view).format;
+            const auto desc = device->get_resource_desc(inputs[j]);
+            if (desc.type != reshade::api::resource_type::texture_2d
+                || desc.texture.width != last_render_width.load() || desc.texture.height != last_render_height.load()) {
+              inputs[j] = {};
+              continue;
+            }
+            break;
+          }
+        }
+        std::unique_lock mask_lock(object_mask_state.mutex);
+        if (snapshot.has_value() && inputs[0].handle != 0u && inputs[1].handle != 0u
+            && (object_mask_state.device == nullptr || object_mask_state.device == device)) {
+          object_mask_state.device = device;
+          if (object_mask_state.layout.handle == 0u) {
+            using DS = reshade::api::shader_stage;
+            using DT = reshade::api::descriptor_type;
+            using PT = reshade::api::pipeline_layout_param_type;
+            reshade::api::descriptor_range srvs = {0, 0, 0, 2, DS::all_compute, 1, DT::texture_shader_resource_view};
+            reshade::api::descriptor_range uav = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};
+            reshade::api::constant_range constants = {};
+            constants.count = 4u;
+            constants.visibility = DS::all_compute;
+            reshade::api::pipeline_layout_param params[3] = {};
+            params[0].type = PT::descriptor_table;
+            params[0].descriptor_table = {1u, &srvs};
+            params[1].type = PT::descriptor_table;
+            params[1].descriptor_table = {1u, &uav};
+            params[2].type = PT::push_constants;
+            params[2].push_constants = constants;
+            device->create_pipeline_layout(3u, params, &object_mask_state.layout);
+          }
+          if (object_mask_state.layout.handle != 0u && object_mask_state.pipeline.handle == 0u) {
+            reshade::api::shader_desc shader = {};
+            shader.code = __dlss_object_motion_mask.data();
+            shader.code_size = __dlss_object_motion_mask.size();
+            shader.entry_point = "main";
+            reshade::api::pipeline_subobject subobject = {reshade::api::pipeline_subobject_type::compute_shader, 1u, &shader};
+            device->create_pipeline(object_mask_state.layout, 1u, &subobject, &object_mask_state.pipeline);
+          }
+          ObjectMaskState::Slot* mask = nullptr;
+          ObjectMaskState::Slot* empty = nullptr;
+          for (auto& slot : object_mask_state.slots) {
+            if (slot.texture.handle == 0u && empty == nullptr) empty = &slot;
+            if (slot.packed.handle == output_resource && slot.depth.handle == inputs[0].handle
+                && slot.flags.handle == inputs[1].handle && slot.texture.handle != 0u) {
+              mask = &slot;
+              break;
+            }
+          }
+          if (mask == nullptr && empty != nullptr && object_mask_state.pipeline.handle != 0u) {
+            auto& slot = *empty;
+            const uint32_t width = last_render_width.load() / 2u;
+            const uint32_t height = last_render_height.load() / 2u;
+            reshade::api::resource_desc desc = {};
+            desc.type = reshade::api::resource_type::texture_2d;
+            desc.texture = {width, height, 1u, 1u, reshade::api::format::r8_unorm, 1u};
+            desc.heap = reshade::api::memory_heap::gpu_only;
+            desc.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+            reshade::api::resource_view_desc view_desc(reshade::api::resource_view_type::texture_2d,
+                                                       reshade::api::format::r8_unorm, 0, 1, 0, 1);
+            if (device->create_resource(desc, nullptr, reshade::api::resource_usage::shader_resource, &slot.texture)
+                && device->create_resource_view(slot.texture, reshade::api::resource_usage::shader_resource, view_desc, &slot.srv)
+                && device->create_resource_view(slot.texture, reshade::api::resource_usage::unordered_access, view_desc, &slot.uav)
+                && device->allocate_descriptor_table(object_mask_state.layout, 0u, &slot.tables[0])
+                && device->allocate_descriptor_table(object_mask_state.layout, 1u, &slot.tables[1])) {
+              const reshade::api::resource_view views[2] = {
+                  GetOrCreateTextureView(device, inputs[0], formats[0]), GetOrCreateTextureView(device, inputs[1], formats[1])};
+              if (views[0].handle != 0u && views[1].handle != 0u) {
+                const reshade::api::descriptor_table_update updates[2] = {
+                    {slot.tables[0], 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, views},
+                    {slot.tables[1], 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &slot.uav}};
+                device->update_descriptor_tables(2u, updates);
+                slot.packed = reshade::api::resource{output_resource};
+                slot.depth = inputs[0];
+                slot.flags = inputs[1];
+                mask = &slot;
+              }
+            }
+          }
+          if (mask != nullptr) {
+            cmd_list->barrier(mask->texture, reshade::api::resource_usage::shader_resource,
+                              reshade::api::resource_usage::unordered_access);
+            cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, object_mask_state.pipeline);
+            cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, object_mask_state.layout, 0u, 2u, mask->tables);
+            const uint32_t constants[4] = {last_render_width.load(), last_render_height.load(),
+                                           last_render_width.load() / 2u, last_render_height.load() / 2u};
+            cmd_list->push_constants(reshade::api::shader_stage::all_compute, object_mask_state.layout, 2u, 0u, 4u, constants);
+            cmd_list->dispatch((constants[2] + 7u) / 8u, (constants[3] + 7u) / 8u, 1u);
+            cmd_list->barrier(mask->texture, reshade::api::resource_usage::unordered_access,
+                              reshade::api::resource_usage::shader_resource);
+            snapshot->ApplyCompute();
+            mask->interval = camera_builder_frame.load(std::memory_order_acquire);
+            ++object_mask_state.generated;
+          } else {
+            ++object_mask_state.unavailable;
+          }
+        } else {
+          ++object_mask_state.unavailable;
+          if (!snapshot.has_value()) ++object_mask_state.missing_snapshot;
+          else if (inputs[0].handle == 0u || inputs[1].handle == 0u) ++object_mask_state.missing_inputs;
+        }
       }
       std::unique_lock lock(motion_producer_trace.mutex);
       if (output_resource != 0u) {
@@ -4083,7 +4370,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   const uint32_t motion_src_height = use_motion_placeholder
       ? placeholders.height
       : static_cast<uint32_t>(motion->GetDesc().Height);
-  if (!use_motion_placeholder && dlss_motion_pair_probe != 0.f) {
+  if (!use_motion_placeholder && (dlss_motion_pair_probe != 0.f || dlss_object_motion_correction != 0.f)) {
     const uint64_t interval = camera_builder_frame.load(std::memory_order_acquire);
     std::unique_lock lock(motion_producer_trace.mutex);
     MotionProducerTrace::Entry* match = nullptr;
@@ -4103,31 +4390,6 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       ++motion_producer_trace.matched_other_list;
     }
   }
-  ID3D12Resource* motion_vectors = nullptr;
-  if (use_motion_placeholder) {
-    // A substituted motion input is used as-is: it is already pixel-space zero
-    // motion at the input resolution, so the unpack has nothing to decode.
-    motion_vectors = reinterpret_cast<ID3D12Resource*>(placeholders.motion.handle);
-  } else {
-    // Our own view of the resolved resource: a recorded handle would name whichever
-    // view last occupied that slot, not the one this draw bound.
-    const reshade::api::resource_view motion_view =
-        GetOrCreateTextureView(device, motion_in.resource, motion_in.format);
-    if (motion_view.handle == 0u) {
-      NoteFail(kFailUnpack);
-      return false;
-    }
-    if (!DispatchUnpack(device, cmd_list, motion_view, input_width, input_height,
-                        motion_src_width, motion_src_height)) {
-      NoteFail(kFailUnpack);
-      return false;
-    }
-    motion_vectors = unpack.texture.handle != 0u
-        ? reinterpret_cast<ID3D12Resource*>(unpack.texture.handle)
-        : nullptr;
-  }
-  if (motion_vectors == nullptr) return false;
-
   // Reset DLSS history only on a structural change.
   {
     const uint64_t dims = (static_cast<uint64_t>(input_width) << 48)
@@ -4203,12 +4465,22 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   bool builder_scene_matches = false;
   uint32_t builder_halton_step = 0u;
   float builder_pixels[2] = {};
+  float previous_builder_pixels[2] = {};
+  bool previous_builder_valid = false;
   if (camera_builder_halton_enabled.load(std::memory_order_acquire)) {
     std::shared_lock lock(camera_builder_test.mutex);
     builder_halton = camera_builder_test.halton_frame == frame_counter;
     if (builder_halton) {
       builder_pixels[0] = camera_builder_test.halton_pixels[0];
       builder_pixels[1] = camera_builder_test.halton_pixels[1];
+      if (frame_counter != 0u) {
+        const auto& previous = camera_builder_test.halton_history[(frame_counter - 1u) % camera_builder_test.halton_history.size()];
+        if (previous.frame == frame_counter - 1u && previous.width == input_width && previous.height == input_height) {
+          previous_builder_pixels[0] = previous.pixels[0];
+          previous_builder_pixels[1] = previous.pixels[1];
+          previous_builder_valid = true;
+        }
+      }
       builder_halton_step = camera_builder_test.halton_step;
       builder_scene_matches = scene_fresh && scene_jitter.from_projection
           && std::abs(scene_jitter.pixels_x - builder_pixels[0]) < 0.01f
@@ -4230,6 +4502,82 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     jitter_y = 0.f;
   }
 
+  // Keep the existing correction as the default while allowing controlled A/B tests.
+  float object_strength = 1.f;
+  switch (static_cast<int>(dlss_object_motion_strength)) {
+    case 1: object_strength = 0.f; break;
+    case 2: object_strength = -1.f; break;
+    case 3: object_strength = 0.5f; break;
+    case 4: object_strength = -0.5f; break;
+    default: break;
+  }
+  reshade::api::resource_view object_mask = {};
+  float object_delta_x = 0.f;
+  float object_delta_y = 0.f;
+  if (!use_motion_placeholder && dlss_object_motion_correction != 0.f && builder_halton
+      && dlss_motion_vectors_jittered == 0.f && previous_builder_valid) {
+    bool paired_in_recording = false;
+    {
+      std::shared_lock lock(motion_producer_trace.mutex);
+      // These lists are normally recorded before either is submitted. Require
+      // matching current-frame recording and a history of ordered submissions;
+      // submission callbacks alone cannot prove this frame's future queue.
+      if (motion_producer_trace.same_queue_ordered >= 32u && motion_producer_trace.same_queue_reversed == 0u
+          && motion_producer_trace.different_queues == 0u) {
+        for (const auto& entry : motion_producer_trace.entries) {
+          if (entry.resource == motion_in.resource.handle && entry.interval == frame_counter
+              && entry.command_list != nullptr && entry.eval_command_list == cmd_list) {
+            paired_in_recording = true;
+            break;
+          }
+        }
+      }
+    }
+    if (paired_in_recording) {
+      std::unique_lock lock(object_mask_state.mutex);
+      for (const auto& slot : object_mask_state.slots) {
+        if (slot.packed.handle == motion_in.resource.handle && slot.interval == frame_counter) {
+          object_mask = slot.srv;
+          object_delta_x = jitter_x - previous_builder_pixels[0];
+          object_delta_y = jitter_y - previous_builder_pixels[1];
+          break;
+        }
+      }
+      if (object_mask.handle == 0u) ++object_mask_state.mask_not_ready;
+    } else {
+      std::unique_lock lock(object_mask_state.mutex);
+      ++object_mask_state.queue_not_ready;
+    }
+  }
+  ID3D12Resource* motion_vectors = nullptr;
+  if (use_motion_placeholder) {
+    // A substituted motion input is used as-is: it is already pixel-space zero
+    // motion at the input resolution, so the unpack has nothing to decode.
+    motion_vectors = reinterpret_cast<ID3D12Resource*>(placeholders.motion.handle);
+  } else {
+    // Our own view of the resolved resource: a recorded handle would name whichever
+    // view last occupied that slot, not the one this draw bound.
+    const reshade::api::resource_view motion_view =
+        GetOrCreateTextureView(device, motion_in.resource, motion_in.format);
+    if (motion_view.handle == 0u) {
+      NoteFail(kFailUnpack);
+      return false;
+    }
+    if (!DispatchUnpack(device, cmd_list, motion_view, input_width, input_height,
+                        motion_src_width, motion_src_height, object_mask, object_delta_x, object_delta_y, object_strength)) {
+      NoteFail(kFailUnpack);
+      return false;
+    }
+    motion_vectors = unpack.texture.handle != 0u
+        ? reinterpret_cast<ID3D12Resource*>(unpack.texture.handle)
+        : nullptr;
+    if (object_mask.handle != 0u && unpack.masked_pipeline.handle != 0u) {
+      std::unique_lock lock(object_mask_state.mutex);
+      ++object_mask_state.applied;
+    }
+  }
+  if (motion_vectors == nullptr) return false;
+
   if (dlss_jitter_source >= 2.5f && temporal_jitter_valid) {
     ++stat_jitter_temporal;
   } else if (dlss_jitter_source >= 2.5f) {
@@ -4248,20 +4596,35 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   static bool previous_jitter_flip = false;
   static bool previous_camera_override = false;
   static bool previous_builder_halton = false;
+  static bool previous_motion_offsets = false;
+  static bool previous_object_correction = false;
+  static float previous_object_strength = 1.f;
+  // A temporarily unavailable mask should not repeatedly erase DLSS history.
+  const bool current_object_correction = dlss_object_motion_correction != 0.f && dlss_motion_vectors_jittered == 0.f;
   const int current_jitter_source = static_cast<int>(dlss_jitter_source);
   const bool current_jitter_flip = flip_game_jitter;
   if (current_jitter_source != previous_jitter_source || current_jitter_flip != previous_jitter_flip
-      || camera_override_applied != previous_camera_override || builder_halton != previous_builder_halton) {
+      || camera_override_applied != previous_camera_override || builder_halton != previous_builder_halton
+      || camera_builder_motion_offsets_enabled.load(std::memory_order_acquire) != previous_motion_offsets
+      || current_object_correction != previous_object_correction
+      || (current_object_correction && object_strength != previous_object_strength)) {
     ngx.reset = true;
     previous_jitter_source = current_jitter_source;
     previous_jitter_flip = current_jitter_flip;
     previous_camera_override = camera_override_applied;
     previous_builder_halton = builder_halton;
+    previous_motion_offsets = camera_builder_motion_offsets_enabled.load(std::memory_order_acquire);
+    previous_object_correction = current_object_correction;
+    previous_object_strength = object_strength;
   }
 
   // Record the copy after unpack and before NGX on the same command list.
   // Only a command list observed being submitted can be read back.
   ID3D12Resource* capture_buffer = nullptr;
+  reshade::api::resource capture_mask = {};
+  reshade::api::resource capture_packed = {};
+  uint32_t capture_mask_x = 0u;
+  uint32_t capture_mask_y = 0u;
   bool want_motion_sample = false;
   {
     std::shared_lock lock(motion_capture.mutex);
@@ -4281,6 +4644,28 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       motion_capture.x = input_width / 2u;
       motion_capture.y = input_height / 2u;
       motion_capture.pending = {.jitter_x = jitter_x, .jitter_y = jitter_y, .frame = frame_counter};
+      if (object_mask.handle != 0u && unpack.masked_pipeline.handle != 0u
+          && motion_src_width >= 2u && motion_src_height >= 2u) {
+        const float x = (static_cast<float>(input_width / 2u) + 0.5f) * motion_src_width / input_width - 0.5f;
+        const float y = (static_cast<float>(input_height / 2u) + 0.5f) * motion_src_height / input_height - 0.5f;
+        const float floor_x = std::floor(x);
+        const float floor_y = std::floor(y);
+        capture_mask_x = static_cast<uint32_t>((std::clamp)(static_cast<int32_t>(floor_x), 0, static_cast<int32_t>(motion_src_width) - 2));
+        capture_mask_y = static_cast<uint32_t>((std::clamp)(static_cast<int32_t>(floor_y), 0, static_cast<int32_t>(motion_src_height) - 2));
+        capture_mask = device->get_resource_from_view(object_mask);
+        motion_capture.pending.mask_valid = capture_mask.handle != 0u;
+        if (motion_in.format == reshade::api::format::r8g8_unorm && motion_in.resource.handle != 0u) {
+          capture_packed = motion_in.resource;
+          motion_capture.pending.packed_valid = true;
+          motion_capture.pending.motion_scale = dlss_mv_scale * (dlss_mv_flip != 0.f ? -1.f : 1.f);
+          motion_capture.pending.input_width = input_width;
+          motion_capture.pending.input_height = input_height;
+        }
+        motion_capture.pending.mask_fraction[0] = x - floor_x;
+        motion_capture.pending.mask_fraction[1] = y - floor_y;
+        motion_capture.pending.correction_delta[0] = object_delta_x * object_strength;
+        motion_capture.pending.correction_delta[1] = object_delta_y * object_strength;
+      }
       const float* matrix = motion_producer_report.motion_constants;
       // The producer selects a depth-neighborhood location and the unpack
       // filters packed values. Evaluate two hypothetical depth terms at the
@@ -4326,6 +4711,46 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     command_list->CopyTextureRegion(&dst, 0u, 0u, 0u, &src, &box);
     cmd_list->barrier(motion_resource, reshade::api::resource_usage::copy_source,
                       reshade::api::resource_usage::shader_resource);
+    if (capture_mask.handle != 0u) {
+      cmd_list->barrier(capture_mask, reshade::api::resource_usage::shader_resource,
+                        reshade::api::resource_usage::copy_source);
+      D3D12_TEXTURE_COPY_LOCATION mask_source = {};
+      mask_source.pResource = reinterpret_cast<ID3D12Resource*>(capture_mask.handle);
+      mask_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      D3D12_TEXTURE_COPY_LOCATION mask_destination = {};
+      mask_destination.pResource = capture_buffer;
+      mask_destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      mask_destination.PlacedFootprint.Offset = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+      mask_destination.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8_UNORM;
+      mask_destination.PlacedFootprint.Footprint.Width = 2u;
+      mask_destination.PlacedFootprint.Footprint.Height = 2u;
+      mask_destination.PlacedFootprint.Footprint.Depth = 1u;
+      mask_destination.PlacedFootprint.Footprint.RowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+      const D3D12_BOX mask_box{capture_mask_x, capture_mask_y, 0u, capture_mask_x + 2u, capture_mask_y + 2u, 1u};
+      command_list->CopyTextureRegion(&mask_destination, 0u, 0u, 0u, &mask_source, &mask_box);
+      cmd_list->barrier(capture_mask, reshade::api::resource_usage::copy_source,
+                        reshade::api::resource_usage::shader_resource);
+    }
+    if (capture_packed.handle != 0u) {
+      cmd_list->barrier(capture_packed, reshade::api::resource_usage::shader_resource,
+                        reshade::api::resource_usage::copy_source);
+      D3D12_TEXTURE_COPY_LOCATION packed_source = {};
+      packed_source.pResource = reinterpret_cast<ID3D12Resource*>(capture_packed.handle);
+      packed_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      D3D12_TEXTURE_COPY_LOCATION packed_destination = {};
+      packed_destination.pResource = capture_buffer;
+      packed_destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      packed_destination.PlacedFootprint.Offset = 2u * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+      packed_destination.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8_UNORM;
+      packed_destination.PlacedFootprint.Footprint.Width = 2u;
+      packed_destination.PlacedFootprint.Footprint.Height = 2u;
+      packed_destination.PlacedFootprint.Footprint.Depth = 1u;
+      packed_destination.PlacedFootprint.Footprint.RowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+      const D3D12_BOX packed_box{capture_mask_x, capture_mask_y, 0u, capture_mask_x + 2u, capture_mask_y + 2u, 1u};
+      command_list->CopyTextureRegion(&packed_destination, 0u, 0u, 0u, &packed_source, &packed_box);
+      cmd_list->barrier(capture_packed, reshade::api::resource_usage::copy_source,
+                        reshade::api::resource_usage::shader_resource);
+    }
   }
 
   NVSDK_NGX_D3D12_DLSS_Eval_Params eval = {};
@@ -4662,6 +5087,23 @@ inline std::string BuildDebugReport() {
     out += line;
   }
   {
+    std::shared_lock lock(object_mask_state.mutex);
+    char line[240];
+    snprintf(line, sizeof(line),
+             "  object motion   : %s strength-mode=%.0f masks=%llu unavailable=%llu corrected=%llu; requires Halton and MV jittered off\n",
+             dlss_object_motion_correction != 0.f ? "test on" : "off", dlss_object_motion_strength,
+             static_cast<unsigned long long>(object_mask_state.generated),
+             static_cast<unsigned long long>(object_mask_state.unavailable),
+             static_cast<unsigned long long>(object_mask_state.applied));
+    out += line;
+    snprintf(line, sizeof(line), "    object motion diagnostics: no-snapshot=%llu no-inputs=%llu queue-not-ready=%llu mask-not-ready=%llu\n",
+             static_cast<unsigned long long>(object_mask_state.missing_snapshot),
+             static_cast<unsigned long long>(object_mask_state.missing_inputs),
+             static_cast<unsigned long long>(object_mask_state.queue_not_ready),
+             static_cast<unsigned long long>(object_mask_state.mask_not_ready));
+    out += line;
+  }
+  {
     std::shared_lock lock(motion_capture.mutex);
     const char* state = "idle";
     switch (motion_capture.state) {
@@ -4684,6 +5126,45 @@ inline std::string BuildDebugReport() {
                static_cast<unsigned long long>(sample.frame), sample.x, sample.y,
                sample.jitter_x, sample.jitter_y);
       out += line;
+      if (sample.mask_valid) {
+        const float fx = sample.mask_fraction[0];
+        const float fy = sample.mask_fraction[1];
+        const float weight = (sample.mask[0] * (1.f - fx) * (1.f - fy)
+                              + sample.mask[1] * fx * (1.f - fy)
+                              + sample.mask[2] * (1.f - fx) * fy
+                              + sample.mask[3] * fx * fy) / 255.f;
+        snprintf(line, sizeof(line),
+                 "      object mask=%u,%u,%u,%u weight=%.4f correction=(%.4f,%.4f) px\n",
+                 static_cast<unsigned>(sample.mask[0]), static_cast<unsigned>(sample.mask[1]),
+                 static_cast<unsigned>(sample.mask[2]), static_cast<unsigned>(sample.mask[3]), weight,
+                 sample.correction_delta[0] * weight, sample.correction_delta[1] * weight);
+        out += line;
+        if (sample.packed_valid) {
+          const auto decode = [&](uint32_t channel) {
+            const float value = (sample.packed[channel] * (1.f - fx) * (1.f - fy)
+                                 + sample.packed[2u + channel] * fx * (1.f - fy)
+                                 + sample.packed[4u + channel] * (1.f - fx) * fy
+                                 + sample.packed[6u + channel] * fx * fy) / 255.f;
+            const float m = value - 0.49803921580314636f;
+            const float x = m * 2.f;
+            if (x < -0.6687403321266174f) return m * 4.830047130584717f + 1.415023684501648f;
+            if (x >= 0.6687403321266174f) return m * 4.830047130584717f - 1.415023684501648f;
+            const float x2 = x * x;
+            return x2 * x2 * (m > 0.f ? 1.f : (m < 0.f ? -1.f : 0.f));
+          };
+          const float raw_x = decode(0u) * 0.1f * sample.input_width * sample.motion_scale;
+          const float raw_y = decode(1u) * 0.1f * sample.input_height * sample.motion_scale;
+          snprintf(line, sizeof(line),
+                   "      raw mv=(%.5f,%.5f) px; output minus expected=(%.5f,%.5f) px\n",
+                   raw_x, raw_y, sample.x - raw_x - sample.correction_delta[0] * weight,
+                   sample.y - raw_y - sample.correction_delta[1] * weight);
+          out += line;
+        } else {
+          out += "      packed motion unavailable for this evaluation\n";
+        }
+      } else {
+        out += "      object mask unavailable for this evaluation\n";
+      }
       if (sample.matrix_valid) {
         snprintf(line, sizeof(line),
                  "      camera estimates=(%.5f,%.5f)/(%.5f,%.5f) px; depth terms 0/0.01 hypothetical\n",
@@ -4864,6 +5345,10 @@ inline std::string BuildDebugReport() {
       snprintf(line, sizeof(line), "      viewport cb0+0x334 jitter-frame=%u offscreen-flag=%u (unverified)\n",
                sample.jitter_frame, sample.offscreen);
       out += line;
+      snprintf(line, sizeof(line), "      cb0+0x2c0 MotionVectorOffsets=(%.9g,%.9g,%.9g,%.9g); CPU candidate\n",
+               sample.motion_vector_offsets[0], sample.motion_vector_offsets[1],
+               sample.motion_vector_offsets[2], sample.motion_vector_offsets[3]);
+      out += line;
       double shifts[2][2] = {};
       double norms[2] = {};
       const float* matrices[] = {sample.matrix, sample.previous_matrix};
@@ -4935,6 +5420,13 @@ inline std::string BuildDebugReport() {
              static_cast<unsigned long long>(camera_builder_test.halton_verified),
              camera_builder_test.last_input[0], camera_builder_test.last_input[1],
              camera_builder_test.last_projection[0], camera_builder_test.last_projection[1], camera_builder_test.last_frame);
+    out += line;
+    snprintf(line, sizeof(line), "    motion offset patch: %s hook=%s patched=%llu rejected=%llu last-before=(%.4f,%.4f); scene buffer values below\n",
+             camera_builder_motion_offsets_enabled.load() ? "on" : "off",
+             camera_builder_test.offsets_hook_installed ? "installed" : "unavailable",
+             static_cast<unsigned long long>(camera_builder_test.motion_offset_patched),
+             static_cast<unsigned long long>(camera_builder_test.motion_offset_rejected),
+             camera_builder_test.motion_offset_before[0], camera_builder_test.motion_offset_before[1]);
     out += line;
     snprintf(line, sizeof(line), "    halton at eval : %s step=%u camera px=(%.4f,%.4f) scene matches=%s; flip ignored; NGX px shown above\n",
              report.builder_halton_at_eval ? "yes" : "no", report.builder_halton_step_at_eval,
@@ -5125,7 +5617,7 @@ inline std::string BuildDebugReport() {
 
 // ── Event handlers ──
 inline void OnExecuteCommandList(reshade::api::command_queue* queue, reshade::api::command_list* cmd_list) {
-  if (dlss_motion_pair_probe != 0.f && queue != nullptr && cmd_list != nullptr) {
+  if ((dlss_motion_pair_probe != 0.f || dlss_object_motion_correction != 0.f) && queue != nullptr && cmd_list != nullptr) {
     std::unique_lock lock(motion_producer_trace.mutex);
     const uint64_t serial = ++motion_producer_trace.submit_serial;
     for (auto& entry : motion_producer_trace.entries) {
@@ -5573,7 +6065,7 @@ inline void OnPresent(
       heap.VisibleNodeMask = 1u;
       D3D12_RESOURCE_DESC desc = {};
       desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      desc.Width = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+      desc.Width = 2u * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT + 2u * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
       desc.Height = 1u;
       desc.DepthOrArraySize = 1u;
       desc.MipLevels = 1u;
@@ -5592,8 +6084,10 @@ inline void OnPresent(
       // after submission. Waiting here is limited to the four requested samples.
       queue->wait_idle();
       uint16_t values[2] = {};
+      uint8_t mask_values[4] = {};
+      uint8_t packed_values[8] = {};
       void* mapped = nullptr;
-      D3D12_RANGE read_range{0u, sizeof(values)};
+      D3D12_RANGE read_range{0u, 2u * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT + 2u * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
       ID3D12Resource* buffer = nullptr;
       {
         std::shared_lock lock(motion_capture.mutex);
@@ -5602,6 +6096,14 @@ inline void OnPresent(
       const bool mapped_ok = buffer != nullptr && SUCCEEDED(buffer->Map(0u, &read_range, &mapped)) && mapped != nullptr;
       if (mapped_ok) {
         std::memcpy(values, mapped, sizeof(values));
+        const auto* bytes = static_cast<const uint8_t*>(mapped) + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+        mask_values[0] = bytes[0];
+        mask_values[1] = bytes[1];
+        mask_values[2] = bytes[D3D12_TEXTURE_DATA_PITCH_ALIGNMENT];
+        mask_values[3] = bytes[D3D12_TEXTURE_DATA_PITCH_ALIGNMENT + 1u];
+        bytes += D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+        std::memcpy(packed_values, bytes, 4u);
+        std::memcpy(packed_values + 4u, bytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, 4u);
         const D3D12_RANGE written{0u, 0u};
         buffer->Unmap(0u, &written);
       }
@@ -5617,6 +6119,12 @@ inline void OnPresent(
       if (mapped_ok) {
         motion_capture.pending.x = half_to_float(values[0]);
         motion_capture.pending.y = half_to_float(values[1]);
+        if (motion_capture.pending.mask_valid) {
+          std::copy(std::begin(mask_values), std::end(mask_values), std::begin(motion_capture.pending.mask));
+        }
+        if (motion_capture.pending.packed_valid) {
+          std::copy(std::begin(packed_values), std::end(packed_values), std::begin(motion_capture.pending.packed));
+        }
         motion_capture.samples[motion_capture.count++] = motion_capture.pending;
         motion_capture.state = (motion_capture.count == motion_capture.samples.size())
             ? MotionCapture::State::complete : MotionCapture::State::armed;
@@ -5670,6 +6178,7 @@ inline void OnPresent(
   ++frame_counter;
   camera_builder_frame.store(frame_counter, std::memory_order_release);
   const bool want_halton = dlss_halton_jitter != 0.f && dlss_enabled != 0.f;
+  camera_builder_motion_offsets_enabled.store(want_halton && dlss_halton_motion_offsets != 0.f, std::memory_order_release);
   if (want_halton) StartCameraBuilderTest();
   {
     std::shared_lock lock(camera_builder_test.mutex);
@@ -5752,6 +6261,7 @@ inline void OnDestroyDevice(reshade::api::device* device) {
   }
   if (was_ours) {
     ReleaseNgx();
+    ReleaseObjectMasks(device);
     ReleaseUnpack(unpack_device);
     unpack_device = nullptr;
     ReleasePlaceholders(device);
@@ -5768,6 +6278,9 @@ inline void Use(DWORD fdw_reason) {
   //
   // Descriptor copies are subscribed only when the experimental test is started,
   // because the engine issues enough copies for interception to be expensive.
+  if (fdw_reason == DLL_PROCESS_ATTACH && dlss_object_motion_correction != 0.f) {
+    renodx::utils::state::use_snapshot = true;
+  }
   renodx::utils::shader::Use(fdw_reason);
   renodx::utils::pipeline_layout::Use(fdw_reason);
 
@@ -5825,7 +6338,9 @@ inline void Use(DWORD fdw_reason) {
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       {
-        reshade::api::device* device = unpack_device != nullptr ? unpack_device : placeholder_device;
+        reshade::api::device* device = unpack_device != nullptr ? unpack_device
+            : (placeholder_device != nullptr ? placeholder_device : object_mask_state.device);
+        ReleaseObjectMasks(device);
         unpack_device = nullptr;
         ReleaseUnpack(device);
         ReleasePlaceholders(device);

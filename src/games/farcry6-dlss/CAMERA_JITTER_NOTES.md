@@ -141,9 +141,8 @@ Implementation started: `dlss_object_motion_mask.cs_6_0.hlsl` generates an R8
 mask from the producer's linear depth and flags. It mirrors the producer's
 ordered 3x3 neighborhood of 2x2 gathers and tests bit 3 at the selected sample.
 The shader compiles with DXC, and synthetic gather/tie-order cases were checked.
-It is not yet bound or dispatched by the addon; GPU comparison against the
-original producer, sampler/addressing details, resource and descriptor lifetime,
-queue ordering, state restoration, and the motion correction remain open.
+GPU comparison against the original producer and sampler/addressing details
+remain open.
 
 `Motion Pairing Probe` is an opt-in CPU-side diagnostic. It matches the
 producer's u0 resource against TAA's resolved motion input within the same
@@ -158,8 +157,52 @@ first, and no different-queue or reversed pairs. This supports investigating an
 ordered GPU-only handoff for this session; it does not prove all future frames
 or safe reuse of descriptors and mask resources while the GPU is behind.
 
-`dlss_mv_masked_unpack.cs_6_0.hlsl` is an unbound experimental unpack shader.
+`dlss_mv_masked_unpack.cs_6_0.hlsl` is an experimental unpack shader.
 It preserves the existing packed-motion filter and adds an object-mask-weighted
 current-minus-previous jitter delta, with an explicit correction scale. The
-sign, edge interpolation and actual mask coverage remain unverified, and neither
-shader is dispatched by the addon yet. The shader compiles with DXC.
+sign, edge interpolation and actual mask coverage remain unverified. The addon
+now dispatches both shaders under the opt-in Object Motion Correction test,
+which requires DevKit descriptor tracking and a restart after enabling state
+snapshots. A mask is paired by packed resource and present interval; correction
+falls back when the queue, Halton history or mask is unavailable. The producer
+compute state is captured and restored around mask generation. These mechanisms
+and the FPS cost have not been verified in game, and a prior same-queue observation
+does not prove queue identity or resource safety for every later frame.
+
+## Object motion shader follow-up
+
+The 2026-10-28 report with strength 0 confirmed that the masked unpack output
+matched the decoded game motion, and the user reported less shaking than with
+the other tested strengths. This does not prove that the original object
+motion is correct or rule out edge filtering and animation effects.
+
+In the active DevKit snapshot, draw 1670 bound 0xD8F98738 as its pixel shader
+and the motion producer's full-resolution t3 resource as RTV2. Its DXIL writes
+encoded motion to target 2 xy. The calculation reads viewport cb0 register 44
+(offset 0x2c0, MotionVectorOffsets) and uses its xy components with SV_Position
+and the viewport scale before encoding. Its viewport cb0 used the same buffer
+and offset as a sampled scene camera buffer in this snapshot. Other object
+shaders and the exact meaning of this field remain unverified. Copy Report now
+records all four CPU-read values beside the scene matrix for comparison; these
+values are candidates, not a per-draw GPU verification.
+
+The 2026-10-28 report shows sampled `MotionVectorOffsets.xy` alternating
+between (+0.25,-0.25) and (-0.25,+0.25), while the camera follows Halton.
+The guarded experimental camera-hook patch attempts to replace provider
+`+0x2e0` with Halton pixel offsets only when its existing xy match the original
+camera input converted to pixels. The buffer observation and one object shader
+make this a candidate, not proof of timing, coverage, sign or visual improvement.
+Copy Report records guard counts and the later sampled camera-buffer values; a
+patch count alone does not prove that the GPU consumed the new value.
+
+The following report found the first camera-hook attempt rejected 515/517
+providers and the scene buffer retained the original two-phase values. A
+bounded scan of the DLL's PE unwind-described functions found a later candidate
+writer: function `0x1806cbe10`, instruction `0x1806cbeed`, copies eight bytes
+from its second argument +0x70 to its first argument +0x2e0. Nearby writes set
+the provider's viewport at +0x220. Static analysis does not establish which
+runtime view invokes it or its ordering relative to the Halton camera builder.
+The experimental hook now runs after this writer and requires matching render
+size, projection, current-frame Halton history and original two-phase offsets.
+Copy Report must establish whether it matched and whether the later scene
+buffer actually contains the desired offsets; visual and GPU verification remain.
