@@ -85,6 +85,8 @@ inline constexpr uint32_t kRt12DynamicInstanceId = 0xFFFFFFu;  // InstanceID of 
 inline constexpr uint32_t kRt12CarrierWidth = 4096u;     // carrier texels per row; vertex v at (v % width, v / width)
 inline constexpr uint32_t kRt12CarrierHeight = 512u;     // 4096 * 512 vertices = the 24 MB deform arena of float3
 inline constexpr uint32_t kRt12DynamicRebuildFrames = 30u;  // full BLAS rebuild cadence (owner decision)
+inline constexpr uint32_t kRt12RecordTexels = 12u;          // WorldInstanceGPU = 192 bytes = 12 RGBA32_UINT texels
+inline constexpr uint32_t kRt12RecordCarrierHeight = 96u;   // 4096 * 96 texels = 32768 records (kPoolDynamicInstances)
 
 // End (exclusive) of the vertices `count` characters use: max(vertex_base + 3 * triangles), 0 for none.
 inline uint64_t Rt12DynamicVertexEnd(const uint32_t* vertex_base, const uint32_t* triangles, size_t count) {
@@ -126,6 +128,26 @@ inline Rt12InstanceFields MakeRt12InstanceFields(const float* world16, float vis
     fields.transform[i] = world16[i];
   }
   return fields;
+}
+
+// The 16 words of the D3D12_RAYTRACING_INSTANCE_DESC that world_rt12_records.cs_6_5.hlsl writes for one P2b record
+// (its CPU transcription, tested against MakeRt12InstanceFields and the D3D12 struct in the harness):
+// words 0..11 = record floats 4..15 (world rows 0..2, row-major, as raw bits); word 12 = instance_id | mask << 24;
+// word 13 = flags << 24 (0x1 TRIANGLE_CULL_DISABLE | 0x4 FORCE_OPAQUE or 0x8 FORCE_NON_OPAQUE);
+// words 14..15 = the BLAS address (low, high): blas_address when the record is valid (header.w = record float 3 >= 0.5),
+// else (0, 0). The caller passes blas_address = 0 for a slot out of range or without a D3D12 BLAS (the shader's
+// g_blas_addresses rule). mask follows MakeRt12InstanceFields (visibility.z = record float 46, header.z = record
+// float 2; record float 0 = header.x slot), forced to 0 when the record is invalid or the written address is (0, 0).
+inline void Rt12RecordDescWords(const float* record48, uint32_t instance_id, uint64_t blas_address, uint32_t out16[16]) {
+  const bool valid = record48[3] >= 0.5f;
+  const uint64_t address = valid ? blas_address : 0u;
+  const Rt12InstanceFields fields = MakeRt12InstanceFields(record48 + 4, record48[46], record48[2]);
+  const uint32_t mask = (valid && address != 0u) ? fields.mask : 0u;
+  std::memcpy(out16, fields.transform, sizeof(fields.transform));
+  out16[12] = instance_id | (mask << 24);
+  out16[13] = (0x1u | (fields.opaque ? 0x4u : 0x8u)) << 24;
+  out16[14] = static_cast<uint32_t>(address);
+  out16[15] = static_cast<uint32_t>(address >> 32);
 }
 
 inline void MirrorStoreReset() {

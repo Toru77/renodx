@@ -678,7 +678,7 @@ inline bool DrawBvhPanel() {
   bool dxr = rt12::g_rt12_enabled.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("DXR backend (experimental)", &dxr)) rt12::g_rt12_enabled.store(dxr, std::memory_order_relaxed);
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Session only. RTAO pass A traces on a Direct3D 12 device with hardware ray tracing (DXR 1.1). Turning it on reloads the BVH (a few frames without RT). Characters are traced on DXR; moving objects (P2b) are not yet. Off: the compute path, exactly as before.");
+    ImGui::SetTooltip("Session only. RTAO pass A traces on a Direct3D 12 device with hardware ray tracing (DXR 1.1). Turning it on reloads the BVH (a few frames without RT). Characters are traced on DXR. Off: the compute path, exactly as before.");
   }
   ImGui::SameLine();
   if (ImGui::Button("Dump DXR JSON")) rt12::DumpRt12Json();
@@ -689,6 +689,7 @@ inline bool DrawBvhPanel() {
   }
   std::string dxr_line = std::string("DXR: ") + rt12::Rt12ReasonName(dxr_panel.reason) + "  traced " + std::to_string(dxr_panel.traced_frames)
                          + "  busy " + std::to_string(dxr_panel.busy_frames) + "  wrapped " + (dxr_panel.wrapped ? "yes" : "no");
+  dxr_line += ", P2b records " + std::to_string(dxr_panel.records);
   if (dxr_panel.stuck) dxr_line += "  STUCK (objects leaked)";
   if (!dxr_panel.failed_stage.empty()) {
     dxr_line += "  failed at " + dxr_panel.failed_stage + " hr=" + renodx::utils::log::AsHex(static_cast<uint32_t>(dxr_panel.hr));
@@ -714,14 +715,10 @@ inline bool DrawBvhPanel() {
     return std::string(text);
   };
   const std::string dxr_gpu = "DXR GPU ms (D3D12 timestamps, avg): BLAS " + dxr_ms(dxr_panel.blas_ms_sum, dxr_panel.blas_ms_n)
-                              + " characters " + dxr_ms(dxr_panel.dynamic_ms_sum, dxr_panel.dynamic_ms_n) + " TLAS "
+                              + " characters " + dxr_ms(dxr_panel.dynamic_ms_sum, dxr_panel.dynamic_ms_n) + " P2b "
+                              + dxr_ms(dxr_panel.records_ms_sum, dxr_panel.records_ms_n) + " TLAS "
                               + dxr_ms(dxr_panel.tlas_ms_sum, dxr_panel.tlas_ms_n) + " trace " + dxr_ms(dxr_panel.trace_ms_sum, dxr_panel.trace_ms_n);
   ImGui::TextUnformatted(dxr_gpu.c_str());
-  if (dxr_panel.p2b_records_not_traced != 0u) {
-    const std::string dxr_note = "DXR does not trace P2b records (" + std::to_string(dxr_panel.p2b_records_not_traced)
-                                 + ") yet: turn P2b off for an A/B";
-    ImGui::TextUnformatted(dxr_note.c_str());
-  }
   bool skip_noop = g_live_bvh.skip_noop.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Skip no-op TLAS rebuilds", &skip_noop)) {
     g_live_bvh.skip_noop.store(skip_noop, std::memory_order_relaxed);

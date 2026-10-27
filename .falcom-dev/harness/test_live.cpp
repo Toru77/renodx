@@ -17,6 +17,8 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <Windows.h>
+#include <d3d12.h>
 #include "gen/mock_base.hpp"
 #include "harness_timer.hpp"
 #include "json_check.hpp"
@@ -4792,6 +4794,55 @@ static void TestRt12Dynamic() {
         "carrier holds the deform arena");
 }
 
+// M5 (rt12): a P2b record's D3D12 instance desc (rt12::Rt12RecordDescWords, the transcription of world_rt12_records.cs_6_5.hlsl)
+// equals the desc the static path builds (MakeRt12InstanceFields); an invalid record or one without a BLAS is inactive.
+static void TestRt12Records() {
+  namespace rt12 = falcom_world::rt12;
+  Stage("rt12 records");
+  const uint32_t kStatic = 7u;  // S: the static instance count (InstanceID of record r = S + r)
+  const uint64_t kAddress = 0x12340000ull;
+  // 1. Four records: camera-visible valid, shadow-only valid, invalid (header.w 0) with an address, valid without a BLAS.
+  struct Case {
+    float header_w;
+    float visibility_z;
+    uint64_t address;
+    uint32_t mask;
+    uint64_t blas;
+  };
+  const Case cases[4] = {{1.f, 2.f, kAddress, 1u, kAddress}, {1.f, 4.f, kAddress, 4u, kAddress}, {0.f, 2.f, kAddress, 0u, 0u},
+                         {1.f, 2.f, 0u, 0u, 0u}};
+  for (uint32_t r = 0u; r < 4u; ++r) {
+    float record[48] = {};
+    record[0] = static_cast<float>(r);  // header.x: live store slot
+    record[2] = 0.f;                    // header.z: opaque material
+    record[3] = cases[r].header_w;      // header.w: valid
+    for (uint32_t k = 0u; k < 12u; ++k) record[4u + k] = 0.1f * static_cast<float>(k + 1u) + static_cast<float>(r);
+    record[46] = cases[r].visibility_z;  // visibility.z: INSTANCE_* flags
+    uint32_t words[16] = {};
+    rt12::Rt12RecordDescWords(record, kStatic + r, cases[r].address, words);
+    D3D12_RAYTRACING_INSTANCE_DESC desc = {};
+    std::memcpy(&desc, words, sizeof(desc));
+    CHECK(desc.InstanceID == kStatic + r, "record %u: InstanceID is S + r", r);
+    CHECK(desc.InstanceMask == cases[r].mask, "record %u: mask %u", r, cases[r].mask);
+    CHECK(desc.AccelerationStructure == cases[r].blas, "record %u: BLAS address", r);
+    // The static path's desc for the same record (MakeRt12InstanceFields); mask and address as the rules above.
+    const rt12::Rt12InstanceFields fields = rt12::MakeRt12InstanceFields(record + 4, record[46], record[2]);
+    D3D12_RAYTRACING_INSTANCE_DESC expect = {};
+    std::memcpy(expect.Transform, fields.transform, sizeof(expect.Transform));
+    expect.InstanceID = kStatic + r;
+    expect.InstanceMask = cases[r].mask;
+    expect.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE
+                   | (fields.opaque ? D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE);
+    expect.AccelerationStructure = cases[r].blas;
+    CHECK(sizeof(desc) == 64u, "the D3D12 instance desc is 64 bytes");
+    CHECK(std::memcmp(&desc, &expect, sizeof(desc)) == 0, "record %u: the 64 bytes equal the static path's desc", r);
+  }
+  // 2. The records carrier holds every record: 12 texels each, 32768 records.
+  CHECK(static_cast<uint64_t>(rt12::kRt12CarrierWidth) * rt12::kRt12RecordCarrierHeight
+            >= static_cast<uint64_t>(bvh::kPoolDynamicInstances) * rt12::kRt12RecordTexels,
+        "records carrier holds kPoolDynamicInstances records");
+}
+
 int main() {
   falcom_world::g_state.pool_capture_requested.store(true);
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -5868,6 +5919,7 @@ int main() {
   TestRegionCoverage(&dev, &queue);
   TestRt12Mirror(&dev, &queue);
   TestRt12Dynamic();
+  TestRt12Records();
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);

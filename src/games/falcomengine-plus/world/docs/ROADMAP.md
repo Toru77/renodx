@@ -83,6 +83,7 @@ R1b-0 (diagnostic, startup hook-off mask), implemented, not validated in game: `
 | DX12 probe M2b (DXR round trip, transfer paths) | Run DX12 probe, send dx12_probe_f<frame>.json | world/rt12/rt12_probe.hpp, world/shaders/world_rt12_probe.cs_6_5.hlsl |
 | DXR backend M3 (RTAO pass A on D3D12, scene mirror, alpha mirror) | Owner list in Reference: DXR backend (M3) | world/rt12/rt12_backend.hpp, rt12_mirror.hpp, world/shaders/world_rt12_*.hlsl |
 | DXR backend M4 (characters on DXR: carrier, character BLAS, mask 8) | Owner test in Reference: DXR backend (M4) | world/rt12/rt12_backend.hpp, world/shaders/world_rt12_carrier.cs_5_0.hlsl, world_rt12_deform_unpack.cs_6_5.hlsl |
+| DXR backend M5 (P2b moving objects on DXR: records carrier, records pass, instance table at S + r) | Owner test in Reference: DXR backend (M5) | world/rt12/rt12_backend.hpp, world/rt12/rt12_mirror.hpp, world/shaders/world_rt12_records_carrier.cs_5_0.hlsl, world_rt12_records.cs_6_5.hlsl |
 
 ## Reference
 
@@ -298,6 +299,24 @@ Owner test (DevKit build; RTAO on, Trace characters ON, P2b OFF, Two-Sided disco
 4. Change map twice: `characters` keeps matching; no fallback reason other than `off` in `world_rt12.json` (a few `tlas_empty` or `characters` during loads are acceptable).
 5. Toggle the switch OFF, ON, OFF; exit with it ON: no crash.
 6. Send both perf files, both `world_rtao*.json`, `world_rt12.json`, the screenshots, the `[world-rt12]` log lines and the four DXR panel lines.
+
+### DXR backend (M5): P2b records on DXR
+
+Scope: with the DXR switch on, the DXR pass A traces the P2b records the compute pass A traces (`t19`, `dynamic.instances`, the records of this present), so DXR RTAO covers the static TLAS, alpha foliage, characters and P2b. R = the record count (`push.fade[3]`, the same count the compute pass uses); R = 0 is the M4 path, unchanged.
+
+Design: (1) records carrier (D3D11, `world_rt12_records_carrier.cs_5_0.hlsl`): record r, float4 j (0..11) at texel 12 r + j of a shared RGBA32_UINT texture of 4096 x 96 (`kRt12RecordCarrierHeight`). (2) records pass (D3D12, `world_rt12_records.cs_6_5.hlsl`, after the M4 character block): one `D3D12_RAYTRACING_INSTANCE_DESC` per record into the slot's descs buffer after the static and character descs, and the record itself into the instance table at `S + r` (`S` = `tlas_instances_cpu.size()`), so `InstanceID = S + r` resolves in the trace like a static instance. The packing is `rt12::Rt12RecordDescWords` (`rt12_mirror.hpp`), tested against `MakeRt12InstanceFields` in the harness (`TestRt12Records`). (3) Mask as the static path (camera visible 1, foliage or alpha-tested 2, else 4). An invalid record (`header.w < 0.5`), a slot out of range or a slot without a D3D12 BLAS gets mask 0 and BLAS address (0, 0), so it is never hit. The address table (one uint64 per live store slot, `Rt12Slot::addresses`) is rewritten when `blas_generation` moves. (4) The TLAS is built from the slot's descs buffer with static + characters + R instances; it is rebuilt every frame while records exist and once after they disappear.
+
+Counted fallback `records` (new): R above `kPoolDynamicInstances`, or the expansion not ready. Panel line 2 gets `, P2b records N`; line 3 gets `P2b <ms>` (the records pass, timestamp 4 minus 3). Lighting timestamps are now 2 start, 3 after the character BLAS, 4 after the records, 5 after the TLAS, 6 after the trace (`dynamic_ms`, `records_ms`, `tlas_ms`, `trace_ms`). `world_rt12.json`: the `records` key replaces `p2b_records_not_traced`, and `gpu_ms.records` has `last` and `avg`.
+
+Owner test (DevKit build; RTAO on, Trace characters ON, P2b ON, Two-Sided discovery OFF, Performance Gather on):
+1. Near moving objects (a swaying sign, carts, doors). DXR OFF: 30 s Performance test, Read RTAO Stats (rename to `world_rtao_off.json`), screenshot, RTAO Debug 1 screenshot.
+2. DXR ON, wait for `DXR: tracing`. Panel line 2 shows `P2b records N`, with N equal to the P2b record count (`dynamic_instance_count` in `world_pool.json`). Repeat the captures (`world_rtao_on.json`), then Dump DXR JSON.
+3. Watch a moving object with RTAO Debug 1: the occlusion follows it the same way with DXR ON and OFF.
+4. A large outdoor area: repeat steps 1 and 2.
+5. Change map twice; toggle the switch OFF, ON, OFF; exit with it ON: no crash, no `stuck`.
+6. Send: perf files, `world_rtao_*.json`, `world_rt12.json`, screenshots, `[world-rt12]` log lines, the panel lines.
+
+Decision (recommendation only, not implemented in M5): keep the compute pass A as the fallback for every counted reason and as the A/B reference. After the A/B confirms parity (rays and hits within a few percent, images match) in an interior and a large outdoor area, make the DXR backend the default for RTAO on DXR 1.1 devices (a saved setting, still with the counted fallback) in its own milestone. Retire the compute traversal and the CPU LBVH only when every RT consumer (RTAO, RTGI, RTLS, RT sun, debug views) traces on DXR, in one cleanup milestone.
 
 ## Open decisions
 
