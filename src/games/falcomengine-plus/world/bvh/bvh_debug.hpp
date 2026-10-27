@@ -357,6 +357,7 @@ inline void OnWorldPresentBvh(
   }
   const auto present_time = SamplePerfPresent(device, extra);
   UpdateLiveBvh(device, queue);
+  rt12::OnPresent(device);
   UpdateCacheDiag(device, present_time);
   UpdateDeformLive(device, queue);
   rtao::MaybeCaptureRtaoStats(device, queue);

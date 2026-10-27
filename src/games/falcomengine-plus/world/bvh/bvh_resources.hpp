@@ -33,6 +33,7 @@
 #include "bvh_pool.hpp"
 #include "camera_fade.hpp"
 #include "gpu_timer.hpp"
+#include "../rt12/rt12_mirror.hpp"
 
 namespace falcom_world::bvh {
 
@@ -378,6 +379,7 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   reshade::api::resource tlas_node_buffer = {0u};
   reshade::api::resource_view tlas_node_srv = {0u};
   std::vector<WorldInstanceGPU> tlas_instances_cpu;  // as uploaded (GPU check)
+  uint64_t tlas_cpu_version = 0u;  // +1 whenever tlas_instances_cpu changes (rt12 rebuilds its TLAS from it)
   std::vector<LiveTlasInstance> tlas_info;           // pool provenance per TLAS instance (inspect)
   std::vector<LiveTlasInstance> tlas_info_spare;     // session scratch: the next rebuild's snapshot (capacity kept; the old tlas_info rotates here)
   std::vector<LiveTlasInstance> tlas_dynamic_scratch;  // session scratch: the dynamic instances of the rebuild snapshot, appended after the static ones; the refit's updated copy
@@ -478,6 +480,7 @@ inline void DestroyLiveTlas(reshade::api::device* device, BvhDeviceData* data) {
   DestroyBuffer(device, &data->tlas_leaf_srv, &data->tlas_leaf_buffer);
   DestroyBuffer(device, &data->tlas_node_srv, &data->tlas_node_buffer);
   data->tlas_instances_cpu.clear();
+  data->tlas_cpu_version += 1u;
   data->tlas_info.clear();
   data->tlas_leaves_cpu.clear();
   data->tlas_nodes_cpu.clear();
@@ -515,11 +518,13 @@ inline void DestroyLiveStore(reshade::api::device* device, BvhDeviceData* data) 
   data->descriptors_dirty = false;
   data->upload_retry_frame = 0u;
   data->tlas_retry_frame = 0u;
+  rt12::MirrorStoreReset();
 }
 
 // Destroys the alpha atlas, its materials and the blit (alpha_foliage off, or the device goes). The TLAS drops
 // the alpha instances (store_version). The counters are kept.
 inline void DestroyAlphaGpu(reshade::api::device* device, BvhDeviceData* data) {
+  rt12::MirrorMaterialsCleared();
   AlphaGpu& alpha = data->alpha;
   if (!alpha.slot_of_uid.empty()) data->store_version += 1u;
   for (reshade::api::descriptor_table& table : alpha.blit_tables) {

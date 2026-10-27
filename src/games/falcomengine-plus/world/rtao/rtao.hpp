@@ -133,6 +133,12 @@ inline void NullComputeSlots(reshade::api::command_list* cmd_list, uint32_t srv_
           {}, 0, 0, sampler_count, reshade::api::descriptor_type::sampler, null_samplers});
 }
 
+#if !defined(FALCOM_WINDOWS_HARNESS)
+}  // namespace falcom_world::rtao
+#include "../rt12/rt12_backend.hpp"
+namespace falcom_world::rtao {
+#endif
+
 // Spatial filter (S3): the MakeFilterPlan chain, one dispatch per pass, slots nulled after each one. The first pass
 // reads the AO texel (A); the last pass writes B. Returns false when a target or the pipeline cannot be created
 // (the caller then uses A). The filter timer wraps the whole chain.
@@ -243,28 +249,36 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
 
   bvh::BeginGpuTimer(device, cmd_list, &data.timer);
 
-  // Pass A.
-  reshade::api::resource_view srvs[kRtaoSrvCount] = {};
-  bvh::FillBvhSceneSrvs(*bvh_data, in.depth_view, in.dynamic, srvs);
-  srvs[17] = in.mrt_normal_view;
-  srvs[18] = in.isfast_view;
-  srvs[19] = bvh_data->dynamic.instances_srv;
+  // Pass A: on D3D12 (rt12, DXR backend switch) when it can run this frame, otherwise the compute pass.
   const reshade::api::resource_view uavs[kRtaoUavCount] = {
       data.ao_uav, data.stats_uav, (d > 1u ? data.trace_uav : data.raw_uav[data.raw_index])};
-  const reshade::api::buffer_range scene_cbv = SceneCbvRange(in.scene_cbv_view);
-  reshade::api::descriptor_table_update updates[3] = {
-      {data.cbv_table, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &scene_cbv},
-      {data.srv_table, 0, 0, kRtaoSrvCount, reshade::api::descriptor_type::shader_resource_view, srvs},
-      {data.uav_table, 0, 0, kRtaoUavCount, reshade::api::descriptor_type::unordered_access_view, uavs},
-  };
-  device->update_descriptor_tables(3, updates);
-  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, data.pipeline);
-  const reshade::api::descriptor_table tables[3] = {data.cbv_table, data.srv_table, data.uav_table};
-  cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, data.layout, 0, 3, tables);
-  cmd_list->push_constants(
-      reshade::api::shader_stage::all_compute, data.layout, 3, 0, kRtaoPushConstantCount, &push);
-  cmd_list->dispatch((trace_w + 7u) / 8u, (trace_h + 7u) / 8u, 1u);
-  NullComputeSlots(cmd_list, kRtaoSrvCount, kRtaoUavCount, 0u);
+#if !defined(FALCOM_WINDOWS_HARNESS)
+  const bool dxr_pass_a = rt12::RunRtaoPassA(device, cmd_list, data, push, in.depth_view, in.mrt_normal_view,
+                                             in.isfast_view, in.scene_cbv_view, uavs, trace_w, trace_h);
+#else
+  const bool dxr_pass_a = false;
+#endif
+  if (!dxr_pass_a) {
+    reshade::api::resource_view srvs[kRtaoSrvCount] = {};
+    bvh::FillBvhSceneSrvs(*bvh_data, in.depth_view, in.dynamic, srvs);
+    srvs[17] = in.mrt_normal_view;
+    srvs[18] = in.isfast_view;
+    srvs[19] = bvh_data->dynamic.instances_srv;
+    const reshade::api::buffer_range scene_cbv = SceneCbvRange(in.scene_cbv_view);
+    reshade::api::descriptor_table_update updates[3] = {
+        {data.cbv_table, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &scene_cbv},
+        {data.srv_table, 0, 0, kRtaoSrvCount, reshade::api::descriptor_type::shader_resource_view, srvs},
+        {data.uav_table, 0, 0, kRtaoUavCount, reshade::api::descriptor_type::unordered_access_view, uavs},
+    };
+    device->update_descriptor_tables(3, updates);
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, data.pipeline);
+    const reshade::api::descriptor_table tables[3] = {data.cbv_table, data.srv_table, data.uav_table};
+    cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, data.layout, 0, 3, tables);
+    cmd_list->push_constants(
+        reshade::api::shader_stage::all_compute, data.layout, 3, 0, kRtaoPushConstantCount, &push);
+    cmd_list->dispatch((trace_w + 7u) / 8u, (trace_h + 7u) / 8u, 1u);
+    NullComputeSlots(cmd_list, kRtaoSrvCount, kRtaoUavCount, 0u);
+  }
 
   if (d > 1u) {
     // Pass A wrote the trace-size raw AO through u2; the upsample reads it through t0 and writes the full-size AO.

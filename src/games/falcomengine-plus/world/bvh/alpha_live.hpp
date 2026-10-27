@@ -14,6 +14,7 @@
 #include "alpha_atlas.hpp"
 #include "bvh_pool.hpp"
 #include "bvh_resources.hpp"
+#include "../rt12/rt12_mirror.hpp"
 
 namespace falcom_world::bvh {
 
@@ -250,6 +251,7 @@ inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_li
                                      static_cast<uint64_t>(slice) * sizeof(AlphaMaterialGPU), &material, sizeof(material), &error)
                     && device->create_resource_view(job.proxy, RU::shader_resource, reshade::api::resource_view_desc(job.format), &source);
     if (ok) {
+      rt12::MirrorMaterial(slice, &material);
       const reshade::api::descriptor_table_update source_update = {alpha.blit_tables[0], 0, 0, 1, DT::shader_resource_view, &source};
       device->update_descriptor_tables(1, &source_update);
       cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, alpha.blit_pipeline);

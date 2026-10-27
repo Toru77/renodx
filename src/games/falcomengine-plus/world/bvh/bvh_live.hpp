@@ -68,6 +68,7 @@
 #include "cache_diag.hpp"
 #include "perf_run.hpp"
 #include "deform_live.hpp"
+#include "../rt12/rt12_mirror.hpp"
 
 namespace falcom_world::bvh {
 
@@ -205,6 +206,7 @@ inline uint32_t RetireLiveSlots(BvhDeviceData* data, const std::vector<uint64_t>
     LiveMeshSlot& slot = data->slots[i];
     if (!slot.live || live.count(slot.uid) != 0u) continue;
     slot.live = false;
+    rt12::MirrorRetireSlot(static_cast<uint32_t>(i));
     data->slot_by_uid.erase(slot.uid);
     if (i < data->mesh_descriptors.size()) data->mesh_descriptors[i] = WorldMeshGPU{};
     retired += 1u;
@@ -400,6 +402,17 @@ inline LiveUploadResult UploadLiveMeshes(
     data->upload_retry_frame = frame + kLiveRetryFrames;
     renodx::utils::log::w("[world-bvh] live store: ", stats.last_failure);
     return result;
+  }
+  {
+    std::vector<rt12::Rt12MirrorSlot> mirror_slots;
+    mirror_slots.reserve(new_slots.size());
+    for (size_t k = 0; k < new_slots.size(); ++k) {
+      const LiveMeshSlot& slot = new_slots[k];
+      mirror_slots.push_back({static_cast<uint32_t>(data->slots.size() + k), slot.vertex_offset, slot.vertex_count,
+                              slot.index_offset, slot.index_count});
+    }
+    rt12::MirrorUpload(data->vertices.used, vertex_batch, data->indices.used, index_batch, data->uvs.used, uv_batch,
+                       mirror_slots);
   }
   data->vertices.used += vertex_batch.size() / 4u;
   data->indices.used += index_batch.size();
@@ -878,6 +891,7 @@ inline bool TryApplyLiveTlasSlack(reshade::api::device* device, reshade::api::co
 
   // Swapped only after every write succeeded.
   data->tlas_instances_cpu = std::move(next);
+  data->tlas_cpu_version += 1u;
   data->tlas_leaves_cpu = std::move(leaves);
   data->tlas_nodes_cpu = std::move(nodes);
   data->tlas_info = std::move(next_info);
@@ -1295,6 +1309,7 @@ inline void RebuildLiveTlas(
   data->tlas_node_srv = node_buffer.view;
   data->active_count = static_cast<uint32_t>(instances.size() - spares);
   data->tlas_instances_cpu.swap(instances);
+  data->tlas_cpu_version += 1u;
   data->tlas_slot_of_id.clear();
   if (slack_layout) {
     for (uint32_t i = 0; i < static_count; ++i) data->tlas_slot_of_id[info[i].id] = i;
@@ -1532,6 +1547,7 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
 
   // Swapped only after every write succeeded.
   std::move(instances.begin(), instances.end(), data->tlas_instances_cpu.begin() + df);
+  data->tlas_cpu_version += 1u;
   std::move(updated.begin(), updated.end(), data->tlas_info.begin() + df);
   data->tlas_dynamic_revision = dynamic_revision;
   data->tlas_refits_since_rebuild += 1u;

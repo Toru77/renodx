@@ -30,6 +30,7 @@
 namespace falcom_world::bvh {
 
 inline void OnDestroyDeviceBvh(reshade::api::device* device) {
+  rt12::DestroyRt12(device);
   DestroyBvhDebugResources(device);
   rtao::DestroyRtaoDeviceData(device);
   rtgi::DestroyRtgiDeviceData(device);
@@ -673,6 +674,48 @@ inline bool DrawBvhPanel() {
     ImGui::TextUnformatted(rt12_result.c_str());
   } else {
     ImGui::TextDisabled("DX12 probe: not run");
+  }
+  bool dxr = rt12::g_rt12_enabled.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("DXR backend (experimental)", &dxr)) rt12::g_rt12_enabled.store(dxr, std::memory_order_relaxed);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Session only. RTAO pass A traces on a Direct3D 12 device with hardware ray tracing (DXR 1.1). Turning it on reloads the BVH (a few frames without RT). Characters and moving objects (P2b) are not traced on DXR yet. Off: the compute path, exactly as before.");
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Dump DXR JSON")) rt12::DumpRt12Json();
+  rt12::Rt12Panel dxr_panel;
+  {
+    std::lock_guard<std::mutex> lock(rt12::g_rt12_panel_mutex);
+    dxr_panel = rt12::g_rt12_panel;
+  }
+  std::string dxr_line = std::string("DXR: ") + rt12::Rt12ReasonName(dxr_panel.reason) + "  traced " + std::to_string(dxr_panel.traced_frames)
+                         + "  busy " + std::to_string(dxr_panel.busy_frames) + "  wrapped " + (dxr_panel.wrapped ? "yes" : "no");
+  if (dxr_panel.stuck) dxr_line += "  STUCK (objects leaked)";
+  if (!dxr_panel.failed_stage.empty()) {
+    dxr_line += "  failed at " + dxr_panel.failed_stage + " hr=" + renodx::utils::log::AsHex(static_cast<uint32_t>(dxr_panel.hr));
+  }
+  ImGui::TextUnformatted(dxr_line.c_str());
+  char dxr_scene[256] = {};
+  std::snprintf(dxr_scene, sizeof(dxr_scene), "DXR scene: %u meshes, %u BLAS (%.1f MB), TLAS %u (no BLAS %u, holes %u, bad mesh %u), sanitized triangles %llu, alpha mirror %s",
+                dxr_panel.mesh_count, dxr_panel.blas_count, static_cast<double>(dxr_panel.blas_bytes) / (1024.0 * 1024.0),
+                dxr_panel.tlas_instances, dxr_panel.tlas_no_blas, dxr_panel.tlas_holes, dxr_panel.tlas_bad_mesh,
+                static_cast<unsigned long long>(dxr_panel.sanitized_triangles), dxr_panel.alpha_mirror ? "yes" : "no");
+  ImGui::TextUnformatted(dxr_scene);
+  const auto dxr_ms = [](float sum, uint32_t n) {
+    char text[32] = {};
+    if (n == 0u) {
+      std::snprintf(text, sizeof(text), "--");
+    } else {
+      std::snprintf(text, sizeof(text), "%.3f", static_cast<double>(sum) / n);
+    }
+    return std::string(text);
+  };
+  const std::string dxr_gpu = "DXR GPU ms (D3D12 timestamps, avg): BLAS " + dxr_ms(dxr_panel.blas_ms_sum, dxr_panel.blas_ms_n) + " TLAS "
+                              + dxr_ms(dxr_panel.tlas_ms_sum, dxr_panel.tlas_ms_n) + " trace " + dxr_ms(dxr_panel.trace_ms_sum, dxr_panel.trace_ms_n);
+  ImGui::TextUnformatted(dxr_gpu.c_str());
+  if (dxr_panel.characters_not_traced != 0u || dxr_panel.p2b_records_not_traced != 0u) {
+    const std::string dxr_note = "DXR does not trace characters (" + std::to_string(dxr_panel.characters_not_traced) + " objects) or P2b records ("
+                                 + std::to_string(dxr_panel.p2b_records_not_traced) + "): turn them off for an A/B";
+    ImGui::TextUnformatted(dxr_note.c_str());
   }
   bool skip_noop = g_live_bvh.skip_noop.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Skip no-op TLAS rebuilds", &skip_noop)) {

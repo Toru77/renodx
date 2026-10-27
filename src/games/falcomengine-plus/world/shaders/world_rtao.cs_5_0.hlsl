@@ -9,13 +9,16 @@
 // Camera: the game scene CBV bound as b0 (viewInv_g, viewProjInv_g), not g_state.camera.
 // Sampling: IS-FAST blue noise (t18, Load only, 128x128x32), or IGN when it is not loaded.
 
+#ifndef RTAO_DXR
 // P2b records at t19 (t17 is the MRT normal here); camera-hidden records are skipped (RTAO views hide them).
 #define WORLD_TRACE_DYNAMIC_INSTANCES
 #define WORLD_TRACE_DYNAMIC_SLOT t19
 #define WORLD_TRACE_DYNAMIC_SKIP_HIDDEN
+#endif
 #include "world_bvh_trace.hlsli"
 #include "../../include/mrt_normal.hlsli"
 
+#ifndef RTAO_DXR
 Texture2D<float4> g_game_depth : register(t9);
 Texture2D<uint4> g_mrt_normal : register(t17);
 Texture3D<float2> g_isfast_noise : register(t18);
@@ -31,6 +34,7 @@ cbuffer cb_scene : register(b0)
     float4x4 viewProjInv_g : packoffset(c20);
     float2 resolutionScaling_g : packoffset(c49);
 };
+#endif
 
 // Push constants (rtao.hpp fills these; 24 floats).
 cbuffer cb_rtao : register(b12)
@@ -64,6 +68,9 @@ cbuffer cb_rtao : register(b12)
 groupshared uint gs_stats[RTAO_STAT_COUNT];
 groupshared uint gs_disc[RTAO_DISC_COUNT];
 
+#ifndef RTAO_TRACE_CLOSEST
+#define RTAO_TRACE_CLOSEST TraceWorldClosest
+#endif
 void TracePixel(uint2 px)
 {
     const uint rtao_flags = (uint)g_rtao_fade.z;
@@ -118,7 +125,7 @@ void TracePixel(uint2 px)
                 const float3 view_dir = (P - camera) / distance_to_camera;
                 WorldCameraView disc_view = {true, 1.0, 0u, 0u};
                 WorldTraceCounters disc_counters;
-                const WorldTraceHit disc_hit = TraceWorldClosest(camera, view_dir, 1e-3, 1.05 * distance_to_camera, disc_view, disc_counters);
+                const WorldTraceHit disc_hit = RTAO_TRACE_CLOSEST(camera, view_dir, 1e-3, 1.05 * distance_to_camera, disc_view, disc_counters);
                 if (disc_hit.prim != 0xFFFFFFFFu && abs(disc_hit.t - distance_to_camera) <= max(0.02 * distance_to_camera, 0.05))
                 {
                     const uint back = disc_hit.facing > 0.0 ? 1u : 0u;
@@ -158,7 +165,7 @@ void TracePixel(uint2 px)
                 const float3 dir = T * (r * cos(phi)) + B * (r * sin(phi)) + N * sqrt(max(0.0, 1.0 - u.x));
 
                 WorldTraceCounters counters;
-                const WorldTraceHit hit = TraceWorldClosest(origin, dir, 1e-3, ray_max, view, counters);
+                const WorldTraceHit hit = RTAO_TRACE_CLOSEST(origin, dir, 1e-3, ray_max, view, counters);
                 rays += 1u;
                 invalid_refs += counters.invalid_refs;
                 stack_overflow += counters.stack_overflow;
@@ -189,6 +196,7 @@ void TracePixel(uint2 px)
     else g_rtao_ao[px] = texel;
 }
 
+#ifndef RTAO_DXR
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
 {
@@ -208,3 +216,4 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
     if (group_index < RTAO_STAT_COUNT) InterlockedAdd(g_rtao_stats[group_index], gs_stats[group_index]);
     if (((uint)g_rtao_fade.z & RTAO_FLAG_DISCOVERY) != 0u && group_index < RTAO_DISC_COUNT) InterlockedAdd(g_rtao_stats[RTAO_DISC_BASE + group_index], gs_disc[group_index]);
 }
+#endif

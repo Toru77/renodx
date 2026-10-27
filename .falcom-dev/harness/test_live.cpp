@@ -4606,6 +4606,171 @@ static void TestPerfExtraGpu(Device* dev) {
   bvh::ResetCacheDiagCounters();
 }
 
+// M3 (rt12): the store hooks feed the D3D12 mirror only while it is active; the helpers follow their rules; the
+// material copy keeps its version with the mirror off.
+static void TestRt12Mirror(Device* dev, Queue* queue) {
+  namespace rt12 = falcom_world::rt12;
+  Stage("rt12 mirror");
+  // 1. Indices: out-of-range or non-finite triangles become 0,0,0; the trailing partial triangle stays.
+  {
+    const float v[16] = {0.f, 0.f, 0.f, 1.f, 1.f, 0.f, 0.f, 1.f, 0.f, 1.f, 0.f, 1.f, NAN, 0.f, 0.f, 1.f};
+    uint32_t idx[13] = {0u, 1u, 2u, 0u, 1u, 9u, 0u, 3u, 1u, 2u, 1u, 0u, 5u};
+    const uint32_t want[13] = {0u, 1u, 2u, 0u, 0u, 0u, 0u, 0u, 0u, 2u, 1u, 0u, 5u};
+    const uint32_t changed = rt12::SanitizeRt12Indices(v, 4u, idx, 13u);
+    CHECK(changed == 2u, "sanitize changed %u triangles", changed);
+    for (int i = 0; i < 13; ++i) CHECK(idx[i] == want[i], "sanitize index %d is %u", i, idx[i]);
+  }
+  // 2. Instance fields: visibility flags to mask, material flag to opaque, world floats to transform.
+  {
+    const float world[16] = {1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f, 9.f, 10.f, 11.f, 12.f, 13.f, 14.f, 15.f, 16.f};
+    CHECK(rt12::MakeRt12InstanceFields(world, 2.f, 0.f).mask == 1u, "camera visible: mask 1");
+    CHECK(rt12::MakeRt12InstanceFields(world, 10.f, 0.f).mask == 2u, "camera visible foliage: mask 2");
+    CHECK(rt12::MakeRt12InstanceFields(world, 18.f, 0.f).mask == 2u, "camera visible alpha-tested: mask 2");
+    CHECK(rt12::MakeRt12InstanceFields(world, 4.f, 0.f).mask == 4u, "shadow only: mask 4");
+    CHECK(rt12::MakeRt12InstanceFields(world, 0.f, 0.f).mask == 4u, "not visible: mask 4");
+    CHECK(rt12::MakeRt12InstanceFields(world, 2.f, 0.f).opaque, "material 0: opaque");
+    CHECK(!rt12::MakeRt12InstanceFields(world, 2.f, 3.f).opaque, "material 3: not opaque");
+    const rt12::Rt12InstanceFields fields = rt12::MakeRt12InstanceFields(world, 2.f, 0.f);
+    bool same = true;
+    for (int i = 0; i < 12; ++i) same = same && fields.transform[i] == world[i];
+    CHECK(same, "transform rows are the world floats");
+  }
+  // 3. Mirror through the live store: the uploads queue the arena appends and the new slots at the D3D11 offsets.
+  {
+    const auto reset_mirror = [](bool active) {
+      std::lock_guard lock(rt12::g_rt12_mirror.mutex);
+      rt12::g_rt12_mirror.active = active;
+      rt12::g_rt12_mirror.reset = false;
+      rt12::g_rt12_mirror.appends.clear();
+      rt12::g_rt12_mirror.new_slots.clear();
+      rt12::g_rt12_mirror.retired_slots.clear();
+    };
+    bvh::ResetWorldPool();
+    auto& frame = falcom_world::g_state.frame;
+    frame.store(6000u);
+    SetCamera(10.f, 5.f, 10.f);
+    bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+    const auto present = [&]() {
+      frame.fetch_add(1u);
+      bvh::SamplePerfPresent(dev);
+      bvh::UpdateLiveBvh(dev, queue);
+    };
+    bvh::PoolDecodedMesh uv_mesh = BoxMesh(1.f);
+    for (const auto& p : uv_mesh.positions) uv_mesh.uvs.push_back({p[1] * 0.5f + 0.5f, p[2] * 0.5f + 0.5f});
+    AddMesh(0x71, uv_mesh);
+    AddMesh(0x72, Grid(4, 4, 4.f, 0.5f));
+    AddInstance(0x71, 0.f, 0.f, 20.f);
+    AddInstance(0x72, 6.f, 0.f, 20.f);
+
+    reset_mirror(true);
+    const uint64_t vertices_before = data->vertices.used;
+    const uint64_t indices_before = data->indices.used;
+    const uint64_t uvs_before = data->uvs.used;
+    for (int i = 0; i < 30; ++i) present();
+    CHECK(data->slots.size() == 2u, "two live slots (%zu)", data->slots.size());
+    {
+      std::lock_guard lock(rt12::g_rt12_mirror.mutex);
+      uint64_t bytes[3] = {0u, 0u, 0u};
+      bool first_seen[3] = {false, false, false};
+      bool first_at_before = true;
+      for (const rt12::Rt12MirrorAppend& append : rt12::g_rt12_mirror.appends) {
+        bytes[append.arena] += append.bytes.size();
+        const uint64_t before = append.arena == rt12::kRt12ArenaVertices ? vertices_before
+                              : append.arena == rt12::kRt12ArenaIndices ? indices_before : uvs_before;
+        if (!first_seen[append.arena]) first_at_before = first_at_before && append.first_element == before;
+        first_seen[append.arena] = true;
+      }
+      CHECK(first_at_before, "each arena's first append starts at the old element count");
+      CHECK(bytes[rt12::kRt12ArenaVertices] == (data->vertices.used - vertices_before) * 16u, "vertex bytes queued (%llu)",
+            (unsigned long long)bytes[rt12::kRt12ArenaVertices]);
+      CHECK(bytes[rt12::kRt12ArenaIndices] == (data->indices.used - indices_before) * 4u, "index bytes queued (%llu)",
+            (unsigned long long)bytes[rt12::kRt12ArenaIndices]);
+      CHECK(bytes[rt12::kRt12ArenaUvs] == (data->uvs.used - uvs_before) * 8u, "UV bytes queued (%llu)",
+            (unsigned long long)bytes[rt12::kRt12ArenaUvs]);
+      CHECK(rt12::g_rt12_mirror.new_slots.size() == data->slots.size(), "new slots queued (%zu)", rt12::g_rt12_mirror.new_slots.size());
+      for (const rt12::Rt12MirrorSlot& queued : rt12::g_rt12_mirror.new_slots) {
+        const bvh::LiveMeshSlot& live = data->slots[queued.slot];
+        CHECK(live.vertex_offset == queued.vertex_offset && live.vertex_count == queued.vertex_count
+                  && live.index_offset == queued.index_offset && live.index_count == queued.index_count,
+              "queued slot %u matches the store", queued.slot);
+      }
+      CHECK(rt12::g_rt12_mirror.sanitized_triangles == 0u, "no invalid triangles in the test meshes");
+    }
+    // Retire one slot: its index is queued.
+    const uint64_t kept_uid = data->slots[0].uid;
+    CHECK(bvh::RetireLiveSlots(data, {kept_uid}) == 1u, "one slot retired");
+    {
+      std::lock_guard lock(rt12::g_rt12_mirror.mutex);
+      CHECK(rt12::g_rt12_mirror.retired_slots.size() == 1u && rt12::g_rt12_mirror.retired_slots[0] == 1u,
+            "retired slot queued (%zu)", rt12::g_rt12_mirror.retired_slots.size());
+    }
+    // A store reset drops everything queued before it.
+    bvh::DestroyLiveStore(dev, data);
+    {
+      std::lock_guard lock(rt12::g_rt12_mirror.mutex);
+      CHECK(rt12::g_rt12_mirror.reset && rt12::g_rt12_mirror.appends.empty() && rt12::g_rt12_mirror.new_slots.empty()
+                && rt12::g_rt12_mirror.retired_slots.empty(),
+            "store reset: reset flag set, queues empty");
+    }
+    // 4. Mirror inactive: the same uploads queue nothing.
+    reset_mirror(false);
+    bvh::ResetWorldPool();
+    AddMesh(0x73, uv_mesh);
+    AddInstance(0x73, 0.f, 0.f, 20.f);
+    for (int i = 0; i < 30; ++i) present();
+    {
+      std::lock_guard lock(rt12::g_rt12_mirror.mutex);
+      CHECK(rt12::g_rt12_mirror.appends.empty() && rt12::g_rt12_mirror.new_slots.empty() && !rt12::g_rt12_mirror.reset,
+            "inactive mirror queues nothing");
+    }
+    bvh::ResetWorldPool();
+    present();
+  }
+  // 5. Materials with the mirror inactive: one slice, the out-of-range slice ignored, cleared, kept across a store reset.
+  {
+    uint8_t bytes[32];
+    std::memset(bytes, 0x5A, sizeof(bytes));
+    uint64_t version = 0u;
+    {
+      std::lock_guard lock(rt12::g_rt12_mirror.mutex);
+      version = rt12::g_rt12_mirror.materials_version;
+    }
+    rt12::MirrorMaterial(3u, bytes);
+    {
+      std::lock_guard lock(rt12::g_rt12_mirror.mutex);
+      CHECK(rt12::g_rt12_mirror.materials[3][0] == 0x5Au && rt12::g_rt12_mirror.materials[3][31] == 0x5Au, "slice 3 copied");
+      CHECK(rt12::g_rt12_mirror.materials_version == version + 1u, "slice 3 moves the version");
+    }
+    rt12::MirrorMaterial(256u, bytes);
+    {
+      std::lock_guard lock(rt12::g_rt12_mirror.mutex);
+      CHECK(rt12::g_rt12_mirror.materials_version == version + 1u, "slice 256 ignored");
+    }
+    rt12::MirrorMaterial(5u, bytes);
+    bvh::DestroyLiveStore(dev, bvh::GetBvhDeviceData(dev));
+    {
+      std::lock_guard lock(rt12::g_rt12_mirror.mutex);
+      CHECK(rt12::g_rt12_mirror.materials[5][0] == 0x5Au, "store reset keeps the materials");
+    }
+    rt12::MirrorMaterialsCleared();
+    {
+      std::lock_guard lock(rt12::g_rt12_mirror.mutex);
+      bool zero = true;
+      for (const auto& slice : rt12::g_rt12_mirror.materials) for (uint8_t b : slice) zero = zero && b == 0u;
+      CHECK(zero, "cleared materials are zero");
+      CHECK(rt12::g_rt12_mirror.materials_version == version + 3u, "clear moves the version");
+    }
+  }
+  {
+    std::lock_guard lock(rt12::g_rt12_mirror.mutex);
+    rt12::g_rt12_mirror.active = false;
+    rt12::g_rt12_mirror.reset = false;
+    rt12::g_rt12_mirror.appends.clear();
+    rt12::g_rt12_mirror.new_slots.clear();
+    rt12::g_rt12_mirror.retired_slots.clear();
+  }
+}
+
 int main() {
   falcom_world::g_state.pool_capture_requested.store(true);
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -5680,6 +5845,7 @@ int main() {
   TestPerfInclusionFlip(&dev);
   Stage("11e BVH range coverage");
   TestRegionCoverage(&dev, &queue);
+  TestRt12Mirror(&dev, &queue);
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);
