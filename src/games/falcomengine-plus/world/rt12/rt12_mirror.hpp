@@ -80,6 +80,27 @@ inline uint32_t SanitizeRt12Indices(const float* vertices, uint32_t vertex_count
 inline constexpr uint32_t kRt12MaskOpaqueVisible = 1u;   // RT12_MASK_OPAQUE_VISIBLE
 inline constexpr uint32_t kRt12MaskFoliageVisible = 2u;  // RT12_MASK_FOLIAGE_VISIBLE
 inline constexpr uint32_t kRt12MaskShadowOnly = 4u;      // RT12_MASK_SHADOW_ONLY
+inline constexpr uint32_t kRt12MaskDynamic = 8u;         // RT12_MASK_DYNAMIC: characters (deforming meshes)
+inline constexpr uint32_t kRt12DynamicInstanceId = 0xFFFFFFu;  // InstanceID of a character instance (not in the instance table)
+inline constexpr uint32_t kRt12CarrierWidth = 4096u;     // carrier texels per row; vertex v at (v % width, v / width)
+inline constexpr uint32_t kRt12CarrierHeight = 512u;     // 4096 * 512 vertices = the 24 MB deform arena of float3
+inline constexpr uint32_t kRt12DynamicRebuildFrames = 30u;  // full BLAS rebuild cadence (owner decision)
+
+// End (exclusive) of the vertices `count` characters use: max(vertex_base + 3 * triangles), 0 for none.
+inline uint64_t Rt12DynamicVertexEnd(const uint32_t* vertex_base, const uint32_t* triangles, size_t count) {
+  uint64_t end = 0u;
+  for (size_t i = 0u; i < count; ++i) {
+    const uint64_t character_end = static_cast<uint64_t>(vertex_base[i]) + 3u * static_cast<uint64_t>(triangles[i]);
+    if (character_end > end) end = character_end;
+  }
+  return end;
+}
+
+// Whether a character's BLAS is built from scratch this frame (else refit in place): no BLAS yet, a different
+// triangle count than the BLAS was built with, or kRt12DynamicRebuildFrames or more frames since its last build.
+inline bool Rt12DynamicNeedsBuild(bool has_blas, uint32_t blas_triangles, uint32_t triangles, uint32_t frames_since_build) {
+  return !has_blas || blas_triangles != triangles || frames_since_build >= kRt12DynamicRebuildFrames;
+}
 
 // D3D12 instance fields of a live TLAS entry: Transform rows 0..2 = WorldInstanceGPU world floats 0..11 (row-major),
 // mask from the visibility flags (visibility_z as stored), flags from the material (header_z as stored).

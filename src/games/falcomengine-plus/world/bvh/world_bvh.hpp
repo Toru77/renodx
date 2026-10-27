@@ -678,7 +678,7 @@ inline bool DrawBvhPanel() {
   bool dxr = rt12::g_rt12_enabled.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("DXR backend (experimental)", &dxr)) rt12::g_rt12_enabled.store(dxr, std::memory_order_relaxed);
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Session only. RTAO pass A traces on a Direct3D 12 device with hardware ray tracing (DXR 1.1). Turning it on reloads the BVH (a few frames without RT). Characters and moving objects (P2b) are not traced on DXR yet. Off: the compute path, exactly as before.");
+    ImGui::SetTooltip("Session only. RTAO pass A traces on a Direct3D 12 device with hardware ray tracing (DXR 1.1). Turning it on reloads the BVH (a few frames without RT). Characters are traced on DXR; moving objects (P2b) are not yet. Off: the compute path, exactly as before.");
   }
   ImGui::SameLine();
   if (ImGui::Button("Dump DXR JSON")) rt12::DumpRt12Json();
@@ -695,10 +695,14 @@ inline bool DrawBvhPanel() {
   }
   ImGui::TextUnformatted(dxr_line.c_str());
   char dxr_scene[256] = {};
-  std::snprintf(dxr_scene, sizeof(dxr_scene), "DXR scene: %u meshes, %u BLAS (%.1f MB), TLAS %u (no BLAS %u, holes %u, bad mesh %u), sanitized triangles %llu, alpha mirror %s",
+  std::snprintf(dxr_scene, sizeof(dxr_scene), "DXR scene: %u meshes, %u BLAS (%.1f MB), TLAS %u (no BLAS %u, holes %u, bad mesh %u), sanitized triangles %llu, alpha mirror %s, "
+                "characters %u (%u BLAS, %.1f MB, builds %llu, refits %llu)",
                 dxr_panel.mesh_count, dxr_panel.blas_count, static_cast<double>(dxr_panel.blas_bytes) / (1024.0 * 1024.0),
                 dxr_panel.tlas_instances, dxr_panel.tlas_no_blas, dxr_panel.tlas_holes, dxr_panel.tlas_bad_mesh,
-                static_cast<unsigned long long>(dxr_panel.sanitized_triangles), dxr_panel.alpha_mirror ? "yes" : "no");
+                static_cast<unsigned long long>(dxr_panel.sanitized_triangles), dxr_panel.alpha_mirror ? "yes" : "no",
+                dxr_panel.dynamic_objects, dxr_panel.dynamic_blas_count,
+                static_cast<double>(dxr_panel.dynamic_blas_bytes) / (1024.0 * 1024.0),
+                static_cast<unsigned long long>(dxr_panel.dynamic_builds), static_cast<unsigned long long>(dxr_panel.dynamic_refits));
   ImGui::TextUnformatted(dxr_scene);
   const auto dxr_ms = [](float sum, uint32_t n) {
     char text[32] = {};
@@ -709,12 +713,13 @@ inline bool DrawBvhPanel() {
     }
     return std::string(text);
   };
-  const std::string dxr_gpu = "DXR GPU ms (D3D12 timestamps, avg): BLAS " + dxr_ms(dxr_panel.blas_ms_sum, dxr_panel.blas_ms_n) + " TLAS "
+  const std::string dxr_gpu = "DXR GPU ms (D3D12 timestamps, avg): BLAS " + dxr_ms(dxr_panel.blas_ms_sum, dxr_panel.blas_ms_n)
+                              + " characters " + dxr_ms(dxr_panel.dynamic_ms_sum, dxr_panel.dynamic_ms_n) + " TLAS "
                               + dxr_ms(dxr_panel.tlas_ms_sum, dxr_panel.tlas_ms_n) + " trace " + dxr_ms(dxr_panel.trace_ms_sum, dxr_panel.trace_ms_n);
   ImGui::TextUnformatted(dxr_gpu.c_str());
-  if (dxr_panel.characters_not_traced != 0u || dxr_panel.p2b_records_not_traced != 0u) {
-    const std::string dxr_note = "DXR does not trace characters (" + std::to_string(dxr_panel.characters_not_traced) + " objects) or P2b records ("
-                                 + std::to_string(dxr_panel.p2b_records_not_traced) + "): turn them off for an A/B";
+  if (dxr_panel.p2b_records_not_traced != 0u) {
+    const std::string dxr_note = "DXR does not trace P2b records (" + std::to_string(dxr_panel.p2b_records_not_traced)
+                                 + ") yet: turn P2b off for an A/B";
     ImGui::TextUnformatted(dxr_note.c_str());
   }
   bool skip_noop = g_live_bvh.skip_noop.load(std::memory_order_relaxed);

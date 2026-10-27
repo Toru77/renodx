@@ -10,6 +10,7 @@
 #define RT12_MASK_OPAQUE_VISIBLE 1u
 #define RT12_MASK_FOLIAGE_VISIBLE 2u
 #define RT12_MASK_SHADOW_ONLY 4u
+#define RT12_MASK_DYNAMIC 8u
 
 Texture2D<uint4> g_rt12_normal : register(t17);
 RaytracingAccelerationStructure g_rt12_tlas : register(t20);
@@ -21,6 +22,7 @@ RWTexture2D<uint> g_rt12_stats : register(u1);
 RWTexture2D<float> g_rtao_raw : register(u2);
 
 static uint g_rt12_d = 1u;
+static uint g_rt12_dynamic_mask = 0u;  // RT12_MASK_DYNAMIC while RTAO traces characters
 
 struct Rt12Depth
 {
@@ -63,7 +65,7 @@ WorldTraceHit TraceWorldClosestDxr(float3 origin, float3 direction, float t_min,
     uint mesh_stride;
     g_trace_meshes.GetDimensions(mesh_count, mesh_stride);
     const bool skip_foliage = (view.skip_flags & (INSTANCE_FOLIAGE | INSTANCE_ALPHA_TESTED)) != 0u;
-    const uint mask = RT12_MASK_OPAQUE_VISIBLE | (skip_foliage ? 0u : RT12_MASK_FOLIAGE_VISIBLE);
+    const uint mask = RT12_MASK_OPAQUE_VISIBLE | (skip_foliage ? 0u : RT12_MASK_FOLIAGE_VISIBLE) | g_rt12_dynamic_mask;
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = direction;
@@ -96,12 +98,22 @@ WorldTraceHit TraceWorldClosestDxr(float3 origin, float3 direction, float t_min,
     }
     counters.hits = 1u;
     hit.t = query.CommittedRayT();
-    hit.instance = query.CommittedInstanceID();
-    const WorldInstanceGPU committed = g_trace_instances[hit.instance];
-    hit.mesh = (uint)committed.header.x;
     hit.prim = query.CommittedPrimitiveIndex();
     hit.position = origin + direction * hit.t;
-    hit.material = (uint)committed.header.z;
+    if (query.CommittedInstanceID() == 0xFFFFFFu)
+    {
+        // A character (rt12 kRt12DynamicInstanceId): as the compute path's dynamic objects.
+        hit.instance = DYNAMIC_INSTANCE_FLAG;
+        hit.mesh = DYNAMIC_MESH_MARKER;
+        hit.material = 0u;
+    }
+    else
+    {
+        hit.instance = query.CommittedInstanceID();
+        const WorldInstanceGPU committed = g_trace_instances[hit.instance];
+        hit.mesh = (uint)committed.header.x;
+        hit.material = (uint)committed.header.z;
+    }
     return hit;
 }
 
@@ -112,6 +124,7 @@ WorldTraceHit TraceWorldClosestDxr(float3 origin, float3 direction, float t_min,
 void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
 {
     g_rt12_d = max((uint)g_rtao_trace.x, 1u);
+    g_rt12_dynamic_mask = (uint)g_rtao_size.z > 0u ? RT12_MASK_DYNAMIC : 0u;
     viewInv_g = float4x4(asfloat(g_rt12_scene.Load(int3(0, 0, 0))), asfloat(g_rt12_scene.Load(int3(1, 0, 0))),
                          asfloat(g_rt12_scene.Load(int3(2, 0, 0))), asfloat(g_rt12_scene.Load(int3(3, 0, 0))));
     viewProjInv_g = float4x4(asfloat(g_rt12_scene.Load(int3(4, 0, 0))), asfloat(g_rt12_scene.Load(int3(5, 0, 0))),

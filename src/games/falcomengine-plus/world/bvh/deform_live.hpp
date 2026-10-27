@@ -334,6 +334,13 @@ struct DynamicObjectInfo {
   float bbox_max[3] = {};
 };
 
+// One character RefitDeformLiveCharacters traced for the lighting frame (rt12 builds its DXR BLAS from the same set).
+struct DynamicCharacter {
+  uint64_t key = 0u;          // DeformDrawKey of the identity
+  uint32_t vertex_base = 0u;  // first float3 vertex in the arena (this frame)
+  uint32_t triangles = 0u;
+};
+
 // An identity traced at the previous present and not traced at this one (world_deform_live.json).
 struct DynamicDropout {
   uint32_t frame = 0u;
@@ -423,6 +430,7 @@ struct DeformLiveState {
   // Character refit at lighting time (RefitDeformLiveCharacters), once per frame.
   uint32_t lighting_frame = UINT32_MAX;  // game frame of the last character refit
   uint32_t lighting_object_count = 0u;   // characters refit for lighting_frame
+  std::vector<DynamicCharacter> lighting_characters;  // the characters of lighting_frame, in object order
   std::vector<DynamicDropout> dropouts;  // last kDynamicDropoutRing
   DeformLiveStats stats;
 };
@@ -1295,6 +1303,7 @@ inline DynamicTraceInputs RefitDeformLiveCharacters(reshade::api::device* device
   DynamicTraceInputs inputs;
   const uint32_t frame = g_state.frame.load();
   std::vector<DynamicObjectGPU> character_objects;
+  std::vector<DynamicCharacter> characters;
   reshade::api::resource objects_buffer = {0u};
   reshade::api::resource_view objects_srv = {0u};
   {
@@ -1310,6 +1319,7 @@ inline DynamicTraceInputs RefitDeformLiveCharacters(reshade::api::device* device
     }
     g_deform_live.lighting_frame = frame;
     g_deform_live.lighting_object_count = 0u;
+    g_deform_live.lighting_characters.clear();
     if (g_deform_live.capture_frame != frame) return inputs;
     for (const DynamicCapture& capture : g_deform_live.captures) {
       if (!capture.skinned) continue;
@@ -1317,6 +1327,7 @@ inline DynamicTraceInputs RefitDeformLiveCharacters(reshade::api::device* device
       if (it == g_deform_live.identities.end() || !it->second.resident) continue;
       if (character_objects.size() >= kDynamicMaxObjects) break;
       character_objects.push_back(MakeDynamicObjectGPU(it->second, capture.vertex_base));
+      characters.push_back({capture.key, capture.vertex_base, capture.triangles});
     }
     objects_buffer = g_deform_live.lighting_objects_buffer;
     objects_srv = g_deform_live.lighting_objects_srv;
@@ -1335,8 +1346,24 @@ inline DynamicTraceInputs RefitDeformLiveCharacters(reshade::api::device* device
   std::lock_guard<std::mutex> lock(g_deform_live.mutex);
   if (g_deform_live.lighting_frame != frame) return inputs;
   g_deform_live.lighting_object_count = count;
+  g_deform_live.lighting_characters = std::move(characters);
   inputs.count = count;
   return inputs;
+}
+
+// rt12 (DXR RTAO): the characters RefitDeformLiveCharacters traced for this frame and the arena they live in.
+// False when that refit did not run this frame or produced nothing.
+inline bool GetDeformLiveCharacters(reshade::api::device* device, std::vector<DynamicCharacter>* out,
+                                    reshade::api::resource_view* arena_srv) {
+  std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+  if (!g_deform_live.enabled.load(std::memory_order_relaxed) || g_deform_live.device != device) return false;
+  if (g_deform_live.lighting_frame != g_state.frame.load() || g_deform_live.lighting_object_count == 0u
+      || g_deform_live.lighting_characters.size() != g_deform_live.lighting_object_count) {
+    return false;
+  }
+  *out = g_deform_live.lighting_characters;
+  *arena_srv = g_deform_live.arena_srv;
+  return true;
 }
 
 // Presence diagnostics of the deforming meshes (world_deform_live.json, written with world_pool.json).

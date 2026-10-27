@@ -4771,6 +4771,27 @@ static void TestRt12Mirror(Device* dev, Queue* queue) {
   }
 }
 
+// M4 (rt12): the character vertex range, the BLAS build cadence and the carrier capacity.
+static void TestRt12Dynamic() {
+  namespace rt12 = falcom_world::rt12;
+  Stage("rt12 dynamic");
+  // 1. Vertex end: the largest vertex_base + 3 * triangles over the characters; 0 for none.
+  {
+    const uint32_t bases[3] = {0u, 300u, 90u};
+    const uint32_t triangles[3] = {10u, 5u, 100u};
+    CHECK(rt12::Rt12DynamicVertexEnd(bases, triangles, 3u) == 390u, "vertex end of three characters is 390");
+    CHECK(rt12::Rt12DynamicVertexEnd(bases, triangles, 0u) == 0u, "no characters: vertex end 0");
+  }
+  // 2. BLAS cadence: built when new, when the triangle count moved, and every 30 frames; otherwise refit.
+  CHECK(rt12::Rt12DynamicNeedsBuild(false, 0u, 10u, 0u), "a new identity builds");
+  CHECK(rt12::Rt12DynamicNeedsBuild(true, 10u, 11u, 1u), "a changed triangle count builds");
+  CHECK(!rt12::Rt12DynamicNeedsBuild(true, 10u, 10u, 29u), "29 frames after the build refits");
+  CHECK(rt12::Rt12DynamicNeedsBuild(true, 10u, 10u, 30u), "30 frames after the build rebuilds");
+  // 3. The carrier holds the whole deform arena (float3 vertices, 12 bytes each).
+  CHECK(static_cast<uint64_t>(rt12::kRt12CarrierWidth) * rt12::kRt12CarrierHeight * 12u >= bvh::kDynamicArenaBytes,
+        "carrier holds the deform arena");
+}
+
 int main() {
   falcom_world::g_state.pool_capture_requested.store(true);
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -5846,6 +5867,7 @@ int main() {
   Stage("11e BVH range coverage");
   TestRegionCoverage(&dev, &queue);
   TestRt12Mirror(&dev, &queue);
+  TestRt12Dynamic();
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);
