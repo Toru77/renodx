@@ -27,6 +27,7 @@
 #include "deform_probe.hpp"
 #include "bvh_resources.hpp"
 #include "bvh_trace.hpp"
+#include "../rt12/rt12_probe.hpp"
 
 namespace falcom_world::bvh {
 
@@ -308,6 +309,7 @@ inline void OnWorldPresentBvh(
   if (queue == nullptr || swapchain == nullptr) return;
   auto* device = queue->get_device();
   if (device == nullptr) return;
+  if (rt12::g_rt12_probe.requested.exchange(false, std::memory_order_relaxed)) rt12::RunRt12Probe(device, g_state.frame.load());
   if (g_perf_gate.clear_pending.exchange(false)) {
     ClearPerfGathered(GetBvhDeviceData(device));
     rtao::ClearRtaoPerfGathered(device);

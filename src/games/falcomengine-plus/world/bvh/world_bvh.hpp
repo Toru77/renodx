@@ -660,6 +660,20 @@ inline bool DrawBvhPanel() {
   ImGui::SameLine();
   if (ImGui::Button("Rebuild BVH")) g_live_bvh.reset_requested.store(true, std::memory_order_relaxed);
   if (ImGui::IsItemHovered()) ImGui::SetTooltip("Drops every GPU mesh and streams the pool in again.");
+  if (ImGui::Button("Run DX12 probe")) rt12::g_rt12_probe.requested.store(true, std::memory_order_relaxed);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Creates a Direct3D 12 device on this GPU, logs its ray tracing tier and the D3D11/D3D12 sync cost, then releases it. Waits for the GPU: expect a short hitch.");
+  }
+  std::string rt12_result;
+  {
+    std::lock_guard<std::mutex> lock(rt12::g_rt12_probe.mutex);
+    rt12_result = rt12::g_rt12_probe.result;
+  }
+  if (!rt12_result.empty()) {
+    ImGui::TextUnformatted(rt12_result.c_str());
+  } else {
+    ImGui::TextDisabled("DX12 probe: not run");
+  }
   bool skip_noop = g_live_bvh.skip_noop.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Skip no-op TLAS rebuilds", &skip_noop)) {
     g_live_bvh.skip_noop.store(skip_noop, std::memory_order_relaxed);

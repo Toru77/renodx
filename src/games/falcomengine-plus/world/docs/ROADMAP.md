@@ -79,6 +79,7 @@ R1b-0 (diagnostic, startup hook-off mask), implemented, not validated in game: `
 | Refit and drain cleanup; refit diet; rebuild diet; housekeeping | Regression only; no pins changed | HISTORY: Refit and drain cleanup; Rebuild diet; Refit diet; Housekeeping |
 | Wind sway range slider | Slider check and dumps | HISTORY: Wind sway range slider |
 | Diagnostics round 3b and the M0 to M3 switches | Dump split checks | HISTORY: Round: diagnostics (2026-10-08) |
+| DX12 probe (M2a, diagnostic) | Run DX12 probe; send dx12_probe_f<frame>.json from renodx-dev\falcomengine-plus\world | world/rt12/rt12_probe.hpp |
 
 ## Reference
 
