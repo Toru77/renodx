@@ -93,9 +93,11 @@
 
 #include "../../utils/bitwise.hpp"
 #include "../../utils/build_info.hpp"
+#include "../../utils/descriptor.hpp"
 #include "../../utils/minhook.hpp"
 #include "../../utils/pipeline_layout.hpp"
 #include "../../utils/shader.hpp"
+#include "../../utils/state.hpp"
 #include "./camera_jitter.hpp"
 
 namespace farcry6_dlss::dlss {
@@ -3285,13 +3287,28 @@ struct MotionProducerTrace {
     uint64_t resource = 0u;
     uint64_t interval = UINT64_MAX;
     reshade::api::command_list* command_list = nullptr;
+    reshade::api::command_list* eval_command_list = nullptr;
+    reshade::api::command_queue* producer_queue = nullptr;
+    reshade::api::command_queue* eval_queue = nullptr;
+    uint64_t producer_submit = 0u;
+    uint64_t eval_submit = 0u;
+    bool queue_counted = false;
   };
   std::array<Entry, 8> entries = {};
   uint64_t writes = 0u;
+  uint64_t mirrored = 0u;
   uint64_t unresolved = 0u;
+  uint64_t no_range = 0u;
+  uint64_t no_table = 0u;
+  uint64_t no_descriptor = 0u;
+  uint64_t wrong_size = 0u;
   uint64_t matched_same_list = 0u;
   uint64_t matched_other_list = 0u;
   uint64_t unmatched = 0u;
+  uint64_t submit_serial = 0u;
+  uint64_t same_queue_ordered = 0u;
+  uint64_t same_queue_reversed = 0u;
+  uint64_t different_queues = 0u;
 };
 inline MotionProducerTrace motion_producer_trace;
 inline float dlss_motion_pair_probe = 0.f;
@@ -3563,14 +3580,56 @@ inline bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
           layout, 0u, 0u, reshade::api::descriptor_type::texture_unordered_access_view,
           output_params, output_bindings, 4u, reshade::api::shader_stage::all_compute);
       uint64_t output_resource = 0u;
+      bool mirrored = false;
+      bool had_table = false;
+      bool had_descriptor = false;
+      bool had_wrong_size = false;
+      const auto bound = renodx::utils::state::CopyBoundDescriptorTables(
+          cmd_list, renodx::utils::state::PipelineBindPoint::COMPUTE);
       for (uint32_t i = 0u; i < output_count; ++i) {
         if (output_params[i] >= data->descriptor_tables.size()) continue;
+        auto table = data->descriptor_tables[output_params[i]];
+        if (bound.has_value() && bound->known && bound->layout == layout && output_params[i] < bound->tables.size()) {
+          table = bound->tables[output_params[i]];
+        }
+        if (table.handle == 0u) continue;
+        had_table = true;
         DescriptorFingerprint key;
         RecordedDescriptor record;
-        if (!ReadSlotFingerprint(device, data->descriptor_tables[output_params[i]], output_bindings[i], key)
+        if (!ReadSlotFingerprint(device, table, output_bindings[i], key)
             || !LookupFingerprint(key, record) || !record.has_resource
-            || record.type != reshade::api::descriptor_type::texture_unordered_access_view) continue;
-        if (record.width * 2u != last_render_width.load() || record.height * 2u != last_render_height.load()) continue;
+            || record.type != reshade::api::descriptor_type::texture_unordered_access_view) {
+          // DevKit already maintains this mirror while it is loaded; do not turn
+          // descriptor-copy tracking on just for this optional diagnostic.
+          auto* descriptors = renodx::utils::data::Get<renodx::utils::descriptor::DeviceData>(device);
+          reshade::api::descriptor_heap heap = {};
+          uint32_t offset = 0u;
+          device->get_descriptor_heap_offset(table, output_bindings[i], 0u, &heap, &offset);
+          reshade::api::resource_view view = {};
+          if (descriptors != nullptr && heap.handle != 0u) {
+            std::shared_lock lock(descriptors->mutex);
+            const auto it = descriptors->heaps.find(heap.handle);
+            if (it != descriptors->heaps.end() && offset < it->second.size()) {
+              const auto& slot = it->second[offset];
+              if (slot.type == reshade::api::descriptor_type::texture_unordered_access_view) {
+                view = slot.resource_view;
+              }
+            }
+          }
+          if (view.handle == 0u) continue;
+          record.resource = device->get_resource_from_view(view);
+          if (record.resource.handle == 0u) continue;
+          const auto desc = device->get_resource_desc(record.resource);
+          if (desc.type != reshade::api::resource_type::texture_2d) continue;
+          record.width = desc.texture.width;
+          record.height = desc.texture.height;
+          mirrored = true;
+        }
+        had_descriptor = true;
+        if (record.width * 2u != last_render_width.load() || record.height * 2u != last_render_height.load()) {
+          had_wrong_size = true;
+          continue;
+        }
         output_resource = record.resource.handle;
         break;
       }
@@ -3580,8 +3639,13 @@ inline bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
         entry = {.resource = output_resource,
                  .interval = camera_builder_frame.load(std::memory_order_acquire),
                  .command_list = cmd_list};
+        if (mirrored) ++motion_producer_trace.mirrored;
       } else {
         ++motion_producer_trace.unresolved;
+        if (output_count == 0u) ++motion_producer_trace.no_range;
+        else if (!had_table) ++motion_producer_trace.no_table;
+        else if (!had_descriptor) ++motion_producer_trace.no_descriptor;
+        else if (had_wrong_size) ++motion_producer_trace.wrong_size;
       }
     }
     uint32_t params[4] = {};
@@ -4022,8 +4086,8 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   if (!use_motion_placeholder && dlss_motion_pair_probe != 0.f) {
     const uint64_t interval = camera_builder_frame.load(std::memory_order_acquire);
     std::unique_lock lock(motion_producer_trace.mutex);
-    const MotionProducerTrace::Entry* match = nullptr;
-    for (const auto& entry : motion_producer_trace.entries) {
+    MotionProducerTrace::Entry* match = nullptr;
+    for (auto& entry : motion_producer_trace.entries) {
       if (entry.resource == motion_in.resource.handle && entry.interval == interval) {
         match = &entry;
         break;
@@ -4032,8 +4096,10 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     if (match == nullptr) {
       ++motion_producer_trace.unmatched;
     } else if (match->command_list == cmd_list) {
+      match->eval_command_list = cmd_list;
       ++motion_producer_trace.matched_same_list;
     } else {
+      match->eval_command_list = cmd_list;
       ++motion_producer_trace.matched_other_list;
     }
   }
@@ -4582,6 +4648,18 @@ inline std::string BuildDebugReport() {
              static_cast<unsigned long long>(motion_producer_trace.matched_other_list),
              static_cast<unsigned long long>(motion_producer_trace.unmatched));
     out += line;
+    snprintf(line, sizeof(line), "    pairing lookup : mirrored=%llu no-range=%llu no-table=%llu no-descriptor=%llu wrong-size=%llu\n",
+             static_cast<unsigned long long>(motion_producer_trace.mirrored),
+             static_cast<unsigned long long>(motion_producer_trace.no_range),
+             static_cast<unsigned long long>(motion_producer_trace.no_table),
+             static_cast<unsigned long long>(motion_producer_trace.no_descriptor),
+             static_cast<unsigned long long>(motion_producer_trace.wrong_size));
+    out += line;
+    snprintf(line, sizeof(line), "    pairing submit : same-queue-producer-first=%llu same-queue-eval-first=%llu different-queues=%llu (submission callbacks; not GPU completion)\n",
+             static_cast<unsigned long long>(motion_producer_trace.same_queue_ordered),
+             static_cast<unsigned long long>(motion_producer_trace.same_queue_reversed),
+             static_cast<unsigned long long>(motion_producer_trace.different_queues));
+    out += line;
   }
   {
     std::shared_lock lock(motion_capture.mutex);
@@ -5047,6 +5125,29 @@ inline std::string BuildDebugReport() {
 
 // ── Event handlers ──
 inline void OnExecuteCommandList(reshade::api::command_queue* queue, reshade::api::command_list* cmd_list) {
+  if (dlss_motion_pair_probe != 0.f && queue != nullptr && cmd_list != nullptr) {
+    std::unique_lock lock(motion_producer_trace.mutex);
+    const uint64_t serial = ++motion_producer_trace.submit_serial;
+    for (auto& entry : motion_producer_trace.entries) {
+      if (entry.command_list == cmd_list && entry.producer_submit == 0u) {
+        entry.producer_queue = queue;
+        entry.producer_submit = serial;
+      }
+      if (entry.eval_command_list == cmd_list && entry.eval_submit == 0u) {
+        entry.eval_queue = queue;
+        entry.eval_submit = serial;
+      }
+      if (entry.queue_counted || entry.producer_submit == 0u || entry.eval_submit == 0u) continue;
+      entry.queue_counted = true;
+      if (entry.producer_queue != entry.eval_queue) {
+        ++motion_producer_trace.different_queues;
+      } else if (entry.producer_submit <= entry.eval_submit) {
+        ++motion_producer_trace.same_queue_ordered;
+      } else {
+        ++motion_producer_trace.same_queue_reversed;
+      }
+    }
+  }
   {
     std::unique_lock lock(scene_buffer_capture.mutex);
     if (scene_buffer_capture.state == SceneBufferCapture::State::recorded && scene_buffer_capture.command_list == cmd_list) {

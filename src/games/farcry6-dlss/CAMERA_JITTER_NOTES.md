@@ -151,3 +151,15 @@ present interval and counts same-list, different-list, and unresolved cases in
 Copy Report. A match indicates command recording identity only; it does not
 prove command submission order, GPU completion, queue dependencies, or mask
 lifetime. The probe neither dispatches the mask shader nor changes motion.
+
+The 2026-10-27 pairing report recorded 428 producer/evaluation pairs on different
+command lists, all 428 submitted to the same queue with the producer callback
+first, and no different-queue or reversed pairs. This supports investigating an
+ordered GPU-only handoff for this session; it does not prove all future frames
+or safe reuse of descriptors and mask resources while the GPU is behind.
+
+`dlss_mv_masked_unpack.cs_6_0.hlsl` is an unbound experimental unpack shader.
+It preserves the existing packed-motion filter and adds an object-mask-weighted
+current-minus-previous jitter delta, with an explicit correction scale. The
+sign, edge interpolation and actual mask coverage remain unverified, and neither
+shader is dispatched by the addon yet. The shader compiles with DXC.
