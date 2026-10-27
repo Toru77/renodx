@@ -1020,6 +1020,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // VBGI radiance inputs (lighting draw): 0 mrt1 t2, 1 mrt2 t3, 2 deferredParams t6, 3 shadow t7 (Sora 2nd) / t9 (Sora 1st), 4 dynamicLights t11, 5 lightIndices t12.
   reshade::api::resource_view vbgi_in_srv[6] = {};
   uint64_t vbgi_in_frame[6] = {UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
+  uint64_t vbgi_in_res[6] = {};                 // resource of vbgi_in_srv[k] (destroy-event liveness)
+  std::atomic<bool> vbgi_in_live[6] = {};       // false after the view or its resource is destroyed
   reshade::api::resource vbgi_radiance_texture = {};
   reshade::api::resource_view vbgi_radiance_srv = {};
   reshade::api::resource_view vbgi_radiance_mip_srv[4] = {};
@@ -5744,10 +5746,34 @@ static void OnPushDescriptorsCapture(
         }
       }
     }
-    // VBGI radiance inputs: only from the Sora and Kai lighting shaders while VBGI runs. The binding is the array base, so each
-    // slot of the update is matched by its own number (shadow t9 on Sora 1st, t7 on Sora 2nd, t16 cascade array on Kai; slot 3 is
-    // the depth on Kai, so it is not captured there).
+    // VBGI radiance inputs: from the Sora and Kai lighting shaders while VBGI runs. The binding is the array base, so each
+    // slot of the update is matched by its own number (shadow t9 on Sora 1st, t7 on Sora 2nd; slot 3 is the depth on Kai, so
+    // it is not captured there). Kai slots 16, 11 and 12 come from any pixel-shader push (shape-filtered), see below.
     if (VbgiRunning() && update.count >= 1) {
+      // Kai: t16 (cascade array), t11 and t12 (lamp lists) are bound by earlier passes and stay bound into the lighting
+      // draw, so they are taken from any pixel-shader push, filtered by resource shape. The last accepted view is what the
+      // lighting draw sees.
+      if (IsKai()) {
+        for (uint32_t i = 0; i < update.count; ++i) {
+          const uint32_t slot = update.binding + i;
+          const int k = slot == 16u ? 3 : (slot == 11u ? 4 : (slot == 12u ? 5 : -1));
+          if (k < 0 || views[i].handle == 0u) continue;
+          if (views[i].handle != d->vbgi_in_srv[k].handle) {
+            const auto res = device->get_resource_from_view(views[i]);
+            if (res.handle == 0u) continue;
+            const auto desc = device->get_resource_desc(res);
+            const bool ok = k == 3
+                ? (desc.type == reshade::api::resource_type::texture_2d && desc.texture.depth_or_layers == 3u)
+                : (desc.type == reshade::api::resource_type::buffer && desc.buffer.size > 0u
+                   && desc.buffer.size % (k == 4 ? 112u : 576u) == 0u);
+            if (!ok) continue;
+            d->vbgi_in_srv[k] = views[i];
+            d->vbgi_in_res[k] = res.handle;
+          }
+          d->vbgi_in_live[k] = true;
+          d->vbgi_in_frame[k] = d->frame_index;
+        }
+      }
       auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
@@ -5762,11 +5788,13 @@ static void OnPushDescriptorsCapture(
             if (slot == 2u) k = 0;
             else if (slot == 3u && !kai) k = 1;
             else if (slot == deferred_slot) k = 2;
-            else if (slot == shadow_slot) k = 3;
-            else if (slot == 11u) k = 4;
-            else if (slot == 12u) k = 5;
+            else if (!kai && slot == shadow_slot) k = 3;
+            else if (!kai && slot == 11u) k = 4;
+            else if (!kai && slot == 12u) k = 5;
             if (k < 0) continue;
+            if (views[i].handle != d->vbgi_in_srv[k].handle) d->vbgi_in_res[k] = device->get_resource_from_view(views[i]).handle;
             d->vbgi_in_srv[k] = views[i];
+            d->vbgi_in_live[k] = true;
             d->vbgi_in_frame[k] = d->frame_index;
           }
         }
@@ -6230,6 +6258,7 @@ static void KillAllTracked(DeviceData* d, uint64_t deadView, uint64_t deadRes) {
   KillTrackedInput(d, d->rcas_motion_srv, d->rcas_motion_res, d->rcas_motion_live, "rcasMotion", deadView, deadRes);
   KillTrackedInput(d, d->mb_rtv4_srv, d->mb_rtv4_res, d->mb_rtv4_live, "mbRtv4Motion", deadView, deadRes);
   KillTrackedInput(d, d->mb_tonemap_src_srv, d->mb_tonemap_src_res, d->mb_tonemap_src_live, "mbTonemapSrc", deadView, deadRes);
+  for (int k = 0; k < 6; ++k) KillTrackedInput(d, d->vbgi_in_srv[k], d->vbgi_in_res[k], d->vbgi_in_live[k], "vbgiInput", deadView, deadRes);
 }
 static void OnDestroyResourceView(reshade::api::device* device, reshade::api::resource_view view) {
   if (!device || !view.handle) return;
@@ -12924,14 +12953,17 @@ constexpr float kVbgiFeedbackMax = 0.9f;  // Multi-Bounce Strength x Intensity l
 static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
   if (d->vbgi_radiance_frame == d->frame_index) return true;
   if (!VbgiRunning() || !d->captured_depth_srv.handle || !d->captured_mrt_normal_srv.handle
-      || !d->captured_scene_cbv_valid || !d->captured_color_srv.handle || d->captured_color_frame != d->frame_index) return false;
+      || !d->captured_scene_cbv_valid || !d->captured_color_srv.handle || d->captured_color_frame != d->frame_index) {
+    CSLog("vbgi", "radiance skipped: depth=" + std::to_string(d->captured_depth_srv.handle != 0) + " mrt=" + std::to_string(d->captured_mrt_normal_srv.handle != 0) + " cbv=" + std::to_string(d->captured_scene_cbv_valid) + " color=" + std::to_string(d->captured_color_srv.handle != 0) + " colorAge=" + std::to_string(d->captured_color_frame == UINT64_MAX ? -1 : (long long)(d->frame_index - d->captured_color_frame)), true);
+    return false;
+  }
   for (uint32_t k = 0; k < 6; ++k) {
     if (k == 1 && IsKai()) continue;
-    if (!d->vbgi_in_srv[k].handle || d->vbgi_in_frame[k] != d->frame_index) {
+    if (!d->vbgi_in_srv[k].handle || !d->vbgi_in_live[k] || d->vbgi_in_frame[k] != d->frame_index) {
       static bool s_inputs_logged = false;
       if (!s_inputs_logged) {
-        s_inputs_logged = true;
         CSLog("vbgi", "radiance skipped: lighting input " + std::to_string(k) + " not captured", true);
+        s_inputs_logged = true;
       }
       return false;
     }
