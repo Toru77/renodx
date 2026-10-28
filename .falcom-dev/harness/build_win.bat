@@ -18,7 +18,7 @@ if /i "%~2"=="fast" (
   set "OUT=%NAME%_fast"
   set "ASAN="
 )
-cl /nologo /std:c++20 /EHsc /DNOMINMAX /DWIN32_LEAN_AND_MEAN /O2 /Zi /MD /FS %ASAN% /W1 /wd4996 ^
+cl /nologo /std:c++20 /EHsc /DNOMINMAX /DWIN32_LEAN_AND_MEAN /O2 /Zi /MD /FS /bigobj %ASAN% /W1 /wd4996 ^
   /I. /Iinc /I"%REPO%external\reshade\include" ^
   /DFALCOM_BYTECODE_DIR=\"../bytecode/\" /DFALCOM_WINDOWS_HARNESS ^
   %NAME%.cpp /Fe:%OUT%.exe /Fo:%OUT%.obj /Fd:%OUT%.pdb

@@ -30,6 +30,7 @@
 namespace falcom_world::bvh {
 
 inline void OnDestroyDeviceBvh(reshade::api::device* device) {
+  rt12::DestroyGc(device);
   rt12::DestroyRt12(device);
   DestroyBvhDebugResources(device);
   rtao::DestroyRtaoDeviceData(device);
@@ -719,6 +720,51 @@ inline bool DrawBvhPanel() {
                               + dxr_ms(dxr_panel.records_ms_sum, dxr_panel.records_ms_n) + " TLAS "
                               + dxr_ms(dxr_panel.tlas_ms_sum, dxr_panel.tlas_ms_n) + " trace " + dxr_ms(dxr_panel.trace_ms_sum, dxr_panel.trace_ms_n);
   ImGui::TextUnformatted(dxr_gpu.c_str());
+  bool gc_on = bvh::g_gpu_capture.enabled.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("GPU geometry cache (experimental)", &gc_on)) bvh::g_gpu_capture.enabled.store(gc_on, std::memory_order_relaxed);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Session only. Needs the DXR backend. Copies and decodes the static meshes on the GPU into a separate D3D12 cache with its own BLAS. Validation only: nothing traces it. Off: no GPU cache work at all.");
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Check GPU geometry")) rt12::g_gc_check_requested.store(true, std::memory_order_relaxed);
+  ImGui::SameLine();
+  if (ImGui::Button("Dump GPU cache JSON")) rt12::g_gc_dump_requested.store(true, std::memory_order_relaxed);
+  rt12::Rt12GcPanel gc_panel;
+  {
+    std::lock_guard lock(rt12::g_gc_panel_mutex);
+    gc_panel = rt12::g_gc_panel;
+  }
+  const uint64_t gc_range = gc_panel.phase_counts[0] + gc_panel.phase_counts[1];
+  const uint64_t gc_data = gc_panel.phase_counts[2] + gc_panel.phase_counts[3];
+  const uint64_t gc_entries = gc_range + gc_data + gc_panel.phase_counts[4] + gc_panel.phase_counts[5];
+  const std::string gc_state = "GPU cache: " + gc_panel.state + "  entries " + std::to_string(gc_entries) + " (range " + std::to_string(gc_range)
+                               + ", data " + std::to_string(gc_data) + ", done " + std::to_string(gc_panel.phase_counts[4]) + ", refused "
+                               + std::to_string(gc_panel.phase_counts[5]) + "), resident " + std::to_string(gc_panel.resident) + " of "
+                               + std::to_string(gc_panel.pool_meshes) + " pool meshes, pending " + std::to_string(gc_panel.pending)
+                               + ", BLAS queue " + std::to_string(gc_panel.blas_queue);
+  ImGui::TextUnformatted(gc_state.c_str());
+  constexpr double kMb = 1024.0 * 1024.0;
+  const double gc_used = static_cast<double>(gc_panel.arena_used[0] + gc_panel.arena_used[1] + gc_panel.arena_used[2]) / kMb;
+  char gc_memory[256] = {};
+  std::snprintf(gc_memory, sizeof(gc_memory),
+                "GPU cache memory: geometry %.1f / %.0f MB (dead %.1f MB), BLAS %.1f MB, D3D11 112 MB, linear 32 MB; build GPU ms %s, D3D11 decode ms %s",
+                gc_used, static_cast<double>(bvh::kGcGeometryBytesMax) / kMb, static_cast<double>(gc_panel.dead_bytes) / kMb,
+                static_cast<double>(gc_panel.blas_bytes) / kMb, dxr_ms(static_cast<float>(gc_panel.build_ms_sum), static_cast<uint32_t>(gc_panel.build_ms_n)).c_str(),
+                dxr_ms(static_cast<float>(gc_panel.decode_ms_sum), static_cast<uint32_t>(gc_panel.decode_ms_n)).c_str());
+  ImGui::TextUnformatted(gc_memory);
+  std::string gc_check_line = "Check GPU geometry: not run";
+  if (gc_panel.check.run) {
+    char wait[32] = {};
+    std::snprintf(wait, sizeof(wait), "%.1f", gc_panel.check.wait_ms);
+    uint64_t cpu_failed = 0u;
+    for (const auto& [reason, count] : gc_panel.check.cpu_failed) cpu_failed += count;
+    gc_check_line = "Check GPU geometry: first " + std::to_string(gc_panel.check.checked + gc_panel.check.cpu_absent + cpu_failed) + " meshes with a BLAS by key: "
+                    + std::to_string(gc_panel.check.checked) + " meshes, " + std::to_string(gc_panel.check.triangles)
+                    + " triangles, " + std::to_string(gc_panel.check.mismatched_triangles) + " mismatched (" + std::to_string(gc_panel.check.mismatched_meshes)
+                    + " meshes), cpu absent " + std::to_string(gc_panel.check.cpu_absent) + ", cpu failed " + std::to_string(cpu_failed)
+                    + ", uv size mismatch " + std::to_string(gc_panel.check.uv_size_mismatch) + ", wait " + wait + " ms";
+  }
+  ImGui::TextUnformatted(gc_check_line.c_str());
   bool skip_noop = g_live_bvh.skip_noop.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Skip no-op TLAS rebuilds", &skip_noop)) {
     g_live_bvh.skip_noop.store(skip_noop, std::memory_order_relaxed);

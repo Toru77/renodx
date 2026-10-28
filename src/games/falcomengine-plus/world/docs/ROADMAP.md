@@ -84,6 +84,7 @@ R1b-0 (diagnostic, startup hook-off mask), implemented, not validated in game: `
 | DXR backend M3 (RTAO pass A on D3D12, scene mirror, alpha mirror) | Owner list in Reference: DXR backend (M3) | world/rt12/rt12_backend.hpp, rt12_mirror.hpp, world/shaders/world_rt12_*.hlsl |
 | DXR backend M4 (characters on DXR: carrier, character BLAS, mask 8) | Owner test in Reference: DXR backend (M4) | world/rt12/rt12_backend.hpp, world/shaders/world_rt12_carrier.cs_5_0.hlsl, world_rt12_deform_unpack.cs_6_5.hlsl |
 | DXR backend M5 (P2b moving objects on DXR: records carrier, records pass, instance table at S + r) | Owner test in Reference: DXR backend (M5) | world/rt12/rt12_backend.hpp, world/rt12/rt12_mirror.hpp, world/shaders/world_rt12_records_carrier.cs_5_0.hlsl, world_rt12_records.cs_6_5.hlsl |
+| GPU geometry cache G2 (validation only, not traced) | Owner test in Reference: GPU geometry cache (G2) | world/bvh/gpu_capture.hpp, world/rt12/rt12_capture.hpp, world/shaders/world_gc_range.cs_5_0.hlsl, world_gc_decode.cs_5_0.hlsl |
 
 ## Reference
 
@@ -317,6 +318,49 @@ Owner test (DevKit build; RTAO on, Trace characters ON, P2b ON, Two-Sided discov
 6. Send: perf files, `world_rtao_*.json`, `world_rt12.json`, screenshots, `[world-rt12]` log lines, the panel lines.
 
 Decision (recommendation only, not implemented in M5): keep the compute pass A as the fallback for every counted reason and as the A/B reference. After the A/B confirms parity (rays and hits within a few percent, images match) in an interior and a large outdoor area, make the DXR backend the default for RTAO on DXR 1.1 devices (a saved setting, still with the counted fallback) in its own milestone. Retire the compute traversal and the CPU LBVH only when every RT consumer (RTAO, RTGI, RTLS, RT sun, debug views) traces on DXR, in one cleanup milestone.
+
+### GPU geometry cache (G2): reference
+
+Scope: validation only, not traced. The static mesh geometry is copied on the GPU at the draw (index, vertex and UV ranges), decoded by a D3D11 pass into a carrier ring, and copied by D3D12 into its own arenas with one BLAS per mesh. Nothing traces it; the CPU pool, the M3 mirror, M5 and the compute pass A are unchanged. Switch "GPU geometry cache (experimental)": session only, default OFF, effective only with the DXR switch on. Code: `world/bvh/gpu_capture.hpp` (draw side and the transcriptions the harness tests), `world/rt12/rt12_capture.hpp` (present side), `world/shaders/world_gc_range.cs_5_0.hlsl` and `world_gc_decode.cs_5_0.hlsl` (FXC; no cs_6_5 shader).
+
+Design (short form):
+- D1, D2 (draw): `GpuCaptureOnDraw` runs after `LogPoolMeshCopies` in `OnPoolScanDraw` for direct draws whose VB, IB and UV buffers the pool tracks for the key. Off: one relaxed load. Entries are keyed by `mesh_key`. `g_gpu_capture.mutex` and `g_pool.mutex` are never nested, and no graphics call is made under either.
+- D3, D5: phases Range (index copy at a draw) -> RangeWait (16-byte min/max result read two presents later) -> Data (vertex, index and UV copies at a later draw of the same key) -> DataWait (decode at that present) -> Done (in the carrier, handed to D3D12). A write (`NotePoolBufferWrite`) resets the entry to Range; the third write refuses it (`rewritten`). A destroyed buffer erases it. Each creation or reset takes a new generation; stale jobs are dropped (`stale_jobs`).
+- D7 to D9: staging is one 16 MB raw buffer; copies are 4-byte aligned, starts 16-aligned. The range pass takes InterlockedMax of ~abs and abs, and counts invalid indices. The decode pass has one thread per texel slot; texel n is at (n % 4096, n / 4096); vertices are float4 with w = 1; indices are relative to the min vertex (out of range -> 0); UVs are pairs (u0, v0, u1, v1).
+- D10: carrier ring of 3 shared RGBA32_UINT textures, 4096 x 512 each. A decode runs only when the carrier and the GC slot are free (else `carrier_busy` / `carrier_full`); the cache never waits on the CPU per frame.
+- D11 to D13: D3D12 uses copies only: one CopyTextureRegion of the carrier rows into a 32 MB linear buffer, then CopyBufferRegion per mesh into arena 0 (vertices, 16 B), 1 (indices, 4 B) and 2 (UVs, 8 B). Arenas grow by copy as in SubmitPresent. Caps: 256 MB geometry (`vram_cap`), 512 MB BLAS (`blas_cap_waits`). When dead bytes exceed half of a used arena above 64 MB, the cache resets (`fragmented`). One BLAS per mesh (PREFER_FAST_TRACE), at most 1,048,576 triangles per present.
+- D14, D15: `OnGcPresent` runs after `UpdateLiveBvh` and before `rt12::OnPresent`. The GC submission waits on fence11 (when it placed meshes) and on `last_signal`, then signals and becomes `last_signal`. A failure before ExecuteCommandLists deactivates the cache (`[world-gc] failed at <stage>`; the M5 path continues); a failed signal after execute stops DXR (FailSession).
+- D17: "Check GPU geometry" copies up to 64 resident meshes back into a readback buffer, waits at most 2000 ms, and compares bitwise per triangle, in object space, with the CPU pool mesh of the same key (`GcCompareTriangles`). Mismatches are split by VB usage and flags, IB usage and flags, position format and index size. Keys with no CPU mesh are split: `cpu_failed` (a histogram of the pool's failure reason for the key) and `cpu_absent` (no pool mesh and no failure record). The UV compare runs only when the CPU has one UV per position; an index outside the CPU positions is a mismatch.
+- P-2 note: `cpu_absent` (keys the GPU holds with no pool mesh and no pool failure record) and the `cpu_dynamic` and `rewritten` counts are new evidence; `cpu_failed` is not. G2 does not resolve the P-2 contradiction.
+- G2 note (a): the owner-mismatch compare (`g_rt12_gc->owner != g_rt12.get()`) is a raw-pointer compare with no generation id. This is accepted: `OnGcPresent` runs before `rt12::OnPresent` and `DestroyGc` before `DestroyRt12`, so a null `g_rt12` always precedes a reuse of the address.
+- G2 note (b): the owner-mismatch teardown path (`[world-gc] teardown (owner mismatch): leaked`) is untested. It is defensive and not reachable in game; plan section 7 step 6 covers the reachable teardowns.
+- Ordering invariant (item 2): the draw copies are issued only on the immediate context, in the order of the draws. A deferred draw serves none (`deferred_skips`). A present's range and decode passes are submitted before the next frame's draw copies on that context, so they read this present's staging.
+- staging_used reset (item 8, disclosure): `staging_used` is reset to 0 when the present takes its jobs (OnGcPresent step 6), and in FailGc and TeardownGc. The 16 MB staging is reused by each present; this is safe only because of the ordering invariant above.
+- G4 to-do (item 10): `pending` (entries in Range, RangeWait, Data and DataWait, plus `build_queue`) is the settle signal. Before G4 gates on it, confirm it covers every job still in flight, including range results waiting in `readback_jobs`.
+
+Refusals (each counted by reason in `refused`; the CPU pool still captures these meshes): the `ResolvePoolMeshLayout` errors (not indexed, triangle list, stride 0, no input layout, ...), `gpu_written`, `cpu_dynamic`, `format`, `uv_format`, `rewritten`, `range`, `too_large`, `bad_index`, `vram_cap`. Indirect draws are not hooked (no entry): their meshes show as `pool_meshes - resident`. A draw on a deferred context serves no copy (`deferred_skips`). `cap_attempts`, `staging_full_attempts` and `jobs_cap_attempts` count attempts, not meshes (a key refused for capacity is tried again at its next draw and counts again); they are not in `refused`. A Data-phase draw that binds another UV stream buffer than the entry's is skipped and counted (`uv_stream_mismatch`).
+
+Defaults chosen because G1 (the census) was skipped by owner decision; all unverified until the data in `world_gc.json` is read:
+| Item | Default | Data |
+|---|---|---|
+| Duplicates | no GPU dedup; each draw key gets its own mesh | `duplicates` (`dup_ratio`; the 25% rule is decided after G2) |
+| VRAM | caps above; D3D11 16 MB staging, 3 x 32 MB carriers; 32 MB linear | `memory`, `largest` |
+| Formats | the five float formats of the CPU decoder; R8G8B8A8_UNORM refused (x/255 is not bit-exact on the GPU) | `formats`, `buffers` |
+| Verify | UAV and stream-output buffers, and dynamic buffers, refused; a key written 3 times refused | `rewritten_by_buffer`, check `split` |
+| Settle | `settled` logged when pending falls to 0 from 32 meshes or more; last 8 kept | `settle` |
+
+Half subnormal (matched, not fixed): `renodx::utils::scene::HalfToFloat` (`src/utils/scene.hpp`) increments the exponent in its subnormal branch where it should decrement it, so 0x0200 decodes as 2^-13 instead of 2^-15. The CPU pool and the GPU decode both use this behaviour and so agree. The fix belongs in `src/utils` as its own change.
+
+Owner test (DevKit build; RTAO on, DXR on, Trace characters on, P2b on, Performance Gather on):
+1. Cache OFF: 30 s Performance test at a town street; screenshot; RTAO Debug 1 screenshot; Dump DXR JSON (rename to `world_rt12_off.json`).
+2. Tick "GPU geometry cache (experimental)". The log shows `[world-gc] active ...`. Within a few seconds `pending` drops to 0 and `resident` approaches the pool mesh count (minus refused and indirect-only meshes). The log shows `settled`.
+3. Press "Check GPU geometry" three times, at an interior, the street and a large outdoor area. Expected: 0 mismatched each time, and a wait under 50 ms. Then "Dump GPU cache JSON".
+4. Repeat the step 1 captures with the cache ON: the same images, rays and hits within a few percent (nothing traces the cache). Send both perf files.
+5. Change map twice. Each time: `settled`, then a check with 0 mismatched.
+6. Toggle the cache OFF, ON, OFF. Toggle DXR OFF with the cache ON (expect `[world-gc] teardown (dxr off)` before `[world-rt12] teardown (switch off)`). Exit with both ON: no crash, no `STUCK`.
+7. Send: `world_gc.json` (after steps 3 and 5), both `world_rt12*.json`, the perf files, the screenshots, the `[world-gc]` and `[world-rt12]` log lines, and the three GPU-cache panel lines.
+
+Pass: 0 mismatched at every check; resident covers the pool minus the counted refusals; step 4 images match; no crash. Mismatches are not fixed in G2; they are reported with their split.
 
 ## Open decisions
 

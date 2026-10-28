@@ -4234,6 +4234,8 @@ inline bool ReadPoolWindInputs(reshade::api::device* device, reshade::api::comma
   return true;
 }
 
+#include "gpu_capture.hpp"
+
 inline void OnPoolScanDraw(
     reshade::api::device* device,
     reshade::api::command_list* cmd_list,
@@ -4287,6 +4289,7 @@ inline void OnPoolScanDraw(
   bool queued = false;  // this draw is queued for a copy (ReservePoolCopy None, QueuePoolMesh ran)
   PoolDynamicDraw dynamic_copy;  // P2b: the slice copy of this draw, reserved under the lock
   bool dynamic_ok = false;
+  bool gc_tracked = false;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     if (gate.alpha_material) NotePoolAlphaMaterial(PoolMeshKey(draw), alpha_material, vbs_known ? &vbs : nullptr);
@@ -4375,6 +4378,15 @@ inline void OnPoolScanDraw(
     }
     if (skip != PoolSkip::None && !trace_declined) CountPoolSkip(family, skip, gate.state);
     if (gate.skip == PoolSkip::PixelUnknown) NotePoolPixelUnknown(draw, gate.unknown_reason);
+    if (mesh_key != 0u && g_gpu_capture.active.load(std::memory_order_relaxed)) {
+      const auto tracks = [&](uint64_t handle) {
+        const auto it = g_pool.keys_by_resource.find(handle);
+        return it != g_pool.keys_by_resource.end() && std::find(it->second.begin(), it->second.end(), mesh_key) != it->second.end();
+      };
+      gc_tracked = tracks(draw.vb.handle) && (draw.ib.handle == draw.vb.handle || tracks(draw.ib.handle))
+                   && (uv.buffer.handle == 0u || uv.buffer.handle == draw.vb.handle || uv.buffer.handle == draw.ib.handle
+                       || tracks(uv.buffer.handle));
+    }
     mesh_count = ReservePoolMeshCopies(device, draw, uv, false, deferred, frame, commands.data() + command_count,
                                        mesh_copies.data(), kPoolMeshCopiesPerDraw);
     command_count += mesh_count;
@@ -4398,6 +4410,7 @@ inline void OnPoolScanDraw(
   stage.Set("direct draw: copy");
   IssuePoolCopies(cmd_list, commands.data(), command_count);
   LogPoolMeshCopies(mesh_copies.data(), mesh_count, frame);
+  if (gc_tracked) GpuCaptureOnDraw(cmd_list, draw, mesh_key, uv, deferred);
 }
 
 // DrawIndexedInstancedIndirect and friends. `draw` carries the bindings at
@@ -4652,22 +4665,27 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
 inline void NotePoolBufferWrite(uint64_t handle) {
   if (handle == 0u || !PoolBloomTest(handle)) return;
   g_pool.write_events.tracked.fetch_add(1u, std::memory_order_relaxed);
-  std::lock_guard<std::mutex> lock(g_pool.mutex);
-  const auto it = g_pool.keys_by_resource.find(handle);
-  if (it == g_pool.keys_by_resource.end()) return;
-  g_pool.stats.tracked_buffer_writes += 1u;
-  for (const uint64_t mesh_key : it->second) {
-    const auto mesh = g_pool.mesh_by_key.find(mesh_key);
-    if (mesh != g_pool.mesh_by_key.end() && mesh->second < g_pool.meshes.size()) {
-      uint32_t& writes = g_pool.meshes[mesh->second].writes_after_capture;
-      if (writes != UINT32_MAX) writes += 1u;
-    }
-    const auto request = g_pool.mesh_requests.find(mesh_key);
-    if (request != g_pool.mesh_requests.end() && !request->second.written) {
-      request->second.written = true;
-      g_pool.stats.requests_written += 1u;
+  std::vector<uint64_t> gc_keys;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    const auto it = g_pool.keys_by_resource.find(handle);
+    if (it == g_pool.keys_by_resource.end()) return;
+    if (g_gpu_capture.active.load(std::memory_order_relaxed)) gc_keys = it->second;
+    g_pool.stats.tracked_buffer_writes += 1u;
+    for (const uint64_t mesh_key : it->second) {
+      const auto mesh = g_pool.mesh_by_key.find(mesh_key);
+      if (mesh != g_pool.mesh_by_key.end() && mesh->second < g_pool.meshes.size()) {
+        uint32_t& writes = g_pool.meshes[mesh->second].writes_after_capture;
+        if (writes != UINT32_MAX) writes += 1u;
+      }
+      const auto request = g_pool.mesh_requests.find(mesh_key);
+      if (request != g_pool.mesh_requests.end() && !request->second.written) {
+        request->second.written = true;
+        g_pool.stats.requests_written += 1u;
+      }
     }
   }
+  if (!gc_keys.empty()) InvalidateGpuCaptureKeys(gc_keys, false);
 }
 
 inline bool OnUpdateBufferRegionPool(
@@ -4711,27 +4729,32 @@ inline bool OnCopyResourcePool(reshade::api::command_list*, reshade::api::resour
 inline void OnDestroyResourcePool(reshade::api::device* device, reshade::api::resource resource) {
   (void)device;
   const PoolStageScope stage("buffer release");
-  std::lock_guard<std::mutex> lock(g_pool.mutex);
-  if (!g_pool.indirect_refs.empty() && g_pool.indirect_refs.count(resource.handle) != 0u) {
-    g_pool.indirect_dead.insert(resource.handle);
-  }
-  if (!g_pool.alpha_sources.empty()) {  // the destroyed texture's copy is no longer linked to it
-    const auto link = g_pool.alpha_source_by_texture.find(resource.handle);
-    if (link != g_pool.alpha_source_by_texture.end()) {
-      const auto source_it = g_pool.alpha_sources.find(link->second);
-      if (source_it != g_pool.alpha_sources.end()) {
-        source_it->second.texture_dead = true;
-        UnlinkPoolAlphaTexture(link->second, source_it->second);
-      } else {
-        g_pool.alpha_source_by_texture.erase(link);  // a stale link (no copy): nothing to free, and no throw in a destroy event
+  std::vector<uint64_t> gc_keys;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    if (!g_pool.indirect_refs.empty() && g_pool.indirect_refs.count(resource.handle) != 0u) {
+      g_pool.indirect_dead.insert(resource.handle);
+    }
+    if (!g_pool.alpha_sources.empty()) {  // the destroyed texture's copy is no longer linked to it
+      const auto link = g_pool.alpha_source_by_texture.find(resource.handle);
+      if (link != g_pool.alpha_source_by_texture.end()) {
+        const auto source_it = g_pool.alpha_sources.find(link->second);
+        if (source_it != g_pool.alpha_sources.end()) {
+          source_it->second.texture_dead = true;
+          UnlinkPoolAlphaTexture(link->second, source_it->second);
+        } else {
+          g_pool.alpha_source_by_texture.erase(link);  // a stale link (no copy): nothing to free, and no throw in a destroy event
+        }
       }
     }
+    const auto it = g_pool.keys_by_resource.find(resource.handle);
+    if (it == g_pool.keys_by_resource.end()) return;
+    if (g_gpu_capture.active.load(std::memory_order_relaxed)) gc_keys = it->second;
+    for (const uint64_t mesh_key : it->second) InvalidatePoolMeshKey(mesh_key);
+    g_pool.keys_by_resource.erase(it);
+    g_pool.stats.resource_invalidations += 1u;
   }
-  const auto it = g_pool.keys_by_resource.find(resource.handle);
-  if (it == g_pool.keys_by_resource.end()) return;
-  for (const uint64_t mesh_key : it->second) InvalidatePoolMeshKey(mesh_key);
-  g_pool.keys_by_resource.erase(it);
-  g_pool.stats.resource_invalidations += 1u;
+  if (!gc_keys.empty()) InvalidateGpuCaptureKeys(gc_keys, true);
 }
 
 // Caller holds g_pool.mutex. Removes instances admitted through invalidated
@@ -6204,6 +6227,7 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
 }
 
 inline void ResetWorldPool() {
+  if (g_gpu_capture.active.load(std::memory_order_relaxed)) ResetGpuCaptureEntries("pool reset");
   std::lock_guard<std::mutex> lock(g_pool.mutex);
   g_pool.wind_keys.clear();
   g_pool.wind_sway.clear();

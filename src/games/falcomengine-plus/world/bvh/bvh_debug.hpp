@@ -28,6 +28,7 @@
 #include "bvh_resources.hpp"
 #include "bvh_trace.hpp"
 #include "../rt12/rt12_probe.hpp"
+#include "../rt12/rt12_capture.hpp"
 
 namespace falcom_world::bvh {
 
@@ -357,6 +358,7 @@ inline void OnWorldPresentBvh(
   }
   const auto present_time = SamplePerfPresent(device, extra);
   UpdateLiveBvh(device, queue);
+  rt12::OnGcPresent(device, queue);
   rt12::OnPresent(device);
   UpdateCacheDiag(device, present_time);
   UpdateDeformLive(device, queue);

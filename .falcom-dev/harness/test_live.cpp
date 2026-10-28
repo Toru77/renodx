@@ -4843,6 +4843,450 @@ static void TestRt12Records() {
         "records carrier holds kPoolDynamicInstances records");
 }
 
+// ---------------------------------------------------------------------------
+// G2 GPU geometry cache: the transcriptions (decode, carrier layout, budget, compare) and the draw-side hook.
+// ---------------------------------------------------------------------------
+
+// The decode passes against the CPU decode, bit for bit: every position format x index size x UV layout, with an
+// unaligned position (stride 14, offset 6, for the half formats), base_vertex -3, odd first_index, and half subnormals.
+static void TestGcDecode() {
+  namespace gc = falcom_world::bvh;
+  namespace scene = renodx::utils::scene;
+  Stage("gpu capture decode");
+  struct PosCase {
+    uint32_t code;
+    reshade::api::format format;
+    uint32_t bytes;
+    uint32_t offset;
+  };
+  struct UvCase {
+    uint32_t code;
+    reshade::api::format format;
+    uint32_t bytes;
+  };
+  const PosCase poses[5] = {{gc::kGcFormatF32x2, reshade::api::format::r32g32_float, 8u, 0u},
+                            {gc::kGcFormatF32x3, reshade::api::format::r32g32b32_float, 12u, 0u},
+                            {gc::kGcFormatF32x4, reshade::api::format::r32g32b32a32_float, 16u, 0u},
+                            {gc::kGcFormatF16x2, reshade::api::format::r16g16_float, 4u, 6u},
+                            {gc::kGcFormatF16x4, reshade::api::format::r16g16b16a16_float, 8u, 6u}};
+  const UvCase uvs[3] = {{gc::kGcFormatNone, reshade::api::format::unknown, 0u},
+                         {gc::kGcFormatF16x2, reshade::api::format::r16g16_float, 4u},
+                         {gc::kGcFormatF32x2, reshade::api::format::r32g32_float, 8u}};
+  const uint32_t kVertices = 50u, kTriangles = 40u, kFirstIndex = 3u;
+  std::mt19937 rng(7u);
+  for (const PosCase& pos : poses) {
+    for (const uint32_t index_size : {2u, 4u}) {
+      for (const UvCase& uv : uvs) {
+        const bool has_uv = uv.code != gc::kGcFormatNone;
+        const bool half = pos.format == reshade::api::format::r16g16_float || pos.format == reshade::api::format::r16g16b16a16_float;
+        const uint32_t stride = pos.offset + pos.bytes + uv.bytes + 2u;
+        const uint32_t uv_offset = pos.offset + pos.bytes;
+        const uint32_t index_count = 3u * kTriangles;
+        // Vertex bytes: random finite values; vertex 1 holds the half subnormal 0x0200 in x.
+        std::vector<uint8_t> vb(kVertices * stride, 0u);
+        const auto fill = [&](uint8_t* dst, bool is_half, uint32_t bytes) {
+          const uint32_t count = is_half ? bytes / 2u : bytes / 4u;
+          for (uint32_t c = 0u; c < count; ++c) {
+            if (is_half) {
+              uint16_t bits = static_cast<uint16_t>(rng() & 0xFFFFu);
+              if (((bits >> 10u) & 0x1Fu) == 31u) bits = static_cast<uint16_t>(bits & ~0x0400u);
+              std::memcpy(dst + 2u * c, &bits, 2u);
+            } else {
+              const float value = std::uniform_real_distribution<float>(-100.f, 100.f)(rng);
+              std::memcpy(dst + 4u * c, &value, 4u);
+            }
+          }
+        };
+        for (uint32_t v = 0u; v < kVertices; ++v) {
+          fill(vb.data() + v * stride + pos.offset, half, pos.bytes);
+          if (has_uv) fill(vb.data() + v * stride + uv_offset, uv.code == gc::kGcFormatF16x2, uv.bytes);
+        }
+        const uint16_t subnormal = 0x0200u;
+        std::memcpy(vb.data() + stride + pos.offset, &subnormal, 2u);  // half formats read it as a half
+        // Index bytes: the draw reads from first_index; the three before it are garbage.
+        std::vector<uint8_t> ib((kFirstIndex + index_count) * index_size, 0xEEu);
+        for (uint32_t i = 0u; i < index_count; ++i) {
+          const uint32_t raw = 3u + (rng() % kVertices);  // absolute = raw - 3 in [0, kVertices)
+          const uint32_t at = (kFirstIndex + i) * index_size;
+          if (index_size == 2u) {
+            const uint16_t value = static_cast<uint16_t>(raw);
+            std::memcpy(ib.data() + at, &value, 2u);
+          } else {
+            std::memcpy(ib.data() + at, &raw, 4u);
+          }
+        }
+        const int32_t base_vertex = -3;
+        const uint64_t index_begin = uint64_t{kFirstIndex} * index_size;
+        const uint64_t index_bytes = uint64_t{index_count} * index_size;
+
+        // CPU reference.
+        std::vector<uint32_t> cpu_indices;
+        uint32_t min_vertex = 0u, max_vertex = 0u, raw_min = 0u, raw_max = 0u;
+        uint32_t first_raw[gc::kPoolFirstRawCount] = {};
+        const char* index_error = gc::DecodePoolMeshIndices(ib.data() + index_begin, index_bytes, index_size, index_count, base_vertex,
+                                                             stride, &cpu_indices, &min_vertex, &max_vertex, &raw_min, &raw_max, first_raw);
+        CHECK(index_error == nullptr, "cpu index decode: %s", index_error ? index_error : "");
+        const uint64_t vertex_bytes = uint64_t{max_vertex - min_vertex + 1u} * stride;
+        gc::PoolDecodedMesh cpu_mesh;
+        const char* vertex_error = gc::DecodePoolMeshVertices(vb.data() + uint64_t{min_vertex} * stride, vertex_bytes, stride,
+                                                              static_cast<int32_t>(pos.offset), pos.format,
+                                                              has_uv ? static_cast<int32_t>(uv_offset) : -1, uv.format, cpu_indices,
+                                                              min_vertex, max_vertex, &cpu_mesh);
+        CHECK(vertex_error == nullptr, "cpu vertex decode: %s", vertex_error ? vertex_error : "");
+
+        // GPU side: the copies placed as the hook places them (16-aligned offsets, 4-aligned copies).
+        std::vector<uint8_t> staging(64u * 1024u, 0u);
+        uint64_t cursor = 0u;
+        const auto place = [&](const std::vector<uint8_t>& source, uint64_t begin, uint64_t end) {
+          const uint64_t offset = (cursor + 15u) & ~uint64_t{15u};
+          const uint64_t aligned_begin = begin & ~uint64_t{3u};
+          const uint64_t copied = (std::min)((end + 3u) & ~uint64_t{3u}, uint64_t{source.size()}) - aligned_begin;
+          std::memcpy(staging.data() + offset, source.data() + aligned_begin, copied);
+          cursor = offset + copied;
+          return static_cast<uint32_t>(offset + (begin - aligned_begin));
+        };
+        const uint32_t index_byte = place(ib, index_begin, index_begin + index_bytes);
+        const uint32_t vertex_byte = place(vb, uint64_t{min_vertex} * stride, uint64_t{max_vertex + 1u} * stride);
+        std::array<uint32_t, 4> range = {};
+        gc::GcRangeJob(staging.data(), staging.size(), index_byte, index_size, index_count, base_vertex, range.data());
+        CHECK(~range[0] == min_vertex && range[1] == max_vertex && range[2] == 0u, "range job: min %u max %u invalid %u (cpu %u..%u)",
+              ~range[0], range[1], range[2], min_vertex, max_vertex);
+
+        const uint32_t vertices = max_vertex - min_vertex + 1u;
+        const uint32_t texels = gc::GcJobTexels(vertices, index_count, has_uv);
+        gc::GcDecodeParams params;
+        params.index_byte = index_byte;
+        params.index_size = index_size;
+        params.index_count = index_count;
+        params.base_vertex = base_vertex;
+        params.vertex_byte = vertex_byte;
+        params.stride = stride;
+        params.pos_offset = pos.offset;
+        params.pos_format = pos.code;
+        params.uv_byte = vertex_byte;
+        params.uv_stride = stride;
+        params.uv_offset = has_uv ? uv_offset : gc::kGcNoUv;
+        params.uv_format = uv.code;
+        params.vertex_count = vertices;
+        params.min_vertex = min_vertex;
+        params.vtx_texel = 0u;
+        params.idx_texel = vertices;
+        std::vector<uint32_t> carrier(size_t{texels} * 4u, 0u);
+        gc::GcDecodeJob(staging.data(), staging.size(), params, carrier.data());
+
+        std::vector<float> gpu_vertices(size_t{vertices} * 4u);
+        std::vector<uint32_t> gpu_indices(index_count);
+        std::vector<float> gpu_uvs(size_t{vertices} * 2u);
+        std::memcpy(gpu_vertices.data(), carrier.data(), gpu_vertices.size() * sizeof(float));
+        for (uint32_t i = 0u; i < index_count; ++i) gpu_indices[i] = carrier[(size_t{vertices + i / 4u}) * 4u + i % 4u];
+        const uint32_t uv_texel = vertices + (index_count + 3u) / 4u;
+        for (uint32_t v = 0u; has_uv && v < vertices; ++v) {
+          std::memcpy(gpu_uvs.data() + 2u * v, carrier.data() + (size_t{uv_texel + v / 2u} * 4u + (v % 2u) * 2u), 2u * sizeof(float));
+        }
+        std::vector<uint32_t> cpu_flat;
+        for (const auto& triangle : cpu_mesh.triangles) cpu_flat.insert(cpu_flat.end(), triangle.begin(), triangle.end());
+        const gc::GcCompareResult compare = gc::GcCompareTriangles(gpu_vertices.data(), vertices, gpu_indices.data(), index_count,
+                                                                  has_uv ? gpu_uvs.data() : nullptr, cpu_mesh.positions, cpu_flat,
+                                                                  cpu_mesh.uvs);
+        CHECK(compare.mismatched == 0u && compare.first < 0, "pos %u index %u uv %u: %u mismatched triangles (first %lld)", pos.code,
+              index_size, uv.code, compare.mismatched, static_cast<long long>(compare.first));
+        CHECK(compare.triangles == kTriangles, "triangles %u, expected %u", compare.triangles, kTriangles);
+        CHECK(compare.uv_compared == (has_uv && !cpu_mesh.uvs.empty()), "uv compared flag %d", compare.uv_compared ? 1 : 0);
+      }
+    }
+  }
+
+  // HalfToFloat: the transcription is bit-exact for all 65536 inputs (including the CPU's subnormal branch).
+  uint32_t half_mismatches = 0u;
+  for (uint32_t bits = 0u; bits < 65536u; ++bits) {
+    const float ours = gc::GcHalfToFloat(bits);
+    const float theirs = scene::HalfToFloat(static_cast<uint16_t>(bits));
+    uint32_t ours_bits = 0u, theirs_bits = 0u;
+    std::memcpy(&ours_bits, &ours, sizeof(ours_bits));
+    std::memcpy(&theirs_bits, &theirs, sizeof(theirs_bits));
+    if (ours_bits != theirs_bits) half_mismatches += 1u;
+  }
+  CHECK(half_mismatches == 0u, "GcHalfToFloat differs from HalfToFloat for %u inputs", half_mismatches);
+  CHECK(gc::GcHalfToFloat(0x0200u) == scene::HalfToFloat(0x0200u), "half subnormal 0x0200 matches the CPU");
+
+  // A negative absolute index (raw 0, base -3) is counted as invalid.
+  const uint8_t zero_index[4] = {0u, 0u, 0u, 0u};
+  uint32_t invalid_range[4] = {};
+  gc::GcRangeJob(zero_index, sizeof(zero_index), 0u, 2u, 2u, -3, invalid_range);
+  CHECK(invalid_range[2] == 2u, "negative absolute indices counted: %u", invalid_range[2]);
+}
+
+// The carrier blocks of a job are contiguous, and an odd vertex count leaves the UV padding at 0.
+static void TestGcCarrierLayout() {
+  namespace gc = falcom_world::bvh;
+  namespace rt12 = falcom_world::rt12;
+  Stage("gpu capture carrier layout");
+  static_assert(sizeof(gc::GcDecodeParams) == 64u);
+  CHECK(gc::kGcCarrierWidth == rt12::kRt12CarrierWidth, "carrier width %u vs %u", gc::kGcCarrierWidth, rt12::kRt12CarrierWidth);
+  struct Case {
+    uint32_t vertices, indices;
+    bool uv;
+  };
+  const Case cases[4] = {{1u, 3u, false}, {3u, 3u, true}, {4097u, 12u, true}, {5u, 4096u * 4u + 3u, false}};
+  for (const Case& c : cases) {
+    const uint32_t index_texels = (c.indices + 3u) / 4u;
+    const uint32_t uv_begin = c.vertices + index_texels;
+    const uint32_t uv_end = uv_begin + (c.uv ? (c.vertices + 1u) / 2u : 0u);
+    CHECK(gc::GcJobTexels(c.vertices, c.indices, c.uv) == uv_end, "texels of (%u, %u, %d): %u, blocks end at %u", c.vertices, c.indices,
+          c.uv ? 1 : 0, gc::GcJobTexels(c.vertices, c.indices, c.uv), uv_end);
+    if (c.uv) CHECK(2u * ((c.vertices + 1u) / 2u) - c.vertices <= 1u, "UV pairs hold the vertices");
+  }
+  // Odd vertex count: the second UV of the last pair is never written and stays 0.
+  uint8_t staging[256] = {};
+  const float positions[9] = {0.f, 0.f, 0.f, 1.f, 1.f, 1.f, 2.f, 2.f, 2.f};
+  const float uv_values[6] = {0.25f, 0.5f, 0.75f, 1.f, 1.25f, 1.5f};
+  std::memcpy(staging, positions, sizeof(positions));
+  for (uint32_t v = 0u; v < 3u; ++v) std::memcpy(staging + 12u + 20u * v, uv_values + 2u * v, 8u);
+  const uint16_t index_values[3] = {0u, 1u, 2u};
+  std::memcpy(staging + 64u, index_values, sizeof(index_values));
+  gc::GcDecodeParams params;
+  params.index_byte = 64u;
+  params.index_size = 2u;
+  params.index_count = 3u;
+  params.vertex_byte = 0u;
+  params.stride = 20u;
+  params.pos_format = gc::kGcFormatF32x3;
+  params.uv_byte = 0u;
+  params.uv_stride = 20u;
+  params.uv_offset = 12u;
+  params.uv_format = gc::kGcFormatF32x2;
+  params.vertex_count = 3u;
+  params.idx_texel = 3u;
+  std::vector<uint32_t> carrier(6u * 4u, 0u);
+  gc::GcDecodeJob(staging, sizeof(staging), params, carrier.data());
+  const uint32_t padding_texel = 5u;  // uv block: texel 4 holds vertices 0 and 1, texel 5 holds vertex 2 and the padding
+  CHECK(carrier[padding_texel * 4u + 2u] == 0u && carrier[padding_texel * 4u + 3u] == 0u, "UV padding of an odd vertex count is 0");
+  float uv_pair[4] = {};
+  std::memcpy(uv_pair, &carrier[4u * 4u], sizeof(uv_pair));  // texel 4: vertices 0 and 1
+  CHECK(uv_pair[0] == 0.25f && uv_pair[1] == 0.5f && uv_pair[2] == 0.75f && uv_pair[3] == 1.f, "UV pair of vertices 0 and 1");
+}
+
+// GcBlasBudgetCount: the largest prefix within the budget, at least one.
+static void TestGcBudget() {
+  namespace gc = falcom_world::bvh;
+  Stage("gpu capture budget");
+  CHECK(gc::GcBlasBudgetCount({600000u, 600000u, 10u}, 1u << 20) == 1u, "first two over budget");
+  CHECK(gc::GcBlasBudgetCount({10u, 20u, 30u}, 1u << 20) == 3u, "three small meshes");
+  CHECK(gc::GcBlasBudgetCount({2000000u}, 1u << 20) == 1u, "one mesh over budget is built alone");
+  CHECK(gc::GcBlasBudgetCount({}, 1u << 20) == 0u, "empty queue");
+  CHECK(gc::GcBlasBudgetCount({1u << 20, 1u}, 1u << 20) == 1u, "exact fit then one more");
+}
+
+// GcCompareTriangles: bitwise per triangle, the first mismatch, counts, and UVs only when the CPU has them.
+static void TestGcCompare() {
+  namespace gc = falcom_world::bvh;
+  Stage("gpu capture compare");
+  const float gpu[12] = {0.f, 0.f, 0.f, 1.f, 1.f, 0.f, 0.f, 1.f, 0.f, 1.f, 0.f, 1.f};  // float4 x 3
+  const std::vector<std::array<float, 3>> cpu = {{0.f, 0.f, 0.f}, {1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}};
+  const std::vector<uint32_t> cpu_indices = {0u, 1u, 2u};
+  const uint32_t gpu_indices[3] = {0u, 1u, 2u};
+  gc::GcCompareResult same = gc::GcCompareTriangles(gpu, 3u, gpu_indices, 3u, nullptr, cpu, cpu_indices, {});
+  CHECK(same.mismatched == 0u && same.first < 0 && same.triangles == 1u, "identical triangle compares equal");
+
+  float flipped[12] = {};
+  std::memcpy(flipped, gpu, sizeof(gpu));
+  uint32_t one_bit = 0u;
+  std::memcpy(&one_bit, &flipped[0], sizeof(one_bit));
+  one_bit ^= 1u;
+  std::memcpy(&flipped[0], &one_bit, sizeof(one_bit));  // x of vertex 0 differs in one bit
+  gc::GcCompareResult bit = gc::GcCompareTriangles(flipped, 3u, gpu_indices, 3u, nullptr, cpu, cpu_indices, {});
+  CHECK(bit.mismatched == 1u && bit.first == 0, "one changed bit: mismatched %u first %lld", bit.mismatched, static_cast<long long>(bit.first));
+
+  const uint32_t two_triangles[6] = {0u, 1u, 2u, 0u, 1u, 2u};
+  gc::GcCompareResult counts = gc::GcCompareTriangles(gpu, 3u, two_triangles, 6u, nullptr, cpu, cpu_indices, {});
+  CHECK(counts.mismatched == 2u && counts.first == 0, "different triangle counts: mismatched %u", counts.mismatched);
+
+  const uint32_t out_of_range[3] = {0u, 1u, 9u};
+  gc::GcCompareResult outside = gc::GcCompareTriangles(gpu, 3u, out_of_range, 3u, nullptr, cpu, cpu_indices, {});
+  CHECK(outside.mismatched == 1u, "GPU index out of range is a mismatch");
+
+  const float gpu_uvs[6] = {0.f, 0.f, 1.f, 0.f, 0.f, 1.f};
+  const std::vector<std::array<float, 2>> cpu_uvs = {{0.f, 0.f}, {1.f, 0.f}, {0.f, 2.f}};
+  gc::GcCompareResult no_cpu_uv = gc::GcCompareTriangles(gpu, 3u, gpu_indices, 3u, gpu_uvs, cpu, cpu_indices, {});
+  CHECK(!no_cpu_uv.uv_compared && no_cpu_uv.mismatched == 0u, "no CPU UVs: not compared");
+  gc::GcCompareResult with_uv = gc::GcCompareTriangles(gpu, 3u, gpu_indices, 3u, gpu_uvs, cpu, cpu_indices, cpu_uvs);
+  CHECK(with_uv.uv_compared && with_uv.uv_mismatched == 1u && with_uv.mismatched == 1u, "UV mismatch counted once per triangle");
+  const std::vector<std::array<float, 2>> short_uvs = {{0.f, 0.f}, {1.f, 0.f}};  // fewer UVs than positions
+  gc::GcCompareResult short_uv = gc::GcCompareTriangles(gpu, 3u, gpu_indices, 3u, gpu_uvs, cpu, cpu_indices, short_uvs);
+  CHECK(!short_uv.uv_compared && short_uv.uv_mismatched == 0u && short_uv.mismatched == 0u, "UVs shorter than positions: not compared");
+}
+
+// The draw side (bvh/gpu_capture.hpp): refusals, the creation counts, the phases, invalidation, and the OFF path.
+static void TestGcHook(Device* dev) {
+  namespace gc = falcom_world::bvh;
+  Stage("gpu capture hook");
+  constexpr uint64_t kGcLayout = 0x6A1u;
+  constexpr uint64_t kGcLayoutUnorm = 0x6A2u;
+  {
+    renodx::utils::scene::InputLayoutInfo info;
+    renodx::utils::scene::InputElementCopy position;
+    position.semantic = "POSITION";
+    position.format = reshade::api::format::r32g32b32_float;
+    position.stride = 12u;
+    info.elements.push_back(position);
+    renodx::utils::scene::shared.data->input_layouts[kGcLayout] = info;
+    renodx::utils::scene::InputLayoutInfo unorm;
+    renodx::utils::scene::InputElementCopy color = position;
+    color.format = reshade::api::format::r8g8b8a8_unorm;
+    color.stride = 4u;
+    unorm.elements.push_back(color);
+    renodx::utils::scene::shared.data->input_layouts[kGcLayoutUnorm] = unorm;
+  }
+  const auto make_buffer = [dev](uint64_t bytes, reshade::api::resource* out) {
+    reshade::api::resource_desc desc = {};
+    desc.type = reshade::api::resource_type::buffer;
+    desc.buffer.size = bytes;
+    desc.heap = reshade::api::memory_heap::gpu_only;
+    desc.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_source | reshade::api::resource_usage::copy_dest;
+    return dev->create_resource(desc, nullptr, reshade::api::resource_usage::shader_resource, out);
+  };
+  reshade::api::resource vb = {0u}, ib = {0u}, staging = {0u};
+  CHECK(make_buffer(4096u, &vb) && make_buffer(4096u, &ib) && make_buffer(16u << 20, &staging), "test buffers");
+  CmdList cl;
+  cl.dev = dev;
+
+  gc::ResetWorldPool();
+  gc::g_gpu_capture.active.store(true);
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    gc::g_gpu_capture.staging = staging;
+    gc::g_gpu_capture.staging_used = 0u;
+  }
+  const auto base_draw = [&](uint64_t vb_offset, uint32_t first_index, uint64_t layout) {
+    falcom_world::DrawRecord draw;
+    draw.method = 1;
+    draw.has_index_buffer = true;
+    draw.vb = vb;
+    draw.vb_offset = vb_offset;
+    draw.vb_stride = layout == kGcLayoutUnorm ? 4u : 12u;
+    draw.vb_size = 4096u;
+    draw.ib = ib;
+    draw.ib_size = 4096u;
+    draw.index_size = 2u;
+    draw.index_count = 36u;
+    draw.first_index = first_index;
+    draw.instance_count = 1u;
+    draw.input_layout = {layout};
+    draw.topology = reshade::api::primitive_topology::triangle_list;
+    return draw;
+  };
+  const falcom_world::DrawRecord draw_a = base_draw(0u, 0u, kGcLayout);
+  const uint64_t key_a = gc::PoolMeshKey(draw_a);
+  {
+    std::lock_guard lock(gc::g_pool.mutex);
+    gc::AddPoolResourceKey(draw_a.vb.handle, key_a);
+    gc::AddPoolResourceKey(draw_a.ib.handle, key_a);
+  }
+  const gc::PoolUvStream no_uv;
+  CHECK(gc::GpuCaptureOnDraw(&cl, draw_a, key_a, no_uv, false) == 1u, "first sighting copies the index range");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.entries.at(key_a).phase == gc::GcPhase::RangeWait && gc::g_gpu_capture.range_jobs.size() == 1u,
+          "entry waits for the range result");
+  }
+  CHECK(gc::GpuCaptureOnDraw(&cl, draw_a, key_a, no_uv, false) == 0u, "second draw in the same frame copies nothing");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    gc::GcEntry& entry = gc::g_gpu_capture.entries.at(key_a);
+    entry.phase = gc::GcPhase::Data;
+    entry.min_vertex = 0u;
+    entry.max_vertex = 7u;
+  }
+  CHECK(gc::GpuCaptureOnDraw(&cl, draw_a, key_a, no_uv, false) == 2u, "data draw copies the vertex and index ranges");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.entries.at(key_a).phase == gc::GcPhase::DataWait && gc::g_gpu_capture.decode_jobs.size() == 1u,
+          "entry waits for the decode");
+  }
+
+  // Deferred draws serve no copy.
+  const falcom_world::DrawRecord draw_b = base_draw(0u, 36u, kGcLayout);
+  const uint64_t key_b = gc::PoolMeshKey(draw_b);
+  CHECK(gc::GpuCaptureOnDraw(&cl, draw_b, key_b, no_uv, true) == 0u, "deferred draw copies nothing");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.stats.deferred_skips == 1u, "deferred skip counted");
+  }
+
+  // Refusals: a written buffer, a dynamic buffer, a non-float position format.
+  falcom_world::DrawRecord written = base_draw(64u, 0u, kGcLayout);
+  written.vb_usage = static_cast<uint32_t>(reshade::api::resource_usage::unordered_access);
+  const uint64_t key_written = gc::PoolMeshKey(written);
+  CHECK(gc::GpuCaptureOnDraw(&cl, written, key_written, no_uv, false) == 0u, "written buffer copies nothing");
+  falcom_world::DrawRecord dynamic = base_draw(128u, 0u, kGcLayout);
+  dynamic.vb_flags = static_cast<uint32_t>(reshade::api::resource_flags::dynamic);
+  const uint64_t key_dynamic = gc::PoolMeshKey(dynamic);
+  CHECK(gc::GpuCaptureOnDraw(&cl, dynamic, key_dynamic, no_uv, false) == 0u, "dynamic buffer copies nothing");
+  falcom_world::DrawRecord unorm = base_draw(256u, 0u, kGcLayoutUnorm);
+  const uint64_t key_unorm = gc::PoolMeshKey(unorm);
+  CHECK(gc::GpuCaptureOnDraw(&cl, unorm, key_unorm, no_uv, false) == 0u, "unorm position copies nothing");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    const auto& refused = gc::g_gpu_capture.stats.refused;
+    CHECK(refused.count("gpu_written") == 1u && refused.at("gpu_written") == 1u, "gpu_written counted");
+    CHECK(refused.count("cpu_dynamic") == 1u && refused.at("cpu_dynamic") == 1u, "cpu_dynamic counted");
+    CHECK(refused.count("format") == 1u && refused.at("format") == 1u, "format counted");
+    CHECK(gc::g_gpu_capture.entries.at(key_unorm).phase == gc::GcPhase::Refused, "unorm entry refused");
+  }
+
+  // Writes: three writes refuse the key; the key is reported for the D3D12 side.
+  gc::InvalidateGpuCaptureKeys({key_a}, false);
+  gc::InvalidateGpuCaptureKeys({key_a}, false);
+  gc::InvalidateGpuCaptureKeys({key_a}, false);
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.entries.at(key_a).phase == gc::GcPhase::Refused, "third write refuses the key");
+    CHECK(gc::g_gpu_capture.stats.refused.count("rewritten") == 1u, "rewritten counted");
+    CHECK(std::find(gc::g_gpu_capture.invalidated.begin(), gc::g_gpu_capture.invalidated.end(), key_a) != gc::g_gpu_capture.invalidated.end(),
+          "invalidated key reported");
+  }
+  // Destroy: the entry is erased.
+  gc::InvalidateGpuCaptureKeys({key_a}, true);
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.entries.count(key_a) == 0u, "destroyed buffer erases its entry");
+  }
+  gc::ResetGpuCaptureEntries("pool reset");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.entries.empty() && gc::g_gpu_capture.stats.resets_pool == 1u, "pool reset empties the cache");
+  }
+
+  // OFF path: with the cache inactive the pool hook creates no entries.
+  gc::g_gpu_capture.active.store(false);
+  uint64_t created_before = 0u;
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    created_before = gc::g_gpu_capture.stats.created;
+  }
+  const bool scan_was = gc::g_pool.scan_active.load();
+  gc::g_pool.scan_active.store(true);
+  falcom_world::WorldCommandListData cl_data;
+  gc::OnPoolScanDraw(dev, &cl, draw_a, &cl_data);
+  gc::g_pool.scan_active.store(scan_was);
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.entries.empty() && gc::g_gpu_capture.stats.created == created_before, "OFF path creates no cache objects");
+  }
+  // Restore.
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    gc::g_gpu_capture.staging = {0u};
+    gc::g_gpu_capture.staging_used = 0u;
+    gc::g_gpu_capture.invalidated.clear();
+    gc::g_gpu_capture.stats = gc::GcStats{};
+  }
+  gc::ResetWorldPool();
+  dev->destroy_resource(vb);
+  dev->destroy_resource(ib);
+  dev->destroy_resource(staging);
+}
+
 int main() {
   falcom_world::g_state.pool_capture_requested.store(true);
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -5920,6 +6364,12 @@ int main() {
   TestRt12Mirror(&dev, &queue);
   TestRt12Dynamic();
   TestRt12Records();
+  Stage("gpu capture");
+  TestGcDecode();
+  TestGcCarrierLayout();
+  TestGcBudget();
+  TestGcCompare();
+  TestGcHook(&dev);
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);
