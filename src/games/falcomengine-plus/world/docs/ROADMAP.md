@@ -394,11 +394,18 @@ Deviations (planner decisions, with reasons):
 - Record bounds are the translation point (no GPU mesh box yet). The DXR path does not read record bounds; G3 records must never be handed to the compute trace.
 - Harness split: pure logic in `test_live.cpp`; the real shaders on WARP in `test_gpu_p2b.cpp`.
 
+### G4-0: compare splits
+- Compare splits: no_entry is split into indirect, untracked, cap and other (other is the remainder).
+- gpu_no_cpu_mesh and gpu_only are split by state (the CPU observation state); both state maps are written as null on a timeout.
+- Note-map cap rule: once the note map holds kGcNoEntryKeys (16384) keys, further untracked keys count as no_entry (other).
+- Closed G3 to-dos: the hash-pose check (to-do a) and deferred counting (to-do b), as marked above.
+- Pin check: test_live 2760, 3011, 3472 and test_motion 700, 1092 are the same checks as HEAD, with unchanged text.
+
 G4 to-do list: G3b (indirect draws) if `no_entry` is large; a region filter in compact; record bounds from a mesh box; header.z material; record ranges are [0, set) and [65536, +moving); the 60-present hold rule versus the CPU repeat/stale rule (`NotePoolMotion`, not transcribed).
-- G4 to-do (a): one pose per hash tested; widen the CPU/GPU hash check.
-- G4 to-do (b): deferred instance draws of entries not yet Done are counted only in `deferred_skips`.
-- G4 to-do (c): flags are merged across all sightings of an entry.
-- G4 to-do (d): a reused slot inherits the previous mesh's moving mark.
+- G4 to-do (a): one pose per hash tested; widen the CPU/GPU hash check. Closed in G4-0: test_gpu_p2b P6 checks every live entry's pose hash against its own world.
+- G4 to-do (b): deferred instance draws of entries not yet Done are counted only in `deferred_skips`. Closed in G4-0: a deferred draw with instances also counts `inst_deferred`.
+- G4 to-do (c): flags are merged across all sightings of an entry. Accepted, no code: the union of all sightings is the compute path's rule (G4 design D12).
+- G4 to-do (d): a reused slot inherits the previous mesh's moving mark. Accepted, no code: the inherited mark lasts at most `kPoolMovingHoldFrames`, and its sightings become per-present records that G4 traces (G4 design D12).
 - G4 prerequisite: the `no_entry` split (indirect vs direct) must be added before G4 is planned; `gpu_no_cpu_mesh` must be split by pool failure reason before it is called P-2 evidence.
 
 Owner test (DevKit build; RTAO on, DXR on, Trace characters on, P2b on, Performance Gather on). Do not toggle DXR off and on and then the cache on (known G2 stall).

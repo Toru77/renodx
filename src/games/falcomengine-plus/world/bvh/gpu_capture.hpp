@@ -43,6 +43,7 @@ inline constexpr uint32_t kGcInstanceDrawsPerPresent = 16384u;
 inline constexpr float kGcPoseTranslationScale = 256.f;            // pose key grid: 1/256 m
 inline constexpr float kGcPoseBasisScale = 4096.f;                 // and 1/4096 per basis element
 inline constexpr uint32_t kGcCompareCpuSamples = 256u, kGcCompareGpuSamples = 32u;
+inline constexpr size_t kGcNoEntryKeys = 16384u;  // G4-0: no-entry reasons kept (direct keys)
 // Modes of world_gc_insert.cs_5_0.hlsl (GC_MODE_*); dispatched in the order clear, mark, rehash, insert.
 inline constexpr uint32_t kGcModeClear = 0u, kGcModeRehash = 1u, kGcModeMark = 2u, kGcModeInsert = 3u;
 // The 16 counters of one present (world_gc_instance.hlsli GC_COUNTER_*).
@@ -162,6 +163,7 @@ struct GpuCaptureState {
   std::vector<uint32_t> slot_epoch = std::vector<uint32_t>(kGcMaxEntries, 0u);
   std::vector<uint64_t> slot_key = std::vector<uint64_t>(kGcMaxEntries, 0u);
   bool epochs_dirty = true;
+  std::unordered_map<uint64_t, const char*> no_entry_reason;  // G4-0 (0a): direct keys with no entry ("untracked", "cap"), at most kGcNoEntryKeys
 };
 
 inline GpuCaptureState g_gpu_capture;
@@ -222,6 +224,7 @@ inline void ResetGpuCaptureEntries(const char* why) {
     BumpGcSlotEpoch(entry.slot);
   }
   g.entries.clear();
+  g.no_entry_reason.clear();
   g.range_jobs.clear();
   g.decode_jobs.clear();
   g.instance_draws.clear();
@@ -231,6 +234,15 @@ inline void ResetGpuCaptureEntries(const char* why) {
   std::fill(g.slot_key.begin(), g.slot_key.end(), 0u);
   if (std::strcmp(why, "pool reset") == 0) g.stats.resets_pool += 1u;
   if (std::strcmp(why, "fragmented") == 0) g.stats.resets_fragmented += 1u;
+}
+
+// G4-0 (0a): a direct draw of a key the cache has no entry for. Called from OnPoolScanDraw after its lock.
+inline void GpuCaptureNoteNoEntry(uint64_t mesh_key, const char* reason) {
+  if (!g_gpu_capture.active.load(std::memory_order_relaxed) || mesh_key == 0u) return;
+  std::lock_guard lock(g_gpu_capture.mutex);
+  if (g_gpu_capture.entries.count(mesh_key) != 0u) return;
+  if (g_gpu_capture.no_entry_reason.size() >= kGcNoEntryKeys && g_gpu_capture.no_entry_reason.count(mesh_key) == 0u) return;
+  g_gpu_capture.no_entry_reason[mesh_key] = reason;
 }
 
 // Called from OnPoolScanDraw after its lock is released, for a direct draw whose buffers the pool tracks for this key.
@@ -265,6 +277,9 @@ inline uint32_t GpuCaptureOnDraw(reshade::api::command_list* cmd_list, const Dra
     if (it == g.entries.end()) {
       if (g.entries.size() >= kGcMaxEntries) {
         g.stats.cap_attempts += 1u;
+        if (g.no_entry_reason.size() < kGcNoEntryKeys || g.no_entry_reason.count(mesh_key) != 0u) {
+          g.no_entry_reason[mesh_key] = "cap";
+        }
         return 0u;
       }
       GcEntry created;
@@ -309,10 +324,14 @@ inline uint32_t GpuCaptureOnDraw(reshade::api::command_list* cmd_list, const Dra
       created.phase = GcPhase::Range;
       if (refusal != nullptr) RefuseGpuCaptureEntry(created, refusal);
       it = g.entries.emplace(mesh_key, std::move(created)).first;
+      g.no_entry_reason.erase(mesh_key);
     }
     GcEntry& entry = it->second;
     if (deferred && (entry.phase == GcPhase::Range || entry.phase == GcPhase::Data)) {
       g.stats.deferred_skips += 1u;
+      if (instances != nullptr) {
+        g.stats.inst_deferred += 1u;
+      }
       return 0u;
     }
     if (entry.phase == GcPhase::Range) {
@@ -642,6 +661,7 @@ struct GcCompareGpuInstance {
   uint64_t mesh_key = 0u;
   int64_t mesh_id = -1;             // CPU mesh of the key, -1 none
   bool cpu_alpha_conflict = false;  // that CPU mesh has an alpha conflict (P-2)
+  std::string cpu_state;            // G4-0 (0b): no CPU mesh -> "failed:<reason>", "queued", "absent"; else the CPU observation of this pose -> "not_observed", "observing", "rejected", "merged", "admitted"
   float world[12] = {};
   uint32_t flags = 0u;              // kInstance* (record visibility.z)
 };
@@ -675,6 +695,7 @@ struct GcInstanceCompare {
   uint64_t cpu_only = 0u, timeouts = 0u;
   double wait_ms = 0.0;
   std::map<std::string, uint64_t> cpu_only_by_reason;
+  std::map<std::string, uint64_t> gpu_no_cpu_mesh_by_state, gpu_only_by_state;  // G4-0 (0b): GPU records by cpu_state
   std::vector<CpuOnly> cpu_only_samples;  // up to kGcCompareCpuSamples
   std::vector<GpuOnly> gpu_only_samples;  // up to kGcCompareGpuSamples
 };
@@ -696,6 +717,7 @@ inline GcInstanceCompare GcCompareInstances(const std::vector<GcCompareGpuInstan
   for (const GcCompareGpuInstance& instance : gpu) {
     if (instance.mesh_id < 0) {
       result.gpu_no_cpu_mesh += 1u;
+      result.gpu_no_cpu_mesh_by_state[instance.cpu_state] += 1u;
       continue;
     }
     if (!gpu_keys.insert(key_of(static_cast<uint32_t>(instance.mesh_id), instance.world)).second) result.gpu_dup_content += 1u;
@@ -731,6 +753,7 @@ inline GcInstanceCompare GcCompareInstances(const std::vector<GcCompareGpuInstan
     const uint64_t key = key_of(static_cast<uint32_t>(instance.mesh_id), instance.world);
     if (cpu_keys.count(key) != 0u || !reported.insert(key).second) continue;
     result.gpu_only += 1u;
+    result.gpu_only_by_state[instance.cpu_state] += 1u;
     if ((instance.flags & 16u) != 0u) result.gpu_only_alpha += 1u;  // kInstanceAlphaTested (bvh_resources.hpp)
     if (instance.cpu_alpha_conflict) result.gpu_only_alpha_conflict += 1u;
     if (result.gpu_only_samples.size() < kGcCompareGpuSamples) {

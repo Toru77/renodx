@@ -807,7 +807,9 @@ inline bool DrawBvhPanel() {
                       + std::to_string(cmp.gpu_only_alpha) + ", conflict " + std::to_string(cmp.gpu_only_alpha_conflict) + "), no CPU mesh "
                       + std::to_string(cmp.gpu_no_cpu_mesh) + ", CPU-only " + std::to_string(cmp.cpu_only) + ": done " + std::to_string(done)
                       + ", done unseen " + std::to_string(count_of("done_unseen")) + ", dynamic " + std::to_string(count_of("dynamic"))
-                      + ", pending " + std::to_string(count_of("pending")) + ", refused " + std::to_string(refused) + ", no entry "
+                      + ", pending " + std::to_string(count_of("pending")) + ", refused " + std::to_string(refused)
+                      + ", no entry: indirect " + std::to_string(count_of("no_entry_indirect")) + ", untracked "
+                      + std::to_string(count_of("no_entry_untracked")) + ", cap " + std::to_string(count_of("no_entry_cap")) + ", other "
                       + std::to_string(count_of("no_entry")) + "; set " + std::to_string(cmp.set_count) + ", wait " + wait + " ms";
     if (cmp.timeouts != 0u) gc_compare_line += ", TIMEOUT";
   }

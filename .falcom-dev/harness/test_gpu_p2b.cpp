@@ -417,6 +417,22 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
   CHECK(c[bvh::kGcCounterInserted] + c[bvh::kGcCounterSetOverflow] == 100u, "P6 inserted + overflow == 100");
   CHECK(c[bvh::kGcCounterSet] == c[bvh::kGcCounterInserted] && c[bvh::kGcCounterInserted] <= kCapacity, "P6 set equals inserted");
   CHECK(c[bvh::kGcCounterInserted] >= 40u, "P6 inserted >= 40 (%u)", c[bvh::kGcCounterInserted]);
+  {
+    const std::vector<uint8_t> entry_bytes = words_of(entries_buffer, 2u * kCapacity * sizeof(bvh::GcSetEntryGPU));
+    const auto* entries = reinterpret_cast<const bvh::GcSetEntryGPU*>(entry_bytes.data());
+    const std::vector<uint8_t> meta_bytes = words_of(meta_buffer, 2u * kCapacity * 4u * sizeof(uint32_t));
+    const auto* meta = reinterpret_cast<const uint32_t*>(meta_bytes.data());
+    uint32_t live = 0u, mismatched = 0u;
+    for (uint32_t i = kCapacity; i < 2u * kCapacity; ++i) {  // P6 dst is the second half
+      if (meta[i * 4u] == 0u) continue;
+      live += 1u;
+      uint32_t hash[2] = {};
+      bvh::GcPoseHash(6u, entries[i].world, hash);
+      if (entries[i].pose_lo != hash[0] || entries[i].pose_hi != hash[1]) mismatched += 1u;
+    }
+    CHECK(live == c[bvh::kGcCounterSet] && live > 0u, "P6 live entries %u equal the set (%u)", live, c[bvh::kGcCounterSet]);
+    CHECK(mismatched == 0u, "P6 every live entry hashes its own pose with slot 6 (%u mismatched)", mismatched);
+  }
   const uint32_t p6_set = c[bvh::kGcCounterSet];
   // P6b (frame 801): slot 6's epoch moves on; the whole P6 set is dropped.
   epochs[6] = 1u;

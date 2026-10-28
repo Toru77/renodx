@@ -176,6 +176,7 @@ inline void StopGcDrawSide() {
   bvh::g_gpu_capture.active.store(false, std::memory_order_relaxed);
   std::lock_guard lock(bvh::g_gpu_capture.mutex);
   bvh::g_gpu_capture.entries.clear();
+  bvh::g_gpu_capture.no_entry_reason.clear();
   bvh::g_gpu_capture.range_jobs.clear();
   bvh::g_gpu_capture.decode_jobs.clear();
   bvh::g_gpu_capture.invalidated.clear();
@@ -648,6 +649,15 @@ inline void RunGcCheck(Rt12State& s, Rt12GcState& gc) {
                         result.cpu_absent, ", wait ", result.wait_ms, " ms");
 }
 
+// G4-0 (0b): a count map as a JSON object (keys escaped).
+inline std::string GcCountsJson(const std::map<std::string, uint64_t>& counts) {
+  std::string text = "{";
+  for (const auto& [key, count] : counts) {
+    text += (text.size() > 1u ? ", " : "") + std::string("\"") + bvh::PoolJsonEscape(key) + "\": " + std::to_string(count);
+  }
+  return text + "}";
+}
+
 // Writes world_gc_compare_f<present>.json (schema 1) with one compare result. A failed write is logged and ignored.
 inline void DumpGcCompareJson(const bvh::GcInstanceCompare& cmp, uint32_t present, const uint32_t (&counters)[bvh::kGcCounterCount]) {
   const bool timed_out = cmp.timeouts > 0u;  // nothing was read or compared: every count is null
@@ -673,9 +683,13 @@ inline void DumpGcCompareJson(const bvh::GcInstanceCompare& cmp, uint32_t presen
       << ", \"alpha_conflict\": " << num(cmp.gpu_only_alpha_conflict) << "},\n";
   out << "  \"gpu_no_cpu_mesh\": " << num(cmp.gpu_no_cpu_mesh) << ", \"gpu_dup_content\": " << num(cmp.gpu_dup_content)
       << ", \"cpu_dup\": " << num(cmp.cpu_dup) << ",\n";
+  out << "  \"gpu_no_cpu_mesh_by_state\": " << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_no_cpu_mesh_by_state))
+      << ", \"gpu_only_by_state\": " << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_only_by_state)) << ",\n";
   out << "  \"cpu_only\": {\"count\": " << num(cmp.cpu_only) << ", \"by_reason\": {\"done\": " << num(done)
       << ", \"done_unseen\": " << num(count_of("done_unseen")) << ", \"dynamic\": " << num(count_of("dynamic")) << ", \"pending\": "
-      << num(count_of("pending")) << ", \"refused\": " << num(refused) << ", \"no_entry\": " << num(count_of("no_entry")) << "}},\n";
+      << num(count_of("pending")) << ", \"refused\": " << num(refused) << ", \"no_entry\": " << num(count_of("no_entry")) << ", \"no_entry_indirect\": " << num(count_of("no_entry_indirect"))
+      << ", \"no_entry_untracked\": " << num(count_of("no_entry_untracked")) << ", \"no_entry_cap\": " << num(count_of("no_entry_cap"))
+      << "}},\n";
   out << "  \"match_ratio\": ";
   if (timed_out) {
     out << "null";
@@ -765,13 +779,37 @@ inline void RunGcInstanceCompare(reshade::api::device* device, reshade::api::com
   }
   std::vector<bvh::GcCompareCpuInstance> cpu;
   std::unordered_set<uint64_t> cpu_mesh_keys;
+  std::unordered_set<uint64_t> indirect_keys;
   {
     std::lock_guard lock(bvh::g_pool.mutex);
     for (bvh::GcCompareGpuInstance& instance : gpu) {
       const auto mesh_it = bvh::g_pool.mesh_by_key.find(instance.mesh_key);
-      if (instance.mesh_key == 0u || mesh_it == bvh::g_pool.mesh_by_key.end() || mesh_it->second >= bvh::g_pool.meshes.size()) continue;
+      if (instance.mesh_key == 0u || mesh_it == bvh::g_pool.mesh_by_key.end() || mesh_it->second >= bvh::g_pool.meshes.size()) {
+        const auto failed = bvh::g_pool.failed_meshes.find(instance.mesh_key);
+        if (failed != bvh::g_pool.failed_meshes.end()) {
+          instance.cpu_state = std::string("failed:") + failed->second.reason;
+        } else {
+          instance.cpu_state = bvh::g_pool.mesh_queued.count(instance.mesh_key) != 0u ? "queued" : "absent";
+        }
+        continue;
+      }
       instance.mesh_id = static_cast<int64_t>(mesh_it->second);
       instance.cpu_alpha_conflict = bvh::g_pool.meshes[mesh_it->second].alpha_state.conflict;
+      const auto observed = bvh::g_pool.observations.find(bvh::InstanceKey{instance.mesh_key, MatrixHash(instance.world, bvh::kPoolWorldFloats)});
+      if (observed == bvh::g_pool.observations.end()) {
+        instance.cpu_state = "not_observed";
+      } else if (observed->second.rejected) {
+        instance.cpu_state = "rejected";
+      } else if (observed->second.merged_mesh_key != 0u) {
+        instance.cpu_state = "merged";
+      } else if (observed->second.admitted) {
+        instance.cpu_state = "admitted";
+      } else {
+        instance.cpu_state = "observing";
+      }
+    }
+    for (const auto& indirect : bvh::g_pool.dynamic_indirect) {
+      indirect_keys.insert(indirect.second);
     }
     const uint32_t frame = g_state.frame.load();
     for (const bvh::WorldInstance& instance : bvh::g_pool.instances) {
@@ -794,7 +832,15 @@ inline void RunGcInstanceCompare(reshade::api::device* device, reshade::api::com
     std::lock_guard lock(bvh::g_gpu_capture.mutex);
     for (const uint64_t key : cpu_mesh_keys) {
       const auto entry_it = bvh::g_gpu_capture.entries.find(key);
-      if (entry_it == bvh::g_gpu_capture.entries.end()) continue;
+      if (entry_it == bvh::g_gpu_capture.entries.end()) {
+        const auto noted = bvh::g_gpu_capture.no_entry_reason.find(key);
+        if (indirect_keys.count(key) != 0u) {
+          reasons[key] = "no_entry_indirect";
+        } else if (noted != bvh::g_gpu_capture.no_entry_reason.end()) {
+          reasons[key] = std::string("no_entry_") + noted->second;
+        }
+        continue;
+      }
       const bvh::GcEntry& entry = entry_it->second;
       if (entry.phase == bvh::GcPhase::Done) {
         reasons[key] = "done";
@@ -814,10 +860,18 @@ inline void RunGcInstanceCompare(reshade::api::device* device, reshade::api::com
   for (const auto& [reason, count] : result.cpu_only_by_reason) {
     reason_text += (reason_text.empty() ? "" : ",") + reason + ":" + std::to_string(count);
   }
+  std::string no_cpu_mesh_text;
+  for (const auto& [state, count] : result.gpu_no_cpu_mesh_by_state) {
+    no_cpu_mesh_text += (no_cpu_mesh_text.empty() ? "" : ",") + state + ":" + std::to_string(count);
+  }
+  std::string gpu_only_text;
+  for (const auto& [state, count] : result.gpu_only_by_state) {
+    gpu_only_text += (gpu_only_text.empty() ? "" : ",") + state + ":" + std::to_string(count);
+  }
   renodx::utils::log::i("[world-gc] compare: set ", result.set_count, ", cpu ", result.cpu_instances, ", matched ", result.matched,
                         ", gpu-only ", result.gpu_only, " (alpha ", result.gpu_only_alpha, ", conflict ", result.gpu_only_alpha_conflict,
                         "), no cpu mesh ", result.gpu_no_cpu_mesh, ", cpu-only ", result.cpu_only, " (", reason_text, "), wait ",
-                        result.wait_ms, " ms");
+                        result.wait_ms, " ms, no-cpu-mesh states (", no_cpu_mesh_text, "), gpu-only states (", gpu_only_text, ")");
   DumpGcCompareJson(result, gc.present, counters);
 }
 
@@ -982,13 +1036,15 @@ inline void DumpGcJson(const Rt12GcState& gc) {
       << ", \"gpu_ms_avg\": " << bvh::PoolJsonFloat{static_cast<float>(p.inst_ms_n > 0u ? p.inst_ms_sum / static_cast<double>(p.inst_ms_n) : -1.0)}
       << ", \"d3d11_bytes\": " << gc.inst_bytes << ",\n";
   const bvh::GcInstanceCompare& cmp = p.compare;
+  const bool timed_out = cmp.timeouts > 0u;  // nothing was read or compared: the by-state maps are null
   out << "    \"compare\": {\"run\": " << (cmp.run ? "true" : "false") << ", \"set_count\": " << cmp.set_count
       << ", \"moving_records\": " << cmp.moving_records << ", \"gpu_records\": " << cmp.gpu_records
       << ", \"cpu_instances\": " << cmp.cpu_instances << ", \"matched\": " << cmp.matched << ", \"gpu_only\": " << cmp.gpu_only
       << ", \"gpu_only_alpha\": " << cmp.gpu_only_alpha << ", \"gpu_only_alpha_conflict\": " << cmp.gpu_only_alpha_conflict
       << ", \"gpu_no_cpu_mesh\": " << cmp.gpu_no_cpu_mesh << ", \"gpu_dup_content\": " << cmp.gpu_dup_content
       << ", \"cpu_dup\": " << cmp.cpu_dup << ", \"cpu_only\": " << cmp.cpu_only << ", \"timeouts\": " << cmp.timeouts
-      << ", \"wait_ms\": " << bvh::PoolJsonFloat{static_cast<float>(cmp.wait_ms)} << ",\n      \"cpu_only_by_reason\": {";
+      << ", \"wait_ms\": " << bvh::PoolJsonFloat{static_cast<float>(cmp.wait_ms)} << ",\n      \"gpu_no_cpu_mesh_by_state\": " << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_no_cpu_mesh_by_state))
+      << ", \"gpu_only_by_state\": " << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_only_by_state)) << ",\n      \"cpu_only_by_reason\": {";
   bool first_reason = true;
   for (const auto& [reason, count] : cmp.cpu_only_by_reason) {
     out << (first_reason ? "" : ", ") << "\"" << bvh::PoolJsonEscape(reason) << "\": " << count;

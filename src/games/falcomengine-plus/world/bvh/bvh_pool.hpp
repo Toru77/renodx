@@ -4413,6 +4413,8 @@ inline void OnPoolScanDraw(
   if (gc_tracked) {
     const GcInstanceSource instances = {.buffer = slice.instance_buffer, .base = slice.base, .count = count, .pass = gate.pass};
     GpuCaptureOnDraw(cmd_list, draw, mesh_key, uv, deferred, &instances);
+  } else if (mesh_key != 0u) {
+    GpuCaptureNoteNoEntry(mesh_key, "untracked");
   }
 }
 

@@ -5521,9 +5521,45 @@ static void TestGcInstanceHook(Device* dev) {
     CHECK(gc::g_gpu_capture.entries.empty(), "reset empties the entries");
   }
 
+  // j2. G4-0 (0a): a direct draw with no entry is noted; its creation erases the note; a reset clears the notes.
+  const falcom_world::DrawRecord noted = base_draw(128u, 0u);
+  const uint64_t key_noted = gc::PoolMeshKey(noted);
+  gc::GpuCaptureNoteNoEntry(key_noted, "untracked");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.no_entry_reason.count(key_noted) == 1u
+              && std::strcmp(gc::g_gpu_capture.no_entry_reason.at(key_noted), "untracked") == 0,
+          "no-entry note recorded");
+  }
+  gc::GpuCaptureOnDraw(&cl, noted, key_noted, no_uv, false);
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.no_entry_reason.count(key_noted) == 0u, "creation erases the no-entry note");
+  }
+  gc::GpuCaptureNoteNoEntry(key_noted, "cap");
+  gc::ResetGpuCaptureEntries("pool reset");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.no_entry_reason.empty(), "reset clears the no-entry notes");
+  }
+
+  // j3. G4-0 (T-1): a deferred Range draw with instances counts inst_deferred.
+  const falcom_world::DrawRecord deferred_range = base_draw(192u, 0u);
+  CHECK(gc::GpuCaptureOnDraw(&cl, deferred_range, gc::PoolMeshKey(deferred_range), no_uv, true, &source) == 0u,
+        "deferred range instance draw copies nothing");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.stats.inst_deferred == 2u, "deferred range instance draw counted (%llu)", gc::g_gpu_capture.stats.inst_deferred);
+  }
+
   // k. OFF path: an inactive cache copies nothing and records nothing.
   gc::g_gpu_capture.active.store(false);
   CHECK(gc::GpuCaptureOnDraw(&cl, draw, key, no_uv, false, &source) == 0u, "inactive cache copies nothing");
+  gc::GpuCaptureNoteNoEntry(key_noted, "untracked");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.no_entry_reason.empty(), "inactive cache notes no entry");
+  }
   {
     std::lock_guard lock(gc::g_gpu_capture.mutex);
     CHECK(gc::g_gpu_capture.instance_draws.empty(), "inactive cache records no instance draw");
@@ -5567,7 +5603,7 @@ static void TestGcCompareInstances() {
     instance.recently_seen = recently_seen;
     return instance;
   };
-  std::vector<gc::GcCompareGpuInstance> gpu(4);
+  std::vector<gc::GcCompareGpuInstance> gpu(6);
   gpu[0].mesh_key = 0x1u;
   gpu[0].mesh_id = 1;
   place(gpu[0].world, 1.f, 2.f, 3.f);
@@ -5581,9 +5617,19 @@ static void TestGcCompareInstances() {
   place(gpu[2].world, 5.f, 0.f, 0.f);
   gpu[2].flags = 16u;
   gpu[2].cpu_alpha_conflict = true;
+  gpu[2].cpu_state = "not_observed";
   gpu[3].mesh_key = 0x4u;
   gpu[3].mesh_id = -1;
   place(gpu[3].world, 0.f, 0.f, 0.f);
+  gpu[3].cpu_state = "absent";
+  gpu[4].mesh_key = 0x10u;  // no CPU mesh: the pool failed it
+  gpu[4].mesh_id = -1;
+  place(gpu[4].world, 2.f, 0.f, 0.f);
+  gpu[4].cpu_state = "failed:x";
+  gpu[5].mesh_key = 0x11u;  // GPU-only, the CPU pool has it observed
+  gpu[5].mesh_id = 9;
+  place(gpu[5].world, 9.f, 9.f, 9.f);
+  gpu[5].cpu_state = "observing";
   std::vector<gc::GcCompareCpuInstance> cpu = {
       cpu_at(0x1u, 1u, 1.f, 2.f, 3.f, false, false),   // matched
       cpu_at(0x1u, 1u, 1.f, 2.f, 3.f, false, false),   // the same instance again
@@ -5593,12 +5639,12 @@ static void TestGcCompareInstances() {
       cpu_at(0x6u, 6u, 13.f, 0.f, 0.f, false, false),  // refused
       cpu_at(0x7u, 7u, 15.f, 0.f, 0.f, false, false),  // done, not seen recently
   };
-  const std::unordered_map<uint64_t, std::string> reasons = {{0x3u, "done"}, {0x6u, "refused:format"}, {0x7u, "done"}};
+  const std::unordered_map<uint64_t, std::string> reasons = {{0x3u, "done"}, {0x5u, "no_entry_indirect"}, {0x6u, "refused:format"}, {0x7u, "done"}};
   const gc::GcInstanceCompare result = gc::GcCompareInstances(gpu, cpu, reasons);
   CHECK(result.matched == 1u, "matched %llu", result.matched);
   CHECK(result.gpu_dup_content == 1u, "gpu duplicate content %llu", result.gpu_dup_content);
-  CHECK(result.gpu_no_cpu_mesh == 1u, "gpu without a cpu mesh %llu", result.gpu_no_cpu_mesh);
-  CHECK(result.gpu_only == 1u && result.gpu_only_alpha == 1u && result.gpu_only_alpha_conflict == 1u,
+  CHECK(result.gpu_no_cpu_mesh == 2u, "gpu without a cpu mesh %llu", result.gpu_no_cpu_mesh);
+  CHECK(result.gpu_only == 2u && result.gpu_only_alpha == 1u && result.gpu_only_alpha_conflict == 1u,
         "gpu-only %llu, alpha %llu, conflict %llu", result.gpu_only, result.gpu_only_alpha, result.gpu_only_alpha_conflict);
   CHECK(result.cpu_dup == 1u, "cpu duplicate %llu", result.cpu_dup);
   CHECK(result.cpu_only == 5u, "cpu-only %llu", result.cpu_only);
@@ -5606,12 +5652,18 @@ static void TestGcCompareInstances() {
     const auto it = result.cpu_only_by_reason.find(reason);
     return it == result.cpu_only_by_reason.end() ? uint64_t{0u} : it->second;
   };
-  CHECK(by_reason("done") == 1u && by_reason("dynamic") == 1u && by_reason("no_entry") == 1u && by_reason("refused:format") == 1u
-            && by_reason("done_unseen") == 1u && result.cpu_only_by_reason.size() == 5u,
-        "reasons: done %llu, dynamic %llu, no_entry %llu, refused %llu, done_unseen %llu", by_reason("done"), by_reason("dynamic"),
-        by_reason("no_entry"), by_reason("refused:format"), by_reason("done_unseen"));
-  CHECK(result.cpu_only_samples.size() == 5u && result.gpu_only_samples.size() == 1u, "samples %zu, %zu", result.cpu_only_samples.size(),
+  CHECK(by_reason("done") == 1u && by_reason("dynamic") == 1u && by_reason("no_entry_indirect") == 1u && by_reason("no_entry") == 0u
+            && by_reason("refused:format") == 1u && by_reason("done_unseen") == 1u && result.cpu_only_by_reason.size() == 5u,
+        "reasons: done %llu, dynamic %llu, no_entry_indirect %llu, no_entry %llu, refused %llu, done_unseen %llu", by_reason("done"),
+        by_reason("dynamic"), by_reason("no_entry_indirect"), by_reason("no_entry"), by_reason("refused:format"), by_reason("done_unseen"));
+  CHECK(result.cpu_only_samples.size() == 5u && result.gpu_only_samples.size() == 2u, "samples %zu, %zu", result.cpu_only_samples.size(),
         result.gpu_only_samples.size());
+  CHECK(result.gpu_no_cpu_mesh_by_state.size() == 2u && result.gpu_no_cpu_mesh_by_state.at("absent") == 1u
+            && result.gpu_no_cpu_mesh_by_state.at("failed:x") == 1u,
+        "no-cpu-mesh states: absent and failed:x");
+  CHECK(result.gpu_only_by_state.size() == 2u && result.gpu_only_by_state.at("not_observed") == 1u
+            && result.gpu_only_by_state.at("observing") == 1u,
+        "gpu-only states: not_observed and observing");
 }
 
 int main() {
