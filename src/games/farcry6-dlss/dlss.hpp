@@ -104,6 +104,8 @@
 #include "../../utils/shader.hpp"
 #include "../../utils/state.hpp"
 #include "./camera_jitter.hpp"
+#include "./streamline_runtime.hpp"
+#include "./fg_camera.hpp"
 
 namespace farcry6_dlss::dlss {
 
@@ -1924,9 +1926,18 @@ struct SceneMatrixSample {
   uint32_t offscreen = 0u;
   float viewport[2] = {};
   float motion_vector_offsets[4] = {};
+  float inverse_projection[16] = {};
+  float inverse_view[16] = {};
   float projection[16] = {};
+  float view[16] = {};
+  float view_projection[16] = {};
   float matrix[16] = {};
   float previous_matrix[16] = {};
+  float camera_position[3] = {};
+  float previous_camera_position[3] = {};
+  float camera_right[3] = {};
+  float camera_up[3] = {};
+  float camera_direction[3] = {};
   float temporal[2] = {};
   bool temporal_valid = false;
   DescriptorFingerprint fingerprint = {};
@@ -2520,9 +2531,18 @@ inline void ProbeSceneConstantBuffer(
             sample.fingerprint_valid = false;
             std::memcpy(sample.viewport, mapped + begin + 0x200u, sizeof(sample.viewport));
             std::memcpy(sample.motion_vector_offsets, mapped + begin + 0x2c0u, sizeof(sample.motion_vector_offsets));
+            std::memcpy(sample.inverse_projection, mapped + begin, sizeof(sample.inverse_projection));
+            std::memcpy(sample.inverse_view, mapped + begin + 0x40u, sizeof(sample.inverse_view));
             std::memcpy(sample.projection, mapped + begin + 8u * 4u * sizeof(float), sizeof(sample.projection));
+            std::memcpy(sample.view, mapped + begin + 0xc0u, sizeof(sample.view));
+            std::memcpy(sample.view_projection, mapped + begin + 0x100u, sizeof(sample.view_projection));
             std::memcpy(sample.matrix, mapped + begin + 20u * 4u * sizeof(float), sizeof(sample.matrix));
             std::memcpy(sample.previous_matrix, mapped + begin + 0x180u, sizeof(sample.previous_matrix));
+            std::memcpy(sample.camera_position, mapped + begin + 0x230u, sizeof(sample.camera_position));
+            std::memcpy(sample.previous_camera_position, mapped + begin + 0x240u, sizeof(sample.previous_camera_position));
+            std::memcpy(sample.camera_right, mapped + begin + 0x270u, sizeof(sample.camera_right));
+            std::memcpy(sample.camera_up, mapped + begin + 0x280u, sizeof(sample.camera_up));
+            std::memcpy(sample.camera_direction, mapped + begin + 0x290u, sizeof(sample.camera_direction));
             scene_matrix_frame.store(frame_counter);
             sampled = true;
           }
@@ -3010,6 +3030,13 @@ inline std::wstring GetProcessDirectory() {
   std::wstring result(path.data(), length);
   const auto separator = result.find_last_of(L"\\/");
   return separator == std::wstring::npos ? L"." : result.substr(0u, separator);
+}
+
+inline bool OnCreateDevice(reshade::api::device_api api, uint32_t& api_version) {
+  if (api == reshade::api::device_api::d3d12) {
+    farcry6_dlss::streamline::LoadRuntime(GetProcessDirectory());
+  }
+  return false;
 }
 
 struct FsrContext {
@@ -3782,6 +3809,11 @@ struct DeployReport {
   int flags = 0;
   float jitter_x = 0.f;
   float jitter_y = 0.f;
+  bool fg_camera_valid = false;
+  uint64_t fg_camera_frame = UINT64_MAX;
+  float fg_clip_to_previous[16] = {};
+  float fg_camera_near = 0.f;
+  float fg_camera_far = 0.f;
   float scene_jitter_at_eval[2] = {};
   float temporal_jitter_at_eval[2] = {};
   bool scene_jitter_fresh_at_eval = false;
@@ -5257,8 +5289,32 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   // The game's dispatch is only taken out for frames DLSS actually wrote.
   if (fsr1_mode) fsr1_wrote_this_frame.store(true);
 
+  sl::Constants fg_camera = {};
+  bool fg_camera_valid = false;
+  if (dlss_detailed_diagnostics != 0.f) {
+    const std::lock_guard<std::mutex> lock(scene_matrix_mutex);
+    const SceneMatrixSample* current_camera = nullptr;
+    const SceneMatrixSample* previous_camera = nullptr;
+    for (const auto& sample : scene_matrix_samples) {
+      if (sample.frame == frame_counter) current_camera = &sample;
+      if (frame_counter != 0u && sample.frame == frame_counter - 1u) previous_camera = &sample;
+    }
+    if (current_camera != nullptr && previous_camera != nullptr) {
+      fg_camera_valid = BuildFrameGenerationCamera(*current_camera, *previous_camera, jitter_x, jitter_y,
+                                                   dlss_depth_inverted != 0.f, dlss_motion_vectors_jittered != 0.f,
+                                                   eval.InReset != 0, &fg_camera);
+    }
+  }
+
   {
     const std::lock_guard<std::mutex> lock(report_mutex);
+    deploy_report.fg_camera_valid = fg_camera_valid;
+    deploy_report.fg_camera_frame = fg_camera_valid ? frame_counter : UINT64_MAX;
+    if (fg_camera_valid) {
+      std::memcpy(deploy_report.fg_clip_to_previous, &fg_camera.clipToPrevClip, sizeof(deploy_report.fg_clip_to_previous));
+      deploy_report.fg_camera_near = fg_camera.cameraNear;
+      deploy_report.fg_camera_far = fg_camera.cameraFar;
+    }
     deploy_report.input_width = input_width;
     deploy_report.input_height = input_height;
     deploy_report.target_width = target_width;
@@ -5334,6 +5390,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
 
 // ── Report ──
 inline std::string BuildDebugReport() {
+  farcry6_dlss::streamline::LoadRuntime(GetProcessDirectory());
   const DeployReport report = [&] {
     const std::lock_guard<std::mutex> lock(report_mutex);
     return deploy_report;
@@ -5402,6 +5459,25 @@ inline std::string BuildDebugReport() {
       fsr1_target_width.load(), fsr1_target_height.load(), fsr1_target_format.load(),
       static_cast<unsigned long long>(fsr1_output_resource.load()));
   std::string out(buf);
+  out += "  Streamline runtime: ";
+  out += farcry6_dlss::streamline::runtime.status;
+  out += "\n";
+  {
+    char line[256];
+    if (report.fg_camera_valid) {
+      snprintf(line, sizeof(line), "  FG camera candidate: frame=%llu near=%.6g far=%.6g; CPU conversion, not sent to Streamline\n",
+               static_cast<unsigned long long>(report.fg_camera_frame), report.fg_camera_near, report.fg_camera_far);
+      out += line;
+      for (uint32_t row = 0u; row < 4u; ++row) {
+        const float* matrix = report.fg_clip_to_previous + row * 4u;
+        snprintf(line, sizeof(line), "    clip to previous [%u]: %.9g %.9g %.9g %.9g\n",
+                 row, matrix[0], matrix[1], matrix[2], matrix[3]);
+        out += line;
+      }
+    } else {
+      out += "  FG camera candidate: unavailable (needs consecutive valid camera samples and detailed diagnostics)\n";
+    }
+  }
   {
     char line[384];
     snprintf(line, sizeof(line), "  upscaler         : %s; FSR provider=%s; dispatches=%llu; last result=%u; retired contexts=%zu; reactive mask=none\n",
@@ -5868,6 +5944,27 @@ inline std::string BuildDebugReport() {
                sample.motion_vector_offsets[0], sample.motion_vector_offsets[1],
                sample.motion_vector_offsets[2], sample.motion_vector_offsets[3]);
       out += line;
+      snprintf(line, sizeof(line), "      camera position=(%.9g,%.9g,%.9g) previous=(%.9g,%.9g,%.9g); CPU values\n",
+               sample.camera_position[0], sample.camera_position[1], sample.camera_position[2],
+               sample.previous_camera_position[0], sample.previous_camera_position[1], sample.previous_camera_position[2]);
+      out += line;
+      snprintf(line, sizeof(line), "      camera basis right=(%.6g,%.6g,%.6g) up=(%.6g,%.6g,%.6g) direction=(%.6g,%.6g,%.6g)\n",
+               sample.camera_right[0], sample.camera_right[1], sample.camera_right[2],
+               sample.camera_up[0], sample.camera_up[1], sample.camera_up[2],
+               sample.camera_direction[0], sample.camera_direction[1], sample.camera_direction[2]);
+      out += line;
+      const float* camera_matrices[] = {sample.inverse_projection, sample.inverse_view, sample.view, sample.view_projection};
+      const char* camera_matrix_names[] = {"inverse projection", "inverse view", "view", "view projection"};
+      for (uint32_t matrix_index = 0u; matrix_index < std::size(camera_matrices); ++matrix_index) {
+        snprintf(line, sizeof(line), "      %s:\n", camera_matrix_names[matrix_index]);
+        out += line;
+        for (uint32_t row = 0u; row < 4u; ++row) {
+          const float* values = camera_matrices[matrix_index] + row * 4u;
+          snprintf(line, sizeof(line), "      [%u] %.9g %.9g %.9g %.9g\n",
+                   row, values[0], values[1], values[2], values[3]);
+          out += line;
+        }
+      }
       double shifts[2][2] = {};
       double norms[2] = {};
       const float* matrices[] = {sample.matrix, sample.previous_matrix};
@@ -6950,6 +7047,7 @@ inline void Use(DWORD fdw_reason) {
     case DLL_PROCESS_ATTACH:
       if (attached) return;
       attached = true;
+      reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::register_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
@@ -6999,6 +7097,7 @@ inline void Use(DWORD fdw_reason) {
       reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
+      reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
       {
         reshade::api::device* device = unpack_device != nullptr ? unpack_device
             : (placeholder_device != nullptr ? placeholder_device : object_mask_state.device);
