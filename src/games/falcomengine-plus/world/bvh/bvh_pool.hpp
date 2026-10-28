@@ -4410,7 +4410,10 @@ inline void OnPoolScanDraw(
   stage.Set("direct draw: copy");
   IssuePoolCopies(cmd_list, commands.data(), command_count);
   LogPoolMeshCopies(mesh_copies.data(), mesh_count, frame);
-  if (gc_tracked) GpuCaptureOnDraw(cmd_list, draw, mesh_key, uv, deferred);
+  if (gc_tracked) {
+    const GcInstanceSource instances = {.buffer = slice.instance_buffer, .base = slice.base, .count = count, .pass = gate.pass};
+    GpuCaptureOnDraw(cmd_list, draw, mesh_key, uv, deferred, &instances);
+  }
 }
 
 // DrawIndexedInstancedIndirect and friends. `draw` carries the bindings at

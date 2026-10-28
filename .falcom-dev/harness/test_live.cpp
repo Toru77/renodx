@@ -5287,6 +5287,333 @@ static void TestGcHook(Device* dev) {
   dev->destroy_resource(staging);
 }
 
+// G3 (gpu_capture.hpp GcPoseHash): the pose key is the grid of the 12 world floats (translation 1/256 m, basis 1/4096).
+static void TestGcPoseHash() {
+  Stage("gpu instance pose hash");
+  const auto key = [](uint32_t lead, const float* world) {
+    uint32_t out[2] = {};
+    falcom_world::bvh::GcPoseHash(lead, world, out);
+    return (uint64_t{out[0]} << 32u) | out[1];
+  };
+  const float base[12] = {1.f, 0.f, 0.f, 1.f, 0.f, 1.f, 0.f, 2.f, 0.f, 0.f, 1.f, 3.f};
+  float near_basis[12] = {};
+  std::memcpy(near_basis, base, sizeof(base));
+  near_basis[0] += 3e-8f;
+  float moved[12] = {};
+  std::memcpy(moved, base, sizeof(base));
+  moved[7] += 0.005f;
+  const float identity[12] = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+  const float negative_zero[12] = {1.f, 0.f, 0.f, -0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+  const float half_step[12] = {1.f, 0.f, 0.f, 0.5f / 256.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+  const float tie_up[12] = {1.f, 0.f, 0.f, 1.5f / 256.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+  const float two_step[12] = {1.f, 0.f, 0.f, 2.f / 256.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+  CHECK(key(1, base) == key(1, base), "same world, same key");
+  CHECK(key(1, base) == key(1, near_basis), "basis +3e-8 keeps the key");
+  CHECK(key(1, base) != key(1, moved), "translation +0.005 m changes the key");
+  CHECK(key(1, base) != key(2, base), "the leading word (mesh slot or mesh id) is part of the key");
+  CHECK(key(1, identity) == key(1, negative_zero), "-0 and 0 share a key");
+  CHECK(key(1, identity) == key(1, half_step), "translation 0.5/256 ties to even (0)");
+  CHECK(key(1, tie_up) == key(1, two_step), "translation 1.5/256 ties to even (2)");
+  std::set<uint32_t> low16;
+  std::set<uint32_t> low6;
+  for (int i = 0; i < 100; ++i) {
+    const float along[12] = {1.f, 0.f, 0.f, static_cast<float>(i), 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+    uint32_t out[2] = {};
+    falcom_world::bvh::GcPoseHash(6u, along, out);
+    low16.insert(out[0] & 0xFFFFu);
+    low6.insert(out[0] & 63u);
+  }
+  CHECK(low16.size() >= 95u, "finalizer: 100 poses give >= 95 distinct low16 (%zu)", low16.size());
+  CHECK(low6.size() >= 40u, "finalizer: 100 poses give >= 40 distinct low6 (%zu)", low6.size());
+}
+
+// G3 draw side (D2) and the bookkeeping of slots and epochs (D1) on the mock device.
+static void TestGcInstanceHook(Device* dev) {
+  namespace gc = falcom_world::bvh;
+  Stage("gpu instance hook");
+  constexpr uint64_t kGcLayout = 0x6A1u;
+  {
+    renodx::utils::scene::InputLayoutInfo info;
+    renodx::utils::scene::InputElementCopy position;
+    position.semantic = "POSITION";
+    position.format = reshade::api::format::r32g32b32_float;
+    position.stride = 12u;
+    info.elements.push_back(position);
+    renodx::utils::scene::shared.data->input_layouts[kGcLayout] = info;
+  }
+  const auto make_buffer = [dev](uint64_t bytes, reshade::api::resource* out) {
+    reshade::api::resource_desc desc = {};
+    desc.type = reshade::api::resource_type::buffer;
+    desc.buffer.size = bytes;
+    desc.heap = reshade::api::memory_heap::gpu_only;
+    desc.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_source | reshade::api::resource_usage::copy_dest;
+    return dev->create_resource(desc, nullptr, reshade::api::resource_usage::shader_resource, out);
+  };
+  reshade::api::resource vb = {0u}, ib = {0u}, staging = {0u}, slices = {0u}, arena = {0u};
+  CHECK(make_buffer(4096u, &vb) && make_buffer(4096u, &ib) && make_buffer(16u << 20, &staging) && make_buffer(160u * 8u, &slices)
+            && make_buffer(1u << 20, &arena),
+        "test buffers");
+  CmdList cl;
+  cl.dev = dev;
+  const auto base_draw = [&](uint64_t vb_offset, uint32_t first_index) {
+    falcom_world::DrawRecord draw;
+    draw.method = 1;
+    draw.has_index_buffer = true;
+    draw.vb = vb;
+    draw.vb_offset = vb_offset;
+    draw.vb_stride = 12u;
+    draw.vb_size = 4096u;
+    draw.ib = ib;
+    draw.ib_size = 4096u;
+    draw.index_size = 2u;
+    draw.index_count = 36u;
+    draw.first_index = first_index;
+    draw.instance_count = 1u;
+    draw.input_layout = {kGcLayout};
+    draw.topology = reshade::api::primitive_topology::triangle_list;
+    return draw;
+  };
+
+  gc::ResetWorldPool();
+  gc::g_gpu_capture.active.store(true);
+  gc::ResetGpuCaptureEntries("pool reset");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    gc::g_gpu_capture.staging = staging;
+    gc::g_gpu_capture.staging_used = 0u;
+    gc::g_gpu_capture.instance_arena = arena;
+    gc::g_gpu_capture.instance_arena_used = 0u;
+    gc::g_gpu_capture.instance_draws.clear();
+  }
+  const falcom_world::DrawRecord draw = base_draw(0u, 0u);
+  const uint64_t key = gc::PoolMeshKey(draw);
+  {
+    std::lock_guard lock(gc::g_pool.mutex);
+    gc::AddPoolResourceKey(draw.vb.handle, key);
+    gc::AddPoolResourceKey(draw.ib.handle, key);
+  }
+  const gc::PoolUvStream no_uv;
+  const gc::GcInstanceSource source = {.buffer = slices, .base = 2, .count = 3u, .pass = 9u};
+
+  // a. The first sighting creates the entry (Range): no instance copy.
+  gc::GpuCaptureOnDraw(&cl, draw, key, no_uv, false, &source);
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    const gc::GcEntry& entry = gc::g_gpu_capture.entries.at(key);
+    CHECK(entry.phase == gc::GcPhase::RangeWait, "first sighting waits for its range result");
+    CHECK(gc::g_gpu_capture.stats.inst_no_geometry == 1u, "no geometry counted (%llu)", gc::g_gpu_capture.stats.inst_no_geometry);
+    CHECK(gc::g_gpu_capture.instance_draws.empty(), "no instance draw before Done");
+    CHECK(gc::g_gpu_capture.slot_key[entry.slot] == key, "the entry's slot maps to its key");
+  }
+
+  // b. Done: the slice is copied and recorded with its slot and epoch.
+  uint32_t slot = 0u;
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    gc::GcEntry& entry = gc::g_gpu_capture.entries.at(key);
+    entry.phase = gc::GcPhase::Done;
+    slot = entry.slot;
+  }
+  CHECK(gc::GpuCaptureOnDraw(&cl, draw, key, no_uv, false, &source) == 1u, "Done draw copies its instance slice");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.instance_draws.size() == 1u, "one instance draw recorded");
+    const gc::GcInstanceDrawGPU& recorded = gc::g_gpu_capture.instance_draws[0];
+    CHECK(recorded.arena_float4 == 0u && recorded.count == 3u && recorded.slot == slot, "draw: arena 0, count 3, slot %u", recorded.slot);
+    CHECK(recorded.epoch == gc::g_gpu_capture.slot_epoch[slot], "draw epoch is the slot epoch");
+    CHECK(recorded.pass_bits == 9u, "draw pass bits");
+    CHECK(gc::g_gpu_capture.instance_arena_used == 480u, "arena used 480 (%llu)", gc::g_gpu_capture.instance_arena_used);
+    CHECK(gc::g_gpu_capture.stats.inst_draws == 1u && gc::g_gpu_capture.stats.inst_instances == 3u, "draw counters");
+  }
+
+  // c. Deferred: no copy.
+  CHECK(gc::GpuCaptureOnDraw(&cl, draw, key, no_uv, true, &source) == 0u, "deferred instance draw copies nothing");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.stats.inst_deferred == 1u, "deferred counted");
+  }
+
+  // d. Arena full.
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    gc::g_gpu_capture.instance_arena_used = gc::kGcInstanceArenaBytes - 100u;
+  }
+  CHECK(gc::GpuCaptureOnDraw(&cl, draw, key, no_uv, false, &source) == 0u, "full arena copies nothing");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.stats.inst_arena_full == 1u, "arena full counted");
+    gc::g_gpu_capture.instance_arena_used = 480u;
+  }
+
+  // e. Draw cap.
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    gc::g_gpu_capture.instance_draws.resize(gc::kGcInstanceDrawsPerPresent);
+  }
+  CHECK(gc::GpuCaptureOnDraw(&cl, draw, key, no_uv, false, &source) == 0u, "draw cap copies nothing");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.stats.inst_draws_cap == 1u, "draw cap counted");
+    gc::g_gpu_capture.instance_draws.clear();
+  }
+
+  // f. A write bumps the slot epoch, keeps the slot.
+  uint32_t epoch_before = 0u;
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    epoch_before = gc::g_gpu_capture.slot_epoch[slot];
+    gc::g_gpu_capture.epochs_dirty = false;
+  }
+  gc::InvalidateGpuCaptureKeys({key}, false);
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.slot_epoch[slot] == epoch_before + 1u, "write bumps the epoch");
+    CHECK(gc::g_gpu_capture.epochs_dirty, "epoch change marks the table dirty");
+    const gc::GcEntry& entry = gc::g_gpu_capture.entries.at(key);
+    CHECK(entry.slot == slot && entry.phase == gc::GcPhase::Range, "write keeps the slot and restarts the entry");
+  }
+
+  // g. Destroy frees the slot and bumps the epoch again.
+  gc::InvalidateGpuCaptureKeys({key}, true);
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.entries.count(key) == 0u, "destroy erases the entry");
+    CHECK(std::find(gc::g_gpu_capture.free_slots.begin(), gc::g_gpu_capture.free_slots.end(), slot) != gc::g_gpu_capture.free_slots.end(),
+          "destroy frees the slot");
+    CHECK(gc::g_gpu_capture.slot_key[slot] == 0u, "freed slot has no key");
+    CHECK(gc::g_gpu_capture.slot_epoch[slot] == epoch_before + 2u, "destroy bumps the epoch (%u)", gc::g_gpu_capture.slot_epoch[slot]);
+  }
+
+  // h. A new key takes the freed slot.
+  CHECK(gc::GpuCaptureOnDraw(&cl, draw, key, no_uv, false, &source) == 1u, "new entry copies its range");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.entries.at(key).slot == slot, "new entry reuses the freed slot");
+    CHECK(gc::g_gpu_capture.slot_key[slot] == key, "reused slot maps to the new key");
+    CHECK(gc::g_gpu_capture.free_slots.empty(), "free list consumed");
+  }
+
+  // i. A key refused at creation (written buffer) bumps the epoch of its slot.
+  falcom_world::DrawRecord written = base_draw(64u, 0u);
+  written.vb_usage = static_cast<uint32_t>(reshade::api::resource_usage::unordered_access);
+  const uint64_t key_written = gc::PoolMeshKey(written);
+  uint32_t expected_slot = 0u;
+  uint32_t written_before = 0u;
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    expected_slot = gc::g_gpu_capture.free_slots.empty() ? gc::g_gpu_capture.next_slot : gc::g_gpu_capture.free_slots.back();
+    written_before = gc::g_gpu_capture.slot_epoch[expected_slot];
+  }
+  gc::GpuCaptureOnDraw(&cl, written, key_written, no_uv, false);
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    const gc::GcEntry& entry = gc::g_gpu_capture.entries.at(key_written);
+    CHECK(entry.phase == gc::GcPhase::Refused, "written buffer refused at creation");
+    CHECK(entry.slot == expected_slot && gc::g_gpu_capture.slot_epoch[entry.slot] == written_before + 1u,
+          "refusal bumps the slot epoch (slot %u)", entry.slot);
+  }
+
+  // j. A pool reset returns every slot.
+  gc::ResetGpuCaptureEntries("pool reset");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.next_slot == 0u && gc::g_gpu_capture.free_slots.empty(), "reset returns the slots");
+    CHECK(gc::g_gpu_capture.entries.empty(), "reset empties the entries");
+  }
+
+  // k. OFF path: an inactive cache copies nothing and records nothing.
+  gc::g_gpu_capture.active.store(false);
+  CHECK(gc::GpuCaptureOnDraw(&cl, draw, key, no_uv, false, &source) == 0u, "inactive cache copies nothing");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.instance_draws.empty(), "inactive cache records no instance draw");
+  }
+
+  // Restore.
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    gc::g_gpu_capture.instance_draws.clear();
+    gc::g_gpu_capture.instance_arena = {0u};
+    gc::g_gpu_capture.instance_arena_used = 0u;
+    gc::g_gpu_capture.staging = {0u};
+    gc::g_gpu_capture.staging_used = 0u;
+    gc::g_gpu_capture.invalidated.clear();
+    gc::g_gpu_capture.range_jobs.clear();
+    gc::g_gpu_capture.decode_jobs.clear();
+    gc::g_gpu_capture.stats = gc::GcStats{};
+  }
+  gc::ResetWorldPool();
+  dev->destroy_resource(vb);
+  dev->destroy_resource(ib);
+  dev->destroy_resource(staging);
+  dev->destroy_resource(slices);
+  dev->destroy_resource(arena);
+}
+
+// G3 compare (D10): buckets of matched, GPU-only and CPU-only instances, with the reasons.
+static void TestGcCompareInstances() {
+  namespace gc = falcom_world::bvh;
+  Stage("gpu instance compare");
+  const auto place = [](float* world, float x, float y, float z) {
+    const float m[12] = {1.f, 0.f, 0.f, x, 0.f, 1.f, 0.f, y, 0.f, 0.f, 1.f, z};
+    std::memcpy(world, m, sizeof(m));
+  };
+  const auto cpu_at = [&place](uint64_t mesh_key, uint32_t mesh_id, float x, float y, float z, bool dynamic, bool recently_seen) {
+    gc::GcCompareCpuInstance instance;
+    instance.mesh_key = mesh_key;
+    instance.mesh_id = mesh_id;
+    place(instance.world, x, y, z);
+    instance.dynamic = dynamic;
+    instance.recently_seen = recently_seen;
+    return instance;
+  };
+  std::vector<gc::GcCompareGpuInstance> gpu(4);
+  gpu[0].mesh_key = 0x1u;
+  gpu[0].mesh_id = 1;
+  place(gpu[0].world, 1.f, 2.f, 3.f);
+  gpu[0].flags = 2u;
+  gpu[1].mesh_key = 0x9u;  // the same content as gpu[0] under another key
+  gpu[1].mesh_id = 1;
+  place(gpu[1].world, 1.f, 2.f, 3.f);
+  gpu[1].flags = 2u;
+  gpu[2].mesh_key = 0x2u;
+  gpu[2].mesh_id = 2;
+  place(gpu[2].world, 5.f, 0.f, 0.f);
+  gpu[2].flags = 16u;
+  gpu[2].cpu_alpha_conflict = true;
+  gpu[3].mesh_key = 0x4u;
+  gpu[3].mesh_id = -1;
+  place(gpu[3].world, 0.f, 0.f, 0.f);
+  std::vector<gc::GcCompareCpuInstance> cpu = {
+      cpu_at(0x1u, 1u, 1.f, 2.f, 3.f, false, false),   // matched
+      cpu_at(0x1u, 1u, 1.f, 2.f, 3.f, false, false),   // the same instance again
+      cpu_at(0x3u, 3u, 7.f, 0.f, 0.f, false, true),    // done
+      cpu_at(0x8u, 4u, 9.f, 0.f, 0.f, true, false),    // dynamic
+      cpu_at(0x5u, 5u, 11.f, 0.f, 0.f, false, false),  // no entry
+      cpu_at(0x6u, 6u, 13.f, 0.f, 0.f, false, false),  // refused
+      cpu_at(0x7u, 7u, 15.f, 0.f, 0.f, false, false),  // done, not seen recently
+  };
+  const std::unordered_map<uint64_t, std::string> reasons = {{0x3u, "done"}, {0x6u, "refused:format"}, {0x7u, "done"}};
+  const gc::GcInstanceCompare result = gc::GcCompareInstances(gpu, cpu, reasons);
+  CHECK(result.matched == 1u, "matched %llu", result.matched);
+  CHECK(result.gpu_dup_content == 1u, "gpu duplicate content %llu", result.gpu_dup_content);
+  CHECK(result.gpu_no_cpu_mesh == 1u, "gpu without a cpu mesh %llu", result.gpu_no_cpu_mesh);
+  CHECK(result.gpu_only == 1u && result.gpu_only_alpha == 1u && result.gpu_only_alpha_conflict == 1u,
+        "gpu-only %llu, alpha %llu, conflict %llu", result.gpu_only, result.gpu_only_alpha, result.gpu_only_alpha_conflict);
+  CHECK(result.cpu_dup == 1u, "cpu duplicate %llu", result.cpu_dup);
+  CHECK(result.cpu_only == 5u, "cpu-only %llu", result.cpu_only);
+  const auto by_reason = [&result](const char* reason) {
+    const auto it = result.cpu_only_by_reason.find(reason);
+    return it == result.cpu_only_by_reason.end() ? uint64_t{0u} : it->second;
+  };
+  CHECK(by_reason("done") == 1u && by_reason("dynamic") == 1u && by_reason("no_entry") == 1u && by_reason("refused:format") == 1u
+            && by_reason("done_unseen") == 1u && result.cpu_only_by_reason.size() == 5u,
+        "reasons: done %llu, dynamic %llu, no_entry %llu, refused %llu, done_unseen %llu", by_reason("done"), by_reason("dynamic"),
+        by_reason("no_entry"), by_reason("refused:format"), by_reason("done_unseen"));
+  CHECK(result.cpu_only_samples.size() == 5u && result.gpu_only_samples.size() == 1u, "samples %zu, %zu", result.cpu_only_samples.size(),
+        result.gpu_only_samples.size());
+}
+
 int main() {
   falcom_world::g_state.pool_capture_requested.store(true);
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -6370,6 +6697,9 @@ int main() {
   TestGcBudget();
   TestGcCompare();
   TestGcHook(&dev);
+  TestGcPoseHash();
+  TestGcInstanceHook(&dev);
+  TestGcCompareInstances();
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);

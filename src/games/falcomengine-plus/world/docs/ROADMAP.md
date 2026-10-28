@@ -85,6 +85,7 @@ R1b-0 (diagnostic, startup hook-off mask), implemented, not validated in game: `
 | DXR backend M4 (characters on DXR: carrier, character BLAS, mask 8) | Owner test in Reference: DXR backend (M4) | world/rt12/rt12_backend.hpp, world/shaders/world_rt12_carrier.cs_5_0.hlsl, world_rt12_deform_unpack.cs_6_5.hlsl |
 | DXR backend M5 (P2b moving objects on DXR: records carrier, records pass, instance table at S + r) | Owner test in Reference: DXR backend (M5) | world/rt12/rt12_backend.hpp, world/rt12/rt12_mirror.hpp, world/shaders/world_rt12_records_carrier.cs_5_0.hlsl, world_rt12_records.cs_6_5.hlsl |
 | GPU geometry cache G2 (validation only, not traced) | Owner test in Reference: GPU geometry cache (G2) | world/bvh/gpu_capture.hpp, world/rt12/rt12_capture.hpp, world/shaders/world_gc_range.cs_5_0.hlsl, world_gc_decode.cs_5_0.hlsl |
+| GPU instance set G3 (validation only, not traced) | Owner test in Reference: GPU instance set (G3) | world/bvh/gpu_capture.hpp, world/rt12/rt12_capture.hpp, world/shaders/world_gc_instance.hlsli, world_gc_insert.cs_5_0.hlsl, world_gc_compact.cs_5_0.hlsl, world_instance_math.hlsli |
 
 ## Reference
 
@@ -366,6 +367,51 @@ Status (first enable, owner run): first enable works. 694 resident; check of 63 
 - Known issue, open: after DXR is turned off and on, re-enabling G2 can stall after frame 6 (5 s watchdog, then crash). Repro: DXR off with G2 on (clean), then G2 on again. Logs: 12:31:57 to 12:32:03 in ReShade.log. Not diagnosed.
 - The switch stays default OFF until this is fixed or the user decides otherwise.
 - Fixes applied: the readback query gate (no unbounded map), and the UAV unbind descriptor count fix (null_views, count 2).
+
+### GPU instance set (G3): reference
+
+Scope: validation only, not traced. While the G2 switch is on, the instance slice of each direct draw of a Done G2 mesh is copied at the draw into a per-present arena (D2). At present step 7b, D3D11 passes build a persistent instance set keyed by (GPU mesh slot, quantized pose): clear, mark, rehash, insert, then a compact pass that writes the set as `WorldInstanceGPU` records. "Compare GPU instances" reads the records back (bounded) and counts matched, GPU-only and CPU-only instances against the CPU pool (D9, D10). Nothing traces the set: the TLAS, DXR and the compute trace never read it. The CPU pool, the live store, the M3 mirror, M5 and compute pass A are unchanged.
+
+Design (short form):
+- D1: each G2 entry gets a dense `slot` (< 8192) from a free list. `slot_epoch[slot]` is bumped on write invalidation, destroy, refusal and reset; a destroyed slot returns to the free list. Set entries and draw records carry (slot, epoch); a mismatch drops them on the GPU. The 32 KB epoch table is uploaded when dirty.
+- D2: `GpuCaptureOnDraw(..., instances)` copies `count * 160` bytes into the arena for a Done, non-deferred entry within the caps (16384 draws, 16 MB). Other cases are counted: `inst_no_geometry`, `inst_deferred`, `inst_draws_cap`, `inst_arena_full`.
+- D3: step 7b (immediate context, after the G2 passes): upload epochs and draws, zero the 16 counters, dispatch clear, mark, rehash (src to dst), insert, then compact; unbind the 5 UAVs; copy the counters to readback slot `present % 3` (an unread slot counts `inst_readback_busy`). No CPU wait; counters are read two presents later by query. The halves swap every present.
+- D4: the set is double buffered, 65536 entries per half. `meta` = (tag, last_seen, flags, 0), `entries` = 64-byte `GcSetEntryGPU`. Open addressing, linear probing, 32 probes; tag = pose_hi | 1 (CAS from 0); probe start = pose_lo & (capacity - 1). The rehash drops entries aged more than 600 presents, stale-epoch entries and moving-held entries. No tombstones.
+- D5: pose key: 12 world floats, translation rounded to 1/256 m, basis to 1/4096, round half to even; FNV-style words with a leading word (the slot on the GPU). `GcPoseHash` (gpu_capture.hpp) is the C++ reference; `world_gc_insert.cs_5_0.hlsl` must match. Both halves then get the fmix32 finalizer (same five steps in C++ and HLSL), so the probe start and the tag use mixed bits.
+- D6: validity: `abs(det) >= 1e-12` and `WorldRowsPlausible` with the P2b limits (legacy scale honoured). Invalid sightings only count.
+- D7: moving: a camera sighting with `PoolSightingMoves` (transcribed inline) sets `moving[slot] = frame + 1` in mark mode. A slot with a moving sighting in the last `kPoolMovingHoldFrames` (60) presents keeps all its sightings as per-present records at [65536, +8192) and its set entries are dropped at the rehash.
+- D8: records (`WorldInstanceGPU`): header (slot, 0, 0, 1); world rows = the pose; inverse from `WorldAffineInverse`; bounds = the translation point; visibility = (0, 0, flags, 0) with flags camera 2, light 4, wind 8, alpha 16. Set records are at [0, n), moving records at [65536, +n).
+- D9, D10: the compare runs on request (step 11): the records and counters are copied to a gpu_to_cpu buffer, an event query ends, and the present polls for at most `kRt12TeardownMs`; a timeout is counted and the buffer is not read. Three non-nested lock phases: slot to key; key to CPU mesh id and alpha conflict, plus a CPU snapshot with `recently_seen`; CPU key to entry reason. The pure `GcCompareInstances` then buckets matched, gpu_only (with alpha and alpha-conflict counts, the P-2 hypothesis), and cpu_only with reason `dynamic`, `no_entry`, `pending`, `done`, `done_unseen` (not seen in 600 frames) or `refused:<reason>`.
+- Extra output (beyond the plan's JSON keys): `world_gc_compare_f<present>.json` is written only when a compare is requested, in the same folder as `world_gc.json`.
+- D11: the G2 lock rule holds: no graphics call under either mutex, and the two mutexes are never nested.
+- D12: OFF path: every new draw-side branch is inside `if (gc_tracked)`. The P2b shader refactor (`world_instance_math.hlsli`, shared by `world_dynamic_expand`) leaves its output unchanged (test_gpu_p2b T2).
+
+Assumed programme decisions (owner has not approved them in writing): 1, 4, 5, 6, 7 and 8 as written; G3 does not act on 7 or 8. Decision 3 is assumed with one extension (the D7 hold): shadow passes leave prevWorld zero, so without the hold a swaying sign's shadow sightings would insert a new key every present. Decision 2 is assumed in part: header.z is 0 in G3 (G4 fills the material).
+
+Deviations (planner decisions, with reasons):
+- Direct draws only. `OnPoolScanIndirectDraw` is untouched: G2 has no entry for keys drawn only indirectly, so their CPU instances show as `no_entry` in the compare. A G3b adds indirect draws if that bucket is large.
+- No region filter in the compact pass: the compare covers the whole CPU pool. G4 owns the region.
+- Record bounds are the translation point (no GPU mesh box yet). The DXR path does not read record bounds; G3 records must never be handed to the compute trace.
+- Harness split: pure logic in `test_live.cpp`; the real shaders on WARP in `test_gpu_p2b.cpp`.
+
+G4 to-do list: G3b (indirect draws) if `no_entry` is large; a region filter in compact; record bounds from a mesh box; header.z material; record ranges are [0, set) and [65536, +moving); the 60-present hold rule versus the CPU repeat/stale rule (`NotePoolMotion`, not transcribed).
+- G4 to-do (a): one pose per hash tested; widen the CPU/GPU hash check.
+- G4 to-do (b): deferred instance draws of entries not yet Done are counted only in `deferred_skips`.
+- G4 to-do (c): flags are merged across all sightings of an entry.
+- G4 to-do (d): a reused slot inherits the previous mesh's moving mark.
+- G4 prerequisite: the `no_entry` split (indirect vs direct) must be added before G4 is planned; `gpu_no_cpu_mesh` must be split by pool failure reason before it is called P-2 evidence.
+
+Owner test (DevKit build; RTAO on, DXR on, Trace characters on, P2b on, Performance Gather on). Do not toggle DXR off and on and then the cache on (known G2 stall).
+1. Cache off: 30 s Performance test at a town street.
+2. Tick "GPU geometry cache (experimental)". Wait for `[world-gc] settled`. The "GPU instances" line shows the set rising, with overflow 0 / 0 / 0.
+3. At an interior, the street and a large outdoor area: stand still 10 s and press "Compare GPU instances". Expect a wait under 100 ms, no TIMEOUT, and matched at 95% or more of matched + done; GPU-only small. Then "Dump GPU cache JSON".
+4. Near a moving object (swaying sign, door, cart): the line shows moving above 0; standing still, the set stays stable (no growth from ghosts).
+5. 30 s Performance test with the cache on at the street (the D3D11 ms on the line and `pool_hooks` show the cost).
+6. Change map twice; after `settled` plus 10 s, compare again.
+7. Toggle the cache off, on, off; DXR off with the cache on (expect `[world-gc] teardown (dxr off)`); exit with both on. No crash, no STUCK.
+8. Send `world_gc.json` (after steps 3 and 6), both performance files, the `[world-gc]` lines (`active`, `compare`, `teardown`) and the GPU-cache panel lines.
+
+Pass: overflow 0, no timeout, matched at least 95% of matched + done at every spot. CPU-only `done` samples go to the planner. Not fixed in G3: CPU-only `no_entry`, `refused` and `pending` (G2 coverage), and GPU-only (CPU admission, the P-2 evidence).
 
 ## Open decisions
 

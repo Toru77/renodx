@@ -9,6 +9,7 @@
 // are the cofactor columns over the determinant); the bounds are the mesh's local box, transformed.
 
 #include "world_bvh_types.hlsli"
+#include "world_instance_math.hlsli"
 
 ByteAddressBuffer g_dyn_arena : register(t0);
 StructuredBuffer<DynamicDrawGPU> g_dyn_draws : register(t1);
@@ -25,29 +26,6 @@ cbuffer cb_dynamic_expand : register(b0)
 #define DYNAMIC_THREADS 64u
 #define DYNAMIC_ELEMENT_FLOAT4 10u  // one instance slice element (kPoolInstanceStride = 160 bytes), in float4
 
-// CheckPoolWorld (bvh_pool.hpp): finite; each row length >= 1e-6 (not zero scale) and within [min, max); each
-// translation within max_position; no two rows nearly parallel (|cos| < 0.995).
-bool DynamicWorldPlausible(float4 r0, float4 r1, float4 r2)
-{
-    if (!all(isfinite(r0)) || !all(isfinite(r1)) || !all(isfinite(r2))) return false;
-    const float3 rows[3] = {r0.xyz, r1.xyz, r2.xyz};
-    const float3 translation = float3(r0.w, r1.w, r2.w);
-    if (!all(abs(translation) <= g_max_position)) return false;
-    float lengths[3];
-    for (uint r = 0; r < 3; ++r)
-    {
-        lengths[r] = length(rows[r]);
-        if (!(lengths[r] >= 1e-6) || !(lengths[r] >= g_min_scale) || !(lengths[r] < g_max_scale)) return false;
-    }
-    for (uint a = 0; a < 3; ++a)
-    {
-        for (uint b = a + 1; b < 3; ++b)
-        {
-            if (!(abs(dot(rows[a], rows[b]) / (lengths[a] * lengths[b])) < 0.995)) return false;
-        }
-    }
-    return true;
-}
 
 [numthreads(DYNAMIC_THREADS, 1, 1)]
 void main(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
@@ -68,15 +46,9 @@ void main(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
             rows[1] = asfloat(g_dyn_arena.Load4((element + 1u) * 16u));
             rows[2] = asfloat(g_dyn_arena.Load4((element + 2u) * 16u));
         }
-        const float3 a0 = rows[0].xyz;
-        const float3 a1 = rows[1].xyz;
-        const float3 a2 = rows[2].xyz;
-        // Columns of the adjugate: rows of the inverse are (c0.k, c1.k, c2.k) / det.
-        const float3 c0 = cross(a1, a2);
-        const float3 c1 = cross(a2, a0);
-        const float3 c2 = cross(a0, a1);
-        const float det = dot(a0, c0);
-        const bool valid = live && abs(det) >= 1e-12 && DynamicWorldPlausible(rows[0], rows[1], rows[2]);
+        float4 inverse_rows[3];
+        const float det = WorldAffineInverse(rows[0], rows[1], rows[2], inverse_rows);
+        const bool valid = live && abs(det) >= 1e-12 && WorldRowsPlausible(rows[0], rows[1], rows[2], g_min_scale, g_max_scale, g_max_position);
         const float3 translation = float3(rows[0].w, rows[1].w, rows[2].w);
 
         // header.z = 0: alpha-tested meshes are never recorded (RecordPoolDynamicDraw), so every record is not alpha-tested.
@@ -86,12 +58,6 @@ void main(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
         record.world[1] = rows[1];
         record.world[2] = rows[2];
         record.world[3] = float4(0.0, 0.0, 0.0, 1.0);
-        float4 inverse_rows[3];
-        for (uint r = 0; r < 3; ++r)
-        {
-            const float3 inverse_row = float3(c0[r], c1[r], c2[r]) / det;
-            inverse_rows[r] = float4(inverse_row, -dot(inverse_row, translation));
-        }
         record.inverse_world[0] = inverse_rows[0];
         record.inverse_world[1] = inverse_rows[1];
         record.inverse_world[2] = inverse_rows[2];

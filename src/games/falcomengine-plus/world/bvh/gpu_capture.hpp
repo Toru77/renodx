@@ -8,12 +8,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 inline constexpr uint64_t kGcStagingBytes = 16ull << 20;
@@ -32,6 +34,25 @@ inline constexpr uint32_t kGcCheckMeshes = 64u;
 inline constexpr uint32_t kGcFormatNone = 0u, kGcFormatF32x2 = 1u, kGcFormatF32x3 = 2u, kGcFormatF32x4 = 3u,
                           kGcFormatF16x2 = 4u, kGcFormatF16x4 = 5u;
 inline constexpr uint32_t kGcNoUv = 0xFFFFFFFFu;  // GcDecodeParams uv_offset: the draw has no UV
+// G3: the GPU instance set (rt12/rt12_capture.hpp step 7b; world_gc_insert / world_gc_compact.cs_5_0.hlsl).
+inline constexpr uint32_t kGcSetCapacity = 65536u;               // set entries per half (power of two); set records at [0, n)
+inline constexpr uint32_t kGcMovingRecords = 8192u;              // per-present records of moving sightings, at [kGcSetCapacity, +n)
+inline constexpr uint32_t kGcSetMaxProbes = 32u;
+inline constexpr uint64_t kGcInstanceArenaBytes = 16ull << 20;    // instance slices copied at the draws of one present
+inline constexpr uint32_t kGcInstanceDrawsPerPresent = 16384u;
+inline constexpr float kGcPoseTranslationScale = 256.f;            // pose key grid: 1/256 m
+inline constexpr float kGcPoseBasisScale = 4096.f;                 // and 1/4096 per basis element
+inline constexpr uint32_t kGcCompareCpuSamples = 256u, kGcCompareGpuSamples = 32u;
+// Modes of world_gc_insert.cs_5_0.hlsl (GC_MODE_*); dispatched in the order clear, mark, rehash, insert.
+inline constexpr uint32_t kGcModeClear = 0u, kGcModeRehash = 1u, kGcModeMark = 2u, kGcModeInsert = 3u;
+// The 16 counters of one present (world_gc_instance.hlsli GC_COUNTER_*).
+inline constexpr uint32_t kGcCounterSet = 0u, kGcCounterInserted = 1u, kGcCounterHits = 2u, kGcCounterKept = 3u,
+                          kGcCounterAged = 4u, kGcCounterDroppedEpoch = 5u, kGcCounterDroppedMoving = 6u,
+                          kGcCounterMovingRecords = 7u, kGcCounterMovingHeld = 8u, kGcCounterInvalid = 9u,
+                          kGcCounterStaleEpoch = 10u, kGcCounterSetOverflow = 11u, kGcCounterRehashOverflow = 12u,
+                          kGcCounterMarked = 13u, kGcCounterSightings = 14u, kGcCounterCount = 16u;
+static_assert((kGcSetCapacity & (kGcSetCapacity - 1u)) == 0u, "the set probe mask needs a power of two");
+static_assert(kGcMaxEntries < (1u << 24), "a slot must be exact in a float (record header.x)");
 
 inline uint32_t GcFormatCode(reshade::api::format format) {
   switch (format) {
@@ -60,6 +81,7 @@ struct GcEntry {
   uint32_t min_vertex = 0u, max_vertex = 0u;
   uint32_t rewrites = 0u;
   uint32_t frame = 0u;
+  uint32_t slot = 0u;  // G3 mesh slot (D1)
 };
 
 struct GcJob {
@@ -82,12 +104,37 @@ struct GcDecoded {
   uint32_t vb_usage = 0u, vb_flags = 0u, ib_usage = 0u, ib_flags = 0u, pos_format = 0u, index_size = 0u;  // the check split
 };
 
+// One direct draw of a GPU-cache mesh in this present (world_gc_instance.hlsli GcInstanceDraw).
+struct GcInstanceDrawGPU {
+  uint32_t arena_float4 = 0u;  // its instance slice in the instance arena, in float4 units
+  uint32_t count = 0u;
+  uint32_t slot = 0u;
+  uint32_t epoch = 0u;         // slot_epoch[slot] at the draw
+  uint32_t pass_bits = 0u;     // kPoolPass* of the draw
+  uint32_t pad[3] = {};
+};
+static_assert(sizeof(GcInstanceDrawGPU) == 32u, "GcInstanceDrawGPU must match world_gc_instance.hlsli");
+// One entry of the instance set (world_gc_instance.hlsli GcSetEntry); tag, last_seen and flags are in the meta buffer.
+struct GcSetEntryGPU {
+  uint32_t slot = 0u, epoch = 0u, pose_lo = 0u, pose_hi = 0u;
+  float world[12] = {};
+};
+static_assert(sizeof(GcSetEntryGPU) == 64u, "GcSetEntryGPU must match world_gc_instance.hlsli");
+// The instance slice of a direct draw (OnPoolScanDraw).
+struct GcInstanceSource {
+  reshade::api::resource buffer = {0u};  // t15
+  int32_t base = 0;                      // CPU b1 base
+  uint32_t count = 0u;
+  uint8_t pass = 0u;                     // kPoolPass* bits
+};
+
 struct GcStats {
   uint64_t created = 0u, range_jobs = 0u, decode_jobs = 0u, decoded = 0u, deferred_skips = 0u, staging_full = 0u;
   uint64_t jobs_cap = 0u, cap_attempts = 0u, carrier_busy = 0u, carrier_full = 0u, stale_jobs = 0u, invalidated_write = 0u;
   uint64_t uv_stream_mismatch = 0u;  // a Data-phase draw bound another UV stream buffer than the entry's (skipped)
   uint64_t invalidated_destroy = 0u, resets_pool = 0u, resets_fragmented = 0u;
   uint64_t readback_busy = 0u;  // range jobs returned to Range: their readback slot was unread
+  uint64_t inst_draws = 0u, inst_instances = 0u, inst_no_geometry = 0u, inst_deferred = 0u, inst_arena_full = 0u, inst_draws_cap = 0u;  // G3 draw side (D2)
   std::map<std::string, uint64_t> refused;
   std::map<std::array<uint32_t, 4>, uint64_t> formats;  // pos code, uv code, index size, stride
   std::map<std::array<uint32_t, 4>, uint64_t> buffers;  // vb usage, vb flags, ib usage, ib flags
@@ -106,15 +153,31 @@ struct GpuCaptureState {
   std::vector<GcJob> range_jobs, decode_jobs;
   std::vector<uint64_t> invalidated;  // keys whose D3D12 geometry must be dropped at the next present
   GcStats stats;
+  // G3 (D1, D2).
+  reshade::api::resource instance_arena = {0u};  // D3D11 raw buffer, kGcInstanceArenaBytes
+  uint64_t instance_arena_used = 0u;
+  std::vector<GcInstanceDrawGPU> instance_draws;
+  uint32_t next_slot = 0u;
+  std::vector<uint32_t> free_slots;
+  std::vector<uint32_t> slot_epoch = std::vector<uint32_t>(kGcMaxEntries, 0u);
+  std::vector<uint64_t> slot_key = std::vector<uint64_t>(kGcMaxEntries, 0u);
+  bool epochs_dirty = true;
 };
 
 inline GpuCaptureState g_gpu_capture;
+
+// Caller holds g_gpu_capture.mutex. The slot's set entries and recorded draws become stale on the GPU (D1).
+inline void BumpGcSlotEpoch(uint32_t slot) {
+  g_gpu_capture.slot_epoch[slot] += 1u;
+  g_gpu_capture.epochs_dirty = true;
+}
 
 // Caller holds g_gpu_capture.mutex.
 inline void RefuseGpuCaptureEntry(GcEntry& entry, const char* reason) {
   entry.phase = GcPhase::Refused;
   entry.reason = reason;
   g_gpu_capture.stats.refused[reason] += 1u;
+  BumpGcSlotEpoch(entry.slot);
 }
 
 // The game wrote or destroyed a buffer of these keys (called from the pool's hooks, after its lock is released).
@@ -128,6 +191,9 @@ inline void InvalidateGpuCaptureKeys(const std::vector<uint64_t>& keys, bool des
     GcEntry& entry = it->second;
     const bool was_refused = entry.phase == GcPhase::Refused;
     if (destroyed) {
+      BumpGcSlotEpoch(entry.slot);
+      g.free_slots.push_back(entry.slot);
+      g.slot_key[entry.slot] = 0u;
       g.entries.erase(it);
       g.stats.invalidated_destroy += 1u;
     } else {
@@ -135,6 +201,7 @@ inline void InvalidateGpuCaptureKeys(const std::vector<uint64_t>& keys, bool des
       g.stats.invalidated_write += 1u;
       g.stats.rewritten_by_buffer[{entry.draw.vb_usage, entry.draw.vb_flags, entry.draw.ib_usage, entry.draw.ib_flags}] += 1u;
       entry.rewrites += 1u;
+      BumpGcSlotEpoch(entry.slot);
       if (entry.rewrites >= kGcMaxRewrites) {
         RefuseGpuCaptureEntry(entry, "rewritten");
       } else {
@@ -150,21 +217,30 @@ inline void InvalidateGpuCaptureKeys(const std::vector<uint64_t>& keys, bool des
 inline void ResetGpuCaptureEntries(const char* why) {
   GpuCaptureState& g = g_gpu_capture;
   std::lock_guard lock(g.mutex);
-  for (const auto& [mesh_key, entry] : g.entries) g.invalidated.push_back(mesh_key);
+  for (const auto& [mesh_key, entry] : g.entries) {
+    g.invalidated.push_back(mesh_key);
+    BumpGcSlotEpoch(entry.slot);
+  }
   g.entries.clear();
   g.range_jobs.clear();
   g.decode_jobs.clear();
+  g.instance_draws.clear();
+  g.instance_arena_used = 0u;
+  g.next_slot = 0u;
+  g.free_slots.clear();
+  std::fill(g.slot_key.begin(), g.slot_key.end(), 0u);
   if (std::strcmp(why, "pool reset") == 0) g.stats.resets_pool += 1u;
   if (std::strcmp(why, "fragmented") == 0) g.stats.resets_fragmented += 1u;
 }
 
 // Called from OnPoolScanDraw after its lock is released, for a direct draw whose buffers the pool tracks for this key.
 // Returns the copies issued. Copies only on the immediate context (a deferred draw serves none).
+// With `instances`, a draw of a Done entry also copies its instance slice into the G3 arena (D2).
 inline uint32_t GpuCaptureOnDraw(reshade::api::command_list* cmd_list, const DrawRecord& draw, uint64_t mesh_key,
-                                 const PoolUvStream& uv, bool deferred) {
+                                 const PoolUvStream& uv, bool deferred, const GcInstanceSource* instances = nullptr) {
   if (!g_gpu_capture.active.load(std::memory_order_relaxed) || mesh_key == 0u) return 0u;
   GpuCaptureState& g = g_gpu_capture;
-  std::array<PoolCopyCommand, 3> commands;
+  std::array<PoolCopyCommand, 4> commands;
   uint32_t count = 0u;
   {
     std::lock_guard lock(g.mutex);
@@ -196,6 +272,13 @@ inline uint32_t GpuCaptureOnDraw(reshade::api::command_list* cmd_list, const Dra
       created.generation = g.next_generation++;
       created.draw = draw;
       created.frame = g_state.frame.load();
+      if (g.free_slots.empty()) {
+        created.slot = g.next_slot++;
+      } else {
+        created.slot = g.free_slots.back();
+        g.free_slots.pop_back();
+      }
+      g.slot_key[created.slot] = mesh_key;
       reshade::api::format pos_format = reshade::api::format::unknown;
       reshade::api::format layout_uv_format = reshade::api::format::unknown;
       int32_t layout_uv_offset = -1;
@@ -286,6 +369,29 @@ inline uint32_t GpuCaptureOnDraw(reshade::api::command_list* cmd_list, const Dra
             g.stats.decode_jobs += 1u;
           }
         }
+      }
+    }
+    if (instances != nullptr) {
+      const uint64_t bytes = uint64_t{instances->count} * kPoolInstanceStride;
+      if (entry.phase != GcPhase::Done) {
+        g.stats.inst_no_geometry += 1u;
+      } else if (deferred) {
+        g.stats.inst_deferred += 1u;
+      } else if (g.instance_draws.size() >= kGcInstanceDrawsPerPresent) {
+        g.stats.inst_draws_cap += 1u;
+      } else if (g.instance_arena_used + bytes > kGcInstanceArenaBytes) {
+        g.stats.inst_arena_full += 1u;
+      } else {
+        g.instance_draws.push_back({.arena_float4 = static_cast<uint32_t>(g.instance_arena_used / 16u),
+                                    .count = instances->count,
+                                    .slot = entry.slot,
+                                    .epoch = g.slot_epoch[entry.slot],
+                                    .pass_bits = instances->pass});
+        commands[count++] = {instances->buffer, static_cast<uint64_t>(instances->base) * kPoolInstanceStride, g.instance_arena,
+                             g.instance_arena_used, bytes};
+        g.instance_arena_used += bytes;
+        g.stats.inst_draws += 1u;
+        g.stats.inst_instances += instances->count;
       }
     }
   }
@@ -497,6 +603,140 @@ inline GcCompareResult GcCompareTriangles(const float* gpu_vertices, uint32_t gp
       result.first = static_cast<int64_t>(t);
       std::memcpy(result.gpu, gpu, sizeof(gpu));
       std::memcpy(result.cpu, cpu, sizeof(cpu));
+    }
+  }
+  return result;
+}
+
+// Key of a pose in the GPU instance set (D5): the 12 world floats on a grid (translation 1/256 m, basis 1/4096; round half
+// to even, as HLSL round), FNV-style words with a leading word (the GPU mesh slot; the compare uses the CPU mesh id).
+// out[0] picks the probe start, out[1] | 1 is the tag. world_gc_insert.cs_5_0.hlsl must match.
+inline void GcPoseHash(uint32_t lead, const float* world, uint32_t out[2]) {
+  uint32_t h1 = 2166136261u;
+  uint32_t h2 = 0x9747B28Cu;
+  const auto mix = [&](uint32_t word) {
+    h1 = (h1 ^ word) * 16777619u;
+    h2 = (h2 ^ word) * 0x5BD1E995u;
+    h2 ^= h2 >> 15u;
+  };
+  mix(lead);
+  for (uint32_t i = 0u; i < 12u; ++i) {
+    const float scale = (i == 3u || i == 7u || i == 11u) ? kGcPoseTranslationScale : kGcPoseBasisScale;
+    mix(static_cast<uint32_t>(static_cast<int32_t>(std::nearbyint(world[i] * scale))));
+  }
+  h1 ^= h1 >> 16u;
+  h1 *= 0x85EBCA6Bu;
+  h1 ^= h1 >> 13u;
+  h1 *= 0xC2B2AE35u;
+  h1 ^= h1 >> 16u;
+  h2 ^= h2 >> 16u;
+  h2 *= 0x85EBCA6Bu;
+  h2 ^= h2 >> 13u;
+  h2 *= 0xC2B2AE35u;
+  h2 ^= h2 >> 16u;
+  out[0] = h1;
+  out[1] = h2;
+}
+
+struct GcCompareGpuInstance {
+  uint64_t mesh_key = 0u;
+  int64_t mesh_id = -1;             // CPU mesh of the key, -1 none
+  bool cpu_alpha_conflict = false;  // that CPU mesh has an alpha conflict (P-2)
+  float world[12] = {};
+  uint32_t flags = 0u;              // kInstance* (record visibility.z)
+};
+struct GcCompareCpuInstance {
+  uint64_t mesh_key = 0u;
+  uint32_t mesh_id = 0u;
+  float world[12] = {};
+  bool dynamic = false;        // follow instance (moving object)
+  bool recently_seen = false;  // observed within kPoolPruneAge frames
+  bool alpha = false;
+  uint32_t vs_hash = 0u;
+};
+struct GcInstanceCompare {
+  struct CpuOnly {
+    uint64_t mesh_key = 0u;
+    uint32_t mesh_id = 0u;
+    float translation[3] = {};
+    std::string reason;
+    bool alpha = false;
+    uint32_t vs_hash = 0u;
+  };
+  struct GpuOnly {
+    uint64_t mesh_key = 0u;
+    int64_t mesh_id = -1;
+    float translation[3] = {};
+    uint32_t flags = 0u;
+  };
+  bool run = false;
+  uint64_t set_count = 0u, moving_records = 0u, gpu_records = 0u, cpu_instances = 0u, matched = 0u, gpu_only = 0u;
+  uint64_t gpu_only_alpha = 0u, gpu_only_alpha_conflict = 0u, gpu_no_cpu_mesh = 0u, gpu_dup_content = 0u, cpu_dup = 0u;
+  uint64_t cpu_only = 0u, timeouts = 0u;
+  double wait_ms = 0.0;
+  std::map<std::string, uint64_t> cpu_only_by_reason;
+  std::vector<CpuOnly> cpu_only_samples;  // up to kGcCompareCpuSamples
+  std::vector<GpuOnly> gpu_only_samples;  // up to kGcCompareGpuSamples
+};
+
+// D10. `entry_reason`: per CPU mesh key with a G2 entry, "pending", "done" or "refused:<reason>" (absent = "no_entry").
+inline GcInstanceCompare GcCompareInstances(const std::vector<GcCompareGpuInstance>& gpu,
+                                            const std::vector<GcCompareCpuInstance>& cpu,
+                                            const std::unordered_map<uint64_t, std::string>& entry_reason) {
+  GcInstanceCompare result;
+  result.run = true;
+  result.gpu_records = gpu.size();
+  result.cpu_instances = cpu.size();
+  const auto key_of = [](uint32_t mesh_id, const float* world) {
+    uint32_t hash[2] = {};
+    GcPoseHash(mesh_id, world, hash);
+    return (uint64_t{hash[0]} << 32u) | hash[1];
+  };
+  std::unordered_set<uint64_t> gpu_keys;
+  for (const GcCompareGpuInstance& instance : gpu) {
+    if (instance.mesh_id < 0) {
+      result.gpu_no_cpu_mesh += 1u;
+      continue;
+    }
+    if (!gpu_keys.insert(key_of(static_cast<uint32_t>(instance.mesh_id), instance.world)).second) result.gpu_dup_content += 1u;
+  }
+  std::unordered_set<uint64_t> cpu_keys;
+  for (const GcCompareCpuInstance& instance : cpu) {
+    const uint64_t key = key_of(instance.mesh_id, instance.world);
+    if (!cpu_keys.insert(key).second) {
+      result.cpu_dup += 1u;
+      continue;
+    }
+    if (gpu_keys.count(key) != 0u) {
+      result.matched += 1u;
+      continue;
+    }
+    std::string reason = "dynamic";
+    if (!instance.dynamic) {
+      const auto it = entry_reason.find(instance.mesh_key);
+      reason = (it == entry_reason.end() ? std::string("no_entry") : it->second);
+      if (reason == "done" && !instance.recently_seen) reason = "done_unseen";
+    }
+    result.cpu_only += 1u;
+    result.cpu_only_by_reason[reason] += 1u;
+    if (result.cpu_only_samples.size() < kGcCompareCpuSamples) {
+      result.cpu_only_samples.push_back({.mesh_key = instance.mesh_key, .mesh_id = instance.mesh_id,
+                                         .translation = {instance.world[3], instance.world[7], instance.world[11]},
+                                         .reason = reason, .alpha = instance.alpha, .vs_hash = instance.vs_hash});
+    }
+  }
+  std::unordered_set<uint64_t> reported;
+  for (const GcCompareGpuInstance& instance : gpu) {
+    if (instance.mesh_id < 0) continue;
+    const uint64_t key = key_of(static_cast<uint32_t>(instance.mesh_id), instance.world);
+    if (cpu_keys.count(key) != 0u || !reported.insert(key).second) continue;
+    result.gpu_only += 1u;
+    if ((instance.flags & 16u) != 0u) result.gpu_only_alpha += 1u;  // kInstanceAlphaTested (bvh_resources.hpp)
+    if (instance.cpu_alpha_conflict) result.gpu_only_alpha_conflict += 1u;
+    if (result.gpu_only_samples.size() < kGcCompareGpuSamples) {
+      result.gpu_only_samples.push_back({.mesh_key = instance.mesh_key, .mesh_id = instance.mesh_id,
+                                         .translation = {instance.world[3], instance.world[7], instance.world[11]},
+                                         .flags = instance.flags});
     }
   }
   return result;

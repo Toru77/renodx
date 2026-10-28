@@ -729,6 +729,11 @@ inline bool DrawBvhPanel() {
   if (ImGui::Button("Check GPU geometry")) rt12::g_gc_check_requested.store(true, std::memory_order_relaxed);
   ImGui::SameLine();
   if (ImGui::Button("Dump GPU cache JSON")) rt12::g_gc_dump_requested.store(true, std::memory_order_relaxed);
+  ImGui::SameLine();
+  if (ImGui::Button("Compare GPU instances")) rt12::g_gc_compare_requested.store(true, std::memory_order_relaxed);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("%s", "Reads the GPU instance set back (waits at most 2 s) and counts matched, GPU-only and CPU-only instances against the CPU pool. Validation only.");
+  }
   rt12::Rt12GcPanel gc_panel;
   {
     std::lock_guard lock(rt12::g_gc_panel_mutex);
@@ -765,6 +770,48 @@ inline bool DrawBvhPanel() {
                     + ", uv size mismatch " + std::to_string(gc_panel.check.uv_size_mismatch) + ", wait " + wait + " ms";
   }
   ImGui::TextUnformatted(gc_check_line.c_str());
+  const uint32_t* inst = gc_panel.inst_counters;
+  const std::string gc_instance_line =
+      "GPU instances (last present): set " + std::to_string(inst[bvh::kGcCounterSet]) + " / " + std::to_string(bvh::kGcSetCapacity)
+      + ", moving " + std::to_string(inst[bvh::kGcCounterMovingRecords]) + " (held " + std::to_string(inst[bvh::kGcCounterMovingHeld])
+      + "), inserted " + std::to_string(inst[bvh::kGcCounterInserted]) + ", hits " + std::to_string(inst[bvh::kGcCounterHits])
+      + ", kept " + std::to_string(inst[bvh::kGcCounterKept]) + ", aged " + std::to_string(inst[bvh::kGcCounterAged])
+      + ", dropped " + std::to_string(inst[bvh::kGcCounterDroppedEpoch]) + " epoch / " + std::to_string(inst[bvh::kGcCounterDroppedMoving])
+      + " moving, invalid " + std::to_string(inst[bvh::kGcCounterInvalid]) + ", stale " + std::to_string(inst[bvh::kGcCounterStaleEpoch])
+      + ", overflow " + std::to_string(inst[bvh::kGcCounterSetOverflow]) + " set / " + std::to_string(inst[bvh::kGcCounterRehashOverflow])
+      + " rehash / "
+      + std::to_string(inst[bvh::kGcCounterMovingRecords] > bvh::kGcMovingRecords ? inst[bvh::kGcCounterMovingRecords] - bvh::kGcMovingRecords : 0u)
+      + " moving; draws " + std::to_string(gc_panel.stats.inst_draws) + " (no geometry " + std::to_string(gc_panel.stats.inst_no_geometry)
+      + ", deferred " + std::to_string(gc_panel.stats.inst_deferred) + ", arena full " + std::to_string(gc_panel.stats.inst_arena_full)
+      + ", cap " + std::to_string(gc_panel.stats.inst_draws_cap) + "), readback busy " + std::to_string(gc_panel.inst_readback_busy)
+      + ", D3D11 ms " + dxr_ms(static_cast<float>(gc_panel.inst_ms_sum), static_cast<uint32_t>(gc_panel.inst_ms_n));
+  ImGui::TextUnformatted(gc_instance_line.c_str());
+  std::string gc_compare_line = "Compare GPU instances: not run";
+  if (gc_panel.compare.run) {
+    const bvh::GcInstanceCompare& cmp = gc_panel.compare;
+    const auto count_of = [&cmp](const char* reason) {
+      const auto it = cmp.cpu_only_by_reason.find(reason);
+      return it == cmp.cpu_only_by_reason.end() ? uint64_t{0u} : it->second;
+    };
+    uint64_t refused = 0u;
+    for (const auto& [reason, count] : cmp.cpu_only_by_reason) {
+      if (reason.rfind("refused:", 0) == 0) refused += count;
+    }
+    const uint64_t done = count_of("done");
+    char pct[32] = {};
+    std::snprintf(pct, sizeof(pct), "%.1f", 100.0 * static_cast<double>(cmp.matched) / static_cast<double>((std::max)(uint64_t{1u}, cmp.matched + done)));
+    char wait[32] = {};
+    std::snprintf(wait, sizeof(wait), "%.1f", cmp.wait_ms);
+    gc_compare_line = "Compare GPU instances: CPU " + std::to_string(cmp.cpu_instances) + ", matched " + std::to_string(cmp.matched) + " ("
+                      + pct + "% of matched + done), GPU-only " + std::to_string(cmp.gpu_only) + " (alpha "
+                      + std::to_string(cmp.gpu_only_alpha) + ", conflict " + std::to_string(cmp.gpu_only_alpha_conflict) + "), no CPU mesh "
+                      + std::to_string(cmp.gpu_no_cpu_mesh) + ", CPU-only " + std::to_string(cmp.cpu_only) + ": done " + std::to_string(done)
+                      + ", done unseen " + std::to_string(count_of("done_unseen")) + ", dynamic " + std::to_string(count_of("dynamic"))
+                      + ", pending " + std::to_string(count_of("pending")) + ", refused " + std::to_string(refused) + ", no entry "
+                      + std::to_string(count_of("no_entry")) + "; set " + std::to_string(cmp.set_count) + ", wait " + wait + " ms";
+    if (cmp.timeouts != 0u) gc_compare_line += ", TIMEOUT";
+  }
+  ImGui::TextUnformatted(gc_compare_line.c_str());
   bool skip_noop = g_live_bvh.skip_noop.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Skip no-op TLAS rebuilds", &skip_noop)) {
     g_live_bvh.skip_noop.store(skip_noop, std::memory_order_relaxed);
