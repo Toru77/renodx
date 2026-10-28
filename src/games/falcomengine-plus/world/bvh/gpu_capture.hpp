@@ -50,6 +50,7 @@ inline constexpr uint32_t kGcMaterialRefreshPresents = 64u;  // G4 (D6): the mat
 // G4 (D6): the per-slot material word of the GPU records (world_gc_instance.hlsli GC_MATERIAL_*).
 inline constexpr uint32_t kGcMaterialSliceMask = 0x00FFFFFFu, kGcMaterialAlphaMesh = 0x20000000u,
                           kGcMaterialWithheld = 0x40000000u, kGcMaterialNoCpuMesh = 0x80000000u;
+inline constexpr uint32_t kGcPoolReduceStreak = 120u;  // G5: presents in a row with no blocker before the CPU pool is reduced
 // Modes of world_gc_insert.cs_5_0.hlsl (GC_MODE_*); dispatched in the order clear, mark, rehash, insert.
 inline constexpr uint32_t kGcModeClear = 0u, kGcModeRehash = 1u, kGcModeMark = 2u, kGcModeInsert = 3u;
 // The counters of one present (world_gc_instance.hlsli GC_COUNTER_*).
@@ -159,11 +160,36 @@ struct GcStats {
   uint32_t largest_vertex_range = 0u, largest_index_count = 0u;
 };
 
+// G5: what keeps the CPU pool full, gathered once per present by ApplyBvhInputs (bvh_debug.hpp).
+struct GcPoolReduceInputs {
+  bool switch_on = false;    // g_gpu_capture.reduce_pool
+  bool gc_owns = false;      // rt12::GcOwnsRtao(): cache and trace on
+  bool gc_active = false;    // g_gpu_capture.active
+  bool dxr_on = false;       // rt12::g_rt12_enabled
+  bool dxr_running = false;  // rt12::g_rt12 exists, not failed, not stuck
+  bool scene_ready = false;  // rt12::g_rt12_gc_scene.ready
+  bool rtao = false, rtgi = false, rtls = false, rt_sun = false;
+  bool debug_view = false;   // a BVH GPU debug view
+  bool pool_scan = false;    // the Pool Scan tick
+  bool discovery = false;    // RTAO Two-Sided discovery (always the compute pass)
+};
+
+// G5: the reduced-pool state (under g_gpu_capture.mutex).
+struct GcPoolReduceStats {
+  const char* full_reason = "switch_off";  // first blocker of the last present, "streak" while waiting, "" while reduced
+  uint32_t streak = 0u;                     // presents in a row with no blocker
+  uint64_t entered = 0u, left = 0u, reduced_presents = 0u, vanilla_frames = 0u;
+  std::map<std::string, uint64_t> left_by_reason;
+};
+
 struct GpuCaptureState {
   std::atomic<bool> enabled{false};  // the panel switch (session only, not saved)
   std::atomic<bool> active{false};   // set by the present side once its objects exist; every hook returns on !active
   std::atomic<bool> trace{true};              // G4: DXR RTAO traces the GPU scene while the cache is on (session only)
   std::atomic<bool> trace_no_cpu_mesh{true};  // G4: also trace slots whose key has no CPU mesh (session only, A/B)
+  std::atomic<bool> reduce_pool{true};        // G5: reduce the CPU pool while DXR RTAO is the only RT consumer (session only)
+  std::atomic<bool> pool_reduced{false};      // G5: set by UpdateGcPoolReduce; read by the draw hooks, UpdateLiveBvh and RTAO
+  std::atomic<bool> reduced_fallback{false};  // G5: an RTAO frame fell back while reduced (rtao::Dispatch); read at the next present
   std::mutex mutex;
   reshade::api::resource staging = {0u};  // D3D11 raw buffer, kGcStagingBytes
   uint64_t staging_used = 0u;             // bytes reserved in this present's copies
@@ -184,6 +210,7 @@ struct GpuCaptureState {
   std::unordered_map<uint64_t, const char*> no_entry_reason;  // G4-0 (0a): direct keys with no entry ("untracked", "cap"), at most kGcNoEntryKeys
   uint64_t slot_version = 0u;  // G4: bumped when a slot gets or loses its key
   bool settle_reset = false;   // G4 (D5): ResetGpuCaptureEntries ran; the present side clears its settle latch
+  GcPoolReduceStats pool_reduce;  // G5
 };
 
 inline GpuCaptureState g_gpu_capture;
@@ -276,6 +303,54 @@ inline uint32_t GcRecordsBound(const std::vector<uint32_t>& recent_out) {
   const uint64_t wanted = uint64_t{largest} + (std::max)(2048u, largest / 4u);
   const uint64_t aligned = (wanted + 1023u) & ~uint64_t{1023u};
   return static_cast<uint32_t>((std::min)(aligned, uint64_t{kGcSetCapacity} + kGcMovingRecords));
+}
+
+// G5: one present of the reduced CPU pool (ApplyBvhInputs; render thread, no lock held). Reduced after kGcPoolReduceStreak
+// presents in a row with no blocker; full again at the first present with one. Going full re-streams the pool as a map change
+// does (every schedule is due at the next frame). An RTAO fallback while reduced is a blocker and counts a vanilla frame.
+// Locks: g_gpu_capture.mutex, then g_pool.mutex, never nested; no graphics call.
+inline void UpdateGcPoolReduce(const GcPoolReduceInputs& in, uint32_t frame) {
+  const bool fallback = g_gpu_capture.reduced_fallback.exchange(false, std::memory_order_relaxed);
+  const char* blocker = !in.switch_on    ? "switch_off"
+                        : !in.gc_owns     ? "gc_off"
+                        : !in.dxr_on      ? "dxr_off"
+                        : !in.dxr_running ? "dxr_failed"
+                        : !in.gc_active   ? "gc_inactive"
+                        : !in.scene_ready ? "not_ready"
+                        : !in.rtao        ? "rtao_off"
+                        : in.rtgi         ? "rtgi"
+                        : in.rtls         ? "rtls"
+                        : in.rt_sun       ? "rt_sun"
+                        : in.debug_view   ? "debug_view"
+                        : in.pool_scan    ? "pool_scan"
+                        : in.discovery    ? "discovery"
+                        : fallback        ? "fallback"
+                                          : nullptr;
+  const bool was = g_gpu_capture.pool_reduced.load(std::memory_order_relaxed);
+  bool now = false;
+  uint32_t streak = 0u;
+  {
+    std::lock_guard lock(g_gpu_capture.mutex);
+    GcPoolReduceStats& st = g_gpu_capture.pool_reduce;
+    if (fallback && was) st.vanilla_frames += 1u;
+    st.streak = blocker != nullptr ? 0u : st.streak + 1u;
+    now = blocker == nullptr && (was || st.streak >= kGcPoolReduceStreak);
+    st.full_reason = now ? "" : (blocker != nullptr ? blocker : "streak");
+    if (now) st.reduced_presents += 1u;
+    if (now && !was) st.entered += 1u;
+    if (was && !now) {
+      st.left += 1u;
+      st.left_by_reason[blocker] += 1u;
+    }
+    streak = st.streak;
+  }
+  g_gpu_capture.pool_reduced.store(now, std::memory_order_relaxed);
+  if (was && !now) {
+    std::lock_guard lock(g_pool.mutex);
+    for (auto& [key, schedule] : g_pool.schedule) schedule.next_frame = frame + 1u;
+  }
+  if (now && !was) renodx::utils::log::i("[world-gc] pool reduced (after ", streak, " presents)");
+  if (was && !now) renodx::utils::log::i("[world-gc] pool full (", blocker, "): re-stream");
 }
 
 // Called from OnPoolScanDraw after its lock is released, for a direct draw whose buffers the pool tracks for this key.

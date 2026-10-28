@@ -5788,6 +5788,92 @@ static void TestGcRecordsBound() {
   CHECK(gc::GcRecordsBound({1000u, 9000u}) == 11264u, "the largest of the history counts");
 }
 
+static void TestGcPoolReduce() {
+  namespace gc = falcom_world::bvh;
+  Stage("gpu pool reduce");
+  const auto reset = [] {
+    gc::g_gpu_capture.pool_reduced.store(false);
+    gc::g_gpu_capture.reduced_fallback.store(false);
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    gc::g_gpu_capture.pool_reduce = {};
+  };
+  const auto stats = [] {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    return gc::g_gpu_capture.pool_reduce;
+  };
+  reset();
+  const gc::GcPoolReduceInputs ok = {.switch_on = true, .gc_owns = true, .gc_active = true, .dxr_on = true, .dxr_running = true,
+                                     .scene_ready = true, .rtao = true};
+  // a. Each blocker alone, in the order of the blocker chain.
+  struct BlockerCase {
+    const char* name;
+    bool gc::GcPoolReduceInputs::*field;
+    bool value;
+  };
+  const BlockerCase cases[] = {
+      {"switch_off", &gc::GcPoolReduceInputs::switch_on, false}, {"gc_off", &gc::GcPoolReduceInputs::gc_owns, false},
+      {"dxr_off", &gc::GcPoolReduceInputs::dxr_on, false},       {"dxr_failed", &gc::GcPoolReduceInputs::dxr_running, false},
+      {"gc_inactive", &gc::GcPoolReduceInputs::gc_active, false}, {"not_ready", &gc::GcPoolReduceInputs::scene_ready, false},
+      {"rtao_off", &gc::GcPoolReduceInputs::rtao, false},        {"rtgi", &gc::GcPoolReduceInputs::rtgi, true},
+      {"rtls", &gc::GcPoolReduceInputs::rtls, true},             {"rt_sun", &gc::GcPoolReduceInputs::rt_sun, true},
+      {"debug_view", &gc::GcPoolReduceInputs::debug_view, true}, {"pool_scan", &gc::GcPoolReduceInputs::pool_scan, true},
+      {"discovery", &gc::GcPoolReduceInputs::discovery, true},
+  };
+  for (const BlockerCase& c : cases) {
+    gc::GcPoolReduceInputs in = ok;
+    in.*(c.field) = c.value;
+    gc::UpdateGcPoolReduce(in, 100u);
+    const gc::GcPoolReduceStats st = stats();
+    CHECK(!gc::g_gpu_capture.pool_reduced.load() && std::strcmp(st.full_reason, c.name) == 0, "G5 blocker %s: full (%s)", c.name, st.full_reason);
+  }
+  {
+    gc::GcPoolReduceInputs in = ok;
+    in.dxr_on = false;
+    in.rtgi = true;
+    gc::UpdateGcPoolReduce(in, 100u);
+    CHECK(std::strcmp(stats().full_reason, "dxr_off") == 0, "G5 first blocker wins: dxr_off before rtgi (%s)", stats().full_reason);
+  }
+  // b. 120 presents in a row with no blocker: reduced at the 120th.
+  int streak_mismatch = 0;
+  for (uint32_t f = 101u; f <= 219u; ++f) {
+    gc::UpdateGcPoolReduce(ok, f);
+    streak_mismatch += (gc::g_gpu_capture.pool_reduced.load() || std::strcmp(stats().full_reason, "streak") != 0) ? 1 : 0;
+  }
+  CHECK(streak_mismatch == 0, "G5 streak: 119 presents not reduced, reason streak (%d mismatches)", streak_mismatch);
+  gc::UpdateGcPoolReduce(ok, 220u);
+  CHECK(gc::g_gpu_capture.pool_reduced.load() && stats().entered == 1u && std::strcmp(stats().full_reason, "") == 0,
+        "G5 streak: reduced at the 120th present (entered %llu)", (unsigned long long)stats().entered);
+  // c. A blocker leaves at once, re-streams every schedule (next_frame = frame + 1) and logs one leave.
+  {
+    std::lock_guard lock(gc::g_pool.mutex);
+    gc::g_pool.schedule[0x5005u].next_frame = 9999u;
+  }
+  gc::GcPoolReduceInputs rtgi_on = ok;
+  rtgi_on.rtgi = true;
+  gc::UpdateGcPoolReduce(rtgi_on, 500u);
+  gc::GcPoolReduceStats left_stats = stats();
+  {
+    std::lock_guard lock(gc::g_pool.mutex);
+    CHECK(!gc::g_gpu_capture.pool_reduced.load() && left_stats.left == 1u && left_stats.left_by_reason["rtgi"] == 1u && left_stats.streak == 0u
+              && gc::g_pool.schedule[0x5005u].next_frame == 501u,
+          "G5 leave: immediate, left 1 (rtgi), streak 0, next_frame 501 (%u)", gc::g_pool.schedule[0x5005u].next_frame);
+    gc::g_pool.schedule.erase(0x5005u);
+  }
+  // d. Re-entry needs the streak again; an RTAO fallback while reduced leaves with the reason "fallback" and counts a vanilla frame.
+  for (uint32_t f = 600u; f <= 719u; ++f) gc::UpdateGcPoolReduce(ok, f);
+  CHECK(gc::g_gpu_capture.pool_reduced.load(), "G5 re-entry: reduced after 120 presents again");
+  gc::g_gpu_capture.reduced_fallback.store(true);
+  gc::UpdateGcPoolReduce(ok, 800u);
+  CHECK(!gc::g_gpu_capture.pool_reduced.load() && stats().vanilla_frames == 1u && stats().left_by_reason["fallback"] == 1u
+            && !gc::g_gpu_capture.reduced_fallback.load(),
+        "G5 fallback: full, vanilla frames 1, left by fallback");
+  // e. A fallback while full is not a vanilla frame.
+  gc::g_gpu_capture.reduced_fallback.store(true);
+  gc::UpdateGcPoolReduce(ok, 801u);
+  CHECK(stats().vanilla_frames == 1u, "G5 fallback while full: vanilla frames still 1 (%llu)", (unsigned long long)stats().vanilla_frames);
+  reset();
+}
+
 int main() {
   falcom_world::g_state.pool_capture_requested.store(true);
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -6876,6 +6962,7 @@ int main() {
   TestGcInstanceHook(&dev);
   TestGcCompareInstances();
   TestGcRecordsBound();
+  TestGcPoolReduce();
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);

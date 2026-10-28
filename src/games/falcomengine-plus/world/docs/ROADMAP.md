@@ -88,6 +88,7 @@ R1b-0 (diagnostic, startup hook-off mask), implemented, not validated in game: `
 | GPU instance set G3 (validation only, not traced) | Owner test in Reference: GPU instance set (G3) | world/bvh/gpu_capture.hpp, world/rt12/rt12_capture.hpp, world/shaders/world_gc_instance.hlsli, world_gc_insert.cs_5_0.hlsl, world_gc_compact.cs_5_0.hlsl, world_instance_math.hlsli |
 | GPU instance set G3b (indirect draws; validation only, not traced) | Owner test in Reference: indirect draws in the GPU instance set (G3b) | world/bvh/bvh_pool.hpp, world/bvh/gpu_capture.hpp, world/shaders/world_gc_insert.cs_5_0.hlsl |
 | GPU scene on DXR RTAO G4 (sub-switch, default ON with the cache) | Owner test in Reference: GPU scene on DXR RTAO (G4) | world/rt12/rt12_backend.hpp, world/rt12/rt12_capture.hpp, world/bvh/gpu_capture.hpp, world/shaders/world_gc_*.hlsl* |
+| Reduced CPU pool G5 (switch, default ON, effective with the cache and trace on) | Owner test in Reference: Reduced CPU pool (G5) | world/bvh/gpu_capture.hpp, world/bvh/bvh_pool.hpp, world/bvh/bvh_live.hpp, world/bvh/bvh_debug.hpp, world/rtao/rtao.hpp, addon.cpp |
 
 ## Reference
 
@@ -478,6 +479,63 @@ Owner test (DevKit build; RTAO on, Trace characters on, P2b on, Performance Gath
 6. Session 1 exits with DXR, cache and trace ON. Session 2: cache OFF, ON, OFF, then DXR OFF and compute captures; exit.
 
 Pass: no crash or STUCK; `gpu_capture` frames only before `settled` and during loads; `bound misses` 0 after settle; GC-withheld rays within 1% and hits within 5% of M5 at both spots; differences of GC versus GC-withheld match `gpu_no_cpu_mesh_camera_by_distance` near buckets; `untraced` and alpha waiting small after settle. Frame time and GPU ms are reported for the planner.
+
+### Reduced CPU pool (G5): reference
+
+Switch: "Reduce the CPU pool (experimental)" (`bvh::g_gpu_capture.reduce_pool`, default ON, session only, not saved). Effective only
+while the G2 cache and "Trace the GPU scene" are on (`GcOwnsRtao()`), so with either off the code takes the G4 path.
+
+Goal: while DXR RTAO traces the GPU scene (G4) and nothing else ray traces, the CPU pool stops its per-draw instance work for direct
+draws (slice staging, observation, admission, P2b records, wind CB reads) and the CPU TLAS is not rebuilt or refitted. Mesh capture,
+buffer-key tracking, alpha sources, `SyncLiveMeshes`, `SyncLiveAlpha` and the indirect path (except the P2b record) keep running:
+the GPU path needs them. Characters on DXR come from deform live, untouched.
+
+Kept while reduced: the gate, alpha read, UV stream, slice resolve (GC instance copy), the pool lock, `NotePoolAlphaMaterial`, the
+mesh queue on the schedule cadence (`QueuePoolMesh` without staging), mesh copies, alpha source capture, the GC hooks, the drain,
+`SyncLiveMeshes`, `SyncLiveAlpha`, the whole indirect path except P2b.
+Removed while reduced: direct-draw slice staging and its resolve, observation and admission, P2b records (direct and indirect), wind
+CB reads for direct draws, the prevWorld trace, CPU TLAS rebuilds and refits.
+
+Blockers, first match wins (`full_reason`): `switch_off`, `gc_off`, `dxr_off`, `dxr_failed` (no DXR session, failed or stuck),
+`gc_inactive`, `not_ready` (GC scene not settled), `rtao_off`, `rtgi`, `rtls`, `rt_sun`, `debug_view`, `pool_scan`, `discovery`,
+`fallback`. Reduced after 120 presents in a row with no blocker (`streak`, `kGcPoolReduceStreak`). Leaving is immediate. Re-entry
+needs the streak again.
+
+Fallback (decision 8): a frame whose DXR pass falls back while reduced shows vanilla SSAO (RTAO reason `pool_reduced`, counted in
+`vanilla_frames`), and the next present turns the full pool back on (`fallback`). No compute trace while reduced.
+DXR session failure: the first present that sees no running session (`dxr_failed` or `dxr_off`) leaves at once. Lock order in
+`UpdateGcPoolReduce`: `g_gpu_capture.mutex` alone, then `g_pool.mutex` alone (every schedule's `next_frame = frame + 1`, a re-stream
+as at a map change), never nested, no graphics call.
+
+RTAO while reduced: the gate needs only `bvh_data != nullptr` (`RtBvhReady` is skipped) and the region is `CurrentPoolRegion()`.
+With the pool full, RTAO is HEAD's.
+
+Counters and names: `world_gc.json` `pool_reduce` {switch, state, full_reason, streak, streak_needed, entered, left,
+reduced_presents, vanilla_frames, left_by_reason}. RTAO panel `CPU pool: reduced ...` or `CPU pool: full (<reason>, streak n of 120)
+...`. RTAO reason `pool_reduced` in `frames_without_ao_by_reason`. Logs `[world-gc] pool reduced (after N presents)` and
+`[world-gc] pool full (<reason>): re-stream`.
+
+Re-enable stall (G2): G5 creates, destroys and reorders no graphics object. DXR or the cache off while reduced re-streams in the
+same frames as the teardown. Re-test: DXR off while reduced logs `pool full (dxr_off): re-stream` before `teardown (dxr off)`,
+no crash; the stall repro gives the same outcome with Reduce OFF and ON.
+
+"Compare GPU instances" is meaningful only with the pool full (the CPU instances are stale while reduced).
+
+Owner test (DevKit build; RTAO on, Trace characters on, P2b on, Performance Gather on, alpha foliage default). Precondition: G4 parity
+accepted (rerun B). Two sessions (village spot of the G4 compare; large outdoor area). Each: (1) DXR, cache, trace ON, Reduce
+unticked, stand still: Full captures (two 30 s Performance tests, RTAO Stats `world_rtao_full.json`, screenshot, RTAO Debug 1,
+`world_rt12_full.json`, `world_gc_full.json`). (2) Tick Reduce: `pool reduced (after 120 presents)` and `CPU pool: reduced` within
+about 2 s; same captures as `_reduced`. (3) Walk 60 s near moving objects, alpha foliage, NPCs: no flicker, `vanilla frames 0`,
+`left 0`. (4) Change map while reduced: stays reduced. (5) RTGI on: `pool full (rtgi)`, RTGI off: reduced again after about 2 s.
+(6) Cache OFF: `pool full (gc_off)`; cache ON: reduced again. (7) Exit; session 2: DXR OFF while reduced, compute captures.
+(8) Last: the G2 stall repro with Reduce ON. (9) Send perf files, all `world_rtao_*`, `world_rt12_*`, `world_gc_*`, screenshots and the
+`[world-gc]` and `[world-rt12]` log lines, with the CPU pool and DXR panel lines.
+
+Pass: (a) both Reduced runs at both spots have a lower mean frame time than both Full runs, with lower `pool_hooks`,
+`pool_drain_excl_capture`, `tlas_rebuild` and `present_bvh_cpu`; (b) RTAO parity with Full: rays within 1%, hits within 5%, Debug 1
+images match; (c) after `pool reduced`: `vanilla_frames` 0 and `left_by_reason` holds only the owner's toggles; rt12
+`fallback_frames` no higher than in the Full run; (d) no crash or STUCK; the stall step behaves as before G5. A smaller or
+unrepeatable gain goes to the planner with the perf rows.
 
 ## Open decisions
 

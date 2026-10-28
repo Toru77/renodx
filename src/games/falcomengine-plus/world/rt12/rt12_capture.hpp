@@ -985,6 +985,17 @@ inline void DumpGcJson(const Rt12GcState& gc) {
   out << "  \"hr\": " << static_cast<uint32_t>(p.hr) << ",\n";
   out << "  \"leaked\": " << (p.leaked ? "true" : "false") << ",\n";
   out << "  \"presents\": " << p.presents << ",\n";
+  bvh::GcPoolReduceStats reduce;  // G5
+  {
+    std::lock_guard lock(bvh::g_gpu_capture.mutex);
+    reduce = bvh::g_gpu_capture.pool_reduce;
+  }
+  out << "  \"pool_reduce\": {\"switch\": " << (bvh::g_gpu_capture.reduce_pool.load(std::memory_order_relaxed) ? "true" : "false")
+      << ", \"state\": \"" << (bvh::g_gpu_capture.pool_reduced.load(std::memory_order_relaxed) ? "reduced" : "full")
+      << "\", \"full_reason\": \"" << bvh::PoolJsonEscape(reduce.full_reason) << "\", \"streak\": " << reduce.streak
+      << ", \"streak_needed\": " << bvh::kGcPoolReduceStreak << ", \"entered\": " << reduce.entered << ", \"left\": " << reduce.left
+      << ", \"reduced_presents\": " << reduce.reduced_presents << ", \"vanilla_frames\": " << reduce.vanilla_frames
+      << ", \"left_by_reason\": " << GcCountsJson(reduce.left_by_reason) << "},\n";
   out << "  \"phases\": {\"range\": " << p.phase_counts[0] << ", \"range_wait\": " << p.phase_counts[1]
       << ", \"data\": " << p.phase_counts[2] << ", \"data_wait\": " << p.phase_counts[3] << ", \"done\": " << p.phase_counts[4]
       << ", \"refused\": " << p.phase_counts[5] << "},\n";

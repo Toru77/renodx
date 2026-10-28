@@ -61,6 +61,7 @@ enum class Reason : uint8_t {
   NoMotion,        // Temporal on but no usable motion: round-1 AO, history invalid (note)
   HistoryReset,    // Temporal history reset for one frame (note)
   FilterFailed,    // Spatial filter could not run: the unfiltered AO is used (note)
+  PoolReduced,     // G5: the DXR pass fell back while the CPU pool is reduced: vanilla SSAO this frame
 };
 
 inline const char* ReasonName(Reason reason) {
@@ -81,6 +82,7 @@ inline const char* ReasonName(Reason reason) {
     case Reason::NoMotion: return "no_motion";
     case Reason::HistoryReset: return "history_reset";
     case Reason::FilterFailed: return "filter_failed";
+    case Reason::PoolReduced: return "pool_reduced";
   }
   return "unknown";
 }
@@ -146,7 +148,7 @@ inline MotionCheck CheckMotionResources(uint64_t rcas_res, uint64_t rtv4_res) {
 }
 
 // Number of Reason codes (frames without AO are counted per code).
-inline constexpr size_t kReasonCount = 16u;
+inline constexpr size_t kReasonCount = 17u;
 
 // Names of the pass B diagnostics, in index order (stats index = kRtaoStatTemporalFBase + i).
 inline constexpr const char* kTemporalDiagnosticNames[16] = {

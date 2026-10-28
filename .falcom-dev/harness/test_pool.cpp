@@ -986,5 +986,39 @@ int main() {
     CHECK(present(1320u, true) == 1u, "grid frame 1320 with a rebuild: deferred (1)");
     CHECK(present(1321u, false) == 0u, "the pending pass runs on the next present without a rebuild");
   }
+  HStage("G5: reduced pool");
+  {
+    // Reduced: meshes are queued and captured on the schedule's cadence, no slice is staged, nothing is admitted.
+    // Leaving re-streams every schedule, and the instance is admitted as in the first stage.
+    bvh::g_pool.scan_active.store(true);
+    bvh::ResetWorldPool();
+    falcom_world::g_state.frame.store(2000u);
+    resource vb_r;
+    dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb_r);
+    fixture::WriteVertices(dev.res[vb_r.handle].bytes, fixture::Box(5.f));
+    objects.clear();
+    objects.push_back({"R reduced", vb_r.handle, 0, kRigid, kOpaque, {{300, 0, 0}}});
+    bvh::g_gpu_capture.pool_reduced.store(true);
+    for (int i = 0; i < 40; ++i) run_frame(frame++, false);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      CHECK(bvh::g_pool.meshes.size() == 1u, "G5 reduced: the mesh is captured (%zu)", bvh::g_pool.meshes.size());
+      CHECK(bvh::g_pool.instances.empty(), "G5 reduced: nothing admitted (%zu)", bvh::g_pool.instances.size());
+      CHECK(bvh::g_pool.stats.copied_draws == 0u, "G5 reduced: no slice staged (%llu)", (unsigned long long)bvh::g_pool.stats.copied_draws);
+    }
+    bvh::UpdateGcPoolReduce(bvh::GcPoolReduceInputs{}, falcom_world::g_state.frame.load());  // switch off: full, re-stream
+    CHECK(!bvh::g_gpu_capture.pool_reduced.load(), "G5: switch off turns the full pool back on");
+    for (int i = 0; i < 40; ++i) run_frame(frame++, false);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      CHECK(bvh::g_pool.instances.size() == 1u && bvh::g_pool.instances[0].matrix[3] == 300.f,
+            "G5 full again: the instance is admitted (%zu)", bvh::g_pool.instances.size());
+    }
+    bvh::g_gpu_capture.pool_reduced.store(false);
+    {
+      std::lock_guard lock(bvh::g_gpu_capture.mutex);
+      bvh::g_gpu_capture.pool_reduce = {};
+    }
+  }
   return g_failures == 0 ? 0 : 1;
 }

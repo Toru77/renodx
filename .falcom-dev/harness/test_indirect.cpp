@@ -341,6 +341,14 @@ int main() {
               "P2b indirect copy: args bytes in the arena");
       }
     }
+    // G5: a reduced pool records no P2b draw for an indirect draw.
+    bvh::g_gpu_capture.pool_reduced.store(true);
+    bvh::OnPoolScanIndirectDraw(&dev, &cl, draw, &cl_data, args, 0u, 1u, 20u);
+    bvh::g_gpu_capture.pool_reduced.store(false);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      CHECK(bvh::g_pool.dynamic_draws.size() == 1u, "G5: no P2b record while reduced (%zu)", bvh::g_pool.dynamic_draws.size());
+    }
     bvh::DrainPoolScan(&dev, &queue);
   }
 

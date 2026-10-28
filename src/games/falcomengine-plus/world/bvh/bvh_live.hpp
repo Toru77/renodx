@@ -2359,6 +2359,7 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
   }
   if (live_on) {
     const uint32_t frame = g_state.frame.load();
+    const bool reduced = g_gpu_capture.pool_reduced.load(std::memory_order_relaxed);  // G5: nothing traces the CPU TLAS; LiveTlasChange rebuilds it once the pool is full
     uint64_t revision = 0u;
     uint64_t visibility_revision = 0u;
     uint64_t dynamic_revision = 0u;
@@ -2402,7 +2403,7 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
     // Flag changes wait for the rebuild interval (up to 8 presents of latency: a short ghost or duplicate in the debug view and RTAO for a flag set); switch changes are immediate.
     // A skipped rebuild (RebuildLiveTlas) counts as a check: the next one keeps the cadence it would have had.
     const uint32_t last_tlas = (std::max)(data->live.tlas_frame, data->tlas_check_frame);
-    if (change != nullptr && frame >= data->tlas_retry_frame
+    if (!reduced && change != nullptr && frame >= data->tlas_retry_frame
         && (data->live.tlas_rebuilds == 0u || frame - last_tlas >= kLiveTlasInterval || frame < last_tlas
             || alpha_off_now || sway_switched || per_frame_switched || slack_switched)) {
       RebuildLiveTlas(device, cmd_list, data, region, frame, change, allow_slack);
@@ -2415,9 +2416,9 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
           data->tlas_sway_deferred = true;
         }
       }
-    } else if (data->tlas_built && frame >= data->tlas_retry_frame && data->tlas_refit_failed) {
+    } else if (!reduced && data->tlas_built && frame >= data->tlas_retry_frame && data->tlas_refit_failed) {
       RebuildLiveTlas(device, cmd_list, data, region, frame, "refit failed", false);
-    } else if (data->tlas_built && frame >= data->tlas_retry_frame && data->tlas_store_version == data->store_version
+    } else if (!reduced && data->tlas_built && frame >= data->tlas_retry_frame && data->tlas_store_version == data->store_version
                && (data->tlas_dynamic_revision != dynamic_revision || WindSwayPending(*data))) {
       if (data->tlas_refits_since_rebuild >= kLiveTlasRefitsPerRebuild) {
         RebuildLiveTlas(device, cmd_list, data, region, frame, "refit quality", false);
@@ -2446,7 +2447,7 @@ inline void RefitLiveTlasAfterDrain(reshade::api::device* device, reshade::api::
   // Read and cleared on every path: the flag is set by UpdateLiveBvh in this present only.
   const bool sway_deferred = data->tlas_sway_deferred;
   data->tlas_sway_deferred = false;
-  if (!g_live_bvh.enabled.load(std::memory_order_relaxed)) return;
+  if (!g_live_bvh.enabled.load(std::memory_order_relaxed) || g_gpu_capture.pool_reduced.load(std::memory_order_relaxed)) return;
   auto* cmd_list = queue->get_immediate_command_list();
   if (cmd_list == nullptr) return;
   const uint32_t frame = g_state.frame.load();

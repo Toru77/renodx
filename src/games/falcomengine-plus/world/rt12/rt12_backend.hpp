@@ -213,7 +213,7 @@ struct Rt12State {
   bool failed = false;
 };
 
-inline std::atomic<bool> g_rt12_enabled{false};  // the panel switch (session only, not saved)
+inline std::atomic<bool> g_rt12_enabled{true};  // the panel switch (session only, not saved)
 inline std::unique_ptr<Rt12State> g_rt12;        // one D3D11 device in this game
 
 struct Rt12Panel {  // copied under g_rt12_panel_mutex for the panel and the JSON; written on the render thread
@@ -1102,7 +1102,7 @@ inline void OnPresent(reshade::api::device* device) {
     return;
   }
   if (!g_rt12) {
-    CreateRt12(device);
+    if (rtao::RtaoRequested()) CreateRt12(device);
     return;
   }
   Rt12State& s = *g_rt12;

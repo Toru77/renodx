@@ -29,6 +29,22 @@ inline void DrawRtaoPanel() {
     ImGui::Text("Spatial filter: not run (%s)", frame.filter_failed ? "filter_failed" : "debug modes 1 to 7 bypass it");
   }
   ImGui::Text("Frames without AO: %llu", static_cast<unsigned long long>(frame.frames_without_ao));
+  {
+    bvh::GcPoolReduceStats reduce;  // G5
+    {
+      std::lock_guard lock(bvh::g_gpu_capture.mutex);
+      reduce = bvh::g_gpu_capture.pool_reduce;
+    }
+    if (bvh::g_gpu_capture.pool_reduced.load(std::memory_order_relaxed)) {
+      ImGui::Text("CPU pool: reduced (DXR traces the GPU scene); entered %llu, left %llu, vanilla frames %llu",
+                  static_cast<unsigned long long>(reduce.entered), static_cast<unsigned long long>(reduce.left),
+                  static_cast<unsigned long long>(reduce.vanilla_frames));
+    } else {
+      ImGui::Text("CPU pool: full (%s, streak %u of %u); entered %llu, left %llu, vanilla frames %llu", reduce.full_reason,
+                  reduce.streak, bvh::kGcPoolReduceStreak, static_cast<unsigned long long>(reduce.entered),
+                  static_cast<unsigned long long>(reduce.left), static_cast<unsigned long long>(reduce.vanilla_frames));
+    }
+  }
   if (frame.fade_valid) {
     ImGui::Text("Fade: effective start %.0f m, end %.0f m (requested %.0f / %.0f m, BVH range %.0f m; stored %.1f%% / %.1f%%)",
                 frame.fade.start, frame.fade.end, frame.fade.start_req, frame.fade.end_req, frame.fade.coverage,

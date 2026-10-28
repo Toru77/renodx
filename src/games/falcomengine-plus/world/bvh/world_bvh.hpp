@@ -747,6 +747,13 @@ inline bool DrawBvhPanel() {
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip("Session only. Off withholds GPU records whose mesh the CPU pool does not have (parity A/B with M5).");
   }
+  bool gc_reduce_pool = bvh::g_gpu_capture.reduce_pool.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Reduce the CPU pool (experimental)", &gc_reduce_pool)) {
+    bvh::g_gpu_capture.reduce_pool.store(gc_reduce_pool, std::memory_order_relaxed);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Session only. While DXR RTAO traces the GPU scene and no other RT effect, BVH debug view, Pool Scan or discovery is on, the CPU pool stops its per-draw instance staging and P2b records and the CPU TLAS is not rebuilt. A frame DXR cannot trace shows vanilla SSAO and turns the full pool back on (re-stream). Off: the full pool (G4). State in the RTAO panel.");
+  }
   rt12::Rt12GcPanel gc_panel;
   {
     std::lock_guard lock(rt12::g_gc_panel_mutex);

@@ -292,6 +292,22 @@ inline void ApplyBvhInputs() {
   g_state.rt_sun_cascades.store(
       rtsun_produced ? rtsun::RtSunEffectiveCascades(static_cast<int>(rtsun::g_rtsun_cascade_range), g_state.camera, rtsun::g_rtsun_frame.built_range) : 0,
       std::memory_order_relaxed);
+  // G5: reduce the CPU pool while DXR RTAO, tracing the GPU scene, is the only RT consumer.
+  const rt12::Rt12State* rt12_state = rt12::g_rt12.get();
+  UpdateGcPoolReduce(GcPoolReduceInputs{.switch_on = g_gpu_capture.reduce_pool.load(std::memory_order_relaxed),
+                                        .gc_owns = rt12::GcOwnsRtao(),
+                                        .gc_active = g_gpu_capture.active.load(std::memory_order_relaxed),
+                                        .dxr_on = rt12::g_rt12_enabled.load(std::memory_order_relaxed),
+                                        .dxr_running = rt12_state != nullptr && !rt12_state->failed && !rt12_state->stuck,
+                                        .scene_ready = rt12::g_rt12_gc_scene.ready,
+                                        .rtao = rtao::RtaoRequested(),
+                                        .rtgi = rtgi::g_rtgi_enabled > 0.5f,
+                                        .rtls = rtls::RtlsRequested(),
+                                        .rt_sun = rtsun::RtSunRequested(),
+                                        .debug_view = g_bvh_debug.mode.load(std::memory_order_relaxed) != 0,
+                                        .pool_scan = scan_setting,
+                                        .discovery = rtao::g_rtao_discovery > 0.5f},
+                     g_state.frame.load());
   RefreshPoolCaptureRequest();
 }
 

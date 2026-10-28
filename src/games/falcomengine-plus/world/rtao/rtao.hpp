@@ -107,6 +107,7 @@ struct RtaoDispatchInputs {
 struct RtaoDispatchResult {
   bool ok = false;           // pass A (and pass B when it ran) dispatched
   bool temporal_ran = false; // pass B ran; history was swapped
+  bool pool_reduced = false;  // G5: no AO: the DXR pass fell back while the CPU pool is reduced
 };
 
 // Null-array sizes: upper bounds of the SRV and UAV counts of every pass that calls NullComputeSlots (RTAO, RTGI and RTLS). 8 is the D3D11 compute UAV slot count.
@@ -258,6 +259,13 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
 #else
   const bool dxr_pass_a = false;
 #endif
+  if (!dxr_pass_a && bvh::g_gpu_capture.pool_reduced.load(std::memory_order_relaxed)) {
+    // G5 (decision 8): the CPU pool is reduced, so the compute pass would trace a stale scene. No AO this frame (vanilla
+    // SSAO); the next present turns the full pool back on (UpdateGcPoolReduce, "fallback").
+    bvh::g_gpu_capture.reduced_fallback.store(true, std::memory_order_relaxed);
+    bvh::EndGpuTimer(cmd_list, &data.timer);
+    return {.ok = false, .temporal_ran = false, .pool_reduced = true};
+  }
   if (!dxr_pass_a) {
     reshade::api::resource_view srvs[kRtaoSrvCount] = {};
     bvh::FillBvhSceneSrvs(*bvh_data, in.depth_view, in.dynamic, srvs);

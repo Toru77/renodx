@@ -8886,9 +8886,19 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   }
   auto& rd = rtao::GetRtaoDeviceData(dev);
   const auto* bvh_data = falcom_world::bvh::GetBvhDeviceData(dev);
-  if (!RtBvhReady(bvh_data, &frame.reason)) return;
+  // G5: with the CPU pool reduced, DXR traces the GPU scene and the CPU TLAS may be stale or empty: the region follows the camera.
+  const bool pool_reduced = falcom_world::bvh::g_gpu_capture.pool_reduced.load(std::memory_order_relaxed);
+  if (pool_reduced && bvh_data == nullptr) {
+    frame.reason = rtao::Reason::BvhNotReady;
+    return;
+  }
+  if (!pool_reduced && !RtBvhReady(bvh_data, &frame.reason)) return;
+  const falcom_world::bvh::PoolRegion camera_region = pool_reduced ? falcom_world::bvh::CurrentPoolRegion() : falcom_world::bvh::PoolRegion{};
+  const float region_range = pool_reduced ? camera_region.range : bvh_data->tlas_region_range;
+  const float region_size = pool_reduced ? camera_region.size : bvh_data->tlas_region_size;
+  const float* region_min = pool_reduced ? camera_region.min : bvh_data->tlas_region_min;
   const auto fade = rtao::RtaoEffectiveFade(
-      bvh_data->tlas_region_range, falcom_world::bvh::g_pool.region_size, rtao::g_rtao_fade_start_pct, rtao::g_rtao_fade_end_pct);
+      region_range, falcom_world::bvh::g_pool.region_size, rtao::g_rtao_fade_start_pct, rtao::g_rtao_fade_end_pct);
   frame.fade = fade;
   frame.fade_valid = true;
   if (fade.coverage < 1.f) {
@@ -8934,8 +8944,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
       {rtao::g_rtao_radius, rtao::g_rtao_ray_max, rtao::g_rtao_strength, rtao::g_rtao_normal_bias},
       {spp, isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed},
       {fade.start, fade.end, static_cast<float>(rtao_flags), 0.f},
-      {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
-       bvh_data->tlas_region_size},
+      {region_min[0], region_min[1], region_min[2], region_size},
       {0.f, 0.f, 0.f, 0.f},
   };
 
@@ -9018,7 +9027,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   rf.temporal_ran = result.temporal_ran;
   rf.temporal_last = temporal_on && result.temporal_ran;
   if (!result.ok) {
-    frame.reason = rtao::Reason::PipelineFailed;
+    frame.reason = result.pool_reduced ? rtao::Reason::PoolReduced : rtao::Reason::PipelineFailed;
     return;
   }
   // Temporal requested but pass B did not run: round-1 AO this frame, history invalid next frame.

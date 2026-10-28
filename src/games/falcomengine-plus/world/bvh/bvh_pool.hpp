@@ -4262,6 +4262,7 @@ inline void OnPoolScanDraw(
   if (device == nullptr || cmd_list == nullptr || cl_data == nullptr) return;
   PoolStageScope stage("direct draw: gate");
   const bool deferred = IsPoolDeferredList(cmd_list);
+  const bool reduced = g_gpu_capture.pool_reduced.load(std::memory_order_relaxed);  // G5: no slice staging, P2b record or wind read
 
   const PoolDrawGate gate = GatePoolDraw(draw, true);
   if (gate.wind_rest) {
@@ -4288,7 +4289,7 @@ inline void OnPoolScanDraw(
   }
 
   // Wind sway inputs as this draw reads them (CPU mirrors, no GPU work).
-  const bool wind_attempt = gate.wind_rest && skip == PoolSkip::None;
+  const bool wind_attempt = gate.wind_rest && skip == PoolSkip::None && !reduced;
   WindSwayParams wind;
   uint8_t wind_fail[2] = {};
   TrackedCbInfo wind_info[2];
@@ -4310,7 +4311,7 @@ inline void OnPoolScanDraw(
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     if (gate.alpha_material) NotePoolAlphaMaterial(PoolMeshKey(draw), alpha_material, vbs_known ? &vbs : nullptr);
     if (wind_read) g_pool.wind_sway[mesh_key] = wind;
-    if (gate.wind_rest && skip == PoolSkip::None && !wind_read) g_pool.stats.wind_sway_unread += 1u;
+    if (gate.wind_rest && skip == PoolSkip::None && !wind_read && !reduced) g_pool.stats.wind_sway_unread += 1u;
     if (gate.vs_class == contract::VsClass::Wind) {
       PoolWindDraws& tally = g_pool.stats.wind_direct;
       tally.draws += 1u;
@@ -4333,7 +4334,18 @@ inline void OnPoolScanDraw(
     family.vs_class = static_cast<uint8_t>(gate.vs_class);
     family.draws += 1u;
 
-    if (skip == PoolSkip::None) {
+    if (skip == PoolSkip::None && reduced) {
+      // G5: the mesh is queued on the schedule's cadence (ReservePoolCopy's cooldown rule); no slice is staged.
+      PoolSchedule& schedule = g_pool.schedule[PoolScheduleKey(mesh_key, draw.first_instance, count)];
+      if (schedule.next_frame != 0u && schedule.copy_frame != frame && frame < schedule.next_frame) {
+        skip = PoolSkip::Cooldown;
+      } else {
+        schedule.copy_frame = frame;
+        schedule.next_frame = frame + kPoolRecaptureFrames;
+        QueuePoolMesh(mesh_key, draw.vs_hash, draw, false, uv);
+        queued = true;
+      }
+    } else if (skip == PoolSkip::None) {
       const uint64_t schedule_key = PoolScheduleKey(mesh_key, draw.first_instance, count);
       const auto known_schedule = g_pool.schedule.find(schedule_key);
       const bool follow = (gate.pass & kPoolPassCamera) != 0u && known_schedule != g_pool.schedule.end()
@@ -4486,6 +4498,7 @@ inline void OnPoolScanIndirectDraw(
       static_cast<uint32_t>((std::min)(static_cast<uint64_t>(kPoolIndirectWindow), slice.available));
   if (skip == PoolSkip::None && max_window == 0u) skip = PoolSkip::SliceRange;
   const bool gc_active = g_gpu_capture.active.load(std::memory_order_relaxed);
+  const bool reduced = g_gpu_capture.pool_reduced.load(std::memory_order_relaxed);  // G5: no P2b record
   uint64_t args_size = 0u;
   bool args_uav = false;
   stage.Set("indirect draw: args size");
@@ -4573,7 +4586,7 @@ inline void OnPoolScanIndirectDraw(
       }
       const uint64_t bytes =
           kPoolCbCopyBytes + kPoolIndirectArgsBytes + static_cast<uint64_t>(window) * kPoolInstanceStride;
-      if (sub_skip == PoolSkip::None
+      if (sub_skip == PoolSkip::None && !reduced
           && RecordPoolDynamicDraw(dynamic_key, draw, gate.pass, true, deferred, slice.base, window, sub_args_offset,
                                    &dynamic_copies[dynamic_count])) {
         dynamic_count += 1u;
