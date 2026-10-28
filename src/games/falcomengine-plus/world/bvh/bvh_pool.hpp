@@ -1286,19 +1286,6 @@ struct PoolPrevTrace {
   std::array<Key, kPoolTraceKeys> keys = {};
 };
 
-// Adds the CPU time of its scope to total_us (steady_clock, microseconds).
-struct PoolCpuTimer {
-  std::atomic_uint64_t* total_us;
-  const bool armed = g_perf_gate.gather.load(std::memory_order_relaxed);
-  std::chrono::steady_clock::time_point start = armed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-  ~PoolCpuTimer() {
-    if (!armed) return;
-    total_us->fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                                  std::chrono::steady_clock::now() - start).count()),
-                        std::memory_order_relaxed);
-  }
-};
-
 // One pool instance whose bounds the inspect pixel's ray crosses (DescribeLiveCandidates), nearest first.
 struct PoolInspectCandidate {
   uint64_t instance_id = 0u;
@@ -1448,7 +1435,7 @@ struct PoolState {
   std::vector<uint32_t> orphan_seen;     // RetirePoolOrphans scratch: PoolInstanceLastSeen per instance
   uint32_t lifecycle_lines_logged = 0u;  // per session
   std::vector<std::string> pending_lines;  // flagged-moving lines, logged by the present block
-  // CPU time of the pool hooks and of DrainPoolScan (PoolCpuTimer): accumulated during a frame,
+  // CPU time of the pool hooks and of DrainPoolScan (PoolCpuTimer, nanoseconds): accumulated during a frame,
   // moved to the *_frame_us values (last frame) by SamplePerfPresent.
   std::atomic_uint64_t cpu_hook_us{0u};
   std::atomic_uint64_t cpu_drain_us{0u};
@@ -4743,6 +4730,7 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
 // own calls; the pool never makes graphics calls under its lock, so this
 // cannot re-enter it.
 inline void NotePoolBufferWrite(uint64_t handle) {
+  const PoolCpuTimer write_timer{&g_perf_gate.block_us[kPerfBlockPoolWriteHooks]};
   if (handle == 0u || !PoolBloomTest(handle)) return;
   g_pool.write_events.tracked.fetch_add(1u, std::memory_order_relaxed);
   std::vector<uint64_t> gc_keys;

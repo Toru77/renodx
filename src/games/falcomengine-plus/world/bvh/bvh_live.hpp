@@ -2502,6 +2502,20 @@ inline std::chrono::steady_clock::time_point SamplePerfPresent(reshade::api::dev
     g_pool.cpu_drain_frame_us = g_pool.cpu_drain_us.exchange(0u);
     g_pool.cpu_capture_frame_us = g_pool.cpu_capture_us.exchange(0u);
     g_deform_live.cpu_frame_us = g_deform_live.cpu_us.exchange(0u);
+    g_perf_gate.hook_draws_frame = g_perf_gate.hook_draws.exchange(0u);
+    g_perf_gate.hook_draws_indirect_frame = g_perf_gate.hook_draws_indirect.exchange(0u);
+    g_perf_gate.hook_draws_unconsumed_frame = g_perf_gate.hook_draws_unconsumed.exchange(0u);
+    g_perf_gate.record_mismatch_rtv0_frame = g_perf_gate.record_mismatch_rtv0.exchange(0u);
+    g_perf_gate.record_mismatch_dsv_frame = g_perf_gate.record_mismatch_dsv.exchange(0u);
+    g_perf_gate.record_mismatch_topology_frame = g_perf_gate.record_mismatch_topology.exchange(0u);
+    g_perf_gate.record_mismatch_input_layout_frame = g_perf_gate.record_mismatch_input_layout.exchange(0u);
+    g_perf_gate.record_mismatch_has_viewport_frame = g_perf_gate.record_mismatch_has_viewport.exchange(0u);
+    g_perf_gate.record_mismatch_viewport_frame = g_perf_gate.record_mismatch_viewport.exchange(0u);
+    g_perf_gate.record_mismatch_blend_enable_frame = g_perf_gate.record_mismatch_blend_enable.exchange(0u);
+    g_perf_gate.record_mismatch_depth_enable_frame = g_perf_gate.record_mismatch_depth_enable.exchange(0u);
+    g_perf_gate.record_mismatch_depth_write_frame = g_perf_gate.record_mismatch_depth_write.exchange(0u);
+    g_perf_gate.record_mismatch_cull_mode_frame = g_perf_gate.record_mismatch_cull_mode.exchange(0u);
+    g_perf_gate.record_mismatch_front_counter_clockwise_frame = g_perf_gate.record_mismatch_front_counter_clockwise.exchange(0u);
     PerfCounters counters;
     {
       std::lock_guard<std::mutex> lock(g_pool.mutex);
@@ -2642,7 +2656,7 @@ inline void UpdateCacheDiag(reshade::api::device* device, std::chrono::steady_cl
   CacheWork delta;  // BLAS counters are cleared by a device destroy (now < previous: the delta is now)
   delta.blas_builds = blas_builds < d.prev.blas_builds ? blas_builds : blas_builds - d.prev.blas_builds;
   delta.blas_ms = blas_ms < d.prev.blas_ms ? blas_ms : blas_ms - d.prev.blas_ms;
-  delta.capture_ms = static_cast<float>(g_pool.cpu_capture_frame_us.load(std::memory_order_relaxed)) / 1000.f;
+  delta.capture_ms = static_cast<float>(g_pool.cpu_capture_frame_us.load(std::memory_order_relaxed)) / 1000000.f;
   delta.capture_meshes = resight.capture_meshes - d.prev.capture_meshes;
   delta.capture_wait_sum = resight.capture_wait_sum - d.prev.capture_wait_sum;
   d.prev.blas_builds = blas_builds;

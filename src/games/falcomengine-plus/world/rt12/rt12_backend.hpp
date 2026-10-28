@@ -1553,6 +1553,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   // 12. Signal A (the D3D11 pack is ordered before it), flushed.
   uint64_t a = renodx::utils::gpu_fence::NO_SIGNAL;
   try {
+    const bvh::PoolCpuTimer flush_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockRt12SignalFlush]};
     a = renodx::utils::gpu_fence::QueueSignal(s.ctx11.Get(), s.fence11.get());
     s.ctx11->Flush();
   } catch (const std::exception&) {
@@ -2120,6 +2121,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
 
   // 13.8 Ordering: wait for the D3D11 signal A, then for the previous D3D12 submission; execute; signal B.
   // Nothing was executed when a wait fails (the compute pass A runs this frame).
+  const auto submit_start = bvh::PerfNow();
   bool ordered = false;
   try {
     ordered = renodx::utils::gpu_fence::QueueWait(s.queue12.Get(), s.fence11.get(), a);
@@ -2145,6 +2147,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     FailSession(s, Rt12Reason::SubmitFailed, "lighting signal");
     return RtFallback(Rt12Reason::SubmitFailed);
   }
+  bvh::AddPerfBlockMs(bvh::kPerfBlockRt12Submit, bvh::LiveElapsedMs(submit_start));
 
   // 13.9 Bookkeeping.
   L.fence_value = b;
@@ -2195,6 +2198,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   // 14. The D3D11 side waits for B (GPU wait, no CPU wait) before the resolve.
   bool waited = false;
   try {
+    const bvh::PoolCpuTimer wait_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockRt12WaitB]};
     waited = renodx::utils::gpu_fence::QueueWait(s.ctx11.Get(), s.fence12.get(), b);
   } catch (const std::exception&) {
     waited = false;

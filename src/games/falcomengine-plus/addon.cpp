@@ -8869,6 +8869,7 @@ static void PushRtaoAo(reshade::api::command_list* cmd_list, reshade::api::resou
 }
 
 static void RunRtaoInline(reshade::api::command_list* cmd_list) {
+  const falcom_world::bvh::PoolCpuTimer inline_timer{&falcom_world::bvh::g_perf_gate.block_us[falcom_world::bvh::kPerfBlockRtaoInline]};
   namespace rtao = falcom_world::rtao;
   shader_injection.rtao_debug_show = 0.f;  // set again by PushRtaoAo when RTAO produces this frame
   shader_injection.rtao_ao_bound = 0.f;
@@ -9735,6 +9736,13 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   shader_injection.gtvbao_debug_mode = shader_injection.gtvbao_debug_view;
   shader_injection.foliage_debug_mode = shader_injection.debug_show_env_sss;
 
+  namespace perf = falcom_world::bvh;
+  const bool perf_immediate = reinterpret_cast<uint64_t>(cmd_list) == perf::g_pool.immediate_cmd_list.load(std::memory_order_relaxed);
+  const auto rt_start = perf::PerfNow();
+  if (perf_immediate && !perf::g_perf_gate.rt_seen) {
+    perf::AddPerfBlockMs(perf::kPerfBlockSegToRt, perf::LiveElapsedMs(perf::g_perf_gate.frame_start));
+    perf::g_perf_gate.rt_seen = true;
+  }
   // RT dispatches null most compute slots and rebind their own. Snapshot the game's compute state
   // once here and restore it after RTGI: the engine's volumetric-fog compute reads those bindings.
   std::optional<renodx::utils::state::CommandListSnapshot> game_compute_state;
@@ -9755,6 +9763,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   if (game_compute_state) {
     game_compute_state->ApplyCompute(true);
   }
+  perf::AddPerfBlockMs(perf::kPerfBlockLightingRt, perf::LiveElapsedMs(rt_start));
+  if (perf_immediate) perf::g_perf_gate.rt_end = perf::PerfNow();
 
   // Contact / Micro Shadows. Placed here, before the GTVBAO/DynCube early-out
   // below, because those two are entirely independent of the shadow passes: on a

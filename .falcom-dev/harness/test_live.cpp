@@ -1374,12 +1374,12 @@ static void TestCacheEpisodeWork() {
 static void TestCacheCaptureTime(Device* dev) {
   bvh::ResetCacheDiagCounters();
   bvh::g_cache_diag.enabled.store(true);
-  bvh::g_pool.cpu_capture_frame_us.store(2500u);
+  bvh::g_pool.cpu_capture_frame_us.store(2500000u);
   bvh::UpdateCacheDiag(dev);
   {
     std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
-    CHECK(bvh::g_cache_diag.data.work.capture_ms == 2.5f && bvh::g_pool.cpu_capture_frame_us.load() == 2500u,
-          "2500 us of capture CPU (the drain's frame value) gives 2.5 ms (%.3f ms)", (double)bvh::g_cache_diag.data.work.capture_ms);
+    CHECK(bvh::g_cache_diag.data.work.capture_ms == 2.5f && bvh::g_pool.cpu_capture_frame_us.load() == 2500000u,
+          "2500000 ns of capture CPU (the drain's frame value) gives 2.5 ms (%.3f ms)", (double)bvh::g_cache_diag.data.work.capture_ms);
   }
   bvh::g_pool.cpu_capture_frame_us.store(0u);
   bvh::ResetCacheDiagCounters();
@@ -1550,7 +1550,7 @@ static void PerfPresentCosts(bvh::BvhDeviceData* data) {
   data->live.blas_builds += 1u;
   data->trace_timer.ms_sum += 2.0;
   data->trace_timer.samples += 1u;
-  bvh::g_pool.cpu_hook_frame_us = 250u;
+  bvh::g_pool.cpu_hook_frame_us = 250000u;
 }
 
 // Refused while active, while a map change is swept, and during the refill; allowed 400 presents after the episode start.
@@ -4028,8 +4028,8 @@ static void TestPerfTimerGate() {
 static void TestPerfCaptureInDrain(Device* dev) {
   bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
   bvh::g_perf_gate.gather.store(true);
-  bvh::g_pool.cpu_drain_frame_us.store(5000u);
-  bvh::g_pool.cpu_capture_frame_us.store(2000u);
+  bvh::g_pool.cpu_drain_frame_us.store(5000000u);
+  bvh::g_pool.cpu_capture_frame_us.store(2000000u);
   bvh::g_pool.cpu_hook_frame_us.store(0u);
   bvh::g_deform_live.cpu_frame_us.store(0u);
   bvh::PerfCounters c;
@@ -4057,7 +4057,7 @@ static void TestPerfSampleAlignment(Device* dev) {
   bvh::g_perf_gate.gather.store(true);
   ResetPerfTab();
   bvh::SamplePerfPresent(dev);  // primes
-  bvh::g_perf_gate.present_world_us.fetch_add(10000u);  // 10 ms inside present N
+  bvh::g_perf_gate.present_world_us.fetch_add(10000000u);  // 10 ms inside present N
   bvh::SamplePerfPresent(dev);  // start of N+1: the sample of N
   CHECK(Near(static_cast<float>(PerfTabNow().now[bvh::kPerfPresentWorldCpu]), 10.f, 1e-4f),
         "a 10 ms block in present N is in N's sample (%.4f)", PerfTabNow().now[bvh::kPerfPresentWorldCpu]);
@@ -4086,7 +4086,7 @@ static void TestPerfBlockGate() {
   }
   const uint64_t sync = bvh::g_perf_gate.block_us[bvh::kPerfBlockSyncMeshes].load();
   const uint64_t diag = bvh::g_perf_gate.block_us[bvh::kPerfBlockCacheDiag].load();
-  CHECK(sync == 2000u && diag >= 1000u, "gathering on: AddPerfBlockMs adds 2 ms and the scope adds its time (%llu, %llu us)",
+  CHECK(sync == 2000000u && diag >= 1000000u, "gathering on: AddPerfBlockMs adds 2 ms and the scope adds its time (%llu, %llu ns)",
         (unsigned long long)sync, (unsigned long long)diag);
   for (auto& us : bvh::g_perf_gate.block_us) us.store(0u);
 }
@@ -4209,7 +4209,7 @@ static void TestPerfWorstPresent(Device* dev) {
     ++k;
     if (k == 100) {
       bvh::AddPerfBlockMs(bvh::kPerfBlockResolveIndirect, 10.0);
-      bvh::g_perf_gate.present_world_us.fetch_add(14000u);
+      bvh::g_perf_gate.present_world_us.fetch_add(14000000u);
     }
     if (k == 200) {
       bvh::AddPerfBlockMs(bvh::kPerfBlockSyncMeshes, 2.5);
@@ -4282,7 +4282,7 @@ static void TestPerfSettingsCost(Device* dev) {
   int k = 0;
   while (bvh::g_perf.active.load() && k < 12000) {
     ++k;
-    bvh::g_perf_gate.alpha_sync_us.fetch_add(1000u);
+    bvh::g_perf_gate.alpha_sync_us.fetch_add(1000000u);
     data->alpha.timer.ms_sum += 0.5;
     data->alpha.timer.samples += 1u;
     if (k == 100) bvh::AddPerfBlockMs(bvh::kPerfBlockP2bRecord, 4.0);

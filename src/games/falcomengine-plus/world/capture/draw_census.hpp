@@ -88,18 +88,82 @@ inline bool LayoutHasSkinInputs(const reshade::api::pipeline& input_layout) {
   return has_skin;
 }
 
-inline void FillCommonDrawRecord(
-    DrawRecord* record,
-    reshade::api::command_list* cmd_list,
-    reshade::api::device* device) {
-  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
-  if (shader_state != nullptr) {
-    record->vs_hash = renodx::utils::shader::GetCurrentVertexShaderHash(shader_state);
-    record->ps_hash = renodx::utils::shader::GetCurrentPixelShaderHash(shader_state);
-    record->vs_pipeline = shader_state->stage_states[renodx::utils::shader::VERTEX_INDEX].pipeline.handle;
-    record->ps_pipeline = shader_state->stage_states[renodx::utils::shader::PIXEL_INDEX].pipeline.handle;
+// Render state read straight from the D3D11 context (M1). The handles are the native state objects, the keys of StateMaps.
+inline void FillRenderStateFromNative(DrawRecord* record, reshade::api::command_list* cmd_list) {
+  auto* native = reinterpret_cast<ID3D11DeviceContext*>(static_cast<uintptr_t>(cmd_list->get_native()));
+
+  ID3D11RenderTargetView* rtv = nullptr;
+  ID3D11DepthStencilView* dsv = nullptr;
+  native->OMGetRenderTargets(1u, &rtv, &dsv);
+  record->rtv0 = {reinterpret_cast<uintptr_t>(rtv)};
+  record->dsv = {reinterpret_cast<uintptr_t>(dsv)};
+  if (rtv != nullptr) rtv->Release();
+  if (dsv != nullptr) dsv->Release();
+
+  D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  native->IAGetPrimitiveTopology(&topology);
+  record->topology = static_cast<reshade::api::primitive_topology>(topology);
+
+  std::array<D3D11_VIEWPORT, D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports = {};
+  UINT viewport_count = static_cast<UINT>(viewports.size());
+  native->RSGetViewports(&viewport_count, viewports.data());
+  if (viewport_count != 0u) {
+    const auto& viewport = viewports[0];
+    record->viewport = {static_cast<float>(viewport.TopLeftX), static_cast<float>(viewport.TopLeftY),
+                        static_cast<float>(viewport.Width), static_cast<float>(viewport.Height),
+                        viewport.MinDepth, viewport.MaxDepth};
+    record->has_viewport = true;
   }
 
+  ID3D11InputLayout* input_layout = nullptr;
+  native->IAGetInputLayout(&input_layout);
+  record->input_layout = {reinterpret_cast<uintptr_t>(input_layout)};
+  if (input_layout != nullptr) input_layout->Release();
+
+  ID3D11BlendState* blend_state = nullptr;
+  FLOAT blend_factor[4] = {};
+  UINT sample_mask = 0u;
+  native->OMGetBlendState(&blend_state, blend_factor, &sample_mask);
+  if (blend_state != nullptr) {
+    reshade::api::blend_desc desc = {};
+    if (GetBlendDesc(reinterpret_cast<uintptr_t>(blend_state), &desc)) record->blend_enable = desc.blend_enable[0];
+    blend_state->Release();
+  }
+
+  ID3D11DepthStencilState* depth_state = nullptr;
+  UINT stencil_ref = 0u;
+  native->OMGetDepthStencilState(&depth_state, &stencil_ref);
+  if (depth_state != nullptr) {
+    reshade::api::depth_stencil_desc desc = {};
+    if (GetDepthStencilDesc(reinterpret_cast<uintptr_t>(depth_state), &desc)) {
+      record->depth_enable = desc.depth_enable;
+      record->depth_write = desc.depth_write_mask;
+    } else {
+      // D3D11 default depth-stencil state: test on, write all.
+      record->depth_enable = true;
+      record->depth_write = true;
+    }
+    depth_state->Release();
+  } else {
+    // D3D11 default depth-stencil state: test on, write all.
+    record->depth_enable = true;
+    record->depth_write = true;
+  }
+
+  ID3D11RasterizerState* rasterizer_state = nullptr;
+  native->RSGetState(&rasterizer_state);
+  if (rasterizer_state != nullptr) {
+    reshade::api::rasterizer_desc desc = {};
+    if (GetRasterizerDesc(reinterpret_cast<uintptr_t>(rasterizer_state), &desc)) {
+      record->cull_mode = static_cast<uint32_t>(desc.cull_mode);
+      record->front_counter_clockwise = desc.front_counter_clockwise;
+    }
+    rasterizer_state->Release();
+  }
+}
+
+// Render state from the framework's tracked snapshot. Used only by the sampled parity check in FillCommonDrawRecord.
+inline void FillRenderStateFromFramework(DrawRecord* record, reshade::api::command_list* cmd_list) {
   auto* render_state = renodx::utils::state::GetCurrentState(cmd_list);
   if (render_state != nullptr) {
     if (!render_state->render_targets.empty()) record->rtv0 = render_state->render_targets[0];
@@ -138,9 +202,48 @@ inline void FillCommonDrawRecord(
       }
     }
   }
+}
 
+inline void FillCommonDrawRecord(
+    DrawRecord* record,
+    reshade::api::command_list* cmd_list,
+    reshade::api::device* device) {
+  const auto shader_start = bvh::PerfNow();
+  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  if (shader_state != nullptr) {
+    record->vs_hash = renodx::utils::shader::GetCurrentVertexShaderHash(shader_state);
+    record->ps_hash = renodx::utils::shader::GetCurrentPixelShaderHash(shader_state);
+    record->vs_pipeline = shader_state->stage_states[renodx::utils::shader::VERTEX_INDEX].pipeline.handle;
+    record->ps_pipeline = shader_state->stage_states[renodx::utils::shader::PIXEL_INDEX].pipeline.handle;
+  }
+  bvh::AddPerfBlockMs(bvh::kPerfBlockRecordShader, bvh::LiveElapsedMs(shader_start));
+
+  const auto render_start = bvh::PerfNow();
+  FillRenderStateFromNative(record, cmd_list);
+  bvh::AddPerfBlockMs(bvh::kPerfBlockRecordRender, bvh::LiveElapsedMs(render_start));
+  // Parity gate: while gathering, every 64th draw also reads the framework state and counts the render-state fields that differ.
+  if (bvh::g_perf_gate.gather.load(std::memory_order_relaxed)
+      && bvh::g_perf_gate.record_native_seq.fetch_add(1u, std::memory_order_relaxed) % 64u == 0u) {
+    DrawRecord framework;
+    FillRenderStateFromFramework(&framework, cmd_list);
+    bvh::g_perf_gate.record_mismatch_rtv0.fetch_add(framework.rtv0.handle != record->rtv0.handle, std::memory_order_relaxed);
+    bvh::g_perf_gate.record_mismatch_dsv.fetch_add(framework.dsv.handle != record->dsv.handle, std::memory_order_relaxed);
+    bvh::g_perf_gate.record_mismatch_topology.fetch_add(framework.topology != record->topology, std::memory_order_relaxed);
+    bvh::g_perf_gate.record_mismatch_input_layout.fetch_add(framework.input_layout.handle != record->input_layout.handle, std::memory_order_relaxed);
+    bvh::g_perf_gate.record_mismatch_has_viewport.fetch_add(framework.has_viewport != record->has_viewport, std::memory_order_relaxed);
+    bvh::g_perf_gate.record_mismatch_viewport.fetch_add(std::memcmp(&framework.viewport, &record->viewport, sizeof(record->viewport)) != 0, std::memory_order_relaxed);
+    bvh::g_perf_gate.record_mismatch_blend_enable.fetch_add(framework.blend_enable != record->blend_enable, std::memory_order_relaxed);
+    bvh::g_perf_gate.record_mismatch_depth_enable.fetch_add(framework.depth_enable != record->depth_enable, std::memory_order_relaxed);
+    bvh::g_perf_gate.record_mismatch_depth_write.fetch_add(framework.depth_write != record->depth_write, std::memory_order_relaxed);
+    bvh::g_perf_gate.record_mismatch_cull_mode.fetch_add(framework.cull_mode != record->cull_mode, std::memory_order_relaxed);
+    bvh::g_perf_gate.record_mismatch_front_counter_clockwise.fetch_add(framework.front_counter_clockwise != record->front_counter_clockwise, std::memory_order_relaxed);
+  }
+
+  const auto skin_start = bvh::PerfNow();
   record->has_skin_inputs = LayoutHasSkinInputs(record->input_layout);
+  bvh::AddPerfBlockMs(bvh::kPerfBlockRecordSkin, bvh::LiveElapsedMs(skin_start));
 
+  const auto scene_start = bvh::PerfNow();
   auto* scene_state = renodx::utils::data::Get<renodx::utils::scene::SceneCommandListData>(cmd_list);
   if (scene_state != nullptr) {
     if (!scene_state->vertex_buffers.empty()) {
@@ -162,6 +265,7 @@ inline void FillCommonDrawRecord(
     record->ib_usage = ib_info.usage;
     record->ib_flags = ib_info.flags;
   }
+  bvh::AddPerfBlockMs(bvh::kPerfBlockRecordScene, bvh::LiveElapsedMs(scene_start));
 }
 
 // Camera and lighting depth come from the lighting pass; the pool region and
@@ -428,6 +532,7 @@ struct WorldDrawCallback {
   template <typename Arguments>
   renodx::utils::command_action::CallbackResult<renodx::utils::command_action::CommandContext<Arguments>>
   Record(renodx::utils::command_action::CommandContext<Arguments>& context, uint8_t method) const {
+    const bvh::PoolCpuTimer hook_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockDrawHookTotal]};
     if (context.cmd_list == nullptr) return {};
     if (!WorldDrawHookNeeded()) return {};
     auto* device = context.cmd_list->get_device();
@@ -638,6 +743,18 @@ struct WorldDrawCallback {
     }
 
     if (!CaptureActive()) return {.bypass = skip_cascade_draw};
+    if (bvh::g_perf_gate.gather.load(std::memory_order_relaxed)) {
+      bvh::g_perf_gate.hook_draws.fetch_add(1u, std::memory_order_relaxed);
+      auto* shader_state = renodx::utils::shader::GetCurrentState(context.cmd_list);
+      const uint64_t vs_pipeline = shader_state != nullptr ? shader_state->stage_states[renodx::utils::shader::VERTEX_INDEX].pipeline.handle : 0u;
+      const uint32_t ps_hash = shader_state != nullptr ? renodx::utils::shader::GetCurrentPixelShaderHash(shader_state) : 0u;
+      const auto vs_class = static_cast<contract::VsClass>(contract::LookupVertexTraits(vs_pipeline).cls);
+      // M1 consumed rule (plan step 5): draws the census, RTAO discovery, lighting, pool or deform paths need. Count only in M0.
+      const bool consumed = CensusEnabled() || rtao::g_rtao_discovery > 0.5f || IsLightingHash(ps_hash)
+                            || vs_class == contract::VsClass::Rigid || vs_class == contract::VsClass::Wind || contract::IsDeformingClass(vs_class);
+      if (!consumed) bvh::g_perf_gate.hook_draws_unconsumed.fetch_add(1u, std::memory_order_relaxed);
+    }
+    const auto record_start = bvh::PerfNow();
 
     DrawRecord record;
     record.method = method;
@@ -657,14 +774,20 @@ struct WorldDrawCallback {
     }
 
     FillCommonDrawRecord(&record, context.cmd_list, device);
+    const auto rest_start = bvh::PerfNow();
     record.is_candidate = IsGeometryCandidate(record);
 
     auto* cl_data = GetWorldCommandListData(context.cmd_list);
     FillDrawBindingMasks(&record, cl_data);
 
     CommitDrawRecord(record, device, cl_data);
+    bvh::AddPerfBlockMs(bvh::kPerfBlockRecordRest, bvh::LiveElapsedMs(rest_start));
+    bvh::AddPerfBlockMs(bvh::kPerfBlockDrawHookRecord, bvh::LiveElapsedMs(record_start));
     bvh::OnPoolScanDraw(device, context.cmd_list, record, cl_data);
-    bvh::OnDeformProbeDraw(device, context.cmd_list, record);
+    {
+      const bvh::PoolCpuTimer probe_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockDeformProbeDraw]};
+      bvh::OnDeformProbeDraw(device, context.cmd_list, record);
+    }
     bvh::OnDeformCaptureDraw(device, context.cmd_list, record);
     return {.bypass = skip_cascade_draw};
   }
@@ -684,9 +807,14 @@ struct WorldDrawCallback {
   // the draw (the buffer can be rewritten later in the frame).
   renodx::utils::command_action::CallbackResult<renodx::utils::command_action::CommandContext<renodx::utils::command_action::IndirectArguments>>
   operator()(renodx::utils::command_action::CommandContext<renodx::utils::command_action::IndirectArguments>& context) const {
+    const bvh::PoolCpuTimer hook_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockDrawHookTotal]};
     if (!CaptureActive() || context.cmd_list == nullptr) return {};
     auto* device = context.cmd_list->get_device();
     if (device == nullptr || device->get_api() != reshade::api::device_api::d3d11) return {};
+    if (bvh::g_perf_gate.gather.load(std::memory_order_relaxed)) {
+      bvh::g_perf_gate.hook_draws.fetch_add(1u, std::memory_order_relaxed);
+      bvh::g_perf_gate.hook_draws_indirect.fetch_add(1u, std::memory_order_relaxed);
+    }
 
     const auto& args = context.arguments;
     if (args.buffer.handle == 0u) return {};
@@ -709,16 +837,21 @@ struct WorldDrawCallback {
 
     auto* cl_data = GetWorldCommandListData(context.cmd_list);
     DrawRecord record;
+    const auto record_start = bvh::PerfNow();
     FillCommonDrawRecord(&record, context.cmd_list, device);
     record.method = indexed ? 1u : 0u;
     record.frame = g_state.frame.load();
     FillDrawBindingMasks(&record, cl_data);
+    bvh::AddPerfBlockMs(bvh::kPerfBlockDrawHookIndirectRecord, bvh::LiveElapsedMs(record_start));
 
     // The pool copies b1, the args and the instance window on the command list
     // here and reads them back later without waiting.
     bvh::OnPoolScanIndirectDraw(
         device, context.cmd_list, record, cl_data, args.buffer, args.offset, draw_count, stride);
-    bvh::OnDeformProbeIndirectDraw(device, context.cmd_list, record, args.buffer, args.offset, draw_count, args.stride);
+    {
+      const bvh::PoolCpuTimer probe_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockDeformProbeDraw]};
+      bvh::OnDeformProbeIndirectDraw(device, context.cmd_list, record, args.buffer, args.offset, draw_count, args.stride);
+    }
 
     // The census reads the args back at present with a GPU wait, so it only
     // runs while the census itself is on.

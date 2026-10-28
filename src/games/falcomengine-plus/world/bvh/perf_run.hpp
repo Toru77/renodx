@@ -163,13 +163,33 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"compact_rearm", true, kPerfSubset, false, nullptr},
     {"orphan_scan", true, kPerfSubset, false, nullptr},
     {"orphan_newest", true, kPerfSubset, false, nullptr},
+    {"draw_hook_total", true, kPerfSubset, false, nullptr},
+    {"draw_hook_record", true, kPerfSubset, false, nullptr},
+    {"deform_probe_draw", true, kPerfSubset, false, nullptr},
+    {"cb_hooks", true, kPerfSubset, false, nullptr},
+    {"bind_hook", true, kPerfSubset, false, nullptr},
+    {"pool_write_hooks", true, kPerfSubset, false, nullptr},
+    {"rtao_inline", true, kPerfSubset, false, nullptr},
+    {"lighting_rt", true, kPerfSubset, false, nullptr},
+    {"rt12_signal_flush", true, kPerfSubset, false, nullptr},
+    {"rt12_submit", true, kPerfSubset, false, nullptr},
+    {"rt12_wait_b", true, kPerfSubset, false, nullptr},
+    {"seg_to_rt", true, kPerfSubset, false, nullptr},
+    {"seg_after_rt", true, kPerfSubset, false, nullptr},
+    {"seg_present", true, kPerfSubset, false, nullptr},
+    {"draw_hook_indirect_record", true, kPerfSubset, false, nullptr},
+    {"record_shader_state", true, kPerfSubset, false, nullptr},
+    {"record_render_state", true, kPerfSubset, false, nullptr},
+    {"record_skin_layout", true, kPerfSubset, false, nullptr},
+    {"record_scene_query", true, kPerfSubset, false, nullptr},
+    {"record_rest", true, kPerfSubset, false, nullptr},
 };
 inline constexpr bool PerfInTotal(const PerfCostInfo& info) {
   return info.role == kPerfInPresent || info.role == kPerfDrawTime || info.role == kPerfGpu;
 }
 
-enum PerfGauge : size_t { kPerfGaugeTlasInstances, kPerfGaugeTlasDynamic, kPerfGaugePoolInstances, kPerfGaugePoolMeshes, kPerfGaugeSlackHoles, kPerfGaugeCount };
-inline constexpr const char* kPerfGaugeNames[kPerfGaugeCount] = {"tlas_instances", "tlas_dynamic_instances", "pool_instances", "pool_meshes", "slack_free_holes"};
+enum PerfGauge : size_t { kPerfGaugeTlasInstances, kPerfGaugeTlasDynamic, kPerfGaugePoolInstances, kPerfGaugePoolMeshes, kPerfGaugeSlackHoles, kPerfGaugeHookDraws, kPerfGaugeHookDrawsIndirect, kPerfGaugeHookDrawsUnconsumed, kPerfGaugeRecordMismatchRtv0, kPerfGaugeRecordMismatchDsv, kPerfGaugeRecordMismatchTopology, kPerfGaugeRecordMismatchInputLayout, kPerfGaugeRecordMismatchHasViewport, kPerfGaugeRecordMismatchViewport, kPerfGaugeRecordMismatchBlendEnable, kPerfGaugeRecordMismatchDepthEnable, kPerfGaugeRecordMismatchDepthWrite, kPerfGaugeRecordMismatchCullMode, kPerfGaugeRecordMismatchFrontCounterClockwise, kPerfGaugeCount };
+inline constexpr const char* kPerfGaugeNames[kPerfGaugeCount] = {"tlas_instances", "tlas_dynamic_instances", "pool_instances", "pool_meshes", "slack_free_holes", "hook_draws", "hook_draws_indirect", "hook_draws_unconsumed", "record_mismatch_rtv0", "record_mismatch_dsv", "record_mismatch_topology", "record_mismatch_input_layout", "record_mismatch_has_viewport", "record_mismatch_viewport", "record_mismatch_blend_enable", "record_mismatch_depth_enable", "record_mismatch_depth_write", "record_mismatch_cull_mode", "record_mismatch_front_counter_clockwise"};
 
 struct PerfCounters {
   double cost[kPerfCostCount] = {};
@@ -439,7 +459,7 @@ inline void MaxInto(double* max, double value) {
 
 inline PerfState g_perf;
 
-inline double PerfMsOf(const std::atomic_uint64_t& us) { return static_cast<double>(us.load(std::memory_order_relaxed)) / 1000.0; }
+inline double PerfMsOf(const std::atomic_uint64_t& us) { return static_cast<double>(us.load(std::memory_order_relaxed)) / 1000000.0; }
 
 // Counters at one present. Caller holds g_pool.mutex (tlas_timing, the expand sum and the admitted count).
 inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraGpu& extra = {}) {
@@ -502,6 +522,20 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.gauge[kPerfGaugePoolInstances] = static_cast<double>(g_pool.instances.size());
   c.gauge[kPerfGaugePoolMeshes] = live.pool_meshes;
   c.gauge[kPerfGaugeSlackHoles] = live.slack_free_holes;
+  c.gauge[kPerfGaugeHookDraws] = static_cast<double>(g_perf_gate.hook_draws_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeHookDrawsIndirect] = static_cast<double>(g_perf_gate.hook_draws_indirect_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeHookDrawsUnconsumed] = static_cast<double>(g_perf_gate.hook_draws_unconsumed_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeRecordMismatchRtv0] = static_cast<double>(g_perf_gate.record_mismatch_rtv0_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeRecordMismatchDsv] = static_cast<double>(g_perf_gate.record_mismatch_dsv_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeRecordMismatchTopology] = static_cast<double>(g_perf_gate.record_mismatch_topology_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeRecordMismatchInputLayout] = static_cast<double>(g_perf_gate.record_mismatch_input_layout_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeRecordMismatchHasViewport] = static_cast<double>(g_perf_gate.record_mismatch_has_viewport_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeRecordMismatchViewport] = static_cast<double>(g_perf_gate.record_mismatch_viewport_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeRecordMismatchBlendEnable] = static_cast<double>(g_perf_gate.record_mismatch_blend_enable_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeRecordMismatchDepthEnable] = static_cast<double>(g_perf_gate.record_mismatch_depth_enable_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeRecordMismatchDepthWrite] = static_cast<double>(g_perf_gate.record_mismatch_depth_write_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeRecordMismatchCullMode] = static_cast<double>(g_perf_gate.record_mismatch_cull_mode_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeRecordMismatchFrontCounterClockwise] = static_cast<double>(g_perf_gate.record_mismatch_front_counter_clockwise_frame.load(std::memory_order_relaxed));
   return c;
 }
 
@@ -809,6 +843,34 @@ inline void ClearPerfGathered(BvhDeviceData* data) {
   g_perf_gate.rtls_record_us.store(0u);
   g_perf_gate.deform_update_us.store(0u);
   for (std::atomic_uint64_t& us : g_perf_gate.block_us) us.store(0u);
+  g_perf_gate.hook_draws.store(0u);
+  g_perf_gate.hook_draws_frame.store(0u);
+  g_perf_gate.hook_draws_indirect.store(0u);
+  g_perf_gate.hook_draws_indirect_frame.store(0u);
+  g_perf_gate.hook_draws_unconsumed.store(0u);
+  g_perf_gate.hook_draws_unconsumed_frame.store(0u);
+  g_perf_gate.record_mismatch_rtv0.store(0u);
+  g_perf_gate.record_mismatch_rtv0_frame.store(0u);
+  g_perf_gate.record_mismatch_dsv.store(0u);
+  g_perf_gate.record_mismatch_dsv_frame.store(0u);
+  g_perf_gate.record_mismatch_topology.store(0u);
+  g_perf_gate.record_mismatch_topology_frame.store(0u);
+  g_perf_gate.record_mismatch_input_layout.store(0u);
+  g_perf_gate.record_mismatch_input_layout_frame.store(0u);
+  g_perf_gate.record_mismatch_has_viewport.store(0u);
+  g_perf_gate.record_mismatch_has_viewport_frame.store(0u);
+  g_perf_gate.record_mismatch_viewport.store(0u);
+  g_perf_gate.record_mismatch_viewport_frame.store(0u);
+  g_perf_gate.record_mismatch_blend_enable.store(0u);
+  g_perf_gate.record_mismatch_blend_enable_frame.store(0u);
+  g_perf_gate.record_mismatch_depth_enable.store(0u);
+  g_perf_gate.record_mismatch_depth_enable_frame.store(0u);
+  g_perf_gate.record_mismatch_depth_write.store(0u);
+  g_perf_gate.record_mismatch_depth_write_frame.store(0u);
+  g_perf_gate.record_mismatch_cull_mode.store(0u);
+  g_perf_gate.record_mismatch_cull_mode_frame.store(0u);
+  g_perf_gate.record_mismatch_front_counter_clockwise.store(0u);
+  g_perf_gate.record_mismatch_front_counter_clockwise_frame.store(0u);
   g_deform_live.cpu_us.store(0u);
   g_deform_live.cpu_frame_us.store(0u);
   {

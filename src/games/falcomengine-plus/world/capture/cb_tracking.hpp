@@ -15,6 +15,7 @@
 // bindings are dropped when its recording finishes (its state resets).
 
 #include "../world_state.hpp"
+#include "../bvh/perf_gate.hpp"
 
 namespace falcom_world {
 
@@ -62,6 +63,7 @@ inline void OnPushDescriptorsWorld(
     reshade::api::pipeline_layout layout,
     uint32_t param_index,
     const reshade::api::descriptor_table_update& update) {
+  const bvh::PoolCpuTimer bind_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockBindHook]};
   if (!WorldDrawHookNeeded()) return;
   (void)layout;
   (void)param_index;

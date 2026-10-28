@@ -319,6 +319,12 @@ inline void OnWorldPresentBvh(
     uint32_t dirty_rect_count,
     const reshade::api::rect* dirty_rects) {
   const PoolCpuTimer present_timer{&g_perf_gate.present_bvh_us};
+  if (g_perf_gate.rt_seen) {
+    AddPerfBlockMs(kPerfBlockSegAfterRt, LiveElapsedMs(g_perf_gate.rt_end));
+  } else {
+    AddPerfBlockMs(kPerfBlockSegToRt, LiveElapsedMs(g_perf_gate.frame_start));
+  }
+  g_perf_gate.present_start = PerfNow();
   (void)source_rect;
   (void)dest_rect;
   (void)dirty_rect_count;
@@ -419,6 +425,16 @@ inline void OnWorldPresentBvh(
   const auto found = rtgi::g_rtgi_devices.find(device);
   if (found == rtgi::g_rtgi_devices.end() || found->second.debug.srv[0].handle == 0u) return;
   blit_debug(found->second.debug.srv[0]);
+}
+
+// Performance segments (diagnostic): the present call, from OnWorldPresentBvh to the end of the native Present (other
+// present handlers, ReShade effects and overlay, the swap chain Present). Starts the next frame's segment. Render thread only.
+inline void OnWorldFinishPresentPerf(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) {
+  (void)queue;
+  (void)swapchain;
+  AddPerfBlockMs(kPerfBlockSegPresent, LiveElapsedMs(g_perf_gate.present_start));
+  g_perf_gate.frame_start = PerfNow();
+  g_perf_gate.rt_seen = false;
 }
 
 }  // namespace falcom_world::bvh

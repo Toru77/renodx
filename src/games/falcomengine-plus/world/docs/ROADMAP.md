@@ -51,6 +51,8 @@ R1b-0 (diagnostic, startup hook-off mask), implemented, not validated in game: `
 | 6 | 64 | present handlers (OnWorldPresent, OnCrashLogPresent, OnWorldPresentBvh) |
 | 7 | 128 | everything else: shader registry, depth-log events, pipeline state, resource destroy, remaining BVH events |
 
+CPU gap diagnostic (timed rows only, no behaviour change), implemented, not validated in game: PoolCpuTimer counts nanoseconds (was truncated to whole microseconds per scope); new Subset rows draw_hook_total, draw_hook_record, deform_probe_draw, cb_hooks, bind_hook, pool_write_hooks, rtao_inline, lighting_rt, rt12_signal_flush, rt12_submit, rt12_wait_b and the wall-clock segments seg_to_rt, seg_after_rt, seg_present (finish_present event); gauge hook_draws. Owner test: three 30 s performance tests at one spot (rtoff, rtao_compute, rtao_dxr), overlay closed.
+
 | Feature | Owner test list | Where |
 |---|---|---|
 | Path 2: moving objects out of the static pool (P2a, P2a-rev) | Pool Scan near moving objects, rule line, Depth Compare | HISTORY: Path 2, round P2a; round P2a-rev |

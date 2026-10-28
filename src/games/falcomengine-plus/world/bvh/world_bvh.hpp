@@ -60,6 +60,7 @@ inline void Use(DWORD fdw_reason) {
       }
       if ((hook_off & 64u) == 0u) {
         reshade::register_event<reshade::addon_event::present>(OnWorldPresentBvh);
+        reshade::register_event<reshade::addon_event::finish_present>(OnWorldFinishPresentPerf);
       }
       if ((hook_off & 128u) == 0u) {
         reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeform);
@@ -85,6 +86,7 @@ inline void Use(DWORD fdw_reason) {
       }
       if ((hook_off & 64u) == 0u) {
         reshade::unregister_event<reshade::addon_event::present>(OnWorldPresentBvh);
+        reshade::unregister_event<reshade::addon_event::finish_present>(OnWorldFinishPresentPerf);
       }
       if ((hook_off & 128u) == 0u) {
         reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeform);

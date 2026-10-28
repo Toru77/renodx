@@ -24,6 +24,7 @@
 #include <include/reshade.hpp>
 
 #include "../world_state.hpp"
+#include "../bvh/perf_gate.hpp"
 
 namespace falcom_world {
 
@@ -135,6 +136,7 @@ inline void OnMapBufferRegionCbTracker(
     uint64_t size,
     reshade::api::map_access access,
     void** data) {
+  const bvh::PoolCpuTimer cb_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockCbHooks]};
   if (!CaptureActive()) {
     if (access != reshade::api::map_access::read_only) {
       NoteUntrackedCbWrite(resource);
@@ -155,6 +157,7 @@ inline void OnMapBufferRegionCbTracker(
 }
 
 inline void OnUnmapBufferRegionCbTracker(reshade::api::device* device, reshade::api::resource resource) {
+  const bvh::PoolCpuTimer cb_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockCbHooks]};
   (void)device;
   auto& tracker = CbTracker();
   if (tracker.mapped_count.load(std::memory_order_relaxed) == 0u && !CaptureActive()) return;
@@ -177,6 +180,7 @@ inline void TrackCbUpdate(
     const void* data,
     uint64_t offset,
     uint64_t size) {
+  const bvh::PoolCpuTimer cb_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockCbHooks]};
   if (!CaptureActive()) {
     NoteUntrackedCbWrite(resource);
     return;
