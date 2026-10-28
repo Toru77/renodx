@@ -87,6 +87,7 @@ struct GcStats {
   uint64_t jobs_cap = 0u, cap_attempts = 0u, carrier_busy = 0u, carrier_full = 0u, stale_jobs = 0u, invalidated_write = 0u;
   uint64_t uv_stream_mismatch = 0u;  // a Data-phase draw bound another UV stream buffer than the entry's (skipped)
   uint64_t invalidated_destroy = 0u, resets_pool = 0u, resets_fragmented = 0u;
+  uint64_t readback_busy = 0u;  // range jobs returned to Range: their readback slot was unread
   std::map<std::string, uint64_t> refused;
   std::map<std::array<uint32_t, 4>, uint64_t> formats;  // pos code, uv code, index size, stride
   std::map<std::array<uint32_t, 4>, uint64_t> buffers;  // vb usage, vb flags, ib usage, ib flags

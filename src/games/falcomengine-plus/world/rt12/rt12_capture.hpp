@@ -86,7 +86,8 @@ struct Rt12GcState {
   reshade::api::descriptor_table srv_table = {0u}, uav_table = {0u};
   reshade::api::pipeline range_pipeline = {0u}, decode_pipeline = {0u};
   bvh::GpuTimer timer;
-  std::vector<bvh::GcJob> readback_jobs[bvh::kGcReadbackSlots];  // range jobs whose results are read two presents later
+  std::vector<bvh::GcJob> readback_jobs[bvh::kGcReadbackSlots];  // range jobs whose results are read once their query is done
+  Microsoft::WRL::ComPtr<ID3D11Query> readback_done[bvh::kGcReadbackSlots];  // event query after each slot's copy
   uint32_t present = 0u;
   // The carrier ring (D10): one shared texture per present slot.
   Rt12Shared carriers[kRt12Slots];
@@ -231,6 +232,12 @@ inline bool CreateGc(reshade::api::device* device, Rt12State& s, Rt12GcState& gc
                                  nullptr, RU::copy_dest, &readback)) {
       return fail("readback", E_FAIL);
     }
+  }
+  auto* native11 = reinterpret_cast<ID3D11Device*>(static_cast<uintptr_t>(device->get_native()));  // NOLINT(performance-no-int-to-ptr)
+  const D3D11_QUERY_DESC event_desc = {D3D11_QUERY_EVENT, 0u};
+  for (Microsoft::WRL::ComPtr<ID3D11Query>& query : gc.readback_done) {
+    const HRESULT query_hr = native11->CreateQuery(&event_desc, &query);
+    if (FAILED(query_hr)) return fail("readback query", query_hr);
   }
   DR srv_range = {0, 0, 0, 1, DS::all_compute, 1, DT::shader_resource_view};
   DR uav_range = {0, 0, 0, 2, DS::all_compute, 1, DT::unordered_access_view};
@@ -563,7 +570,7 @@ inline void DumpGcJson(const Rt12GcState& gc) {
       << ", \"carrier_full\": " << st.carrier_full << ", \"stale_jobs\": " << st.stale_jobs << ", \"invalidated_write\": " << st.invalidated_write
       << ", \"uv_stream_mismatch\": " << st.uv_stream_mismatch << ", \"invalidated_destroy\": " << st.invalidated_destroy
       << ", \"resets_pool\": " << st.resets_pool
-      << ", \"resets_fragmented\": " << st.resets_fragmented << "},\n";
+      << ", \"resets_fragmented\": " << st.resets_fragmented << ", \"readback_busy\": " << st.readback_busy << "},\n";
   out << "  \"refused\": {";
   bool first = true;
   for (const auto& [reason, count] : st.refused) {
@@ -757,22 +764,40 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
     renodx::utils::log::i("[world-gc] reset (fragmented)");
   }
 
-  // 5. Range results of the slot written two presents ago (mapped outside any lock). Results apply to RangeWait entries
-  // of the same generation; the rest are stale.
+  // 5. Range results of each readback slot whose copy has finished, oldest first (mapped outside any lock). Results apply to
+  // RangeWait entries of the same generation; the rest are stale.
+  const bool diag = gc.present < 8u;
+  if (diag) {
+    renodx::utils::log::i("[world-gc] diag p", gc.present, " begin: invalidated=", invalidated.size(), " resident=", gc.meshes.size());
+  }
   const uint32_t present = gc.present;
   gc.present += 1u;
-  const uint32_t read_slot = (present + 1u) % bvh::kGcReadbackSlots;
-  if (!gc.readback_jobs[read_slot].empty()) {
+  auto* immediate = queue->get_immediate_command_list();
+  ID3D11DeviceContext* context11 = bvh::GpuTimerContext(immediate);
+  if (context11 == nullptr) {
+    FailGc(gc, "immediate context", E_FAIL);
+    return;
+  }
+  uint32_t slots_read = 0u, slots_waiting = 0u;
+  for (uint32_t age = 0u; age < bvh::kGcReadbackSlots; ++age) {
+    const uint32_t slot = (present + age) % bvh::kGcReadbackSlots;
+    if (gc.readback_jobs[slot].empty()) continue;
+    BOOL done = FALSE;
+    if (context11->GetData(gc.readback_done[slot].Get(), &done, sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK || !done) {
+      slots_waiting += 1u;
+      continue;
+    }
+    slots_read += 1u;
     std::vector<bvh::GcJob> jobs;
-    jobs.swap(gc.readback_jobs[read_slot]);
+    jobs.swap(gc.readback_jobs[slot]);
     uint32_t results[bvh::kGcJobsPerPresent * 4u] = {};
     void* mapped = nullptr;
-    if (!device->map_buffer_region(gc.readback[read_slot], 0u, sizeof(results), reshade::api::map_access::read_only, &mapped)) {
+    if (!device->map_buffer_region(gc.readback[slot], 0u, sizeof(results), reshade::api::map_access::read_only, &mapped)) {
       FailGc(gc, "range readback map", E_FAIL);
       return;
     }
     std::memcpy(results, mapped, sizeof(results));
-    device->unmap_buffer_region(gc.readback[read_slot]);
+    device->unmap_buffer_region(gc.readback[slot]);
     std::lock_guard lock(bvh::g_gpu_capture.mutex);
     for (size_t j = 0u; j < jobs.size(); ++j) {
       const auto it = bvh::g_gpu_capture.entries.find(jobs[j].mesh_key);
@@ -804,9 +829,13 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
       bvh::g_gpu_capture.stats.largest_index_count = (std::max)(bvh::g_gpu_capture.stats.largest_index_count, entry.draw.index_count);
     }
   }
+  if (diag) {
+    renodx::utils::log::i("[world-gc] diag p", present, " readback: read=", slots_read, " waiting=", slots_waiting);
+  }
 
   // 6. Work for this present: the carrier and slot must be free for decodes; the jobs that do not fit go back to Data.
   const bool slot_free = gc.slots[gc.gc_next].fence_value <= completed && gc.carrier_fence[gc.carrier_next] <= completed;
+  const bool readback_free = gc.readback_jobs[present % bvh::kGcReadbackSlots].empty();
   std::vector<bvh::GcJob> range_dispatched;
   std::vector<std::array<uint32_t, 16>> range_words;
   std::vector<std::array<uint32_t, 16>> decode_words;
@@ -827,6 +856,11 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
         continue;
       }
       const bvh::GcEntry& entry = it->second;
+      if (!readback_free) {
+        it->second.phase = bvh::GcPhase::Range;
+        bvh::g_gpu_capture.stats.readback_busy += 1u;
+        continue;
+      }
       std::array<uint32_t, 16> words = {};
       words[0] = job.index_byte;
       words[1] = entry.draw.index_size;
@@ -902,14 +936,17 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
 
   // 7. D3D11 passes on the immediate context: the range pass (results copied to the readback slot of this present) and
   // the decode pass into this present's carrier.
+  if (diag) {
+    renodx::utils::log::i("[world-gc] diag p", present, " passes: range=", range_words.size(), " decode=", decode_words.size(), " readback_free=", readback_free ? 1 : 0);
+  }
   if (!range_words.empty() || !decode_words.empty()) {
-    auto* cmd_list = queue->get_immediate_command_list();
+    auto* cmd_list = immediate;
     if (cmd_list == nullptr) {
       FailGc(gc, "immediate command list", E_FAIL);
       return;
     }
     const reshade::api::descriptor_table tables[2] = {gc.srv_table, gc.uav_table};
-    const reshade::api::resource_view null_view = {0u};
+    const reshade::api::resource_view null_views[2] = {{0u}, {0u}};
     const reshade::api::descriptor_table_update srv_update = {gc.srv_table, 0, 0, 1, DT::shader_resource_view, &gc.staging_srv};
     device->update_descriptor_tables(1, &srv_update);
     bvh::BeginGpuTimer(device, cmd_list, &gc.timer);
@@ -918,7 +955,7 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
       bvh::WriteBufferRange(device, cmd_list, gc.results, 16u, 0u, zeros, sizeof(zeros), nullptr);
       cmd_list->barrier(gc.results, RU::copy_dest, RU::unordered_access);
       cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, gc.range_pipeline);
-      const reshade::api::resource_view range_views[2] = {null_view, gc.results_uav};  // u0 unused, u1 the results
+      const reshade::api::resource_view range_views[2] = {null_views[0], gc.results_uav};  // u0 unused, u1 the results
       const reshade::api::descriptor_table_update uav_update = {gc.uav_table, 0, 0, 2, DT::unordered_access_view, range_views};
       device->update_descriptor_tables(1, &uav_update);
       cmd_list->bind_descriptor_tables(DS::all_compute, gc.layout, 0, 2, tables);
@@ -927,16 +964,17 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
         const uint32_t groups = (words[2] + 63u) / 64u;
         cmd_list->dispatch((std::min)(groups, 65535u), (groups + 65534u) / 65535u, 1u);
       }
-      const reshade::api::descriptor_table_update uav_unbind = {gc.uav_table, 0, 0, 2, DT::unordered_access_view, &null_view};
+      const reshade::api::descriptor_table_update uav_unbind = {gc.uav_table, 0, 0, 2, DT::unordered_access_view, null_views};
       device->update_descriptor_tables(1, &uav_unbind);
       cmd_list->bind_descriptor_tables(DS::all_compute, gc.layout, 1, 1, &gc.uav_table);
       cmd_list->barrier(gc.results, RU::unordered_access, RU::copy_source);
       cmd_list->copy_buffer_region(gc.results, 0u, gc.readback[present % bvh::kGcReadbackSlots], 0u, sizeof(zeros));
+      context11->End(gc.readback_done[present % bvh::kGcReadbackSlots].Get());
       gc.readback_jobs[present % bvh::kGcReadbackSlots] = range_dispatched;
     }
     if (!decode_words.empty()) {
       cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, gc.decode_pipeline);
-      const reshade::api::resource_view decode_views[2] = {gc.carriers[gc.carrier_next].uav11, null_view};  // u0 the carrier
+      const reshade::api::resource_view decode_views[2] = {gc.carriers[gc.carrier_next].uav11, null_views[0]};  // u0 the carrier
       const reshade::api::descriptor_table_update uav_update = {gc.uav_table, 0, 0, 2, DT::unordered_access_view, decode_views};
       device->update_descriptor_tables(1, &uav_update);
       cmd_list->bind_descriptor_tables(DS::all_compute, gc.layout, 0, 2, tables);
@@ -946,11 +984,14 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
         const uint32_t groups = (loops + 63u) / 64u;
         cmd_list->dispatch((std::min)(groups, 65535u), (groups + 65534u) / 65535u, 1u);
       }
-      const reshade::api::descriptor_table_update uav_unbind = {gc.uav_table, 0, 0, 2, DT::unordered_access_view, &null_view};
+      const reshade::api::descriptor_table_update uav_unbind = {gc.uav_table, 0, 0, 2, DT::unordered_access_view, null_views};
       device->update_descriptor_tables(1, &uav_unbind);
       cmd_list->bind_descriptor_tables(DS::all_compute, gc.layout, 1, 1, &gc.uav_table);
     }
     bvh::EndGpuTimer(cmd_list, &gc.timer);
+    if (diag) {
+      renodx::utils::log::i("[world-gc] diag p", present, " passes recorded");
+    }
   }
 
   // 8. The GC submission needs its slot free. Signal fence11 after the decode passes (the D3D12 side waits on it).
@@ -1339,6 +1380,9 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
   {
     std::lock_guard lock(g_gc_panel_mutex);
     g_gc_panel = std::move(panel);
+  }
+  if (diag) {
+    renodx::utils::log::i("[world-gc] diag p", present, " end: submit=", submit ? 1 : 0, " placed=", placed.size(), " resident=", gc.meshes.size(), " pending=", pending);
   }
   if (g_gc_dump_requested.exchange(false)) DumpGcJson(gc);
 #else

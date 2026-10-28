@@ -362,6 +362,11 @@ Owner test (DevKit build; RTAO on, DXR on, Trace characters on, P2b on, Performa
 
 Pass: 0 mismatched at every check; resident covers the pool minus the counted refusals; step 4 images match; no crash. Mismatches are not fixed in G2; they are reported with their split.
 
+Status (first enable, owner run): first enable works. 694 resident; check of 63 meshes with 0 mismatched triangles, 0 refusals, 0 timeouts.
+- Known issue, open: after DXR is turned off and on, re-enabling G2 can stall after frame 6 (5 s watchdog, then crash). Repro: DXR off with G2 on (clean), then G2 on again. Logs: 12:31:57 to 12:32:03 in ReShade.log. Not diagnosed.
+- The switch stays default OFF until this is fixed or the user decides otherwise.
+- Fixes applied: the readback query gate (no unbounded map), and the UAV unbind descriptor count fix (null_views, count 2).
+
 ## Open decisions
 
 1. Foliage motion (P-1, P-4): option (b), a CPU sway approximation, was chosen on 2026-10-14. It still needs a planner pass and harness tests before code. Options are in HISTORY: Work plan, Step 5.
