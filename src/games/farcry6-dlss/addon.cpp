@@ -107,6 +107,54 @@ renodx::utils::settings::Settings settings = {
         },
     },
     new renodx::utils::settings::Setting{
+        .key = "FGPresentationTest",
+        .binding = &farcry6_dlss::dlss::fg_bootstrap_test,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Frame Generation Presentation Test",
+        .section = "Antialiasing",
+        .tooltip = "Tests Streamline presentation with Frame Generation off. Restart the game after changing this setting. Copy Report shows the result.",
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "FGInputTest",
+        .binding = &farcry6_dlss::dlss::fg_input_test,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Frame Generation Input Test",
+        .section = "Antialiasing",
+        .tooltip = "Tests Streamline camera, depth, motion, and present markers with frame generation off. Requires the presentation test and Halton motion offsets. See Copy Report.",
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "FGStartExperiment",
+        .binding = nullptr,
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .default_value = 0.f,
+        .label = "Start Frame Generation Experiment",
+        .section = "Antialiasing",
+        .tooltip = "Experimental HDR10 gameplay test. Requires presentation and input tests plus Halton motion offsets. Stop the experiment and confirm FG is off before changing display settings or leaving gameplay.",
+        .on_click = [] {
+          farcry6_dlss::dlss::fg_enable_requested.store(true);
+          return true;
+        },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "FGStopExperiment",
+        .binding = nullptr,
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .default_value = 0.f,
+        .label = "Stop Frame Generation Experiment",
+        .section = "Antialiasing",
+        .tooltip = "Requests FG off. Copy Report confirms when an off present has completed.",
+        .on_click = [] {
+          farcry6_dlss::dlss::fg_enable_requested.store(false);
+          return true;
+        },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLSSCpuTiming",
         .binding = &farcry6_dlss::dlss::dlss_cpu_timing,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,

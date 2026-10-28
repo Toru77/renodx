@@ -91,7 +91,7 @@ inline void LoadRuntime(const std::wstring& process_directory) {
       runtime.status = "interposer is missing required Streamline exports";
       return;
     }
-    found.status = "loaded; Frame Generation integration is not active";
+    found.status = "loaded";
     runtime = found;
   });
 }

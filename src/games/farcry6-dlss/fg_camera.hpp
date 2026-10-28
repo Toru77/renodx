@@ -8,10 +8,35 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 #include "./streamline/include/sl_consts.h"
 
 namespace farcry6_dlss::dlss {
+
+// The provider stores the same camera constants the game uploads to its GPU
+// buffer. Validate its viewport before accepting a sample for this frame.
+template <typename CameraSample>
+bool CaptureFrameGenerationCamera(const void* constants, uint32_t width, uint32_t height, uint64_t frame, CameraSample* output) {
+  if (constants == nullptr || output == nullptr || width == 0u || height == 0u) return false;
+  const auto* bytes = static_cast<const uint8_t*>(constants);
+  float viewport[2] = {};
+  std::memcpy(viewport, bytes + 0x200u, sizeof(viewport));
+  if (viewport[0] != static_cast<float>(width) || viewport[1] != static_cast<float>(height)) return false;
+  CameraSample sample = {};
+  sample.frame = frame;
+  std::memcpy(sample.viewport, viewport, sizeof(viewport));
+  std::memcpy(sample.projection, bytes + 0x80u, sizeof(sample.projection));
+  std::memcpy(sample.matrix, bytes + 0x140u, sizeof(sample.matrix));
+  std::memcpy(sample.previous_matrix, bytes + 0x180u, sizeof(sample.previous_matrix));
+  std::memcpy(sample.camera_position, bytes + 0x230u, sizeof(sample.camera_position));
+  std::memcpy(sample.previous_camera_position, bytes + 0x240u, sizeof(sample.previous_camera_position));
+  std::memcpy(sample.camera_right, bytes + 0x270u, sizeof(sample.camera_right));
+  std::memcpy(sample.camera_up, bytes + 0x280u, sizeof(sample.camera_up));
+  std::memcpy(sample.camera_direction, bytes + 0x290u, sizeof(sample.camera_direction));
+  *output = sample;
+  return true;
+}
 
 // The game's matrices multiply column vectors; Streamline uses row vectors.
 // Build the transformation from two real, consecutive camera samples instead
@@ -22,6 +47,7 @@ bool BuildFrameGenerationCamera(
     float jitter_x, float jitter_y, bool depth_inverted, bool motion_jittered,
     bool reset, sl::Constants* output) {
   if (output == nullptr || current.frame == 0u || previous.frame != current.frame - 1u
+      || !std::isfinite(current.viewport[0]) || !std::isfinite(current.viewport[1])
       || current.viewport[0] < 1.f || current.viewport[1] < 1.f
       || current.viewport[0] != previous.viewport[0] || current.viewport[1] != previous.viewport[1]
       || !std::isfinite(jitter_x) || !std::isfinite(jitter_y)) return false;
@@ -139,6 +165,7 @@ bool BuildFrameGenerationCamera(
   to_streamline(multiply(multiply(current_view_projection, previous_to_current), inverse_previous), &constants.prevClipToClip);
   constants.jitterOffset = sl::float2(jitter_x, jitter_y);
   constants.mvecScale = sl::float2(1.f / current.viewport[0], 1.f / current.viewport[1]);
+  constants.cameraPinholeOffset = sl::float2(0.f, 0.f);
   constants.cameraPos = sl::float3(current.camera_position[0], current.camera_position[1], current.camera_position[2]);
   constants.cameraRight = sl::float3(current.camera_right[0], current.camera_right[1], current.camera_right[2]);
   constants.cameraUp = sl::float3(current.camera_up[0], current.camera_up[1], current.camera_up[2]);
@@ -154,6 +181,24 @@ bool BuildFrameGenerationCamera(
   constants.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
   *output = constants;
   return true;
+}
+
+// The engine supplies an unjittered previous rotation-projection and the
+// previous position in the current camera buffer. This avoids pairing camera
+// providers from different views or CPU recording intervals.
+template <typename CameraSample>
+bool BuildFrameGenerationCameraFromProvider(
+    const CameraSample& current, float jitter_x, float jitter_y,
+    bool depth_inverted, bool motion_jittered, bool reset, sl::Constants* output) {
+  if (current.frame == 0u) return false;
+  CameraSample previous = current;
+  previous.frame = current.frame - 1u;
+  std::memcpy(previous.matrix, current.previous_matrix, sizeof(previous.matrix));
+  previous.projection[2] = 0.f;
+  previous.projection[6] = 0.f;
+  std::memcpy(previous.camera_position, current.previous_camera_position, sizeof(previous.camera_position));
+  return BuildFrameGenerationCamera(current, previous, jitter_x, jitter_y,
+                                    depth_inverted, motion_jittered, reset, output);
 }
 
 }  // namespace farcry6_dlss::dlss
