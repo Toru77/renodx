@@ -87,6 +87,7 @@ inline constexpr uint32_t kRt12CarrierHeight = 512u;     // 4096 * 512 vertices 
 inline constexpr uint32_t kRt12DynamicRebuildFrames = 30u;  // full BLAS rebuild cadence (owner decision)
 inline constexpr uint32_t kRt12RecordTexels = 12u;          // WorldInstanceGPU = 192 bytes = 12 RGBA32_UINT texels
 inline constexpr uint32_t kRt12RecordCarrierHeight = 96u;   // 4096 * 96 texels = 32768 records (kPoolDynamicInstances)
+inline constexpr uint32_t kRt12GcRecordCarrierHeight = 216u;  // 4096 * 216 texels = 73728 records (G4 GPU records)
 
 // End (exclusive) of the vertices `count` characters use: max(vertex_base + 3 * triangles), 0 for none.
 inline uint64_t Rt12DynamicVertexEnd(const uint32_t* vertex_base, const uint32_t* triangles, size_t count) {
@@ -148,6 +149,21 @@ inline void Rt12RecordDescWords(const float* record48, uint32_t instance_id, uin
   out16[13] = (0x1u | (fields.opaque ? 0x4u : 0x8u)) << 24;
   out16[14] = static_cast<uint32_t>(address);
   out16[15] = static_cast<uint32_t>(address >> 32);
+}
+
+// G4: one GPU-cache mesh as WorldMeshGPU words (header = vertex offset, count, index offset, count; bbox_min.w = UV offset
+// + 1, 0 without UV). The DXR trace reads header.z and bbox_min.w for alpha candidates only. False when an index or UV
+// element offset is not exact in a float (2^24): the slot's alpha slice is then withheld.
+inline bool Rt12GcMeshWords(uint64_t v_off, uint32_t vertex_count, uint64_t i_off, uint32_t index_count, bool has_uv,
+                            uint64_t u_off, float out16[16]) {
+  for (uint32_t k = 0u; k < 16u; ++k) out16[k] = 0.f;
+  out16[0] = static_cast<float>(v_off);
+  out16[1] = static_cast<float>(vertex_count);
+  out16[2] = static_cast<float>(i_off);
+  out16[3] = static_cast<float>(index_count);
+  if (has_uv) out16[7] = static_cast<float>(u_off + 1u);
+  constexpr uint64_t kExact = 1ull << 24u;
+  return i_off + index_count < kExact && (!has_uv || u_off + vertex_count < kExact);
 }
 
 inline void MirrorStoreReset() {

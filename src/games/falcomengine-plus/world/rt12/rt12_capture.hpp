@@ -82,6 +82,12 @@ struct Rt12GcPanel {
   double inst_ms_sum = 0.0;
   uint64_t inst_ms_n = 0u;
   bvh::GcInstanceCompare compare;
+  bool scene_ready = false;
+  std::string scene_not_ready;
+  uint32_t bound = 0u;
+  uint64_t bound_misses = 0u;
+  uint64_t alpha_inexact = 0u;
+  std::map<std::string, uint64_t> scene_no_cpu_mesh;  // G4: slots without a CPU mesh, by state
 };
 
 struct Rt12GcState {
@@ -126,8 +132,10 @@ struct Rt12GcState {
   // G3 (D3, D4): the instance set, the D3D11 passes and the counter readback ring.
   reshade::api::resource inst_arena = {0u}, inst_draws = {0u}, inst_epochs = {0u}, inst_meta = {0u}, inst_entries = {0u};
   reshade::api::resource inst_records = {0u}, inst_counters_buffer = {0u}, inst_moving = {0u};
+  reshade::api::resource inst_materials = {0u};
   reshade::api::resource inst_readback[bvh::kGcReadbackSlots] = {};
   reshade::api::resource_view inst_arena_srv = {0u}, inst_draws_srv = {0u}, inst_epochs_srv = {0u};
+  reshade::api::resource_view inst_materials_srv = {0u}, inst_records_srv = {0u};
   reshade::api::resource_view inst_meta_uav = {0u}, inst_entries_uav = {0u}, inst_records_uav = {0u}, inst_counters_uav = {0u},
                               inst_moving_uav = {0u};
   reshade::api::pipeline_layout inst_layout = {0u};
@@ -142,6 +150,18 @@ struct Rt12GcState {
   uint64_t inst_readback_busy = 0u;
   uint64_t inst_bytes = 0u;    // D3D11 bytes of the G3 objects (log and world_gc.json)
   bvh::GcInstanceCompare compare;
+  // G4 (D4, D5, D6): the TLAS bound, the settle latch and the material words.
+  std::vector<uint32_t> recent_out;
+  uint32_t bound = 0u;
+  uint64_t bound_misses = 0u;
+  bool settled_latch = false;
+  bool scene_dirty = true;
+  uint64_t scene_slot_version = ~0ull;
+  uint64_t materials_store_version = ~0ull, materials_slot_version = ~0ull;
+  uint32_t materials_present = 0u;
+  bool materials_trace_no_cpu_mesh = true, materials_alpha_foliage = false;
+  uint64_t alpha_inexact = 0u;
+  std::map<std::string, uint64_t> scene_no_cpu_mesh;
   bool failed = false;
   const char* failed_stage = "";
   HRESULT hr = S_OK;
@@ -154,6 +174,8 @@ inline std::atomic<bool> g_gc_check_requested{false}, g_gc_dump_requested{false}
 
 // A GC failure before any work is submitted: the D3D11 side is deactivated (the M5 path continues).
 inline void FailGc(Rt12GcState& gc, const char* stage, HRESULT hr) {
+  g_rt12_gc_scene = {};
+  g_rt12_gc_scene.not_ready = "failed";
   gc.failed = true;
   gc.failed_stage = stage;
   gc.hr = hr;
@@ -188,12 +210,14 @@ inline void StopGcDrawSide() {
   bvh::g_gpu_capture.next_slot = 0u;
   bvh::g_gpu_capture.free_slots.clear();
   std::fill(bvh::g_gpu_capture.slot_key.begin(), bvh::g_gpu_capture.slot_key.end(), 0u);
+  bvh::g_gpu_capture.slot_version += 1u;
   std::fill(bvh::g_gpu_capture.slot_epoch.begin(), bvh::g_gpu_capture.slot_epoch.end(), 0u);
   bvh::g_gpu_capture.epochs_dirty = true;
 }
 
 // Stops the cache (D16 and D15 teardown). A stuck or missing DXR state leaks its objects on purpose.
 inline void TeardownGc(reshade::api::device* device, const char* why) {
+  g_rt12_gc_scene = {};
   StopGcDrawSide();
   if (!g_rt12_gc) return;
   if (!g_rt12 || g_rt12->stuck) {
@@ -206,13 +230,13 @@ inline void TeardownGc(reshade::api::device* device, const char* why) {
   for (Rt12Shared& carrier : gc.carriers) RetireShared(s, carrier, s.last_signal);
   for (reshade::api::resource_view view : {gc.staging_srv, gc.results_uav, gc.inst_arena_srv, gc.inst_draws_srv, gc.inst_epochs_srv,
                                            gc.inst_meta_uav, gc.inst_entries_uav, gc.inst_records_uav, gc.inst_counters_uav,
-                                           gc.inst_moving_uav}) {
+                                           gc.inst_moving_uav, gc.inst_materials_srv, gc.inst_records_srv}) {
     if (view.handle != 0u) device->destroy_resource_view(view);
   }
   for (reshade::api::resource resource : {gc.staging, gc.results, gc.readback[0], gc.readback[1], gc.readback[2], gc.inst_arena,
                                           gc.inst_draws, gc.inst_epochs, gc.inst_meta, gc.inst_entries, gc.inst_records,
-                                          gc.inst_counters_buffer, gc.inst_moving, gc.inst_readback[0], gc.inst_readback[1],
-                                          gc.inst_readback[2]}) {
+                                          gc.inst_counters_buffer, gc.inst_moving, gc.inst_materials, gc.inst_readback[0],
+                                          gc.inst_readback[1], gc.inst_readback[2]}) {
     if (resource.handle != 0u) device->destroy_resource(resource);
   }
   if (gc.srv_table.handle != 0u) device->free_descriptor_table(gc.srv_table);
@@ -359,11 +383,15 @@ inline bool CreateGc(reshade::api::device* device, Rt12State& s, Rt12GcState& gc
                              RU::shader_resource | RU::copy_dest)) {
     return fail("instance epochs", E_FAIL);
   }
+  if (!bvh::CreatePoolBuffer(device, zero_slots.data(), bvh::kGcMaxEntries * 4u, 4u, &gc.inst_materials, &gc.inst_materials_srv,
+                             RU::shader_resource | RU::copy_dest)) {
+    return fail("instance materials", E_FAIL);
+  }
   if (!bvh::CreatePoolBuffer(device, zero_slots.data(), bvh::kGcMaxEntries * 4u, 4u, &gc.inst_moving, &gc.inst_moving_uav,
                              RU::unordered_access)) {
     return fail("instance moving", E_FAIL);
   }
-  gc.inst_bytes += 2u * bvh::kGcMaxEntries * 4u;
+  gc.inst_bytes += 3u * bvh::kGcMaxEntries * 4u;
   const std::vector<uint32_t> zero_meta(size_t{2} * bvh::kGcSetCapacity * 4u, 0u);
   if (!bvh::CreatePoolBuffer(device, zero_meta.data(), zero_meta.size() * 4u, 4u, &gc.inst_meta, &gc.inst_meta_uav,
                              RU::unordered_access)) {
@@ -375,12 +403,19 @@ inline bool CreateGc(reshade::api::device* device, Rt12State& s, Rt12GcState& gc
     return fail("instance entries", E_FAIL);
   }
   gc.inst_bytes += size_t{2} * bvh::kGcSetCapacity * sizeof(bvh::GcSetEntryGPU);
-  if (!bvh::CreatePoolBuffer(device, nullptr, (bvh::kGcSetCapacity + bvh::kGcMovingRecords) * sizeof(bvh::WorldInstanceGPU),
+  if (!bvh::CreatePoolBuffer(device, nullptr, (bvh::kGcSetCapacity + 2u * bvh::kGcMovingRecords) * sizeof(bvh::WorldInstanceGPU),
                              sizeof(bvh::WorldInstanceGPU), &gc.inst_records, &gc.inst_records_uav,
-                             RU::unordered_access | RU::copy_source)) {
+                             RU::shader_resource | RU::unordered_access | RU::copy_source)) {
     return fail("instance records", E_FAIL);
   }
-  gc.inst_bytes += (bvh::kGcSetCapacity + bvh::kGcMovingRecords) * sizeof(bvh::WorldInstanceGPU);
+  if (!device->create_resource_view(gc.inst_records, RU::shader_resource,
+                                    reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer,
+                                                                     reshade::api::format::unknown, 0,
+                                                                     bvh::kGcSetCapacity + 2u * bvh::kGcMovingRecords),
+                                    &gc.inst_records_srv)) {
+    return fail("instance records view", E_FAIL);
+  }
+  gc.inst_bytes += (bvh::kGcSetCapacity + 2u * bvh::kGcMovingRecords) * sizeof(bvh::WorldInstanceGPU);
   if (!bvh::CreatePoolBuffer(device, nullptr, bvh::kGcCounterCount * 4u, 4u, &gc.inst_counters_buffer, &gc.inst_counters_uav,
                              RU::unordered_access | RU::copy_source | RU::copy_dest)) {
     return fail("instance counters", E_FAIL);
@@ -400,7 +435,7 @@ inline bool CreateGc(reshade::api::device* device, Rt12State& s, Rt12GcState& gc
   }
   const HRESULT compare_query_hr = native11->CreateQuery(&event_desc, &gc.compare_done);
   if (FAILED(compare_query_hr)) return fail("compare query", compare_query_hr);
-  if (!make_layout(3u, 5u, &gc.inst_layout)) return fail("instance layout", E_FAIL);
+  if (!make_layout(4u, 5u, &gc.inst_layout)) return fail("instance layout", E_FAIL);
   if (!device->allocate_descriptor_table(gc.inst_layout, 0, &gc.inst_srv_table)
       || !device->allocate_descriptor_table(gc.inst_layout, 1, &gc.inst_uav_table)) {
     return fail("instance descriptor tables", E_FAIL);
@@ -685,6 +720,18 @@ inline void DumpGcCompareJson(const bvh::GcInstanceCompare& cmp, uint32_t presen
       << ", \"cpu_dup\": " << num(cmp.cpu_dup) << ",\n";
   out << "  \"gpu_no_cpu_mesh_by_state\": " << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_no_cpu_mesh_by_state))
       << ", \"gpu_only_by_state\": " << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_only_by_state)) << ",\n";
+  out << "  \"untraced\": " << num(cmp.untraced) << ", \"camera\": ";
+  if (timed_out || !cmp.camera_valid) {
+    out << "null";
+  } else {
+    out << "[" << bvh::PoolJsonFloat{cmp.camera[0]} << ", " << bvh::PoolJsonFloat{cmp.camera[1]} << ", "
+        << bvh::PoolJsonFloat{cmp.camera[2]} << "]";
+  }
+  out << ",\n  \"gpu_only_camera_by_distance\": "
+      << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_only_camera_by_distance))
+      << ", \"gpu_no_cpu_mesh_camera_by_distance\": "
+      << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_no_cpu_mesh_camera_by_distance))
+      << ", \"cpu_only_by_distance\": " << (timed_out ? std::string("null") : GcCountsJson(cmp.cpu_only_by_distance)) << ",\n";
   out << "  \"cpu_only\": {\"count\": " << num(cmp.cpu_only) << ", \"by_reason\": {\"done\": " << num(done)
       << ", \"done_unseen\": " << num(count_of("done_unseen")) << ", \"dynamic\": " << num(count_of("dynamic")) << ", \"pending\": "
       << num(count_of("pending")) << ", \"refused\": " << num(refused) << ", \"no_entry\": " << num(count_of("no_entry")) << ", \"no_entry_indirect\": " << num(count_of("no_entry_indirect"))
@@ -715,7 +762,7 @@ inline void DumpGcCompareJson(const bvh::GcInstanceCompare& cmp, uint32_t presen
 inline void RunGcInstanceCompare(reshade::api::device* device, reshade::api::command_list* cmd_list, ID3D11DeviceContext* context11,
                                  Rt12GcState& gc) {
   using RU = reshade::api::resource_usage;
-  const uint64_t records_bytes = uint64_t{bvh::kGcSetCapacity} * sizeof(bvh::WorldInstanceGPU);
+  const uint64_t records_bytes = uint64_t{bvh::kGcSetCapacity + bvh::kGcMovingRecords} * sizeof(bvh::WorldInstanceGPU);
   const uint64_t counters_bytes = uint64_t{bvh::kGcCounterCount} * 4u;
   reshade::api::resource readback = {0u};
   if (!device->create_resource(reshade::api::resource_desc(records_bytes + counters_bytes, reshade::api::memory_heap::gpu_to_cpu,
@@ -724,9 +771,9 @@ inline void RunGcInstanceCompare(reshade::api::device* device, reshade::api::com
     renodx::utils::log::w("[world-gc] compare: readback buffer failed");
     return;
   }
-  cmd_list->barrier(gc.inst_records, RU::unordered_access, RU::copy_source);
+  cmd_list->barrier(gc.inst_records, RU::shader_resource, RU::copy_source);
   cmd_list->copy_buffer_region(gc.inst_records, 0u, readback, 0u, records_bytes);
-  cmd_list->barrier(gc.inst_records, RU::copy_source, RU::unordered_access);
+  cmd_list->barrier(gc.inst_records, RU::copy_source, RU::shader_resource);
   cmd_list->copy_buffer_region(gc.inst_counters_buffer, 0u, readback, records_bytes, counters_bytes);
   context11->End(gc.compare_done.Get());
   context11->Flush();
@@ -764,19 +811,28 @@ inline void RunGcInstanceCompare(reshade::api::device* device, reshade::api::com
   uint32_t counters[bvh::kGcCounterCount] = {};
   std::memcpy(counters, static_cast<const uint8_t*>(mapped) + records_bytes, sizeof(counters));
   const uint32_t set_count = (std::min)(counters[bvh::kGcCounterSet], bvh::kGcSetCapacity);
-  std::vector<uint32_t> slots(set_count);
-  std::vector<bvh::GcCompareGpuInstance> gpu(set_count);
-  for (uint32_t r = 0u; r < set_count; ++r) {
-    slots[r] = static_cast<uint32_t>(records[r].header[0]);
-    std::memcpy(gpu[r].world, records[r].world, sizeof(gpu[r].world));
-    gpu[r].flags = static_cast<uint32_t>(records[r].visibility[2]);
+  const uint32_t out = (std::min)(counters[bvh::kGcCounterOut], bvh::kGcSetCapacity + bvh::kGcMovingRecords);
+  std::vector<uint32_t> slots;
+  std::vector<bvh::GcCompareGpuInstance> gpu;
+  slots.reserve(set_count);
+  gpu.reserve(set_count);
+  uint64_t untraced = 0u;
+  for (uint32_t r = 0u; r < out; ++r) {
+    if (records[r].visibility[3] > 0.5f) continue;  // a moving record of this present (G4): not a set entry
+    if (records[r].header[3] < 0.5f) untraced += 1u;
+    slots.push_back(static_cast<uint32_t>(records[r].header[0]));
+    bvh::GcCompareGpuInstance instance;
+    std::memcpy(instance.world, records[r].world, sizeof(instance.world));
+    instance.flags = static_cast<uint32_t>(records[r].visibility[2]);
+    gpu.push_back(instance);
   }
   device->unmap_buffer_region(readback);
   device->destroy_resource(readback);
+  const bvh::PoolCameraInfo camera = bvh::GetPoolCameraInfo();  // takes g_state.mutex: before the GC and pool locks
 
   {
     std::lock_guard lock(bvh::g_gpu_capture.mutex);
-    for (uint32_t r = 0u; r < set_count; ++r) {
+    for (size_t r = 0u; r < gpu.size(); ++r) {
       gpu[r].mesh_key = slots[r] < bvh::kGcMaxEntries ? bvh::g_gpu_capture.slot_key[slots[r]] : 0u;
     }
   }
@@ -854,10 +910,11 @@ inline void RunGcInstanceCompare(reshade::api::device* device, reshade::api::com
       }
     }
   }
-  result = bvh::GcCompareInstances(gpu, cpu, reasons);
+  result = bvh::GcCompareInstances(gpu, cpu, reasons, camera.valid ? camera.position : nullptr);
   result.wait_ms = QpcMsSince(start);
   result.set_count = set_count;
   result.moving_records = counters[bvh::kGcCounterMovingRecords];
+  result.untraced = untraced;
   gc.compare = result;
   std::string reason_text;
   for (const auto& [reason, count] : result.cpu_only_by_reason) {
@@ -874,7 +931,8 @@ inline void RunGcInstanceCompare(reshade::api::device* device, reshade::api::com
   renodx::utils::log::i("[world-gc] compare: set ", result.set_count, ", cpu ", result.cpu_instances, ", matched ", result.matched,
                         ", gpu-only ", result.gpu_only, " (alpha ", result.gpu_only_alpha, ", conflict ", result.gpu_only_alpha_conflict,
                         "), no cpu mesh ", result.gpu_no_cpu_mesh, ", cpu-only ", result.cpu_only, " (", reason_text, "), wait ",
-                        result.wait_ms, " ms, no-cpu-mesh states (", no_cpu_mesh_text, "), gpu-only states (", gpu_only_text, ")");
+                        result.wait_ms, " ms, no-cpu-mesh states (", no_cpu_mesh_text, "), gpu-only states (", gpu_only_text, "), untraced ",
+                        result.untraced);
   DumpGcCompareJson(result, gc.present, counters);
 }
 
@@ -1021,7 +1079,12 @@ inline void DumpGcJson(const Rt12GcState& gc) {
     out << "]}";
   }
   out << "]},\n  \"instances\": {\"capacity\": " << bvh::kGcSetCapacity << ", \"moving_capacity\": " << bvh::kGcMovingRecords
-      << ",\n    \"counters\": {\"set\": " << p.inst_counters[bvh::kGcCounterSet]
+      << ",\n    \"scene\": {\"ready\": " << (p.scene_ready ? "true" : "false") << ", \"not_ready\": \""
+      << bvh::PoolJsonEscape(p.scene_not_ready) << "\", \"bound\": " << p.bound << ", \"bound_misses\": " << p.bound_misses
+      << ", \"out\": " << p.inst_counters[bvh::kGcCounterOut] << ", \"alpha_waiting\": " << p.inst_counters[bvh::kGcCounterAlphaWaiting]
+      << ", \"no_cpu_mesh_records\": " << p.inst_counters[bvh::kGcCounterNoCpuMesh] << ", \"alpha_inexact\": " << p.alpha_inexact
+      << ", \"no_cpu_mesh_slots\": " << GcCountsJson(p.scene_no_cpu_mesh) << "},\n"
+      << "    \"counters\": {\"set\": " << p.inst_counters[bvh::kGcCounterSet]
       << ", \"inserted\": " << p.inst_counters[bvh::kGcCounterInserted] << ", \"hits\": " << p.inst_counters[bvh::kGcCounterHits]
       << ", \"kept\": " << p.inst_counters[bvh::kGcCounterKept] << ", \"aged\": " << p.inst_counters[bvh::kGcCounterAged]
       << ", \"dropped_epoch\": " << p.inst_counters[bvh::kGcCounterDroppedEpoch]
@@ -1035,7 +1098,8 @@ inline void DumpGcJson(const Rt12GcState& gc) {
       << ", \"indirect_empty\": " << p.inst_counters[bvh::kGcCounterIndirectEmpty]
       << ", \"indirect_mismatch\": " << p.inst_counters[bvh::kGcCounterIndirectMismatch]
       << ", \"indirect_truncated\": " << p.inst_counters[bvh::kGcCounterIndirectTruncated]
-      << "},\n    \"draw_side\": {\"draws\": " << p.stats.inst_draws << ", \"instances\": " << p.stats.inst_instances
+      << ", \"out\": " << p.inst_counters[bvh::kGcCounterOut] << ", \"alpha_waiting\": " << p.inst_counters[bvh::kGcCounterAlphaWaiting]
+      << ", \"no_cpu_mesh\": " << p.inst_counters[bvh::kGcCounterNoCpuMesh] << "},\n    \"draw_side\": {\"draws\": " << p.stats.inst_draws << ", \"instances\": " << p.stats.inst_instances
       << ", \"no_geometry\": " << p.stats.inst_no_geometry << ", \"deferred\": " << p.stats.inst_deferred
       << ", \"arena_full\": " << p.stats.inst_arena_full << ", \"draws_cap\": " << p.stats.inst_draws_cap << ", \"indirect_draws\": " << p.stats.inst_indirect_draws
       << ", \"indirect_unlearned\": " << p.stats.inst_indirect_unlearned << ", \"indirect_args_uav\": " << p.stats.inst_indirect_args_uav << "},\n"
@@ -1049,9 +1113,15 @@ inline void DumpGcJson(const Rt12GcState& gc) {
       << ", \"cpu_instances\": " << cmp.cpu_instances << ", \"matched\": " << cmp.matched << ", \"gpu_only\": " << cmp.gpu_only
       << ", \"gpu_only_alpha\": " << cmp.gpu_only_alpha << ", \"gpu_only_alpha_conflict\": " << cmp.gpu_only_alpha_conflict
       << ", \"gpu_no_cpu_mesh\": " << cmp.gpu_no_cpu_mesh << ", \"gpu_dup_content\": " << cmp.gpu_dup_content
-      << ", \"cpu_dup\": " << cmp.cpu_dup << ", \"cpu_only\": " << cmp.cpu_only << ", \"timeouts\": " << cmp.timeouts
-      << ", \"wait_ms\": " << bvh::PoolJsonFloat{static_cast<float>(cmp.wait_ms)} << ",\n      \"gpu_no_cpu_mesh_by_state\": " << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_no_cpu_mesh_by_state))
-      << ", \"gpu_only_by_state\": " << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_only_by_state)) << ",\n      \"cpu_only_by_reason\": {";
+      << ", \"cpu_dup\": " << cmp.cpu_dup << ", \"cpu_only\": " << cmp.cpu_only << ", \"untraced\": " << cmp.untraced
+      << ", \"timeouts\": " << cmp.timeouts << ", \"wait_ms\": " << bvh::PoolJsonFloat{static_cast<float>(cmp.wait_ms)}
+      << ",\n      \"gpu_no_cpu_mesh_by_state\": " << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_no_cpu_mesh_by_state))
+      << ", \"gpu_only_by_state\": " << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_only_by_state))
+      << ",\n      \"gpu_only_camera_by_distance\": " << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_only_camera_by_distance))
+      << ",\n      \"gpu_no_cpu_mesh_camera_by_distance\": "
+      << (timed_out ? std::string("null") : GcCountsJson(cmp.gpu_no_cpu_mesh_camera_by_distance))
+      << ",\n      \"cpu_only_by_distance\": " << (timed_out ? std::string("null") : GcCountsJson(cmp.cpu_only_by_distance))
+      << ",\n      \"cpu_only_by_reason\": {";
   bool first_reason = true;
   for (const auto& [reason, count] : cmp.cpu_only_by_reason) {
     out << (first_reason ? "" : ", ") << "\"" << bvh::PoolJsonEscape(reason) << "\": " << count;
@@ -1100,6 +1170,7 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
   const bool dxr_ok = g_rt12 && g_rt12->device == device && !g_rt12->failed && !g_rt12->stuck;
   // The state belongs to an earlier DXR state whose device is gone: no graphics call on its objects. Leaked on purpose.
   if (g_rt12_gc && g_rt12 && g_rt12_gc->owner != g_rt12.get()) {
+    g_rt12_gc_scene = {};
     StopGcDrawSide();
     g_rt12_gc.release();
     renodx::utils::log::w("[world-gc] teardown (owner mismatch): leaked");
@@ -1130,6 +1201,8 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
   Rt12State& s = *g_rt12;
   Rt12GcState& gc = *g_rt12_gc;
   if (gc.failed) {
+    g_rt12_gc_scene = {};
+    g_rt12_gc_scene.not_ready = "failed";
     std::lock_guard lock(g_gc_panel_mutex);
     g_gc_panel.state = "failed";
     g_gc_panel.failed_stage = gc.failed_stage;
@@ -1169,6 +1242,7 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
     gc.blas_bytes -= it->second.blas_bytes;
     gc.dead_bytes += GcMeshBytes(it->second.vertex_count, it->second.index_count, it->second.has_uv);
     gc.meshes.erase(it);
+    gc.scene_dirty = true;
     std::erase(gc.build_queue, mesh_key);
   }
 
@@ -1178,6 +1252,7 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
   if (gc.dead_bytes * 2u > used_bytes && used_bytes > (64ull << 20)) {
     for (auto& [mesh_key, mesh] : gc.meshes) RetireObject(s, s.last_signal, mesh.blas);
     gc.meshes.clear();
+    gc.scene_dirty = true;
     gc.build_queue.clear();
     gc.blas_bytes = 0u;
     for (Rt12Arena& arena : gc.arenas) arena.used = 0u;
@@ -1424,6 +1499,88 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
     }
   }
 
+  // 7a. G4 (D6): the material word of each GC slot (slice + 1 of its CPU mesh's alpha material, alpha-mesh, withheld and
+  // no-CPU-mesh bits), rebuilt when the store, the slots or a switch moved, and every kGcMaterialRefreshPresents.
+  const bvh::BvhDeviceData* bvh_data = bvh::GetBvhDeviceData(device);
+  const bool trace_no_cpu_mesh = bvh::g_gpu_capture.trace_no_cpu_mesh.load(std::memory_order_relaxed);
+  const bool alpha_foliage = bvh::g_pool.alpha_foliage.load(std::memory_order_relaxed);
+  uint64_t slot_version = 0u;
+  bool materials_stale = false;
+  std::vector<uint64_t> material_slot_keys;
+  {
+    std::lock_guard lock(bvh::g_gpu_capture.mutex);
+    slot_version = bvh::g_gpu_capture.slot_version;
+    materials_stale = bvh_data != nullptr
+                      && (bvh_data->store_version != gc.materials_store_version || slot_version != gc.materials_slot_version
+                          || trace_no_cpu_mesh != gc.materials_trace_no_cpu_mesh || alpha_foliage != gc.materials_alpha_foliage
+                          || present - gc.materials_present >= bvh::kGcMaterialRefreshPresents);
+    if (materials_stale) material_slot_keys = bvh::g_gpu_capture.slot_key;
+  }
+  if (materials_stale) {
+    struct SlotCpuMesh {
+      bool has_mesh = false;
+      bool alpha = false;
+      uint64_t uid = 0u;
+      std::string state;  // without a CPU mesh: "failed:<reason>", "queued" or "absent"
+    };
+    std::vector<SlotCpuMesh> slot_meshes(bvh::kGcMaxEntries);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      for (size_t slot = 0u; slot < material_slot_keys.size(); ++slot) {
+        const uint64_t mesh_key = material_slot_keys[slot];
+        if (mesh_key == 0u) continue;
+        SlotCpuMesh& cpu = slot_meshes[slot];
+        const auto mesh_it = bvh::g_pool.mesh_by_key.find(mesh_key);
+        if (mesh_it != bvh::g_pool.mesh_by_key.end() && mesh_it->second < bvh::g_pool.meshes.size()) {
+          const bvh::WorldMesh& mesh = bvh::g_pool.meshes[mesh_it->second];
+          cpu.has_mesh = true;
+          cpu.alpha = mesh.alpha;
+          cpu.uid = mesh.uid;
+        } else {
+          const auto failed = bvh::g_pool.failed_meshes.find(mesh_key);
+          if (failed != bvh::g_pool.failed_meshes.end()) {
+            cpu.state = std::string("failed:") + failed->second.reason;
+          } else {
+            cpu.state = bvh::g_pool.mesh_queued.count(mesh_key) != 0u ? "queued" : "absent";
+          }
+        }
+      }
+    }
+    std::vector<uint32_t> material_words(bvh::kGcMaxEntries, 0u);
+    gc.scene_no_cpu_mesh.clear();
+    gc.alpha_inexact = 0u;
+    for (size_t slot = 0u; slot < slot_meshes.size(); ++slot) {
+      const uint64_t mesh_key = material_slot_keys[slot];
+      if (mesh_key == 0u) continue;
+      const SlotCpuMesh& cpu = slot_meshes[slot];
+      if (!cpu.has_mesh) {
+        material_words[slot] = bvh::kGcMaterialNoCpuMesh | (trace_no_cpu_mesh ? 0u : bvh::kGcMaterialWithheld);
+        gc.scene_no_cpu_mesh[cpu.state] += 1u;
+        continue;
+      }
+      if (!cpu.alpha) continue;
+      material_words[slot] = bvh::kGcMaterialAlphaMesh;
+      const auto gc_mesh = gc.meshes.find(mesh_key);
+      const auto slice = bvh_data->alpha.slot_of_uid.find(cpu.uid);
+      if (alpha_foliage && slice != bvh_data->alpha.slot_of_uid.end() && gc_mesh != gc.meshes.end()) {
+        const Rt12GcMesh& mesh = gc_mesh->second;
+        float words16[16] = {};
+        if (Rt12GcMeshWords(mesh.v_off, mesh.vertex_count, mesh.i_off, mesh.index_count, mesh.has_uv, mesh.u_off, words16)) {
+          material_words[slot] |= (slice->second + 1u) & bvh::kGcMaterialSliceMask;
+        } else {
+          gc.alpha_inexact += 1u;
+        }
+      }
+    }
+    bvh::WriteBufferRange(device, immediate, gc.inst_materials, 4u, 0u, material_words.data(), material_words.size() * 4u, nullptr);
+    immediate->barrier(gc.inst_materials, RU::copy_dest, RU::shader_resource);
+    gc.materials_store_version = bvh_data->store_version;
+    gc.materials_slot_version = slot_version;
+    gc.materials_trace_no_cpu_mesh = trace_no_cpu_mesh;
+    gc.materials_alpha_foliage = alpha_foliage;
+    gc.materials_present = present;
+  }
+
   // 7b. G3: the instance set (D3) and its counters, read back by query (D3D11 only, no CPU wait).
   for (uint32_t age = 0u; age < bvh::kGcReadbackSlots; ++age) {
     const uint32_t slot = (present + age) % bvh::kGcReadbackSlots;
@@ -1438,6 +1595,10 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
     std::memcpy(gc.inst_counters, mapped, sizeof(gc.inst_counters));
     device->unmap_buffer_region(gc.inst_readback[slot]);
     gc.inst_pending[slot] = false;
+    if (gc.inst_counters[bvh::kGcCounterOut] > gc.bound) gc.bound_misses += 1u;
+    gc.recent_out.push_back(gc.inst_counters[bvh::kGcCounterOut]);
+    while (gc.recent_out.size() > bvh::kGcBoundHistory) gc.recent_out.erase(gc.recent_out.begin());
+    gc.bound = bvh::GcRecordsBound(gc.recent_out);
   }
   auto* cmd_list = immediate;
   if (!inst_epochs.empty()) {
@@ -1453,9 +1614,10 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
   const uint32_t zero_counters[bvh::kGcCounterCount] = {};
   bvh::WriteBufferRange(device, cmd_list, gc.inst_counters_buffer, 4u, 0u, zero_counters, sizeof(zero_counters), nullptr);
   cmd_list->barrier(gc.inst_counters_buffer, RU::copy_dest, RU::unordered_access);
+  cmd_list->barrier(gc.inst_records, RU::shader_resource, RU::unordered_access);
   bvh::BeginGpuTimer(device, cmd_list, &gc.inst_timer);
-  const reshade::api::resource_view inst_srvs[3] = {gc.inst_arena_srv, gc.inst_draws_srv, gc.inst_epochs_srv};
-  const reshade::api::descriptor_table_update inst_srv_update = {gc.inst_srv_table, 0, 0, 3, DT::shader_resource_view, inst_srvs};
+  const reshade::api::resource_view inst_srvs[4] = {gc.inst_arena_srv, gc.inst_draws_srv, gc.inst_epochs_srv, gc.inst_materials_srv};
+  const reshade::api::descriptor_table_update inst_srv_update = {gc.inst_srv_table, 0, 0, 4, DT::shader_resource_view, inst_srvs};
   device->update_descriptor_tables(1, &inst_srv_update);
   const reshade::api::resource_view inst_uavs[5] = {gc.inst_meta_uav, gc.inst_entries_uav, gc.inst_records_uav, gc.inst_counters_uav,
                                                     gc.inst_moving_uav};
@@ -1495,6 +1657,7 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
   const reshade::api::resource_view null_inst_uavs[5] = {{0u}, {0u}, {0u}, {0u}, {0u}};
   const reshade::api::descriptor_table_update inst_uav_unbind = {gc.inst_uav_table, 0, 0, 5, DT::unordered_access_view, null_inst_uavs};
   device->update_descriptor_tables(1, &inst_uav_unbind);
+  cmd_list->barrier(gc.inst_records, RU::unordered_access, RU::shader_resource);
   cmd_list->bind_descriptor_tables(DS::all_compute, gc.inst_layout, 1, 1, &gc.inst_uav_table);
   bvh::EndGpuTimer(cmd_list, &gc.inst_timer);
   cmd_list->barrier(gc.inst_counters_buffer, RU::unordered_access, RU::copy_source);
@@ -1822,6 +1985,7 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
       mesh.blas = build.result;
       mesh.blas_bytes = build.result_bytes;
       gc.blas_bytes += build.result_bytes;
+      gc.scene_dirty = true;
     }
     gc.build_queue.erase(gc.build_queue.begin(), gc.build_queue.begin() + static_cast<std::ptrdiff_t>(builds.size()));
     gc.blas_peak = (std::max)(gc.blas_peak, gc.blas_bytes);
@@ -1834,11 +1998,17 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
   // 12. Pending meshes (the settle line), the geometry and BLAS peaks, and the panel copy.
   uint64_t phase_counts[6] = {};
   bvh::GcStats stats;
+  bool settle_reset = false;
+  std::vector<uint64_t> scene_slot_keys;
   {
     std::lock_guard lock(bvh::g_gpu_capture.mutex);
     for (const auto& [mesh_key, entry] : bvh::g_gpu_capture.entries) phase_counts[static_cast<uint32_t>(entry.phase)] += 1u;
     stats = bvh::g_gpu_capture.stats;
+    settle_reset = bvh::g_gpu_capture.settle_reset;
+    bvh::g_gpu_capture.settle_reset = false;
+    if (gc.scene_dirty || slot_version != gc.scene_slot_version) scene_slot_keys = bvh::g_gpu_capture.slot_key;
   }
+  if (settle_reset) gc.settled_latch = false;
   const uint64_t pending = phase_counts[0] + phase_counts[1] + phase_counts[2] + phase_counts[3] + gc.build_queue.size();
   if (pending > 0u && gc.pending_peak == 0u) {
     gc.pending_since = present;
@@ -1846,6 +2016,7 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
   }
   gc.pending_peak = (std::max)(gc.pending_peak, pending);
   if (pending == 0u) {
+    gc.settled_latch = true;
     if (gc.pending_peak >= bvh::kPoolMassRetireMeshes) {
       Rt12GcSettle settle;
       settle.meshes = gc.meshes.size();
@@ -1898,6 +2069,47 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
   panel.inst_ms_sum = gc.inst_timer.ms_sum;
   panel.inst_ms_n = gc.inst_timer.samples;
   panel.compare = gc.compare;
+  // 12b. G4 (D5, D7): the GPU-cache scene for RunRtaoPassA (raw pointers, valid until the next present), and the mesh and
+  // address tables when the slot keys moved.
+  if (!scene_slot_keys.empty()) {
+    g_rt12_gc_scene.meshes.assign(size_t{bvh::kGcMaxEntries} * 16u, 0.f);
+    g_rt12_gc_scene.addresses.assign(bvh::kGcMaxEntries, 0u);
+    for (size_t slot = 0u; slot < scene_slot_keys.size(); ++slot) {
+      const auto mesh_it = gc.meshes.find(scene_slot_keys[slot]);
+      if (mesh_it == gc.meshes.end()) continue;
+      const Rt12GcMesh& mesh = mesh_it->second;
+      Rt12GcMeshWords(mesh.v_off, mesh.vertex_count, mesh.i_off, mesh.index_count, mesh.has_uv, mesh.u_off, &g_rt12_gc_scene.meshes[slot * 16u]);
+      g_rt12_gc_scene.addresses[slot] = (mesh.blas != nullptr ? mesh.blas->GetGPUVirtualAddress() : 0u);
+    }
+    g_rt12_gc_scene.version = ++g_rt12_gc_epoch;
+    gc.scene_dirty = false;
+    gc.scene_slot_version = slot_version;
+  }
+  const bool arenas_ready = gc.arenas[kRt12ArenaIndices].buffer != nullptr && gc.arenas[kRt12ArenaUvs].buffer != nullptr;
+  const char* not_ready = "";
+  if (!gc.settled_latch) {
+    not_ready = "not_settled";
+  } else if (gc.recent_out.empty()) {
+    not_ready = "no_counters";
+  } else if (!arenas_ready) {
+    not_ready = "no_geometry";
+  } else if (g_rt12_gc_scene.version == 0u) {
+    not_ready = "no_tables";
+  }
+  g_rt12_gc_scene.indices = gc.arenas[kRt12ArenaIndices].buffer.Get();
+  g_rt12_gc_scene.index_count = gc.arenas[kRt12ArenaIndices].used;
+  g_rt12_gc_scene.uvs = gc.arenas[kRt12ArenaUvs].buffer.Get();
+  g_rt12_gc_scene.uv_count = gc.arenas[kRt12ArenaUvs].used;
+  g_rt12_gc_scene.records_srv = gc.inst_records_srv;
+  g_rt12_gc_scene.bound = gc.bound;
+  g_rt12_gc_scene.not_ready = not_ready;
+  g_rt12_gc_scene.ready = (*not_ready == '\0');
+  panel.scene_ready = g_rt12_gc_scene.ready;
+  panel.scene_not_ready = not_ready;
+  panel.bound = gc.bound;
+  panel.bound_misses = gc.bound_misses;
+  panel.alpha_inexact = gc.alpha_inexact;
+  panel.scene_no_cpu_mesh = gc.scene_no_cpu_mesh;
   {
     std::lock_guard lock(g_gc_panel_mutex);
     g_gc_panel = std::move(panel);

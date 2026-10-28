@@ -28,6 +28,13 @@
 #define GC_COUNTER_INDIRECT_EMPTY 15u
 #define GC_COUNTER_INDIRECT_MISMATCH 16u
 #define GC_COUNTER_INDIRECT_TRUNCATED 17u
+#define GC_COUNTER_OUT 18u  // kGcCounter* / kGcMaterial* (gpu_capture.hpp, G4)
+#define GC_COUNTER_ALPHA_WAITING 19u
+#define GC_COUNTER_NO_CPU_MESH 20u
+#define GC_MATERIAL_SLICE_MASK 0x00FFFFFFu
+#define GC_MATERIAL_ALPHA_MESH 0x20000000u
+#define GC_MATERIAL_WITHHELD 0x40000000u
+#define GC_MATERIAL_NO_CPU_MESH 0x80000000u
 #define GC_NO_ARGS 0xFFFFFFFFu  // kGcNoArgs
 #define GC_PASS_CAMERA 1u   // kPoolPass* (bvh_pool.hpp)
 #define GC_PASS_LIGHT 8u
@@ -64,6 +71,7 @@ struct GcSetEntry  // gpu_capture.hpp GcSetEntryGPU (64 bytes)
 ByteAddressBuffer g_gc_arena : register(t0);                  // instance slices (160 bytes per element)
 StructuredBuffer<GcInstanceDraw> g_gc_draws : register(t1);
 StructuredBuffer<uint> g_gc_epochs : register(t2);            // per slot
+StructuredBuffer<uint> g_gc_materials : register(t3);  // G4 (D6): per slot material word
 RWStructuredBuffer<uint> g_gc_meta : register(u0);            // per set index: tag, last_seen, flags, 0
 RWStructuredBuffer<GcSetEntry> g_gc_entries : register(u1);
 RWStructuredBuffer<WorldInstanceGPU> g_gc_records : register(u2);
@@ -96,11 +104,20 @@ uint GcSetInsert(uint base, uint capacity, uint max_probes, uint pose_lo, uint p
     return 2u;
 }
 
-// D8: header (slot, 0, 0, 1); bounds are the translation point (no mesh box on this path; DXR uses the BLAS).
-WorldInstanceGPU GcMakeRecord(uint slot, float4 r0, float4 r1, float4 r2, float4 inverse_rows[3], uint flags)
+// D8 / G4 (D3, D6): header (slot, 0, slice + 1, valid); valid is 0 for an alpha mesh whose slot has no
+// slice (counted alpha waiting) and for a withheld slot. bounds = the translation point (DXR uses the BLAS).
+// visibility.w = 1 marks a per-present moving record (the compare skips it; DXR does not read it).
+WorldInstanceGPU GcMakeRecord(uint slot, float4 r0, float4 r1, float4 r2, float4 inverse_rows[3], uint flags, bool moving)
 {
+    const uint material_word = g_gc_materials[slot];
+    const uint slice = material_word & GC_MATERIAL_SLICE_MASK;
+    const bool alpha = (material_word & GC_MATERIAL_ALPHA_MESH) != 0u;  // M5: mesh alpha only (kInstanceAlphaTested)
+    const bool waiting = alpha && slice == 0u;
+    const bool withheld = (material_word & GC_MATERIAL_WITHHELD) != 0u;
+    if (waiting) InterlockedAdd(g_gc_counters[GC_COUNTER_ALPHA_WAITING], 1u);
+    if ((material_word & GC_MATERIAL_NO_CPU_MESH) != 0u) InterlockedAdd(g_gc_counters[GC_COUNTER_NO_CPU_MESH], 1u);
     WorldInstanceGPU record;
-    record.header = float4((float)slot, 0.0, 0.0, 1.0);
+    record.header = float4((float)slot, 0.0, (float)slice, (waiting || withheld) ? 0.0 : 1.0);
     record.world[0] = r0;
     record.world[1] = r1;
     record.world[2] = r2;
@@ -112,6 +129,6 @@ WorldInstanceGPU GcMakeRecord(uint slot, float4 r0, float4 r1, float4 r2, float4
     const float4 translation = float4(r0.w, r1.w, r2.w, 0.0);
     record.bounds_min = translation;
     record.bounds_max = translation;
-    record.visibility = float4(0.0, 0.0, (float)flags, 0.0);
+    record.visibility = float4(0.0, 0.0, (float)((flags & ~16u) | (alpha ? 16u : 0u)), moving ? 1.0 : 0.0);
     return record;
 }

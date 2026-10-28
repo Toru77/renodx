@@ -87,6 +87,7 @@ R1b-0 (diagnostic, startup hook-off mask), implemented, not validated in game: `
 | GPU geometry cache G2 (validation only, not traced) | Owner test in Reference: GPU geometry cache (G2) | world/bvh/gpu_capture.hpp, world/rt12/rt12_capture.hpp, world/shaders/world_gc_range.cs_5_0.hlsl, world_gc_decode.cs_5_0.hlsl |
 | GPU instance set G3 (validation only, not traced) | Owner test in Reference: GPU instance set (G3) | world/bvh/gpu_capture.hpp, world/rt12/rt12_capture.hpp, world/shaders/world_gc_instance.hlsli, world_gc_insert.cs_5_0.hlsl, world_gc_compact.cs_5_0.hlsl, world_instance_math.hlsli |
 | GPU instance set G3b (indirect draws; validation only, not traced) | Owner test in Reference: indirect draws in the GPU instance set (G3b) | world/bvh/bvh_pool.hpp, world/bvh/gpu_capture.hpp, world/shaders/world_gc_insert.cs_5_0.hlsl |
+| GPU scene on DXR RTAO G4 (sub-switch, default ON with the cache) | Owner test in Reference: GPU scene on DXR RTAO (G4) | world/rt12/rt12_backend.hpp, world/rt12/rt12_capture.hpp, world/bvh/gpu_capture.hpp, world/shaders/world_gc_*.hlsl* |
 
 ## Reference
 
@@ -279,11 +280,11 @@ Architecture, per frame:
 
 Decisions: sync through `renodx::utils::gpu_fence` only (no CPU wait per frame). Every D3D12 submission first waits on the previous one (`QueueWait` on `last_signal`), so buffers are reused in place after their slot's fence completed. A busy slot means a compute fallback (lighting) or a deferral with order kept (present). Stuck = no fence progress for 2000 ms with work pending: DXR disabled for the session, objects leaked on purpose. Teardown waits at most 2000 ms, then leaks. Instances are `data->tlas_instances_cpu` minus holes, instances without a BLAS and bad mesh ids; `InstanceID` is the index into the full array. Masks: 1 camera-visible plain, 2 foliage or alpha-tested, 4 shadow-only. `TRIANGLE_CULL_DISABLE` always; `FORCE_NON_OPAQUE` for alpha materials. Invalid triangles are degenerate `0,0,0` in the D3D12 index copy only. Alpha: the atlas is copied into a shared mirror, the materials are mirrored on CPU writes (kept whether or not DXR is on). Near fade is not applied on DXR (RTAO's view uses floor 1.0). Characters are traced on DXR since M4 (see the M4 section); P2b records are not (M5). Inputs and outputs cross as textures only (buffer sharing does not work).
 
-Fallback reasons (`Rt12ReasonName`, panel `fallback_frames`): off, not_created, create_failed, no_dxr, fence_error, stuck, discovery, busy, context_mismatch, tlas_empty, alpha_mirror, target_failed, submit_failed, characters, tracing (a traced frame).
+Fallback reasons (`Rt12ReasonName`, panel `fallback_frames`): off, not_created, create_failed, no_dxr, fence_error, stuck, discovery, busy, context_mismatch, tlas_empty, alpha_mirror, target_failed, submit_failed, characters, tracing (a traced frame), gpu_capture (GC scene not ready, G4).
 
 Panel lines (GPU BVH (live) section): `DXR: <reason>  traced <n>  busy <n>  wrapped <yes|no>` (+ `STUCK (objects leaked)`, + `failed at <stage> hr=`); `DXR scene: <meshes> meshes, <BLAS> BLAS (<MB>), TLAS <n> (no BLAS, holes, bad mesh), sanitized triangles, alpha mirror`; `DXR GPU ms (D3D12 timestamps, avg): BLAS, TLAS, trace` (`--` without a sample); line 2 adds `characters <n> (<BLAS> BLAS, <MB>, builds, refits)` and the GPU ms line adds `characters <ms>`; the P2b note appears when the last traced frame had P2b records.
 
-`world_rt12.json` (Dump DXR JSON, schema 1): switch_on, reason, failed_stage, hr, wrapped, stuck, leaked, alpha_mirror, traced_frames, fallback_frames, busy_frames, present_submits, present_skipped_busy, lighting_submits, blas_count, blas_bytes, mesh_count, arena_bytes, tlas_instances, tlas_no_blas, tlas_holes, tlas_bad_mesh, tlas_bytes, sanitized_triangles, atlas_copies, noise_copies, gpu_ms (blas, tlas, trace, dynamic {last, avg}, avg), dynamic_objects, dynamic_vertices, dynamic_builds, dynamic_refits, dynamic_blas_count, dynamic_blas_bytes, p2b_records_not_traced (schema 1 is kept: M4 added keys and removed characters_not_traced).
+`world_rt12.json` (Dump DXR JSON, schema 1): switch_on, reason, failed_stage, hr, wrapped, stuck, leaked, alpha_mirror, traced_frames, fallback_frames, busy_frames, present_submits, present_skipped_busy, lighting_submits, blas_count, blas_bytes, mesh_count, arena_bytes, tlas_instances, tlas_no_blas, tlas_holes, tlas_bad_mesh, tlas_bytes, sanitized_triangles, atlas_copies, noise_copies, gpu_ms (blas, tlas, trace, dynamic {last, avg}, avg), dynamic_objects, dynamic_vertices, dynamic_builds, dynamic_refits, dynamic_blas_count, dynamic_blas_bytes, p2b_records_not_traced, gpu_capture {traced_frames, records, not_ready} (G4) (schema 1 is kept: M4 added keys and removed characters_not_traced).
 
 Owner test (DevKit build; RTAO on, Trace characters OFF, P2b OFF, Two-Sided discovery OFF): (1) baseline with DXR OFF: 30 s Performance test at a fixed spot, screenshot, Read RTAO Stats. (2) Tick DXR: a few frames without RT, panel `DXR: tracing`, log `[world-rt12] created (wrapped yes, ...)`. (3) Same spot: screenshots and RTAO Debug 1 ON and OFF, Read RTAO Stats, 30 s test: same AO (edge differences allowed), rays and hits within a few percent. (4) Alpha-tested foliage: screenshots ON and OFF, panel `alpha mirror yes`. (5) Two map transitions: `no BLAS` back to 0, busy small, no STUCK. (6) Switch OFF, ON, OFF quickly: no crash, `[world-rt12] teardown (switch off)`. (7) Exit with the switch ON: no crash. (8) Send `world_rt12.json` (after steps 3 and 5), both `world_rtao.json`, both perf files, the screenshots, the `[world-rt12]` log lines and the four panel lines.
 
@@ -402,7 +403,7 @@ Deviations (planner decisions, with reasons):
 - Closed G3 to-dos: the hash-pose check (to-do a) and deferred counting (to-do b), as marked above.
 - Pin check: test_live 2760, 3011, 3472 and test_motion 700, 1092 are the same checks as HEAD, with unchanged text.
 
-G4 to-do list: G3b (indirect draws): done; a region filter in compact; record bounds from a mesh box; header.z material; record ranges are [0, set) and [65536, +moving); the 60-present hold rule versus the CPU repeat/stale rule (`NotePoolMotion`, not transcribed).
+G4 to-do list: G3b (indirect draws): done; header.z material and record ranges (compacted to [0, out)): done in G4; a region filter in compact and record bounds from a mesh box stay open; the 60-present hold rule versus the CPU repeat/stale rule (`NotePoolMotion`, not transcribed).
 - G4 to-do (a): one pose per hash tested; widen the CPU/GPU hash check. Closed in G4-0: test_gpu_p2b P6 checks every live entry's pose hash against its own world.
 - G4 to-do (b): deferred instance draws of entries not yet Done are counted only in `deferred_skips`. Closed in G4-0: a deferred draw with instances also counts `inst_deferred`.
 - G4 to-do (c): flags are merged across all sightings of an entry. Accepted, no code: the union of all sightings is the compute path's rule (G4 design D12).
@@ -445,6 +446,38 @@ Owner test (DevKit build; RTAO on, DXR on, Trace characters on, P2b on). Avoid D
 5. Send both `world_gc_compare_f*.json`, `world_gc.json`, the GPU-instances and compare panel lines and the `[world-gc]` lines.
 
 Pass (village): no TIMEOUT; `no_entry_indirect` + `no_entry_indirect_untracked` at most 1% of `cpu_instances`; `matched / cpu_instances` at least 0.90 (0.49 before G3b); `match_ratio` at least 0.99; `inst_arena_full` 0 and `inst_draws_cap` 0; overflow 0 / 0 / 0; indirect mismatch at most 1% of indirect draws. Anything else: send the files to the planner.
+
+### GPU scene on DXR RTAO (G4): reference
+
+Switch: "GPU geometry cache (experimental)" with the sub-switch "Trace the GPU scene" (`bvh::g_gpu_capture.trace`, default ON, session only). With DXR on, DXR RTAO pass A traces a TLAS built from the G3 instance records (set and moving, compacted to `[0, out)`) plus the characters, against the G2 BLAS, instead of the M3 mirror and the M5 P2b records. "Trace meshes the CPU pool lacks" (`trace_no_cpu_mesh`, default ON) withholds the GPU records whose key has no CPU mesh; OFF is the parity run against M5. Switch OFF is the M5 path (the mirror is re-streamed once).
+
+Design (short form of the G4 plan):
+- D1 `GcOwnsRtao()` = cache enabled AND trace (user intent, not readiness).
+- D2 the mirror arenas and BLAS are dropped while tracing (VRAM) and re-streamed when tracing stops (`mirror off (GPU capture traces)` / `mirror on (re-stream)`). `SubmitPresent` reads the vertex and index arenas null-safely; nothing else there changed.
+- D3 records: set and moving records compacted to `[0, out)`; moving records are staged at `[capacity + moving_capacity, +moving_capacity)` and have `visibility.w = 1`. Clear zeroes headers of `[0, capacity + moving_capacity)`.
+- D4 TLAS bound without readback: `GcRecordsBound` = `largest + max(2048, largest / 4)` over the last 8 counter reads, aligned to 1024, capped at 73728. `bound_misses` counts reads above the bound in force.
+- D5 readiness: `ready` when the settle latch is set (set at `pending == 0`, cleared by `ResetGpuCaptureEntries`), at least one counter read exists and both GC arenas exist and a GC table was published (version != 0). Sub-reasons in order: `not_settled`, `no_counters`, `no_geometry`, `no_tables`; the frame then runs the compute pass with reason `gpu_capture`.
+- D6 material word per GC slot (`g_gc_materials`, t3): bits 0-23 alpha slice + 1 (0 none); bit 29 `GC_MATERIAL_ALPHA_MESH` (CPU mesh alpha); bit 30 `GC_MATERIAL_WITHHELD`; bit 31 `GC_MATERIAL_NO_CPU_MESH`. Rebuilt when the pool store, the slot keys or a switch changed, and at least every 64 presents. A record is waiting (count 19, invalid) when its CPU mesh is alpha (bit 29; draw flag 16 is ignored, as M5) and has no slice. The record's flag 16 is the mesh alpha bit, as M5.
+- D7 `g_rt12_gc_scene` (raw pointers, written in `OnGcPresent` 12b, read by `RunRtaoPassA`); reset in `TeardownGc`, `FailGc`, the owner mismatch, the failed branch and `TeardownRt12`. `version` comes from `g_rt12_gc_epoch` (never reset), so a lighting slot's `gc_version` never matches a later session; 0 = no table yet.
+- D8 `RunRtaoPassA` with GC mode: no static part and no P2b; descs = characters; the GC records are copied into `s.gc_records` (4096 x 216 texels); per-lighting-slot GC mesh and address tables (`L.gc_meshes`, `L.gc_addresses`) are uploaded when the scene version moved.
+- D9 ordering: unchanged from G3 (records written in present N are copied by lighting N+1 before present N+1 rewrites them).
+- D10 `Rt12Reason::GpuCapture` ("gpu_capture") appended last; `kRt12ReasonCount` = 17.
+- D11 GC mode does not trace the CPU P2b records on DXR; compute still traces P2b.
+
+Counters (`kGcCounterCount` stays 32): 18 `kGcCounterOut` (records written this present), 19 `kGcCounterAlphaWaiting` (alpha records without a slice), 20 `kGcCounterNoCpuMesh` (records written for a slot without a CPU mesh, traced or withheld). Panel: DXR line `GPU scene traced N` (and `(not ready: <sub-reason>)`), GPU instances line `out, bound (misses), alpha waiting, no CPU mesh, scene`, compare line `untraced`. JSON: `gpu_capture` in `rt12_*.json`, `instances.scene` and counters 18-20 in `world_gc.json`, `untraced`, `camera` and the distance maps (`lt16m`, `lt64m`, `lt256m`, `far`) in `world_gc_compare_f*.json`. Per-slot no-CPU-mesh states (`failed:<reason>`, `queued`, `absent`) are in `scene.no_cpu_mesh_slots`.
+
+Q2 (476 `failed:vertex range larger than the mesh staging` records): GPU records of keys the CPU pool failed (a failed key is never requeued). G2 accepts them under the same 4 MB rule, so the GPU geometry is valid by G2's own checks; the CPU failure cause is not known. G4 traces them by default and counts them (counter 20 and the per-state map); the parity run withholds them.
+Q3 (re-enable stall): G4 changes no create, teardown or present order of the cache beyond the new objects inside the existing G3 block, and the two new D3D11 buffers are destroyed in the existing lists. The stall mechanism is not diagnosed.
+
+Owner test (DevKit build; RTAO on, Trace characters on, P2b on, Performance Gather on). Never turn DXR off and on and then the cache on. Compute runs last in a session.
+1. Start with DXR ON, cache OFF. Wait for `DXR: tracing`. M5 captures: 30 s Performance test, RTAO Stats, screenshot, RTAO Debug 1, Dump DXR JSON.
+2. Cache ON (trace ON). Log `mirror off (GPU capture traces)`. Wait for `[world-gc] settled` and `GPU scene traced` rising with no `not ready`. GC captures, then Compare GPU instances and Dump GPU cache JSON.
+3. Untick "Trace meshes the CPU pool lacks": GC-withheld captures and Compare again. Tick it again.
+4. Near a moving object: occlusion follows with no lag beyond one frame, no ghost.
+5. Trace OFF: log `mirror on (re-stream)`; DXR back to M5 after a few frames; trace ON again.
+6. Session 1 exits with DXR, cache and trace ON. Session 2: cache OFF, ON, OFF, then DXR OFF and compute captures; exit.
+
+Pass: no crash or STUCK; `gpu_capture` frames only before `settled` and during loads; `bound misses` 0 after settle; GC-withheld rays within 1% and hits within 5% of M5 at both spots; differences of GC versus GC-withheld match `gpu_no_cpu_mesh_camera_by_distance` near buckets; `untraced` and alpha waiting small after settle. Frame time and GPU ms are reported for the planner.
 
 ## Open decisions
 

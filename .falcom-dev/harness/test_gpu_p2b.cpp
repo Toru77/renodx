@@ -228,6 +228,7 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
   const Mat12 p7_prev[8] = {identity, zero, translate(62.f, 0.f, 0.f), translate(63.f, 0.f, 0.f),
                             translate(40000.004f, 0.f, 0.f), translate(40000.03f, 0.f, 0.f), nan_prev, translate(80.f, 0.f, 0.f)};
   for (uint32_t i = 0u; i < 8u; ++i) put(200u + i, p7_world[i], p7_prev[i]);
+  for (uint32_t i = 0u; i < 5u; ++i) put(400u + i, translate(130.f + 10.f * static_cast<float>(i), 0.f, 0.f), zero);  // G4 P8
 
   const auto make_buffer = [device](UINT bytes, UINT bind, UINT misc, UINT stride, const void* init) {
     return MakeBuffer(device, bytes, bind, misc, stride, init);
@@ -245,7 +246,7 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
   const std::vector<uint32_t> zero_words(kSlots, 0u);
   const std::vector<uint32_t> zero_counters(bvh::kGcCounterCount, 0u);
   const std::vector<uint8_t> zero_entries(2u * kCapacity * sizeof(bvh::GcSetEntryGPU), 0u);
-  const std::vector<uint8_t> zero_records((kCapacity + kMovingCapacity) * sizeof(bvh::WorldInstanceGPU), 0u);
+  const std::vector<uint8_t> zero_records((kCapacity + 2u * kMovingCapacity) * sizeof(bvh::WorldInstanceGPU), 0u);
   ID3D11Buffer* arena_buffer = make_buffer(kElements * 160u, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0u,
                                            arena.data());
   ID3D11Buffer* draws_buffer = make_buffer(kSlots * sizeof(bvh::GcInstanceDrawGPU), D3D11_BIND_SHADER_RESOURCE,
@@ -262,13 +263,15 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
                                               zero_counters.data());
   ID3D11Buffer* moving_buffer = make_buffer(kSlots * 4u, D3D11_BIND_UNORDERED_ACCESS, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 4u,
                                             zero_words.data());
+  ID3D11Buffer* materials_buffer = make_buffer(kSlots * 4u, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 4u,
+                                               zero_words.data());
   ID3D11Buffer* cb_buffer = make_buffer(64u, D3D11_BIND_CONSTANT_BUFFER, 0u, 0u, nullptr);
   CHECK(arena_buffer && draws_buffer && epochs_buffer && meta_buffer && entries_buffer && records_buffer && counters_buffer
-            && moving_buffer && cb_buffer,
+            && moving_buffer && materials_buffer && cb_buffer,
         "G3 buffers");
   if (arena_buffer == nullptr || draws_buffer == nullptr || epochs_buffer == nullptr || meta_buffer == nullptr
       || entries_buffer == nullptr || records_buffer == nullptr || counters_buffer == nullptr || moving_buffer == nullptr
-      || cb_buffer == nullptr) {
+      || materials_buffer == nullptr || cb_buffer == nullptr) {
     return;
   }
   D3D11_SHADER_RESOURCE_VIEW_DESC arena_desc = {};
@@ -278,9 +281,11 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
   arena_desc.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
   ID3D11ShaderResourceView* arena_srv = nullptr;
   device->CreateShaderResourceView(arena_buffer, &arena_desc, &arena_srv);
-  ID3D11ShaderResourceView* srvs[3] = {arena_srv, MakeSrv(device, draws_buffer, kSlots), MakeSrv(device, epochs_buffer, kSlots)};
+  ID3D11ShaderResourceView* srvs[4] = {arena_srv, MakeSrv(device, draws_buffer, kSlots), MakeSrv(device, epochs_buffer, kSlots),
+                                       MakeSrv(device, materials_buffer, kSlots)};
   ID3D11UnorderedAccessView* uavs[5] = {make_uav(meta_buffer, 2u * kCapacity * 4u), make_uav(entries_buffer, 2u * kCapacity),
-                                        make_uav(records_buffer, kCapacity + kMovingCapacity), make_uav(counters_buffer, bvh::kGcCounterCount),
+                                        make_uav(records_buffer, kCapacity + 2u * kMovingCapacity),
+                                        make_uav(counters_buffer, bvh::kGcCounterCount),
                                         make_uav(moving_buffer, kSlots)};
 
   std::vector<uint32_t> epochs(kSlots, 0u);
@@ -296,7 +301,7 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
     context->UpdateSubresource(draws_buffer, 0u, nullptr, padded.data(), 0u, 0u);
     context->UpdateSubresource(epochs_buffer, 0u, nullptr, epochs.data(), 0u, 0u);
     context->UpdateSubresource(counters_buffer, 0u, nullptr, zero_counters.data(), 0u, 0u);
-    context->CSSetShaderResources(0u, 3u, srvs);
+    context->CSSetShaderResources(0u, 4u, srvs);
     context->CSSetUnorderedAccessViews(0u, 5u, uavs, nullptr);
     context->CSSetConstantBuffers(0u, 1u, &cb_buffer);
     uint32_t words[16] = {0u, frame, src, dst, draw_count, kCapacity, bits(bvh::kPoolMinScale), bits(bvh::kPoolMaxScale),
@@ -313,9 +318,9 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
     dispatch(bvh::kGcModeRehash, kCapacity / 64u, insert_shader);
     if (draw_count != 0u) dispatch(bvh::kGcModeInsert, draw_count, insert_shader);
     dispatch(0u, kCapacity / 64u, compact_shader);
-    ID3D11ShaderResourceView* nulls[3] = {nullptr, nullptr, nullptr};
+    ID3D11ShaderResourceView* nulls[4] = {nullptr, nullptr, nullptr, nullptr};
     ID3D11UnorderedAccessView* null_uavs[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
-    context->CSSetShaderResources(0u, 3u, nulls);
+    context->CSSetShaderResources(0u, 4u, nulls);
     context->CSSetUnorderedAccessViews(0u, 5u, null_uavs, nullptr);
     current = 1u - current;
     const std::vector<uint8_t> raw = Readback(device, context, counters_buffer, bvh::kGcCounterCount * 4u);
@@ -356,11 +361,20 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
   CHECK(c[bvh::kGcCounterInvalid] == 1u && c[bvh::kGcCounterStaleEpoch] == 1u, "P0 invalid 1, stale 1");
   CHECK(c[bvh::kGcCounterSetOverflow] == 0u && c[bvh::kGcCounterRehashOverflow] == 0u, "P0 no overflow");
   {
-    const std::vector<uint8_t> record_bytes = words_of(records_buffer, (kCapacity + kMovingCapacity) * sizeof(bvh::WorldInstanceGPU));
+    const uint32_t out = c[bvh::kGcCounterOut];
+    CHECK(out == 4u, "P0 out 4 = set 2 + moving 2 (%u)", out);
+    const std::vector<uint8_t> record_bytes = words_of(records_buffer, (kCapacity + 2u * kMovingCapacity) * sizeof(bvh::WorldInstanceGPU));
     const auto* records = reinterpret_cast<const bvh::WorldInstanceGPU*>(record_bytes.data());
     const bvh::WorldInstanceGPU* rec_a = nullptr;
     const bvh::WorldInstanceGPU* rec_b = nullptr;
-    for (uint32_t r = 0u; r < c[bvh::kGcCounterSet]; ++r) {
+    const bvh::WorldInstanceGPU* moving[2] = {};
+    uint32_t moving_count = 0u;
+    for (uint32_t r = 0u; r < out; ++r) {
+      if (records[r].visibility[3] > 0.5f) {  // a moving record of this present (G4)
+        if (moving_count < 2u) moving[moving_count] = &records[r];
+        moving_count += 1u;
+        continue;
+      }
       if (records[r].world[3] == 1.f) rec_a = &records[r];
       if (records[r].world[3] == 5.f) rec_b = &records[r];
     }
@@ -368,6 +382,7 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
     if (rec_a != nullptr && rec_b != nullptr) {
       CHECK(rec_a->header[0] == 1.f && rec_a->header[3] == 1.f && rec_a->visibility[2] == 6.f, "P0 record A: slot 1, flags 6");
       CHECK(rec_b->header[0] == 1.f && rec_b->visibility[2] == 2.f, "P0 record B: slot 1, flags 2");
+      CHECK(rec_a->header[2] == 0.f && rec_b->header[2] == 0.f && rec_b->header[3] == 1.f, "P0 A and B: header.z 0, header.w 1");
       CHECK(rec_a->bounds_min[0] == 1.f && rec_a->bounds_max[1] == 2.f && rec_a->bounds_max[2] == 3.f, "P0 record A bounds: translation");
       float matrix[16] = {1.f, 0.f, 0.f, 1.f, 0.f, 1.f, 0.f, 2.f, 0.f, 0.f, 1.f, 3.f, 0.f, 0.f, 0.f, 1.f};
       float inverse[16] = {};
@@ -379,11 +394,13 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
       }
       CHECK(inverse_ok, "P0 record A inverse matches ComputeMatrixInverse");
     }
-    const bvh::WorldInstanceGPU* moving0 = records + kCapacity;
-    CHECK(moving0[0].header[0] == 2.f && moving0[1].header[0] == 2.f, "P0 moving records are slot 2");
-    CHECK(moving0[0].visibility[2] + moving0[1].visibility[2] == 6.f
-              && std::min(moving0[0].visibility[2], moving0[1].visibility[2]) == 2.f,
-          "P0 moving record flags are camera and light");
+    CHECK(moving_count == 2u && moving[0] != nullptr && moving[1] != nullptr, "P0 two moving records (%u)", moving_count);
+    if (moving_count == 2u && moving[0] != nullptr && moving[1] != nullptr) {
+      CHECK(moving[0]->header[0] == 2.f && moving[1]->header[0] == 2.f, "P0 moving records are slot 2");
+      CHECK(moving[0]->visibility[2] + moving[1]->visibility[2] == 6.f
+                && std::min(moving[0]->visibility[2], moving[1]->visibility[2]) == 2.f,
+            "P0 moving record flags are camera and light");
+    }
   }
   {
     const std::vector<uint8_t> entry_bytes = words_of(entries_buffer, 2u * kCapacity * sizeof(bvh::GcSetEntryGPU));
@@ -411,6 +428,12 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
   c = present(72u, {draw_of(4u, 1u, 2u, 0u, 8u)});
   CHECK(c[bvh::kGcCounterKept] == 2u && c[bvh::kGcCounterInserted] == 1u && c[bvh::kGcCounterSet] == 3u,
         "P1 kept 2, inserted 1, set 3");
+  CHECK(c[bvh::kGcCounterOut] == 3u, "P1 out 3 (%u)", c[bvh::kGcCounterOut]);
+  {
+    const std::vector<uint8_t> record_bytes = words_of(records_buffer, (kCapacity + 2u * kMovingCapacity) * sizeof(bvh::WorldInstanceGPU));
+    const auto* records = reinterpret_cast<const bvh::WorldInstanceGPU*>(record_bytes.data());
+    CHECK(records[3].header[3] == 0.f && records[4].header[3] == 0.f, "P1 records 3 and 4 are cleared (header.w 0)");
+  }
   // P2 (frame 611): A and B are aged out (600 presents); D is kept.
   c = present(611u, {});
   CHECK(c[bvh::kGcCounterAged] == 2u && c[bvh::kGcCounterKept] == 1u && c[bvh::kGcCounterSet] == 1u, "P2 aged 2, kept 1, set 1");
@@ -465,6 +488,46 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
         "P7 inserted and set are the rest (%u)", c[bvh::kGcCounterInserted]);
   CHECK(c[bvh::kGcCounterInvalid] == 0u && c[bvh::kGcCounterSetOverflow] == 0u, "P7 no invalid, no overflow");
 
+  // P8 (frame 950, G4): slot 3 (alpha with slice 3), slot 4 (alpha, no slice), slot 0 (no CPU mesh), slot 2 (withheld),
+  // slot 6 (alpha mesh, no slice). Records by x: 130 valid with slice 4 and flags 2; 140, 160, 170 invalid; 150 valid.
+  {
+    std::vector<uint32_t> materials(kSlots, 0u);
+    materials[0] = bvh::kGcMaterialNoCpuMesh;
+    materials[2] = bvh::kGcMaterialNoCpuMesh | bvh::kGcMaterialWithheld;
+    materials[3] = 4u;
+    materials[4] = 0u;
+    materials[6] = bvh::kGcMaterialAlphaMesh;
+    context->UpdateSubresource(materials_buffer, 0u, nullptr, materials.data(), 0u, 0u);
+  }
+  const std::vector<bvh::GcInstanceDrawGPU> p8 = {draw_of(400u, 1u, 3u, 0u, 17u), draw_of(401u, 1u, 4u, 0u, 17u),
+                                                  draw_of(402u, 1u, 0u, 0u, 1u), draw_of(403u, 1u, 2u, 1u, 1u),
+                                                  draw_of(404u, 1u, 6u, 1u, 1u)};
+  c = present(950u, p8);
+  CHECK(c[bvh::kGcCounterInserted] == 5u, "P8 inserted 5 (%u)", c[bvh::kGcCounterInserted]);
+  // Alpha waiting follows the mesh-alpha rule (flag 16 only for an alpha mesh), matching M5.
+  CHECK(c[bvh::kGcCounterAlphaWaiting] == 1u, "P8 alpha waiting 1 (%u)", c[bvh::kGcCounterAlphaWaiting]);
+  CHECK(c[bvh::kGcCounterNoCpuMesh] == 2u, "P8 no CPU mesh 2 (%u)", c[bvh::kGcCounterNoCpuMesh]);
+  CHECK(c[bvh::kGcCounterOut] == c[bvh::kGcCounterSet], "P8 out equals set, no moving (%u, %u)", c[bvh::kGcCounterOut],
+        c[bvh::kGcCounterSet]);
+  {
+    const uint32_t out = c[bvh::kGcCounterOut];
+    const std::vector<uint8_t> record_bytes = words_of(records_buffer, (kCapacity + 2u * kMovingCapacity) * sizeof(bvh::WorldInstanceGPU));
+    const auto* records = reinterpret_cast<const bvh::WorldInstanceGPU*>(record_bytes.data());
+    const bvh::WorldInstanceGPU* by_x[5] = {};
+    for (uint32_t r = 0u; r < out; ++r) {
+      for (uint32_t i = 0u; i < 5u; ++i) {
+        if (records[r].world[3] == 130.f + 10.f * static_cast<float>(i)) by_x[i] = &records[r];
+      }
+    }
+    CHECK(by_x[0] != nullptr && by_x[0]->header[2] == 4.f && by_x[0]->header[3] == 1.f && by_x[0]->visibility[2] == 2.f,
+          "P8 x 130: slice 4, valid, flags 2 (camera; pass alpha dropped on a non-alpha mesh)");
+    // A pass-alpha draw on a non-alpha mesh is traced solid, as M5 does.
+    CHECK(by_x[1] != nullptr && by_x[1]->header[3] == 1.f, "P8 x 140: valid (solid, non-alpha mesh)");
+    CHECK(by_x[2] != nullptr && by_x[2]->header[2] == 0.f && by_x[2]->header[3] == 1.f, "P8 x 150: slice 0, valid");
+    CHECK(by_x[3] != nullptr && by_x[3]->header[3] == 0.f, "P8 x 160: invalid (withheld)");
+    CHECK(by_x[4] != nullptr && by_x[4]->header[3] == 0.f, "P8 x 170: invalid (alpha mesh, no slice)");
+  }
+
   // P9 (frame 1000): G3b indirect draws on slot 7 (light). The args decide the count: empty, mismatch and truncated each drop
   // or cut one draw; the last draw has vertex offset -1 and matches its args.
   const auto indirect_draw = [&draw_of](uint32_t args_element, uint32_t slice_element, uint32_t window, int32_t vertex_offset) {
@@ -487,12 +550,13 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
 
   PrintMessages(queue, "gc instances");
   for (ID3D11Buffer* buffer : {arena_buffer, draws_buffer, epochs_buffer, meta_buffer, entries_buffer, records_buffer, counters_buffer,
-                               moving_buffer, cb_buffer}) {
+                               moving_buffer, materials_buffer, cb_buffer}) {
     buffer->Release();
   }
   arena_srv->Release();
   srvs[1]->Release();
   srvs[2]->Release();
+  srvs[3]->Release();
   for (ID3D11UnorderedAccessView* view : uavs) view->Release();
   insert_shader->Release();
   compact_shader->Release();

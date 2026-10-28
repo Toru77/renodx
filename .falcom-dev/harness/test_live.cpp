@@ -4837,6 +4837,30 @@ static void TestRt12Records() {
     CHECK(sizeof(desc) == 64u, "the D3D12 instance desc is 64 bytes");
     CHECK(std::memcmp(&desc, &expect, sizeof(desc)) == 0, "record %u: the 64 bytes equal the static path's desc", r);
   }
+  // 3. GPU-cache records (G4): table base 0. A is valid, camera-visible, non-opaque (header.z 3); B is invalid (header.w 0).
+  {
+    float record[2][48] = {};
+    record[0][0] = 5.f;
+    record[0][2] = 3.f;
+    record[0][3] = 1.f;
+    record[0][46] = 2.f;
+    record[1][0] = 6.f;
+    D3D12_RAYTRACING_INSTANCE_DESC descs[2] = {};
+    for (uint32_t r = 0u; r < 2u; ++r) {
+      for (uint32_t k = 0u; k < 12u; ++k) record[r][4u + k] = 0.1f * static_cast<float>(k + 1u);
+      uint32_t words[16] = {};
+      rt12::Rt12RecordDescWords(record[r], r, kAddress, words);
+      std::memcpy(&descs[r], words, sizeof(descs[r]));
+    }
+    CHECK(descs[0].InstanceID == 0u && descs[0].InstanceMask == 1u && descs[0].AccelerationStructure == kAddress,
+          "GPU-cache record A: InstanceID 0, mask 1, BLAS address");
+    CHECK((static_cast<uint32_t>(descs[0].Flags) & static_cast<uint32_t>(D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE)) != 0u,
+          "GPU-cache record A: FORCE_NON_OPAQUE (header.z 3)");
+    CHECK(descs[1].InstanceMask == 0u && descs[1].AccelerationStructure == 0u, "GPU-cache record B (invalid): mask 0, BLAS 0");
+  }
+  CHECK(static_cast<uint64_t>(rt12::kRt12CarrierWidth) * rt12::kRt12GcRecordCarrierHeight
+            >= static_cast<uint64_t>(bvh::kGcSetCapacity + bvh::kGcMovingRecords) * rt12::kRt12RecordTexels,
+        "GPU-cache records carrier holds set + moving records");
   // 2. The records carrier holds every record: 12 texels each, 32768 records.
   CHECK(static_cast<uint64_t>(rt12::kRt12CarrierWidth) * rt12::kRt12RecordCarrierHeight
             >= static_cast<uint64_t>(bvh::kPoolDynamicInstances) * rt12::kRt12RecordTexels,
@@ -5376,7 +5400,19 @@ static void TestGcInstanceHook(Device* dev) {
 
   gc::ResetWorldPool();
   gc::g_gpu_capture.active.store(true);
+  uint64_t slot_version_reset = 0u;
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    gc::g_gpu_capture.settle_reset = false;
+    slot_version_reset = gc::g_gpu_capture.slot_version;
+  }
   gc::ResetGpuCaptureEntries("pool reset");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.settle_reset && gc::g_gpu_capture.slot_version == slot_version_reset + 1u,
+          "a pool reset sets settle_reset and raises slot_version by 1");
+    gc::g_gpu_capture.settle_reset = false;
+  }
   {
     std::lock_guard lock(gc::g_gpu_capture.mutex);
     gc::g_gpu_capture.staging = staging;
@@ -5396,10 +5432,16 @@ static void TestGcInstanceHook(Device* dev) {
   const gc::GcInstanceSource source = {.buffer = slices, .base = 2, .count = 3u, .pass = 9u};
 
   // a. The first sighting creates the entry (Range): no instance copy.
+  uint64_t slot_version_before_create = 0u;
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    slot_version_before_create = gc::g_gpu_capture.slot_version;
+  }
   gc::GpuCaptureOnDraw(&cl, draw, key, no_uv, false, &source);
   {
     std::lock_guard lock(gc::g_gpu_capture.mutex);
     const gc::GcEntry& entry = gc::g_gpu_capture.entries.at(key);
+    CHECK(gc::g_gpu_capture.slot_version == slot_version_before_create + 1u, "creating an entry raises slot_version by 1");
     CHECK(entry.phase == gc::GcPhase::RangeWait, "first sighting waits for its range result");
     CHECK(gc::g_gpu_capture.stats.inst_no_geometry == 1u, "no geometry counted (%llu)", gc::g_gpu_capture.stats.inst_no_geometry);
     CHECK(gc::g_gpu_capture.instance_draws.empty(), "no instance draw before Done");
@@ -5666,6 +5708,8 @@ static void TestGcCompareInstances() {
   gpu[5].mesh_id = 9;
   place(gpu[5].world, 9.f, 9.f, 9.f);
   gpu[5].cpu_state = "observing";
+  gpu[4].flags = 2u;
+  gpu[5].flags = 2u;
   std::vector<gc::GcCompareCpuInstance> cpu = {
       cpu_at(0x1u, 1u, 1.f, 2.f, 3.f, false, false),   // matched
       cpu_at(0x1u, 1u, 1.f, 2.f, 3.f, false, false),   // the same instance again
@@ -5679,6 +5723,9 @@ static void TestGcCompareInstances() {
   const std::unordered_map<uint64_t, std::string> reasons = {{0x3u, "done"}, {0x5u, "no_entry_indirect"}, {0x6u, "refused:format"}, {0x7u, "done"},
                                                              {0x12u, "no_entry_indirect_untracked"}};
   const gc::GcInstanceCompare result = gc::GcCompareInstances(gpu, cpu, reasons);
+  CHECK(!result.camera_valid && result.gpu_only_camera_by_distance.empty() && result.gpu_no_cpu_mesh_camera_by_distance.empty()
+            && result.cpu_only_by_distance.empty(),
+        "without a camera no distance map is counted");
   CHECK(result.matched == 1u, "matched %llu", result.matched);
   CHECK(result.gpu_dup_content == 1u, "gpu duplicate content %llu", result.gpu_dup_content);
   CHECK(result.gpu_no_cpu_mesh == 2u, "gpu without a cpu mesh %llu", result.gpu_no_cpu_mesh);
@@ -5703,6 +5750,42 @@ static void TestGcCompareInstances() {
   CHECK(result.gpu_only_by_state.size() == 2u && result.gpu_only_by_state.at("not_observed") == 1u
             && result.gpu_only_by_state.at("observing") == 1u,
         "gpu-only states: not_observed and observing");
+  const float camera[3] = {0.f, 0.f, 0.f};
+  const gc::GcInstanceCompare near_result = gc::GcCompareInstances(gpu, cpu, reasons, camera);
+  CHECK(near_result.camera_valid, "a camera is recorded");
+  CHECK(near_result.gpu_only_camera_by_distance.size() == 1u && near_result.gpu_only_camera_by_distance.at("lt16m") == 1u,
+        "camera-visible GPU-only records by distance: lt16m 1");
+  CHECK(near_result.gpu_no_cpu_mesh_camera_by_distance.size() == 1u && near_result.gpu_no_cpu_mesh_camera_by_distance.at("lt16m") == 1u,
+        "camera-visible no-CPU-mesh records by distance: lt16m 1");
+  CHECK(near_result.cpu_only_by_distance.size() == 2u && near_result.cpu_only_by_distance.at("lt16m") == 5u && near_result.cpu_only_by_distance.at("lt64m") == 1u,
+        "CPU-only instances by distance: lt16m 5, lt64m 1");
+}
+
+static void TestRt12GcMeshWords() {
+  namespace rt12 = falcom_world::rt12;
+  Stage("rt12 gc mesh words");
+  float words[16] = {};
+  CHECK(rt12::Rt12GcMeshWords(5u, 10u, 100u, 30u, true, 7u, words), "exact offsets are accepted");
+  CHECK(words[0] == 5.f && words[1] == 10.f && words[2] == 100.f && words[3] == 30.f && words[7] == 8.f,
+        "header words and the UV offset + 1 (word 7)");
+  bool others_zero = true;
+  for (uint32_t k = 0u; k < 16u; ++k) {
+    if (k != 0u && k != 1u && k != 2u && k != 3u && k != 7u && words[k] != 0.f) others_zero = false;
+  }
+  CHECK(others_zero, "every other word is 0");
+  CHECK(rt12::Rt12GcMeshWords(5u, 10u, 100u, 30u, false, 7u, words) && words[7] == 0.f, "without UV word 7 is 0");
+  CHECK(!rt12::Rt12GcMeshWords(5u, 10u, 1u << 24u, 30u, false, 0u, words), "an index offset of 2^24 is not exact");
+  CHECK(!rt12::Rt12GcMeshWords(5u, 10u, 100u, 30u, true, (1u << 24u) - 5u, words), "a UV offset near 2^24 is not exact");
+}
+
+static void TestGcRecordsBound() {
+  namespace gc = falcom_world::bvh;
+  Stage("gpu records bound");
+  CHECK(gc::GcRecordsBound({}) == 0u, "no counter read: bound 0");
+  CHECK(gc::GcRecordsBound({0u}) == 2048u, "out 0: bound 2048");
+  CHECK(gc::GcRecordsBound({10000u}) == 13312u, "out 10000: bound 13312");
+  CHECK(gc::GcRecordsBound({80000u}) == 73728u, "out 80000: capped at the records buffer");
+  CHECK(gc::GcRecordsBound({1000u, 9000u}) == 11264u, "the largest of the history counts");
 }
 
 int main() {
@@ -6782,6 +6865,7 @@ int main() {
   TestRt12Mirror(&dev, &queue);
   TestRt12Dynamic();
   TestRt12Records();
+  TestRt12GcMeshWords();
   Stage("gpu capture");
   TestGcDecode();
   TestGcCarrierLayout();
@@ -6791,6 +6875,7 @@ int main() {
   TestGcPoseHash();
   TestGcInstanceHook(&dev);
   TestGcCompareInstances();
+  TestGcRecordsBound();
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);

@@ -45,6 +45,11 @@ inline constexpr float kGcPoseTranslationScale = 256.f;            // pose key g
 inline constexpr float kGcPoseBasisScale = 4096.f;                 // and 1/4096 per basis element
 inline constexpr uint32_t kGcCompareCpuSamples = 256u, kGcCompareGpuSamples = 32u;
 inline constexpr size_t kGcNoEntryKeys = 16384u;  // G4-0: no-entry reasons kept (direct keys)
+inline constexpr uint32_t kGcBoundHistory = 8u;              // G4 (D4): counter reads the TLAS bound looks back over
+inline constexpr uint32_t kGcMaterialRefreshPresents = 64u;  // G4 (D6): the material words are rebuilt at least this often
+// G4 (D6): the per-slot material word of the GPU records (world_gc_instance.hlsli GC_MATERIAL_*).
+inline constexpr uint32_t kGcMaterialSliceMask = 0x00FFFFFFu, kGcMaterialAlphaMesh = 0x20000000u,
+                          kGcMaterialWithheld = 0x40000000u, kGcMaterialNoCpuMesh = 0x80000000u;
 // Modes of world_gc_insert.cs_5_0.hlsl (GC_MODE_*); dispatched in the order clear, mark, rehash, insert.
 inline constexpr uint32_t kGcModeClear = 0u, kGcModeRehash = 1u, kGcModeMark = 2u, kGcModeInsert = 3u;
 // The counters of one present (world_gc_instance.hlsli GC_COUNTER_*).
@@ -53,7 +58,9 @@ inline constexpr uint32_t kGcCounterSet = 0u, kGcCounterInserted = 1u, kGcCounte
                           kGcCounterMovingRecords = 7u, kGcCounterMovingHeld = 8u, kGcCounterInvalid = 9u,
                           kGcCounterStaleEpoch = 10u, kGcCounterSetOverflow = 11u, kGcCounterRehashOverflow = 12u,
                           kGcCounterMarked = 13u, kGcCounterSightings = 14u, kGcCounterIndirectEmpty = 15u,
-                          kGcCounterIndirectMismatch = 16u, kGcCounterIndirectTruncated = 17u, kGcCounterCount = 32u;
+                          kGcCounterIndirectMismatch = 16u, kGcCounterIndirectTruncated = 17u, kGcCounterOut = 18u,
+                          kGcCounterAlphaWaiting = 19u;
+inline constexpr uint32_t kGcCounterNoCpuMesh = 20u, kGcCounterCount = 32u;
 static_assert((kGcSetCapacity & (kGcSetCapacity - 1u)) == 0u, "the set probe mask needs a power of two");
 static_assert(kGcMaxEntries < (1u << 24), "a slot must be exact in a float (record header.x)");
 
@@ -155,6 +162,8 @@ struct GcStats {
 struct GpuCaptureState {
   std::atomic<bool> enabled{false};  // the panel switch (session only, not saved)
   std::atomic<bool> active{false};   // set by the present side once its objects exist; every hook returns on !active
+  std::atomic<bool> trace{true};              // G4: DXR RTAO traces the GPU scene while the cache is on (session only)
+  std::atomic<bool> trace_no_cpu_mesh{true};  // G4: also trace slots whose key has no CPU mesh (session only, A/B)
   std::mutex mutex;
   reshade::api::resource staging = {0u};  // D3D11 raw buffer, kGcStagingBytes
   uint64_t staging_used = 0u;             // bytes reserved in this present's copies
@@ -173,6 +182,8 @@ struct GpuCaptureState {
   std::vector<uint64_t> slot_key = std::vector<uint64_t>(kGcMaxEntries, 0u);
   bool epochs_dirty = true;
   std::unordered_map<uint64_t, const char*> no_entry_reason;  // G4-0 (0a): direct keys with no entry ("untracked", "cap"), at most kGcNoEntryKeys
+  uint64_t slot_version = 0u;  // G4: bumped when a slot gets or loses its key
+  bool settle_reset = false;   // G4 (D5): ResetGpuCaptureEntries ran; the present side clears its settle latch
 };
 
 inline GpuCaptureState g_gpu_capture;
@@ -205,6 +216,7 @@ inline void InvalidateGpuCaptureKeys(const std::vector<uint64_t>& keys, bool des
       BumpGcSlotEpoch(entry.slot);
       g.free_slots.push_back(entry.slot);
       g.slot_key[entry.slot] = 0u;
+      g.slot_version += 1u;
       g.entries.erase(it);
       g.stats.invalidated_destroy += 1u;
     } else {
@@ -241,6 +253,8 @@ inline void ResetGpuCaptureEntries(const char* why) {
   g.next_slot = 0u;
   g.free_slots.clear();
   std::fill(g.slot_key.begin(), g.slot_key.end(), 0u);
+  g.slot_version += 1u;
+  g.settle_reset = true;
   if (std::strcmp(why, "pool reset") == 0) g.stats.resets_pool += 1u;
   if (std::strcmp(why, "fragmented") == 0) g.stats.resets_fragmented += 1u;
 }
@@ -252,6 +266,16 @@ inline void GpuCaptureNoteNoEntry(uint64_t mesh_key, const char* reason) {
   if (g_gpu_capture.entries.count(mesh_key) != 0u) return;
   if (g_gpu_capture.no_entry_reason.size() >= kGcNoEntryKeys && g_gpu_capture.no_entry_reason.count(mesh_key) == 0u) return;
   g_gpu_capture.no_entry_reason[mesh_key] = reason;
+}
+
+// G4 (D4): GPU records traced this frame, from the largest `out` of the last counter reads (0 = no read yet). The CPU sizes
+// the TLAS without a readback; records past `out` are invalid (header.w 0) and become inactive instances.
+inline uint32_t GcRecordsBound(const std::vector<uint32_t>& recent_out) {
+  if (recent_out.empty()) return 0u;
+  const uint32_t largest = *std::max_element(recent_out.begin(), recent_out.end());
+  const uint64_t wanted = uint64_t{largest} + (std::max)(2048u, largest / 4u);
+  const uint64_t aligned = (wanted + 1023u) & ~uint64_t{1023u};
+  return static_cast<uint32_t>((std::min)(aligned, uint64_t{kGcSetCapacity} + kGcMovingRecords));
 }
 
 // Called from OnPoolScanDraw after its lock is released, for a direct draw whose buffers the pool tracks for this key.
@@ -304,6 +328,7 @@ inline uint32_t GpuCaptureOnDraw(reshade::api::command_list* cmd_list, const Dra
         g.free_slots.pop_back();
       }
       g.slot_key[created.slot] = mesh_key;
+      g.slot_version += 1u;
       reshade::api::format pos_format = reshade::api::format::unknown;
       reshade::api::format layout_uv_format = reshade::api::format::unknown;
       int32_t layout_uv_offset = -1;
@@ -714,31 +739,56 @@ struct GcInstanceCompare {
   uint64_t set_count = 0u, moving_records = 0u, gpu_records = 0u, cpu_instances = 0u, matched = 0u, gpu_only = 0u;
   uint64_t gpu_only_alpha = 0u, gpu_only_alpha_conflict = 0u, gpu_no_cpu_mesh = 0u, gpu_dup_content = 0u, cpu_dup = 0u;
   uint64_t cpu_only = 0u, timeouts = 0u;
+  uint64_t untraced = 0u;  // G4: set records written invalid (alpha waiting, withheld)
   double wait_ms = 0.0;
+  bool camera_valid = false;
+  float camera[3] = {};
   std::map<std::string, uint64_t> cpu_only_by_reason;
   std::map<std::string, uint64_t> gpu_no_cpu_mesh_by_state, gpu_only_by_state;  // G4-0 (0b): GPU records by cpu_state
+  // G4: distance buckets lt16m, lt64m, lt256m, far (camera given).
+  std::map<std::string, uint64_t> gpu_only_camera_by_distance, gpu_no_cpu_mesh_camera_by_distance, cpu_only_by_distance;
   std::vector<CpuOnly> cpu_only_samples;  // up to kGcCompareCpuSamples
   std::vector<GpuOnly> gpu_only_samples;  // up to kGcCompareGpuSamples
 };
 
 // D10. `entry_reason`: per CPU mesh key with a G2 entry, "pending", "done" or "refused:<reason>" (absent = "no_entry").
+// With `camera`, GPU-only and no-CPU-mesh records that are camera-visible (flags 2) and every CPU-only instance are also counted
+// by distance.
 inline GcInstanceCompare GcCompareInstances(const std::vector<GcCompareGpuInstance>& gpu,
                                             const std::vector<GcCompareCpuInstance>& cpu,
-                                            const std::unordered_map<uint64_t, std::string>& entry_reason) {
+                                            const std::unordered_map<uint64_t, std::string>& entry_reason,
+                                            const float* camera = nullptr) {
   GcInstanceCompare result;
   result.run = true;
   result.gpu_records = gpu.size();
   result.cpu_instances = cpu.size();
+  result.camera_valid = camera != nullptr;
+  if (camera != nullptr) {
+    result.camera[0] = camera[0];
+    result.camera[1] = camera[1];
+    result.camera[2] = camera[2];
+  }
   const auto key_of = [](uint32_t mesh_id, const float* world) {
     uint32_t hash[2] = {};
     GcPoseHash(mesh_id, world, hash);
     return (uint64_t{hash[0]} << 32u) | hash[1];
+  };
+  const auto distance_bucket = [camera](const float* world) {
+    const float dx = world[3] - camera[0], dy = world[7] - camera[1], dz = world[11] - camera[2];
+    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (distance < 16.f) return "lt16m";
+    if (distance < 64.f) return "lt64m";
+    if (distance < 256.f) return "lt256m";
+    return "far";
   };
   std::unordered_set<uint64_t> gpu_keys;
   for (const GcCompareGpuInstance& instance : gpu) {
     if (instance.mesh_id < 0) {
       result.gpu_no_cpu_mesh += 1u;
       result.gpu_no_cpu_mesh_by_state[instance.cpu_state] += 1u;
+      if (camera != nullptr && (instance.flags & 2u) != 0u) {
+        result.gpu_no_cpu_mesh_camera_by_distance[distance_bucket(instance.world)] += 1u;
+      }
       continue;
     }
     if (!gpu_keys.insert(key_of(static_cast<uint32_t>(instance.mesh_id), instance.world)).second) result.gpu_dup_content += 1u;
@@ -762,6 +812,7 @@ inline GcInstanceCompare GcCompareInstances(const std::vector<GcCompareGpuInstan
     }
     result.cpu_only += 1u;
     result.cpu_only_by_reason[reason] += 1u;
+    if (camera != nullptr) result.cpu_only_by_distance[distance_bucket(instance.world)] += 1u;
     if (result.cpu_only_samples.size() < kGcCompareCpuSamples) {
       result.cpu_only_samples.push_back({.mesh_key = instance.mesh_key, .mesh_id = instance.mesh_id,
                                          .translation = {instance.world[3], instance.world[7], instance.world[11]},
@@ -775,6 +826,7 @@ inline GcInstanceCompare GcCompareInstances(const std::vector<GcCompareGpuInstan
     if (cpu_keys.count(key) != 0u || !reported.insert(key).second) continue;
     result.gpu_only += 1u;
     result.gpu_only_by_state[instance.cpu_state] += 1u;
+    if (camera != nullptr && (instance.flags & 2u) != 0u) result.gpu_only_camera_by_distance[distance_bucket(instance.world)] += 1u;
     if ((instance.flags & 16u) != 0u) result.gpu_only_alpha += 1u;  // kInstanceAlphaTested (bvh_resources.hpp)
     if (instance.cpu_alpha_conflict) result.gpu_only_alpha_conflict += 1u;
     if (result.gpu_only_samples.size() < kGcCompareGpuSamples) {

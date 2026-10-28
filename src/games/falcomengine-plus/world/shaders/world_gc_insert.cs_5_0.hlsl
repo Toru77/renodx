@@ -2,6 +2,7 @@
 // CheckPoolWorld). Modes in cb_gc_instances: clear and rehash run one thread per set index; mark and insert run one
 // group per draw of this present (direct and indirect draws, instance slices and indirect args from the G3 arena).
 // The C++ reference for every rule is named at its use; the harness (test_gpu_p2b TestGcInstanceShaders) checks them.
+// Moving records are staged at [capacity + moving_capacity, +moving_capacity); compact copies them to the output (G4).
 
 #include "world_gc_instance.hlsli"
 
@@ -27,6 +28,8 @@ void main(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
         const uint i = group.x * 64u + thread;
         if (i >= capacity) return;
         for (uint k = 0u; k < 4u; ++k) g_gc_meta[(dst + i) * 4u + k] = 0u;
+        g_gc_records[i].header = float4(0.0, 0.0, 0.0, 0.0);
+        if (i < moving_capacity) g_gc_records[capacity + i].header = float4(0.0, 0.0, 0.0, 0.0);
         return;
     }
 
@@ -178,7 +181,7 @@ void main(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
             InterlockedAdd(g_gc_counters[GC_COUNTER_MOVING_RECORDS], 1u, record_index);
             if (record_index < moving_capacity)
             {
-                g_gc_records[capacity + record_index] = GcMakeRecord(draw.slot, w0, w1, w2, inverse_rows, flags);
+                g_gc_records[capacity + moving_capacity + record_index] = GcMakeRecord(draw.slot, w0, w1, w2, inverse_rows, flags, true);
             }
             continue;
         }

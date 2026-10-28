@@ -690,7 +690,8 @@ inline bool DrawBvhPanel() {
   }
   std::string dxr_line = std::string("DXR: ") + rt12::Rt12ReasonName(dxr_panel.reason) + "  traced " + std::to_string(dxr_panel.traced_frames)
                          + "  busy " + std::to_string(dxr_panel.busy_frames) + "  wrapped " + (dxr_panel.wrapped ? "yes" : "no");
-  dxr_line += ", P2b records " + std::to_string(dxr_panel.records);
+  dxr_line += ", P2b records " + std::to_string(dxr_panel.records) + ", GPU scene traced " + std::to_string(dxr_panel.gc_traced_frames);
+  if (!dxr_panel.gc_not_ready.empty()) dxr_line += " (not ready: " + dxr_panel.gc_not_ready + ")";
   if (dxr_panel.stuck) dxr_line += "  STUCK (objects leaked)";
   if (!dxr_panel.failed_stage.empty()) {
     dxr_line += "  failed at " + dxr_panel.failed_stage + " hr=" + renodx::utils::log::AsHex(static_cast<uint32_t>(dxr_panel.hr));
@@ -716,14 +717,14 @@ inline bool DrawBvhPanel() {
     return std::string(text);
   };
   const std::string dxr_gpu = "DXR GPU ms (D3D12 timestamps, avg): BLAS " + dxr_ms(dxr_panel.blas_ms_sum, dxr_panel.blas_ms_n)
-                              + " characters " + dxr_ms(dxr_panel.dynamic_ms_sum, dxr_panel.dynamic_ms_n) + " P2b "
+                              + " characters " + dxr_ms(dxr_panel.dynamic_ms_sum, dxr_panel.dynamic_ms_n) + " P2b/GC records "
                               + dxr_ms(dxr_panel.records_ms_sum, dxr_panel.records_ms_n) + " TLAS "
                               + dxr_ms(dxr_panel.tlas_ms_sum, dxr_panel.tlas_ms_n) + " trace " + dxr_ms(dxr_panel.trace_ms_sum, dxr_panel.trace_ms_n);
   ImGui::TextUnformatted(dxr_gpu.c_str());
   bool gc_on = bvh::g_gpu_capture.enabled.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("GPU geometry cache (experimental)", &gc_on)) bvh::g_gpu_capture.enabled.store(gc_on, std::memory_order_relaxed);
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Session only. Needs the DXR backend. Copies and decodes the static meshes on the GPU into a separate D3D12 cache with its own BLAS. Validation only: nothing traces it. Off: no GPU cache work at all.");
+    ImGui::SetTooltip("Session only. Needs the DXR backend. Copies and decodes the static meshes on the GPU into a separate D3D12 cache with its own BLAS. With Trace the GPU scene on, DXR RTAO traces it instead of the mirror. Off: no GPU cache work at all.");
   }
   ImGui::SameLine();
   if (ImGui::Button("Check GPU geometry")) rt12::g_gc_check_requested.store(true, std::memory_order_relaxed);
@@ -733,6 +734,18 @@ inline bool DrawBvhPanel() {
   if (ImGui::Button("Compare GPU instances")) rt12::g_gc_compare_requested.store(true, std::memory_order_relaxed);
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip("%s", "Reads the GPU instance set back (waits at most 2 s) and counts matched, GPU-only and CPU-only instances against the CPU pool. Validation only.");
+  }
+  bool gc_trace = bvh::g_gpu_capture.trace.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Trace the GPU scene (experimental)", &gc_trace)) bvh::g_gpu_capture.trace.store(gc_trace, std::memory_order_relaxed);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Session only, needs the GPU geometry cache. DXR RTAO traces the GPU instance set and the GPU BLAS instead of the mirror; frames it cannot trace run the compute pass (gpu_capture). Off: the mirror is re-streamed (M5).");
+  }
+  bool gc_trace_no_cpu_mesh = bvh::g_gpu_capture.trace_no_cpu_mesh.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Trace meshes the CPU pool lacks", &gc_trace_no_cpu_mesh)) {
+    bvh::g_gpu_capture.trace_no_cpu_mesh.store(gc_trace_no_cpu_mesh, std::memory_order_relaxed);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Session only. Off withholds GPU records whose mesh the CPU pool does not have (parity A/B with M5).");
   }
   rt12::Rt12GcPanel gc_panel;
   {
@@ -788,6 +801,9 @@ inline bool DrawBvhPanel() {
       + ", args UAV " + std::to_string(gc_panel.stats.inst_indirect_args_uav) + ", empty " + std::to_string(inst[bvh::kGcCounterIndirectEmpty])
       + ", mismatch " + std::to_string(inst[bvh::kGcCounterIndirectMismatch]) + ", truncated " + std::to_string(inst[bvh::kGcCounterIndirectTruncated])
       + ")"
+      + ", out " + std::to_string(inst[bvh::kGcCounterOut]) + ", bound " + std::to_string(gc_panel.bound) + " (misses " + std::to_string(gc_panel.bound_misses)
+      + "), alpha waiting " + std::to_string(inst[bvh::kGcCounterAlphaWaiting]) + ", no CPU mesh " + std::to_string(inst[bvh::kGcCounterNoCpuMesh])
+      + ", scene " + (gc_panel.scene_ready ? "ready" : gc_panel.scene_not_ready)
       + ", readback busy " + std::to_string(gc_panel.inst_readback_busy)
       + ", D3D11 ms " + dxr_ms(static_cast<float>(gc_panel.inst_ms_sum), static_cast<uint32_t>(gc_panel.inst_ms_n));
   ImGui::TextUnformatted(gc_instance_line.c_str());
@@ -816,7 +832,7 @@ inline bool DrawBvhPanel() {
                       + ", no entry: indirect " + std::to_string(count_of("no_entry_indirect")) + ", indirect untracked "
                       + std::to_string(count_of("no_entry_indirect_untracked")) + ", untracked "
                       + std::to_string(count_of("no_entry_untracked")) + ", cap " + std::to_string(count_of("no_entry_cap")) + ", other "
-                      + std::to_string(count_of("no_entry")) + "; set " + std::to_string(cmp.set_count) + ", wait " + wait + " ms";
+                      + std::to_string(count_of("no_entry")) + ", untraced " + std::to_string(cmp.untraced) + "; set " + std::to_string(cmp.set_count) + ", wait " + wait + " ms";
     if (cmp.timeouts != 0u) gc_compare_line += ", TIMEOUT";
   }
   ImGui::TextUnformatted(gc_compare_line.c_str());

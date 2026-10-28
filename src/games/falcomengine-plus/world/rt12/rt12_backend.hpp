@@ -49,6 +49,7 @@ static_assert(kRt12MaskDynamic == 8u);
 static_assert(static_cast<uint64_t>(kRt12CarrierWidth) * kRt12CarrierHeight * 12u >= bvh::kDynamicArenaBytes);
 static_assert(static_cast<uint64_t>(kRt12CarrierWidth) * kRt12RecordCarrierHeight >= static_cast<uint64_t>(bvh::kPoolDynamicInstances) * kRt12RecordTexels);
 static_assert(sizeof(D3D12_RAYTRACING_INSTANCE_DESC) == 64u);
+static_assert(static_cast<uint64_t>(kRt12CarrierWidth) * kRt12GcRecordCarrierHeight >= static_cast<uint64_t>(bvh::kGcSetCapacity + bvh::kGcMovingRecords) * kRt12RecordTexels);
 
 inline constexpr uint32_t kRt12Slots = 3u;              // allocators per submission kind (frames in flight)
 inline constexpr uint32_t kRt12StuckMs = 2000u;         // no fence progress this long with work pending: stuck
@@ -62,8 +63,9 @@ inline constexpr uint64_t kRt12ArenaMinBytes = 1024ull * 1024ull;
 
 enum class Rt12Reason : uint32_t {
   Off, NotCreated, CreateFailed, NoDxr, FenceError, Stuck, Discovery, Busy, ContextMismatch,
-  TlasEmpty, AlphaMirror, TargetFailed, SubmitFailed, Characters, Records, Tracing,
+  TlasEmpty, AlphaMirror, TargetFailed, SubmitFailed, Characters, Records, Tracing, GpuCapture,
 };
+inline constexpr uint32_t kRt12ReasonCount = 17u;
 
 inline const char* Rt12ReasonName(Rt12Reason reason) {
   switch (reason) {
@@ -83,6 +85,7 @@ inline const char* Rt12ReasonName(Rt12Reason reason) {
     case Rt12Reason::Characters: return "characters";
     case Rt12Reason::Records: return "records";
     case Rt12Reason::Tracing: return "tracing";
+    case Rt12Reason::GpuCapture: return "gpu_capture";
   }
   return "unknown";
 }
@@ -123,6 +126,8 @@ struct Rt12Slot {
   uint64_t addresses_bytes = 0u;
   uint64_t addresses_generation = ~0ull;  // blas_generation the addresses were written for
   bool records_timed = false;             // timestamps 2..6 hold a records frame (13.1c)
+  Microsoft::WRL::ComPtr<ID3D12Resource> gc_meshes, gc_addresses;  // G4 (D8): GPU-cache mesh and BLAS address tables (DEFAULT, COMMON)
+  uint64_t gc_version = ~0ull;  // Rt12GcScene::version they hold
 };
 
 struct Rt12Blas {
@@ -185,7 +190,7 @@ struct Rt12State {
   std::vector<Rt12Blas> blas;  // index = live store slot
   uint64_t blas_generation = 0u;
   uint64_t blas_bytes = 0u;
-  Rt12Shared depth, normal, scene, noise, texel, raw, stats, atlas, carrier, records;
+  Rt12Shared depth, normal, scene, noise, texel, raw, stats, atlas, carrier, records, gc_records;
   Microsoft::WRL::ComPtr<ID3D12Resource> dynamic_vertices;  // DEFAULT, kRt12CarrierWidth * kRt12CarrierHeight float4, COMMON
   Microsoft::WRL::ComPtr<ID3D12RootSignature> unpack_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> unpack_pso;
@@ -203,6 +208,7 @@ struct Rt12State {
   reshade::api::resource atlas_source = {0u};
   uint64_t atlas_blits = ~0ull;        // data->alpha.blits at the last atlas copy
   std::vector<Rt12Retired> retired;
+  bool mirror_dropped = false;  // G4 (D2): the mirror's BLAS and arenas were dropped while the GPU scene traces
   bool stuck = false;
   bool failed = false;
 };
@@ -215,7 +221,7 @@ struct Rt12Panel {  // copied under g_rt12_panel_mutex for the panel and the JSO
   std::string failed_stage;
   HRESULT hr = S_OK;
   bool wrapped = false, stuck = false, leaked = false, alpha_mirror = false;
-  uint64_t traced_frames = 0u, fallback_frames[16] = {}, busy_frames = 0u;
+  uint64_t traced_frames = 0u, fallback_frames[kRt12ReasonCount] = {}, busy_frames = 0u;
   uint64_t present_submits = 0u, lighting_submits = 0u, present_skipped_busy = 0u;
   uint32_t blas_count = 0u, mesh_count = 0u, tlas_instances = 0u, tlas_no_blas = 0u, tlas_holes = 0u, tlas_bad_mesh = 0u;
   uint64_t blas_bytes = 0u, arena_bytes[3] = {}, tlas_bytes = 0u, sanitized_triangles = 0u;
@@ -230,9 +236,33 @@ struct Rt12Panel {  // copied under g_rt12_panel_mutex for the panel and the JSO
   uint32_t records = 0u;  // P2b records of the last traced frame (13.1c)
   float records_ms = -1.f, records_ms_sum = 0.f;
   uint32_t records_ms_n = 0u;
+  uint64_t gc_traced_frames = 0u;
+  uint32_t gc_records = 0u;  // bound of the last GC frame
+  std::string gc_not_ready;  // last gpu_capture sub-reason ("" after a traced GC frame)
 };
 inline std::mutex g_rt12_panel_mutex;
 inline Rt12Panel g_rt12_panel;
+
+// G4 (D7): the GPU-cache scene, published by rt12_capture.hpp OnGcPresent 12b and read by RunRtaoPassA (render thread).
+// Raw pointers, valid until the next OnGcPresent: the cache state owns the objects.
+struct Rt12GcScene {
+  bool ready = false;
+  const char* not_ready = "off";
+  ID3D12Resource* indices = nullptr;  // GC arenas, rest state COMMON
+  ID3D12Resource* uvs = nullptr;
+  uint64_t index_count = 0u, uv_count = 0u;
+  std::vector<float> meshes;        // bvh::kGcMaxEntries * 16 (Rt12GcMeshWords per slot)
+  std::vector<uint64_t> addresses;  // bvh::kGcMaxEntries BLAS addresses, 0 none
+  uint64_t version = 0u;
+  reshade::api::resource_view records_srv = {0u};
+  uint32_t bound = 0u;
+};
+inline Rt12GcScene g_rt12_gc_scene;
+inline uint64_t g_rt12_gc_epoch = 0u;  // last Rt12GcScene::version handed out; never reset, so versions never repeat
+
+inline bool GcOwnsRtao() {
+  return bvh::g_gpu_capture.enabled.load(std::memory_order_relaxed) && bvh::g_gpu_capture.trace.load(std::memory_order_relaxed);
+}
 
 template <typename F>
 inline void UpdatePanel(F&& update) {
@@ -458,6 +488,7 @@ inline void DestroyRt12Pipelines(reshade::api::device* device, Rt12State& s) {
 // Stops the DXR path. A stuck scene is leaked on purpose (the GPU may still touch it).
 inline void TeardownRt12(const char* why) {
   if (!g_rt12) return;
+  g_rt12_gc_scene = {};
   {
     std::lock_guard lock(g_rt12_mirror.mutex);
     g_rt12_mirror.active = false;
@@ -480,7 +511,7 @@ inline void TeardownRt12(const char* why) {
     g_rt12.release();  // leaked on purpose (see above)
     return;
   }
-  for (Rt12Shared* shared : {&s.depth, &s.normal, &s.scene, &s.noise, &s.texel, &s.raw, &s.stats, &s.atlas, &s.carrier, &s.records}) {
+  for (Rt12Shared* shared : {&s.depth, &s.normal, &s.scene, &s.noise, &s.texel, &s.raw, &s.stats, &s.atlas, &s.carrier, &s.records, &s.gc_records}) {
     if (shared->srv11.handle != 0u) s.device->destroy_resource_view(shared->srv11);
     if (shared->uav11.handle != 0u) s.device->destroy_resource_view(shared->uav11);
   }
@@ -940,8 +971,10 @@ inline bool SubmitPresent(Rt12State& s, const bvh::BvhDeviceData* data, const st
   geometries.reserve(new_slots.size());
   std::vector<BlasBuild> builds;
   builds.reserve(new_slots.size());
-  const uint64_t vertex_va = s.arenas[kRt12ArenaVertices].buffer->GetGPUVirtualAddress();
-  const uint64_t index_va = s.arenas[kRt12ArenaIndices].buffer->GetGPUVirtualAddress();
+  ID3D12Resource* vertex_arena = s.arenas[kRt12ArenaVertices].buffer.Get();
+  ID3D12Resource* index_arena = s.arenas[kRt12ArenaIndices].buffer.Get();
+  const uint64_t vertex_va = (vertex_arena != nullptr ? vertex_arena->GetGPUVirtualAddress() : 0u);
+  const uint64_t index_va = (index_arena != nullptr ? index_arena->GetGPUVirtualAddress() : 0u);
   for (const Rt12MirrorSlot& slot : new_slots) {
     if (slot.index_count / 3u == 0u) continue;
     D3D12_RAYTRACING_GEOMETRY_DESC geometry = {};
@@ -1083,6 +1116,43 @@ inline void OnPresent(reshade::api::device* device) {
     UpdatePanel([](Rt12Panel& p) { p.stuck = true; });
     DisableMirror();
     return;
+  }
+
+  // 2b. G4 (D2): the mirror is dropped while the GPU-cache scene traces, and re-streamed when it stops.
+  const bool gc_owns = GcOwnsRtao();
+  if (gc_owns && !s.mirror_dropped) {
+    DisableMirror();
+    for (Rt12Blas& blas : s.blas) {
+      RetireObject(s, s.last_signal, blas.buffer);
+      blas.buffer.Reset();
+    }
+    s.blas.clear();
+    s.blas_bytes = 0u;
+    s.blas_generation += 1u;
+    for (Rt12Arena& arena : s.arenas) {
+      RetireObject(s, s.last_signal, arena.buffer);
+      arena.buffer.Reset();
+      arena.capacity = 0u;
+      arena.used = 0u;
+    }
+    s.scene_slot = -1;
+    s.static_descs.clear();
+    s.static_key_version = ~0ull;
+    s.static_key_blas = ~0ull;
+    s.mirror_dropped = true;
+    renodx::utils::log::i("[world-rt12] mirror off (GPU capture traces)");
+  } else if (!gc_owns && s.mirror_dropped) {
+    {
+      std::lock_guard lock(g_rt12_mirror.mutex);
+      g_rt12_mirror.active = true;
+      g_rt12_mirror.reset = false;
+      g_rt12_mirror.appends.clear();
+      g_rt12_mirror.new_slots.clear();
+      g_rt12_mirror.retired_slots.clear();
+    }
+    bvh::g_live_bvh.reset_requested.store(true, std::memory_order_relaxed);
+    s.mirror_dropped = false;
+    renodx::utils::log::i("[world-rt12] mirror on (re-stream)");
   }
 
   // 3. Release retired objects whose fence completed.
@@ -1275,9 +1345,16 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   if (reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()) != s.ctx11.Get()) {  // NOLINT(performance-no-int-to-ptr)
     return RtFallback(Rt12Reason::ContextMismatch);
   }
-  // 5. A built TLAS.
+  const bool gc = GcOwnsRtao();
+  const Rt12GcScene& gc_scene = g_rt12_gc_scene;
+  // 5. A built TLAS (GPU-cache scene: the GPU records, see 7c).
   bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(device);
-  if (data == nullptr || !data->tlas_built) return RtFallback(Rt12Reason::TlasEmpty);
+  if (data == nullptr || (!gc && !data->tlas_built)) return RtFallback(Rt12Reason::TlasEmpty);
+  if (gc && !gc_scene.ready) {
+    const char* not_ready = gc_scene.not_ready;
+    UpdatePanel([not_ready](Rt12Panel& p) { p.gc_not_ready = not_ready; });
+    return RtFallback(Rt12Reason::GpuCapture);
+  }
   // 6. Alpha foliage needs the atlas mirror.
   if (bvh::g_pool.alpha_foliage.load(std::memory_order_relaxed) && s.atlas.texture12 == nullptr) {
     return RtFallback(Rt12Reason::AlphaMirror);
@@ -1314,7 +1391,9 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   // 7c. The P2b records of this present (the compute pass A traces the same t19 records). Over the capacity: compute.
   uint32_t records = 0u;
   std::memcpy(&records, &push.fade[3], sizeof(uint32_t));
-  if (records > 0u && (records > bvh::kPoolDynamicInstances || data->dynamic.instances_srv.handle == 0u || !data->dynamic.ready)) {
+  if (gc) {
+    records = gc_scene.bound;
+  } else if (records > 0u && (records > bvh::kPoolDynamicInstances || data->dynamic.instances_srv.handle == 0u || !data->dynamic.ready)) {
     return RtFallback(Rt12Reason::Records);
   }
   const uint32_t frame = g_state.frame.load();
@@ -1342,20 +1421,23 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
       return RtFallback(Rt12Reason::TargetFailed);
     }
   }
-  if (records > 0u && s.records.texture12 == nullptr
-      && FAILED(CreateRt12Shared(s, device, DXGI_FORMAT_R32G32B32A32_UINT, kRt12CarrierWidth, kRt12RecordCarrierHeight, 1u, true,
-                                 &s.records))) {
+  Rt12Shared& records_carrier = (gc ? s.gc_records : s.records);
+  const uint32_t records_height = (gc ? kRt12GcRecordCarrierHeight : kRt12RecordCarrierHeight);
+  if (records > 0u && records_carrier.texture12 == nullptr
+      && FAILED(CreateRt12Shared(s, device, DXGI_FORMAT_R32G32B32A32_UINT, kRt12CarrierWidth, records_height, 1u, true,
+                                 &records_carrier))) {
     return RtFallback(Rt12Reason::TargetFailed);
   }
-  if (s.arenas[kRt12ArenaIndices].buffer == nullptr || s.arenas[kRt12ArenaUvs].buffer == nullptr || s.mesh_table == nullptr
-      || s.materials == nullptr) {
+  const bool mirror_missing = s.arenas[kRt12ArenaIndices].buffer == nullptr || s.arenas[kRt12ArenaUvs].buffer == nullptr
+                              || s.mesh_table == nullptr;
+  if ((!gc && mirror_missing) || s.materials == nullptr) {
     return RtFallback(Rt12Reason::TlasEmpty);
   }
 
   // 9. The instance list (CPU). The static part is cached by its key (static_key_*); characters are appended in 13.1b.
   // Holes, instances without a BLAS and bad mesh ids are counted when the static part is rebuilt.
   const bool static_changed = data->tlas_cpu_version != s.static_key_version || s.blas_generation != s.static_key_blas;
-  if (static_changed) {
+  if (!gc && static_changed) {
     s.static_descs.clear();
     uint32_t holes = 0u, bad_mesh = 0u, no_blas = 0u;
     for (size_t i = 0u; i < data->tlas_instances_cpu.size(); ++i) {
@@ -1392,17 +1474,17 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     s.static_key_version = data->tlas_cpu_version;
     s.static_key_blas = s.blas_generation;
   }
-  const bool rebuild = s.scene_slot < 0 || s.scene_key_version != s.static_key_version || s.scene_key_blas != s.static_key_blas
+  const bool rebuild = gc || s.scene_slot < 0 || s.scene_key_version != s.static_key_version || s.scene_key_blas != s.static_key_blas
                        || !characters.empty() || s.scene_dynamic_count != 0u || records > 0u || s.scene_record_count != 0u;
-  if (rebuild && s.static_descs.empty() && characters.empty()) return RtFallback(Rt12Reason::TlasEmpty);
+  if (!gc && rebuild && s.static_descs.empty() && characters.empty()) return RtFallback(Rt12Reason::TlasEmpty);
   // This frame's descs: the static part, then one per character (13.1b).
   std::vector<D3D12_RAYTRACING_INSTANCE_DESC> descs;
-  if (rebuild) descs = s.static_descs;
+  if (rebuild && !gc) descs = s.static_descs;
   // The instance table is uploaded only when the slot's table does not hold the current static part.
   // With records the instance table holds the static part and kPoolDynamicInstances records (13.1c): a smaller one is recreated.
   const uint64_t table_records_bytes =
       (static_cast<uint64_t>(data->tlas_instances_cpu.size()) + bvh::kPoolDynamicInstances) * sizeof(bvh::WorldInstanceGPU);
-  const bool table_upload = rebuild && (L.table_key_version != s.static_key_version || L.table_key_blas != s.static_key_blas
+  const bool table_upload = !gc && rebuild && (L.table_key_version != s.static_key_version || L.table_key_blas != s.static_key_blas
                                         || L.instance_table == nullptr || (records > 0u && L.table_bytes < table_records_bytes));
 
   // Binds one of the helper passes on RTAO's layout: cb_scene, then the SRV and UAV tables as given.
@@ -1447,8 +1529,8 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   // 10c. D3D11 records carrier: the P2b records of this present (t19) into the shared RGBA32_UINT records texture.
   if (records > 0u) {
     reshade::api::resource_view srvs[rtao::kRtaoSrvCount] = {};
-    srvs[19] = data->dynamic.instances_srv;
-    const reshade::api::resource_view uav_views[rtao::kRtaoUavCount] = {s.records.uav11};
+    srvs[19] = (gc ? gc_scene.records_srv : data->dynamic.instances_srv);
+    const reshade::api::resource_view uav_views[rtao::kRtaoUavCount] = {records_carrier.uav11};
     bind_pass(s.records_carrier_pipeline, srvs, uav_views);
     const uint32_t records_push[rtao::kRtaoPushConstantCount] = {records};
     cmd_list->push_constants(DS::all_compute, rd.layout, 3, 0, rtao::kRtaoPushConstantCount, records_push);
@@ -1674,14 +1756,18 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   }
   list->EndQuery(s.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, k * kRt12Timestamps + 3u);
 
+  const uint32_t static_count = (gc ? 0u : static_cast<uint32_t>(data->tlas_instances_cpu.size()));
   // 13.1a The upload buffer of this slot (CPU, rebuild frames): the descs at 0, the static instance table at table_offset
   // when it is uploaded and, with records, the BLAS address table after them. 13.1c and 13.2 copy from it.
   const uint64_t desc_bytes = descs.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
   const uint64_t table_offset = Align256(desc_bytes);
   const uint64_t table_bytes = static_cast<uint64_t>(data->tlas_instances_cpu.size()) * sizeof(bvh::WorldInstanceGPU);
-  const uint64_t address_count = std::max<uint64_t>(s.blas.size(), 1u);
-  const bool address_write = records > 0u && (L.addresses_generation != s.blas_generation || L.addresses_bytes < address_count * 8u);
-  const uint64_t addresses_offset = Align256(table_offset + (table_upload ? table_bytes : 0u));
+  // G4 (D8): in GC mode the GPU-cache mesh words follow the descs and the address table has one entry per GC slot.
+  const bool gc_write = gc && L.gc_version != gc_scene.version;
+  const uint64_t gc_meshes_bytes = uint64_t{bvh::kGcMaxEntries} * sizeof(bvh::WorldMeshGPU);
+  const uint64_t address_count = (gc ? uint64_t{bvh::kGcMaxEntries} : std::max<uint64_t>(s.blas.size(), 1u));
+  const bool address_write = (gc ? gc_write : (records > 0u && (L.addresses_generation != s.blas_generation || L.addresses_bytes < address_count * 8u)));
+  const uint64_t addresses_offset = (gc ? Align256(table_offset + gc_meshes_bytes) : Align256(table_offset + (table_upload ? table_bytes : 0u)));
   const uint64_t upload_bytes = address_write ? addresses_offset + address_count * 8u : table_offset + (table_upload ? table_bytes : 0u);
   if (rebuild) {
     if (L.upload == nullptr || L.upload_bytes < upload_bytes) {
@@ -1717,12 +1803,47 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
         L.table_bytes = bytes;
       }
     }
-    if (address_write) {
-      std::vector<uint64_t> addresses(address_count, 0u);
-      for (size_t i = 0u; i < s.blas.size(); ++i) {
-        if (s.blas[i].buffer) addresses[i] = s.blas[i].buffer->GetGPUVirtualAddress();
+    if (gc) {
+      // G4 (D8): the GC records table (records entries, written by the records pass) and the GC mesh and address tables.
+      const uint64_t gc_table_bytes = std::max<uint64_t>(uint64_t{records} * sizeof(bvh::WorldInstanceGPU), 192u);
+      if (L.instance_table == nullptr || L.table_bytes < gc_table_bytes) {
+        ComPtr<ID3D12Resource> table;
+        if (FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, gc_table_bytes, D3D12_RESOURCE_STATE_COMMON,
+                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, table))) {
+          FailSession(s, Rt12Reason::SubmitFailed, "gc instance table");
+          return RtFallback(Rt12Reason::SubmitFailed);
+        }
+        RetireObject(s, s.last_signal, L.instance_table);
+        L.instance_table = table;
+        L.table_bytes = gc_table_bytes;
       }
-      std::memcpy(L.upload_data + addresses_offset, addresses.data(), address_count * 8u);
+      L.table_key_version = ~0ull;
+      if (L.gc_meshes == nullptr) {
+        if (FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, gc_meshes_bytes, D3D12_RESOURCE_STATE_COMMON,
+                                    D3D12_RESOURCE_FLAG_NONE, L.gc_meshes))) {
+          FailSession(s, Rt12Reason::SubmitFailed, "gc mesh table");
+          return RtFallback(Rt12Reason::SubmitFailed);
+        }
+      }
+      if (L.gc_addresses == nullptr) {
+        if (FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, address_count * 8u, D3D12_RESOURCE_STATE_COMMON,
+                                    D3D12_RESOURCE_FLAG_NONE, L.gc_addresses))) {
+          FailSession(s, Rt12Reason::SubmitFailed, "gc addresses");
+          return RtFallback(Rt12Reason::SubmitFailed);
+        }
+      }
+      if (gc_write) std::memcpy(L.upload_data + table_offset, gc_scene.meshes.data(), gc_meshes_bytes);
+    }
+    if (address_write) {
+      if (gc) {
+        std::memcpy(L.upload_data + addresses_offset, gc_scene.addresses.data(), address_count * 8u);
+      } else {
+        std::vector<uint64_t> addresses(address_count, 0u);
+        for (size_t i = 0u; i < s.blas.size(); ++i) {
+          if (s.blas[i].buffer) addresses[i] = s.blas[i].buffer->GetGPUVirtualAddress();
+        }
+        std::memcpy(L.upload_data + addresses_offset, addresses.data(), address_count * 8u);
+      }
     }
   }
 
@@ -1743,7 +1864,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
       L.descs = descs_buffer;
       L.descs_bytes = bytes;
     }
-    if (address_write && (L.addresses == nullptr || L.addresses_bytes < address_count * 8u)) {
+    if (!gc && address_write && (L.addresses == nullptr || L.addresses_bytes < address_count * 8u)) {
       const uint64_t bytes = std::max<uint64_t>(address_count * 8u, 256u);
       ComPtr<ID3D12Resource> addresses;
       if (FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COMMON,
@@ -1755,40 +1876,44 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
       L.addresses = addresses;
       L.addresses_bytes = bytes;
     }
+    ID3D12Resource* address_buffer = (gc ? L.gc_addresses.Get() : L.addresses.Get());
 
     // COMMON -> COPY_DEST for the copies, then the records pass, then NON_PIXEL_SHADER_RESOURCE for the TLAS and the trace.
     barriers.clear();
     Transition(barriers, L.descs.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     if (address_write) {
-      Transition(barriers, L.addresses.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+      Transition(barriers, address_buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     } else {
-      Transition(barriers, L.addresses.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      Transition(barriers, address_buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     if (table_upload) {
       Transition(barriers, L.instance_table.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     } else {
       Transition(barriers, L.instance_table.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
-    Transition(barriers, s.records.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (gc_write) Transition(barriers, L.gc_meshes.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    Transition(barriers, records_carrier.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
     list->CopyBufferRegion(L.descs.Get(), 0u, L.upload.Get(), 0u, desc_bytes);
-    if (address_write) list->CopyBufferRegion(L.addresses.Get(), 0u, L.upload.Get(), addresses_offset, address_count * 8u);
+    if (address_write) list->CopyBufferRegion(address_buffer, 0u, L.upload.Get(), addresses_offset, address_count * 8u);
     if (table_upload) list->CopyBufferRegion(L.instance_table.Get(), 0u, L.upload.Get(), table_offset, table_bytes);
+    if (gc_write) list->CopyBufferRegion(L.gc_meshes.Get(), 0u, L.upload.Get(), table_offset, gc_meshes_bytes);
     barriers.clear();
     Transition(barriers, L.descs.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (address_write) {
-      Transition(barriers, L.addresses.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      Transition(barriers, address_buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     if (table_upload) {
       Transition(barriers, L.instance_table.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
+    if (gc_write) Transition(barriers, L.gc_meshes.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
 
     // Descriptors 16..19 of this slot: records SRV, address SRV, descs UAV (raw), instance table UAV (structured).
     const D3D12_SHADER_RESOURCE_VIEW_DESC records_srv = texture_srv(DXGI_FORMAT_R32G32B32A32_UINT);
-    device12->CreateShaderResourceView(s.records.texture12.Get(), &records_srv, cpu_at(base + 16u));
+    device12->CreateShaderResourceView(records_carrier.texture12.Get(), &records_srv, cpu_at(base + 16u));
     const D3D12_SHADER_RESOURCE_VIEW_DESC addresses_srv = buffer_srv(8u, address_count);
-    device12->CreateShaderResourceView(L.addresses.Get(), &addresses_srv, cpu_at(base + 17u));
+    device12->CreateShaderResourceView(address_buffer, &addresses_srv, cpu_at(base + 17u));
     D3D12_UNORDERED_ACCESS_VIEW_DESC descs_uav = {};
     descs_uav.Format = DXGI_FORMAT_R32_TYPELESS;
     descs_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -1798,7 +1923,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     D3D12_UNORDERED_ACCESS_VIEW_DESC table_uav = {};
     table_uav.Format = DXGI_FORMAT_UNKNOWN;
     table_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    table_uav.Buffer.NumElements = static_cast<UINT>(data->tlas_instances_cpu.size() + records);
+    table_uav.Buffer.NumElements = static_cast<UINT>(static_count + records);
     table_uav.Buffer.StructureByteStride = sizeof(bvh::WorldInstanceGPU);
     device12->CreateUnorderedAccessView(L.instance_table.Get(), nullptr, &table_uav, cpu_at(base + 19u));
 
@@ -1806,8 +1931,8 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     list->SetDescriptorHeaps(1u, heaps);
     list->SetComputeRootSignature(s.records_root.Get());
     list->SetPipelineState(s.records_pso.Get());
-    const UINT records_constants[4] = {records, static_cast<UINT>(data->tlas_instances_cpu.size()), static_cast<UINT>(descs.size()),
-                                       static_cast<UINT>(s.blas.size())};
+    const UINT records_constants[4] = {records, static_count, static_cast<UINT>(descs.size()),
+                                       static_cast<UINT>(gc ? bvh::kGcMaxEntries : s.blas.size())};
     list->SetComputeRoot32BitConstants(0u, 4u, records_constants, 0u);
     list->SetComputeRootDescriptorTable(1u, gpu_at(base + 16u));
     list->Dispatch((records + 63u) / 64u, 1u, 1u);
@@ -1818,7 +1943,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     barriers.clear();
     Transition(barriers, L.descs.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Transition(barriers, L.instance_table.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Transition(barriers, s.records.texture12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    Transition(barriers, records_carrier.texture12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
   }
   list->EndQuery(s.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, k * kRt12Timestamps + 4u);
@@ -1882,15 +2007,21 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
 
   // 13.4 The 14 descriptors of 10.5 for this slot, from the TLAS and instance table this list traces.
   Rt12Slot& scene = s.lighting_slots[rebuild ? k : static_cast<uint32_t>(s.scene_slot)];
-  const uint32_t scene_count = rebuild ? static_cast<uint32_t>(data->tlas_instances_cpu.size()) + records : scene.instance_count;
-  const D3D12_SHADER_RESOURCE_VIEW_DESC indices_srv = buffer_srv(kRt12ArenaStride[kRt12ArenaIndices], s.arenas[kRt12ArenaIndices].used);
-  device12->CreateShaderResourceView(s.arenas[kRt12ArenaIndices].buffer.Get(), &indices_srv, cpu_at(base + 0u));
-  const D3D12_SHADER_RESOURCE_VIEW_DESC mesh_srv = buffer_srv(sizeof(bvh::WorldMeshGPU), s.mesh_count);
-  device12->CreateShaderResourceView(s.mesh_table.Get(), &mesh_srv, cpu_at(base + 1u));
+  const uint32_t scene_count = rebuild ? static_count + records : scene.instance_count;
+  ID3D12Resource* index_arena = (gc ? gc_scene.indices : s.arenas[kRt12ArenaIndices].buffer.Get());
+  const uint64_t index_count = (gc ? gc_scene.index_count : s.arenas[kRt12ArenaIndices].used);
+  ID3D12Resource* uv_arena = (gc ? gc_scene.uvs : s.arenas[kRt12ArenaUvs].buffer.Get());
+  const uint64_t uv_count = (gc ? gc_scene.uv_count : s.arenas[kRt12ArenaUvs].used);
+  ID3D12Resource* mesh_table = (gc ? L.gc_meshes.Get() : s.mesh_table.Get());
+  const uint32_t mesh_count = (gc ? static_cast<uint32_t>(bvh::kGcMaxEntries) : s.mesh_count);
+  const D3D12_SHADER_RESOURCE_VIEW_DESC indices_srv = buffer_srv(kRt12ArenaStride[kRt12ArenaIndices], index_count);
+  device12->CreateShaderResourceView(index_arena, &indices_srv, cpu_at(base + 0u));
+  const D3D12_SHADER_RESOURCE_VIEW_DESC mesh_srv = buffer_srv(sizeof(bvh::WorldMeshGPU), mesh_count);
+  device12->CreateShaderResourceView(mesh_table, &mesh_srv, cpu_at(base + 1u));
   const D3D12_SHADER_RESOURCE_VIEW_DESC instance_srv = buffer_srv(sizeof(bvh::WorldInstanceGPU), scene_count);
   device12->CreateShaderResourceView(scene.instance_table.Get(), &instance_srv, cpu_at(base + 2u));
-  const D3D12_SHADER_RESOURCE_VIEW_DESC uv_srv = buffer_srv(kRt12ArenaStride[kRt12ArenaUvs], s.arenas[kRt12ArenaUvs].used);
-  device12->CreateShaderResourceView(s.arenas[kRt12ArenaUvs].buffer.Get(), &uv_srv, cpu_at(base + 3u));
+  const D3D12_SHADER_RESOURCE_VIEW_DESC uv_srv = buffer_srv(kRt12ArenaStride[kRt12ArenaUvs], uv_count);
+  device12->CreateShaderResourceView(uv_arena, &uv_srv, cpu_at(base + 3u));
   D3D12_SHADER_RESOURCE_VIEW_DESC atlas_srv = {};
   atlas_srv.Format = DXGI_FORMAT_R32_UINT;
   atlas_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -1925,9 +2056,9 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   // 13.5 Barriers into the read and write states; the heap is bound before the stats clear (GPU handle in the heap).
   barriers.clear();
   if (!table_upload && records == 0u) Transition(barriers, scene.instance_table.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-  Transition(barriers, s.arenas[kRt12ArenaIndices].buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-  Transition(barriers, s.arenas[kRt12ArenaUvs].buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-  Transition(barriers, s.mesh_table.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  Transition(barriers, index_arena, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  Transition(barriers, uv_arena, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  Transition(barriers, mesh_table, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   Transition(barriers, s.materials.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   Transition(barriers, s.depth.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   Transition(barriers, s.normal.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1959,14 +2090,18 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   Transition(barriers, s.texel.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
   Transition(barriers, s.raw.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
   Transition(barriers, s.stats.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-  Transition(barriers, s.arenas[kRt12ArenaIndices].buffer.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-  Transition(barriers, s.arenas[kRt12ArenaUvs].buffer.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-  Transition(barriers, s.mesh_table.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+  Transition(barriers, index_arena, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+  Transition(barriers, uv_arena, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+  Transition(barriers, mesh_table, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   Transition(barriers, s.materials.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   Transition(barriers, scene.instance_table.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   if (records > 0u) {
     Transition(barriers, L.descs.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    Transition(barriers, L.addresses.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (gc) {
+      Transition(barriers, L.gc_addresses.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    } else {
+      Transition(barriers, L.addresses.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
   }
   Transition(barriers, s.depth.texture12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   Transition(barriers, s.normal.texture12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -2020,12 +2155,18 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   L.records_timed = records > 0u;
   if (rebuild) {
     s.scene_slot = static_cast<int32_t>(k);
-    s.scene_key_version = s.static_key_version;
-    s.scene_key_blas = s.static_key_blas;
+    if (gc) {
+      s.scene_key_version = ~0ull;
+      s.scene_key_blas = ~0ull;
+      L.gc_version = gc_scene.version;
+    } else {
+      s.scene_key_version = s.static_key_version;
+      s.scene_key_blas = s.static_key_blas;
+    }
     s.scene_dynamic_count = static_cast<uint32_t>(characters.size());
     s.scene_record_count = records;
-    if (address_write) L.addresses_generation = s.blas_generation;
-    L.instance_count = static_cast<uint32_t>(data->tlas_instances_cpu.size());
+    if (!gc && address_write) L.addresses_generation = s.blas_generation;
+    L.instance_count = static_count;
     if (table_upload) {
       L.table_key_version = s.static_key_version;
       L.table_key_blas = s.static_key_blas;
@@ -2080,11 +2221,16 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   for (const auto& item : s.dynamic_blas) dynamic_blas_bytes += item.second.bytes;
   const uint32_t dynamic_objects = static_cast<uint32_t>(characters.size());
   const uint32_t dynamic_blas_count = static_cast<uint32_t>(s.dynamic_blas.size());
-  UpdatePanel([records, dynamic_objects, dynamic_blas_count, dynamic_blas_bytes, vertex_end, character_builds,
+  UpdatePanel([gc, records, dynamic_objects, dynamic_blas_count, dynamic_blas_bytes, vertex_end, character_builds,
                character_refits](Rt12Panel& p) {
     p.traced_frames += 1u;
     p.reason = Rt12Reason::Tracing;
-    p.records = records;
+    p.records = (gc ? 0u : records);
+    if (gc) {
+      p.gc_traced_frames += 1u;
+      p.gc_records = records;
+      p.gc_not_ready.clear();
+    }
     p.dynamic_objects = dynamic_objects;
     p.dynamic_blas_count = dynamic_blas_count;
     p.dynamic_blas_bytes = dynamic_blas_bytes;
@@ -2118,7 +2264,7 @@ inline void DumpRt12Json() {
   out << "  \"traced_frames\": " << p.traced_frames << ",\n";
   out << "  \"fallback_frames\": {";
   bool first = true;
-  for (uint32_t r = 0u; r < 16u; ++r) {
+  for (uint32_t r = 0u; r < kRt12ReasonCount; ++r) {
     if (p.fallback_frames[r] == 0u) continue;
     out << (first ? "" : ", ") << "\"" << Rt12ReasonName(static_cast<Rt12Reason>(r)) << "\": " << p.fallback_frames[r];
     first = false;
@@ -2155,6 +2301,8 @@ inline void DumpRt12Json() {
   out << "  \"dynamic_refits\": " << p.dynamic_refits << ",\n";
   out << "  \"dynamic_blas_count\": " << p.dynamic_blas_count << ",\n";
   out << "  \"dynamic_blas_bytes\": " << p.dynamic_blas_bytes << ",\n";
+  out << "  \"gpu_capture\": {\"traced_frames\": " << p.gc_traced_frames << ", \"records\": " << p.gc_records << ", \"not_ready\": \""
+      << bvh::PoolJsonEscape(p.gc_not_ready) << "\"},\n";
   out << "  \"records\": " << p.records << "\n}\n";
   const std::filesystem::path path = bvh::PoolOutputDir() / "world_rt12.json";
   std::string text = out.str();
