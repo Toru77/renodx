@@ -92,6 +92,8 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 #include <wrl/client.h>
+#include "./amd-fsr/api/include/dx12/ffx_api_dx12.h"
+#include "./amd-fsr/upscalers/include/ffx_upscale.h"
 
 #include "../../utils/bitwise.hpp"
 #include "../../utils/build_info.hpp"
@@ -122,6 +124,7 @@ static constexpr uint32_t kSlotCbv = 0u;       // b0: TAA knobs
 
 // ── Settings (written by the settings system in addon.cpp) ──
 inline float dlss_enabled = 1.f;
+inline float upscaler_type = 0.f;  // 0 = DLSS, 1 = FSR
 // 0=Auto, 1=DLAA, 2=Quality, 3=Balanced, 4=Performance, 5=UltraPerformance
 inline float dlss_mode = 0.f;
 // 0=Default, 1=F, 2=J, 3=K, 4=L, 5=M
@@ -236,15 +239,15 @@ static constexpr int kFailPlaceholder = 10;
 inline const char* FailCodeText(int code) {
   switch (code) {
     case kFailNone: return "ok";
-    case kFailDevice: return "no NVIDIA device";
+    case kFailDevice: return "selected upscaler is not supported on this device";
     case kFailB0: return "b0 constants not resolved";
     case kFailResolve: return "TAA inputs not resolved";
     case kFailSize: return "input/target size mismatch";
     case kFailFormat: return "unsupported TAA target format";
     case kFailNgxInit: return "NGX init failed (see log)";
-    case kFailFeature: return "NGX feature creation failed (see log)";
+    case kFailFeature: return "upscaler context creation failed (see report)";
     case kFailUnpack: return "MV unpack failed (see log)";
-    case kFailEval: return "NGX evaluation failed (see log)";
+    case kFailEval: return "upscaler evaluation failed (see report)";
     case kFailPlaceholder: return "input placeholder creation failed";
     default: return "unknown";
   }
@@ -290,33 +293,35 @@ inline void NoteSuccess() {
 // GPU), so support is per-device and sticky: a non-NVIDIA init must never
 // disable an NVIDIA one.
 inline std::mutex device_mutex;
-inline std::unordered_set<uint64_t> nvidia_devices;
-inline std::atomic<bool> any_nvidia{false};
+inline std::unordered_set<uint64_t> gpu_devices;
+inline std::atomic<bool> any_gpu{false};
 inline std::string device_summary = "none seen";
 inline bool attached = false;
 
 // Lock-free copy of the NVIDIA natives, for the draw path.
+inline std::atomic<uint64_t> gpu_devs[4];
 inline std::atomic<uint64_t> nvidia_devs[4];
 
-inline bool IsKnownNvidiaNative(uint64_t native) {
+inline bool IsKnownGpuNative(uint64_t native) {
   if (native == 0u) return false;
   for (uint32_t i = 0u; i < 4u; ++i) {
-    if (nvidia_devs[i].load() == native) return true;
+    if (gpu_devs[i].load() == native) return true;
   }
   return false;
 }
 
-inline void AddNvidiaNative(uint64_t native) {
-  if (native == 0u || IsKnownNvidiaNative(native)) return;
+inline void AddGpuNative(uint64_t native) {
+  if (native == 0u || IsKnownGpuNative(native)) return;
   for (uint32_t i = 0u; i < 4u; ++i) {
     uint64_t empty = 0u;
-    if (nvidia_devs[i].compare_exchange_strong(empty, native)) return;
+    if (gpu_devs[i].compare_exchange_strong(empty, native)) return;
   }
 }
 
-inline void RemoveNvidiaNative(uint64_t native) {
+inline void RemoveGpuNative(uint64_t native) {
   if (native == 0u) return;
   for (uint32_t i = 0u; i < 4u; ++i) {
+    if (gpu_devs[i].load() == native) gpu_devs[i].store(0u);
     if (nvidia_devs[i].load() == native) nvidia_devs[i].store(0u);
   }
 }
@@ -1289,7 +1294,7 @@ inline bool OnUpdateDescriptorTables(
     uint32_t count,
     const reshade::api::descriptor_table_update* updates) {
   CpuTimingScope timing(CpuTimingCategory::descriptor_update, 63u);
-  if (dlss_enabled == 0.f || !any_nvidia.load()) return false;
+  if (dlss_enabled == 0.f || !any_gpu.load()) return false;
   if (device == nullptr || count == 0u || updates == nullptr) return false;
   if (device->get_api() != reshade::api::device_api::d3d12) return false;
 
@@ -1964,6 +1969,9 @@ struct CameraBuilderTest {
   uint32_t input_frames[4] = {};
   float last_input[2] = {};
   float last_projection[2] = {};
+  float projection_depth_a = 0.f;
+  float projection_depth_b = 0.f;
+  float projection_y_scale = 0.f;
   uint32_t last_frame = 0u;
 };
 inline CameraBuilderTest camera_builder_test;
@@ -2028,6 +2036,9 @@ inline void HookCameraBuilder(void* provider, void* view, void* previous_view, v
       camera_builder_test.last_projection[1] = projection[6];
       camera_builder_test.last_frame = jitter_frame;
       if (verified) {
+        camera_builder_test.projection_depth_a = projection[10];
+        camera_builder_test.projection_depth_b = projection[11];
+        camera_builder_test.projection_y_scale = projection[5];
         ++camera_builder_test.halton_verified;
         camera_builder_test.halton_frame = frame;
         camera_builder_test.halton_step = step;
@@ -3001,6 +3012,105 @@ inline std::wstring GetProcessDirectory() {
   return separator == std::wstring::npos ? L"." : result.substr(0u, separator);
 }
 
+struct FsrContext {
+  ffxContext context = nullptr;
+  ffxCreateBackendDX12Desc backend = {};
+  ffxCreateContextDescUpscale description = {};
+  uint32_t width = 0u;
+  uint32_t height = 0u;
+  uint32_t flags = 0u;
+};
+struct RetiredFsrContext {
+  std::unique_ptr<FsrContext> context;
+  std::shared_ptr<GpuRetirementTicket> ticket;
+};
+struct FsrState {
+  HMODULE loader = nullptr;
+  PfnFfxCreateContext create = nullptr;
+  PfnFfxDestroyContext destroy = nullptr;
+  PfnFfxDispatch dispatch = nullptr;
+  PfnFfxQuery query = nullptr;
+  std::unique_ptr<FsrContext> current;
+  std::vector<RetiredFsrContext> retired;
+  uint64_t last_time_ms = 0u;
+  uint64_t dispatches = 0u;
+  uint32_t last_result = 0u;
+  uint32_t failed_width = 0u;
+  uint32_t failed_height = 0u;
+  uint32_t failed_flags = 0u;
+  bool create_failed = false;
+  float camera_near = 0.1f;
+  float camera_far = 10000.f;
+  float camera_fov = 1.23096f;
+  bool camera_live = false;
+  std::string provider = "not initialized";
+  bool load_failed = false;
+};
+inline FsrState fsr;
+
+inline bool EnsureFsrContext(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t flags) {
+  if (device == nullptr || width == 0u || height == 0u) return false;
+  if (fsr.load_failed) return false;
+  if (fsr.loader == nullptr) {
+    const std::wstring path = GetProcessDirectory() + L"\\amd_fidelityfx_loader_dx12.dll";
+    fsr.loader = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (fsr.loader != nullptr) {
+      fsr.create = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(fsr.loader, "ffxCreateContext"));
+      fsr.destroy = reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(fsr.loader, "ffxDestroyContext"));
+      fsr.dispatch = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(fsr.loader, "ffxDispatch"));
+      fsr.query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(fsr.loader, "ffxQuery"));
+    }
+    if (fsr.loader == nullptr || fsr.create == nullptr || fsr.destroy == nullptr || fsr.dispatch == nullptr) {
+      fsr.load_failed = true;
+      fsr.provider = "AMD loader missing or invalid";
+      return false;
+    }
+  }
+  if (fsr.current && fsr.current->width == width && fsr.current->height == height && fsr.current->flags == flags) return true;
+  if (fsr.create_failed && fsr.failed_width == width && fsr.failed_height == height && fsr.failed_flags == flags) return false;
+  if (fsr.current && fsr.retired.size() >= kRetiredGenerationLimit) {
+    ++stat_retirement_limit;
+    return false;
+  }
+  auto next = std::make_unique<FsrContext>();
+  next->width = width;
+  next->height = height;
+  next->flags = flags;
+  next->backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+  next->backend.device = device;
+  next->description.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+  next->description.header.pNext = &next->backend.header;
+  next->description.flags = flags;
+  next->description.maxRenderSize = {width, height};
+  next->description.maxUpscaleSize = {width, height};
+  fsr.last_result = fsr.create(&next->context, &next->description.header, nullptr);
+  if (fsr.last_result != FFX_API_RETURN_OK || next->context == nullptr) {
+    if (next->context != nullptr) fsr.destroy(&next->context, nullptr);
+    fsr.create_failed = true;
+    fsr.failed_width = width;
+    fsr.failed_height = height;
+    fsr.failed_flags = flags;
+    fsr.provider = "context creation failed";
+    return false;
+  }
+  fsr.create_failed = false;
+  if (fsr.current) {
+    fsr.retired.push_back({.context = std::move(fsr.current), .ticket = RetireGpuCommands()});
+  }
+  fsr.current = std::move(next);
+  fsr.provider = "provider version unavailable";
+  if (fsr.query != nullptr) {
+    ffxQueryGetProviderVersion version = {};
+    version.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+    if (fsr.query(&fsr.current->context, &version.header) == FFX_API_RETURN_OK && version.versionName != nullptr) {
+      fsr.provider = version.versionName;
+    }
+  }
+  fsr.last_time_ms = 0u;
+  ngx.reset = true;
+  return true;
+}
+
 inline const char* ResultToString(NVSDK_NGX_Result result) {
   switch (result) {
     case NVSDK_NGX_Result_Success: return "Success";
@@ -3022,7 +3132,7 @@ inline const char* ResultToString(NVSDK_NGX_Result result) {
   }
 }
 
-inline bool IsSupported() { return any_nvidia.load() && (!ngx.initialized || ngx.supported); }
+inline bool IsSupported() { return any_gpu.load(); }
 
 inline void ReleaseFeatureHandleOnly(bool retire = false) {
   if (retire && (ngx.feature != nullptr || ngx.runtime_parameters != nullptr)) {
@@ -3065,6 +3175,16 @@ inline void ReleaseFeature(bool retire = false) {
 }
 
 inline void ReleaseNgx() {
+  if (fsr.destroy != nullptr) {
+    if (fsr.current && fsr.current->context != nullptr) fsr.destroy(&fsr.current->context, nullptr);
+    for (auto& retired : fsr.retired) {
+      if (retired.context && retired.context->context != nullptr) fsr.destroy(&retired.context->context, nullptr);
+    }
+  }
+  fsr.current.reset();
+  fsr.retired.clear();
+  if (fsr.loader != nullptr) FreeLibrary(fsr.loader);
+  fsr = {};
   ReleaseFeature();
   for (const auto& retired : retired_ngx_features) {
     if (retired.feature != nullptr) NVSDK_NGX_D3D12_ReleaseFeature(retired.feature);
@@ -3894,7 +4014,7 @@ inline bool ResolveDispatchOutput(
 // written and the dispatch itself is prevented.
 inline bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
   CpuTimingScope timing(CpuTimingCategory::dispatch, 63u);
-  if (dlss_enabled == 0.f || !any_nvidia.load()) return false;
+  if (dlss_enabled == 0.f || !any_gpu.load()) return false;
   if (cmd_list == nullptr) return false;
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
   if (shader_state == nullptr) return false;
@@ -4191,6 +4311,37 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   if (cmd_list == nullptr || data == nullptr || dlss_enabled == 0.f || !IsSupported()) return false;
   auto* device = cmd_list->get_device();
   if (device == nullptr || device->get_api() != reshade::api::device_api::d3d12) return false;
+  const bool use_fsr = upscaler_type >= 0.5f;
+  static bool previous_fsr = false;
+  if (use_fsr != previous_fsr) {
+    if (use_fsr && ngx.feature != nullptr) {
+      if (retired_ngx_features.size() >= kRetiredGenerationLimit) {
+        ++stat_retirement_limit;
+        return false;
+      }
+      ReleaseFeatureHandleOnly(true);
+    } else if (!use_fsr && fsr.current) {
+      if (fsr.retired.size() >= kRetiredGenerationLimit) {
+        ++stat_retirement_limit;
+        return false;
+      }
+      fsr.retired.push_back({.context = std::move(fsr.current), .ticket = RetireGpuCommands()});
+    }
+    ngx.eval_failed = false;
+    ngx.create_failed = false;
+    ngx.reset = true;
+    previous_fsr = use_fsr;
+  }
+  if (!use_fsr) {
+    bool nvidia_device = false;
+    for (const auto& native : nvidia_devs) {
+      if (native.load(std::memory_order_relaxed) == device->get_native()) nvidia_device = true;
+    }
+    if (!nvidia_device) {
+      NoteFail(kFailDevice);
+      return false;
+    }
+  }
 
   auto* command_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
   if (command_list == nullptr) return false;
@@ -4212,7 +4363,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   for (auto& hit : slot_hit) hit.store(0);
 
   // Per-device gate: a non-NVIDIA device's command lists keep vanilla TAA.
-  if (!IsKnownNvidiaNative(device->get_native())) {
+  if (!IsKnownGpuNative(device->get_native())) {
     NoteFail(kFailDevice);
     return false;
   }
@@ -4383,7 +4534,8 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
           & static_cast<uint32_t>(reshade::api::resource_usage::unordered_access)) == 0u;
   const uint32_t target_width = fsr1_mode ? fsr1_target_width.load() : display_width.load();
   const uint32_t target_height = fsr1_mode ? fsr1_target_height.load() : display_height.load();
-  if (input_width == 0u || input_height == 0u) {
+  if (input_width == 0u || input_height == 0u
+      || (use_fsr && (input_width > target_width || input_height > target_height))) {
     NoteFail(kFailSize);
     return false;
   }
@@ -4573,11 +4725,11 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     return true;
   }
 
-  if (!EnsureNgxInitialized(device)) {
+  if (!use_fsr && !EnsureNgxInitialized(device)) {
     NoteFail(kFailNgxInit);
     return false;
   }
-  if (!EnsureOutputTexture(ngx.device.Get(), target_width, target_height, output_format)) return false;
+  if (!EnsureOutputTexture(reinterpret_cast<ID3D12Device*>(device->get_native()), target_width, target_height, output_format)) return false;
 
   const uint32_t motion_src_width = use_motion_placeholder
       ? placeholders.width
@@ -4623,8 +4775,13 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   // the substitute rather than left describing motion that is no longer there.
   int feature_flags = GetFeatureFlags();
   if (use_motion_placeholder) feature_flags &= ~NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
-  if (!EnsureFeature(command_list, input_width, input_height, target_width, target_height,
-                     render_preset, feature_flags, perf_quality)) {
+  uint32_t fsr_flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
+  if (dlss_flag_is_hdr != 0.f) fsr_flags |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE;
+  if (dlss_depth_inverted != 0.f) fsr_flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
+  if (!use_motion_placeholder && dlss_motion_vectors_jittered != 0.f) fsr_flags |= FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
+  if ((use_fsr && !EnsureFsrContext(reinterpret_cast<ID3D12Device*>(device->get_native()), target_width, target_height, fsr_flags))
+      || (!use_fsr && !EnsureFeature(command_list, input_width, input_height, target_width, target_height,
+                                     render_preset, feature_flags, perf_quality))) {
     NoteFail(kFailFeature);
     return false;
   }
@@ -5029,7 +5186,50 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     cmd_list->barrier(fsr1_target_resource, fsr1_target_state, reshade::api::resource_usage::unordered_access);
   }
 
-  const NVSDK_NGX_Result result = NGX_D3D12_EVALUATE_DLSS_EXT(command_list, ngx.feature, ngx.runtime_parameters, &eval);
+  NVSDK_NGX_Result result = NVSDK_NGX_Result_Success;
+  if (use_fsr) {
+    ffxDispatchDescUpscale dispatch = {};
+    dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+    dispatch.commandList = command_list;
+    dispatch.color = ffxApiGetResourceDX12(color, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    dispatch.depth = ffxApiGetResourceDX12(depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    dispatch.motionVectors = ffxApiGetResourceDX12(motion_vectors, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    dispatch.output = ffxApiGetResourceDX12(eval.Feature.pInOutput, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    dispatch.jitterOffset = {jitter_x, jitter_y};
+    dispatch.motionVectorScale = {1.f, 1.f};
+    dispatch.renderSize = {input_width, input_height};
+    dispatch.upscaleSize = {target_width, target_height};
+    dispatch.enableSharpening = false;
+    const uint64_t now = GetTickCount64();
+    dispatch.frameTimeDelta = (fsr.last_time_ms != 0u && now >= fsr.last_time_ms)
+        ? static_cast<float>((std::max)(1ull, (std::min)(now - fsr.last_time_ms, 1000ull))) : 16.667f;
+    fsr.last_time_ms = now;
+    dispatch.preExposure = 1.f;
+    dispatch.reset = eval.InReset != 0;
+    {
+      std::shared_lock lock(camera_builder_test.mutex);
+      const float a = camera_builder_test.projection_depth_a;
+      const float b = camera_builder_test.projection_depth_b;
+      const float y = camera_builder_test.projection_y_scale;
+      if (camera_builder_test.halton_frame == frame_counter && std::isfinite(a) && std::isfinite(b)
+          && std::isfinite(y) && a > 0.f && b > 0.f && y > 0.f) {
+        fsr.camera_near = b / (1.f + a);
+        fsr.camera_far = b / a;
+        fsr.camera_fov = 2.f * std::atan(1.f / y);
+        fsr.camera_live = true;
+      } else {
+        fsr.camera_live = false;
+      }
+    }
+    dispatch.cameraNear = fsr.camera_near;
+    dispatch.cameraFar = fsr.camera_far;
+    dispatch.cameraFovAngleVertical = fsr.camera_fov;
+    dispatch.viewSpaceToMetersFactor = 1.f;
+    fsr.last_result = fsr.dispatch(&fsr.current->context, &dispatch.header);
+    if (fsr.last_result == FFX_API_RETURN_OK) ++fsr.dispatches;
+  } else {
+    result = NGX_D3D12_EVALUATE_DLSS_EXT(command_list, ngx.feature, ngx.runtime_parameters, &eval);
+  }
   if (depth_needs_read_transition) {
     cmd_list->barrier(depth_resource, reshade::api::resource_usage::shader_resource_non_pixel, depth_state);
   }
@@ -5038,13 +5238,17 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
   // Restored before anything else: the evaluation dispatched on the native
   // command list, and the game's own commands follow ours on this same list.
-  if (dlss_restore_state != 0.f) RestoreGameDescriptorState(cmd_list);
-  if (NVSDK_NGX_FAILED(result)) {
+  if (use_fsr || dlss_restore_state != 0.f) RestoreGameDescriptorState(cmd_list);
+  if ((use_fsr && fsr.last_result != FFX_API_RETURN_OK) || (!use_fsr && NVSDK_NGX_FAILED(result))) {
     ngx.eval_failed = true;
     NoteFail(kFailEval);
     std::stringstream s;
-    s << "Far Cry 6 DLSS: evaluation failed: " << ResultToString(result)
-      << " (0x" << std::hex << static_cast<uint32_t>(result) << ")";
+    if (use_fsr) {
+      s << "Far Cry 6 FSR: dispatch failed: " << fsr.last_result;
+    } else {
+      s << "Far Cry 6 DLSS: evaluation failed: " << ResultToString(result)
+        << " (0x" << std::hex << static_cast<uint32_t>(result) << ")";
+    }
     reshade::log::message(reshade::log::level::error, s.str().c_str());
     return false;
   }
@@ -5063,8 +5267,8 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     deploy_report.mv_height = motion_src_height;
     deploy_report.depth_width = static_cast<uint32_t>(depth->GetDesc().Width);
     deploy_report.depth_height = static_cast<uint32_t>(depth->GetDesc().Height);
-    deploy_report.quality = ngx.perf_quality;
-    deploy_report.preset = ngx.render_preset;
+    deploy_report.quality = use_fsr ? perf_quality : ngx.perf_quality;
+    deploy_report.preset = use_fsr ? -1 : ngx.render_preset;
     deploy_report.flags = feature_flags;
     deploy_report.jitter_x = jitter_x;
     deploy_report.jitter_y = jitter_y;
@@ -5198,6 +5402,16 @@ inline std::string BuildDebugReport() {
       fsr1_target_width.load(), fsr1_target_height.load(), fsr1_target_format.load(),
       static_cast<unsigned long long>(fsr1_output_resource.load()));
   std::string out(buf);
+  {
+    char line[384];
+    snprintf(line, sizeof(line), "  upscaler         : %s; FSR provider=%s; dispatches=%llu; last result=%u; retired contexts=%zu; reactive mask=none\n",
+             upscaler_type >= 0.5f ? "FSR" : "DLSS", fsr.provider.c_str(),
+             static_cast<unsigned long long>(fsr.dispatches), fsr.last_result, fsr.retired.size());
+    out += line;
+    snprintf(line, sizeof(line), "  FSR camera       : %s near=%.4f far=%.2f vertical FOV=%.4f rad\n",
+             fsr.camera_live ? "live" : "last known or estimated", fsr.camera_near, fsr.camera_far, fsr.camera_fov);
+    out += line;
+  }
   {
     char line[256];
     snprintf(line, sizeof(line), "  GPU retirement: features=%zu outputs=%zu unpack=%zu; reclaimed=%llu; limit=%zu each; fallback hits=%llu\n",
@@ -6062,7 +6276,7 @@ inline void OnBindDescriptorTables(
     reshade::api::command_list* cmd_list, reshade::api::shader_stage stages,
     reshade::api::pipeline_layout, uint32_t first, uint32_t count,
     const reshade::api::descriptor_table* tables) {
-  if (dlss_enabled == 0.f || !any_nvidia.load()) return;
+  if (dlss_enabled == 0.f || !any_gpu.load()) return;
   // Tables are recorded for every stage, not just the pixel stage: the compute
   // dispatch that upscales binds its output through one, and a table left
   // unrecorded is indistinguishable from a table that resolved to nothing.
@@ -6078,7 +6292,7 @@ inline void OnBindDescriptorTables(
 inline void OnBindRenderTargetsAndDepthStencil(
     reshade::api::command_list* cmd_list, uint32_t count,
     const reshade::api::resource_view* rtvs, reshade::api::resource_view dsv) {
-  if (dlss_enabled == 0.f || !any_nvidia.load()) return;
+  if (dlss_enabled == 0.f || !any_gpu.load()) return;
   if (cmd_list == nullptr) return;
   auto* data = Get(cmd_list);
   if (data == nullptr) return;
@@ -6259,7 +6473,7 @@ inline void CaptureCameraCoverage(reshade::api::command_list* cmd_list) {
 
 inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
   CpuTimingScope timing(CpuTimingCategory::draw, 127u);
-  if (dlss_enabled == 0.f || !any_nvidia.load()) return false;
+  if (dlss_enabled == 0.f || !any_gpu.load()) return false;
   NoteDrawForDepth(cmd_list);
   CaptureCameraCoverage(cmd_list);
   if (ReplaceSceneUpscale(cmd_list)) return true;
@@ -6293,7 +6507,7 @@ inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uin
 
 inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
   CpuTimingScope timing(CpuTimingCategory::draw, 127u);
-  if (dlss_enabled == 0.f || !any_nvidia.load()) return false;
+  if (dlss_enabled == 0.f || !any_gpu.load()) return false;
   NoteDrawForDepth(cmd_list);
   CaptureCameraCoverage(cmd_list);
   if (ReplaceSceneUpscale(cmd_list)) return true;
@@ -6371,6 +6585,14 @@ inline void OnPresent(
       it = retired_ngx_features.erase(it);
       ++gpu_retirement.reclaimed;
     }
+    for (auto it = fsr.retired.begin(); it != fsr.retired.end();) {
+      if (!it->ticket->complete) { ++it; continue; }
+      if (it->context && it->context->context != nullptr && fsr.destroy != nullptr) {
+        fsr.destroy(&it->context->context, nullptr);
+      }
+      it = fsr.retired.erase(it);
+      ++gpu_retirement.reclaimed;
+    }
     for (auto it = retired_ngx_outputs.begin(); it != retired_ngx_outputs.end();) {
       if (!it->ticket->complete) { ++it; continue; }
       it = retired_ngx_outputs.erase(it);
@@ -6398,7 +6620,7 @@ inline void OnPresent(
     {
       std::unique_lock lock(scene_buffer_capture.mutex);
       if (scene_buffer_capture.state == SceneBufferCapture::State::requested
-          && IsKnownNvidiaNative(queue->get_device()->get_native())) {
+          && IsKnownGpuNative(queue->get_device()->get_native())) {
         scene_buffer_capture.state = SceneBufferCapture::State::reading;
         create_scene_capture = true;
       } else if (scene_buffer_capture.state == SceneBufferCapture::State::submitted
@@ -6461,7 +6683,7 @@ inline void OnPresent(
     {
       std::unique_lock lock(motion_capture.mutex);
       if (motion_capture.state == MotionCapture::State::requested
-          && IsKnownNvidiaNative(queue->get_device()->get_native())) {
+          && IsKnownGpuNative(queue->get_device()->get_native())) {
         motion_capture.state = MotionCapture::State::reading;
         create_capture = true;
       } else if (motion_capture.state == MotionCapture::State::submitted && motion_capture.queue == queue
@@ -6614,29 +6836,36 @@ inline void OnInitDevice(reshade::api::device* device) {
   int vendor_id = 0;
   const bool is_nvidia = device->get_property(reshade::api::device_properties::vendor_id, &vendor_id)
                       && vendor_id == 0x10de;
+  const bool supported_vendor = is_nvidia || vendor_id == 0x1002 || vendor_id == 0x8086;
   {
     std::lock_guard<std::mutex> lock(device_mutex);
-    if (is_nvidia) {
-      nvidia_devices.insert(device->get_native());
-      AddNvidiaNative(device->get_native());
+    if (supported_vendor && device->get_api() == reshade::api::device_api::d3d12) {
+      gpu_devices.insert(device->get_native());
+      AddGpuNative(device->get_native());
+      if (is_nvidia) {
+        for (auto& native : nvidia_devs) {
+          uint64_t empty = 0u;
+          if (native.compare_exchange_strong(empty, device->get_native())) break;
+        }
+      }
       char buf[128];
-      snprintf(buf, sizeof(buf), "nvidia+%zu", nvidia_devices.size());
+      snprintf(buf, sizeof(buf), "%s+%zu", is_nvidia ? "nvidia" : (vendor_id == 0x1002 ? "amd" : "intel"), gpu_devices.size());
       device_summary = buf;
     } else {
       char buf[160];
-      snprintf(buf, sizeof(buf), "non-nvidia (vendor=0x%X)%s",
+      snprintf(buf, sizeof(buf), "unsupported device (vendor=0x%X)%s",
                static_cast<unsigned>(vendor_id),
-               any_nvidia.load() ? ", nvidia also present" : "");
-      if (!any_nvidia.load()) device_summary = buf;
+               any_gpu.load() ? ", supported GPU also present" : "");
+      if (!any_gpu.load()) device_summary = buf;
     }
-    any_nvidia.store(!nvidia_devices.empty());
+    any_gpu.store(!gpu_devices.empty());
   }
   std::stringstream s;
-  if (is_nvidia) {
-    s << "Far Cry 6 DLSS: NVIDIA device detected (" << device->get_native() << ")";
+  if (supported_vendor && device->get_api() == reshade::api::device_api::d3d12) {
+    s << "Far Cry 6: supported graphics device detected (" << device->get_native() << ", vendor=" << std::hex << vendor_id << ")";
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   } else {
-    s << "Far Cry 6 DLSS: ignoring non-NVIDIA device, vendor=0x" << std::hex << vendor_id;
+    s << "Far Cry 6: ignoring unsupported device, vendor=0x" << std::hex << vendor_id;
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
 }
@@ -6681,9 +6910,9 @@ inline void OnDestroyDevice(reshade::api::device* device) {
   bool was_ours = false;
   {
     std::lock_guard<std::mutex> lock(device_mutex);
-    was_ours = nvidia_devices.erase(device->get_native()) > 0u;
-    any_nvidia.store(!nvidia_devices.empty());
-    if (nvidia_devices.empty()) device_summary = "none seen";
+    was_ours = gpu_devices.erase(device->get_native()) > 0u;
+    any_gpu.store(!gpu_devices.empty());
+    if (gpu_devices.empty()) device_summary = "none seen";
   }
   if (was_ours) {
     ReleaseNgx();
@@ -6700,7 +6929,7 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     gpu_retirement.submit_thread = 0u;
     gpu_retirement.conflicting_submission = false;
   }
-  RemoveNvidiaNative(device->get_native());
+  RemoveGpuNative(device->get_native());
   reshade::log::message(reshade::log::level::info, "Far Cry 6 DLSS: device destroyed");
 }
 

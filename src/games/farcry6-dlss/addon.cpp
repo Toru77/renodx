@@ -40,7 +40,7 @@ static bool DlssStatusDraw() {
   const std::string devices = DeviceSummary();
   ImGui::Text("Devices: %s", devices.c_str());
   ImGui::Text(
-      "TAA draws: %llu  DLSS replacements: %llu",
+      "TAA draws: %llu  upscaler evaluations: %llu",
       static_cast<unsigned long long>(stat_taa_draws.load()),
       static_cast<unsigned long long>(stat_dlss_ok.load()));
   ImGui::Text("State: %s", FailCodeText(stat_fail_code.load()));
@@ -251,13 +251,24 @@ renodx::utils::settings::Settings settings = {
         .on_draw = [] { return DlssStatusDraw(); },
     },
     new renodx::utils::settings::Setting{
+        .key = "UpscalerType",
+        .binding = &farcry6_dlss::dlss::upscaler_type,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Upscaler",
+        .section = "Antialiasing",
+        .tooltip = "Choose NVIDIA DLSS or AMD FSR upscaling. FSR requires AMD's loader and upscaler DLLs next to FarCry6.exe.",
+        .labels = {"DLSS", "FSR"},
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLSSEnabled",
         .binding = &farcry6_dlss::dlss::dlss_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f,
-        .label = "DLSS Replacement",
+        .label = "Upscaler Replacement",
         .section = "Antialiasing",
-        .tooltip = "Runs NVIDIA DLSS in place of Far Cry 6's TAA pass when all of its inputs resolve. Requires nvngx_dlss.dll next to the game executable. When off, the game's own TAA runs unchanged.",
+        .tooltip = "Runs the selected upscaler when its inputs are available. DLSS and FSR require their respective runtime DLLs next to the game executable.",
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
     new renodx::utils::settings::Setting{
@@ -265,9 +276,9 @@ renodx::utils::settings::Settings settings = {
         .binding = &farcry6_dlss::dlss::dlss_output_mode,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f,
-        .label = "DLSS Output",
+        .label = "Upscaler Output",
         .section = "Antialiasing",
-        .tooltip = "What DLSS is allowed to replace, for isolating a rendering fault. Replace skips the TAA draw and puts DLSS output in its target. Evaluate only runs the whole chain but keeps the game's own TAA output. Resolve only resolves and reports the inputs without running DLSS at all.",
+        .tooltip = "Replace uses the selected upscaler output. Evaluate only runs the upscaler but keeps the game's own TAA output. Resolve only checks the inputs without running an upscaler.",
         .labels = {"Replace", "Evaluate only", "Resolve only"},
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
@@ -281,7 +292,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Antialiasing",
         .labels = {"Default", "F - CNN", "J - Transformer 1", "K - Transformer 1", "L - Transformer 2", "M - Transformer 2"},
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
-        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported() && farcry6_dlss::dlss::upscaler_type < 0.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLSSJitterSource",
