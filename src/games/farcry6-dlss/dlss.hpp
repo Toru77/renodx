@@ -181,6 +181,7 @@ inline float dlss_cpu_timing = 0.f;
 inline float dlss_detailed_diagnostics = 0.f;
 inline float fg_bootstrap_test = 0.f;
 inline float fg_input_test = 0.f;
+inline float portable_descriptors_test = 0.f;
 inline std::atomic<bool> fg_enable_requested{false};
 inline std::atomic<int> fg_mode_report{0};
 inline std::atomic<int> fg_mode_result{0};
@@ -334,6 +335,8 @@ inline bool attached = false;
 // Lock-free copy of the NVIDIA natives, for the draw path.
 inline std::atomic<uint64_t> gpu_devs[4];
 inline std::atomic<uint64_t> nvidia_devs[4];
+inline std::atomic<uint64_t> portable_descriptor_devs[4];
+inline std::atomic<bool> portable_descriptor_callback_registered{false};
 
 inline bool IsKnownGpuNative(uint64_t native) {
   if (native == 0u) return false;
@@ -356,7 +359,16 @@ inline void RemoveGpuNative(uint64_t native) {
   for (uint32_t i = 0u; i < 4u; ++i) {
     if (gpu_devs[i].load() == native) gpu_devs[i].store(0u);
     if (nvidia_devs[i].load() == native) nvidia_devs[i].store(0u);
+    if (portable_descriptor_devs[i].load() == native) portable_descriptor_devs[i].store(0u);
   }
+}
+
+inline bool UsesPortableDescriptors(reshade::api::device* device) {
+  if (device == nullptr) return false;
+  for (const auto& native : portable_descriptor_devs) {
+    if (native.load(std::memory_order_relaxed) == device->get_native()) return true;
+  }
+  return false;
 }
 
 inline std::string DeviceSummary() {
@@ -471,6 +483,8 @@ inline std::atomic<uint64_t> stat_fingerprints{0};
 inline std::atomic<uint64_t> stat_fingerprint_collisions{0};
 inline std::atomic<uint64_t> stat_fingerprint_misses{0};
 inline std::atomic<uint64_t> stat_fingerprint_invalidated{0};
+inline std::atomic<uint64_t> stat_portable_copies{0};
+inline std::atomic<uint64_t> stat_portable_copy_misses{0};
 
 // "The same view" is the same resource and the same view format. It is not the
 // view handle: that is a slot address, and comparing slot addresses made the same
@@ -489,10 +503,27 @@ inline void RecordFingerprint(const DescriptorFingerprint& key, const RecordedDe
   if (it == fingerprints.end()) {
     fingerprints.emplace(key, record);
     if (record.has_resource) fingerprints_by_resource.emplace(record.resource.handle, key);
+    else if (key.words.back() == 0x464336534C4F5453ull && record.has_range) {
+      fingerprints_by_resource.emplace(record.range.buffer.handle, key);
+    }
     stat_fingerprints.store(fingerprints.size());
     return;
   }
-  if (SameRecordedView(it->second, record)) return;  // the same view, seen again
+  if (SameRecordedView(it->second, record)
+      && (key.words.back() != 0x464336534C4F5453ull
+          || (it->second.type == record.type && (!record.has_range || it->second.range.size == record.range.size)))) return;
+  if (key.words.back() == 0x464336534C4F5453ull) {
+    const uint64_t old_resource = (it->second.has_resource ? it->second.resource.handle : it->second.range.buffer.handle);
+    const auto range = fingerprints_by_resource.equal_range(old_resource);
+    for (auto reverse = range.first; reverse != range.second;) {
+      if (reverse->second == key) reverse = fingerprints_by_resource.erase(reverse);
+      else ++reverse;
+    }
+    it->second = record;
+    const uint64_t resource = (record.has_resource ? record.resource.handle : record.range.buffer.handle);
+    if (resource != 0u) fingerprints_by_resource.emplace(resource, key);
+    return;
+  }
   stat_fingerprint_collisions.fetch_add(1u, std::memory_order_relaxed);
   if (!fingerprint_collision.captured) {
     fingerprint_collision.captured = true;
@@ -512,13 +543,14 @@ inline bool CanonicalBinding(
     reshade::api::descriptor_table table,
     uint32_t binding,
     uint64_t& heap,
-    uint32_t& offset) {
+    uint32_t& offset,
+    uint32_t array_offset = 0u) {
   heap = 0u;
   offset = 0u;
   if (device == nullptr || table.handle == 0u) return false;
   reshade::api::descriptor_heap h = {};
   uint32_t off = 0u;
-  device->get_descriptor_heap_offset(table, binding, 0u, &h, &off);
+  device->get_descriptor_heap_offset(table, binding, array_offset, &h, &off);
   if (h.handle == 0u) return false;
   heap = h.handle;
   offset = off;
@@ -532,14 +564,22 @@ inline bool ReadSlotFingerprint(
     reshade::api::device* device,
     reshade::api::descriptor_table table,
     uint32_t binding,
-    DescriptorFingerprint& out) {
+    DescriptorFingerprint& out,
+    uint32_t array_offset = 0u) {
   out = {};
   if (device == nullptr || table.handle == 0u) return false;
   if (device->get_api() != reshade::api::device_api::d3d12) return false;
 
   uint64_t heap = 0u;
   uint32_t offset = 0u;
-  if (!CanonicalBinding(device, table, binding, heap, offset)) return false;
+  if (!CanonicalBinding(device, table, binding, heap, offset, array_offset)) return false;
+  if (UsesPortableDescriptors(device)) {
+    out.words[0] = device->get_native();
+    out.words[1] = heap;
+    out.words[2] = offset;
+    out.words.back() = 0x464336534C4F5453ull;
+    return true;
+  }
   auto* native_heap = reinterpret_cast<ID3D12DescriptorHeap*>(heap);
   auto* native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
   if (native_heap == nullptr || native_device == nullptr) return false;
@@ -1327,9 +1367,11 @@ inline bool OnUpdateDescriptorTables(
     uint32_t count,
     const reshade::api::descriptor_table_update* updates) {
   CpuTimingScope timing(CpuTimingCategory::descriptor_update, 63u);
-  if (dlss_enabled == 0.f || !any_gpu.load()) return false;
   if (device == nullptr || count == 0u || updates == nullptr) return false;
   if (device->get_api() != reshade::api::device_api::d3d12) return false;
+  if (!IsKnownGpuNative(device->get_native())) return false;
+  const bool portable = UsesPortableDescriptors(device);
+  if ((!portable && dlss_enabled == 0.f) || !any_gpu.load()) return false;
 
   for (uint32_t u = 0u; u < count; ++u) {
     const auto& update = updates[u];
@@ -1360,7 +1402,17 @@ inline bool OnUpdateDescriptorTables(
         camera_cbv_sources.erase(update.table.handle);
       }
     }
-    if (!is_cbv && !is_view) continue;
+    if ((!is_cbv && !is_view) || update.descriptors == nullptr) {
+      if (portable) {
+        for (uint32_t k = 0u; k < update.count; ++k) {
+          DescriptorFingerprint key;
+          if (ReadSlotFingerprint(device, update.table, update.binding, key, update.array_offset + k)) {
+            RecordFingerprint(key, {});
+          }
+        }
+      }
+      continue;
+    }
 
     for (uint32_t k = 0u; k < update.count; ++k) {
       RecordedDescriptor record;
@@ -1368,7 +1420,7 @@ inline bool OnUpdateDescriptorTables(
       if (is_cbv) {
         record.range = static_cast<const reshade::api::buffer_range*>(update.descriptors)[k];
         record.has_range = record.range.buffer.handle != 0u;
-        if (!record.has_range) continue;
+        if (!record.has_range && !portable) continue;
         // The projection scan is only used as a fallback for the scene jitter source.
         if (dlss_jitter_source > 0.5f && dlss_jitter_source < 1.5f) {
           ProbeConstantBufferForProjection(record.range);
@@ -1376,10 +1428,26 @@ inline bool OnUpdateDescriptorTables(
       } else {
         const reshade::api::resource_view view =
             static_cast<const reshade::api::resource_view*>(update.descriptors)[k];
-        if (view.handle == 0u) continue;
+        if (view.handle == 0u) {
+          if (portable) {
+            DescriptorFingerprint key;
+            if (ReadSlotFingerprint(device, update.table, update.binding, key, update.array_offset + k)) {
+              RecordFingerprint(key, {});
+            }
+          }
+          continue;
+        }
         // Resolve now, while this slot still holds this view.
         record.resource = device->get_resource_from_view(view);
-        if (record.resource.handle == 0u) continue;
+        if (record.resource.handle == 0u) {
+          if (portable) {
+            DescriptorFingerprint key;
+            if (ReadSlotFingerprint(device, update.table, update.binding, key, update.array_offset + k)) {
+              RecordFingerprint(key, {});
+            }
+          }
+          continue;
+        }
         record.format = device->get_resource_view_desc(view).format;
         const reshade::api::resource_desc resource_desc = device->get_resource_desc(record.resource);
         if (resource_desc.type == reshade::api::resource_type::texture_2d) {
@@ -1390,8 +1458,29 @@ inline bool OnUpdateDescriptorTables(
       }
 
       DescriptorFingerprint key;
-      if (!ReadSlotFingerprint(device, update.table, update.binding + k, key)) continue;
+      if (!ReadSlotFingerprint(device, update.table, update.binding, key, update.array_offset + k)) continue;
       RecordFingerprint(key, record);
+    }
+  }
+  return false;
+}
+
+inline bool OnCopyPortableDescriptors(reshade::api::device* device, uint32_t count,
+                                      const reshade::api::descriptor_table_copy* copies) {
+  if (!UsesPortableDescriptors(device) || copies == nullptr) return false;
+  for (uint32_t i = 0u; i < count; ++i) {
+    const auto& copy = copies[i];
+    for (uint32_t k = 0u; k < copy.count; ++k) {
+      DescriptorFingerprint source;
+      DescriptorFingerprint destination;
+      if (!ReadSlotFingerprint(device, copy.dest_table, copy.dest_binding, destination, copy.dest_array_offset + k)) continue;
+      RecordedDescriptor record;
+      if (!ReadSlotFingerprint(device, copy.source_table, copy.source_binding, source, copy.source_array_offset + k)
+          || !LookupFingerprint(source, record)) {
+        stat_portable_copy_misses.fetch_add(1u, std::memory_order_relaxed);
+      }
+      RecordFingerprint(destination, record);
+      stat_portable_copies.fetch_add(1u, std::memory_order_relaxed);
     }
   }
   return false;
@@ -2375,8 +2464,10 @@ inline bool OnCopyCameraDescriptor(
   {
     const std::lock_guard<std::mutex> lock(scene_matrix_mutex);
     for (const auto& sample : scene_matrix_samples) {
-      if (sample.buffer != 0u && sample.buffer_size == CameraOverrideTest::kBytes
-          && sample.fingerprint_valid && sample.fingerprint == fingerprint) {
+      if (sample.buffer != 0u && sample.buffer_size == CameraOverrideTest::kBytes && sample.fingerprint_valid
+          && (UsesPortableDescriptors(device)
+                  ? (sample.buffer == recorded_range.buffer.handle && sample.buffer_offset == recorded_range.offset)
+                  : sample.fingerprint == fingerprint)) {
         camera_range = {reshade::api::resource{sample.buffer}, sample.buffer_offset, sample.buffer_size};
         break;
       }
@@ -3142,6 +3233,7 @@ inline void NVSDK_CONV OnNgxLog(
 struct InstanceData {
   Microsoft::WRL::ComPtr<ID3D12Device> device;
   Microsoft::WRL::ComPtr<ID3D12Resource> output_texture;
+  ID3D12Device* output_device = nullptr;
   NVSDK_NGX_Parameter* capability_parameters = nullptr;
   NVSDK_NGX_Parameter* runtime_parameters = nullptr;
   NVSDK_NGX_Handle* feature = nullptr;
@@ -3223,9 +3315,8 @@ inline std::wstring GetProcessDirectory() {
 }
 
 inline bool OnCreateDevice(reshade::api::device_api api, uint32_t& api_version) {
-  if (api == reshade::api::device_api::d3d12) {
-    farcry6_dlss::streamline::LoadRuntime(GetProcessDirectory());
-    if (fg_bootstrap_test != 0.f) farcry6_dlss::streamline::StartBootstrap(GetProcessDirectory());
+  if (api == reshade::api::device_api::d3d12 && fg_bootstrap_test != 0.f) {
+    farcry6_dlss::streamline::StartBootstrap(GetProcessDirectory());
   }
   return false;
 }
@@ -3284,6 +3375,8 @@ inline bool EnsureFsrContext(ID3D12Device* device, uint32_t width, uint32_t heig
       return false;
     }
   }
+  // FSR resources and the context belong to the device used at creation.
+  if (fsr.current && fsr.current->backend.device != device) return false;
   if (fsr.current && fsr.current->width == width && fsr.current->height == height && fsr.current->flags == flags) return true;
   if (fsr.create_failed && fsr.failed_width == width && fsr.failed_height == height && fsr.failed_flags == flags) return false;
   if (fsr.current && fsr.retired.size() >= kRetiredGenerationLimit) {
@@ -3386,6 +3479,7 @@ inline void ReleaseFeature(bool retire = false) {
     ngx.output_texture.Reset();
   }
   ngx.width = 0u;
+  ngx.output_device = nullptr;
   ngx.height = 0u;
   ngx.input_width = 0u;
   ngx.input_height = 0u;
@@ -3486,6 +3580,7 @@ inline bool EnsureNgxInitialized(reshade::api::device* device) {
 
 inline bool EnsureOutputTexture(ID3D12Device* device, uint32_t width, uint32_t height, DXGI_FORMAT format) {
   if (device == nullptr || width == 0u || height == 0u || format == DXGI_FORMAT_UNKNOWN) return false;
+  if (ngx.output_texture != nullptr && ngx.output_device != device) return false;
   if (ngx.output_texture != nullptr && ngx.width == width && ngx.height == height && ngx.output_format == format) return true;
 
   if ((ngx.output_texture != nullptr && retired_ngx_outputs.size() >= kRetiredGenerationLimit)
@@ -3530,6 +3625,7 @@ inline bool EnsureOutputTexture(ID3D12Device* device, uint32_t width, uint32_t h
   }
 
   ngx.width = width;
+  ngx.output_device = device;
   ngx.height = height;
   ngx.output_format = format;
   return true;
@@ -3846,7 +3942,10 @@ inline bool EnsureUnpackLayout(reshade::api::device* device) {
 
 inline bool EnsureUnpackResources(reshade::api::device* device, uint32_t width, uint32_t height) {
   if (device == nullptr || width == 0u || height == 0u) return false;
-  if (unpack.texture.handle != 0u && unpack.width == width && unpack.height == height) return unpack.pipeline.handle != 0u;
+  if (unpack_device != nullptr && unpack_device != device) return false;
+  if (unpack_device == device && unpack.texture.handle != 0u && unpack.width == width && unpack.height == height) {
+    return unpack.pipeline.handle != 0u;
+  }
   if (unpack_device != device) {
     ReleaseUnpack(unpack_device);
     unpack_device = device;
@@ -5443,10 +5542,11 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       depth_state = reshade::api::resource_usage::depth_stencil_write;
     }
   }
-  const bool depth_needs_read_transition = dlss_transition_depth != 0.f
-      && depth_state != reshade::api::resource_usage::undefined
-      && (static_cast<uint32_t>(depth_state)
-          & static_cast<uint32_t>(reshade::api::resource_usage::shader_resource_non_pixel)) == 0u;
+  const bool depth_needs_read_transition = depth_state != reshade::api::resource_usage::undefined
+      && ((use_fsr && depth_state != reshade::api::resource_usage::shader_resource_non_pixel)
+          || (!use_fsr && dlss_transition_depth != 0.f
+              && (static_cast<uint32_t>(depth_state)
+                  & static_cast<uint32_t>(reshade::api::resource_usage::shader_resource_non_pixel)) == 0u));
   if (depth_needs_read_transition) {
     cmd_list->barrier(depth_resource, depth_state, reshade::api::resource_usage::shader_resource_non_pixel);
     stat_depth_transitions.fetch_add(1u, std::memory_order_relaxed);
@@ -5463,7 +5563,8 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     dispatch.commandList = command_list;
     dispatch.color = ffxApiGetResourceDX12(color, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-    dispatch.depth = ffxApiGetResourceDX12(depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    dispatch.depth = ffxApiGetResourceDX12(depth, (use_depth_mask || use_depth_placeholder)
+        ? FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ : FFX_API_RESOURCE_STATE_COMPUTE_READ);
     dispatch.motionVectors = ffxApiGetResourceDX12(motion_vectors, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     dispatch.output = ffxApiGetResourceDX12(eval.Feature.pInOutput, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     dispatch.jitterOffset = {jitter_x, jitter_y};
@@ -5817,6 +5918,11 @@ inline std::string BuildDebugReport() {
   out += "\n";
   {
     char line[256];
+    snprintf(line, sizeof(line), "  portable descriptors: %s copied=%llu missing-sources=%llu\n",
+             portable_descriptor_callback_registered.load() ? "active" : "inactive",
+             static_cast<unsigned long long>(stat_portable_copies.load()),
+             static_cast<unsigned long long>(stat_portable_copy_misses.load()));
+    out += line;
     snprintf(line, sizeof(line), "  FG presentation test: %s; result=%d; hook=%s; swapchains=%llu failures=%llu\n",
              farcry6_dlss::streamline::bootstrap_status.load(), farcry6_dlss::streamline::bootstrap_result.load(),
              farcry6_dlss::streamline::factory_hook_native.load() ? "native" : "ReShade proxy",
@@ -7954,6 +8060,15 @@ inline void OnInitDevice(reshade::api::device* device) {
           if (native.compare_exchange_strong(empty, device->get_native())) break;
         }
       }
+      if (!is_nvidia || portable_descriptors_test != 0.f) {
+        for (auto& native : portable_descriptor_devs) {
+          uint64_t empty = 0u;
+          if (native.compare_exchange_strong(empty, device->get_native()) || native.load() == device->get_native()) break;
+        }
+        if (!portable_descriptor_callback_registered.exchange(true)) {
+          reshade::register_event<reshade::addon_event::copy_descriptor_tables>(OnCopyPortableDescriptors);
+        }
+      }
       char buf[128];
       snprintf(buf, sizeof(buf), "%s+%zu", is_nvidia ? "nvidia" : (vendor_id == 0x1002 ? "amd" : "intel"), gpu_devices.size());
       device_summary = buf;
@@ -8050,6 +8165,30 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     if (gpu_devices.empty()) device_summary = "none seen";
   }
   if (was_ours) {
+    {
+      const std::lock_guard<std::mutex> lock(fingerprint_mutex);
+      for (auto it = fingerprints.begin(); it != fingerprints.end();) {
+        if (it->first.words.back() == 0x464336534C4F5453ull && it->first.words[0] == device->get_native()) {
+          const uint64_t resource = (it->second.has_resource ? it->second.resource.handle : it->second.range.buffer.handle);
+          const auto range = fingerprints_by_resource.equal_range(resource);
+          for (auto reverse = range.first; reverse != range.second;) {
+            if (reverse->second == it->first) reverse = fingerprints_by_resource.erase(reverse);
+            else ++reverse;
+          }
+          it = fingerprints.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      stat_fingerprints.store(fingerprints.size());
+    }
+  }
+  const bool owns_upscaler_resources = unpack_device == device || placeholder_device == device
+      || ngx.output_device == reinterpret_cast<ID3D12Device*>(device->get_native())
+      || ngx.device.Get() == reinterpret_cast<ID3D12Device*>(device->get_native())
+      || object_mask_state.device == device
+      || (fsr.current && fsr.current->backend.device == reinterpret_cast<ID3D12Device*>(device->get_native()));
+  if (was_ours && owns_upscaler_resources) {
     ReleaseFgHudless(device);
     ReleaseNgx();
     ReleaseObjectMasks(device);
@@ -8066,6 +8205,13 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     gpu_retirement.conflicting_submission = false;
   }
   RemoveGpuNative(device->get_native());
+  bool portable_device_remaining = false;
+  for (const auto& native : portable_descriptor_devs) {
+    if (native.load(std::memory_order_relaxed) != 0u) portable_device_remaining = true;
+  }
+  if (!portable_device_remaining && portable_descriptor_callback_registered.exchange(false)) {
+    reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(OnCopyPortableDescriptors);
+  }
   reshade::log::message(reshade::log::level::info, "Far Cry 6 DLSS: device destroyed");
 }
 
@@ -8112,6 +8258,9 @@ inline void Use(DWORD fdw_reason) {
       reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnFgFullscreenState);
       break;
     case DLL_PROCESS_DETACH:
+      if (portable_descriptor_callback_registered.exchange(false)) {
+        reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(OnCopyPortableDescriptors);
+      }
       if (camera_override_enabled.exchange(false)) {
         reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(OnCopyCameraDescriptor);
         // Game-owned descriptor tables may still refer to this upload allocation.
