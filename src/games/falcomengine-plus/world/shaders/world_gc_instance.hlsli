@@ -25,6 +25,10 @@
 #define GC_COUNTER_REHASH_OVERFLOW 12u
 #define GC_COUNTER_MARKED 13u
 #define GC_COUNTER_SIGHTINGS 14u
+#define GC_COUNTER_INDIRECT_EMPTY 15u
+#define GC_COUNTER_INDIRECT_MISMATCH 16u
+#define GC_COUNTER_INDIRECT_TRUNCATED 17u
+#define GC_NO_ARGS 0xFFFFFFFFu  // kGcNoArgs
 #define GC_PASS_CAMERA 1u   // kPoolPass* (bvh_pool.hpp)
 #define GC_PASS_LIGHT 8u
 #define GC_PASS_ALPHA 16u
@@ -35,13 +39,17 @@
 #define GC_POSE_TRANSLATION_SCALE 256.0  // kGcPoseTranslationScale
 #define GC_POSE_BASIS_SCALE 4096.0       // kGcPoseBasisScale
 
-struct GcInstanceDraw  // gpu_capture.hpp GcInstanceDrawGPU (32 bytes)
+struct GcInstanceDraw  // gpu_capture.hpp GcInstanceDrawGPU (48 bytes)
 {
     uint arena_float4;
     uint count;
     uint slot;
     uint epoch;
     uint pass_bits;
+    uint args_float4;  // G3b: GC_NO_ARGS for a direct draw
+    uint index_count;
+    uint first_index;
+    int vertex_offset;
     uint3 pad;
 };
 struct GcSetEntry  // gpu_capture.hpp GcSetEntryGPU (64 bytes)

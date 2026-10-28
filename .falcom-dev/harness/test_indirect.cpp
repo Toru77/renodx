@@ -397,6 +397,114 @@ int main() {
     bvh::DrainPoolScan(&dev, &queue);
   }
 
+  HStage("G3b: an indirect draw with learned args reaches the GPU cache");
+  {
+    falcom_world::DrawRecord draw;
+    draw.method = 1; draw.has_index_buffer = true; draw.vb = {vb_a.handle}; draw.vb_stride = fixture::kStride; draw.ib = ib;
+    draw.vb_size = 4096; draw.ib_size = 4096; draw.input_layout = {fixture::kLayout};
+    draw.index_size = 2; draw.dsv = {0x77}; draw.depth_enable = true; draw.depth_write = true;
+    draw.topology = primitive_topology::triangle_list;
+    draw.vs_pipeline = kRigid; draw.ps_pipeline = kOpaque; draw.vs_hash = 0x1000u;
+    const uint64_t identity = bvh::PoolIndirectScheduleKey(draw, args, 0u);
+    std::vector<Object> only;
+    { Object o{"indirect 3", vb_a.handle, 3}; o.indirect = true; o.args_instances = 3; o.x = 100; o.args_offset = 0; only.push_back(o); }
+    for (int i = 0; i < 40; ++i) run_frame(frame + i + 1, only);
+    frame += 41;
+    falcom_world::DrawRecord learned_draw = draw;
+    learned_draw.index_count = 36u; learned_draw.first_index = 0u; learned_draw.vertex_offset = 0;
+    const uint64_t expected = bvh::PoolMeshKey(learned_draw);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      const auto schedule = bvh::g_pool.schedule.find(identity);
+      const bool has = schedule != bvh::g_pool.schedule.end();
+      CHECK(has && schedule->second.indirect_index_count == 36u && schedule->second.indirect_first_index == 0u
+                && schedule->second.indirect_vertex_offset == 0,
+            "G3b: the resolve learns the args range (36, 0, 0)");
+      const auto learned = bvh::g_pool.dynamic_indirect.find(identity);
+      CHECK(learned != bvh::g_pool.dynamic_indirect.end() && learned->second == expected,
+            "G3b: the learned mesh key is the PoolMeshKey of the learned range");
+    }
+    resource gc_staging = {0u}, gc_arena = {0u};
+    dev.create_resource(resource_desc(bvh::kGcStagingBytes, memory_heap::gpu_only,
+                                      resource_usage::shader_resource | resource_usage::copy_dest | resource_usage::copy_source),
+                        nullptr, resource_usage::general, &gc_staging);
+    dev.create_resource(resource_desc(1u << 20, memory_heap::gpu_only,
+                                      resource_usage::shader_resource | resource_usage::copy_dest | resource_usage::copy_source),
+                        nullptr, resource_usage::general, &gc_arena);
+    bvh::ResetGpuCaptureEntries("pool reset");
+    bvh::g_gpu_capture.active.store(true);
+    {
+      std::lock_guard lock(bvh::g_gpu_capture.mutex);
+      bvh::g_gpu_capture.staging = gc_staging;
+      bvh::g_gpu_capture.instance_arena = gc_arena;
+      bvh::g_gpu_capture.staging_used = 0u;
+      bvh::g_gpu_capture.instance_arena_used = 0u;
+    }
+    bvh::OnPoolScanIndirectDraw(&dev, &cl, draw, &cl_data, args, 0u, 1u, 20u);
+    {
+      std::lock_guard lock(bvh::g_gpu_capture.mutex);
+      CHECK(bvh::g_gpu_capture.entries.count(expected) == 1u, "G3b: the learned sub-draw gets a GPU cache entry");
+      if (bvh::g_gpu_capture.entries.count(expected) == 1u) bvh::g_gpu_capture.entries.at(expected).phase = bvh::GcPhase::Done;
+    }
+    bvh::OnPoolScanIndirectDraw(&dev, &cl, draw, &cl_data, args, 0u, 1u, 20u);
+    uint32_t window = 0u;
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      const auto schedule = bvh::g_pool.schedule.find(identity);
+      if (schedule != bvh::g_pool.schedule.end()) window = schedule->second.indirect_window;
+    }
+    {
+      std::lock_guard lock(bvh::g_gpu_capture.mutex);
+      CHECK(bvh::g_gpu_capture.instance_draws.size() == 1u, "G3b: one instance draw (%zu)", bvh::g_gpu_capture.instance_draws.size());
+      if (bvh::g_gpu_capture.instance_draws.size() == 1u) {
+        const bvh::GcInstanceDrawGPU& d = bvh::g_gpu_capture.instance_draws[0];
+        CHECK(d.args_float4 == 0u && d.arena_float4 == 2u && d.index_count == 36u, "G3b draw: args 0, arena 2, index count 36 (%u, %u, %u)",
+              d.args_float4, d.arena_float4, d.index_count);
+        CHECK(window != 0u && d.count == window, "G3b draw: count is the learned window (%u, %u)", d.count, window);
+      }
+      CHECK(bvh::g_gpu_capture.stats.inst_indirect_draws == 1u, "G3b: inst_indirect_draws 1 (%llu)",
+            bvh::g_gpu_capture.stats.inst_indirect_draws);
+      CHECK(std::memcmp(dev.res[gc_arena.handle].bytes.data(), dev.res[args.handle].bytes.data(), 20) == 0,
+            "G3b copy: arena bytes [0, 20) equal the args bytes");
+    }
+    const size_t entries_before = [] {
+      std::lock_guard lock(bvh::g_gpu_capture.mutex);
+      return bvh::g_gpu_capture.entries.size();
+    }();
+    bvh::OnPoolScanIndirectDraw(&dev, &cl, draw, &cl_data, args, 448u, 1u, 20u);
+    {
+      std::lock_guard lock(bvh::g_gpu_capture.mutex);
+      CHECK(bvh::g_gpu_capture.stats.inst_indirect_unlearned == 1u, "G3b: an unlearned sub-draw is counted (%llu)",
+            bvh::g_gpu_capture.stats.inst_indirect_unlearned);
+      CHECK(bvh::g_gpu_capture.entries.size() == entries_before, "G3b: an unlearned sub-draw adds no entry");
+    }
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.keys_by_resource.erase(vb_a.handle);
+    }
+    bvh::ResetGpuCaptureEntries("pool reset");
+    bvh::OnPoolScanIndirectDraw(&dev, &cl, draw, &cl_data, args, 0u, 1u, 20u);
+    {
+      std::lock_guard lock(bvh::g_gpu_capture.mutex);
+      CHECK(bvh::g_gpu_capture.entries.count(expected) == 0u, "G3b: an untracked learned key gets no entry");
+      const auto noted = bvh::g_gpu_capture.no_entry_reason.find(expected);
+      CHECK(noted != bvh::g_gpu_capture.no_entry_reason.end() && noted->second == "indirect_untracked",
+            "G3b: an untracked learned key is noted indirect_untracked");
+    }
+    bvh::g_gpu_capture.active.store(false);
+    bvh::ResetGpuCaptureEntries("pool reset");
+    {
+      std::lock_guard lock(bvh::g_gpu_capture.mutex);
+      bvh::g_gpu_capture.staging = {0u};
+      bvh::g_gpu_capture.instance_arena = {0u};
+      bvh::g_gpu_capture.instance_draws.clear();
+      bvh::g_gpu_capture.instance_arena_used = 0u;
+    }
+    bvh::DrainPoolScan(&dev, &queue);
+    dev.destroy_resource(gc_staging);
+    dev.destroy_resource(gc_arena);
+  }
+
   HStage("ResetWorldPool and PrunePool own the indirect map");
   {
     {

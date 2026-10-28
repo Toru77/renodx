@@ -34,11 +34,12 @@ inline constexpr uint32_t kGcCheckMeshes = 64u;
 inline constexpr uint32_t kGcFormatNone = 0u, kGcFormatF32x2 = 1u, kGcFormatF32x3 = 2u, kGcFormatF32x4 = 3u,
                           kGcFormatF16x2 = 4u, kGcFormatF16x4 = 5u;
 inline constexpr uint32_t kGcNoUv = 0xFFFFFFFFu;  // GcDecodeParams uv_offset: the draw has no UV
+inline constexpr uint32_t kGcNoArgs = 0xFFFFFFFFu;  // GcInstanceDrawGPU args_float4: a direct draw (G3b)
 // G3: the GPU instance set (rt12/rt12_capture.hpp step 7b; world_gc_insert / world_gc_compact.cs_5_0.hlsl).
 inline constexpr uint32_t kGcSetCapacity = 65536u;               // set entries per half (power of two); set records at [0, n)
 inline constexpr uint32_t kGcMovingRecords = 8192u;              // per-present records of moving sightings, at [kGcSetCapacity, +n)
 inline constexpr uint32_t kGcSetMaxProbes = 32u;
-inline constexpr uint64_t kGcInstanceArenaBytes = 16ull << 20;    // instance slices copied at the draws of one present
+inline constexpr uint64_t kGcInstanceArenaBytes = 32ull << 20;    // instance slices copied at the draws of one present
 inline constexpr uint32_t kGcInstanceDrawsPerPresent = 16384u;
 inline constexpr float kGcPoseTranslationScale = 256.f;            // pose key grid: 1/256 m
 inline constexpr float kGcPoseBasisScale = 4096.f;                 // and 1/4096 per basis element
@@ -46,12 +47,13 @@ inline constexpr uint32_t kGcCompareCpuSamples = 256u, kGcCompareGpuSamples = 32
 inline constexpr size_t kGcNoEntryKeys = 16384u;  // G4-0: no-entry reasons kept (direct keys)
 // Modes of world_gc_insert.cs_5_0.hlsl (GC_MODE_*); dispatched in the order clear, mark, rehash, insert.
 inline constexpr uint32_t kGcModeClear = 0u, kGcModeRehash = 1u, kGcModeMark = 2u, kGcModeInsert = 3u;
-// The 16 counters of one present (world_gc_instance.hlsli GC_COUNTER_*).
+// The counters of one present (world_gc_instance.hlsli GC_COUNTER_*).
 inline constexpr uint32_t kGcCounterSet = 0u, kGcCounterInserted = 1u, kGcCounterHits = 2u, kGcCounterKept = 3u,
                           kGcCounterAged = 4u, kGcCounterDroppedEpoch = 5u, kGcCounterDroppedMoving = 6u,
                           kGcCounterMovingRecords = 7u, kGcCounterMovingHeld = 8u, kGcCounterInvalid = 9u,
                           kGcCounterStaleEpoch = 10u, kGcCounterSetOverflow = 11u, kGcCounterRehashOverflow = 12u,
-                          kGcCounterMarked = 13u, kGcCounterSightings = 14u, kGcCounterCount = 16u;
+                          kGcCounterMarked = 13u, kGcCounterSightings = 14u, kGcCounterIndirectEmpty = 15u,
+                          kGcCounterIndirectMismatch = 16u, kGcCounterIndirectTruncated = 17u, kGcCounterCount = 32u;
 static_assert((kGcSetCapacity & (kGcSetCapacity - 1u)) == 0u, "the set probe mask needs a power of two");
 static_assert(kGcMaxEntries < (1u << 24), "a slot must be exact in a float (record header.x)");
 
@@ -105,28 +107,34 @@ struct GcDecoded {
   uint32_t vb_usage = 0u, vb_flags = 0u, ib_usage = 0u, ib_flags = 0u, pos_format = 0u, index_size = 0u;  // the check split
 };
 
-// One direct draw of a GPU-cache mesh in this present (world_gc_instance.hlsli GcInstanceDraw).
+// One direct or indirect draw of a GPU-cache mesh in this present (world_gc_instance.hlsli GcInstanceDraw).
 struct GcInstanceDrawGPU {
   uint32_t arena_float4 = 0u;  // its instance slice in the instance arena, in float4 units
   uint32_t count = 0u;
   uint32_t slot = 0u;
   uint32_t epoch = 0u;         // slot_epoch[slot] at the draw
   uint32_t pass_bits = 0u;     // kPoolPass* of the draw
+  uint32_t args_float4 = kGcNoArgs;  // G3b: the copied indirect args (5 uints) in the arena, float4 units; kGcNoArgs = direct
+  uint32_t index_count = 0u;         // G3b: the learned args the mesh key of the slot was built from (checked against the copy)
+  uint32_t first_index = 0u;
+  int32_t vertex_offset = 0;
   uint32_t pad[3] = {};
 };
-static_assert(sizeof(GcInstanceDrawGPU) == 32u, "GcInstanceDrawGPU must match world_gc_instance.hlsli");
+static_assert(sizeof(GcInstanceDrawGPU) == 48u, "GcInstanceDrawGPU must match world_gc_instance.hlsli");
 // One entry of the instance set (world_gc_instance.hlsli GcSetEntry); tag, last_seen and flags are in the meta buffer.
 struct GcSetEntryGPU {
   uint32_t slot = 0u, epoch = 0u, pose_lo = 0u, pose_hi = 0u;
   float world[12] = {};
 };
 static_assert(sizeof(GcSetEntryGPU) == 64u, "GcSetEntryGPU must match world_gc_instance.hlsli");
-// The instance slice of a direct draw (OnPoolScanDraw).
+// The instance slice of a direct draw, or the window and args of an indirect sub-draw (G3b).
 struct GcInstanceSource {
   reshade::api::resource buffer = {0u};  // t15
   int32_t base = 0;                      // CPU b1 base
   uint32_t count = 0u;
   uint8_t pass = 0u;                     // kPoolPass* bits
+  reshade::api::resource args = {0u};    // G3b: the indirect args buffer ({0} = direct draw); count is then the copied window
+  uint64_t args_offset = 0u;
 };
 
 struct GcStats {
@@ -136,6 +144,7 @@ struct GcStats {
   uint64_t invalidated_destroy = 0u, resets_pool = 0u, resets_fragmented = 0u;
   uint64_t readback_busy = 0u;  // range jobs returned to Range: their readback slot was unread
   uint64_t inst_draws = 0u, inst_instances = 0u, inst_no_geometry = 0u, inst_deferred = 0u, inst_arena_full = 0u, inst_draws_cap = 0u;  // G3 draw side (D2)
+  uint64_t inst_indirect_draws = 0u, inst_indirect_unlearned = 0u, inst_indirect_args_uav = 0u;  // G3b draw side
   std::map<std::string, uint64_t> refused;
   std::map<std::array<uint32_t, 4>, uint64_t> formats;  // pos code, uv code, index size, stride
   std::map<std::array<uint32_t, 4>, uint64_t> buffers;  // vb usage, vb flags, ib usage, ib flags
@@ -248,11 +257,12 @@ inline void GpuCaptureNoteNoEntry(uint64_t mesh_key, const char* reason) {
 // Called from OnPoolScanDraw after its lock is released, for a direct draw whose buffers the pool tracks for this key.
 // Returns the copies issued. Copies only on the immediate context (a deferred draw serves none).
 // With `instances`, a draw of a Done entry also copies its instance slice into the G3 arena (D2).
+// An indirect source (G3b) also copies its 20 args bytes, in a 32-byte slot before the window.
 inline uint32_t GpuCaptureOnDraw(reshade::api::command_list* cmd_list, const DrawRecord& draw, uint64_t mesh_key,
                                  const PoolUvStream& uv, bool deferred, const GcInstanceSource* instances = nullptr) {
   if (!g_gpu_capture.active.load(std::memory_order_relaxed) || mesh_key == 0u) return 0u;
   GpuCaptureState& g = g_gpu_capture;
-  std::array<PoolCopyCommand, 4> commands;
+  std::array<PoolCopyCommand, 5> commands;
   uint32_t count = 0u;
   {
     std::lock_guard lock(g.mutex);
@@ -391,6 +401,8 @@ inline uint32_t GpuCaptureOnDraw(reshade::api::command_list* cmd_list, const Dra
       }
     }
     if (instances != nullptr) {
+      const bool indirect = instances->args.handle != 0u;
+      const uint64_t args_bytes = indirect ? kPoolIndirectArgsBytes : 0u;
       const uint64_t bytes = uint64_t{instances->count} * kPoolInstanceStride;
       if (entry.phase != GcPhase::Done) {
         g.stats.inst_no_geometry += 1u;
@@ -398,19 +410,28 @@ inline uint32_t GpuCaptureOnDraw(reshade::api::command_list* cmd_list, const Dra
         g.stats.inst_deferred += 1u;
       } else if (g.instance_draws.size() >= kGcInstanceDrawsPerPresent) {
         g.stats.inst_draws_cap += 1u;
-      } else if (g.instance_arena_used + bytes > kGcInstanceArenaBytes) {
+      } else if (g.instance_arena_used + args_bytes + bytes > kGcInstanceArenaBytes) {
         g.stats.inst_arena_full += 1u;
       } else {
-        g.instance_draws.push_back({.arena_float4 = static_cast<uint32_t>(g.instance_arena_used / 16u),
+        if (indirect) {
+          commands[count++] = {instances->args, instances->args_offset, g.instance_arena, g.instance_arena_used,
+                               kPoolIndirectArgsCopyBytes};
+        }
+        g.instance_draws.push_back({.arena_float4 = static_cast<uint32_t>((g.instance_arena_used + args_bytes) / 16u),
                                     .count = instances->count,
                                     .slot = entry.slot,
                                     .epoch = g.slot_epoch[entry.slot],
-                                    .pass_bits = instances->pass});
+                                    .pass_bits = instances->pass,
+                                    .args_float4 = indirect ? static_cast<uint32_t>(g.instance_arena_used / 16u) : kGcNoArgs,
+                                    .index_count = draw.index_count,
+                                    .first_index = draw.first_index,
+                                    .vertex_offset = draw.vertex_offset});
         commands[count++] = {instances->buffer, static_cast<uint64_t>(instances->base) * kPoolInstanceStride, g.instance_arena,
-                             g.instance_arena_used, bytes};
-        g.instance_arena_used += bytes;
+                             g.instance_arena_used + args_bytes, bytes};
+        g.instance_arena_used += args_bytes + bytes;
         g.stats.inst_draws += 1u;
         g.stats.inst_instances += instances->count;
+        if (indirect) g.stats.inst_indirect_draws += 1u;
       }
     }
   }

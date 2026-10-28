@@ -836,6 +836,10 @@ struct PoolSchedule {
   uint32_t copy_frame = 0u;
   uint32_t next_frame = 0u;
   uint32_t indirect_window = 0u;  // indirect draws: next window (0 = not known yet)
+  // G3b: the last non-empty indirect args of this identity (index count 0 = not learned); the GPU cache keys its mesh by them.
+  uint32_t indirect_index_count = 0u;
+  uint32_t indirect_first_index = 0u;
+  int32_t indirect_vertex_offset = 0;
   bool follow = false;            // moving key in follow mode: copies bypass the cooldown
 };
 
@@ -3732,6 +3736,18 @@ inline void AddPoolResourceKey(uint64_t handle, uint64_t mesh_key) {
   if (std::find(keys.begin(), keys.end(), mesh_key) == keys.end()) keys.push_back(mesh_key);
 }
 
+// Caller holds g_pool.mutex. True when the pool tracks this key's VB, IB and UV stream, so their writes and destroys reach the
+// GPU cache (InvalidateGpuCaptureKeys).
+inline bool PoolKeyBuffersTracked(const DrawRecord& draw, const PoolUvStream& uv, uint64_t mesh_key) {
+  const auto tracks = [&](uint64_t handle) {
+    const auto it = g_pool.keys_by_resource.find(handle);
+    return it != g_pool.keys_by_resource.end() && std::find(it->second.begin(), it->second.end(), mesh_key) != it->second.end();
+  };
+  return tracks(draw.vb.handle) && (draw.ib.handle == draw.vb.handle || tracks(draw.ib.handle))
+         && (uv.buffer.handle == 0u || uv.buffer.handle == draw.vb.handle || uv.buffer.handle == draw.ib.handle
+             || tracks(uv.buffer.handle));
+}
+
 inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord& draw, bool from_indirect, const PoolUvStream& uv) {
   const auto alpha_key = g_pool.alpha_keys.find(mesh_key);
   if (alpha_key != g_pool.alpha_keys.end() && !alpha_key->second.layout.valid) {
@@ -4379,13 +4395,7 @@ inline void OnPoolScanDraw(
     if (skip != PoolSkip::None && !trace_declined) CountPoolSkip(family, skip, gate.state);
     if (gate.skip == PoolSkip::PixelUnknown) NotePoolPixelUnknown(draw, gate.unknown_reason);
     if (mesh_key != 0u && g_gpu_capture.active.load(std::memory_order_relaxed)) {
-      const auto tracks = [&](uint64_t handle) {
-        const auto it = g_pool.keys_by_resource.find(handle);
-        return it != g_pool.keys_by_resource.end() && std::find(it->second.begin(), it->second.end(), mesh_key) != it->second.end();
-      };
-      gc_tracked = tracks(draw.vb.handle) && (draw.ib.handle == draw.vb.handle || tracks(draw.ib.handle))
-                   && (uv.buffer.handle == 0u || uv.buffer.handle == draw.vb.handle || uv.buffer.handle == draw.ib.handle
-                       || tracks(uv.buffer.handle));
+      gc_tracked = PoolKeyBuffersTracked(draw, uv, mesh_key);
     }
     mesh_count = ReservePoolMeshCopies(device, draw, uv, false, deferred, frame, commands.data() + command_count,
                                        mesh_copies.data(), kPoolMeshCopiesPerDraw);
@@ -4475,15 +4485,30 @@ inline void OnPoolScanIndirectDraw(
   const uint32_t max_window =
       static_cast<uint32_t>((std::min)(static_cast<uint64_t>(kPoolIndirectWindow), slice.available));
   if (skip == PoolSkip::None && max_window == 0u) skip = PoolSkip::SliceRange;
+  const bool gc_active = g_gpu_capture.active.load(std::memory_order_relaxed);
   uint64_t args_size = 0u;
+  bool args_uav = false;
   stage.Set("indirect draw: args size");
   if (skip == PoolSkip::None) {
     const auto args_desc = device->get_resource_desc(args_buffer);
     args_size = args_desc.type == reshade::api::resource_type::buffer ? args_desc.buffer.size : 0u;
+    args_uav = gc_active && (static_cast<uint32_t>(args_desc.usage) & static_cast<uint32_t>(reshade::api::resource_usage::unordered_access)) != 0u;
   }
 
   const uint32_t frame = g_state.frame.load();
   const uint32_t sub_draws = (std::min)(draw_count == 0u ? 1u : draw_count, kPoolMaxIndirectSubDraws);
+  // G3b: learned sub-draws for the GPU instance set, handed to GpuCaptureOnDraw after the lock.
+  struct GcIndirectSub {
+    uint64_t mesh_key = 0u;
+    uint64_t args_offset = 0u;
+    uint32_t window = 0u;
+    uint32_t index_count = 0u, first_index = 0u;
+    int32_t vertex_offset = 0;
+    bool tracked = false;
+  };
+  std::array<GcIndirectSub, kPoolMaxIndirectSubDraws> gc_subs;
+  uint32_t gc_count = 0u;
+  uint32_t gc_unlearned = 0u;
 
   stage.Set("indirect draw: reserve");
   std::array<PoolCopyCommand, 3u * kPoolMaxIndirectSubDraws + kPoolMeshCopiesPerDraw> commands;
@@ -4528,6 +4553,24 @@ inline void OnPoolScanIndirectDraw(
       const bool learned = known != g_pool.schedule.end() && known->second.indirect_window != 0u;
       const bool follow = (gate.pass & kPoolPassCamera) != 0u && known != g_pool.schedule.end() && known->second.follow;
       if (learned) window = (std::min)(known->second.indirect_window, max_window);
+      if (gc_active && sub_skip == PoolSkip::None) {
+        if (known == g_pool.schedule.end() || known->second.indirect_index_count == 0u) {
+          gc_unlearned += 1u;
+        } else {
+          DrawRecord record = draw;
+          record.index_count = known->second.indirect_index_count;
+          record.first_index = known->second.indirect_first_index;
+          record.vertex_offset = known->second.indirect_vertex_offset;
+          GcIndirectSub& sub = gc_subs[gc_count++];
+          sub.mesh_key = PoolMeshKey(record);
+          sub.args_offset = sub_args_offset;
+          sub.window = window;
+          sub.index_count = record.index_count;
+          sub.first_index = record.first_index;
+          sub.vertex_offset = record.vertex_offset;
+          sub.tracked = PoolKeyBuffersTracked(draw, uv, sub.mesh_key);
+        }
+      }
       const uint64_t bytes =
           kPoolCbCopyBytes + kPoolIndirectArgsBytes + static_cast<uint64_t>(window) * kPoolInstanceStride;
       if (sub_skip == PoolSkip::None
@@ -4624,6 +4667,25 @@ inline void OnPoolScanIndirectDraw(
   stage.Set("indirect draw: copy");
   IssuePoolCopies(cmd_list, commands.data(), command_count);
   LogPoolMeshCopies(mesh_copies.data(), mesh_count, frame);
+  for (uint32_t i = 0u; i < gc_count; ++i) {
+    const GcIndirectSub& sub = gc_subs[i];
+    if (!sub.tracked) {
+      GpuCaptureNoteNoEntry(sub.mesh_key, "indirect_untracked");
+      continue;
+    }
+    DrawRecord record = draw;
+    record.index_count = sub.index_count;
+    record.first_index = sub.first_index;
+    record.vertex_offset = sub.vertex_offset;
+    const GcInstanceSource instances = {.buffer = slice.instance_buffer, .base = slice.base, .count = sub.window, .pass = gate.pass,
+                                        .args = args_buffer, .args_offset = sub.args_offset};
+    GpuCaptureOnDraw(cmd_list, record, sub.mesh_key, uv, deferred, &instances);
+  }
+  if (gc_unlearned != 0u || (args_uav && gc_count != 0u)) {
+    std::lock_guard lock(g_gpu_capture.mutex);
+    g_gpu_capture.stats.inst_indirect_unlearned += gc_unlearned;
+    if (args_uav) g_gpu_capture.stats.inst_indirect_args_uav += gc_count;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -5826,6 +5888,11 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         record.vertex_offset = static_cast<int32_t>(result.args[3]);
         record.first_instance = result.args[4];
         mesh_key = PoolMeshKey(record);
+        if (schedule != g_pool.schedule.end()) {
+          schedule->second.indirect_index_count = record.index_count;
+          schedule->second.indirect_first_index = record.first_index;
+          schedule->second.indirect_vertex_offset = record.vertex_offset;
+        }
         // At the cap, only an identity already learned may still change its mesh; new identities are dropped.
         if (g_pool.dynamic_indirect.size() < kPoolMaxDynamicKeys || g_pool.dynamic_indirect.count(copy.schedule_key) != 0u) {
           const auto prior = g_pool.dynamic_indirect.find(copy.schedule_key);

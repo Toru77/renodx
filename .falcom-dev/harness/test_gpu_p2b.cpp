@@ -204,6 +204,18 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
   put(7u, mf, mf);
   put(8u, mg, mf);
   for (uint32_t i = 0u; i < 100u; ++i) put(10u + i, translate(static_cast<float>(i), 0.f, 0.f), zero);
+  // P9 (G3b): indirect args (5 uints, bytes 0-19 of their element) and the slices they point at.
+  const auto put_args = [&arena](uint32_t element, const uint32_t (&args)[5]) { std::memcpy(&arena[element * 40u], args, sizeof(args)); };
+  put_args(300u, {36u, 2u, 0u, 0u, 0u});
+  put_args(305u, {36u, 6u, 0u, 0u, 0u});
+  put_args(310u, {0u, 3u, 0u, 0u, 0u});
+  put_args(311u, {36u, 2u, 72u, 0u, 0u});
+  put_args(312u, {36u, 1u, 0u, 0xFFFFFFFFu, 0u});
+  for (uint32_t i = 0u; i < 4u; ++i) {
+    put(301u + i, translate(100.f + static_cast<float>(i), 0.f, 0.f), zero);
+    put(306u + i, translate(110.f + static_cast<float>(i), 0.f, 0.f), zero);
+  }
+  put(313u, translate(120.f, 0.f, 0.f), zero);
   Mat12 identity = {{1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f}};
   Mat12 basis_step = translate(62.f, 0.f, 0.f);
   basis_step.v[0] = 1.f + 1e-6f;
@@ -231,6 +243,7 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
   };
   const std::vector<uint32_t> zero_meta(2u * kCapacity * 4u, 0u);
   const std::vector<uint32_t> zero_words(kSlots, 0u);
+  const std::vector<uint32_t> zero_counters(bvh::kGcCounterCount, 0u);
   const std::vector<uint8_t> zero_entries(2u * kCapacity * sizeof(bvh::GcSetEntryGPU), 0u);
   const std::vector<uint8_t> zero_records((kCapacity + kMovingCapacity) * sizeof(bvh::WorldInstanceGPU), 0u);
   ID3D11Buffer* arena_buffer = make_buffer(kElements * 160u, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0u,
@@ -245,8 +258,8 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
                                              D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, sizeof(bvh::GcSetEntryGPU), zero_entries.data());
   ID3D11Buffer* records_buffer = make_buffer(static_cast<UINT>(zero_records.size()), D3D11_BIND_UNORDERED_ACCESS,
                                              D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, sizeof(bvh::WorldInstanceGPU), zero_records.data());
-  ID3D11Buffer* counters_buffer = make_buffer(16u * 4u, D3D11_BIND_UNORDERED_ACCESS, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 4u,
-                                              zero_words.data());
+  ID3D11Buffer* counters_buffer = make_buffer(bvh::kGcCounterCount * 4u, D3D11_BIND_UNORDERED_ACCESS, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 4u,
+                                              zero_counters.data());
   ID3D11Buffer* moving_buffer = make_buffer(kSlots * 4u, D3D11_BIND_UNORDERED_ACCESS, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 4u,
                                             zero_words.data());
   ID3D11Buffer* cb_buffer = make_buffer(64u, D3D11_BIND_CONSTANT_BUFFER, 0u, 0u, nullptr);
@@ -267,7 +280,7 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
   device->CreateShaderResourceView(arena_buffer, &arena_desc, &arena_srv);
   ID3D11ShaderResourceView* srvs[3] = {arena_srv, MakeSrv(device, draws_buffer, kSlots), MakeSrv(device, epochs_buffer, kSlots)};
   ID3D11UnorderedAccessView* uavs[5] = {make_uav(meta_buffer, 2u * kCapacity * 4u), make_uav(entries_buffer, 2u * kCapacity),
-                                        make_uav(records_buffer, kCapacity + kMovingCapacity), make_uav(counters_buffer, 16u),
+                                        make_uav(records_buffer, kCapacity + kMovingCapacity), make_uav(counters_buffer, bvh::kGcCounterCount),
                                         make_uav(moving_buffer, kSlots)};
 
   std::vector<uint32_t> epochs(kSlots, 0u);
@@ -282,7 +295,7 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
     padded.resize(kSlots);
     context->UpdateSubresource(draws_buffer, 0u, nullptr, padded.data(), 0u, 0u);
     context->UpdateSubresource(epochs_buffer, 0u, nullptr, epochs.data(), 0u, 0u);
-    context->UpdateSubresource(counters_buffer, 0u, nullptr, zero_words.data(), 0u, 0u);
+    context->UpdateSubresource(counters_buffer, 0u, nullptr, zero_counters.data(), 0u, 0u);
     context->CSSetShaderResources(0u, 3u, srvs);
     context->CSSetUnorderedAccessViews(0u, 5u, uavs, nullptr);
     context->CSSetConstantBuffers(0u, 1u, &cb_buffer);
@@ -305,8 +318,8 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
     context->CSSetShaderResources(0u, 3u, nulls);
     context->CSSetUnorderedAccessViews(0u, 5u, null_uavs, nullptr);
     current = 1u - current;
-    const std::vector<uint8_t> raw = Readback(device, context, counters_buffer, 16u * 4u);
-    std::vector<uint32_t> counters(16u, 0u);
+    const std::vector<uint8_t> raw = Readback(device, context, counters_buffer, bvh::kGcCounterCount * 4u);
+    std::vector<uint32_t> counters(bvh::kGcCounterCount, 0u);
     std::memcpy(counters.data(), raw.data(), raw.size());
     std::printf("G3 present %u: set %u inserted %u hits %u kept %u aged %u dropped %u/%u moving %u held %u invalid %u stale %u "
                 "overflow %u/%u marked %u sightings %u\n",
@@ -451,6 +464,26 @@ static void TestGcInstanceShaders(ID3D11Device* device, ID3D11DeviceContext* con
   CHECK(c[bvh::kGcCounterInserted] == 8u - expected_moving && c[bvh::kGcCounterSet] == 8u - expected_moving,
         "P7 inserted and set are the rest (%u)", c[bvh::kGcCounterInserted]);
   CHECK(c[bvh::kGcCounterInvalid] == 0u && c[bvh::kGcCounterSetOverflow] == 0u, "P7 no invalid, no overflow");
+
+  // P9 (frame 1000): G3b indirect draws on slot 7 (light). The args decide the count: empty, mismatch and truncated each drop
+  // or cut one draw; the last draw has vertex offset -1 and matches its args.
+  const auto indirect_draw = [&draw_of](uint32_t args_element, uint32_t slice_element, uint32_t window, int32_t vertex_offset) {
+    bvh::GcInstanceDrawGPU draw = draw_of(slice_element, window, 7u, 0u, 8u);
+    draw.args_float4 = args_element * 10u;
+    draw.index_count = 36u;
+    draw.first_index = 0u;
+    draw.vertex_offset = vertex_offset;
+    return draw;
+  };
+  const std::vector<bvh::GcInstanceDrawGPU> p9 = {indirect_draw(300u, 301u, 4u, 0), indirect_draw(305u, 306u, 4u, 0),
+                                                  indirect_draw(310u, 301u, 4u, 0), indirect_draw(311u, 301u, 4u, 0),
+                                                  indirect_draw(312u, 313u, 1u, -1)};
+  c = present(1000u, p9);
+  CHECK(c[bvh::kGcCounterInserted] == 7u && c[bvh::kGcCounterSightings] == 7u && c[bvh::kGcCounterInvalid] == 0u,
+        "P9 inserted 7, sightings 7, invalid 0 (%u, %u, %u)", c[bvh::kGcCounterInserted], c[bvh::kGcCounterSightings], c[bvh::kGcCounterInvalid]);
+  CHECK(c[bvh::kGcCounterIndirectEmpty] == 1u && c[bvh::kGcCounterIndirectMismatch] == 1u && c[bvh::kGcCounterIndirectTruncated] == 1u,
+        "P9 indirect empty 1, mismatch 1, truncated 1 (%u, %u, %u)", c[bvh::kGcCounterIndirectEmpty], c[bvh::kGcCounterIndirectMismatch],
+        c[bvh::kGcCounterIndirectTruncated]);
 
   PrintMessages(queue, "gc instances");
   for (ID3D11Buffer* buffer : {arena_buffer, draws_buffer, epochs_buffer, meta_buffer, entries_buffer, records_buffer, counters_buffer,

@@ -1,6 +1,6 @@
 // world_gc_insert.cs_5_0.hlsl - G3: the instance set of this present (gpu_capture.hpp GcPoseHash, PoolSightingMoves,
 // CheckPoolWorld). Modes in cb_gc_instances: clear and rehash run one thread per set index; mark and insert run one
-// group per draw of this present (direct draws, instance slices from the G3 arena).
+// group per draw of this present (direct and indirect draws, instance slices and indirect args from the G3 arena).
 // The C++ reference for every rule is named at its use; the harness (test_gpu_p2b TestGcInstanceShaders) checks them.
 
 #include "world_gc_instance.hlsli"
@@ -75,7 +75,28 @@ void main(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
     if ((draw.pass_bits & GC_PASS_WIND) != 0u) flags |= 8u;    // kInstanceFoliage
     if ((draw.pass_bits & GC_PASS_ALPHA) != 0u) flags |= 16u;  // kInstanceAlphaTested
 
-    for (uint i = thread; i < draw.count; i += 64u)
+    // G3b: an indirect draw takes its instance count from the args copied at the draw (index count, instance count, first index,
+    // base vertex), with the CPU resolve rules (bvh_pool.hpp, indirect resolve): empty first, then the learned range, then the window.
+    uint count = draw.count;
+    if (draw.args_float4 != GC_NO_ARGS)
+    {
+        const uint4 args = g_gc_arena.Load4(draw.args_float4 * 16u);
+        const bool report = mode == GC_MODE_INSERT && thread == 0u;
+        if (args.x == 0u || args.y == 0u)
+        {
+            if (report) InterlockedAdd(g_gc_counters[GC_COUNTER_INDIRECT_EMPTY], 1u);
+            return;
+        }
+        if (args.x != draw.index_count || args.z != draw.first_index || asint(args.w) != draw.vertex_offset)
+        {
+            if (report) InterlockedAdd(g_gc_counters[GC_COUNTER_INDIRECT_MISMATCH], 1u);
+            return;
+        }
+        if (report && args.y > draw.count) InterlockedAdd(g_gc_counters[GC_COUNTER_INDIRECT_TRUNCATED], 1u);
+        count = min(args.y, draw.count);
+    }
+
+    for (uint i = thread; i < count; i += 64u)
     {
         const uint element = draw.arena_float4 + i * 10u;
         float world[12];

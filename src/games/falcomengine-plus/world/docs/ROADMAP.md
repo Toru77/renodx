@@ -86,6 +86,7 @@ R1b-0 (diagnostic, startup hook-off mask), implemented, not validated in game: `
 | DXR backend M5 (P2b moving objects on DXR: records carrier, records pass, instance table at S + r) | Owner test in Reference: DXR backend (M5) | world/rt12/rt12_backend.hpp, world/rt12/rt12_mirror.hpp, world/shaders/world_rt12_records_carrier.cs_5_0.hlsl, world_rt12_records.cs_6_5.hlsl |
 | GPU geometry cache G2 (validation only, not traced) | Owner test in Reference: GPU geometry cache (G2) | world/bvh/gpu_capture.hpp, world/rt12/rt12_capture.hpp, world/shaders/world_gc_range.cs_5_0.hlsl, world_gc_decode.cs_5_0.hlsl |
 | GPU instance set G3 (validation only, not traced) | Owner test in Reference: GPU instance set (G3) | world/bvh/gpu_capture.hpp, world/rt12/rt12_capture.hpp, world/shaders/world_gc_instance.hlsli, world_gc_insert.cs_5_0.hlsl, world_gc_compact.cs_5_0.hlsl, world_instance_math.hlsli |
+| GPU instance set G3b (indirect draws; validation only, not traced) | Owner test in Reference: indirect draws in the GPU instance set (G3b) | world/bvh/bvh_pool.hpp, world/bvh/gpu_capture.hpp, world/shaders/world_gc_insert.cs_5_0.hlsl |
 
 ## Reference
 
@@ -389,7 +390,7 @@ Design (short form):
 Assumed programme decisions (owner has not approved them in writing): 1, 4, 5, 6, 7 and 8 as written; G3 does not act on 7 or 8. Decision 3 is assumed with one extension (the D7 hold): shadow passes leave prevWorld zero, so without the hold a swaying sign's shadow sightings would insert a new key every present. Decision 2 is assumed in part: header.z is 0 in G3 (G4 fills the material).
 
 Deviations (planner decisions, with reasons):
-- Direct draws only. `OnPoolScanIndirectDraw` is untouched: G2 has no entry for keys drawn only indirectly, so their CPU instances show as `no_entry` in the compare. A G3b adds indirect draws if that bucket is large.
+- Direct draws only. `OnPoolScanIndirectDraw` is untouched: G2 has no entry for keys drawn only indirectly, so their CPU instances show as `no_entry` in the compare. A G3b adds indirect draws if that bucket is large. Superseded by G3b (see below).
 - No region filter in the compact pass: the compare covers the whole CPU pool. G4 owns the region.
 - Record bounds are the translation point (no GPU mesh box yet). The DXR path does not read record bounds; G3 records must never be handed to the compute trace.
 - Harness split: pure logic in `test_live.cpp`; the real shaders on WARP in `test_gpu_p2b.cpp`.
@@ -401,7 +402,7 @@ Deviations (planner decisions, with reasons):
 - Closed G3 to-dos: the hash-pose check (to-do a) and deferred counting (to-do b), as marked above.
 - Pin check: test_live 2760, 3011, 3472 and test_motion 700, 1092 are the same checks as HEAD, with unchanged text.
 
-G4 to-do list: G3b (indirect draws) if `no_entry` is large; a region filter in compact; record bounds from a mesh box; header.z material; record ranges are [0, set) and [65536, +moving); the 60-present hold rule versus the CPU repeat/stale rule (`NotePoolMotion`, not transcribed).
+G4 to-do list: G3b (indirect draws): done; a region filter in compact; record bounds from a mesh box; header.z material; record ranges are [0, set) and [65536, +moving); the 60-present hold rule versus the CPU repeat/stale rule (`NotePoolMotion`, not transcribed).
 - G4 to-do (a): one pose per hash tested; widen the CPU/GPU hash check. Closed in G4-0: test_gpu_p2b P6 checks every live entry's pose hash against its own world.
 - G4 to-do (b): deferred instance draws of entries not yet Done are counted only in `deferred_skips`. Closed in G4-0: a deferred draw with instances also counts `inst_deferred`.
 - G4 to-do (c): flags are merged across all sightings of an entry. Accepted, no code: the union of all sightings is the compute path's rule (G4 design D12).
@@ -419,6 +420,31 @@ Owner test (DevKit build; RTAO on, DXR on, Trace characters on, P2b on, Performa
 8. Send `world_gc.json` (after steps 3 and 6), both performance files, the `[world-gc]` lines (`active`, `compare`, `teardown`) and the GPU-cache panel lines.
 
 Pass: overflow 0, no timeout, matched at least 95% of matched + done at every spot. CPU-only `done` samples go to the planner. Not fixed in G3: CPU-only `no_entry`, `refused` and `pending` (G2 coverage), and GPU-only (CPU admission, the P-2 evidence).
+
+### Indirect draws in the GPU instance set (G3b): reference
+
+Goal: while the GPU geometry cache is active, each gated rigid indirect sub-draw whose args the pool resolve has learned gets a G2 entry (mesh key rebuilt from the learned index count, first index and base vertex) and, once Done, a G3 instance draw. The 20 args bytes are copied GPU-to-GPU into the arena at the draw (32-byte slot right before the window); the insert shader takes the instance count from the copy. The CPU readback only learns the range, never the count. Cache OFF: no new work.
+
+Answers:
+- Q1 args: GPU copy at the draw, not a CPU readback. UAV-capable args buffers are not refused; they are counted (`inst_indirect_args_uav`). Deferred lists stay refused (`inst_deferred`). VB/IB written by UAV/SO or CPU-dynamic stay refused by G2.
+- Q2 count = min(args instance count, window) on the GPU; start instance ignored (as the CPU); slice base = b1 at the draw. The GPU checks the copied index count, first index and base vertex against the learned range; a different range drops the draw (`indirect_mismatch`).
+- Q3 counters: draw side `inst_indirect_draws`, `inst_indirect_unlearned`, `inst_indirect_args_uav`; GPU (insert mode, thread 0) `indirect_empty`, `indirect_mismatch`, `indirect_truncated` = GPU counters 15, 16, 17. Learned sub-draw with untracked VB/IB/UV: note `indirect_untracked`. Compare buckets: the noted reason wins; `no_entry_indirect_untracked` is new; `no_entry_indirect` is the residual.
+- Q4 caps: 64 sub-draws per indirect call, 512 instances each. Per present, direct and indirect draws share 16384 draws and the instance arena, now 32 MB (was 16 MB). At a cap the draw copies nothing this present (`inst_draws_cap` / `inst_arena_full`); set overflow stays `set_overflow`.
+- Q5 tests: test_live `TestGcInstanceHook` and `TestGcCompareInstances`; test_gpu_p2b P9; test_indirect stage "G3b: an indirect draw with learned args reaches the GPU cache".
+- Q6 re-enable stall: G3b changes no create, teardown or present-order code. More draw-time copies happen only while the cache is active. The known G2 re-enable stall is not changed or debugged here; the owner test still avoids DXR off/on followed by the cache on.
+
+Layout: `GcInstanceDrawGPU` and HLSL `GcInstanceDraw` are 48 bytes (`args_float4`, `index_count`, `first_index`, `vertex_offset` added; `kGcNoArgs` = direct). `kGcCounterCount` = 32.
+
+Counter numbering for G4: G3b takes GPU counters 15-17, so G4 must use 18 and 19 (`kGcCounterOut` = 18, `kGcCounterAlphaWaiting` = 19; shader `GC_COUNTER_OUT` 18u, `GC_COUNTER_ALPHA_WAITING` 19u). The G4 plan must use these numbers; its owner test waits for the G3b owner pass.
+
+Owner test (DevKit build; RTAO on, DXR on, Trace characters on, P2b on). Avoid DXR off/on then cache on.
+1. Village spot of `world_gc_compare_f295`: cache ON, wait for `[world-gc] settled` plus 10 s, press "Compare GPU instances", then "Dump GPU cache JSON".
+2. Same at the large outdoor area.
+3. 30 s Performance test with the cache ON at the village (report only).
+4. Toggle the cache OFF, ON, OFF; exit with the cache ON. No crash, no STUCK.
+5. Send both `world_gc_compare_f*.json`, `world_gc.json`, the GPU-instances and compare panel lines and the `[world-gc]` lines.
+
+Pass (village): no TIMEOUT; `no_entry_indirect` + `no_entry_indirect_untracked` at most 1% of `cpu_instances`; `matched / cpu_instances` at least 0.90 (0.49 before G3b); `match_ratio` at least 0.99; `inst_arena_full` 0 and `inst_draws_cap` 0; overflow 0 / 0 / 0; indirect mismatch at most 1% of indirect draws. Anything else: send the files to the planner.
 
 ## Open decisions
 

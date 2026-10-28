@@ -5422,6 +5422,7 @@ static void TestGcInstanceHook(Device* dev) {
     CHECK(recorded.arena_float4 == 0u && recorded.count == 3u && recorded.slot == slot, "draw: arena 0, count 3, slot %u", recorded.slot);
     CHECK(recorded.epoch == gc::g_gpu_capture.slot_epoch[slot], "draw epoch is the slot epoch");
     CHECK(recorded.pass_bits == 9u, "draw pass bits");
+    CHECK(recorded.args_float4 == gc::kGcNoArgs, "a direct draw keeps the direct path (args_float4 %u)", recorded.args_float4);
     CHECK(gc::g_gpu_capture.instance_arena_used == 480u, "arena used 480 (%llu)", gc::g_gpu_capture.instance_arena_used);
     CHECK(gc::g_gpu_capture.stats.inst_draws == 1u && gc::g_gpu_capture.stats.inst_instances == 3u, "draw counters");
   }
@@ -5455,6 +5456,41 @@ static void TestGcInstanceHook(Device* dev) {
     std::lock_guard lock(gc::g_gpu_capture.mutex);
     CHECK(gc::g_gpu_capture.stats.inst_draws_cap == 1u, "draw cap counted");
     gc::g_gpu_capture.instance_draws.clear();
+  }
+
+  // e2. G3b: an indirect sub-draw copies its 20 args bytes into a 32-byte slot before the window.
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    gc::g_gpu_capture.instance_draws.clear();
+    gc::g_gpu_capture.instance_arena_used = 0u;
+  }
+  const gc::GcInstanceSource indirect = {.buffer = slices, .base = 2, .count = 4u, .pass = 8u, .args = ib, .args_offset = 40u};
+  CHECK(gc::GpuCaptureOnDraw(&cl, draw, key, no_uv, false, &indirect) == 2u, "indirect draw copies its args and its window");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.instance_draws.size() == 1u, "one indirect instance draw recorded");
+    const gc::GcInstanceDrawGPU& recorded = gc::g_gpu_capture.instance_draws[0];
+    CHECK(recorded.args_float4 == 0u && recorded.arena_float4 == 2u && recorded.count == 4u, "indirect draw: args 0, arena 2, count 4 (%u, %u, %u)",
+          recorded.args_float4, recorded.arena_float4, recorded.count);
+    CHECK(recorded.index_count == 36u && recorded.first_index == 0u && recorded.vertex_offset == 0,
+          "indirect draw carries the learned range (%u, %u, %d)", recorded.index_count, recorded.first_index, recorded.vertex_offset);
+    CHECK(gc::g_gpu_capture.instance_arena_used == 672u, "indirect arena used 672 (%llu)", gc::g_gpu_capture.instance_arena_used);
+    CHECK(gc::g_gpu_capture.stats.inst_indirect_draws == 1u, "inst_indirect_draws 1 (%llu)", gc::g_gpu_capture.stats.inst_indirect_draws);
+  }
+  // The args and the window must fit together: 640 fits, 672 does not.
+  uint64_t full_before = 0u;
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    gc::g_gpu_capture.instance_draws.clear();
+    gc::g_gpu_capture.instance_arena_used = gc::kGcInstanceArenaBytes - 650u;
+    full_before = gc::g_gpu_capture.stats.inst_arena_full;
+  }
+  CHECK(gc::GpuCaptureOnDraw(&cl, draw, key, no_uv, false, &indirect) == 0u, "indirect draw that does not fit copies nothing");
+  {
+    std::lock_guard lock(gc::g_gpu_capture.mutex);
+    CHECK(gc::g_gpu_capture.stats.inst_arena_full == full_before + 1u, "indirect arena full counted");
+    gc::g_gpu_capture.instance_draws.clear();
+    gc::g_gpu_capture.instance_arena_used = 480u;
   }
 
   // f. A write bumps the slot epoch, keeps the slot.
@@ -5638,8 +5674,10 @@ static void TestGcCompareInstances() {
       cpu_at(0x5u, 5u, 11.f, 0.f, 0.f, false, false),  // no entry
       cpu_at(0x6u, 6u, 13.f, 0.f, 0.f, false, false),  // refused
       cpu_at(0x7u, 7u, 15.f, 0.f, 0.f, false, false),  // done, not seen recently
+      cpu_at(0x12u, 8u, 17.f, 0.f, 0.f, false, false),  // no entry, indirect and untracked (G3b)
   };
-  const std::unordered_map<uint64_t, std::string> reasons = {{0x3u, "done"}, {0x5u, "no_entry_indirect"}, {0x6u, "refused:format"}, {0x7u, "done"}};
+  const std::unordered_map<uint64_t, std::string> reasons = {{0x3u, "done"}, {0x5u, "no_entry_indirect"}, {0x6u, "refused:format"}, {0x7u, "done"},
+                                                             {0x12u, "no_entry_indirect_untracked"}};
   const gc::GcInstanceCompare result = gc::GcCompareInstances(gpu, cpu, reasons);
   CHECK(result.matched == 1u, "matched %llu", result.matched);
   CHECK(result.gpu_dup_content == 1u, "gpu duplicate content %llu", result.gpu_dup_content);
@@ -5647,16 +5685,17 @@ static void TestGcCompareInstances() {
   CHECK(result.gpu_only == 2u && result.gpu_only_alpha == 1u && result.gpu_only_alpha_conflict == 1u,
         "gpu-only %llu, alpha %llu, conflict %llu", result.gpu_only, result.gpu_only_alpha, result.gpu_only_alpha_conflict);
   CHECK(result.cpu_dup == 1u, "cpu duplicate %llu", result.cpu_dup);
-  CHECK(result.cpu_only == 5u, "cpu-only %llu", result.cpu_only);
+  CHECK(result.cpu_only == 6u, "cpu-only %llu", result.cpu_only);
   const auto by_reason = [&result](const char* reason) {
     const auto it = result.cpu_only_by_reason.find(reason);
     return it == result.cpu_only_by_reason.end() ? uint64_t{0u} : it->second;
   };
   CHECK(by_reason("done") == 1u && by_reason("dynamic") == 1u && by_reason("no_entry_indirect") == 1u && by_reason("no_entry") == 0u
-            && by_reason("refused:format") == 1u && by_reason("done_unseen") == 1u && result.cpu_only_by_reason.size() == 5u,
+            && by_reason("no_entry_indirect_untracked") == 1u && by_reason("refused:format") == 1u && by_reason("done_unseen") == 1u
+            && result.cpu_only_by_reason.size() == 6u,
         "reasons: done %llu, dynamic %llu, no_entry_indirect %llu, no_entry %llu, refused %llu, done_unseen %llu", by_reason("done"),
         by_reason("dynamic"), by_reason("no_entry_indirect"), by_reason("no_entry"), by_reason("refused:format"), by_reason("done_unseen"));
-  CHECK(result.cpu_only_samples.size() == 5u && result.gpu_only_samples.size() == 2u, "samples %zu, %zu", result.cpu_only_samples.size(),
+  CHECK(result.cpu_only_samples.size() == 6u && result.gpu_only_samples.size() == 2u, "samples %zu, %zu", result.cpu_only_samples.size(),
         result.gpu_only_samples.size());
   CHECK(result.gpu_no_cpu_mesh_by_state.size() == 2u && result.gpu_no_cpu_mesh_by_state.at("absent") == 1u
             && result.gpu_no_cpu_mesh_by_state.at("failed:x") == 1u,

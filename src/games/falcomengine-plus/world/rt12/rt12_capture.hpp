@@ -688,6 +688,7 @@ inline void DumpGcCompareJson(const bvh::GcInstanceCompare& cmp, uint32_t presen
   out << "  \"cpu_only\": {\"count\": " << num(cmp.cpu_only) << ", \"by_reason\": {\"done\": " << num(done)
       << ", \"done_unseen\": " << num(count_of("done_unseen")) << ", \"dynamic\": " << num(count_of("dynamic")) << ", \"pending\": "
       << num(count_of("pending")) << ", \"refused\": " << num(refused) << ", \"no_entry\": " << num(count_of("no_entry")) << ", \"no_entry_indirect\": " << num(count_of("no_entry_indirect"))
+      << ", \"no_entry_indirect_untracked\": " << num(count_of("no_entry_indirect_untracked"))
       << ", \"no_entry_untracked\": " << num(count_of("no_entry_untracked")) << ", \"no_entry_cap\": " << num(count_of("no_entry_cap"))
       << "}},\n";
   out << "  \"match_ratio\": ";
@@ -699,6 +700,8 @@ inline void DumpGcCompareJson(const bvh::GcInstanceCompare& cmp, uint32_t presen
   out << ",\n";
   out << "  \"overflow\": {\"set\": " << num(counters[bvh::kGcCounterSetOverflow]) << ", \"rehash\": "
       << num(counters[bvh::kGcCounterRehashOverflow]) << ", \"moving\": " << num(moving_overflow) << "},\n";
+  out << "  \"indirect\": {\"empty\": " << num(counters[bvh::kGcCounterIndirectEmpty]) << ", \"mismatch\": "
+      << num(counters[bvh::kGcCounterIndirectMismatch]) << ", \"truncated\": " << num(counters[bvh::kGcCounterIndirectTruncated]) << "},\n";
   out << "  \"timeouts\": " << cmp.timeouts << ", \"wait_ms\": " << bvh::PoolJsonFloat{static_cast<float>(cmp.wait_ms)} << "\n}\n";
   const std::filesystem::path path = bvh::PoolOutputDir() / ("world_gc_compare_f" + std::to_string(present) + ".json");
   std::ofstream file(path);
@@ -834,10 +837,10 @@ inline void RunGcInstanceCompare(reshade::api::device* device, reshade::api::com
       const auto entry_it = bvh::g_gpu_capture.entries.find(key);
       if (entry_it == bvh::g_gpu_capture.entries.end()) {
         const auto noted = bvh::g_gpu_capture.no_entry_reason.find(key);
-        if (indirect_keys.count(key) != 0u) {
-          reasons[key] = "no_entry_indirect";
-        } else if (noted != bvh::g_gpu_capture.no_entry_reason.end()) {
+        if (noted != bvh::g_gpu_capture.no_entry_reason.end()) {
           reasons[key] = std::string("no_entry_") + noted->second;
+        } else if (indirect_keys.count(key) != 0u) {
+          reasons[key] = "no_entry_indirect";
         }
         continue;
       }
@@ -1029,9 +1032,13 @@ inline void DumpGcJson(const Rt12GcState& gc) {
       << ", \"set_overflow\": " << p.inst_counters[bvh::kGcCounterSetOverflow]
       << ", \"rehash_overflow\": " << p.inst_counters[bvh::kGcCounterRehashOverflow]
       << ", \"marked\": " << p.inst_counters[bvh::kGcCounterMarked] << ", \"sightings\": " << p.inst_counters[bvh::kGcCounterSightings]
+      << ", \"indirect_empty\": " << p.inst_counters[bvh::kGcCounterIndirectEmpty]
+      << ", \"indirect_mismatch\": " << p.inst_counters[bvh::kGcCounterIndirectMismatch]
+      << ", \"indirect_truncated\": " << p.inst_counters[bvh::kGcCounterIndirectTruncated]
       << "},\n    \"draw_side\": {\"draws\": " << p.stats.inst_draws << ", \"instances\": " << p.stats.inst_instances
       << ", \"no_geometry\": " << p.stats.inst_no_geometry << ", \"deferred\": " << p.stats.inst_deferred
-      << ", \"arena_full\": " << p.stats.inst_arena_full << ", \"draws_cap\": " << p.stats.inst_draws_cap << "},\n"
+      << ", \"arena_full\": " << p.stats.inst_arena_full << ", \"draws_cap\": " << p.stats.inst_draws_cap << ", \"indirect_draws\": " << p.stats.inst_indirect_draws
+      << ", \"indirect_unlearned\": " << p.stats.inst_indirect_unlearned << ", \"indirect_args_uav\": " << p.stats.inst_indirect_args_uav << "},\n"
       << "    \"readback_busy\": " << p.inst_readback_busy
       << ", \"gpu_ms_avg\": " << bvh::PoolJsonFloat{static_cast<float>(p.inst_ms_n > 0u ? p.inst_ms_sum / static_cast<double>(p.inst_ms_n) : -1.0)}
       << ", \"d3d11_bytes\": " << gc.inst_bytes << ",\n";

@@ -783,7 +783,12 @@ inline bool DrawBvhPanel() {
       + std::to_string(inst[bvh::kGcCounterMovingRecords] > bvh::kGcMovingRecords ? inst[bvh::kGcCounterMovingRecords] - bvh::kGcMovingRecords : 0u)
       + " moving; draws " + std::to_string(gc_panel.stats.inst_draws) + " (no geometry " + std::to_string(gc_panel.stats.inst_no_geometry)
       + ", deferred " + std::to_string(gc_panel.stats.inst_deferred) + ", arena full " + std::to_string(gc_panel.stats.inst_arena_full)
-      + ", cap " + std::to_string(gc_panel.stats.inst_draws_cap) + "), readback busy " + std::to_string(gc_panel.inst_readback_busy)
+      + ", cap " + std::to_string(gc_panel.stats.inst_draws_cap) + ")"
+      + ", indirect " + std::to_string(gc_panel.stats.inst_indirect_draws) + " (unlearned " + std::to_string(gc_panel.stats.inst_indirect_unlearned)
+      + ", args UAV " + std::to_string(gc_panel.stats.inst_indirect_args_uav) + ", empty " + std::to_string(inst[bvh::kGcCounterIndirectEmpty])
+      + ", mismatch " + std::to_string(inst[bvh::kGcCounterIndirectMismatch]) + ", truncated " + std::to_string(inst[bvh::kGcCounterIndirectTruncated])
+      + ")"
+      + ", readback busy " + std::to_string(gc_panel.inst_readback_busy)
       + ", D3D11 ms " + dxr_ms(static_cast<float>(gc_panel.inst_ms_sum), static_cast<uint32_t>(gc_panel.inst_ms_n));
   ImGui::TextUnformatted(gc_instance_line.c_str());
   std::string gc_compare_line = "Compare GPU instances: not run";
@@ -808,7 +813,8 @@ inline bool DrawBvhPanel() {
                       + std::to_string(cmp.gpu_no_cpu_mesh) + ", CPU-only " + std::to_string(cmp.cpu_only) + ": done " + std::to_string(done)
                       + ", done unseen " + std::to_string(count_of("done_unseen")) + ", dynamic " + std::to_string(count_of("dynamic"))
                       + ", pending " + std::to_string(count_of("pending")) + ", refused " + std::to_string(refused)
-                      + ", no entry: indirect " + std::to_string(count_of("no_entry_indirect")) + ", untracked "
+                      + ", no entry: indirect " + std::to_string(count_of("no_entry_indirect")) + ", indirect untracked "
+                      + std::to_string(count_of("no_entry_indirect_untracked")) + ", untracked "
                       + std::to_string(count_of("no_entry_untracked")) + ", cap " + std::to_string(count_of("no_entry_cap")) + ", other "
                       + std::to_string(count_of("no_entry")) + "; set " + std::to_string(cmp.set_count) + ", wait " + wait + " ms";
     if (cmp.timeouts != 0u) gc_compare_line += ", TIMEOUT";
