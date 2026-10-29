@@ -97,7 +97,7 @@ struct PerfGate {
   std::atomic_uint64_t hook_draws_frame{0u};  // hook_draws of the last frame (moved by SamplePerfPresent)
   std::atomic_uint64_t hook_draws_indirect{0u};  // indirect draws that reached WorldDrawCallback (gather only)
   std::atomic_uint64_t hook_draws_indirect_frame{0u};  // hook_draws_indirect of the last frame (moved by SamplePerfPresent)
-  std::atomic_uint64_t hook_draws_unconsumed{0u};  // direct draws the M1 consumed rule would skip (count only; gather only)
+  std::atomic_uint64_t hook_draws_unconsumed{0u};  // direct draws skipped by the consumed rule (WorldDrawCallback; count only while gathering)
   std::atomic_uint64_t hook_draws_unconsumed_frame{0u};  // hook_draws_unconsumed of the last frame (moved by SamplePerfPresent)
   std::atomic_uint64_t bind_calls{0u};  // push_descriptors calls past WorldDrawHookNeeded (gather only)
   std::atomic_uint64_t bind_calls_frame{0u};  // bind_calls of the last frame (moved by SamplePerfPresent)

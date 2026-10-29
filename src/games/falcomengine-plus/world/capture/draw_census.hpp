@@ -765,17 +765,22 @@ struct WorldDrawCallback {
     }
 
     if (!CaptureActive()) return {.bypass = skip_cascade_draw};
+    auto* shader_state = renodx::utils::shader::GetCurrentState(context.cmd_list);
+    const uint64_t vs_pipeline = (shader_state != nullptr ? shader_state->stage_states[renodx::utils::shader::VERTEX_INDEX].pipeline.handle : 0u);
+    const uint32_t ps_hash = (shader_state != nullptr ? renodx::utils::shader::GetCurrentPixelShaderHash(shader_state) : 0u);
+    const auto vs_class = static_cast<contract::VsClass>(contract::LookupVertexTraits(vs_pipeline).cls);
+    // With the census and RTAO discovery off, no consumer (lighting capture, pool, deform) reads a draw of another VS class or
+    // PS: it skips the record. Only diagnostics change: the pool's per-class draw statistics, the record parity gauges and
+    // timers, and the census serials.
+    const bool consumed = CensusEnabled() || rtao::g_rtao_discovery > 0.5f || IsLightingHash(ps_hash)
+                          || vs_class == contract::VsClass::Rigid || vs_class == contract::VsClass::Wind || contract::IsDeformingClass(vs_class);
     if (bvh::g_perf_gate.gather.load(std::memory_order_relaxed)) {
       bvh::g_perf_gate.hook_draws.fetch_add(1u, std::memory_order_relaxed);
-      auto* shader_state = renodx::utils::shader::GetCurrentState(context.cmd_list);
-      const uint64_t vs_pipeline = shader_state != nullptr ? shader_state->stage_states[renodx::utils::shader::VERTEX_INDEX].pipeline.handle : 0u;
-      const uint32_t ps_hash = shader_state != nullptr ? renodx::utils::shader::GetCurrentPixelShaderHash(shader_state) : 0u;
-      const auto vs_class = static_cast<contract::VsClass>(contract::LookupVertexTraits(vs_pipeline).cls);
-      // M1 consumed rule (plan step 5): draws the census, RTAO discovery, lighting, pool or deform paths need. Count only in M0.
-      const bool consumed = CensusEnabled() || rtao::g_rtao_discovery > 0.5f || IsLightingHash(ps_hash)
-                            || vs_class == contract::VsClass::Rigid || vs_class == contract::VsClass::Wind || contract::IsDeformingClass(vs_class);
-      if (!consumed) bvh::g_perf_gate.hook_draws_unconsumed.fetch_add(1u, std::memory_order_relaxed);
+      if (!consumed) {
+        bvh::g_perf_gate.hook_draws_unconsumed.fetch_add(1u, std::memory_order_relaxed);
+      }
     }
+    if (!consumed) return {.bypass = skip_cascade_draw};
     const auto record_start = bvh::PerfNow();
     if (hook_timer.armed && record_start != std::chrono::steady_clock::time_point{}) {
       bvh::AddPerfBlockMs(bvh::kPerfBlockDrawHookPre, std::chrono::duration<double, std::milli>(record_start - hook_timer.start).count());
