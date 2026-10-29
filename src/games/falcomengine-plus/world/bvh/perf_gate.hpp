@@ -63,6 +63,12 @@ enum PerfBlock : size_t {
   kPerfBlockPoolLock,                // pool draw hook: bookkeeping under the pool lock
   kPerfBlockPoolCopy,                // pool draw hook: IssuePoolCopies and LogPoolMeshCopies
   kPerfBlockPoolGc,                  // pool draw hook: GPU capture note
+  kPerfBlockPoolTail,                // pool draw hook: P2b slice copy and alpha source capture, after the lock
+  kPerfBlockPoolIndGate,             // pool indirect hook: GatePoolDraw, wind read and stats, alpha read, slice, args size
+  kPerfBlockPoolIndLock,             // pool indirect hook: sub-draw bookkeeping under the pool lock
+  kPerfBlockPoolIndTail,             // pool indirect hook: P2b copies and alpha source capture, after the lock
+  kPerfBlockPoolIndCopy,             // pool indirect hook: IssuePoolCopies and LogPoolMeshCopies
+  kPerfBlockPoolIndGc,               // pool indirect hook: GPU capture of the sub-draws and its stats
   kPerfBlockCount
 };
 

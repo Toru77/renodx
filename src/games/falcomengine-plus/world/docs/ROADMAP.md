@@ -55,6 +55,8 @@ CPU gap diagnostic (timed rows only, no behaviour change), implemented, not vali
 
 M2 (CPU, draw records), implemented, not validated in game: QueryBufferInfo and LayoutHasSkinInputs read per-thread caches keyed on the same handles; the caches are cleared when g_record_cache_generation changes, which OnInitPipelineState, OnDestroyPipelineState and OnDestroyResourceWorld (after its buffer_info erase) increment. New Subset timing rows pool_gate, pool_lock, pool_copy and pool_gc (OnPoolScanDraw, direct draws; timers only). test_live checks the generation bumps; the cache lookups in draw_census.hpp are not unit-tested because the harness cannot compile utils/command_action.hpp, so the owner perf run (pool_meshes and instance counts at the same spot) is the parity evidence. Harness baseline failures are now test_live 2762, 3013, 3474; test_motion 700, 1092; test_rtao 1022, 1881 (the test_live lines moved +2 from two new includes, content unchanged).
 
+M3a (CPU, pool hook timing), implemented, not validated in game: new Subset timing rows pool_tail (OnPoolScanDraw: P2b slice copy and alpha source capture after the lock) and pool_ind_gate, pool_ind_lock, pool_ind_tail, pool_ind_copy, pool_ind_gc (OnPoolScanIndirectDraw, same phases as the direct rows); timers only. Owner check: the 30 s RTAO compute run at the village spot; pool_gate+pool_lock+pool_tail+pool_copy+pool_gc+the five pool_ind_* rows should cover at least 80% of pool_hooks, with pool_meshes about 726.
+
 | Feature | Owner test list | Where |
 |---|---|---|
 | Path 2: moving objects out of the static pool (P2a, P2a-rev) | Pool Scan near moving objects, rule line, Depth Compare | HISTORY: Path 2, round P2a; round P2a-rev |

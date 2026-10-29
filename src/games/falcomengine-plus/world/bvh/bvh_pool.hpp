@@ -4408,6 +4408,7 @@ inline void OnPoolScanDraw(
   if (lock_start != std::chrono::steady_clock::time_point{}) {
     AddPerfBlockMs(kPerfBlockPoolLock, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lock_start).count());
   }
+  const auto tail_start = PerfNow();
   if (dynamic_ok) {
     cmd_list->copy_buffer_region(slice.instance_buffer, static_cast<uint64_t>(dynamic_copy.base) * kPoolInstanceStride,
                                  dynamic_copy.buffer, dynamic_copy.arena, static_cast<uint64_t>(dynamic_copy.count) * kPoolInstanceStride);
@@ -4423,6 +4424,9 @@ inline void OnPoolScanDraw(
     } else {
       CapturePoolAlphaSource(device, cmd_list, mesh_key, alpha_material.view, !deferred);
     }
+  }
+  if (tail_start != std::chrono::steady_clock::time_point{}) {
+    AddPerfBlockMs(kPerfBlockPoolTail, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tail_start).count());
   }
   const auto copy_start = PerfNow();
   stage.Set("direct draw: copy");
@@ -4461,6 +4465,7 @@ inline void OnPoolScanIndirectDraw(
   PoolStageScope stage("indirect draw: gate");
   const bool deferred = IsPoolDeferredList(cmd_list);
 
+  const auto gate_start = PerfNow();
   const PoolDrawGate gate = GatePoolDraw(draw, false);
   WindSwayParams wind;
   uint8_t wind_fail[2] = {};
@@ -4511,6 +4516,9 @@ inline void OnPoolScanIndirectDraw(
     args_uav = gc_active && (static_cast<uint32_t>(args_desc.usage) & static_cast<uint32_t>(reshade::api::resource_usage::unordered_access)) != 0u;
   }
 
+  if (gate_start != std::chrono::steady_clock::time_point{}) {
+    AddPerfBlockMs(kPerfBlockPoolIndGate, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gate_start).count());
+  }
   const uint32_t frame = g_state.frame.load();
   const uint32_t sub_draws = (std::min)(draw_count == 0u ? 1u : draw_count, kPoolMaxIndirectSubDraws);
   // G3b: learned sub-draws for the GPU instance set, handed to GpuCaptureOnDraw after the lock.
@@ -4536,6 +4544,7 @@ inline void OnPoolScanIndirectDraw(
   uint32_t wind_index = UINT32_MAX;
   uint32_t command_count = 0u;
   uint32_t mesh_count = 0u;
+  const auto lock_start = PerfNow();
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     PoolFamilyStats& family = g_pool.families[draw.vs_hash];
@@ -4654,6 +4663,10 @@ inline void OnPoolScanIndirectDraw(
                                        mesh_copies.data(), kPoolMeshCopiesPerDraw);
     command_count += mesh_count;
   }
+  if (lock_start != std::chrono::steady_clock::time_point{}) {
+    AddPerfBlockMs(kPerfBlockPoolIndLock, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lock_start).count());
+  }
+  const auto tail_start = PerfNow();
   for (uint32_t i = 0u; i < dynamic_count; ++i) {
     const PoolDynamicDraw& dyn = dynamic_copies[i];
     cmd_list->copy_buffer_region(slice.instance_buffer, static_cast<uint64_t>(dyn.base) * kPoolInstanceStride, dyn.buffer,
@@ -4680,9 +4693,17 @@ inline void OnPoolScanIndirectDraw(
       }
     }
   }
+  if (tail_start != std::chrono::steady_clock::time_point{}) {
+    AddPerfBlockMs(kPerfBlockPoolIndTail, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tail_start).count());
+  }
+  const auto copy_start = PerfNow();
   stage.Set("indirect draw: copy");
   IssuePoolCopies(cmd_list, commands.data(), command_count);
   LogPoolMeshCopies(mesh_copies.data(), mesh_count, frame);
+  if (copy_start != std::chrono::steady_clock::time_point{}) {
+    AddPerfBlockMs(kPerfBlockPoolIndCopy, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copy_start).count());
+  }
+  const auto gc_start = PerfNow();
   for (uint32_t i = 0u; i < gc_count; ++i) {
     const GcIndirectSub& sub = gc_subs[i];
     if (!sub.tracked) {
@@ -4701,6 +4722,9 @@ inline void OnPoolScanIndirectDraw(
     std::lock_guard lock(g_gpu_capture.mutex);
     g_gpu_capture.stats.inst_indirect_unlearned += gc_unlearned;
     if (args_uav) g_gpu_capture.stats.inst_indirect_args_uav += gc_count;
+  }
+  if (gc_start != std::chrono::steady_clock::time_point{}) {
+    AddPerfBlockMs(kPerfBlockPoolIndGc, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gc_start).count());
   }
 }
 

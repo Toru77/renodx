@@ -187,6 +187,12 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"pool_lock", true, kPerfSubset, false, nullptr},
     {"pool_copy", true, kPerfSubset, false, nullptr},
     {"pool_gc", true, kPerfSubset, false, nullptr},
+    {"pool_tail", true, kPerfSubset, false, nullptr},
+    {"pool_ind_gate", true, kPerfSubset, false, nullptr},
+    {"pool_ind_lock", true, kPerfSubset, false, nullptr},
+    {"pool_ind_tail", true, kPerfSubset, false, nullptr},
+    {"pool_ind_copy", true, kPerfSubset, false, nullptr},
+    {"pool_ind_gc", true, kPerfSubset, false, nullptr},
 };
 inline constexpr bool PerfInTotal(const PerfCostInfo& info) {
   return info.role == kPerfInPresent || info.role == kPerfDrawTime || info.role == kPerfGpu;
