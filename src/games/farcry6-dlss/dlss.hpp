@@ -2155,6 +2155,7 @@ inline std::atomic<uint64_t> fg_state_fence_value{0u};
 inline std::atomic<bool> fg_state_has_fence{false};
 inline std::atomic<int> fg_state_result{-1};
 inline std::atomic<uint32_t> fg_complete_input_streak{0u};
+inline std::atomic<bool> fg_completed_input_on_gpu{false};
 inline std::atomic<uint64_t> fg_complete_input_frames{0u};
 inline std::atomic<uint64_t> fg_hudless_converted{0u};
 inline std::atomic<uint64_t> fg_hudless_tagged{0u};
@@ -6536,6 +6537,9 @@ inline std::string BuildDebugReport() {
     snprintf(line, sizeof(line), "  FG complete input intervals: consecutive=%u total=%llu (content not verified)\n",
              fg_complete_input_streak.load(), static_cast<unsigned long long>(fg_complete_input_frames.load()));
     out += line;
+    snprintf(line, sizeof(line), "    GPU input completion observed: %s\n",
+             fg_completed_input_on_gpu.load(std::memory_order_acquire) ? "yes" : "no");
+    out += line;
     snprintf(line, sizeof(line), "  FG display transitions: swapchain=%llu fullscreen=%llu resize-active=%s\n",
              static_cast<unsigned long long>(fg_swapchain_transitions.load()),
              static_cast<unsigned long long>(fg_fullscreen_transitions.load()),
@@ -7632,6 +7636,9 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
           std::shared_lock retirement_lock(gpu_retirement.mutex);
           for (uint32_t i = 0u; i < fg_hudless.slot_limit; ++i) {
             if (!fg_hudless.slots[i].ticket || fg_hudless.slots[i].ticket->complete) {
+              if (fg_hudless.slots[i].ticket) {
+                fg_completed_input_on_gpu.store(true, std::memory_order_release);
+              }
               slot_index = i;
               break;
             }
@@ -8647,6 +8654,7 @@ inline void OnFgDestroySwapchain(reshade::api::swapchain* swapchain, bool) {
   fg_hudless_retire_requested.store(true, std::memory_order_release);
   fg_camera_capture_enabled.store(false, std::memory_order_release);
   fg_complete_input_streak.store(0u, std::memory_order_relaxed);
+  fg_completed_input_on_gpu.store(false, std::memory_order_release);
   fg_stable_gameplay_frames.store(0u, std::memory_order_relaxed);
   fg_swapchain_transitions.fetch_add(1u, std::memory_order_relaxed);
 }
@@ -8662,6 +8670,7 @@ inline bool OnFgFullscreenState(reshade::api::swapchain* swapchain, bool, void*)
   }
   fg_camera_capture_enabled.store(false, std::memory_order_release);
   fg_complete_input_streak.store(0u, std::memory_order_relaxed);
+  fg_completed_input_on_gpu.store(false, std::memory_order_release);
   fg_hudless_retire_requested.store(true, std::memory_order_release);
   fg_stable_gameplay_frames.store(0u, std::memory_order_relaxed);
   fg_successful_present_frame.store(UINT64_MAX, std::memory_order_release);
@@ -8800,6 +8809,7 @@ inline void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::sw
       }
     }
     if (streak >= (quick_recovery ? 2u : 8u) && fg_enable_requested.load(std::memory_order_acquire)
+        && fg_completed_input_on_gpu.load(std::memory_order_acquire)
         && generated_frames != 0u && dlss_enabled != 0.f && upscaler_type < 0.5f
         && fg_mode.ReadyForDisplayChange() && farcry6_dlss::streamline::fg_set_options != nullptr
         && farcry6_dlss::streamline::reflex_set_options != nullptr
@@ -8916,6 +8926,7 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     fg_input_recording_list.store(nullptr, std::memory_order_release);
     fg_camera_capture_enabled.store(false, std::memory_order_release);
     fg_complete_input_streak.store(0u, std::memory_order_relaxed);
+    fg_completed_input_on_gpu.store(false, std::memory_order_release);
     fg_swapchain_transition.store(false, std::memory_order_release);
     fg_output_color_space.store(reshade::api::color_space::unknown, std::memory_order_relaxed);
     fg_output_format.store(0u, std::memory_order_relaxed);

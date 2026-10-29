@@ -225,6 +225,8 @@ struct Rt12State {
   uint64_t address_generation = ~0ull;  // blas_generation the per-slot address tables were last written for (see Rt12Slot)
   std::vector<D3D12_RAYTRACING_INSTANCE_DESC> static_descs;  // the static part of the TLAS, cached by its key
   uint64_t static_key_version = ~0ull, static_key_blas = ~0ull;
+  uint32_t tlas_prebuild_descs = UINT32_MAX;  // NumDescs of the cached TLAS prebuild sizes (UINT32_MAX: none)
+  uint64_t tlas_prebuild_result = 0u, tlas_prebuild_scratch = 0u;  // Align256 of ResultDataMaxSizeInBytes and ScratchDataSizeInBytes
   reshade::api::pipeline pack_pipeline = {0u}, noise_pipeline = {0u}, resolve_pipeline = {0u}, carrier_pipeline = {0u},
                          records_carrier_pipeline = {0u};
   uint64_t noise_source = 0u;          // isfast view handle last copied into `noise`
@@ -1564,9 +1566,9 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   const bool rebuild = gc || s.scene_slot < 0 || s.scene_key_version != s.static_key_version || s.scene_key_blas != s.static_key_blas
                        || !characters.empty() || s.scene_dynamic_count != 0u || records > 0u || s.scene_record_count != 0u;
   if (!gc && rebuild && s.static_descs.empty() && characters.empty()) return RtFallback(Rt12Reason::TlasEmpty);
-  // This frame's descs: the static part, then one per character (13.1b).
-  std::vector<D3D12_RAYTRACING_INSTANCE_DESC> descs;
-  if (rebuild && !gc) descs = s.static_descs;
+  // This frame's descs: the static part (read in place from s.static_descs), then one per character (13.1b).
+  const size_t static_desc_count = ((rebuild && !gc) ? s.static_descs.size() : 0u);
+  std::vector<D3D12_RAYTRACING_INSTANCE_DESC> descs;  // holds the characters (13.1b)
   // The instance table is uploaded only when the slot's table does not hold the current static part.
   // With records the instance table holds the static part and kPoolDynamicInstances records (13.1c): a smaller one is recreated.
   const uint64_t table_records_bytes =
@@ -1719,15 +1721,23 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
       build.inputs.NumDescs = 1u;
       build.inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
       build.inputs.pGeometryDescs = &character_geometries.back();
-      D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
-      s.device12->GetRaytracingAccelerationStructurePrebuildInfo(&build.inputs, &info);
+      uint64_t result_bytes = 0u;
+      if (has_blas && found->second.triangles == character.triangles) {
+        // The prebuild sizes depend only on the triangle count here; the entry was sized for this count.
+        build.build_scratch = found->second.build_scratch;
+        build.update_scratch = found->second.update_scratch;
+        result_bytes = found->second.bytes;
+      } else {
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
+        s.device12->GetRaytracingAccelerationStructurePrebuildInfo(&build.inputs, &info);
+        build.build_scratch = Align256(info.ScratchDataSizeInBytes);
+        build.update_scratch = Align256(info.UpdateScratchDataSizeInBytes);
+        result_bytes = Align256(info.ResultDataMaxSizeInBytes);
+      }
       build.build = Rt12DynamicNeedsBuild(has_blas, has_blas ? found->second.triangles : 0u, character.triangles,
                                           has_blas ? frame - found->second.built_frame : 0u);
-      build.build_scratch = Align256(info.ScratchDataSizeInBytes);
-      build.update_scratch = Align256(info.UpdateScratchDataSizeInBytes);
       build.scratch_offset = scratch_total;
       scratch_total += build.build ? build.build_scratch : build.update_scratch;
-      const uint64_t result_bytes = Align256(info.ResultDataMaxSizeInBytes);
       if (build.build && (!has_blas || found->second.bytes < result_bytes)) {
         if (FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, result_bytes,
                                     D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
@@ -1822,12 +1832,13 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
       }
     }
   }
+  const size_t desc_count = static_desc_count + descs.size();
   list->EndQuery(s.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, k * kRt12Timestamps + 3u);
 
   const uint32_t static_count = (gc ? 0u : static_cast<uint32_t>(data->tlas_instances_cpu.size()));
   // 13.1a The upload buffer of this slot (CPU, rebuild frames): the descs at 0, the static instance table at table_offset
   // when it is uploaded and, with records, the BLAS address table after them. 13.1c and 13.2 copy from it.
-  const uint64_t desc_bytes = descs.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+  const uint64_t desc_bytes = desc_count * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
   const uint64_t table_offset = Align256(desc_bytes);
   const uint64_t table_bytes = static_cast<uint64_t>(data->tlas_instances_cpu.size()) * sizeof(bvh::WorldInstanceGPU);
   // G4 (D8): in GC mode the GPU-cache mesh words follow the descs and the address table has one entry per GC slot.
@@ -1854,7 +1865,13 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
       L.upload_bytes = bytes;
       L.upload_data = static_cast<uint8_t*>(mapped);
     }
-    std::memcpy(L.upload_data, descs.data(), desc_bytes);
+    if (static_desc_count != 0u) {
+      std::memcpy(L.upload_data, s.static_descs.data(), static_desc_count * sizeof(D3D12_RAYTRACING_INSTANCE_DESC));
+    }
+    if (!descs.empty()) {
+      std::memcpy(L.upload_data + static_desc_count * sizeof(D3D12_RAYTRACING_INSTANCE_DESC), descs.data(),
+                  descs.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC));
+    }
     if (table_upload) {
       std::memcpy(L.upload_data + table_offset, data->tlas_instances_cpu.data(), table_bytes);
       const uint64_t table_need = records > 0u ? table_records_bytes : table_bytes;
@@ -1919,7 +1936,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   // the static instance table are copied into their buffers; then the records pass writes one desc per record and the
   // record itself at S + r (InstanceID).
   if (records > 0u) {
-    const uint64_t descs_count = descs.size() + records;
+    const uint64_t descs_count = desc_count + records;
     if (L.descs == nullptr || L.descs_bytes < descs_count * sizeof(D3D12_RAYTRACING_INSTANCE_DESC)) {
       const uint64_t bytes = std::max<uint64_t>(descs_count * sizeof(D3D12_RAYTRACING_INSTANCE_DESC), 256u);
       ComPtr<ID3D12Resource> descs_buffer;
@@ -1999,7 +2016,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     list->SetDescriptorHeaps(1u, heaps);
     list->SetComputeRootSignature(s.records_root.Get());
     list->SetPipelineState(s.records_pso.Get());
-    const UINT records_constants[4] = {records, static_count, static_cast<UINT>(descs.size()),
+    const UINT records_constants[4] = {records, static_count, static_cast<UINT>(desc_count),
                                        static_cast<UINT>(gc ? bvh::kGcMaxEntries : s.blas.size())};
     list->SetComputeRoot32BitConstants(0u, 4u, records_constants, 0u);
     list->SetComputeRootDescriptorTable(1u, gpu_at(base + 16u));
@@ -2031,13 +2048,18 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
     inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
-    inputs.NumDescs = static_cast<UINT>(descs.size() + records);
+    inputs.NumDescs = static_cast<UINT>(desc_count + records);
     inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     inputs.InstanceDescs = (records > 0u ? L.descs : L.upload)->GetGPUVirtualAddress();
-    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
-    s.device12->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
-    const uint64_t tlas_bytes = Align256(info.ResultDataMaxSizeInBytes);
-    const uint64_t scratch_bytes = Align256(info.ScratchDataSizeInBytes);
+    if (s.tlas_prebuild_descs != inputs.NumDescs) {
+      D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
+      s.device12->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+      s.tlas_prebuild_descs = inputs.NumDescs;
+      s.tlas_prebuild_result = Align256(info.ResultDataMaxSizeInBytes);
+      s.tlas_prebuild_scratch = Align256(info.ScratchDataSizeInBytes);
+    }
+    const uint64_t tlas_bytes = s.tlas_prebuild_result;
+    const uint64_t scratch_bytes = s.tlas_prebuild_scratch;
     if (L.tlas == nullptr || L.tlas_bytes < tlas_bytes) {
       ComPtr<ID3D12Resource> tlas;
       if (FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, tlas_bytes,
@@ -2254,7 +2276,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
       if (build.build) entry.built_frame = frame;
       entry.last_frame = frame;
     }
-    const uint32_t instances = static_cast<uint32_t>(descs.size());
+    const uint32_t instances = static_cast<uint32_t>(desc_count);
     const uint64_t bytes = L.tlas_bytes;
     UpdatePanel([instances, bytes](Rt12Panel& p) {
       p.tlas_instances = instances;

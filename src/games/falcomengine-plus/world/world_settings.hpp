@@ -26,8 +26,7 @@
 namespace falcom_world {
 
 inline bool IsDevkitPresent() {
-  if (GetModuleHandleA("renodx-devkit.addon64") != nullptr) return true;
-  if (GetModuleHandleA("renodx-devkit.addon32") != nullptr) return true;
+  if (IsDevkitLoaded()) return true;
   static const bool file_present = []() {
     char exe_path[MAX_PATH] = {};
     const DWORD length = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);

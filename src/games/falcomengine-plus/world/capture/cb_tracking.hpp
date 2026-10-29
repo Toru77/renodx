@@ -104,8 +104,9 @@ inline void OnPushDescriptorsWorld(
       const uint32_t slot = update.binding + i;
       if (slot >= kSrvSlotCapacity) continue;
       const reshade::api::resource_view view = views[i];
-      const reshade::api::resource resource = (view.handle != 0u) ? device->get_resource_from_view(view) : reshade::api::resource{0u};
-      if (bind_timer.armed && view.handle != 0u) {
+      const bool resolve = view.handle != 0u && (vertex_stage || (kPsSrvResourceSlots & (1u << slot)) != 0u);
+      const reshade::api::resource resource = (resolve ? device->get_resource_from_view(view) : reshade::api::resource{0u});
+      if (bind_timer.armed && resolve) {
         bvh::g_perf_gate.bind_srv_resolves.fetch_add(1u, std::memory_order_relaxed);
       }
       if (vertex_stage) {
@@ -114,7 +115,7 @@ inline void OnPushDescriptorsWorld(
       }
       if (pixel_stage) {
         data->ps_srv_view[slot] = view;
-        data->ps_srv[slot] = resource;
+        data->ps_srv[slot] = ((kPsSrvResourceSlots & (1u << slot)) != 0u ? resource : reshade::api::resource{0u});
       }
     }
   }

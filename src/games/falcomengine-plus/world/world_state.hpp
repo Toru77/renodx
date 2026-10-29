@@ -18,6 +18,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <Windows.h>
+
 #include <include/reshade.hpp>
 
 #include "../../../utils/scene.hpp"
@@ -30,6 +32,9 @@ inline constexpr uint32_t kSrvSlotCapacity = 32u;
 inline constexpr uint32_t kCensusRingSize = 4096u;
 inline constexpr uint32_t kLightingHashSora2nd = 0xCA3D8596u;
 inline constexpr uint32_t kLightingDepthRegisterSora2nd = 4u;
+// PS SRV slots whose resource the bind hook resolves (WorldCommandListData::ps_srv): alpha t0 (pool), lighting depth t4,
+// RTGI lights t11 and light indices t12. Other PS slots keep only their view; a new ps_srv reader must add its slot here.
+inline constexpr uint32_t kPsSrvResourceSlots = (1u << 0u) | (1u << kLightingDepthRegisterSora2nd) | (1u << 11u) | (1u << 12u);
 
 // Instance transform layout (the pool stores Inst4x3Row; see bvh/pool_transform.hpp).
 enum class CandidateKind : uint8_t {
@@ -222,6 +227,11 @@ inline uint32_t HookOffMask() {
     return read;
   }();
   return static_cast<uint32_t>(value);
+}
+
+// The DevKit add-on is loaded (not only present as a file).
+inline bool IsDevkitLoaded() {
+  return GetModuleHandleA("renodx-devkit.addon64") != nullptr || GetModuleHandleA("renodx-devkit.addon32") != nullptr;
 }
 
 inline bool CensusEnabled() { return g_state.setting_enabled > 0.5f; }

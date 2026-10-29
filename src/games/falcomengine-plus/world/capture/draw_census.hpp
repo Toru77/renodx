@@ -1006,8 +1006,10 @@ inline void OnWorldPresent(
   const bvh::PoolCpuTimer present_timer{&bvh::g_perf_gate.present_world_us};
   g_state.frame.fetch_add(1u);
   g_state.draw_counter = 0u;
-  if (CaptureActive() && renodx::utils::constants::shared.data != nullptr) {
-    renodx::utils::constants::shared.data->capture_constant_buffers = true;
+  if (renodx::utils::constants::shared.data != nullptr) {
+    // The constant-buffer copies feed only the lighting camera capture (CaptureLightingInputs). A loaded DevKit keeps them on
+    // for its tracing.
+    renodx::utils::constants::shared.data->capture_constant_buffers = CaptureActive() || IsDevkitLoaded();
   }
   if (queue == nullptr) return;
   ResolveIndirectDraws(queue);

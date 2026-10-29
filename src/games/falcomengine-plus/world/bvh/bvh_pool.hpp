@@ -2899,6 +2899,7 @@ inline bool ReadPoolAlphaDraw(reshade::api::command_list* cmd_list, const WorldC
   const reshade::api::resource material = cl_data.ps_cb[contract::kAlphaMaterialSlot];
   const reshade::api::resource swizzle = cl_data.ps_cb[contract::kAlphaSwizzleSlot];
   out->view = cl_data.ps_srv_view[contract::kAlphaTexSlot].handle;
+  static_assert((kPsSrvResourceSlots & (1u << contract::kAlphaTexSlot)) != 0u, "the bind hook resolves the alpha t0 resource");
   out->resource = cl_data.ps_srv[contract::kAlphaTexSlot].handle;
   bool readable = out->view != 0u && material.handle != 0u && cl_data.ps_cb_offset[contract::kAlphaMaterialSlot] == 0u;
   std::array<uint8_t, kTrackedCbBytes> bytes = {};

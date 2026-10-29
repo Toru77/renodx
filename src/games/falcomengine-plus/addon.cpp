@@ -9581,6 +9581,9 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   const bool sora2nd_bindings = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr;
   const float feedback_strength = rtgi::RtgiFeedbackStrengthEffective();
   const uint32_t extra_rays = rtgi::RtgiExtraBounceRaysEffective();
+  static_assert((falcom_world::kPsSrvResourceSlots & (1u << rtgi::kLightingLightsRegister)) != 0u
+                    && (falcom_world::kPsSrvResourceSlots & (1u << rtgi::kLightingLightIndicesRegister)) != 0u,
+                "the bind hook resolves the RTGI light buffers");
   rtgi::RtgiDispatchInputs in = {
       .depth_view = dd->captured_depth_srv,
       .mrt_normal_view = dd->captured_mrt_normal_srv,
