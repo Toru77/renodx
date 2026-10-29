@@ -24,6 +24,17 @@ inline void DrawRtgiPanel() {
   } else {
     ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "RTGI: requested, not running (%s)", ReasonName(frame.reason));
   }
+  {
+    rt12::Rt12RtgiPanel dxr;
+    {
+      std::lock_guard<std::mutex> lock(rt12::g_rt12_rtgi_panel_mutex);
+      dxr = rt12::g_rt12_rtgi_panel;
+    }
+    ImGui::Text("RTGI trace: DXR %s, traced %llu, waits %llu (max %.2f ms), characters %u, GPU %.2f ms (trace %.2f ms)",
+                rt12::Rt12RtgiReasonName(dxr.reason),
+                static_cast<unsigned long long>(dxr.frames[static_cast<uint32_t>(rt12::Rt12RtgiReason::Tracing)]),
+                static_cast<unsigned long long>(dxr.waits), dxr.wait_ms_max, dxr.characters, dxr.gpu_ms, dxr.trace_ms);
+  }
   if (g_rtgi_enabled > 0.5f && rtao::RtaoRequested()) {
     ImGui::Text(g_rtgi_rtao_restore > 0.5f ? "RTAO: on (was already on; stays on when RTGI is turned off)"
                                            : "RTAO: on (turned on by RTGI; back to Off when RTGI is turned off)");

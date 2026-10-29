@@ -55,6 +55,7 @@ enum class Reason : uint8_t {
   RtaoNotProducing,  // RTAO did not dispatch on this lighting draw (its reason is in the RTAO panel)
   PipelineFailed,
   SceneLayoutUnknown,  // the running game's scene-buffer layout is not in RtgiPrevViewProjRegister
+  DxrUnavailable,      // the RTGI trace runs on DXR and DXR is not available (rt12::RunRtgiTrace returned false)
 };
 
 inline const char* ReasonName(Reason reason) {
@@ -64,6 +65,7 @@ inline const char* ReasonName(Reason reason) {
     case Reason::RtaoNotProducing: return "rtao_not_producing";
     case Reason::PipelineFailed: return "pipeline_failed";
     case Reason::SceneLayoutUnknown: return "scene_layout_unknown";
+    case Reason::DxrUnavailable: return "dxr_unavailable";
   }
   return "unknown";
 }

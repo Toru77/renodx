@@ -102,6 +102,7 @@ struct RtaoDispatchInputs {
   int debug_mode = 0;
   bvh::DynamicTraceInputs dynamic = {};  // characters (RefitDeformLiveCharacters), count 0 when off
   uint32_t trace_divisor = 1u;  // Trace Resolution: block side d (1 Full, 2 Half, 4 Quarter)
+  uint32_t scene_characters = 0u;
 };
 
 struct RtaoDispatchResult {
@@ -255,7 +256,7 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
       data.ao_uav, data.stats_uav, (d > 1u ? data.trace_uav : data.raw_uav[data.raw_index])};
 #if !defined(FALCOM_WINDOWS_HARNESS)
   const bool dxr_pass_a = rt12::RunRtaoPassA(device, cmd_list, data, push, in.depth_view, in.mrt_normal_view,
-                                             in.isfast_view, in.scene_cbv_view, uavs, trace_w, trace_h);
+                                             in.isfast_view, in.scene_cbv_view, uavs, trace_w, trace_h, in.scene_characters);
 #else
   const bool dxr_pass_a = false;
 #endif

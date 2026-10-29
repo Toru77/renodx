@@ -222,4 +222,74 @@ inline void MirrorUpload(uint64_t vertex_first, const std::vector<float>& vertex
   g_rt12_mirror.new_slots.insert(g_rt12_mirror.new_slots.end(), slots.begin(), slots.end());
 }
 
+enum class Rt12RtgiReason : uint32_t {
+  Tracing,
+  DxrOff,
+  NotCreated,
+  Failed,
+  Stuck,
+  ContextMismatch,
+  SceneMissing,
+  TargetFailed,
+  SubmitFailed,
+};
+inline constexpr uint32_t kRt12RtgiReasonCount = 9u;
+
+inline const char* Rt12RtgiReasonName(Rt12RtgiReason reason) {
+  switch (reason) {
+    case Rt12RtgiReason::Tracing: return "tracing";
+    case Rt12RtgiReason::DxrOff: return "dxr_off";
+    case Rt12RtgiReason::NotCreated: return "not_created";
+    case Rt12RtgiReason::Failed: return "failed";
+    case Rt12RtgiReason::Stuck: return "stuck";
+    case Rt12RtgiReason::ContextMismatch: return "context_mismatch";
+    case Rt12RtgiReason::SceneMissing: return "scene_missing";
+    case Rt12RtgiReason::TargetFailed: return "target_failed";
+    case Rt12RtgiReason::SubmitFailed: return "submit_failed";
+  }
+  return "unknown";
+}
+
+struct Rt12RtgiPanel {
+  Rt12RtgiReason reason = Rt12RtgiReason::DxrOff;
+  uint64_t frames[kRt12RtgiReasonCount] = {};
+  uint64_t waits = 0u;
+  float wait_ms_max = 0.f;
+  uint32_t characters = 0u;
+  uint32_t instances = 0u;
+  float gpu_ms = 0.f;
+  double gpu_ms_sum = 0.0;
+  uint64_t gpu_ms_n = 0u;
+  float trace_ms = 0.f;
+  double trace_ms_sum = 0.0;
+  uint64_t trace_ms_n = 0u;
+};
+inline std::mutex g_rt12_rtgi_panel_mutex;
+inline Rt12RtgiPanel g_rt12_rtgi_panel;
+
+inline bool Rt12RtgiReadsSunInputs(float sun_contribution, int debug_mode) {
+  return sun_contribution != 1.f || debug_mode == 9;
+}
+
+inline bool Rt12RtgiReadsMaterialInputs(float dynamic_light_contribution) {
+  return dynamic_light_contribution != 1.f;
+}
+
+inline constexpr uint32_t kRt12RtgiDescriptors = 25u;
+inline constexpr uint32_t kRt12RtgiTimestamps = 3u;
+inline constexpr uint32_t kRt12RtgiSceneRows = 96u;
+inline constexpr uint32_t kRt12RtgiLampTexels = 7u;
+inline constexpr uint32_t kRt12RtgiDeferredTexels = 9u;
+inline constexpr uint32_t kRt12RtgiDeferredMax = 0x4e20u;
+inline constexpr uint32_t kRt12RtgiDeferredRows = 44u;
+inline constexpr uint32_t kRt12RtgiCarrierWidth = 4096u;
+
+static_assert(kRt12RtgiLampTexels * 16u == 112u);
+static_assert(kRt12RtgiDeferredTexels * 16u == 144u);
+static_assert(kRt12RtgiSceneRows * 16u % 256u == 0u);
+static_assert(7168u * 16u % 256u == 0u);
+static_assert(1024u * 4u % 256u == 0u);
+static_assert(kRt12RtgiCarrierWidth * 16u % 256u == 0u);
+static_assert(kRt12RtgiDeferredRows * kRt12RtgiCarrierWidth >= kRt12RtgiDeferredMax * 9u);
+
 }  // namespace falcom_world::rt12

@@ -21,24 +21,22 @@
 // g_scene_rows window at the register in c5.w. Reads past the end of a smaller scene buffer return 0 (D3D11 rule;
 // the debug layer may warn that the buffer is smaller than declared).
 
+#ifndef RTGI_DXR
 #define WORLD_TRACE_DYNAMIC_INSTANCES
 #define WORLD_TRACE_DYNAMIC_SLOT t19
 #define WORLD_TRACE_DYNAMIC_SKIP_HIDDEN
+#endif
 #include "world_bvh_trace.hlsli"
 #include "../../include/mrt_normal.hlsli"
 #include "world_rt_lamps.hlsli"
 
-// The game's DeferredParam (144 bytes). Only dynamicLightIntensity (byte offset 76 = .w of mid) is read.
-struct GameDeferredParam
-{
-    float4 head[4];
-    float4 mid;
-    float4 tail[4];
-};
-
 Texture2D<float4> g_game_depth : register(t9);
+#ifndef RTGI_DXR
 Texture2D<uint4> g_mrt_normal : register(t17);
+#endif
+#ifndef RTGI_DXR
 Texture3D<float2> g_isfast_noise : register(t18);
+#endif
 Texture2D<float4> g_rtgi_radiance : register(t20);
 Texture2D<float4> g_rtgi_prev_final : register(t21);  // last frame's final GI (one-bounce correction)
 Texture2D<float4> g_rtgi_albedo : register(t22);      // this frame's G-buffer colour, the lighting draw's colorTexture
@@ -50,7 +48,9 @@ Texture2D<uint2> g_mrt2 : register(t27);                    // G-buffer mrtTextu
 StructuredBuffer<GameDeferredParam> g_rtgi_deferred : register(t28);  // Sora 2nd deferredParams_g
 
 RWTexture2D<float4> g_rtgi_debug : register(u0);
+#ifndef RTGI_DXR
 RWStructuredBuffer<uint> g_rtgi_stats : register(u1);
+#endif
 RWTexture2D<float4> g_rtgi_raw : register(u2);
 
 cbuffer cb_scene : register(b0)
@@ -114,6 +114,19 @@ cbuffer cb_rtgi : register(b12)
 #define RTGI_FLAG_LAMP_SHADOWS 256u
 #define RTGI_LAMP_COUNT 1024u
 #define RTGI_FALLBACK_ALBEDO 0.5
+// world_rt12_rtgi.cs_6_5.hlsl includes this file with RTGI_DXR and its own trace, stats target and prologue.
+#ifndef RTGI_TRACE_CLOSEST
+#define RTGI_TRACE_CLOSEST TraceWorldClosest
+#endif
+#ifndef RTGI_TRACE_ANY
+#define RTGI_TRACE_ANY TraceWorldAny
+#endif
+#ifndef RTGI_STATS_AT
+#define RTGI_STATS_AT(i) g_rtgi_stats[i]
+#endif
+#ifndef RTGI_MAIN_PROLOGUE
+#define RTGI_MAIN_PROLOGUE
+#endif
 
 // The G-buffer colour at a screen UV (this frame's lighting colorTexture).
 float3 BounceSurfaceAt(float2 uv)
@@ -174,7 +187,7 @@ float3 LampDiffuseSum(float3 position, float3 n, bool shadow_rays)
                 const WorldCameraView lamp_view = {false, 1.0, 0u, 0u};
                 WorldTraceCounters lamp_counters;
                 const float3 lamp_origin = position + n * (dot(n, lamp_dir) > 0.0 ? g_rtgi_params.y : -g_rtgi_params.y);
-                const WorldTraceHit lamp_hit = TraceWorldAny(lamp_origin, lamp_dir, 1e-3, lamp_reach, lamp_view, lamp_counters);
+                const WorldTraceHit lamp_hit = RTGI_TRACE_ANY(lamp_origin, lamp_dir, 1e-3, lamp_reach, lamp_view, lamp_counters);
                 if (lamp_hit.prim != 0xFFFFFFFFu) continue;
             }
         }
@@ -202,6 +215,7 @@ groupshared uint gs_stats[RTGI_STAT_TRACE_COUNT];
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
 {
+    RTGI_MAIN_PROLOGUE
     // Characters (t10-t13): c6.y objects, 0 unless Trace characters is on. P2b record count: c2.w (uint bits).
     g_trace_dynamic_count = (uint)g_rtgi_sun.y;
     g_trace_dynamic_instance_count = asuint(g_rtgi_fade.w);
@@ -327,7 +341,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                         const float3 dir = T * (r * cos(phi)) + B * (r * sin(phi)) + ray_N * sqrt(max(0.0, 1.0 - u.x));
 
                         WorldTraceCounters counters;
-                        const WorldTraceHit hit = TraceWorldClosest(ray_origin, dir, 1e-3, ray_max, view, counters);
+                        const WorldTraceHit hit = RTGI_TRACE_CLOSEST(ray_origin, dir, 1e-3, ray_max, view, counters);
                         invalid_refs += counters.invalid_refs;
                         stack_overflow += counters.stack_overflow;
                         if (hit.prim == 0xFFFFFFFFu)
@@ -454,7 +468,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                                 const WorldCameraView sun_view = {false, 1.0, 0u,
                                     ((flags & RTGI_FLAG_SUN_CASTERS_ONLY) != 0u ? INSTANCE_SHADOW_CASTER : 0u)};
                                 WorldTraceCounters sun_counters;
-                                const WorldTraceHit sun_hit = TraceWorldAny(hit.position + n * g_rtgi_params.y, sun_dir, 1e-3, g_rtgi_sun.x, sun_view, sun_counters);
+                                const WorldTraceHit sun_hit = RTGI_TRACE_ANY(hit.position + n * g_rtgi_params.y, sun_dir, 1e-3, g_rtgi_sun.x, sun_view, sun_counters);
                                 sun_rays += 1u;
                                 invalid_refs += sun_counters.invalid_refs;
                                 stack_overflow += sun_counters.stack_overflow;
@@ -603,21 +617,21 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
     {
         if (group_index == RTGI_STAT_LUMINANCE_MAX)
         {
-            InterlockedMax(g_rtgi_stats[group_index], gs_stats[group_index]);
+            InterlockedMax(RTGI_STATS_AT(group_index), gs_stats[group_index]);
         }
         else if (group_index == RTGI_STAT_LUMINANCE_SUM)
         {
             // 64-bit sum: carry into the high word when the low word wraps.
             uint before;
-            InterlockedAdd(g_rtgi_stats[RTGI_STAT_LUMINANCE_SUM], gs_stats[group_index], before);
+            InterlockedAdd(RTGI_STATS_AT(RTGI_STAT_LUMINANCE_SUM), gs_stats[group_index], before);
             if (before > 0xFFFFFFFFu - gs_stats[group_index])
             {
-                InterlockedAdd(g_rtgi_stats[RTGI_STAT_LUMINANCE_SUM_HI], 1u);
+                InterlockedAdd(RTGI_STATS_AT(RTGI_STAT_LUMINANCE_SUM_HI), 1u);
             }
         }
         else
         {
-            InterlockedAdd(g_rtgi_stats[group_index], gs_stats[group_index]);
+            InterlockedAdd(RTGI_STATS_AT(group_index), gs_stats[group_index]);
         }
     }
 }

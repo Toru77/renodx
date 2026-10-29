@@ -9021,8 +9021,11 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
       {rf.temporal_last ? 1.f : 0.f, 0.f, 0.f, 0.f},
   };
 
-  if (rtao::g_rtao_trace_characters > 0.5f) {
-    in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
+  const bool rtgi_characters = falcom_world::rtgi::g_rtgi_enabled > 0.5f && falcom_world::rtgi::g_rtgi_trace_characters > 0.5f;
+  if (rtao::g_rtao_trace_characters > 0.5f || rtgi_characters) {
+    const falcom_world::bvh::DynamicTraceInputs characters = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
+    in.scene_characters = characters.count;
+    if (rtao::g_rtao_trace_characters > 0.5f) in.dynamic = characters;
   }
   const rtao::RtaoDispatchResult result = rtao::Dispatch(dev, cmd_list, in);
   rf.temporal_ran = result.temporal_ran;
@@ -9645,7 +9648,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   }
   const rtgi::RtgiDispatchResult result = rtgi::Dispatch(dev, cmd_list, in);
   if (!result.ok) {
-    frame.reason = rtgi::Reason::PipelineFailed;
+    frame.reason = result.dxr_unavailable ? rtgi::Reason::DxrUnavailable : rtgi::Reason::PipelineFailed;
     return;
   }
   frame.producing = true;

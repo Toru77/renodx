@@ -9,9 +9,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstddef>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -42,10 +44,12 @@ inline constexpr std::span<const std::uint8_t> __world_rtgi_upsample{__world_rtg
 #include "harness_timer.hpp"
 #include "json_check.hpp"
 #include "src/games/falcomengine-plus/world/rtgi/rtgi.hpp"
+#include "src/games/falcomengine-plus/world/rt12/rt12_mirror.hpp"
 #include "../../src/games/falcomengine-plus/shared.h"  // REAL: compiled; the ShaderInjectData RTGI fields must exist
 
 using namespace reshade::api;
 namespace rtgi = falcom_world::rtgi;
+namespace rt12 = falcom_world::rt12;
 
 static int g_failures = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { ++g_failures; std::printf("FAIL %s:%d %s | ", __FILE__, __LINE__, #cond); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
@@ -265,6 +269,62 @@ static void TestJson() {
   CHECK(text.find("\"composite\": {") != std::string::npos, "composite object");
   CHECK(text.find("\"subtract_previous\": false") != std::string::npos, "subtract_previous key");
   CHECK(text.find("\"saturation\": ") != std::string::npos, "saturation key");
+}
+
+// M2 T4: the RTGI-on-DXR reason names, the read rules, the constants and the DXR panel in the JSON.
+static void TestRt12RtgiReasons() {
+  using rt12::Rt12RtgiReason;
+  const char* expected[rt12::kRt12RtgiReasonCount] = {"tracing", "dxr_off", "not_created", "failed", "stuck",
+                                                      "context_mismatch", "scene_missing", "target_failed", "submit_failed"};
+  CHECK(rt12::kRt12RtgiReasonCount == 9u, "reason count is 9 (%u)", rt12::kRt12RtgiReasonCount);
+  CHECK(static_cast<uint32_t>(Rt12RtgiReason::SubmitFailed) == 8u, "SubmitFailed is the last reason (%u)", static_cast<uint32_t>(Rt12RtgiReason::SubmitFailed));
+  std::set<std::string> names;
+  for (uint32_t i = 0; i < rt12::kRt12RtgiReasonCount; ++i) {
+    const char* name = rt12::Rt12RtgiReasonName(static_cast<Rt12RtgiReason>(i));
+    CHECK(std::strcmp(name, expected[i]) == 0, "reason %u is %s (%s)", i, expected[i], name);
+    names.insert(name);
+  }
+  CHECK(names.size() == rt12::kRt12RtgiReasonCount, "reason names are unique (%zu)", names.size());
+}
+
+static void TestRt12RtgiReadRules() {
+  CHECK(!rt12::Rt12RtgiReadsSunInputs(1.f, 0), "sun inputs not read at contribution 1, debug 0");
+  CHECK(rt12::Rt12RtgiReadsSunInputs(0.5f, 0), "sun inputs read at contribution 0.5");
+  CHECK(rt12::Rt12RtgiReadsSunInputs(1.f, 9), "sun inputs read in debug mode 9");
+  CHECK(rt12::Rt12RtgiReadsSunInputs(2.f, 3), "sun inputs read at contribution 2");
+  CHECK(!rt12::Rt12RtgiReadsMaterialInputs(1.f), "material inputs not read at contribution 1");
+  CHECK(rt12::Rt12RtgiReadsMaterialInputs(0.5f), "material inputs read at contribution 0.5");
+  CHECK(rt12::Rt12RtgiReadsMaterialInputs(2.f), "material inputs read at contribution 2");
+}
+
+static void TestRt12RtgiConstants() {
+  CHECK(rt12::kRt12RtgiDescriptors == 25u, "descriptors 25 (%u)", rt12::kRt12RtgiDescriptors);
+  CHECK(rt12::kRt12RtgiTimestamps == 3u, "timestamps 3 (%u)", rt12::kRt12RtgiTimestamps);
+  CHECK(rt12::kRt12RtgiSceneRows == 96u, "scene rows 96 (%u)", rt12::kRt12RtgiSceneRows);
+  CHECK(rt12::kRt12RtgiLampTexels == 7u, "lamp texels 7 (%u)", rt12::kRt12RtgiLampTexels);
+  CHECK(rt12::kRt12RtgiDeferredTexels == 9u, "deferred texels 9 (%u)", rt12::kRt12RtgiDeferredTexels);
+  CHECK(rt12::kRt12RtgiDeferredMax == 0x4e20u, "deferred max 0x4e20 (%x)", rt12::kRt12RtgiDeferredMax);
+  CHECK(rt12::kRt12RtgiDeferredRows == 44u, "deferred rows 44 (%u)", rt12::kRt12RtgiDeferredRows);
+  CHECK(rt12::kRt12RtgiCarrierWidth == 4096u, "carrier width 4096 (%u)", rt12::kRt12RtgiCarrierWidth);
+}
+
+static void TestRt12RtgiPanelJson() {
+  const rtgi::RtgiFrameState frame = {};
+  const uint32_t values[rtgi::kRtgiStatsCount] = {};
+  const rtgi::RtgiJsonInput plain = {.frame = &frame, .values = values, .generated_frame = 0u, .perf_gather = false};
+  const std::string plain_text = rtgi::BuildRtgiJson(plain);
+  const rtgi::RtgiJsonInput no_panel = {.frame = &frame, .values = values, .generated_frame = 0u, .perf_gather = false, .dxr = nullptr};
+  CHECK(rtgi::BuildRtgiJson(no_panel) == plain_text, "no DXR panel leaves the JSON unchanged");
+  rt12::Rt12RtgiPanel panel = {};
+  panel.reason = rt12::Rt12RtgiReason::Tracing;
+  panel.frames[static_cast<uint32_t>(rt12::Rt12RtgiReason::Tracing)] = 5u;
+  const rtgi::RtgiJsonInput with_panel = {.frame = &frame, .values = values, .generated_frame = 0u, .perf_gather = false, .dxr = &panel};
+  const std::string text = rtgi::BuildRtgiJson(with_panel);
+  Validator validator(text);
+  CHECK(validator.Run(), "json with DXR panel is valid: %s", validator.error().c_str());
+  const size_t dxr_at = text.find("\"dxr\": {");
+  CHECK(dxr_at != std::string::npos, "DXR panel object present");
+  CHECK(dxr_at != std::string::npos && text.find("\"reason\": \"tracing\"", dxr_at) != std::string::npos, "DXR panel reason is tracing");
 }
 
 // ---- Recording mock (rtgi::Dispatch on a device): every call appends its arguments to g_golden_log ----
@@ -516,6 +576,14 @@ int main() {
   TestComposite();
   HStage("json");
   TestJson();
+  HStage("RTGI-on-DXR reasons");
+  TestRt12RtgiReasons();
+  HStage("RTGI-on-DXR read rules");
+  TestRt12RtgiReadRules();
+  HStage("RTGI-on-DXR constants");
+  TestRt12RtgiConstants();
+  HStage("RTGI-on-DXR panel json");
+  TestRt12RtgiPanelJson();
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);
   return g_failures != 0;
 }

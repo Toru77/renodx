@@ -162,6 +162,14 @@ bool AabbIntersect(
     return t_near <= t_far;
 }
 
+// Unit geometric normal of a triangle, cross(v1 - v0, v2 - v0); (0, 1, 0) when degenerate (IntersectTriangle, DXR).
+float3 TriangleNormal(float3 v0, float3 v1, float3 v2)
+{
+    const float3 raw_normal = cross(v1 - v0, v2 - v0);
+    const float normal_length = length(raw_normal);
+    return normal_length > 1e-12 ? raw_normal / normal_length : float3(0.0, 1.0, 0.0);
+}
+
 bool IntersectTriangle(
     float3 origin,
     float3 direction,
@@ -189,11 +197,9 @@ bool IntersectTriangle(
     if (v < 0.0 || u + v > 1.0) return false;
     const float hit_t = dot(edge2, q) * inv_det;
     if (hit_t <= 0.0) return false;
-    const float3 raw_normal = cross(edge1, edge2);
-    const float normal_length = length(raw_normal);
     bary = float2(u, v);
     t = hit_t;
-    if (normal_length > 1e-12) normal = raw_normal / normal_length;
+    normal = TriangleNormal(v0, v1, v2);
     return true;
 }
 

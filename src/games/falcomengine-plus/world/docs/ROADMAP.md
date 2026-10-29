@@ -63,6 +63,12 @@ Deform store compaction (skinned-mesh flicker fix), implemented, not validated i
 
 Tiny mesh copies (staging guard G1, guard scan, offset-0 lane), implemented, not validated in game: every mesh copy except the lane copy starts at staging offset 4096 or later (kPoolMeshGuardBytes); the lane copy is described in the next sentence. A whole-buffer vertex or uv copy of at most 64 bytes is staged at offset 0, one per slot, because these copies land at offset 0 whatever offset they are given (3- and 4-vertex meshes failed with "vertex position not decodable"). The cause is below ReShade and not proven. world_pool.json: mesh_guard_hits, mesh_guard_explained, mesh_guard_scan, mesh_lane_copies, mesh_lane_busy. guard sentinel_words counts poison words in the guard (the same meaning as sentinel_words elsewhere); the non-poison count is mesh_guard_scan.written_words, after the lane bytes are excluded. Owner check: Poison on, Reset Pool, wait 10 s, Dump; quad 0x31096f65275eb9bf admitted with an instance.
 
+RTGI on DXR (M1, M2), implemented, not validated in game: the RTGI trace runs on DXR by default (`rt12::RunRtgiTrace`, called from `rtgi::Dispatch`). The compute trace (`world_rtgi.cs_5_0.hlsl`) is legacy and builds only under the native harness (`FALCOM_WINDOWS_HARNESS`). The panel line "RTGI trace: DXR ..." and the `dxr` object in world_rtgi.json show the DXR trace. Reason `dxr_unavailable` means RTGI did not run this frame because DXR is off or failed; no GI is added. Owner test list:
+1. At an interior spot and a large outdoor spot, RTGI defaults, standing still: the panel shows "RTGI trace: DXR tracing"; Read RTGI Stats; screenshots of the final image and of RTGI Debug 1, 2 and 8; a 30 s Performance test.
+2. Repeat with RTGI Trace characters on (RTAO characters off), Sun Shadows From Shadow Casters Only, Extra Bounces, Dynamic Lights with Lamp Shadows and Sun Contribution 0.5.
+3. Two map changes with the DXR switch off: RTGI shows `dxr_unavailable` and no GI. Switch DXR on again. Exit the game with RTGI on.
+4. Send world_rtgi.json, world_rt12.json, the perf files, the screenshots and the [world-rt12] log lines. Pass: rays within 1% and hits within 5% against the M1 build at the same spots; waits close to 0; frames that do not trace only during loads and toggles; no STUCK, no crash.
+
 | Feature | Owner test list | Where |
 |---|---|---|
 | Path 2: moving objects out of the static pool (P2a, P2a-rev) | Pool Scan near moving objects, rule line, Depth Compare | HISTORY: Path 2, round P2a; round P2a-rev |

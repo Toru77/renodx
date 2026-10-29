@@ -93,6 +93,7 @@ enum PerfCost : size_t {
   kPerfDxrRecordsGpu,
   kPerfDxrCharactersGpu,
   kPerfGcBlasBuildGpu,
+  kPerfDxrRtgiGpu,
   kPerfBlockRow,  // the block rows (PerfBlock order, perf_gate.hpp) follow: the first 12 are InPresent (disjoint), the rest Subset
   kPerfCostCount = kPerfBlockRow + kPerfBlockCount
 };
@@ -144,6 +145,7 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"dxr_records_gpu", true, kPerfSubset, false, nullptr},
     {"dxr_characters_gpu", true, kPerfSubset, false, nullptr},
     {"gc_blas_build_gpu", true, kPerfSubset, false, nullptr},
+    {"dxr_rtgi_gpu", true, kPerfSubset, false, nullptr},
     // Blocks (PerfBlock order). InPresent blocks are disjoint: they are in the InPresent sum, so they reduce the unattributed CPU.
     {"perf_sample", true, kPerfInPresent, false, nullptr},
     {"sync_live_meshes", true, kPerfInPresent, false, nullptr},
@@ -357,7 +359,7 @@ struct PerfTimerSample {
 };
 struct PerfExtraGpu {
   PerfTimerSample rtao, rtao_filter, rtgi, rtgi_denoise, rtls, rtls_denoise, rtsun, rtsun_denoise, deform_refit;
-  double dxr_tlas_ms = 0.0, dxr_records_ms = 0.0, dxr_characters_ms = 0.0, gc_blas_ms = 0.0;  // D3D12 timestamp sums (rt12 panels); inside gpu_rtao, so Subset rows
+  double dxr_tlas_ms = 0.0, dxr_records_ms = 0.0, dxr_characters_ms = 0.0, gc_blas_ms = 0.0, dxr_rtgi_ms = 0.0;  // D3D12 timestamp sums (rt12 panels); inside gpu_rtao, so Subset rows
 };
 
 // Performance tab: the last kPerfTabWindow presents. NaN means "--" (no value in the window).
@@ -538,6 +540,7 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.cost[kPerfDxrRecordsGpu] = extra.dxr_records_ms;
   c.cost[kPerfDxrCharactersGpu] = extra.dxr_characters_ms;
   c.cost[kPerfGcBlasBuildGpu] = extra.gc_blas_ms;
+  c.cost[kPerfDxrRtgiGpu] = extra.dxr_rtgi_ms;
   for (size_t p = 0; p < 5u; ++p) c.cost[kPerfRebuildPhase0 + p] = timing.rebuild_phase_ms_sum[p];
   for (size_t p = 0; p < 4u; ++p) c.cost[kPerfRefitPhase0 + p] = timing.refit_phase_ms_sum[p];
   for (size_t p = 0; p < 4u; ++p) c.cost[kPerfSlackPhase0 + p] = live.slack_phase_ms_sum[p];

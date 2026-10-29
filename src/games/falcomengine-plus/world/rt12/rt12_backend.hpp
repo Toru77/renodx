@@ -36,6 +36,8 @@
 #include "../../../../utils/path.hpp"
 #include "../bvh/bvh_live.hpp"
 #include "../rtao/rtao_resources.hpp"
+#include "../rtgi/rtgi_resources.hpp"
+#include "../rtgi/rtgi_state.hpp"
 #include "rt12_mirror.hpp"
 
 namespace falcom_world::rt12 {
@@ -151,6 +153,23 @@ struct Rt12Retired {
   Microsoft::WRL::ComPtr<IUnknown> object;
 };
 
+// RTGI on DXR (B): its own slots, list, PSO, heaps, timestamps and textures. The scene (TLAS, instance table) is pass A's.
+struct Rt12RtgiState {
+  bool created = false;
+  Rt12Slot slots[kRt12Slots];
+  uint32_t next = 0u;
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> list;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;      // shader visible, kRt12Slots * kRt12RtgiDescriptors
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> cpu_heap;  // not shader visible, 1 (stats UAV for the clear)
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> queries;        // kRt12Slots * kRt12RtgiTimestamps
+  Microsoft::WRL::ComPtr<ID3D12Resource> query_readback;  // kRt12Slots * kRt12RtgiTimestamps * 8 bytes
+  Microsoft::WRL::ComPtr<ID3D12Resource> scene_cb, lamps, lamp_types, deferred;  // DEFAULT, COMMON
+  Rt12Shared shared[15];  // the RTGI D3D11 textures (fixed and per frame, by format and size)
+  rtgi::RtgiPipeline pack, pack_lights, resolve;
+};
+
 struct Rt12State {
   reshade::api::device* device = nullptr;  // the D3D11 device this state belongs to
   Microsoft::WRL::ComPtr<ID3D11Device> device11;
@@ -199,6 +218,10 @@ struct Rt12State {
   std::unordered_map<uint64_t, Rt12DynamicBlas> dynamic_blas;  // by deform identity key
   uint32_t scene_dynamic_count = 0u;  // character instances in the TLAS of scene_slot
   uint32_t scene_record_count = 0u;   // P2b records in the TLAS of scene_slot
+  uint32_t scene_frame = UINT32_MAX;   // g_state.frame of scene_slot (RTGI)
+  uint32_t scene_instance_count = 0u;  // instances of scene_slot (RTGI)
+  PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = nullptr;
+  Rt12RtgiState rtgi;
   uint64_t address_generation = ~0ull;  // blas_generation the per-slot address tables were last written for (see Rt12Slot)
   std::vector<D3D12_RAYTRACING_INSTANCE_DESC> static_descs;  // the static part of the TLAS, cached by its key
   uint64_t static_key_version = ~0ull, static_key_blas = ~0ull;
@@ -261,7 +284,8 @@ inline Rt12GcScene g_rt12_gc_scene;
 inline uint64_t g_rt12_gc_epoch = 0u;  // last Rt12GcScene::version handed out; never reset, so versions never repeat
 
 inline bool GcOwnsRtao() {
-  return bvh::g_gpu_capture.enabled.load(std::memory_order_relaxed) && bvh::g_gpu_capture.trace.load(std::memory_order_relaxed);
+  return bvh::g_gpu_capture.enabled.load(std::memory_order_relaxed) && bvh::g_gpu_capture.trace.load(std::memory_order_relaxed)
+         && rtgi::g_rtgi_enabled < 0.5f;
 }
 
 template <typename F>
@@ -356,6 +380,35 @@ inline void UavBarrier(std::vector<D3D12_RESOURCE_BARRIER>& barriers, ID3D12Reso
   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   barrier.UAV.pResource = resource;
   barriers.push_back(barrier);
+}
+
+// Descriptor descriptions of the DXR passes (RunRtaoPassA and the RTGI trace).
+inline D3D12_SHADER_RESOURCE_VIEW_DESC Rt12BufferSrv(uint32_t stride, uint64_t count) {
+  D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+  view.Format = DXGI_FORMAT_UNKNOWN;
+  view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  view.Buffer.FirstElement = 0u;
+  view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(count, 1u));
+  view.Buffer.StructureByteStride = stride;
+  view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+  return view;
+}
+
+inline D3D12_SHADER_RESOURCE_VIEW_DESC Rt12TextureSrv(DXGI_FORMAT format) {
+  D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+  view.Format = format;
+  view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  view.Texture2D.MipLevels = 1u;
+  return view;
+}
+
+inline D3D12_UNORDERED_ACCESS_VIEW_DESC Rt12TextureUav(DXGI_FORMAT format) {
+  D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
+  view.Format = format;
+  view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  return view;
 }
 
 // Keeps a replaced GPU object alive until `fence` has completed (the caller assigns the fence once it is known).
@@ -485,6 +538,15 @@ inline void DestroyRt12Pipelines(reshade::api::device* device, Rt12State& s) {
   s.records_carrier_pipeline = {0u};
 }
 
+// Waits, bounded by ms, until the D3D12 fence reaches value. False on timeout.
+inline bool WaitRt12Fence(Rt12State& s, uint64_t value, uint32_t ms) {
+  const LARGE_INTEGER start = QpcNow();
+  while (s.fence12->GetCompletedValue() < value && QpcMsSince(start) < static_cast<double>(ms)) {
+    Sleep(1);
+  }
+  return s.fence12->GetCompletedValue() >= value;
+}
+
 // Stops the DXR path. A stuck scene is leaked on purpose (the GPU may still touch it).
 inline void TeardownRt12(const char* why) {
   if (!g_rt12) return;
@@ -499,11 +561,7 @@ inline void TeardownRt12(const char* why) {
   }
   Rt12State& s = *g_rt12;
   if (!s.stuck && s.last_signal != 0u && s.fence12) {
-    const LARGE_INTEGER start = QpcNow();
-    while (s.fence12->GetCompletedValue() < s.last_signal && QpcMsSince(start) < static_cast<double>(kRt12TeardownMs)) {
-      Sleep(1);
-    }
-    if (s.fence12->GetCompletedValue() < s.last_signal) s.stuck = true;
+    if (!WaitRt12Fence(s, s.last_signal, kRt12TeardownMs)) s.stuck = true;
   }
   if (s.stuck) {
     renodx::utils::log::w("[world-rt12] teardown (", why, "): GPU work still pending, objects leaked on purpose");
@@ -515,7 +573,14 @@ inline void TeardownRt12(const char* why) {
     if (shared->srv11.handle != 0u) s.device->destroy_resource_view(shared->srv11);
     if (shared->uav11.handle != 0u) s.device->destroy_resource_view(shared->uav11);
   }
+  for (Rt12Shared& shared : s.rtgi.shared) {
+    if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
+    if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
+  }
   DestroyRt12Pipelines(s.device, s);
+  rtgi::DestroyRtgiPipeline(s.device, s.rtgi.pack);
+  rtgi::DestroyRtgiPipeline(s.device, s.rtgi.pack_lights);
+  rtgi::DestroyRtgiPipeline(s.device, s.rtgi.resolve);
   renodx::utils::log::i("[world-rt12] teardown (", why, ")");
   g_rt12.reset();
 }
@@ -568,6 +633,7 @@ inline bool CreateRt12(reshade::api::device* device) {
   const auto serialize = reinterpret_cast<PFN_D3D12_SERIALIZE_ROOT_SIGNATURE>(
       GetProcAddress(d3d12_module, "D3D12SerializeRootSignature"));
   if (create_device == nullptr || serialize == nullptr) return fail(Rt12Reason::CreateFailed, "GetProcAddress D3D12", E_FAIL);
+  s.serialize = serialize;
 
   // 5. Device on the OS runtime, unwrapped from the ReShade wrapper (the wrapper stays alive in the state).
   hr = create_device(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&s.wrapper));
@@ -811,13 +877,13 @@ inline bool CreateRt12(reshade::api::device* device) {
 }
 
 // Reads the timestamps of [first, first + count) of the readback buffer (only after their fence completed).
-inline bool ReadRt12Timestamps(Rt12State& s, uint32_t first, uint32_t count, uint64_t* out) {
+inline bool ReadRt12Timestamps(ID3D12Resource* readback, uint32_t first, uint32_t count, uint64_t* out) {
   void* mapped = nullptr;
   const D3D12_RANGE read = {first * 8u, (first + count) * 8u};
-  if (FAILED(s.query_readback->Map(0u, &read, &mapped))) return false;
+  if (FAILED(readback->Map(0u, &read, &mapped))) return false;
   std::memcpy(out, static_cast<const uint8_t*>(mapped) + first * 8u, count * 8u);
   const D3D12_RANGE nothing = {0u, 0u};
-  s.query_readback->Unmap(0u, &nothing);
+  readback->Unmap(0u, &nothing);
   return true;
 }
 
@@ -1173,7 +1239,7 @@ inline void OnPresent(reshade::api::device* device) {
   for (uint32_t k = 0u; k < kRt12Slots; ++k) {
     if (s.present_slots[k].timestamps && s.present_slots[k].fence_value <= completed) {
       uint64_t t[2] = {};
-      if (ReadRt12Timestamps(s, k * kRt12Timestamps, 2u, t)) {
+      if (ReadRt12Timestamps(s.query_readback.Get(), k * kRt12Timestamps, 2u, t)) {
         const float ms = TicksToMs(t[1] - t[0], s.timestamp_frequency);
         UpdatePanel([ms](Rt12Panel& p) {
           p.blas_ms = ms;
@@ -1185,7 +1251,7 @@ inline void OnPresent(reshade::api::device* device) {
     }
     if (s.lighting_slots[k].timestamps && s.lighting_slots[k].fence_value <= completed) {
       uint64_t t[5] = {};
-      if (ReadRt12Timestamps(s, k * kRt12Timestamps + 2u, 5u, t)) {
+      if (ReadRt12Timestamps(s.query_readback.Get(), k * kRt12Timestamps + 2u, 5u, t)) {
         const bool dynamic_timed = s.lighting_slots[k].dynamic_timed;
         const bool records_timed = s.lighting_slots[k].records_timed;
         const float dynamic_ms = TicksToMs(t[1] - t[0], s.timestamp_frequency);
@@ -1212,6 +1278,25 @@ inline void OnPresent(reshade::api::device* device) {
         });
       }
       s.lighting_slots[k].timestamps = false;
+    }
+  }
+
+  // 4b. RTGI slot timestamps: gpu = t2 - t0 and trace = t2 - t1.
+  for (uint32_t k = 0u; k < kRt12Slots; ++k) {
+    if (s.rtgi.slots[k].timestamps && s.rtgi.slots[k].fence_value <= completed) {
+      uint64_t t[kRt12RtgiTimestamps] = {};
+      if (ReadRt12Timestamps(s.rtgi.query_readback.Get(), k * kRt12RtgiTimestamps, kRt12RtgiTimestamps, t)) {
+        const float gpu_ms = TicksToMs(t[2] - t[0], s.timestamp_frequency);
+        const float trace_ms = TicksToMs(t[2] - t[1], s.timestamp_frequency);
+        std::lock_guard lock(g_rt12_rtgi_panel_mutex);
+        g_rt12_rtgi_panel.gpu_ms = gpu_ms;
+        g_rt12_rtgi_panel.gpu_ms_sum += gpu_ms;
+        g_rt12_rtgi_panel.gpu_ms_n += 1u;
+        g_rt12_rtgi_panel.trace_ms = trace_ms;
+        g_rt12_rtgi_panel.trace_ms_sum += trace_ms;
+        g_rt12_rtgi_panel.trace_ms_n += 1u;
+      }
+      s.rtgi.slots[k].timestamps = false;
     }
   }
 
@@ -1320,7 +1405,8 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
                          const rtao::RtaoPushConstants& push, reshade::api::resource_view depth_view,
                          reshade::api::resource_view mrt_normal_view, reshade::api::resource_view isfast_view,
                          reshade::api::resource_view scene_cbv_view,
-                         const reshade::api::resource_view (&uavs)[rtao::kRtaoUavCount], uint32_t trace_w, uint32_t trace_h) {
+                         const reshade::api::resource_view (&uavs)[rtao::kRtaoUavCount], uint32_t trace_w, uint32_t trace_h,
+                         uint32_t scene_characters) {
 #if defined(_WIN32)
   using Microsoft::WRL::ComPtr;
   using DS = reshade::api::shader_stage;
@@ -1369,7 +1455,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   }
 
   // 7b. The characters RefitDeformLiveCharacters traced this frame (the compute pass A's set, in the same arena).
-  const uint32_t characters_requested = static_cast<uint32_t>(push.size[2] + 0.5f);
+  const uint32_t characters_requested = scene_characters;
   std::vector<bvh::DynamicCharacter> characters;
   reshade::api::resource_view arena_srv = {0u};
   uint64_t vertex_end = 0u;
@@ -1587,31 +1673,6 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     handle.ptr += static_cast<UINT64>(index) * s.descriptor_size;
     return handle;
   };
-  const auto buffer_srv = [](uint32_t stride, uint64_t count) {
-    D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
-    view.Format = DXGI_FORMAT_UNKNOWN;
-    view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    view.Buffer.FirstElement = 0u;
-    view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(count, 1u));
-    view.Buffer.StructureByteStride = stride;
-    view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
-    return view;
-  };
-  const auto texture_srv = [](DXGI_FORMAT format) {
-    D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
-    view.Format = format;
-    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    view.Texture2D.MipLevels = 1u;
-    return view;
-  };
-  const auto texture_uav = [](DXGI_FORMAT format) {
-    D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
-    view.Format = format;
-    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    return view;
-  };
   ID3D12Device5* device12 = s.device12.Get();
 
   // 13.1b Characters: the carrier into the vertex buffer (D3D12), one BLAS per character (build or refit) and one desc each.
@@ -1690,7 +1751,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     }
 
     // Descriptors 14 (carrier SRV) and 15 (vertex UAV) of this slot, for the unpack.
-    const D3D12_SHADER_RESOURCE_VIEW_DESC carrier_srv = texture_srv(DXGI_FORMAT_R32G32B32A32_UINT);
+    const D3D12_SHADER_RESOURCE_VIEW_DESC carrier_srv = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT);
     device12->CreateShaderResourceView(s.carrier.texture12.Get(), &carrier_srv, cpu_at(base + 14u));
     D3D12_UNORDERED_ACCESS_VIEW_DESC vertex_uav = {};
     vertex_uav.Format = DXGI_FORMAT_UNKNOWN;
@@ -1738,12 +1799,14 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     Transition(barriers, s.carrier.texture12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
 
-    for (const DynamicBuild& build : dynamic_plan) {
+    for (size_t i = 0u; i < dynamic_plan.size(); ++i) {
+      const DynamicBuild& build = dynamic_plan[i];
       D3D12_RAYTRACING_INSTANCE_DESC desc = {};
       desc.Transform[0][0] = 1.f;
       desc.Transform[1][1] = 1.f;
       desc.Transform[2][2] = 1.f;
       desc.InstanceID = kRt12DynamicInstanceId;
+      desc.InstanceContributionToHitGroupIndex = characters[i].vertex_base;
       desc.InstanceMask = kRt12MaskDynamic;
       desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE | D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
       desc.AccelerationStructure = build.buffer->GetGPUVirtualAddress();
@@ -1911,9 +1974,9 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
 
     // Descriptors 16..19 of this slot: records SRV, address SRV, descs UAV (raw), instance table UAV (structured).
-    const D3D12_SHADER_RESOURCE_VIEW_DESC records_srv = texture_srv(DXGI_FORMAT_R32G32B32A32_UINT);
+    const D3D12_SHADER_RESOURCE_VIEW_DESC records_srv = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT);
     device12->CreateShaderResourceView(records_carrier.texture12.Get(), &records_srv, cpu_at(base + 16u));
-    const D3D12_SHADER_RESOURCE_VIEW_DESC addresses_srv = buffer_srv(8u, address_count);
+    const D3D12_SHADER_RESOURCE_VIEW_DESC addresses_srv = Rt12BufferSrv(8u, address_count);
     device12->CreateShaderResourceView(address_buffer, &addresses_srv, cpu_at(base + 17u));
     D3D12_UNORDERED_ACCESS_VIEW_DESC descs_uav = {};
     descs_uav.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -2015,13 +2078,13 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   const uint64_t uv_count = (gc ? gc_scene.uv_count : s.arenas[kRt12ArenaUvs].used);
   ID3D12Resource* mesh_table = (gc ? L.gc_meshes.Get() : s.mesh_table.Get());
   const uint32_t mesh_count = (gc ? static_cast<uint32_t>(bvh::kGcMaxEntries) : s.mesh_count);
-  const D3D12_SHADER_RESOURCE_VIEW_DESC indices_srv = buffer_srv(kRt12ArenaStride[kRt12ArenaIndices], index_count);
+  const D3D12_SHADER_RESOURCE_VIEW_DESC indices_srv = Rt12BufferSrv(kRt12ArenaStride[kRt12ArenaIndices], index_count);
   device12->CreateShaderResourceView(index_arena, &indices_srv, cpu_at(base + 0u));
-  const D3D12_SHADER_RESOURCE_VIEW_DESC mesh_srv = buffer_srv(sizeof(bvh::WorldMeshGPU), mesh_count);
+  const D3D12_SHADER_RESOURCE_VIEW_DESC mesh_srv = Rt12BufferSrv(sizeof(bvh::WorldMeshGPU), mesh_count);
   device12->CreateShaderResourceView(mesh_table, &mesh_srv, cpu_at(base + 1u));
-  const D3D12_SHADER_RESOURCE_VIEW_DESC instance_srv = buffer_srv(sizeof(bvh::WorldInstanceGPU), scene_count);
+  const D3D12_SHADER_RESOURCE_VIEW_DESC instance_srv = Rt12BufferSrv(sizeof(bvh::WorldInstanceGPU), scene_count);
   device12->CreateShaderResourceView(scene.instance_table.Get(), &instance_srv, cpu_at(base + 2u));
-  const D3D12_SHADER_RESOURCE_VIEW_DESC uv_srv = buffer_srv(kRt12ArenaStride[kRt12ArenaUvs], uv_count);
+  const D3D12_SHADER_RESOURCE_VIEW_DESC uv_srv = Rt12BufferSrv(kRt12ArenaStride[kRt12ArenaUvs], uv_count);
   device12->CreateShaderResourceView(uv_arena, &uv_srv, cpu_at(base + 3u));
   D3D12_SHADER_RESOURCE_VIEW_DESC atlas_srv = {};
   atlas_srv.Format = DXGI_FORMAT_R32_UINT;
@@ -2030,9 +2093,9 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   atlas_srv.Texture2DArray.MipLevels = 1u;
   atlas_srv.Texture2DArray.ArraySize = kRt12AlphaSlices;
   device12->CreateShaderResourceView(s.atlas.texture12.Get(), &atlas_srv, cpu_at(base + 4u));
-  const D3D12_SHADER_RESOURCE_VIEW_DESC materials_srv = buffer_srv(32u, kRt12AlphaSlices);
+  const D3D12_SHADER_RESOURCE_VIEW_DESC materials_srv = Rt12BufferSrv(32u, kRt12AlphaSlices);
   device12->CreateShaderResourceView(s.materials.Get(), &materials_srv, cpu_at(base + 5u));
-  const D3D12_SHADER_RESOURCE_VIEW_DESC normal_srv = texture_srv(DXGI_FORMAT_R32G32B32A32_UINT);
+  const D3D12_SHADER_RESOURCE_VIEW_DESC normal_srv = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT);
   device12->CreateShaderResourceView(s.normal.texture12.Get(), &normal_srv, cpu_at(base + 6u));
   D3D12_SHADER_RESOURCE_VIEW_DESC tlas_srv = {};
   tlas_srv.Format = DXGI_FORMAT_UNKNOWN;
@@ -2040,18 +2103,18 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   tlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   tlas_srv.RaytracingAccelerationStructure.Location = scene.tlas->GetGPUVirtualAddress();
   device12->CreateShaderResourceView(nullptr, &tlas_srv, cpu_at(base + 7u));
-  const D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv = texture_srv(DXGI_FORMAT_R32_UINT);
+  const D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv = Rt12TextureSrv(DXGI_FORMAT_R32_UINT);
   device12->CreateShaderResourceView(s.depth.texture12.Get(), &depth_srv, cpu_at(base + 8u));
-  const D3D12_SHADER_RESOURCE_VIEW_DESC scene_srv = texture_srv(DXGI_FORMAT_R32G32B32A32_UINT);
+  const D3D12_SHADER_RESOURCE_VIEW_DESC scene_srv = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT);
   device12->CreateShaderResourceView(s.scene.texture12.Get(), &scene_srv, cpu_at(base + 9u));
-  const D3D12_SHADER_RESOURCE_VIEW_DESC noise_srv = texture_srv(DXGI_FORMAT_R32G32B32A32_UINT);
+  const D3D12_SHADER_RESOURCE_VIEW_DESC noise_srv = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT);
   device12->CreateShaderResourceView(s.noise.texture12.Get(), &noise_srv, cpu_at(base + 10u));
-  const D3D12_UNORDERED_ACCESS_VIEW_DESC texel_uav = texture_uav(DXGI_FORMAT_R32_UINT);
+  const D3D12_UNORDERED_ACCESS_VIEW_DESC texel_uav = Rt12TextureUav(DXGI_FORMAT_R32_UINT);
   device12->CreateUnorderedAccessView(s.texel.texture12.Get(), nullptr, &texel_uav, cpu_at(base + 11u));
-  const D3D12_UNORDERED_ACCESS_VIEW_DESC stats_uav = texture_uav(DXGI_FORMAT_R32_UINT);
+  const D3D12_UNORDERED_ACCESS_VIEW_DESC stats_uav = Rt12TextureUav(DXGI_FORMAT_R32_UINT);
   device12->CreateUnorderedAccessView(s.stats.texture12.Get(), nullptr, &stats_uav, cpu_at(base + 12u));
   device12->CreateUnorderedAccessView(s.stats.texture12.Get(), nullptr, &stats_uav, s.cpu_heap->GetCPUDescriptorHandleForHeapStart());
-  const D3D12_UNORDERED_ACCESS_VIEW_DESC raw_uav = texture_uav(DXGI_FORMAT_R32_FLOAT);
+  const D3D12_UNORDERED_ACCESS_VIEW_DESC raw_uav = Rt12TextureUav(DXGI_FORMAT_R32_FLOAT);
   device12->CreateUnorderedAccessView(s.raw.texture12.Get(), nullptr, &raw_uav, cpu_at(base + 13u));
 
   // 13.5 Barriers into the read and write states; the heap is bound before the stats clear (GPU handle in the heap).
@@ -2218,6 +2281,11 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     cmd_list->push_constants(DS::all_compute, rd.layout, 3, 0, rtao::kRtaoPushConstantCount, &push);
     cmd_list->dispatch((trace_w + 7u) / 8u, (trace_h + 7u) / 8u, 1u);
     rtao::NullComputeSlots(cmd_list, rtao::kRtaoSrvCount, rtao::kRtaoUavCount, 0u);
+  }
+
+  if (!gc) {
+    s.scene_frame = frame;
+    s.scene_instance_count = scene_count;
   }
 
   // 16. Panel.

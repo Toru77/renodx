@@ -15,10 +15,14 @@
 #include <vector>
 
 #include "../bvh/bvh_trace.hpp"
+#include "../rt12/rt12_mirror.hpp"
 #include "../rtao/rtao.hpp"
 #include "../world_state.hpp"
 #include "rtgi_resources.hpp"
 #include "rtgi_state.hpp"
+#if !defined(FALCOM_WINDOWS_HARNESS)
+#include "../rt12/rt12_rtgi.hpp"
+#endif
 
 namespace falcom_world::rtgi {
 
@@ -113,6 +117,7 @@ struct RtgiDispatchResult {
   bool debug_written = false;
   bool temporal_ran = false;
   bool filter_ran = false;
+  bool dxr_unavailable = false;
 };
 
 // What a trace owner asks the denoise chain to prepare for this frame.
@@ -469,8 +474,14 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
                       reshade::api::resource_usage::shader_resource);
   }
   // Trace.
-  bvh::BeginGpuTimer(device, cmd_list, &data.timer);
   const RtgiPipeline& trace = data.trace_pipeline;
+  const reshade::api::resource_view table_null_views[kRtgiSrvCount] = {};
+  std::vector<reshade::api::descriptor_table_update> table_nulls = {
+      {trace.srv_table, 0, 0, kRtgiSrvCount, kSrv, table_null_views},
+      {trace.uav_table, 0, 0, kRtgiUavCount, kUav, table_null_views},
+  };
+#if defined(FALCOM_WINDOWS_HARNESS)
+  bvh::BeginGpuTimer(device, cmd_list, &data.timer);
   reshade::api::resource_view srvs[kRtgiSrvCount] = {};
   bvh::FillBvhSceneSrvs(*bvh_data, in.depth_view, in.dynamic, srvs);
   srvs[17] = in.mrt_normal_view;
@@ -505,12 +516,52 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   }
   cmd_list->barrier(data.raw.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   bvh::EndGpuTimer(cmd_list, &data.timer);
-
-  const reshade::api::resource_view table_null_views[kRtgiSrvCount] = {};
-  std::vector<reshade::api::descriptor_table_update> table_nulls = {
-      {trace.srv_table, 0, 0, kRtgiSrvCount, kSrv, table_null_views},
-      {trace.uav_table, 0, 0, kRtgiUavCount, kUav, table_null_views},
+#else
+  bvh::BeginGpuTimer(device, cmd_list, &data.timer);
+  const uint32_t lamp_count = lamps_run
+      ? static_cast<uint32_t>(device->get_resource_desc(device->get_resource_from_view(in.lights_view)).buffer.size / kLightParamBytes)
+      : 0u;
+  const uint32_t deferred_count = in.deferred_view.handle != 0u && rt12::Rt12RtgiReadsMaterialInputs(g_rtgi_dynamic_light_contribution)
+      ? static_cast<uint32_t>(device->get_resource_desc(device->get_resource_from_view(in.deferred_view)).buffer.size
+                              / (rt12::kRt12RtgiDeferredTexels * 16u))
+      : 0u;
+  const rt12::Rt12RtgiInputs dxr_inputs = {
+      .depth = in.depth_view,
+      .mrt_normal = in.mrt_normal_view,
+      .isfast = in.isfast_view,
+      .scene_cbv = in.scene_cbv_view,
+      .radiance = in.radiance_view,
+      .prev_gi = in.prev_gi_view,
+      .albedo = in.albedo_view,
+      .lights = lamps_run ? in.lights_view : reshade::api::resource_view{0u},
+      .lamp_types = lamps_run ? data.lamp_types_srv : reshade::api::resource_view{0u},
+      .mrt1 = in.mrt1_view,
+      .shadow = in.shadow_view,
+      .mrt2 = in.mrt2_view,
+      .deferred = in.deferred_view,
+      .raw_texture = data.raw.texture[0],
+      .debug_texture = trace_debug ? data.debug.texture[0] : reshade::api::resource{0u},
+      .stats_uav = data.stats_uav,
+      .trace_width = in.trace_width,
+      .trace_height = in.trace_height,
+      .full_width = in.full_width,
+      .full_height = in.full_height,
+      .trace_characters = g_rtgi_trace_characters > 0.5f,
+      .lamp_count = lamp_count,
+      .deferred_count = deferred_count,
   };
+  const bool dxr_traced = rt12::RunRtgiTrace(device, cmd_list, push, dxr_inputs);
+  bvh::EndGpuTimer(cmd_list, &data.timer);
+  if (!dxr_traced) {
+    if (lamps_run) {
+      table_nulls.push_back({data.lamp_type_pipeline.srv_table, 0, 0, kRtgiLampTypeSrvCount, kSrv, table_null_views});
+      table_nulls.push_back({data.lamp_type_pipeline.uav_table, 0, 0, kRtgiLampTypeUavCount, kUav, table_null_views});
+    }
+    device->update_descriptor_tables(static_cast<uint32_t>(table_nulls.size()), table_nulls.data());
+    return {.dxr_unavailable = true};
+  }
+#endif
+
   const RtgiDenoiseResult denoised = DispatchRtgiDenoise(
       device, cmd_list, &data.denoise,
       {.raw_view = data.raw.srv[0],
@@ -627,6 +678,7 @@ struct RtgiJsonInput {
   uint64_t generated_frame;
   bool perf_gather;
   const CameraSnapshot* camera = nullptr;
+  const rt12::Rt12RtgiPanel* dxr = nullptr;
 };
 
 inline void WriteVec3Json(std::ostream& out, const float* v) {
@@ -646,6 +698,19 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "  \"reason\": \"" << ReasonName(f.reason) << "\",\n";
   out << "  \"producing\": " << (f.producing ? "true" : "false") << ",\n";
   out << "  \"gpu_ms\": " << f.gpu_ms << ",\n";
+  if (in.dxr != nullptr) {
+    const rt12::Rt12RtgiPanel& d = *in.dxr;
+    const double gpu_avg = d.gpu_ms_n != 0u ? d.gpu_ms_sum / static_cast<double>(d.gpu_ms_n) : 0.0;
+    const double trace_avg = d.trace_ms_n != 0u ? d.trace_ms_sum / static_cast<double>(d.trace_ms_n) : 0.0;
+    out << "  \"dxr\": {\"reason\": \"" << rt12::Rt12RtgiReasonName(d.reason) << "\", \"traced_frames\": "
+        << d.frames[static_cast<uint32_t>(rt12::Rt12RtgiReason::Tracing)] << ", \"frames_by_reason\": {";
+    for (uint32_t r = 0u; r < rt12::kRt12RtgiReasonCount; ++r) {
+      out << (r == 0u ? "" : ", ") << "\"" << rt12::Rt12RtgiReasonName(static_cast<rt12::Rt12RtgiReason>(r)) << "\": " << d.frames[r];
+    }
+    out << "}, \"waits\": " << d.waits << ", \"wait_ms_max\": " << d.wait_ms_max << ", \"characters\": " << d.characters
+        << ", \"gpu_ms\": {\"last\": " << d.gpu_ms << ", \"avg\": " << gpu_avg << "}, \"trace_ms\": {\"last\": " << d.trace_ms
+        << ", \"avg\": " << trace_avg << "}},\n";
+  }
   out << "  \"trace\": {\"divisor\": " << f.divisor << ", \"width\": " << f.trace_width
       << ", \"height\": " << f.trace_height << ", \"full_width\": " << f.full_width
       << ", \"full_height\": " << f.full_height << "},\n";
@@ -769,12 +834,18 @@ inline void MaybeCaptureRtgiStats(reshade::api::device* device, reshade::api::co
     std::lock_guard<std::mutex> lock(g_state.mutex);
     camera = g_state.camera;
   }
+  rt12::Rt12RtgiPanel dxr;
+  {
+    std::lock_guard<std::mutex> lock(rt12::g_rt12_rtgi_panel_mutex);
+    dxr = rt12::g_rt12_rtgi_panel;
+  }
   const RtgiJsonInput in = {
       .frame = &g_rtgi_frame,
       .values = g_rtgi_stats.values,
       .generated_frame = g_state.frame.load(),
       .perf_gather = bvh::g_perf_gate.gather.load(std::memory_order_relaxed),
       .camera = &camera,
+      .dxr = &dxr,
   };
   std::string text = BuildRtgiJson(in);
   renodx::utils::path::WriteTextFile(bvh::PoolOutputDir() / "world_rtgi.json", text);

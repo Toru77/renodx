@@ -48,3 +48,11 @@ float LampSpotCone(LightParam lamp, float3 lamp_dir)
 {
     return max(0.0, 1.0 - pow((1.0 - max(0.0, dot(lamp_dir, lamp.vec))) * lamp.spotAngleInv, lamp.attenuationAngle));
 }
+
+// The game's DeferredParam (144 bytes). Only dynamicLightIntensity (byte offset 76 = .w of mid) is read.
+struct GameDeferredParam
+{
+    float4 head[4];
+    float4 mid;
+    float4 tail[4];
+};

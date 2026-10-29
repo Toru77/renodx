@@ -387,6 +387,10 @@ inline void OnWorldPresentBvh(
       std::lock_guard<std::mutex> lock(rt12::g_gc_panel_mutex);
       extra.gc_blas_ms = rt12::g_gc_panel.build_ms_sum;
     }
+    {
+      std::lock_guard<std::mutex> lock(rt12::g_rt12_rtgi_panel_mutex);
+      extra.dxr_rtgi_ms = rt12::g_rt12_rtgi_panel.gpu_ms_sum;
+    }
   }
   const auto present_time = SamplePerfPresent(device, extra);
   UpdateLiveBvh(device, queue);
