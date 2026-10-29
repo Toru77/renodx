@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <iomanip>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -628,6 +629,7 @@ static bool MotionBlurActive(bool cutscene) {
 // game's depth and motion textures actually match the tonemap's resolution.
 static float g_mb_logging = 1.f;
 static bool MotionBlurLogEnabled() { return g_mb_logging > 0.5f; }
+static float g_capture_perf_log = 0.f;
 
 // -- Motion blur quality preset ------------------------------------------------
 // Replaces the raw Max Samples slider. The slider's useful range was narrow, the
@@ -2855,6 +2857,13 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Writes motion blur diagnostics to the ReShade log: the frame rate scale, which chain stage is running, a one-time report of the colour, motion and depth buffer sizes, and any reason the effect could not run. Turn it off to keep the log quiet. The effect itself is not affected either way.",
       .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CapturePerfLog", .binding = &g_capture_perf_log,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Capture Hook Timing", .section = "Motion Blur",
+      .tooltip = "Logs the CPU time of the push-descriptor capture hook once per second (DevKit not loaded only). No rendering change.",
+      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode() && !falcom_world::g_state.supported; },
     },
     new renodx::utils::settings::Setting{      .key = "MotionBlurCameraCutThreshold", .binding = &shader_injection.mb_camera_cut_px,
       .default_value = 360.f, .label = "Camera Cut Threshold", .section = "Motion Blur",
@@ -6352,6 +6361,41 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
   d->frame_index++;
+  {
+    static uint64_t s_cap_frames = 0u;
+    static std::chrono::steady_clock::time_point s_cap_window{};
+    if (!falcom_world::g_state.supported) {
+      const bool want = g_capture_perf_log > 0.5f && IsMotionBlurGame() && IsAdvancedSettingsMode();
+      auto& gate = falcom_world::bvh::g_perf_gate;
+      const auto now = std::chrono::steady_clock::now();
+      if (gate.gather.load(std::memory_order_relaxed) != want) {
+        gate.gather.store(want, std::memory_order_relaxed);
+        gate.block_us[falcom_world::bvh::kPerfBlockCaptureHook].exchange(0u);
+        gate.capture_calls.exchange(0u);
+        gate.capture_b0_calls.exchange(0u);
+        s_cap_frames = 0u;
+        s_cap_window = now;
+      }
+      if (want) {
+        s_cap_frames++;
+        const double elapsed = std::chrono::duration<double>(now - s_cap_window).count();
+        if (elapsed >= 1.0) {
+          const uint64_t frames = s_cap_frames;
+          const uint64_t hook_ns = gate.block_us[falcom_world::bvh::kPerfBlockCaptureHook].exchange(0u);
+          const uint64_t calls = gate.capture_calls.exchange(0u);
+          const uint64_t b0_calls = gate.capture_b0_calls.exchange(0u);
+          std::ostringstream msg;
+          msg << "[CapturePerf] fps=" << std::fixed << std::setprecision(1) << frames / elapsed
+              << " hook_ms_per_frame=" << std::setprecision(3) << hook_ns / 1e6 / frames
+              << " calls_per_frame=" << calls / frames
+              << " b0_per_frame=" << b0_calls / frames;
+          reshade::log::message(reshade::log::level::info, msg.str().c_str());
+          s_cap_frames = 0u;
+          s_cap_window = now;
+        }
+      }
+    }
+  }
   // RTV4 re-arm budget is per frame; a rejected candidate may be retried a few
   // times, but never across a frame boundary.
   d->mb_rtv4_rejects = 0u;
