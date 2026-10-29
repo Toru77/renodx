@@ -133,6 +133,7 @@ inline constexpr uint32_t kPoolMaxIndirectSubDraws = 64u;
 inline constexpr uint32_t kPoolMaxRejectSamples = 2u;       // per family, for the dump
 inline constexpr size_t kPoolMaxNearIndex = 500000u;
 inline constexpr uint64_t kPoolMeshSlotBytes = 4ull * 1024ull * 1024ull;  // mesh copies per slot (frame)
+inline constexpr uint64_t kPoolMeshGuardBytes = 4096u;  // start of each mesh slot left unused (staging guard)
 inline constexpr uint32_t kPoolPoisonWord = 0xFFC0DEADu;  // poison_staging: what a read leaves in the mesh staging
 inline constexpr uint64_t kPoolResidueCycles = 2u;        // poison_staging: cycles of heads kept per slot
 inline constexpr uint32_t kPoolMeshCopiesPerFrame = 64u;
@@ -1155,6 +1156,8 @@ struct PoolStats {
   uint64_t mesh_vertex_copies = 0u;  // vertex ranges copied
   uint64_t mesh_copy_bytes = 0u;
   uint32_t mesh_budget_full = 0u;    // copies postponed: the frame's mesh staging was full
+  uint32_t mesh_guard_hits = 0u;    // resolves whose guard held non-poison words (poison_staging)
+  PoolStagingDiag mesh_guard_last;  // the last such guard: slot, words written, first 48 bytes
   uint32_t mesh_dropped = 0u;        // copies read after their mesh was released or re-queued
   uint32_t mesh_expired = 0u;        // requests not drawn for kPoolPruneAge frames
   uint64_t mesh_deferred_skips = 0u; // draws on a deferred context that could have served a copy
@@ -3869,7 +3872,7 @@ inline uint32_t ReservePoolMeshCopies(
       FailPoolMesh(request_it, error);
       continue;
     }
-    const uint64_t offset = (slot.mesh_used + 15u) & ~uint64_t{15};
+    const uint64_t offset = (std::max)((slot.mesh_used + 15u) & ~uint64_t{15}, kPoolMeshGuardBytes);
     if (offset + (aligned_end - aligned_begin) > kPoolMeshSlotBytes) {
       g_pool.stats.mesh_budget_full += 1u;
       break;
@@ -5662,6 +5665,8 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
   // Mesh copies are decoded straight from the mapped staging.
   stage.Set("present: resolve (decode meshes)");
   const bool poison = g_pool.poison_staging.load(std::memory_order_relaxed);
+  PoolStagingDiag guard;
+  bool guard_hit = false;
   void* mesh_mapped = nullptr;
   const bool meshes_ok = jobs.empty()
                          || (mesh_buffer.handle != 0u && mesh_used != 0u
@@ -5671,6 +5676,20 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
   if (meshes_ok && !jobs.empty()) {
     const PoolCpuTimer cpu_timer{&g_pool.cpu_capture_us};
     const auto* bytes = static_cast<const uint8_t*>(mesh_mapped);
+    if (poison) {
+      guard.slot = slot_index;
+      guard.staging_offset = 0u;
+      guard.copied = kPoolMeshGuardBytes;
+      guard.head_bytes = 48u;
+      std::memcpy(guard.head, bytes, 48u);
+      for (uint64_t w = 0u; w < kPoolMeshGuardBytes / 4u; ++w) {
+        uint32_t word = 0u;
+        std::memcpy(&word, bytes + 4u * w, sizeof(word));
+        if (word != kPoolPoisonWord) guard.sentinel_words += 1u;
+      }
+      guard_hit = guard.sentinel_words != 0u;
+      guard.head_class = "guard";
+    }
     for (PoolMeshJob& job : jobs) {
       if (!job.queued) continue;
       const uint8_t* data = bytes + job.copy.staging_offset + job.copy.skip;
@@ -5738,6 +5757,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     slot.used = 0u;
     slot.follow_used = 0u;
     slot.mesh_used = 0u;
+    if (guard_hit) { g_pool.stats.mesh_guard_hits += 1u; g_pool.stats.mesh_guard_last = guard; }
 
     g_pool.resolve_camera_valid = camera.valid;
     std::memcpy(g_pool.resolve_camera, camera.position, sizeof(g_pool.resolve_camera));
@@ -7679,7 +7699,10 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"mesh_vertex_copies\": " << stats.mesh_vertex_copies
       << ", \"mesh_copy_bytes\": " << stats.mesh_copy_bytes
       << ", \"mesh_budget_full\": " << stats.mesh_budget_full
-      << ", \"mesh_dropped\": " << stats.mesh_dropped
+      << ", \"mesh_guard_hits\": " << stats.mesh_guard_hits
+      << ", \"mesh_guard_last\": ";
+  WritePoolStagingDiag(out, stats.mesh_guard_last);
+  out << ", \"mesh_dropped\": " << stats.mesh_dropped
       << ", \"mesh_expired\": " << stats.mesh_expired
       << ", \"mesh_deferred_skips\": " << stats.mesh_deferred_skips
       << ", \"mesh_failures\": " << stats.mesh_failures
