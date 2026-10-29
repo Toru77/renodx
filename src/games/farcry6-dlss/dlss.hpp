@@ -118,6 +118,7 @@ static constexpr uint32_t kTaaPauseHash = 0x4AD8172Au;
 static constexpr uint32_t kSceneUpscaleHash = 0x944489F5u;
 static constexpr uint32_t kMotionProducerHash = 0xD9289B6Au;
 static constexpr uint32_t kHdrOutputHash = 0x62A8D0C3u;
+static constexpr uint32_t kScRgbOutputHash = 0x6439E80Au;
 static constexpr uint32_t kSdrOutputHash = 0x6A24E345u;
 
 static constexpr uint32_t kTrackedTableCount = 32u;
@@ -132,7 +133,7 @@ static constexpr uint32_t kSlotCbv = 0u;       // b0: TAA knobs
 
 // ── Settings (written by the settings system in addon.cpp) ──
 inline float dlss_enabled = 1.f;
-inline float dlss_rcas_strength = 0.f;
+inline float dlss_rcas_strength = 0.5f;
 inline float upscaler_type = 0.f;  // 0 = DLSS, 1 = FSR
 inline float fsr_version = 1.f;
 inline float fsr_descriptor_guard = 0.f;
@@ -140,9 +141,9 @@ inline thread_local bool fsr_runtime_descriptor_guard = false;
 // 0=Auto, 1=DLAA, 2=Quality, 3=Balanced, 4=Performance, 5=UltraPerformance
 inline float dlss_mode = 0.f;
 // 0=Default, 1=F, 2=J, 3=K, 4=L, 5=M
-inline float dlss_render_preset = 0.f;
+inline float dlss_render_preset = 3.f;
 // 0=Zero, 1=read the jitter the game applies (not wired yet: still zero)
-inline float dlss_jitter_source = 0.f;
+inline float dlss_jitter_source = 3.f;
 // What feeds NGX as depth, for isolating a rendering fault:
 //   0 = Scene depth   the game's own depth buffer, identified by how it is bound
 //   1 = t5 mask       the TAA anti-ghosting mask, which is not depth
@@ -156,11 +157,11 @@ inline float dlss_motion_source = 0.f;
 // Writes a known-good image through the same output plumbing with NGX not
 // involved at all, so artifacts that survive this are ours and not DLSS's.
 inline float dlss_bypass_ngx = 0.f;
-inline float dlss_motion_vectors_jittered = 1.f;
-inline float dlss_depth_inverted = 0.f;
+inline float dlss_motion_vectors_jittered = 0.f;
+inline float dlss_depth_inverted = 1.f;
 // Declares the colour input as HDR, i.e. as values above 1.0. Off preserves the
 // behaviour of every previous build; A/B it rather than assume.
-inline float dlss_flag_is_hdr = 0.f;
+inline float dlss_flag_is_hdr = 1.f;
 // Re-applies the game's descriptor heaps and root signature after each NGX
 // evaluation. NGX dispatches on the native command list, behind ReShade's hooks,
 // and the descriptor heap binding is the piece of state it cannot avoid
@@ -187,8 +188,8 @@ inline float dlss_debug_logging = 0.f;
 inline float fsr_debug_logging = 0.f;
 inline float dlss_cpu_timing = 0.f;
 inline float dlss_detailed_diagnostics = 0.f;
-inline float fg_bootstrap_test = 0.f;
-inline float fg_input_test = 0.f;
+inline float fg_bootstrap_test = 1.f;
+inline float fg_input_test = 1.f;
 inline float fg_multiplier_setting = 0.f;  // 0=off, 1..5=generated frames
 inline std::atomic<bool> fg_enable_requested{false};
 inline std::atomic<uint32_t> fg_requested_generated{0u};
@@ -2220,9 +2221,9 @@ struct CameraBuilderTest {
   uint32_t last_frame = 0u;
 };
 inline CameraBuilderTest camera_builder_test;
-inline float dlss_halton_jitter = 0.f;
-inline float dlss_halton_motion_offsets = 0.f;
-inline float dlss_first_person_halton = 0.f;
+inline float dlss_halton_jitter = 1.f;
+inline float dlss_halton_motion_offsets = 1.f;
+inline float dlss_first_person_halton = 1.f;
 inline std::atomic<bool> camera_builder_motion_offsets_enabled{false};
 inline std::atomic<bool> camera_builder_halton_enabled{false};
 inline std::atomic<uint64_t> camera_builder_frame{0u};
@@ -3183,7 +3184,9 @@ inline bool ResolveSlot(
     if (!ReadSlotFingerprint(device, table, bindings[k], key)) continue;
     RecordedDescriptor record;
     const bool resolved = LookupFingerprint(key, record);
-    RecordProbe(device, probe_index, key, resolved ? &record : nullptr, resolved);
+    if (dlss_detailed_diagnostics != 0.f) {
+      RecordProbe(device, probe_index, key, resolved ? &record : nullptr, resolved);
+    }
     if (!resolved) {
       stat_fingerprint_misses.fetch_add(1u, std::memory_order_relaxed);
       continue;
@@ -3305,7 +3308,7 @@ inline NgxLog ngx_log;
 
 inline void NVSDK_CONV OnNgxLog(
     const char* message, NVSDK_NGX_Logging_Level level, NVSDK_NGX_Feature /*source*/) {
-  if (message == nullptr) return;
+  if (message == nullptr || dlss_debug_logging == 0.f) return;
   std::string text(message);
   if (text.size() > 200u) text.resize(200u);
   const std::lock_guard<std::mutex> lock(ngx_log.mutex);
@@ -7582,148 +7585,155 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
     const auto output_space = fg_output_color_space.load(std::memory_order_relaxed);
     const bool is_sdr = output_space == reshade::api::color_space::srgb_nonlinear;
     const bool is_hdr10 = output_space == reshade::api::color_space::hdr10_st2084;
+    const bool is_scrgb = output_space == reshade::api::color_space::extended_srgb_linear
+                       && fg_output_format.load(std::memory_order_relaxed) == static_cast<uint32_t>(reshade::api::format::r16g16b16a16_float);
     bool input_ready = false;
     {
       const std::lock_guard<std::mutex> lock(fg_camera_sample_mutex);
       const auto& evaluation = fg_camera_evaluations[frame % fg_camera_evaluations.size()];
       input_ready = evaluation.frame == frame && evaluation.token != nullptr && evaluation.input_list == cmd_list;
     }
-    if (input_ready && (is_sdr || (is_hdr10 && brightness_frame != UINT64_MAX
+    if (input_ready && (is_sdr || ((is_hdr10 || is_scrgb) && brightness_frame != UINT64_MAX
         && (brightness_frame == frame || brightness_frame + 1u == frame) && std::isfinite(brightness) && brightness > 0.f))) {
       std::unique_lock lock(fg_hudless.mutex, std::try_to_lock);
       if (lock.owns_lock()) {
         auto* device = cmd_list->get_device();
-        if (fg_hudless.device == nullptr) fg_hudless.device = device;
-        if (fg_hudless.device == device && !fg_hudless.pipeline_attempted) {
-          fg_hudless.pipeline_attempted = true;
-          fg_hudless_slots_allocated.store(true, std::memory_order_release);
-          D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {};
-          format_support.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-          auto* native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
-          const bool packed_supported = native_device != nullptr
-              && SUCCEEDED(native_device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &format_support, sizeof(format_support)))
-              && (format_support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0u
-              && (format_support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0u;
-          fg_hudless.output_format = (packed_supported ? reshade::api::format::r10g10b10a2_unorm
-                                                       : reshade::api::format::r16g16b16a16_float);
-          fg_hudless.slot_limit = (packed_supported ? 12u : 6u);
-          using DS = reshade::api::shader_stage;
-          using DT = reshade::api::descriptor_type;
-          using PT = reshade::api::pipeline_layout_param_type;
-          reshade::api::descriptor_range srv = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_shader_resource_view};
-          reshade::api::descriptor_range uav = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};
-          reshade::api::constant_range constants = {};
-          constants.count = 3u;
-          constants.visibility = DS::all_compute;
-          reshade::api::pipeline_layout_param params[3] = {};
-          params[0].type = PT::descriptor_table;
-          params[0].descriptor_table = {1u, &srv};
-          params[1].type = PT::descriptor_table;
-          params[1].descriptor_table = {1u, &uav};
-          params[2].type = PT::push_constants;
-          params[2].push_constants = constants;
-          if (device->create_pipeline_layout(3u, params, &fg_hudless.layout)) {
-            reshade::api::shader_desc shader = {};
-            shader.code = __fg_hdr10_convert.data();
-            shader.code_size = __fg_hdr10_convert.size();
-            shader.entry_point = "main";
-            const reshade::api::pipeline_subobject subobject = {reshade::api::pipeline_subobject_type::compute_shader, 1u, &shader};
-            (void)device->create_pipeline(fg_hudless.layout, 1u, &subobject, &fg_hudless.pipeline);
-          }
-        }
-        uint32_t slot_index = UINT32_MAX;
-        if (fg_hudless.device == device && fg_hudless.pipeline.handle != 0u) {
-          std::shared_lock retirement_lock(gpu_retirement.mutex);
-          for (uint32_t i = 0u; i < fg_hudless.slot_limit; ++i) {
-            if (!fg_hudless.slots[i].ticket || fg_hudless.slots[i].ticket->complete) {
-              if (fg_hudless.slots[i].ticket) {
-                fg_completed_input_on_gpu.store(true, std::memory_order_release);
-              }
-              slot_index = i;
-              break;
-            }
-          }
-        }
-        if (slot_index != UINT32_MAX) {
-          auto& slot = fg_hudless.slots[slot_index];
-          slot.ticket.reset();
-          if (slot.source != reinterpret_cast<uint64_t>(source) && slot.source_view.handle) {
-            device->destroy_resource_view(slot.source_view);
-            slot.source_view = {};
-            slot.source = 0u;
-          }
-          if ((slot.width != src.Width || slot.height != src.Height) && slot.texture.handle) {
-            if (slot.target_view.handle) device->destroy_resource_view(slot.target_view);
-            device->destroy_resource(slot.texture);
-            slot.target_view = {};
-            slot.texture = {};
-            slot.width = slot.height = 0u;
-          }
-          const reshade::api::resource_view_desc source_view_desc(
-              reshade::api::resource_view_type::texture_2d, reshade::api::format::r16g16b16a16_float, 0u, 1u, 0u, 1u);
-          const reshade::api::resource_view_desc target_view_desc(
-              reshade::api::resource_view_type::texture_2d, fg_hudless.output_format, 0u, 1u, 0u, 1u);
-          if (slot.source_view.handle == 0u
-              && device->create_resource_view(reshade::api::resource{reinterpret_cast<uint64_t>(source)},
-                                              reshade::api::resource_usage::shader_resource, source_view_desc, &slot.source_view)) {
-            slot.source = reinterpret_cast<uint64_t>(source);
-          }
-          if (slot.texture.handle == 0u) {
-            reshade::api::resource_desc resource_desc = {};
-            resource_desc.type = reshade::api::resource_type::texture_2d;
-            resource_desc.texture = {static_cast<uint32_t>(src.Width), src.Height, 1u, 1u, fg_hudless.output_format, 1u};
-            resource_desc.heap = reshade::api::memory_heap::gpu_only;
-            resource_desc.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
-            if (device->create_resource(resource_desc, nullptr, reshade::api::resource_usage::shader_resource, &slot.texture)) {
-              slot.width = static_cast<uint32_t>(src.Width);
-              slot.height = src.Height;
-            }
-          }
-          if (slot.texture.handle && slot.target_view.handle == 0u) {
-            (void)device->create_resource_view(slot.texture, reshade::api::resource_usage::unordered_access, target_view_desc, &slot.target_view);
-          }
-          for (uint32_t i = 0u; i < 2u; ++i) {
-            if (slot.tables[i].handle == 0u) (void)device->allocate_descriptor_table(fg_hudless.layout, i, &slot.tables[i]);
-          }
-          if (slot.source_view.handle || slot.target_view.handle || slot.texture.handle
-              || slot.tables[0].handle || slot.tables[1].handle) {
+        if (is_scrgb && fg_hudless.pipeline_attempted
+            && fg_hudless.output_format != reshade::api::format::r16g16b16a16_float) {
+          fg_hudless_retire_requested.store(true, std::memory_order_release);
+        } else {
+          if (fg_hudless.device == nullptr) fg_hudless.device = device;
+          if (fg_hudless.device == device && !fg_hudless.pipeline_attempted) {
+            fg_hudless.pipeline_attempted = true;
             fg_hudless_slots_allocated.store(true, std::memory_order_release);
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {};
+            format_support.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+            auto* native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+            const bool packed_supported = !is_scrgb && native_device != nullptr
+                && SUCCEEDED(native_device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &format_support, sizeof(format_support)))
+                && (format_support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0u
+                && (format_support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0u;
+            fg_hudless.output_format = (packed_supported ? reshade::api::format::r10g10b10a2_unorm
+                                                         : reshade::api::format::r16g16b16a16_float);
+            fg_hudless.slot_limit = (packed_supported ? 12u : 6u);
+            using DS = reshade::api::shader_stage;
+            using DT = reshade::api::descriptor_type;
+            using PT = reshade::api::pipeline_layout_param_type;
+            reshade::api::descriptor_range srv = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_shader_resource_view};
+            reshade::api::descriptor_range uav = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};
+            reshade::api::constant_range constants = {};
+            constants.count = 3u;
+            constants.visibility = DS::all_compute;
+            reshade::api::pipeline_layout_param params[3] = {};
+            params[0].type = PT::descriptor_table;
+            params[0].descriptor_table = {1u, &srv};
+            params[1].type = PT::descriptor_table;
+            params[1].descriptor_table = {1u, &uav};
+            params[2].type = PT::push_constants;
+            params[2].push_constants = constants;
+            if (device->create_pipeline_layout(3u, params, &fg_hudless.layout)) {
+              reshade::api::shader_desc shader = {};
+              shader.code = __fg_hdr10_convert.data();
+              shader.code_size = __fg_hdr10_convert.size();
+              shader.entry_point = "main";
+              const reshade::api::pipeline_subobject subobject = {reshade::api::pipeline_subobject_type::compute_shader, 1u, &shader};
+              (void)device->create_pipeline(fg_hudless.layout, 1u, &subobject, &fg_hudless.pipeline);
+            }
           }
-          if (slot.source_view.handle && slot.target_view.handle && slot.tables[0].handle && slot.tables[1].handle) {
-            const reshade::api::descriptor_table_update updates[] = {
-                {slot.tables[0], 0u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.source_view},
-                {slot.tables[1], 0u, 0u, 1u, reshade::api::descriptor_type::texture_unordered_access_view, &slot.target_view},
-            };
-            device->update_descriptor_tables(2u, updates);
-            const auto stage = reshade::api::shader_stage::all_compute;
-            cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, fg_hudless.pipeline);
-            cmd_list->bind_descriptor_tables(stage, fg_hudless.layout, 0u, 2u, slot.tables);
-            const struct { uint32_t width, height; float brightness; } constants = {slot.width, slot.height, is_sdr ? 0.f : brightness};
-            cmd_list->push_constants(stage, fg_hudless.layout, 2u, 0u, 3u, &constants);
-            const reshade::api::resource source_resource{reinterpret_cast<uint64_t>(source)};
-            cmd_list->barrier(source_resource, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource_non_pixel);
-            cmd_list->barrier(slot.texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
-            cmd_list->dispatch((slot.width + 7u) / 8u, (slot.height + 7u) / 8u, 1u);
-            cmd_list->barrier(slot.texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
-            cmd_list->barrier(source_resource, reshade::api::resource_usage::shader_resource_non_pixel, reshade::api::resource_usage::unordered_access);
-            RestoreGameDescriptorState(cmd_list);
-            slot.ticket = RetireGpuCommands(cmd_list);
-            const std::lock_guard<std::mutex> sample_lock(fg_camera_sample_mutex);
-            auto& evaluation = fg_camera_evaluations[frame % fg_camera_evaluations.size()];
-            if (evaluation.frame == frame && evaluation.input_list == cmd_list) {
-              evaluation.hdr_slot = slot_index;
-              evaluation.hdr_brightness = (is_sdr ? 0.f : brightness);
-              evaluation.output_color_space = output_space;
-              evaluation.scene_output = reinterpret_cast<uint64_t>(target);
-              fg_hudless_converted.fetch_add(1u, std::memory_order_relaxed);
+          uint32_t slot_index = UINT32_MAX;
+          if (fg_hudless.device == device && fg_hudless.pipeline.handle != 0u) {
+            std::shared_lock retirement_lock(gpu_retirement.mutex);
+            for (uint32_t i = 0u; i < fg_hudless.slot_limit; ++i) {
+              if (!fg_hudless.slots[i].ticket || fg_hudless.slots[i].ticket->complete) {
+                if (fg_hudless.slots[i].ticket) {
+                  fg_completed_input_on_gpu.store(true, std::memory_order_release);
+                }
+                slot_index = i;
+                break;
+              }
+            }
+          }
+          if (slot_index != UINT32_MAX) {
+            auto& slot = fg_hudless.slots[slot_index];
+            slot.ticket.reset();
+            if (slot.source != reinterpret_cast<uint64_t>(source) && slot.source_view.handle) {
+              device->destroy_resource_view(slot.source_view);
+              slot.source_view = {};
+              slot.source = 0u;
+            }
+            if ((slot.width != src.Width || slot.height != src.Height) && slot.texture.handle) {
+              if (slot.target_view.handle) device->destroy_resource_view(slot.target_view);
+              device->destroy_resource(slot.texture);
+              slot.target_view = {};
+              slot.texture = {};
+              slot.width = slot.height = 0u;
+            }
+            const reshade::api::resource_view_desc source_view_desc(
+                reshade::api::resource_view_type::texture_2d, reshade::api::format::r16g16b16a16_float, 0u, 1u, 0u, 1u);
+            const reshade::api::resource_view_desc target_view_desc(
+                reshade::api::resource_view_type::texture_2d, fg_hudless.output_format, 0u, 1u, 0u, 1u);
+            if (slot.source_view.handle == 0u
+                && device->create_resource_view(reshade::api::resource{reinterpret_cast<uint64_t>(source)},
+                                                reshade::api::resource_usage::shader_resource, source_view_desc, &slot.source_view)) {
+              slot.source = reinterpret_cast<uint64_t>(source);
+            }
+            if (slot.texture.handle == 0u) {
+              reshade::api::resource_desc resource_desc = {};
+              resource_desc.type = reshade::api::resource_type::texture_2d;
+              resource_desc.texture = {static_cast<uint32_t>(src.Width), src.Height, 1u, 1u, fg_hudless.output_format, 1u};
+              resource_desc.heap = reshade::api::memory_heap::gpu_only;
+              resource_desc.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+              if (device->create_resource(resource_desc, nullptr, reshade::api::resource_usage::shader_resource, &slot.texture)) {
+                slot.width = static_cast<uint32_t>(src.Width);
+                slot.height = src.Height;
+              }
+            }
+            if (slot.texture.handle && slot.target_view.handle == 0u) {
+              (void)device->create_resource_view(slot.texture, reshade::api::resource_usage::unordered_access, target_view_desc, &slot.target_view);
+            }
+            for (uint32_t i = 0u; i < 2u; ++i) {
+              if (slot.tables[i].handle == 0u) (void)device->allocate_descriptor_table(fg_hudless.layout, i, &slot.tables[i]);
+            }
+            if (slot.source_view.handle || slot.target_view.handle || slot.texture.handle
+                || slot.tables[0].handle || slot.tables[1].handle) {
+              fg_hudless_slots_allocated.store(true, std::memory_order_release);
+            }
+            if (slot.source_view.handle && slot.target_view.handle && slot.tables[0].handle && slot.tables[1].handle) {
+              const reshade::api::descriptor_table_update updates[] = {
+                  {slot.tables[0], 0u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.source_view},
+                  {slot.tables[1], 0u, 0u, 1u, reshade::api::descriptor_type::texture_unordered_access_view, &slot.target_view},
+              };
+              device->update_descriptor_tables(2u, updates);
+              const auto stage = reshade::api::shader_stage::all_compute;
+              cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, fg_hudless.pipeline);
+              cmd_list->bind_descriptor_tables(stage, fg_hudless.layout, 0u, 2u, slot.tables);
+              const struct { uint32_t width, height; float brightness; } constants = {slot.width, slot.height, is_sdr ? 0.f : (is_scrgb ? -brightness : brightness)};
+              cmd_list->push_constants(stage, fg_hudless.layout, 2u, 0u, 3u, &constants);
+              const reshade::api::resource source_resource{reinterpret_cast<uint64_t>(source)};
+              cmd_list->barrier(source_resource, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource_non_pixel);
+              cmd_list->barrier(slot.texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+              cmd_list->dispatch((slot.width + 7u) / 8u, (slot.height + 7u) / 8u, 1u);
+              cmd_list->barrier(slot.texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+              cmd_list->barrier(source_resource, reshade::api::resource_usage::shader_resource_non_pixel, reshade::api::resource_usage::unordered_access);
+              RestoreGameDescriptorState(cmd_list);
+              slot.ticket = RetireGpuCommands(cmd_list);
+              const std::lock_guard<std::mutex> sample_lock(fg_camera_sample_mutex);
+              auto& evaluation = fg_camera_evaluations[frame % fg_camera_evaluations.size()];
+              if (evaluation.frame == frame && evaluation.input_list == cmd_list) {
+                evaluation.hdr_slot = slot_index;
+                evaluation.hdr_brightness = (is_sdr ? 0.f : brightness);
+                evaluation.output_color_space = output_space;
+                evaluation.scene_output = reinterpret_cast<uint64_t>(target);
+                fg_hudless_converted.fetch_add(1u, std::memory_order_relaxed);
+              }
+            } else {
+              fg_hudless_rejected.fetch_add(1u, std::memory_order_relaxed);
             }
           } else {
-            fg_hudless_rejected.fetch_add(1u, std::memory_order_relaxed);
-          }
-        } else {
-          fg_hudless_busy.fetch_add(1u, std::memory_order_relaxed);
-          if (fg_hudless.device == device && fg_hudless.pipeline.handle != 0u) {
-            fg_hudless_no_slot.fetch_add(1u, std::memory_order_relaxed);
+            fg_hudless_busy.fetch_add(1u, std::memory_order_relaxed);
+            if (fg_hudless.device == device && fg_hudless.pipeline.handle != 0u) {
+              fg_hudless_no_slot.fetch_add(1u, std::memory_order_relaxed);
+            }
           }
         }
       } else {
@@ -7879,11 +7889,13 @@ inline void TagFgHudless(reshade::api::command_list* cmd_list, uint32_t output_h
   }
   const bool is_sdr = evaluation.output_color_space == reshade::api::color_space::srgb_nonlinear;
   const bool is_hdr10 = evaluation.output_color_space == reshade::api::color_space::hdr10_st2084;
+  const bool is_scrgb = evaluation.output_color_space == reshade::api::color_space::extended_srgb_linear;
   if (evaluation.frame != frame || evaluation.token == nullptr || evaluation.input_list != cmd_list
       || evaluation.hdr_slot >= fg_hudless.slots.size() || evaluation.hudless_tagged
       || evaluation.output_color_space != fg_output_color_space.load(std::memory_order_relaxed)
-      || (!is_sdr && !is_hdr10) || (is_sdr && output_hash != kSdrOutputHash)
-      || (is_hdr10 && (output_hash != kHdrOutputHash || fg_hdr_parameter_frame.load(std::memory_order_acquire) != frame
+      || (!is_sdr && !is_hdr10 && !is_scrgb) || (is_sdr && output_hash != kSdrOutputHash)
+      || ((is_hdr10 || is_scrgb) && ((is_hdr10 ? output_hash != kHdrOutputHash : output_hash != kScRgbOutputHash)
+                       || fg_hdr_parameter_frame.load(std::memory_order_acquire) != frame
                        || fg_hdr_brightness.load(std::memory_order_relaxed) != evaluation.hdr_brightness))) {
     fg_hudless_rejected.fetch_add(1u, std::memory_order_relaxed);
     return;
@@ -7938,7 +7950,7 @@ inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uin
   CommandListData* data = nullptr;
   uint32_t hash = 0u;
   if (!CheckTaaDraw(cmd_list, data, hash)) {
-    if (hash == kHdrOutputHash && fg_camera_capture_enabled.load(std::memory_order_acquire)) {
+    if ((hash == kHdrOutputHash || hash == kScRgbOutputHash) && fg_camera_capture_enabled.load(std::memory_order_acquire)) {
       CaptureFgHdrOutputParameters(cmd_list);
       TagFgHudless(cmd_list, hash);
     } else if (hash == kSdrOutputHash && fg_camera_capture_enabled.load(std::memory_order_acquire)) {
@@ -7981,7 +7993,7 @@ inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32
   CommandListData* data = nullptr;
   uint32_t hash = 0u;
   if (!CheckTaaDraw(cmd_list, data, hash)) {
-    if (hash == kHdrOutputHash && fg_camera_capture_enabled.load(std::memory_order_acquire)) {
+    if ((hash == kHdrOutputHash || hash == kScRgbOutputHash) && fg_camera_capture_enabled.load(std::memory_order_acquire)) {
       CaptureFgHdrOutputParameters(cmd_list);
       TagFgHudless(cmd_list, hash);
     } else if (hash == kSdrOutputHash && fg_camera_capture_enabled.load(std::memory_order_acquire)) {
@@ -8412,7 +8424,7 @@ inline void OnPresent(
   scene_probe_attempts_left = kSceneProbeAttemptsPerFrame;
   scene_attempts_made = 0u;
   scene_projected_this_frame = false;
-  {
+  if (dlss_detailed_diagnostics != 0.f) {
     std::unique_lock lock(camera_coverage.mutex);
     if (camera_coverage.state == CameraCoverage::State::requested) {
       camera_coverage.entries = {};
@@ -8647,7 +8659,6 @@ inline void OnFgDestroySwapchain(reshade::api::swapchain* swapchain, bool) {
     }
   }
   if (fg_mode_report.load(std::memory_order_relaxed) != 0) {
-    fg_enable_requested.store(false, std::memory_order_release);
     fg_unsafe_transitions.fetch_add(1u, std::memory_order_relaxed);
   }
   fg_swapchain_transition.store(true, std::memory_order_release);
@@ -8665,7 +8676,6 @@ inline bool OnFgFullscreenState(reshade::api::swapchain* swapchain, bool, void*)
       || reinterpret_cast<void*>(swapchain->get_device()->get_native())
           != farcry6_dlss::streamline::bootstrap_device.load(std::memory_order_acquire)) return false;
   if (fg_mode_report.load(std::memory_order_relaxed) != 0) {
-    fg_enable_requested.store(false, std::memory_order_release);
     fg_unsafe_transitions.fetch_add(1u, std::memory_order_relaxed);
   }
   fg_camera_capture_enabled.store(false, std::memory_order_release);
@@ -8697,9 +8707,9 @@ inline void OnFgInitSwapchain(reshade::api::swapchain* swapchain, bool) {
 }
 
 inline void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) {
-  LARGE_INTEGER present_end = {};
-  QueryPerformanceCounter(&present_end);
   if (cpu_timing_enabled.load(std::memory_order_relaxed)) {
+    LARGE_INTEGER present_end = {};
+    QueryPerformanceCounter(&present_end);
     std::unique_lock lock(fg_timing.mutex);
     if (fg_timing.swapchain == swapchain && fg_timing.present_start.QuadPart > 0
         && present_end.QuadPart >= fg_timing.present_start.QuadPart) {
@@ -8847,7 +8857,7 @@ inline void OnInitDevice(reshade::api::device* device) {
       farcry6_dlss::streamline::StopBootstrap(nullptr);
     }
   }
-  const bool supported_vendor = is_nvidia || vendor_id == 0x1002 || vendor_id == 0x8086;
+  const bool supported_vendor = is_nvidia;
   {
     std::lock_guard<std::mutex> lock(device_mutex);
     if (supported_vendor && device->get_api() == reshade::api::device_api::d3d12) {

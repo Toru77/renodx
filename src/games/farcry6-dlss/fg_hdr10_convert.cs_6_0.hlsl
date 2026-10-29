@@ -1,5 +1,5 @@
-// Matches the game's SDR copy or HDR10 output pass for the HUD-less image.
-// HDR10 uses the output pass's b1 c18.y; zero selects the SDR copy.
+// Matches the game's SDR, HDR10, or scRGB output pass for the HUD-less image.
+// Brightness is positive for HDR10, negative for scRGB, and zero for SDR.
 Texture2D<float4> source : register(t0);
 RWTexture2D<float4> target : register(u0);
 
@@ -14,14 +14,20 @@ void main(uint3 id : SV_DispatchThreadID) {
 
   float3 encoded = source.Load(int3(id.xy, 0)).rgb;
   // The SDR output pass copies this image directly to an UNORM backbuffer.
-  if (output_brightness <= 0.f) {
+  if (output_brightness == 0.f) {
     target[id.xy] = float4(saturate(encoded), 1.f);
     return;
   }
+  if (output_brightness < 0.f) encoded = max(encoded, 0.f);
   float3 linear_color = float3(
       encoded.r >= 0.03928571194410324f ? pow(abs((encoded.r + 0.055f) * 0.9478673338890076f), 2.4f) : encoded.r * 0.0773801133f,
       encoded.g >= 0.03928571194410324f ? pow(abs((encoded.g + 0.055f) * 0.9478673338890076f), 2.4f) : encoded.g * 0.0773801133f,
       encoded.b >= 0.03928571194410324f ? pow(abs((encoded.b + 0.055f) * 0.9478673338890076f), 2.4f) : encoded.b * 0.0773801133f);
+
+  if (output_brightness < 0.f) {
+    target[id.xy] = float4(linear_color * (-output_brightness * 2.f / 80.f), 1.f);
+    return;
+  }
 
   linear_color *= output_brightness * 0.0002f;
   float3 intermediate = float3(
