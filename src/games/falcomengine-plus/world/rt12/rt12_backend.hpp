@@ -951,7 +951,7 @@ inline bool SubmitPresent(Rt12State& s, const bvh::BvhDeviceData* data, const st
   for (uint32_t a = 0u; a < 3u; ++a) {
     Rt12Arena& arena = s.arenas[a];
     const uint64_t stride = kRt12ArenaStride[a];
-    if (needed[a] <= arena.capacity) continue;
+    if (arena.buffer && needed[a] <= arena.capacity) continue;
     const uint64_t capacity = std::max({needed[a], 2u * arena.capacity, kRt12ArenaMinBytes / stride});
     ComPtr<ID3D12Resource> buffer;
     if (FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, capacity * stride, D3D12_RESOURCE_STATE_COMMON,
