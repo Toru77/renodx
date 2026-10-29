@@ -197,6 +197,37 @@ inline uint64_t fg_last_state_query_frame = UINT64_MAX;
 inline farcry6_dlss::frame_generation::ModeState fg_mode;
 inline reshade::api::swapchain* fg_mode_swapchain = nullptr;
 inline bool fg_mode_present_outstanding = false;
+inline uint64_t fg_last_missing_hudless_ms = 0u;
+inline uint32_t fg_missing_hudless_restarts = 0u;
+inline std::atomic<bool> cpu_timing_enabled{false};
+
+struct FgTimingEvent {
+  uint64_t time_ms = 0u;
+  uint64_t frame = 0u;
+  const char* kind = nullptr;
+  uint32_t details = 0u;
+  double elapsed_ms = 0.0;
+};
+struct FgTimingDiagnostics {
+  std::shared_mutex mutex;
+  std::array<FgTimingEvent, 64> events = {};
+  uint64_t count = 0u;
+  LARGE_INTEGER present_start = {};
+  reshade::api::swapchain* swapchain = nullptr;
+  uint64_t frame = 0u;
+  int mode = 0;
+  uint64_t samples[2] = {};
+  uint64_t slow[2] = {};
+  double max_ms[2] = {};
+};
+inline FgTimingDiagnostics fg_timing;
+
+inline void RecordFgTimingEvent(const char* kind, uint64_t frame, uint32_t details, double elapsed_ms = 0.0) {
+  if (!cpu_timing_enabled.load(std::memory_order_relaxed)) return;
+  std::unique_lock lock(fg_timing.mutex);
+  fg_timing.events[fg_timing.count++ % fg_timing.events.size()] = {
+      .time_ms = GetTickCount64(), .frame = frame, .kind = kind, .details = details, .elapsed_ms = elapsed_ms};
+}
 
 inline bool SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode mode) {
   auto* set_options = farcry6_dlss::streamline::fg_set_options;
@@ -211,8 +242,6 @@ inline bool SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode mode) {
   fg_mode_changes.fetch_add(1u, std::memory_order_relaxed);
   return true;
 }
-inline std::atomic<bool> cpu_timing_enabled{false};
-
 enum class CpuTimingCategory : uint32_t {
   descriptor_update, resource_destroy, scene_probe, draw, dispatch, evaluate, present, count
 };
@@ -2094,6 +2123,7 @@ inline std::atomic<uint64_t> fg_complete_input_frames{0u};
 inline std::atomic<uint64_t> fg_hudless_converted{0u};
 inline std::atomic<uint64_t> fg_hudless_tagged{0u};
 inline std::atomic<uint64_t> fg_hudless_busy{0u};
+inline std::atomic<uint64_t> fg_hudless_no_slot{0u};
 inline std::atomic<uint64_t> fg_hudless_rejected{0u};
 struct FgPendingPresent {
   sl::FrameToken* token = nullptr;
@@ -3923,7 +3953,7 @@ struct FgHudlessState {
   bool pipeline_attempted = false;
   reshade::api::format output_format = reshade::api::format::unknown;
   uint32_t slot_limit = 0u;
-  std::array<FgHudlessSlot, 6> slots = {};
+  std::array<FgHudlessSlot, 12> slots = {};
 };
 inline FgHudlessState fg_hudless;
 inline std::atomic<bool> fg_hudless_slots_allocated{false};
@@ -6107,6 +6137,23 @@ inline std::string BuildDebugReport() {
              fg_mode_result.load(), fg_reflex_result.load(), static_cast<unsigned long long>(fg_mode_changes.load()),
              static_cast<unsigned long long>(fg_unsafe_transitions.load()));
     out += line;
+    {
+      std::shared_lock lock(fg_timing.mutex);
+      snprintf(line, sizeof(line), "  FG present interval: off samples=%llu >=50ms=%llu max=%.3fms; active/pending samples=%llu >=50ms=%llu max=%.3fms\n",
+               static_cast<unsigned long long>(fg_timing.samples[0]), static_cast<unsigned long long>(fg_timing.slow[0]), fg_timing.max_ms[0],
+               static_cast<unsigned long long>(fg_timing.samples[1]), static_cast<unsigned long long>(fg_timing.slow[1]), fg_timing.max_ms[1]);
+      out += line;
+      out += "    Interval spans this addon's pre-present callback exit to finish-present entry; includes other callbacks and native present. Clock is milliseconds since system boot.\n";
+      out += "    request-off bits: 1=no paired present, 2=no HUD-less tag, 4=input test off, 8=stop requested, 16=transition, 32=pause, 64=no token, 128=no handoff, 256=queue mismatch, 512=capture off.\n";
+      const uint64_t first = (fg_timing.count > fg_timing.events.size() ? fg_timing.count - fg_timing.events.size() : 0u);
+      for (uint64_t i = first; i < fg_timing.count; ++i) {
+        const auto& event = fg_timing.events[i % fg_timing.events.size()];
+        snprintf(line, sizeof(line), "    %llums frame=%llu %s details=0x%X elapsed=%.3fms\n",
+                 static_cast<unsigned long long>(event.time_ms), static_cast<unsigned long long>(event.frame),
+                 event.kind, event.details, event.elapsed_ms);
+        out += line;
+      }
+    }
     snprintf(line, sizeof(line), "  FG support: DLSS-G=%d Reflex=%d (0=supported, -1=not checked); missing functions mask=0x%X\n",
              farcry6_dlss::streamline::bootstrap_fg_support.load(), farcry6_dlss::streamline::bootstrap_reflex_support.load(),
              farcry6_dlss::streamline::bootstrap_missing_functions.load());
@@ -6200,9 +6247,9 @@ inline std::string BuildDebugReport() {
                  * (fg_hudless.output_format == reshade::api::format::r10g10b10a2_unorm ? 4u : 8u);
         }
       }
-      snprintf(line, sizeof(line), "  FG HUD-less HDR: converted=%llu tagged=%llu busy=%llu rejected=%llu textures=%u/%u format=%s bytes=%llu retiring=%s\n",
+      snprintf(line, sizeof(line), "  FG HUD-less HDR: converted=%llu tagged=%llu busy=%llu no-slot=%llu rejected=%llu textures=%u/%u format=%s bytes=%llu retiring=%s\n",
                static_cast<unsigned long long>(fg_hudless_converted.load()), static_cast<unsigned long long>(fg_hudless_tagged.load()),
-               static_cast<unsigned long long>(fg_hudless_busy.load()), static_cast<unsigned long long>(fg_hudless_rejected.load()),
+               static_cast<unsigned long long>(fg_hudless_busy.load()), static_cast<unsigned long long>(fg_hudless_no_slot.load()), static_cast<unsigned long long>(fg_hudless_rejected.load()),
                allocated, fg_hudless.slot_limit,
                fg_hudless.output_format == reshade::api::format::r10g10b10a2_unorm ? "R10G10B10A2" : "RGBA16F/none",
                static_cast<unsigned long long>(bytes), fg_hudless_retire_requested.load() ? "yes" : "no");
@@ -7234,7 +7281,7 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
               && (format_support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0u;
           fg_hudless.output_format = (packed_supported ? reshade::api::format::r10g10b10a2_unorm
                                                        : reshade::api::format::r16g16b16a16_float);
-          fg_hudless.slot_limit = (packed_supported ? 6u : 3u);
+          fg_hudless.slot_limit = (packed_supported ? 12u : 6u);
           using DS = reshade::api::shader_stage;
           using DT = reshade::api::descriptor_type;
           using PT = reshade::api::pipeline_layout_param_type;
@@ -7345,6 +7392,9 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
           }
         } else {
           fg_hudless_busy.fetch_add(1u, std::memory_order_relaxed);
+          if (fg_hudless.device == device && fg_hudless.pipeline.handle != 0u) {
+            fg_hudless_no_slot.fetch_add(1u, std::memory_order_relaxed);
+          }
         }
       } else {
         fg_hudless_busy.fetch_add(1u, std::memory_order_relaxed);
@@ -8125,6 +8175,29 @@ inline void OnPresent(
                        && !fg_swapchain_transition.load(std::memory_order_acquire) && !PauseTaaRecentlySeen();
       if (!usable && !fg_mode.ReadyForDisplayChange()
           && !(fg_mode.has_pending && fg_mode.pending == farcry6_dlss::frame_generation::ModeState::Mode::off)) {
+        const uint32_t reasons = (fg_has_pending_present.load(std::memory_order_acquire) ? 0u : 1u)
+                               | (fg_pending_present.hudless_tagged ? 0u : 2u)
+                               | (fg_input_test != 0.f ? 0u : 4u)
+                               | (fg_enable_requested.load(std::memory_order_acquire) ? 0u : 8u)
+                               | (fg_swapchain_transition.load(std::memory_order_acquire) ? 16u : 0u)
+                               | (PauseTaaRecentlySeen() ? 32u : 0u)
+                               | (present_input.token == nullptr ? 64u : 0u)
+                               | (!present_input.handoff ? 128u : 0u)
+                               | (present_input.submit_queue != queue || present_input.conflicting_queue ? 256u : 0u)
+                               | (!fg_camera_capture_enabled.load(std::memory_order_acquire) ? 512u : 0u);
+        RecordFgTimingEvent("request-off", frame_counter, reasons);
+        if (reasons == 2u) {
+          const uint64_t now = GetTickCount64();
+          fg_missing_hudless_restarts = (fg_last_missing_hudless_ms != 0u && now - fg_last_missing_hudless_ms < 5000u
+                                             ? fg_missing_hudless_restarts + 1u : 1u);
+          fg_last_missing_hudless_ms = now;
+          if (fg_missing_hudless_restarts >= 3u) {
+            fg_enable_requested.store(false, std::memory_order_release);
+            fg_missing_hudless_restarts = 0u;
+            fg_last_missing_hudless_ms = 0u;
+            RecordFgTimingEvent("auto-retry-stopped", frame_counter, reasons);
+          }
+        }
         if (!SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode::off)) {
           fg_mode_report.store(4, std::memory_order_relaxed);
           fg_enable_requested.store(false, std::memory_order_release);
@@ -8166,6 +8239,15 @@ inline void OnPresent(
   // inside one. From here the budget is spent on the frame's first writes, which is
   // where per-view data lives.
   projection_probes_left = kProjectionProbesPerFrame;
+  if (cpu_timing_enabled.load(std::memory_order_relaxed) && queue != nullptr && swapchain != nullptr
+      && queue->get_device() != nullptr && reinterpret_cast<void*>(queue->get_device()->get_native())
+          == farcry6_dlss::streamline::bootstrap_device.load(std::memory_order_acquire)) {
+    std::unique_lock lock(fg_timing.mutex);
+    fg_timing.swapchain = swapchain;
+    fg_timing.frame = fg_present_frame.load(std::memory_order_relaxed);
+    fg_timing.mode = fg_mode_report.load(std::memory_order_relaxed);
+    QueryPerformanceCounter(&fg_timing.present_start);
+  }
 }
 
 inline void OnFgDestroySwapchain(reshade::api::swapchain* swapchain, bool) {
@@ -8230,6 +8312,29 @@ inline void OnFgInitSwapchain(reshade::api::swapchain* swapchain, bool) {
 }
 
 inline void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) {
+  LARGE_INTEGER present_end = {};
+  QueryPerformanceCounter(&present_end);
+  if (cpu_timing_enabled.load(std::memory_order_relaxed)) {
+    std::unique_lock lock(fg_timing.mutex);
+    if (fg_timing.swapchain == swapchain && fg_timing.present_start.QuadPart > 0
+        && present_end.QuadPart >= fg_timing.present_start.QuadPart) {
+      LARGE_INTEGER frequency = {};
+      QueryPerformanceFrequency(&frequency);
+      if (frequency.QuadPart > 0) {
+        const double elapsed_ms = 1000.0 * (present_end.QuadPart - fg_timing.present_start.QuadPart) / frequency.QuadPart;
+        const size_t mode = (fg_timing.mode == 0 ? 0u : 1u);
+        ++fg_timing.samples[mode];
+        fg_timing.max_ms[mode] = (std::max)(fg_timing.max_ms[mode], elapsed_ms);
+        if (elapsed_ms >= 50.0) {
+          ++fg_timing.slow[mode];
+          fg_timing.events[fg_timing.count++ % fg_timing.events.size()] = {
+              .time_ms = GetTickCount64(), .frame = fg_timing.frame, .kind = "slow-present", .details = static_cast<uint32_t>(fg_timing.mode), .elapsed_ms = elapsed_ms};
+        }
+      }
+      fg_timing.present_start = {};
+      fg_timing.swapchain = nullptr;
+    }
+  }
   if (queue != nullptr && swapchain != nullptr && queue->get_device() != nullptr
       && reinterpret_cast<void*>(queue->get_device()->get_native())
           == farcry6_dlss::streamline::bootstrap_device.load(std::memory_order_acquire)) {
@@ -8243,6 +8348,7 @@ inline void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::sw
   if (fg_mode.has_pending && fg_mode_swapchain == swapchain) {
     fg_mode.PresentCompleted(true);
     fg_mode_report.store(fg_mode.ReadyForDisplayChange() ? 0 : 2, std::memory_order_relaxed);
+    RecordFgTimingEvent("mode-applied", fg_present_frame.load(std::memory_order_relaxed), static_cast<uint32_t>(fg_mode_report.load(std::memory_order_relaxed)));
     if (fg_mode.ReadyForDisplayChange() && farcry6_dlss::streamline::reflex_set_options != nullptr) {
       sl::ReflexOptions reflex = {};
       reflex.mode = sl::ReflexMode::eOff;
@@ -8318,6 +8424,7 @@ inline void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::sw
         }
       } else {
         fg_mode_swapchain = swapchain;
+        RecordFgTimingEvent("request-on", fg_present_frame.load(std::memory_order_relaxed), streak);
       }
     }
   } else {
@@ -8400,6 +8507,8 @@ inline void OnDestroyDevice(reshade::api::device* device) {
       fg_mode = {};
       fg_mode_swapchain = nullptr;
       fg_mode_present_outstanding = false;
+      fg_last_missing_hudless_ms = 0u;
+      fg_missing_hudless_restarts = 0u;
       fg_last_state_query_frame = UINT64_MAX;
       fg_mode_report.store(0, std::memory_order_relaxed);
       fg_enable_requested.store(false, std::memory_order_release);

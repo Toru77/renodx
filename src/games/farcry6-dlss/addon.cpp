@@ -133,7 +133,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Start Frame Generation Experiment",
         .section = "Antialiasing",
-        .tooltip = "Experimental HDR10 gameplay test. Requires presentation and input tests plus Halton motion offsets. Stop the experiment and confirm FG is off before changing display settings or leaving gameplay.",
+        .tooltip = "Experimental HDR10 gameplay test. Requires presentation and input tests plus Halton motion offsets. Repeated missing HUD-less inputs stop automatic retries. Stop the experiment and confirm FG is off before changing display settings or leaving gameplay.",
         .on_click = [] {
           farcry6_dlss::dlss::fg_enable_requested.store(true);
           return true;
