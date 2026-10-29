@@ -2863,7 +2863,7 @@ renodx::utils::settings::Settings settings = {
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Capture Hook Timing", .section = "Motion Blur",
       .tooltip = "Logs the CPU time of the push-descriptor capture hook once per second (DevKit not loaded only). No rendering change.",
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode() && !falcom_world::g_state.supported; },
+      .is_visible = []() { return IsMotionBlurGame() && !falcom_world::g_state.supported; },
     },
     new renodx::utils::settings::Setting{      .key = "MotionBlurCameraCutThreshold", .binding = &shader_injection.mb_camera_cut_px,
       .default_value = 360.f, .label = "Camera Cut Threshold", .section = "Motion Blur",
@@ -6365,7 +6365,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     static uint64_t s_cap_frames = 0u;
     static std::chrono::steady_clock::time_point s_cap_window{};
     if (!falcom_world::g_state.supported) {
-      const bool want = g_capture_perf_log > 0.5f && IsMotionBlurGame() && IsAdvancedSettingsMode();
+      const bool want = g_capture_perf_log > 0.5f && IsMotionBlurGame();
       auto& gate = falcom_world::bvh::g_perf_gate;
       const auto now = std::chrono::steady_clock::now();
       if (gate.gather.load(std::memory_order_relaxed) != want) {
