@@ -8307,6 +8307,14 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
   auto bar = [&](reshade::api::resource r, reshade::api::resource_usage o, reshade::api::resource_usage n) {
     if (r.handle) cl->barrier(r, o, n);
   };
+  // Push-constant dedupe for this chain. ReShade's D3D11 push_constants maps and
+  // copies the whole ShaderInjectData block on every call, and the common path
+  // pushes the same bytes for every pass. Every mb layout declares the same push
+  // range (slot 13, root param 4) and nothing else runs between the passes here, so
+  // the last pushed block is still the one bound. Reset per chain, so the first
+  // push of every chain is always sent.
+  ShaderInjectData lastPushed = {};
+  bool havePushed = false;
   auto apply = [&](uint32_t pass, reshade::api::resource_view* srvs, uint32_t srvCount,
                    reshade::api::resource_view uav) {
     std::array<reshade::api::descriptor_table_update, kGtvbaoDescriptorTableParamCount> u = {{
@@ -8320,9 +8328,13 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
     std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount> tables = {
         d->mb_tables[pass][0], d->mb_tables[pass][1], d->mb_tables[pass][2], d->mb_tables[pass][3]};
     cl->bind_descriptor_tables(CS, d->mb_layouts[pass], 0, kGtvbaoDescriptorTableParamCount, tables.data());
-    cl->push_constants(CS, d->mb_layouts[pass], kGtvbaoPushConstantsLayoutParam, 0,
-                       static_cast<uint32_t>(sizeof(ShaderInjectData) / sizeof(uint32_t)),
-                       static_cast<const void*>(&shader_injection));
+    if (!havePushed || std::memcmp(&lastPushed, &shader_injection, sizeof(ShaderInjectData)) != 0) {
+      cl->push_constants(CS, d->mb_layouts[pass], kGtvbaoPushConstantsLayoutParam, 0,
+                         static_cast<uint32_t>(sizeof(ShaderInjectData) / sizeof(uint32_t)),
+                         static_cast<const void*>(&shader_injection));
+      lastPushed = shader_injection;
+      havePushed = true;
+    }
   };
 
   const uint32_t W = d->mb_working_w, H = d->mb_working_h;
