@@ -5628,6 +5628,19 @@ static void OnPushDescriptorsCapture(
       falcom_world::bvh::g_perf_gate.capture_b0_calls.fetch_add(1u, std::memory_order_relaxed);
     }
   }
+  const bool srv = update.type == reshade::api::descriptor_type::texture_shader_resource_view;
+  const bool cbv = update.type == reshade::api::descriptor_type::constant_buffer;
+  if (update.count == 0u || (!srv && !cbv)) return;
+  if (cbv && update.binding != kLightingSceneCbRegister) return;
+  if (srv && update.binding > 5u && update.binding != kDynCubeRegister && !VbgiRunning()) return;
+  renodx::utils::state::CommandListStateCache state_cache;
+  std::optional<uint32_t> ps_hash;
+  auto pixel_hash = [&]() {
+    if (!ps_hash.has_value()) {
+      ps_hash = renodx::utils::state::GetCurrentShaderHash(cmd_list, reshade::api::pipeline_stage::pixel_shader, &state_cache);
+    }
+    return *ps_hash;
+  };
   auto* device = cmd_list->get_device();
   auto* d = device->get_private_data<DeviceData>();
   if (!d) return;
@@ -5639,34 +5652,31 @@ static void OnPushDescriptorsCapture(
     uint32_t depthBinding = IsKai() ? kLightingDepthRegisterKai : kLightingDepthRegister;
     if (update.binding == depthBinding && update.count >= 1
         && views[0].handle != 0u) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (IsLightingShader(hash)) {
-          if (d->captured_depth_srv.handle != views[0].handle) {
-            auto info = CSResolveCapture(device, views[0]);
-            d->captured_depth_res = info.res;
-            d->captured_depth_dims = info.dims;
-            // Cached alongside the log string so a consumer that has to size its
-            // own output to the depth grid does not need a fresh GPU query: the
-            // shadow passes run every frame and a query per frame is not free.
-            d->captured_depth_w = info.w;
-            d->captured_depth_h = info.h;
-            CSLog("capture", std::string("depth handle -> ") + info.dims);
-          }
-          d->captured_depth_srv = views[0];
-          d->captured_depth_live = true;
-          d->captured_depth_frame = d->frame_index;
-          d->captured_scene_cbv_frame = d->frame_index;
-          if (shader_injection.gtvbao_debug_logging > 0.5f) {
-            auto depth_res = device->get_resource_from_view(views[0]);
-            if (depth_res.handle != 0u) {
-              auto dd = device->get_resource_desc(depth_res);
-              reshade::log::message(reshade::log::level::info,
-                (std::string("[GTVBAO] Depth captured from lighting: ") +
-                 std::to_string(dd.texture.width) + "x" +
-                 std::to_string(dd.texture.height)).c_str());
-            }
+      uint32_t hash = pixel_hash();
+      if (IsLightingShader(hash)) {
+        if (d->captured_depth_srv.handle != views[0].handle) {
+          auto info = CSResolveCapture(device, views[0]);
+          d->captured_depth_res = info.res;
+          d->captured_depth_dims = info.dims;
+          // Cached alongside the log string so a consumer that has to size its
+          // own output to the depth grid does not need a fresh GPU query: the
+          // shadow passes run every frame and a query per frame is not free.
+          d->captured_depth_w = info.w;
+          d->captured_depth_h = info.h;
+          CSLog("capture", std::string("depth handle -> ") + info.dims);
+        }
+        d->captured_depth_srv = views[0];
+        d->captured_depth_live = true;
+        d->captured_depth_frame = d->frame_index;
+        d->captured_scene_cbv_frame = d->frame_index;
+        if (shader_injection.gtvbao_debug_logging > 0.5f) {
+          auto depth_res = device->get_resource_from_view(views[0]);
+          if (depth_res.handle != 0u) {
+            auto dd = device->get_resource_desc(depth_res);
+            reshade::log::message(reshade::log::level::info,
+              (std::string("[GTVBAO] Depth captured from lighting: ") +
+               std::to_string(dd.texture.width) + "x" +
+               std::to_string(dd.texture.height)).c_str());
           }
         }
       }
@@ -5678,30 +5688,24 @@ static void OnPushDescriptorsCapture(
     uint32_t ssaoBinding = IsKai() ? kLightingSsaoRegisterKai : kLightingSsaoRegister;
     if (update.binding == ssaoBinding && update.count >= 1
         && views[0].handle != 0u) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (IsLightingShader(hash)) {
-          d->captured_ssao_srv = views[0];
-          d->captured_ssao_frame = d->frame_index;
-        }
+      uint32_t hash = pixel_hash();
+      if (IsLightingShader(hash)) {
+        d->captured_ssao_srv = views[0];
+        d->captured_ssao_frame = d->frame_index;
       }
     }
     if ((update.binding == kLightingMrtNormalRegister) && update.count >= 1
         && views[0].handle != 0u) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (IsLightingShader(hash)) {
-          if (d->captured_mrt_normal_srv.handle != views[0].handle) {
-            auto info = CSResolveCapture(device, views[0]);
-            d->captured_mrt_res = info.res;
-            d->captured_mrt_dims = info.dims;
-            CSLog("capture", std::string("mrt handle -> ") + info.dims);
-          }
-          d->captured_mrt_normal_srv = views[0];
-          d->captured_mrt_live = true;
+      uint32_t hash = pixel_hash();
+      if (IsLightingShader(hash)) {
+        if (d->captured_mrt_normal_srv.handle != views[0].handle) {
+          auto info = CSResolveCapture(device, views[0]);
+          d->captured_mrt_res = info.res;
+          d->captured_mrt_dims = info.dims;
+          CSLog("capture", std::string("mrt handle -> ") + info.dims);
         }
+        d->captured_mrt_normal_srv = views[0];
+        d->captured_mrt_live = true;
       }
     }
     // Capture motion buffer t3 � ONLY from TAA draws (both Sora hashes), for
@@ -5709,19 +5713,16 @@ static void OnPushDescriptorsCapture(
     // the lighting-gated captures above: t3 means different things per shader.
     if (update.binding == 3u && update.count >= 1
         && views[0].handle != 0u) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (hash == 0xFA37EA04u || hash == 0x9D91FAC3u) {
-          if (d->rcas_motion_srv.handle != views[0].handle) {
-            auto info = CSResolveCapture(device, views[0]);
-            d->rcas_motion_res = info.res;
-            reshade::log::message(reshade::log::level::info,
-              (std::string("[RCAS] motion ") + info.dims).c_str());
-          }
-          d->rcas_motion_srv = views[0];
-          d->rcas_motion_live = true;
+      uint32_t hash = pixel_hash();
+      if (hash == 0xFA37EA04u || hash == 0x9D91FAC3u) {
+        if (d->rcas_motion_srv.handle != views[0].handle) {
+          auto info = CSResolveCapture(device, views[0]);
+          d->rcas_motion_res = info.res;
+          reshade::log::message(reshade::log::level::info,
+            (std::string("[RCAS] motion ") + info.dims).c_str());
         }
+        d->rcas_motion_srv = views[0];
+        d->rcas_motion_live = true;
       }
     }
     // Capture the tonemap's t0 for the motion blur deploy. The blit samples t0 and
@@ -5731,36 +5732,30 @@ static void OnPushDescriptorsCapture(
     // expects. Over-capture of binding 0 is prevented by the hash gate.
     if (update.binding == 0u && update.count >= 1
         && views[0].handle != 0u) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (IsMotionBlurDeployHash(hash)) {
-          d->mb_tonemap_src_srv = views[0];
-          d->mb_tonemap_src_res = device->get_resource_from_view(views[0]).handle;
-          d->mb_tonemap_src_live = true;
-        }
+      uint32_t hash = pixel_hash();
+      if (IsMotionBlurDeployHash(hash)) {
+        d->mb_tonemap_src_srv = views[0];
+        d->mb_tonemap_src_res = device->get_resource_from_view(views[0]).handle;
+        d->mb_tonemap_src_live = true;
       }
     }
     // Capture t0 color texture � ONLY from the lighting shader (hash 0xFDAAF80E).
     // Unconditional capture would grab binding 0 from any shader, causing wrong colors.
     if (update.binding == 0u && update.count >= 1
         && views[0].handle != 0u) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (IsLightingShader(hash)) {
-          if (d->captured_color_srv.handle != views[0].handle) {
-            auto info = CSResolveCapture(device, views[0]);
-            d->captured_color_res = info.res;
-            d->captured_color_dims = info.dims;
-            d->captured_color_w = info.w;
-            d->captured_color_h = info.h;
-            CSLog("capture", std::string("color handle -> ") + info.dims);
-          }
-          d->captured_color_srv = views[0];
-          d->captured_color_live = true;
-          d->captured_color_frame = d->frame_index;
+      uint32_t hash = pixel_hash();
+      if (IsLightingShader(hash)) {
+        if (d->captured_color_srv.handle != views[0].handle) {
+          auto info = CSResolveCapture(device, views[0]);
+          d->captured_color_res = info.res;
+          d->captured_color_dims = info.dims;
+          d->captured_color_w = info.w;
+          d->captured_color_h = info.h;
+          CSLog("capture", std::string("color handle -> ") + info.dims);
         }
+        d->captured_color_srv = views[0];
+        d->captured_color_live = true;
+        d->captured_color_frame = d->frame_index;
       }
     }
     // VBGI radiance inputs: from the Sora and Kai lighting shaders while VBGI runs. The binding is the array base, so each
@@ -5791,29 +5786,26 @@ static void OnPushDescriptorsCapture(
           d->vbgi_in_frame[k] = d->frame_index;
         }
       }
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (hash == 0xFDAAF80Eu || hash == 0xCA3D8596u || (IsKai() && (hash == 0x430ED091u || hash == 0xF6C55E5Fu))) {
-          const bool kai = IsKai();
-          const uint32_t shadow_slot = kai ? 16u : (IsSora1st() ? 9u : 7u);
-          const uint32_t deferred_slot = kai ? 5u : 6u;
-          for (uint32_t i = 0; i < update.count; ++i) {
-            if (views[i].handle == 0u) continue;
-            const uint32_t slot = update.binding + i;
-            int k = -1;
-            if (slot == 2u) k = 0;
-            else if (slot == 3u && !kai) k = 1;
-            else if (slot == deferred_slot) k = 2;
-            else if (!kai && slot == shadow_slot) k = 3;
-            else if (!kai && slot == 11u) k = 4;
-            else if (!kai && slot == 12u) k = 5;
-            if (k < 0) continue;
-            if (views[i].handle != d->vbgi_in_srv[k].handle) d->vbgi_in_res[k] = device->get_resource_from_view(views[i]).handle;
-            d->vbgi_in_srv[k] = views[i];
-            d->vbgi_in_live[k] = true;
-            d->vbgi_in_frame[k] = d->frame_index;
-          }
+      uint32_t hash = pixel_hash();
+      if (hash == 0xFDAAF80Eu || hash == 0xCA3D8596u || (IsKai() && (hash == 0x430ED091u || hash == 0xF6C55E5Fu))) {
+        const bool kai = IsKai();
+        const uint32_t shadow_slot = kai ? 16u : (IsSora1st() ? 9u : 7u);
+        const uint32_t deferred_slot = kai ? 5u : 6u;
+        for (uint32_t i = 0; i < update.count; ++i) {
+          if (views[i].handle == 0u) continue;
+          const uint32_t slot = update.binding + i;
+          int k = -1;
+          if (slot == 2u) k = 0;
+          else if (slot == 3u && !kai) k = 1;
+          else if (slot == deferred_slot) k = 2;
+          else if (!kai && slot == shadow_slot) k = 3;
+          else if (!kai && slot == 11u) k = 4;
+          else if (!kai && slot == 12u) k = 5;
+          if (k < 0) continue;
+          if (views[i].handle != d->vbgi_in_srv[k].handle) d->vbgi_in_res[k] = device->get_resource_from_view(views[i]).handle;
+          d->vbgi_in_srv[k] = views[i];
+          d->vbgi_in_live[k] = true;
+          d->vbgi_in_frame[k] = d->frame_index;
         }
       }
     }
@@ -5822,18 +5814,15 @@ static void OnPushDescriptorsCapture(
     // as the color capture above.
     if (update.binding == 0u && update.count >= 1
         && views[0].handle != 0u) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (hash == 0x17F931DEu) {
-          if (d->captured_ssr1_srv.handle != views[0].handle) {
-            auto info = CSResolveCapture(device, views[0]);
-            d->captured_ssr1_res = info.res;
-            CSLog("capture", std::string("ssr1 handle -> ") + info.dims);
-          }
-          d->captured_ssr1_srv = views[0];
-          d->captured_ssr1_live = true;
+      uint32_t hash = pixel_hash();
+      if (hash == 0x17F931DEu) {
+        if (d->captured_ssr1_srv.handle != views[0].handle) {
+          auto info = CSResolveCapture(device, views[0]);
+          d->captured_ssr1_res = info.res;
+          CSLog("capture", std::string("ssr1 handle -> ") + info.dims);
         }
+        d->captured_ssr1_srv = views[0];
+        d->captured_ssr1_live = true;
       }
     }
     // Capture ssr1-draw t2 (the march's own mrt0) for the composite gate + normal
@@ -5841,18 +5830,15 @@ static void OnPushDescriptorsCapture(
     // this exact view. ONLY from the ssr1 pixel shader.
     if (update.binding == 2u && update.count >= 1
         && views[0].handle != 0u) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (hash == 0xE2F406C7u) {
-          if (d->captured_ssr_mrt_srv.handle != views[0].handle) {
-            auto info = CSResolveCapture(device, views[0]);
-            d->captured_ssr_mrt_res = info.res;
-            CSLog("capture", std::string("ssrMrt handle -> ") + info.dims);
-          }
-          d->captured_ssr_mrt_srv = views[0];
-          d->captured_ssr_mrt_live = true;
+      uint32_t hash = pixel_hash();
+      if (hash == 0xE2F406C7u) {
+        if (d->captured_ssr_mrt_srv.handle != views[0].handle) {
+          auto info = CSResolveCapture(device, views[0]);
+          d->captured_ssr_mrt_res = info.res;
+          CSLog("capture", std::string("ssrMrt handle -> ") + info.dims);
         }
+        d->captured_ssr_mrt_srv = views[0];
+        d->captured_ssr_mrt_live = true;
       }
     }
     // Capture the game's vanilla texEnvMap_g (t17) binding � the vanilla cubemap
@@ -5899,15 +5885,12 @@ static void OnPushDescriptorsCapture(
         // variant can never serve after the sliders return to neutral.
         bool swapIsLighting = false;
         {
-          auto* swapState = renodx::utils::shader::GetCurrentState(cmd_list);
-          if (swapState) {
-            uint32_t swapHash = renodx::utils::shader::GetCurrentPixelShaderHash(swapState);
-            swapIsLighting = IsLightingShader(swapHash);
-            if (swapHash != 0u) {
-              std::ostringstream hs;
-              hs << std::hex << swapHash;
-              CSLog("draw", std::string("t17 draw hash=0x") + hs.str());
-            }
+          uint32_t swapHash = pixel_hash();
+          swapIsLighting = IsLightingShader(swapHash);
+          if (swapHash != 0u) {
+            std::ostringstream hs;
+            hs << std::hex << swapHash;
+            CSLog("draw", std::string("t17 draw hash=0x") + hs.str());
           }
         }
         float swapSoften = std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f);
