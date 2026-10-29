@@ -35,6 +35,7 @@ struct Runtime {
   HMODULE module = nullptr;
   PFun_slInit* init = nullptr;
   PFun_slShutdown* shutdown = nullptr;
+  PFun_slFreeResources* free_resources = nullptr;
   PFun_slSetD3DDevice* set_device = nullptr;
   PFun_slUpgradeInterface* upgrade_interface = nullptr;
   PFun_slGetNativeInterface* get_native_interface = nullptr;
@@ -75,6 +76,7 @@ inline void LoadRuntime(const std::wstring& process_directory) {
     found.module = module;
     found.init = reinterpret_cast<PFun_slInit*>(GetProcAddress(module, "slInit"));
     found.shutdown = reinterpret_cast<PFun_slShutdown*>(GetProcAddress(module, "slShutdown"));
+    found.free_resources = reinterpret_cast<PFun_slFreeResources*>(GetProcAddress(module, "slFreeResources"));
     found.set_device = reinterpret_cast<PFun_slSetD3DDevice*>(GetProcAddress(module, "slSetD3DDevice"));
     found.upgrade_interface = reinterpret_cast<PFun_slUpgradeInterface*>(GetProcAddress(module, "slUpgradeInterface"));
     found.get_native_interface = reinterpret_cast<PFun_slGetNativeInterface*>(GetProcAddress(module, "slGetNativeInterface"));

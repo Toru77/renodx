@@ -186,6 +186,7 @@ inline float dlss_detailed_diagnostics = 0.f;
 inline float fg_bootstrap_test = 0.f;
 inline float fg_input_test = 0.f;
 inline std::atomic<bool> fg_enable_requested{false};
+inline std::atomic<bool> fg_swapchain_transition{false};
 inline std::atomic<int> fg_mode_report{0};
 inline std::atomic<int> fg_mode_result{0};
 inline std::atomic<int> fg_reflex_result{0};
@@ -197,6 +198,8 @@ inline uint64_t fg_last_state_query_frame = UINT64_MAX;
 inline farcry6_dlss::frame_generation::ModeState fg_mode;
 inline reshade::api::swapchain* fg_mode_swapchain = nullptr;
 inline bool fg_mode_present_outstanding = false;
+inline bool fg_pending_retain_resources = false;
+inline std::atomic<bool> fg_resources_retained{false};
 inline uint64_t fg_last_missing_hudless_ms = 0u;
 inline uint32_t fg_missing_hudless_restarts = 0u;
 inline std::atomic<bool> cpu_timing_enabled{false};
@@ -234,9 +237,15 @@ inline bool SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode mode) {
   if (set_options == nullptr) return false;
   sl::DLSSGOptions options = {};
   options.mode = (mode == farcry6_dlss::frame_generation::ModeState::Mode::on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff);
+  const bool retain_resources = mode == farcry6_dlss::frame_generation::ModeState::Mode::off
+                             && fg_enable_requested.load(std::memory_order_acquire)
+                             && fg_input_test != 0.f && !fg_swapchain_transition.load(std::memory_order_acquire)
+                             && farcry6_dlss::streamline::runtime.free_resources != nullptr;
+  if (retain_resources) options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
   const auto result = set_options(sl::ViewportHandle(0u), options);
   fg_mode_result.store(static_cast<int>(result), std::memory_order_relaxed);
   if (result != sl::Result::eOk) return false;
+  fg_pending_retain_resources = retain_resources;
   fg_mode.OptionsAccepted(mode);
   fg_mode_report.store(mode == farcry6_dlss::frame_generation::ModeState::Mode::on ? 1 : 3, std::memory_order_relaxed);
   fg_mode_changes.fetch_add(1u, std::memory_order_relaxed);
@@ -2083,7 +2092,6 @@ inline std::atomic<uint64_t> fg_camera_sample_frame{UINT64_MAX};
 inline std::atomic<bool> fg_camera_capture_enabled{false};
 inline std::atomic<uint64_t> fg_last_scene_handoff_frame{UINT64_MAX};
 inline std::atomic<uint32_t> fg_stable_gameplay_frames{0u};
-inline std::atomic<bool> fg_swapchain_transition{false};
 inline std::atomic<uint64_t> fg_swapchain_transitions{0u};
 inline std::atomic<uint64_t> fg_fullscreen_transitions{0u};
 inline std::atomic<uint64_t> fg_present_frame{UINT64_MAX};
@@ -8221,11 +8229,19 @@ inline void OnPresent(
     fg_input_recording_list.store(nullptr, std::memory_order_release);
   }
   if (present_input.token != nullptr || fg_has_pending_present.load(std::memory_order_acquire)
+      || fg_resources_retained.load(std::memory_order_acquire)
       || fg_mode_report.load(std::memory_order_relaxed) != 0) {
     std::lock_guard frame_lock(farcry6_dlss::streamline::frame_api_mutex);
     if (farcry6_dlss::streamline::factory_hook_active.load(std::memory_order_acquire)) {
       auto& runtime = farcry6_dlss::streamline::runtime;
       const sl::ViewportHandle viewport(0u);
+      if (fg_resources_retained.load(std::memory_order_relaxed) && fg_mode.ReadyForDisplayChange()
+          && (!fg_enable_requested.load(std::memory_order_acquire) || fg_input_test == 0.f
+              || fg_swapchain_transition.load(std::memory_order_acquire))
+          && runtime.free_resources != nullptr
+          && runtime.free_resources(sl::kFeatureDLSS_G, viewport) == sl::Result::eOk) {
+        fg_resources_retained.store(false, std::memory_order_release);
+      }
       const sl::ResourceTag clear_tags[] = {
           {nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent},
           {nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent},
@@ -8448,6 +8464,8 @@ inline void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::sw
   if (fg_mode_swapchain == swapchain) fg_mode_present_outstanding = false;
   if (fg_mode.has_pending && fg_mode_swapchain == swapchain) {
     fg_mode.PresentCompleted(true);
+    fg_resources_retained.store(fg_mode.ReadyForDisplayChange() && fg_pending_retain_resources, std::memory_order_release);
+    fg_pending_retain_resources = false;
     fg_mode_report.store(fg_mode.ReadyForDisplayChange() ? 0 : 2, std::memory_order_relaxed);
     RecordFgTimingEvent("mode-applied", fg_present_frame.load(std::memory_order_relaxed), static_cast<uint32_t>(fg_mode_report.load(std::memory_order_relaxed)));
     if (fg_mode.ReadyForDisplayChange() && farcry6_dlss::streamline::reflex_set_options != nullptr) {
@@ -8608,6 +8626,8 @@ inline void OnDestroyDevice(reshade::api::device* device) {
       fg_mode = {};
       fg_mode_swapchain = nullptr;
       fg_mode_present_outstanding = false;
+      fg_pending_retain_resources = false;
+      fg_resources_retained.store(false, std::memory_order_release);
       fg_last_missing_hudless_ms = 0u;
       fg_missing_hudless_restarts = 0u;
       fg_last_state_query_frame = UINT64_MAX;
