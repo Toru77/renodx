@@ -1,5 +1,5 @@
-// Matches the game's HDR10 output pass for the HUD-less upscaler image.
-// The caller supplies the same b1 c18.y value used by that pass.
+// Matches the game's SDR copy or HDR10 output pass for the HUD-less image.
+// HDR10 uses the output pass's b1 c18.y; zero selects the SDR copy.
 Texture2D<float4> source : register(t0);
 RWTexture2D<float4> target : register(u0);
 
@@ -13,6 +13,11 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (any(id.xy >= output_size)) return;
 
   float3 encoded = source.Load(int3(id.xy, 0)).rgb;
+  // The SDR output pass copies this image directly to an UNORM backbuffer.
+  if (output_brightness <= 0.f) {
+    target[id.xy] = float4(saturate(encoded), 1.f);
+    return;
+  }
   float3 linear_color = float3(
       encoded.r >= 0.03928571194410324f ? pow(abs((encoded.r + 0.055f) * 0.9478673338890076f), 2.4f) : encoded.r * 0.0773801133f,
       encoded.g >= 0.03928571194410324f ? pow(abs((encoded.g + 0.055f) * 0.9478673338890076f), 2.4f) : encoded.g * 0.0773801133f,

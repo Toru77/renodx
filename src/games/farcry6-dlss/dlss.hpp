@@ -118,6 +118,7 @@ static constexpr uint32_t kTaaPauseHash = 0x4AD8172Au;
 static constexpr uint32_t kSceneUpscaleHash = 0x944489F5u;
 static constexpr uint32_t kMotionProducerHash = 0xD9289B6Au;
 static constexpr uint32_t kHdrOutputHash = 0x62A8D0C3u;
+static constexpr uint32_t kSdrOutputHash = 0x6A24E345u;
 
 static constexpr uint32_t kTrackedTableCount = 32u;
 static constexpr uint32_t kTrackedRtvCount = 4u;
@@ -131,8 +132,11 @@ static constexpr uint32_t kSlotCbv = 0u;       // b0: TAA knobs
 
 // ── Settings (written by the settings system in addon.cpp) ──
 inline float dlss_enabled = 1.f;
+inline float dlss_rcas_strength = 0.f;
 inline float upscaler_type = 0.f;  // 0 = DLSS, 1 = FSR
 inline float fsr_version = 1.f;
+inline float fsr_descriptor_guard = 0.f;
+inline thread_local bool fsr_runtime_descriptor_guard = false;
 // 0=Auto, 1=DLAA, 2=Quality, 3=Balanced, 4=Performance, 5=UltraPerformance
 inline float dlss_mode = 0.f;
 // 0=Default, 1=F, 2=J, 3=K, 4=L, 5=M
@@ -185,7 +189,11 @@ inline float dlss_cpu_timing = 0.f;
 inline float dlss_detailed_diagnostics = 0.f;
 inline float fg_bootstrap_test = 0.f;
 inline float fg_input_test = 0.f;
+inline float fg_multiplier_setting = 0.f;  // 0=off, 1..5=generated frames
 inline std::atomic<bool> fg_enable_requested{false};
+inline std::atomic<uint32_t> fg_requested_generated{0u};
+inline std::atomic<uint32_t> fg_applied_generated{0u};
+inline uint32_t fg_pending_generated = 0u;
 inline std::atomic<bool> fg_swapchain_transition{false};
 inline std::atomic<int> fg_mode_report{0};
 inline std::atomic<int> fg_mode_result{0};
@@ -233,20 +241,29 @@ inline void RecordFgTimingEvent(const char* kind, uint64_t frame, uint32_t detai
       .time_ms = GetTickCount64(), .frame = frame, .kind = kind, .details = details, .elapsed_ms = elapsed_ms};
 }
 
-inline bool SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode mode) {
+inline bool FgInputsEnabled() {
+  return fg_input_test != 0.f || fg_enable_requested.load(std::memory_order_acquire);
+}
+
+inline bool SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode mode, uint32_t generated_frames = 0u) {
   auto* set_options = farcry6_dlss::streamline::fg_set_options;
   if (set_options == nullptr) return false;
   sl::DLSSGOptions options = {};
   options.mode = (mode == farcry6_dlss::frame_generation::ModeState::Mode::on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff);
+  if (mode == farcry6_dlss::frame_generation::ModeState::Mode::on) {
+    if (generated_frames == 0u) return false;
+    options.numFramesToGenerate = generated_frames;
+  }
   const bool retain_resources = mode == farcry6_dlss::frame_generation::ModeState::Mode::off
                              && fg_enable_requested.load(std::memory_order_acquire)
-                             && fg_input_test != 0.f && !fg_swapchain_transition.load(std::memory_order_acquire)
+                             && FgInputsEnabled() && !fg_swapchain_transition.load(std::memory_order_acquire)
                              && farcry6_dlss::streamline::runtime.free_resources != nullptr;
   if (retain_resources) options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
   const auto result = set_options(sl::ViewportHandle(0u), options);
   fg_mode_result.store(static_cast<int>(result), std::memory_order_relaxed);
   if (result != sl::Result::eOk) return false;
   fg_pending_retain_resources = retain_resources;
+  fg_pending_generated = (mode == farcry6_dlss::frame_generation::ModeState::Mode::on ? generated_frames : 0u);
   if (mode == farcry6_dlss::frame_generation::ModeState::Mode::off) {
     fg_temporary_off_time_ms.store(retain_resources ? GetTickCount64() : 0u, std::memory_order_release);
   }
@@ -1391,6 +1408,7 @@ inline bool OnUpdateDescriptorTables(
     reshade::api::device* device,
     uint32_t count,
     const reshade::api::descriptor_table_update* updates) {
+  if (fsr_runtime_descriptor_guard) return false;
   CpuTimingScope timing(CpuTimingCategory::descriptor_update, 63u);
   if (dlss_enabled == 0.f || !any_gpu.load()) return false;
   if (device == nullptr || count == 0u || updates == nullptr) return false;
@@ -2089,14 +2107,20 @@ struct FgCameraEvaluation {
   bool conflicting_queue = false;
   uint32_t hdr_slot = UINT32_MAX;
   float hdr_brightness = 0.f;
+  reshade::api::color_space output_color_space = reshade::api::color_space::unknown;
+  uint64_t scene_output = 0u;
   bool hudless_tagged = false;
 };
 inline std::array<FgCameraEvaluation, 4> fg_camera_evaluations = {};
 inline std::atomic<uint64_t> fg_camera_sample_frame{UINT64_MAX};
 inline std::atomic<bool> fg_camera_capture_enabled{false};
 inline std::atomic<uint64_t> fg_last_scene_handoff_frame{UINT64_MAX};
+inline std::atomic<uint64_t> last_taa_draw_frame{UINT64_MAX};
+inline std::atomic<uint64_t> last_upscaler_eval_frame{UINT64_MAX};
 inline std::atomic<uint32_t> fg_stable_gameplay_frames{0u};
 inline std::atomic<uint64_t> fg_swapchain_transitions{0u};
+inline std::atomic<reshade::api::color_space> fg_output_color_space{reshade::api::color_space::unknown};
+inline std::atomic<uint32_t> fg_output_format{0u};
 inline std::atomic<uint64_t> fg_fullscreen_transitions{0u};
 inline std::atomic<uint64_t> fg_present_frame{UINT64_MAX};
 inline std::atomic<uint64_t> fg_successful_present_frame{UINT64_MAX};
@@ -3383,8 +3407,11 @@ inline std::wstring GetProcessDirectory() {
 
 inline bool OnCreateDevice(reshade::api::device_api api, uint32_t& api_version) {
   if (api == reshade::api::device_api::d3d12) {
+    const uint32_t requested = static_cast<uint32_t>((std::clamp)(fg_multiplier_setting, 0.f, 5.f));
+    fg_requested_generated.store(requested, std::memory_order_release);
+    fg_enable_requested.store(requested != 0u, std::memory_order_release);
     farcry6_dlss::streamline::LoadRuntime(GetProcessDirectory());
-    if (fg_bootstrap_test != 0.f) farcry6_dlss::streamline::StartBootstrap(GetProcessDirectory());
+    if (fg_bootstrap_test != 0.f || requested != 0u) farcry6_dlss::streamline::StartBootstrap(GetProcessDirectory());
   }
   DebugLog("create device: api=%d process=%ls runtime=%s fg_bootstrap_test=%.0f bootstrap=%s", static_cast<int>(api),
            GetProcessDirectory().c_str(), farcry6_dlss::streamline::runtime.status, fg_bootstrap_test,
@@ -3449,7 +3476,7 @@ inline void OnFfxMessage(uint32_t type, const wchar_t* message) {
   }
 }
 
-inline bool EnsureFsrContext(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t flags) {
+inline bool EnsureFsrContext(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t flags, bool guard_descriptors) {
   if (device == nullptr || width == 0u || height == 0u) return false;
   if (fsr.load_failed) return false;
   if (fsr.loader == nullptr) {
@@ -3568,7 +3595,10 @@ inline bool EnsureFsrContext(ID3D12Device* device, uint32_t width, uint32_t heig
     DebugLog("%s", s.str().c_str());
   }
 
+  const bool previous_guard = fsr_runtime_descriptor_guard;
+  fsr_runtime_descriptor_guard = guard_descriptors;
   fsr.last_result = fsr.create(&next->context, &next->description.header, nullptr);
+  fsr_runtime_descriptor_guard = previous_guard;
   DebugLog("FSR: ffxCreateContext returned %u context=%p", fsr.last_result, static_cast<void*>(next->context));
   if (fsr.last_result != FFX_API_RETURN_OK || next->context == nullptr) {
     if (fsr_debug_logging != 0.f) {
@@ -3590,18 +3620,7 @@ inline bool EnsureFsrContext(ID3D12Device* device, uint32_t width, uint32_t heig
     fsr.retired.push_back({.context = std::move(fsr.current), .ticket = RetireGpuCommands()});
   }
   fsr.current = std::move(next);
-  fsr.provider = "provider version unavailable";
-  if (fsr.query != nullptr) {
-    ffxQueryGetProviderVersion version = {};
-    version.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
-    DebugLog("FSR: querying provider version");
-    const auto query_result = fsr.query(&fsr.current->context, &version.header);
-    DebugLog("FSR: provider query returned %u", static_cast<unsigned>(query_result));
-    if (query_result == FFX_API_RETURN_OK && version.versionName != nullptr) {
-      fsr.provider = version.versionName;
-      DebugLog("FSR: provider %s(%llu)", version.versionName, static_cast<unsigned long long>(version.versionId));
-    }
-  }
+  fsr.provider = (override_index >= 0 ? fsr.version_names[override_index] : "auto (provider not queried)");
   fsr.last_time_ms = 0u;
   ngx.reset = true;
   return true;
@@ -4053,6 +4072,27 @@ struct FgHudlessState {
   std::array<FgHudlessSlot, 12> slots = {};
 };
 inline FgHudlessState fg_hudless;
+struct RcasSlot {
+  reshade::api::resource texture = {};
+  reshade::api::resource_view source_view = {};
+  reshade::api::resource_view target_view = {};
+  reshade::api::descriptor_table tables[2] = {};
+  uint64_t source = 0u;
+  uint32_t width = 0u;
+  uint32_t height = 0u;
+  std::shared_ptr<GpuRetirementTicket> ticket;
+};
+struct RcasState {
+  std::shared_mutex mutex;
+  reshade::api::device* device = nullptr;
+  reshade::api::pipeline_layout layout = {};
+  reshade::api::pipeline pipeline = {};
+  bool pipeline_attempted = false;
+  std::array<RcasSlot, 12> slots = {};
+  std::atomic<uint64_t> dispatched{0u};
+  std::atomic<uint64_t> skipped{0u};
+};
+inline RcasState rcas;
 inline std::atomic<bool> fg_hudless_slots_allocated{false};
 inline std::atomic<bool> fg_hudless_retire_requested{false};
 
@@ -4400,10 +4440,8 @@ inline DeployReport deploy_report;
 // bytes. Context for the jitter work: the scene passes' slots, which carry the
 // game's jitter, sit at a fixed distance from it.
 inline std::atomic<uint64_t> last_b0_offset{0u};
-// Packed input/target dimensions: a change is the only thing that legitimately
-// invalidates DLSS history. The engine ping-pongs its color and history
-// textures every frame, so resetting on handle changes would restart DLSS on
-// every frame and destroy the temporal accumulation.
+// The engine ping-pongs its color and history textures every frame, so handle
+// changes alone do not invalidate DLSS history.
 inline uint64_t last_dims = 0u;
 
 inline bool IsTaaDraw(reshade::api::command_list* cmd_list, CommandListData*& data, uint32_t& hash) {
@@ -4448,6 +4486,9 @@ inline ID3D12Resource* GetNativeResource(reshade::api::device* device, reshade::
 inline bool FailInputs(
     ID3D12Resource* color, ID3D12Resource* motion, ID3D12Resource* depth, ID3D12Resource* target) {
   NoteFail(kFailResolve);
+  const uint32_t missing = (color == nullptr ? 1u : 0u) | (motion == nullptr ? 2u : 0u)
+                         | (depth == nullptr ? 4u : 0u) | (target == nullptr ? 8u : 0u);
+  RecordFgTimingEvent("taa-inputs-missing", frame_counter, missing);
   if (!logged_missing_inputs) {
     logged_missing_inputs = true;
     std::stringstream s;
@@ -5387,7 +5428,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       ++motion_producer_trace.matched_other_list;
     }
   }
-  // Reset DLSS history only on a structural change.
+  // Reset history on structural changes; interrupted evaluation is handled below.
   {
     const uint64_t dims = (static_cast<uint64_t>(input_width) << 48)
                         | (static_cast<uint64_t>(input_height) << 32)
@@ -5409,7 +5450,11 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   if (dlss_flag_is_hdr != 0.f) fsr_flags |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE;
   if (dlss_depth_inverted != 0.f) fsr_flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
   if (!use_motion_placeholder && dlss_motion_vectors_jittered != 0.f) fsr_flags |= FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
-  if ((use_fsr && !EnsureFsrContext(reinterpret_cast<ID3D12Device*>(device->get_native()), target_width, target_height, fsr_flags))
+  int vendor_id = 0;
+  const bool guard_descriptors = fsr_descriptor_guard >= 1.5f
+      || (fsr_descriptor_guard < 0.5f && device->get_property(reshade::api::device_properties::vendor_id, &vendor_id)
+          && vendor_id == 0x1002);
+  if ((use_fsr && !EnsureFsrContext(reinterpret_cast<ID3D12Device*>(device->get_native()), target_width, target_height, fsr_flags, guard_descriptors))
       || (!use_fsr && !EnsureFeature(command_list, input_width, input_height, target_width, target_height,
                                      render_preset, feature_flags, perf_quality))) {
     NoteFail(kFailFeature);
@@ -5787,7 +5832,14 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   eval.InJitterOffsetY = jitter_y;
   eval.InRenderSubrectDimensions.Width = input_width;
   eval.InRenderSubrectDimensions.Height = input_height;
-  eval.InReset = (ngx.reset || dlss_reset_every_frame != 0.f) ? 1 : 0;
+  const uint64_t previous_eval_frame = last_upscaler_eval_frame.load(std::memory_order_relaxed);
+  const bool interrupted_history = previous_eval_frame != UINT64_MAX && frame_counter > previous_eval_frame
+                                && frame_counter - previous_eval_frame > 1u;
+  eval.InReset = (ngx.reset || dlss_reset_every_frame != 0.f || interrupted_history) ? 1 : 0;
+  if (interrupted_history) {
+    RecordFgTimingEvent("upscaler-history-gap-reset", frame_counter,
+                        static_cast<uint32_t>((std::min)(frame_counter - previous_eval_frame - 1u, uint64_t{UINT32_MAX})));
+  }
   eval.InMVScaleX = 1.f;
   eval.InMVScaleY = 1.f;
   eval.InPreExposure = 1.f;
@@ -5878,16 +5930,19 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     dispatch.cameraFar = fsr.camera_far;
     dispatch.cameraFovAngleVertical = fsr.camera_fov;
     dispatch.viewSpaceToMetersFactor = 1.f;
-    if (DebugTrace()) {
+    if (DebugTrace() || (fsr_debug_logging != 0.f && !fsr.current->logged_dispatch)) {
       DebugLog("FSR dispatch: color=%p depth=%p motion=%p output=%p render=%ux%u upscale=%ux%u reset=%d frameTimeDelta=%.3f near=%.3f far=%.3f fov=%.3f",
                static_cast<void*>(color), static_cast<void*>(depth), static_cast<void*>(motion_vectors),
                static_cast<void*>(eval.Feature.pInOutput), input_width, input_height, target_width, target_height, dispatch.reset,
                dispatch.frameTimeDelta, fsr.camera_near, fsr.camera_far, fsr.camera_fov);
     }
     if (fsr_debug_logging != 0.f && !fsr.current->logged_dispatch) {
-      DebugLog("FSR: first dispatch: begin");
+      DebugLog("FSR: first dispatch: begin descriptor_guard=%d", guard_descriptors);
     }
+    const bool previous_guard = fsr_runtime_descriptor_guard;
+    fsr_runtime_descriptor_guard = guard_descriptors;
     fsr.last_result = fsr.dispatch(&fsr.current->context, &dispatch.header);
+    fsr_runtime_descriptor_guard = previous_guard;
     if (fsr.last_result == FFX_API_RETURN_OK) ++fsr.dispatches;
     if (fsr_debug_logging != 0.f && !fsr.current->logged_dispatch) {
       DebugLog("FSR: first dispatch: returned %u", fsr.last_result);
@@ -5925,6 +5980,130 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
   ngx.reset = false;
   NoteSuccess();
+  last_upscaler_eval_frame.store(frame_counter, std::memory_order_relaxed);
+  auto* rcas_source = eval.Feature.pInOutput;
+  const D3D12_RESOURCE_DESC rcas_source_desc = (rcas_source != nullptr ? rcas_source->GetDesc() : D3D12_RESOURCE_DESC{});
+  if (dlss_rcas_strength > 0.f && rcas_source != nullptr
+      && rcas_source_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+      && rcas_source_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
+      && rcas_source_desc.Width == target_width && rcas_source_desc.Height == target_height
+      && rcas_source_desc.DepthOrArraySize == 1u && rcas_source_desc.MipLevels == 1u && rcas_source_desc.SampleDesc.Count == 1u) {
+    std::unique_lock lock(rcas.mutex, std::try_to_lock);
+    if (lock.owns_lock()) {
+      if (rcas.device == nullptr) rcas.device = device;
+      if (rcas.device == device && !rcas.pipeline_attempted) {
+        rcas.pipeline_attempted = true;
+        using DS = reshade::api::shader_stage;
+        using DT = reshade::api::descriptor_type;
+        using PT = reshade::api::pipeline_layout_param_type;
+        reshade::api::descriptor_range srv = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_shader_resource_view};
+        reshade::api::descriptor_range uav = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};
+        reshade::api::constant_range constants = {};
+        constants.count = 3u;
+        constants.visibility = DS::all_compute;
+        reshade::api::pipeline_layout_param params[3] = {};
+        params[0].type = PT::descriptor_table;
+        params[0].descriptor_table = {1u, &srv};
+        params[1].type = PT::descriptor_table;
+        params[1].descriptor_table = {1u, &uav};
+        params[2].type = PT::push_constants;
+        params[2].push_constants = constants;
+        if (device->create_pipeline_layout(3u, params, &rcas.layout)) {
+          reshade::api::shader_desc shader = {};
+          shader.code = __dlss_rcas.data();
+          shader.code_size = __dlss_rcas.size();
+          shader.entry_point = "main";
+          const reshade::api::pipeline_subobject subobject = {reshade::api::pipeline_subobject_type::compute_shader, 1u, &shader};
+          (void)device->create_pipeline(rcas.layout, 1u, &subobject, &rcas.pipeline);
+        }
+      }
+      RcasSlot* slot = nullptr;
+      if (rcas.device == device && rcas.pipeline.handle != 0u) {
+        std::shared_lock retirement_lock(gpu_retirement.mutex);
+        for (auto& candidate : rcas.slots) {
+          if (!candidate.ticket || candidate.ticket->complete) {
+            slot = &candidate;
+            break;
+          }
+        }
+      }
+      if (slot != nullptr) {
+        slot->ticket.reset();
+        const uint64_t source = reinterpret_cast<uint64_t>(rcas_source);
+        if (slot->source != source && slot->source_view.handle != 0u) {
+          device->destroy_resource_view(slot->source_view);
+          slot->source_view = {};
+          slot->source = 0u;
+        }
+        if ((slot->width != target_width || slot->height != target_height) && slot->texture.handle != 0u) {
+          if (slot->target_view.handle != 0u) device->destroy_resource_view(slot->target_view);
+          device->destroy_resource(slot->texture);
+          slot->texture = {};
+          slot->target_view = {};
+          slot->width = slot->height = 0u;
+        }
+        const reshade::api::resource_view_desc view_desc(
+            reshade::api::resource_view_type::texture_2d, reshade::api::format::r16g16b16a16_float, 0u, 1u, 0u, 1u);
+        if (slot->source_view.handle == 0u
+            && device->create_resource_view(reshade::api::resource{source}, reshade::api::resource_usage::shader_resource,
+                                            view_desc, &slot->source_view)) {
+          slot->source = source;
+        }
+        if (slot->texture.handle == 0u) {
+          reshade::api::resource_desc desc = {};
+          desc.type = reshade::api::resource_type::texture_2d;
+          desc.texture = {target_width, target_height, 1u, 1u, reshade::api::format::r16g16b16a16_float, 1u};
+          desc.heap = reshade::api::memory_heap::gpu_only;
+          desc.usage = reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::copy_source;
+          if (device->create_resource(desc, nullptr, reshade::api::resource_usage::unordered_access, &slot->texture)) {
+            slot->width = target_width;
+            slot->height = target_height;
+          }
+        }
+        if (slot->texture.handle != 0u && slot->target_view.handle == 0u) {
+          (void)device->create_resource_view(slot->texture, reshade::api::resource_usage::unordered_access, view_desc, &slot->target_view);
+        }
+        for (uint32_t i = 0u; i < 2u; ++i) {
+          if (slot->tables[i].handle == 0u) (void)device->allocate_descriptor_table(rcas.layout, i, &slot->tables[i]);
+        }
+        if (slot->source_view.handle && slot->target_view.handle && slot->tables[0].handle && slot->tables[1].handle) {
+          const reshade::api::descriptor_table_update updates[] = {
+              {slot->tables[0], 0u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot->source_view},
+              {slot->tables[1], 0u, 0u, 1u, reshade::api::descriptor_type::texture_unordered_access_view, &slot->target_view},
+          };
+          device->update_descriptor_tables(2u, updates);
+          const auto stage = reshade::api::shader_stage::all_compute;
+          cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, rcas.pipeline);
+          cmd_list->bind_descriptor_tables(stage, rcas.layout, 0u, 2u, slot->tables);
+          const struct { uint32_t width, height; float strength; } constants = {
+              target_width, target_height, (std::clamp)(dlss_rcas_strength, 0.f, 1.f)};
+          cmd_list->push_constants(stage, rcas.layout, 2u, 0u, 3u, &constants);
+          const reshade::api::resource source_resource{source};
+          const auto source_state = (fsr1_mode ? fsr1_target_state : reshade::api::resource_usage::unordered_access);
+          if (source_state != reshade::api::resource_usage::shader_resource_non_pixel) {
+            cmd_list->barrier(source_resource, source_state, reshade::api::resource_usage::shader_resource_non_pixel);
+          }
+          cmd_list->dispatch((target_width + 7u) / 8u, (target_height + 7u) / 8u, 1u);
+          cmd_list->barrier(slot->texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::copy_source);
+          cmd_list->barrier(source_resource, reshade::api::resource_usage::shader_resource_non_pixel, reshade::api::resource_usage::copy_dest);
+          command_list->CopyResource(rcas_source, reinterpret_cast<ID3D12Resource*>(slot->texture.handle));
+          cmd_list->barrier(source_resource, reshade::api::resource_usage::copy_dest, source_state);
+          cmd_list->barrier(slot->texture, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::unordered_access);
+          RestoreGameDescriptorState(cmd_list);
+          slot->ticket = RetireGpuCommands(cmd_list);
+          rcas.dispatched.fetch_add(1u, std::memory_order_relaxed);
+        } else {
+          rcas.skipped.fetch_add(1u, std::memory_order_relaxed);
+        }
+      } else {
+        rcas.skipped.fetch_add(1u, std::memory_order_relaxed);
+      }
+    } else {
+      rcas.skipped.fetch_add(1u, std::memory_order_relaxed);
+    }
+  } else if (dlss_rcas_strength > 0.f) {
+    rcas.skipped.fetch_add(1u, std::memory_order_relaxed);
+  }
   // The game's dispatch is only taken out for frames DLSS actually wrote.
   if (fsr1_mode) fsr1_wrote_this_frame.store(true);
 
@@ -5990,7 +6169,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
 
   // The test uses volatile tags because both source buffers may be reused.
   // FG remains off, so Streamline does not need to retain their contents yet.
-  if (fg_input_test != 0.f && fg_camera_capture_enabled.load(std::memory_order_acquire) && fg_camera_valid
+  if (FgInputsEnabled() && fg_camera_capture_enabled.load(std::memory_order_acquire) && fg_camera_valid
       && !fsr1_mode && !use_motion_placeholder && !use_depth_mask && !use_depth_placeholder
       && camera_builder_frame.load(std::memory_order_acquire) == fg_eval_frame
       && depth_state != reshade::api::resource_usage::undefined
@@ -6216,6 +6395,18 @@ inline std::string BuildDebugReport() {
       fsr1_target_width.load(), fsr1_target_height.load(), fsr1_target_format.load(),
       static_cast<unsigned long long>(fsr1_output_resource.load()));
   std::string out(buf);
+  if (dlss_enabled == 0.f) {
+    out += "  upscaler replacement: off; gameplay uses the game's upscaler. Upscaler inputs, evaluations and handoff diagnostics below may be from before it was disabled.\n";
+  } else {
+    out += "  upscaler replacement: on\n";
+  }
+  {
+    char line[192];
+    snprintf(line, sizeof(line), "  RCAS sharpening: strength=%.2f noise-reduction=on dispatched=%llu skipped=%llu (RGBA16F output)\n",
+             static_cast<double>(dlss_rcas_strength), static_cast<unsigned long long>(rcas.dispatched.load()),
+             static_cast<unsigned long long>(rcas.skipped.load()));
+    out += line;
+  }
   out += "  Streamline runtime: ";
   out += farcry6_dlss::streamline::runtime.status;
   out += "\n";
@@ -6237,6 +6428,18 @@ inline std::string BuildDebugReport() {
              fg_mode_result.load(), fg_reflex_result.load(), static_cast<unsigned long long>(fg_mode_changes.load()),
              static_cast<unsigned long long>(fg_unsafe_transitions.load()));
     out += line;
+    snprintf(line, sizeof(line), "  FG multiplier: requested=%ux active=%ux max=%ux (0=off or unknown)\n",
+             fg_requested_generated.load() != 0u ? fg_requested_generated.load() + 1u : 0u,
+             fg_applied_generated.load() != 0u ? fg_applied_generated.load() + 1u : 0u,
+             fg_state_max_generated.load() != 0u ? fg_state_max_generated.load() + 1u : 0u);
+    out += line;
+    const auto output_space = fg_output_color_space.load(std::memory_order_relaxed);
+    const char* output_name = (output_space == reshade::api::color_space::hdr10_st2084 ? "HDR10 PQ"
+                               : output_space == reshade::api::color_space::extended_srgb_linear ? "scRGB linear"
+                               : output_space == reshade::api::color_space::srgb_nonlinear ? "SDR sRGB" : "unknown/other");
+    snprintf(line, sizeof(line), "  FG output      : %s color-space=%u backbuffer-format=%u\n",
+             output_name, static_cast<unsigned>(output_space), fg_output_format.load(std::memory_order_relaxed));
+    out += line;
     {
       std::shared_lock lock(fg_timing.mutex);
       snprintf(line, sizeof(line), "  FG present interval: off samples=%llu >=50ms=%llu max=%.3fms; active/pending samples=%llu >=50ms=%llu max=%.3fms\n",
@@ -6245,6 +6448,8 @@ inline std::string BuildDebugReport() {
       out += line;
       out += "    Interval spans this addon's pre-present callback exit to finish-present entry; includes other callbacks and native present. Clock is milliseconds since system boot.\n";
       out += "    request-off bits: 1=no paired present, 2=no HUD-less tag, 4=input test off, 8=stop requested, 16=transition, 32=pause, 64=no token, 128=no handoff, 256=queue mismatch, 512=capture off.\n";
+      out += "    taa-inputs-missing bits: 1=color, 2=motion, 4=depth, 8=target; CPU draw recording interval.\n";
+      out += "    scene-handoff-gap bits: 1=TAA draw seen, 2=upscaler evaluation succeeded; CPU recording interval.\n";
       const uint64_t first = (fg_timing.count > fg_timing.events.size() ? fg_timing.count - fg_timing.events.size() : 0u);
       for (uint64_t i = first; i < fg_timing.count; ++i) {
         const auto& event = fg_timing.events[i % fg_timing.events.size()];
@@ -6316,7 +6521,7 @@ inline std::string BuildDebugReport() {
              static_cast<unsigned long long>(fg_frame_missing_hdr.load()));
     out += line;
     snprintf(line, sizeof(line), "  FG input test: %s tags=%llu failed=%llu result=%d submitted=%llu busy-skips=%llu present=%llu/%llu unpaired=%llu\n",
-             fg_input_test != 0.f ? "on" : "off", static_cast<unsigned long long>(fg_input_tagged.load()),
+             FgInputsEnabled() ? "on" : "off", static_cast<unsigned long long>(fg_input_tagged.load()),
              static_cast<unsigned long long>(fg_input_failed.load()), fg_input_last_result.load(),
              static_cast<unsigned long long>(fg_input_submitted.load()), static_cast<unsigned long long>(fg_input_queue_skips.load()),
              static_cast<unsigned long long>(fg_present_started.load()), static_cast<unsigned long long>(fg_present_finished.load()),
@@ -6347,7 +6552,7 @@ inline std::string BuildDebugReport() {
                  * (fg_hudless.output_format == reshade::api::format::r10g10b10a2_unorm ? 4u : 8u);
         }
       }
-      snprintf(line, sizeof(line), "  FG HUD-less HDR: converted=%llu tagged=%llu busy=%llu no-slot=%llu rejected=%llu textures=%u/%u format=%s bytes=%llu retiring=%s\n",
+      snprintf(line, sizeof(line), "  FG HUD-less    : converted=%llu tagged=%llu busy=%llu no-slot=%llu rejected=%llu textures=%u/%u format=%s bytes=%llu retiring=%s\n",
                static_cast<unsigned long long>(fg_hudless_converted.load()), static_cast<unsigned long long>(fg_hudless_tagged.load()),
                static_cast<unsigned long long>(fg_hudless_busy.load()), static_cast<unsigned long long>(fg_hudless_no_slot.load()), static_cast<unsigned long long>(fg_hudless_rejected.load()),
                allocated, fg_hudless.slot_limit,
@@ -7364,20 +7569,23 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
   }
   if (!copied) return false;
   fg_last_scene_handoff_frame.store(frame_counter, std::memory_order_release);
-  if (fg_input_test != 0.f && fg_camera_capture_enabled.load(std::memory_order_acquire)
+  if (FgInputsEnabled() && fg_camera_capture_enabled.load(std::memory_order_acquire)
       && !fg_hudless_retire_requested.load(std::memory_order_acquire)
       && !data->in_render_pass && src.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && src.Width <= UINT32_MAX) {
     const uint64_t frame = camera_builder_frame.load(std::memory_order_acquire);
     const uint64_t brightness_frame = fg_hdr_parameter_frame.load(std::memory_order_acquire);
     const float brightness = fg_hdr_brightness.load(std::memory_order_relaxed);
+    const auto output_space = fg_output_color_space.load(std::memory_order_relaxed);
+    const bool is_sdr = output_space == reshade::api::color_space::srgb_nonlinear;
+    const bool is_hdr10 = output_space == reshade::api::color_space::hdr10_st2084;
     bool input_ready = false;
     {
       const std::lock_guard<std::mutex> lock(fg_camera_sample_mutex);
       const auto& evaluation = fg_camera_evaluations[frame % fg_camera_evaluations.size()];
       input_ready = evaluation.frame == frame && evaluation.token != nullptr && evaluation.input_list == cmd_list;
     }
-    if (input_ready && brightness_frame != UINT64_MAX && (brightness_frame == frame || brightness_frame + 1u == frame)
-        && std::isfinite(brightness) && brightness > 0.f) {
+    if (input_ready && (is_sdr || (is_hdr10 && brightness_frame != UINT64_MAX
+        && (brightness_frame == frame || brightness_frame + 1u == frame) && std::isfinite(brightness) && brightness > 0.f))) {
       std::unique_lock lock(fg_hudless.mutex, std::try_to_lock);
       if (lock.owns_lock()) {
         auto* device = cmd_list->get_device();
@@ -7483,7 +7691,7 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
             const auto stage = reshade::api::shader_stage::all_compute;
             cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, fg_hudless.pipeline);
             cmd_list->bind_descriptor_tables(stage, fg_hudless.layout, 0u, 2u, slot.tables);
-            const struct { uint32_t width, height; float brightness; } constants = {slot.width, slot.height, brightness};
+            const struct { uint32_t width, height; float brightness; } constants = {slot.width, slot.height, is_sdr ? 0.f : brightness};
             cmd_list->push_constants(stage, fg_hudless.layout, 2u, 0u, 3u, &constants);
             const reshade::api::resource source_resource{reinterpret_cast<uint64_t>(source)};
             cmd_list->barrier(source_resource, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource_non_pixel);
@@ -7497,7 +7705,9 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
             auto& evaluation = fg_camera_evaluations[frame % fg_camera_evaluations.size()];
             if (evaluation.frame == frame && evaluation.input_list == cmd_list) {
               evaluation.hdr_slot = slot_index;
-              evaluation.hdr_brightness = brightness;
+              evaluation.hdr_brightness = (is_sdr ? 0.f : brightness);
+              evaluation.output_color_space = output_space;
+              evaluation.scene_output = reinterpret_cast<uint64_t>(target);
               fg_hudless_converted.fetch_add(1u, std::memory_order_relaxed);
             }
           } else {
@@ -7650,8 +7860,8 @@ inline void CaptureCameraCoverage(reshade::api::command_list* cmd_list) {
   camera_coverage.entries[camera_coverage.count++] = entry;
 }
 
-inline void TagFgHudless(reshade::api::command_list* cmd_list) {
-  if (cmd_list == nullptr || fg_input_test == 0.f || !fg_camera_capture_enabled.load(std::memory_order_acquire)) return;
+inline void TagFgHudless(reshade::api::command_list* cmd_list, uint32_t output_hash) {
+  if (cmd_list == nullptr || !FgInputsEnabled() || !fg_camera_capture_enabled.load(std::memory_order_acquire)) return;
   const auto* data = cmd_list->get_private_data<CommandListData>();
   if (data == nullptr || data->in_render_pass) return;
   const uint64_t frame = camera_builder_frame.load(std::memory_order_acquire);
@@ -7660,12 +7870,23 @@ inline void TagFgHudless(reshade::api::command_list* cmd_list) {
     const std::lock_guard<std::mutex> lock(fg_camera_sample_mutex);
     evaluation = fg_camera_evaluations[frame % fg_camera_evaluations.size()];
   }
+  const bool is_sdr = evaluation.output_color_space == reshade::api::color_space::srgb_nonlinear;
+  const bool is_hdr10 = evaluation.output_color_space == reshade::api::color_space::hdr10_st2084;
   if (evaluation.frame != frame || evaluation.token == nullptr || evaluation.input_list != cmd_list
       || evaluation.hdr_slot >= fg_hudless.slots.size() || evaluation.hudless_tagged
-      || fg_hdr_parameter_frame.load(std::memory_order_acquire) != frame
-      || fg_hdr_brightness.load(std::memory_order_relaxed) != evaluation.hdr_brightness) {
+      || evaluation.output_color_space != fg_output_color_space.load(std::memory_order_relaxed)
+      || (!is_sdr && !is_hdr10) || (is_sdr && output_hash != kSdrOutputHash)
+      || (is_hdr10 && (output_hash != kHdrOutputHash || fg_hdr_parameter_frame.load(std::memory_order_acquire) != frame
+                       || fg_hdr_brightness.load(std::memory_order_relaxed) != evaluation.hdr_brightness))) {
     fg_hudless_rejected.fetch_add(1u, std::memory_order_relaxed);
     return;
+  }
+  if (is_sdr) {
+    SlotInput input;
+    if (!ResolveSlot(cmd_list, data, 0u, 4u, input) || input.resource.handle != evaluation.scene_output) {
+      fg_hudless_rejected.fetch_add(1u, std::memory_order_relaxed);
+      return;
+    }
   }
   std::shared_lock lock(fg_hudless.mutex, std::try_to_lock);
   if (!lock.owns_lock()) {
@@ -7712,7 +7933,9 @@ inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uin
   if (!CheckTaaDraw(cmd_list, data, hash)) {
     if (hash == kHdrOutputHash && fg_camera_capture_enabled.load(std::memory_order_acquire)) {
       CaptureFgHdrOutputParameters(cmd_list);
-      TagFgHudless(cmd_list);
+      TagFgHudless(cmd_list, hash);
+    } else if (hash == kSdrOutputHash && fg_camera_capture_enabled.load(std::memory_order_acquire)) {
+      TagFgHudless(cmd_list, hash);
     }
     // The scene's own view constants are read at its geometry draws, which is where
     // the jitter is applied and therefore where it exists as data.
@@ -7722,6 +7945,7 @@ inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uin
     return false;
   }
   ++stat_taa_draws;
+  last_taa_draw_frame.store(frame_counter, std::memory_order_relaxed);
   if (!logged_taa_draw_detected) {
     logged_taa_draw_detected = true;
     std::stringstream s;
@@ -7752,7 +7976,9 @@ inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32
   if (!CheckTaaDraw(cmd_list, data, hash)) {
     if (hash == kHdrOutputHash && fg_camera_capture_enabled.load(std::memory_order_acquire)) {
       CaptureFgHdrOutputParameters(cmd_list);
-      TagFgHudless(cmd_list);
+      TagFgHudless(cmd_list, hash);
+    } else if (hash == kSdrOutputHash && fg_camera_capture_enabled.load(std::memory_order_acquire)) {
+      TagFgHudless(cmd_list, hash);
     }
     // The scene's own view constants are read at its geometry draws, which is where
     // the jitter is applied and therefore where it exists as data.
@@ -7762,6 +7988,7 @@ inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32
     return false;
   }
   ++stat_taa_draws;
+  last_taa_draw_frame.store(frame_counter, std::memory_order_relaxed);
   if (!logged_taa_draw_detected) {
     logged_taa_draw_detected = true;
     std::stringstream s;
@@ -7788,6 +8015,16 @@ inline void OnPresent(
   cpu_timing_enabled.store(dlss_cpu_timing != 0.f, std::memory_order_relaxed);
   CpuTimingScope timing(CpuTimingCategory::present, 0u);
   ++stat_presents;
+  if (queue != nullptr && swapchain != nullptr && queue->get_device() != nullptr
+      && reinterpret_cast<void*>(queue->get_device()->get_native())
+          == farcry6_dlss::streamline::bootstrap_device.load(std::memory_order_acquire)) {
+    fg_output_color_space.store(swapchain->get_color_space(), std::memory_order_relaxed);
+    const auto back_buffer = swapchain->get_current_back_buffer();
+    if (back_buffer.handle != 0u) {
+      fg_output_format.store(static_cast<uint32_t>(queue->get_device()->get_resource_desc(back_buffer).texture.format),
+                             std::memory_order_relaxed);
+    }
+  }
   uint32_t budget = debug_trace_budget.load(std::memory_order_relaxed);
   while (budget > 0u && !debug_trace_budget.compare_exchange_weak(budget, budget - 1u, std::memory_order_relaxed)) {}
   if (fsr_debug_logging != 0.f) {
@@ -7947,7 +8184,7 @@ inline void OnPresent(
       it = retired_unpack.erase(it);
       ++gpu_retirement.reclaimed;
     }
-    if (fg_input_test == 0.f && fg_hudless_slots_allocated.load(std::memory_order_acquire)) {
+    if (!FgInputsEnabled() && fg_hudless_slots_allocated.load(std::memory_order_acquire)) {
       fg_hudless_retire_requested.store(true, std::memory_order_release);
     }
     if (fg_hudless_retire_requested.load(std::memory_order_acquire)) {
@@ -8214,7 +8451,8 @@ inline void OnPresent(
               || evaluation.render_width == 0u || evaluation.render_height == 0u
               || evaluation.output_width == 0u || evaluation.output_height == 0u) {
             fg_frame_missing_handoff.fetch_add(1u, std::memory_order_relaxed);
-          } else if (fg_hdr_parameter_frame.load(std::memory_order_acquire) != frame_counter) {
+          } else if (evaluation.output_color_space == reshade::api::color_space::hdr10_st2084
+                     && fg_hdr_parameter_frame.load(std::memory_order_acquire) != frame_counter) {
             fg_frame_missing_hdr.fetch_add(1u, std::memory_order_relaxed);
           } else {
             fg_frame_matched.fetch_add(1u, std::memory_order_relaxed);
@@ -8226,7 +8464,7 @@ inline void OnPresent(
     }
   }
   FgCameraEvaluation present_input = {};
-  if (fg_input_test != 0.f || fg_input_recording_list.load(std::memory_order_acquire) != nullptr) {
+  if (FgInputsEnabled() || fg_input_recording_list.load(std::memory_order_acquire) != nullptr) {
     const std::lock_guard<std::mutex> lock(fg_camera_sample_mutex);
     const auto& evaluation = fg_camera_evaluations[frame_counter % fg_camera_evaluations.size()];
     if (evaluation.frame == frame_counter) present_input = evaluation;
@@ -8240,7 +8478,7 @@ inline void OnPresent(
       auto& runtime = farcry6_dlss::streamline::runtime;
       const sl::ViewportHandle viewport(0u);
       if (fg_resources_retained.load(std::memory_order_relaxed) && fg_mode.ReadyForDisplayChange()
-          && (!fg_enable_requested.load(std::memory_order_acquire) || fg_input_test == 0.f
+          && (!fg_enable_requested.load(std::memory_order_acquire) || !FgInputsEnabled()
               || fg_swapchain_transition.load(std::memory_order_acquire))
           && runtime.free_resources != nullptr
           && runtime.free_resources(sl::kFeatureDLSS_G, viewport) == sl::Result::eOk) {
@@ -8254,6 +8492,8 @@ inline void OnPresent(
       };
       if (fg_mode_present_outstanding && fg_mode_swapchain == swapchain) {
         fg_mode.PresentCompleted(false);
+        fg_applied_generated.store(0u, std::memory_order_release);
+        fg_pending_generated = 0u;
         fg_mode.applied = farcry6_dlss::frame_generation::ModeState::Mode::unknown;
         fg_mode_report.store(4, std::memory_order_relaxed);
         fg_enable_requested.store(false, std::memory_order_release);
@@ -8293,13 +8533,14 @@ inline void OnPresent(
         }
       }
       const bool usable = fg_has_pending_present.load(std::memory_order_acquire) && fg_pending_present.hudless_tagged
-                       && fg_input_test != 0.f && fg_enable_requested.load(std::memory_order_acquire)
+                       && FgInputsEnabled() && fg_enable_requested.load(std::memory_order_acquire)
+                       && dlss_enabled != 0.f && upscaler_type < 0.5f
                        && !fg_swapchain_transition.load(std::memory_order_acquire) && !PauseTaaRecentlySeen();
       if (!usable && !fg_mode.ReadyForDisplayChange()
           && !(fg_mode.has_pending && fg_mode.pending == farcry6_dlss::frame_generation::ModeState::Mode::off)) {
         const uint32_t reasons = (fg_has_pending_present.load(std::memory_order_acquire) ? 0u : 1u)
                                | (fg_pending_present.hudless_tagged ? 0u : 2u)
-                               | (fg_input_test != 0.f ? 0u : 4u)
+                               | (FgInputsEnabled() ? 0u : 4u)
                                | (fg_enable_requested.load(std::memory_order_acquire) ? 0u : 8u)
                                | (fg_swapchain_transition.load(std::memory_order_acquire) ? 16u : 0u)
                                | (PauseTaaRecentlySeen() ? 32u : 0u)
@@ -8330,12 +8571,18 @@ inline void OnPresent(
       }
     }
   }
-  if (fg_input_test == 0.f || present_input.token == nullptr) {
+  if (!FgInputsEnabled() || present_input.token == nullptr) {
     fg_complete_input_streak.store(0u, std::memory_order_relaxed);
   }
   const bool gameplay_handoff = fg_last_scene_handoff_frame.load(std::memory_order_acquire) == frame_counter
                              && !PauseTaaRecentlySeen() && frame_counter != 0u
                              && fg_successful_present_frame.load(std::memory_order_acquire) == frame_counter - 1u;
+  if (frame_counter != 0u && dlss_enabled != 0.f && !fsr1_active.load()
+      && fg_last_scene_handoff_frame.load(std::memory_order_acquire) == frame_counter - 1u) {
+    const uint32_t details = (last_taa_draw_frame.load(std::memory_order_relaxed) == frame_counter ? 1u : 0u)
+                           | (last_upscaler_eval_frame.load(std::memory_order_relaxed) == frame_counter ? 2u : 0u);
+    RecordFgTimingEvent("scene-handoff-gap", frame_counter, details);
+  }
   const uint64_t temporary_off_time = fg_temporary_off_time_ms.load(std::memory_order_acquire);
   // A short missing-frame interruption can recover without the full startup delay.
   // Keep the window open after requesting on so capture stays enabled as it settles.
@@ -8346,16 +8593,18 @@ inline void OnPresent(
   fg_present_frame.store(frame_counter, std::memory_order_release);
   ++frame_counter;
   camera_builder_frame.store(frame_counter, std::memory_order_release);
-  const bool want_halton = dlss_halton_jitter != 0.f && dlss_enabled != 0.f;
-  camera_builder_motion_offsets_enabled.store(want_halton && dlss_halton_motion_offsets != 0.f, std::memory_order_release);
+  const bool fg_requested = fg_enable_requested.load(std::memory_order_acquire);
+  const bool want_halton = (dlss_halton_jitter != 0.f || fg_requested) && dlss_enabled != 0.f;
+  const bool want_motion_offsets = dlss_halton_motion_offsets != 0.f || fg_requested;
+  camera_builder_motion_offsets_enabled.store(want_halton && want_motion_offsets, std::memory_order_release);
   if (want_halton) StartCameraBuilderTest();
   {
     std::shared_lock lock(camera_builder_test.mutex);
     camera_builder_halton_enabled.store(want_halton && camera_builder_test.state == CameraBuilderTest::State::active,
                                         std::memory_order_release);
-    fg_camera_capture_enabled.store(fg_bootstrap_test != 0.f && want_halton && dlss_halton_motion_offsets != 0.f
+    fg_camera_capture_enabled.store(want_halton && want_motion_offsets
                                         && !fg_swapchain_transition.load(std::memory_order_acquire)
-                                        && stable_frames >= (quick_recovery ? 2u : 8u) && camera_builder_test.state == CameraBuilderTest::State::active
+                                        && stable_frames >= (quick_recovery ? 1u : 8u) && camera_builder_test.state == CameraBuilderTest::State::active
                                         && camera_builder_test.offsets_hook_installed
                                         && farcry6_dlss::streamline::factory_hook_active.load(std::memory_order_acquire),
                                     std::memory_order_release);
@@ -8390,8 +8639,8 @@ inline void OnFgDestroySwapchain(reshade::api::swapchain* swapchain, bool) {
                static_cast<uint32_t>(desc.texture.width), static_cast<uint32_t>(desc.texture.height));
     }
   }
-  fg_enable_requested.store(false, std::memory_order_release);
   if (fg_mode_report.load(std::memory_order_relaxed) != 0) {
+    fg_enable_requested.store(false, std::memory_order_release);
     fg_unsafe_transitions.fetch_add(1u, std::memory_order_relaxed);
   }
   fg_swapchain_transition.store(true, std::memory_order_release);
@@ -8407,8 +8656,8 @@ inline bool OnFgFullscreenState(reshade::api::swapchain* swapchain, bool, void*)
       || swapchain == nullptr || swapchain->get_device() == nullptr
       || reinterpret_cast<void*>(swapchain->get_device()->get_native())
           != farcry6_dlss::streamline::bootstrap_device.load(std::memory_order_acquire)) return false;
-  fg_enable_requested.store(false, std::memory_order_release);
   if (fg_mode_report.load(std::memory_order_relaxed) != 0) {
+    fg_enable_requested.store(false, std::memory_order_release);
     fg_unsafe_transitions.fetch_add(1u, std::memory_order_relaxed);
   }
   fg_camera_capture_enabled.store(false, std::memory_order_release);
@@ -8474,6 +8723,8 @@ inline void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::sw
   if (fg_mode_swapchain == swapchain) fg_mode_present_outstanding = false;
   if (fg_mode.has_pending && fg_mode_swapchain == swapchain) {
     fg_mode.PresentCompleted(true);
+    fg_applied_generated.store(fg_pending_generated, std::memory_order_release);
+    fg_pending_generated = 0u;
     fg_resources_retained.store(fg_mode.ReadyForDisplayChange() && fg_pending_retain_resources, std::memory_order_release);
     fg_pending_retain_resources = false;
     fg_mode_report.store(fg_mode.ReadyForDisplayChange() ? 0 : 2, std::memory_order_relaxed);
@@ -8519,7 +8770,7 @@ inline void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::sw
       *fg_pending_present.token, sl::ViewportHandle(0u), clear_tags, 3u, nullptr);
   const bool complete_inputs = fg_pending_present.hudless_tagged && state_healthy
                             && result == sl::Result::eOk && clear_result == sl::Result::eOk
-                            && fg_input_test != 0.f && fg_camera_capture_enabled.load(std::memory_order_acquire)
+                            && FgInputsEnabled() && fg_camera_capture_enabled.load(std::memory_order_acquire)
                             && !fg_swapchain_transition.load(std::memory_order_acquire)
                             && !fg_hudless_retire_requested.load(std::memory_order_acquire);
   fg_pending_present = {};
@@ -8539,7 +8790,17 @@ inline void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::sw
     const uint64_t temporary_off_time = fg_temporary_off_time_ms.load(std::memory_order_acquire);
     const bool quick_recovery = fg_resources_retained.load(std::memory_order_acquire)
                              && temporary_off_time != 0u && GetTickCount64() - temporary_off_time < 1000u;
+    const uint32_t generated_frames = (std::min)(fg_requested_generated.load(std::memory_order_acquire),
+                                                 fg_state_max_generated.load(std::memory_order_relaxed));
+    if (generated_frames != 0u && fg_enable_requested.load(std::memory_order_acquire)
+        && fg_mode.applied == farcry6_dlss::frame_generation::ModeState::Mode::on && !fg_mode.has_pending
+        && fg_applied_generated.load(std::memory_order_acquire) != generated_frames) {
+      if (!SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode::on, generated_frames)) {
+        fg_enable_requested.store(false, std::memory_order_release);
+      }
+    }
     if (streak >= (quick_recovery ? 2u : 8u) && fg_enable_requested.load(std::memory_order_acquire)
+        && generated_frames != 0u && dlss_enabled != 0.f && upscaler_type < 0.5f
         && fg_mode.ReadyForDisplayChange() && farcry6_dlss::streamline::fg_set_options != nullptr
         && farcry6_dlss::streamline::reflex_set_options != nullptr
         && farcry6_dlss::streamline::bootstrap_fg_support.load() == 0
@@ -8548,7 +8809,7 @@ inline void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::sw
       reflex.mode = sl::ReflexMode::eLowLatency;
       const auto reflex_result = farcry6_dlss::streamline::reflex_set_options(reflex);
       fg_reflex_result.store(static_cast<int>(reflex_result), std::memory_order_relaxed);
-      if (reflex_result != sl::Result::eOk || !SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode::on)) {
+      if (reflex_result != sl::Result::eOk || !SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode::on, generated_frames)) {
         fg_enable_requested.store(false, std::memory_order_release);
         if (reflex_result == sl::Result::eOk) {
           reflex.mode = sl::ReflexMode::eOff;
@@ -8630,7 +8891,9 @@ inline void OnInitDevice(reshade::api::device* device) {
 
 inline void OnDestroyDevice(reshade::api::device* device) {
   if (device == nullptr) return;
-  if (device->get_api() == reshade::api::device_api::d3d12) {
+  if (device->get_api() == reshade::api::device_api::d3d12
+      && reinterpret_cast<void*>(device->get_native())
+          == farcry6_dlss::streamline::bootstrap_device.load(std::memory_order_acquire)) {
     farcry6_dlss::streamline::StopBootstrap(reinterpret_cast<void*>(device->get_native()));
     {
       std::lock_guard frame_lock(farcry6_dlss::streamline::frame_api_mutex);
@@ -8640,6 +8903,8 @@ inline void OnDestroyDevice(reshade::api::device* device) {
       fg_mode_swapchain = nullptr;
       fg_mode_present_outstanding = false;
       fg_pending_retain_resources = false;
+      fg_pending_generated = 0u;
+      fg_applied_generated.store(0u, std::memory_order_release);
       fg_resources_retained.store(false, std::memory_order_release);
       fg_temporary_off_time_ms.store(0u, std::memory_order_release);
       fg_last_missing_hudless_ms = 0u;
@@ -8652,6 +8917,8 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     fg_camera_capture_enabled.store(false, std::memory_order_release);
     fg_complete_input_streak.store(0u, std::memory_order_relaxed);
     fg_swapchain_transition.store(false, std::memory_order_release);
+    fg_output_color_space.store(reshade::api::color_space::unknown, std::memory_order_relaxed);
+    fg_output_format.store(0u, std::memory_order_relaxed);
     fg_present_frame.store(UINT64_MAX, std::memory_order_release);
     fg_successful_present_frame.store(UINT64_MAX, std::memory_order_release);
     fg_hdr_parameter_frame.store(UINT64_MAX, std::memory_order_release);
@@ -8661,6 +8928,8 @@ inline void OnDestroyDevice(reshade::api::device* device) {
       fg_camera_evaluations = {};
       fg_camera_sample_frame.store(UINT64_MAX, std::memory_order_release);
       fg_last_scene_handoff_frame.store(UINT64_MAX, std::memory_order_release);
+      last_taa_draw_frame.store(UINT64_MAX, std::memory_order_relaxed);
+      last_upscaler_eval_frame.store(UINT64_MAX, std::memory_order_relaxed);
       fg_stable_gameplay_frames.store(0u, std::memory_order_relaxed);
     }
   }
@@ -8709,6 +8978,26 @@ inline void OnDestroyDevice(reshade::api::device* device) {
   DebugLog("destroy device: device=%p was_ours=%d", static_cast<void*>(device), was_ours);
   if (was_ours) {
     ReleaseFgHudless(device);
+    {
+      std::unique_lock lock(rcas.mutex);
+      if (rcas.device == device) {
+        for (auto& slot : rcas.slots) {
+          if (slot.source_view.handle != 0u) device->destroy_resource_view(slot.source_view);
+          if (slot.target_view.handle != 0u) device->destroy_resource_view(slot.target_view);
+          if (slot.texture.handle != 0u) device->destroy_resource(slot.texture);
+          for (auto& table : slot.tables) {
+            if (table.handle != 0u) device->free_descriptor_table(table);
+          }
+          slot = {};
+        }
+        if (rcas.pipeline.handle != 0u) device->destroy_pipeline(rcas.pipeline);
+        if (rcas.layout.handle != 0u) device->destroy_pipeline_layout(rcas.layout);
+        rcas.pipeline = {};
+        rcas.layout = {};
+        rcas.pipeline_attempted = false;
+        rcas.device = nullptr;
+      }
+    }
     ReleaseNgx();
     ReleaseObjectMasks(device);
     ReleaseUnpack(unpack_device);

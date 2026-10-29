@@ -35,6 +35,12 @@ inline const char* SlotState(int i) {
   return farcry6_dlss::dlss::slot_hit[i].load() == 1 ? "ok" : "-";
 }
 
+void SyncFrameGenerationSetting() {
+  const uint32_t requested = static_cast<uint32_t>((std::clamp)(farcry6_dlss::dlss::fg_multiplier_setting, 0.f, 5.f));
+  farcry6_dlss::dlss::fg_requested_generated.store(requested, std::memory_order_release);
+  farcry6_dlss::dlss::fg_enable_requested.store(requested != 0u, std::memory_order_release);
+}
+
 static bool DlssStatusDraw() {
   using namespace farcry6_dlss::dlss;
   const std::string devices = DeviceSummary();
@@ -44,6 +50,14 @@ static bool DlssStatusDraw() {
       static_cast<unsigned long long>(stat_taa_draws.load()),
       static_cast<unsigned long long>(stat_dlss_ok.load()));
   ImGui::Text("State: %s", FailCodeText(stat_fail_code.load()));
+  const uint32_t fg_max = fg_state_max_generated.load(std::memory_order_relaxed);
+  const uint32_t fg_applied = fg_applied_generated.load(std::memory_order_relaxed);
+  if (fg_max != 0u) {
+    ImGui::Text("Frame Generation: %s  max: %ux", fg_applied == 0u ? "off" : "on", fg_max + 1u);
+    if (fg_applied != 0u) ImGui::Text("Frame Generation active: %ux", fg_applied + 1u);
+  } else if (fg_multiplier_setting != 0.f) {
+    ImGui::TextUnformatted("Frame Generation: waiting for support and gameplay inputs");
+  }
   ImGui::Text(
       "Slots: b0:%s t0:%s t2:%s t5:%s t6:%s", SlotState(0), SlotState(1), SlotState(2),
       SlotState(3), SlotState(4));
@@ -100,7 +114,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Copy Report",
         .section = "Antialiasing",
-        .tooltip = "Copies the live DLSS pipeline state (inputs, sizes, jitter, counters) to the clipboard.",
+        .tooltip = "Copies the addon report to the clipboard, including when Upscaler Replacement is off.",
         .on_click = [] {
           ImGui::SetClipboardText(farcry6_dlss::dlss::BuildDebugReport().c_str());
           return true;
@@ -127,31 +141,15 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
     new renodx::utils::settings::Setting{
-        .key = "FGStartExperiment",
-        .binding = nullptr,
-        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .key = "FrameGeneration",
+        .binding = &farcry6_dlss::dlss::fg_multiplier_setting,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f,
-        .label = "Start Frame Generation Experiment",
+        .label = "Frame Generation",
         .section = "Antialiasing",
-        .tooltip = "Experimental HDR10 gameplay test. Requires presentation and input tests plus Halton motion offsets. Repeated missing HUD-less inputs stop automatic retries. Stop the experiment and confirm FG is off before changing display settings or leaving gameplay.",
-        .on_click = [] {
-          farcry6_dlss::dlss::fg_enable_requested.store(true);
-          return true;
-        },
-        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "FGStopExperiment",
-        .binding = nullptr,
-        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
-        .default_value = 0.f,
-        .label = "Stop Frame Generation Experiment",
-        .section = "Antialiasing",
-        .tooltip = "Requests FG off. Copy Report confirms when an off present has completed.",
-        .on_click = [] {
-          farcry6_dlss::dlss::fg_enable_requested.store(false);
-          return true;
-        },
+        .tooltip = "Choose a frame multiplier. The supported maximum depends on your GPU and driver; higher selections use the maximum supported. Restart the game if Streamline was not enabled at startup. Requires DLSS and SDR or HDR10 output.",
+        .labels = {"Off", "2x", "3x", "4x", "5x", "6x"},
+        .on_change_value = [](float, float) { SyncFrameGenerationSetting(); },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
     new renodx::utils::settings::Setting{
@@ -332,6 +330,17 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported() && farcry6_dlss::dlss::upscaler_type >= 0.5f; },
     },
     new renodx::utils::settings::Setting{
+        .key = "FSRDescriptorGuard",
+        .binding = &farcry6_dlss::dlss::fsr_descriptor_guard,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "FSR Runtime Descriptor Guard (test)",
+        .section = "Antialiasing",
+        .tooltip = "Skip descriptor tracking on the thread running FSR context creation and dispatch. Auto enables the guard on AMD. Experimental crash workaround.",
+        .labels = {"Auto", "Off", "On"},
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported() && farcry6_dlss::dlss::upscaler_type >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLSSEnabled",
         .binding = &farcry6_dlss::dlss::dlss_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -339,6 +348,19 @@ renodx::utils::settings::Settings settings = {
         .label = "Upscaler Replacement",
         .section = "Antialiasing",
         .tooltip = "Runs the selected upscaler when its inputs are available. DLSS and FSR require their respective runtime DLLs next to the game executable.",
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RCASStrength",
+        .binding = &farcry6_dlss::dlss::dlss_rcas_strength,
+        .default_value = 0.f,
+        .label = "RCAS Sharpening",
+        .section = "Antialiasing",
+        .tooltip = "AMD RCAS after upscaling, with noise reduction enabled. Zero disables sharpening.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
     new renodx::utils::settings::Setting{
@@ -566,7 +588,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
   }
 
-  renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
+  renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff, &SyncFrameGenerationSetting);
   farcry6_dlss::dlss::Use(fdw_reason);
 
   return TRUE;
