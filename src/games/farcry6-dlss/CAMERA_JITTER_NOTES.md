@@ -206,3 +206,90 @@ The experimental hook now runs after this writer and requires matching render
 size, projection, current-frame Halton history and original two-phase offsets.
 Copy Report must establish whether it matched and whether the later scene
 buffer actually contains the desired offsets; visual and GPU verification remain.
+
+## Aiming-down-sights investigation
+
+The 2026-10-29 aiming report captured four decoded center-pixel motion samples
+with the Halton camera and motion-offset patch enabled. The samples correlated
+with the current jitter: separate least-squares slopes were approximately 0.55
+for x and 0.45 for y, with correlations 0.98 and 0.88. The camera reprojection
+estimate was close to zero. This is evidence of a jitter-related component at
+that pixel, not a calibrated correction: four samples cannot distinguish weapon
+animation, filtered object edges, prior-frame jitter or GPU frame mismatches.
+The object mask was unavailable, so the samples do not establish which motion
+branch supplied the pixel.
+
+In a live aiming snapshot, the motion producer `0xD9289B6A` u0 and the TAA
+draw's t0 were the same half-resolution texture. A captured geometry draw using
+pixel shader `0xD8F98738` wrote the full-resolution texture bound as the motion
+producer's t3 and also wrote its flags input t2. Its vertex shader contains leaf
+data, so this draw cannot be identified as the weapon. The producer selects t3
+only for the depth-selected sample whose t2 alpha has bit 3 set; otherwise it
+computes camera motion. Live readbacks of these transient resources are not
+frozen at the producer dispatch and must not be used to classify the weapon.
+Comparing snapshots while changing aim also changes visible scene draws; shader
+counts alone did not identify the weapon. A dispatch-time capture of the chosen
+depth, flag, source motion and decoded motion at the same pixel over more Halton
+phases is needed before choosing a correction or modifying the weapon path.
+
+In a subsequent weapon-out / holstered comparison, pixel shader `0xF0520574`
+appeared only with the weapon out and wrote the producer's t2/t3 resources, but
+the user bypassed it and identified it as likely foliage, not the weapon. Pixel
+shader `0x8A7C5124` also appeared only with the weapon out, but its bypass did
+not identify the weapon or arms. Its render target was not the TAA color input
+in the captured frame. Those snapshot differences alone do not identify the
+first-person model; shared shaders, culling and transient resource reuse remain
+possible. Find the first-person draws by visual isolation and then trace their
+actual outputs before choosing a correction.
+
+The next comparison included per-draw bindings. In the weapon-out snapshot,
+the user confirmed vertex shader `0xD1E29DD9` as weapon geometry by bypassing
+it; nearby draws 60 and 64 were identified as arm and accessory geometry. The
+three captured pipelines used vertex/pixel pairs `0x0928F35C/0x74B8E3E2`,
+`0xCBF3A279/0x15CED94D`, and `0xD1E29DD9/0x86D6B1FC`. All three used the same
+viewport b0 buffer range, distinct from the main scene range in that snapshot,
+and wrote the flags and full-resolution motion textures consumed by the motion
+producer. The two arm/weapon vertex shaders `0xCBF3A279` and `0xD1E29DD9`
+read current matrix registers 20-23 and previous matrix registers 24, 25 and
+27 from b0. The weapon pixel shader also reads b0 register 44. This supports a
+separate first-person camera view, but neither the camera-buffer contents at
+draw execution nor consistent handling across other weapons is yet proven.
+Snapshot draw indices, buffer offsets and material handles are not stable IDs.
+
+The subsequent four-interval Camera Coverage report read the confirmed weapon
+and accessory viewport b0 on the CPU. In every interval their projection jitter
+was the game's alternating `(-0.25, 0.25)` and `(0.25, -0.25)` pixels; main
+scene draws in the same CPU intervals instead used Halton samples
+`(-0.375, -0.0556)`, `(0.4375, -0.3889)`, `(-0.0625, 0.4630)`, and
+`(0.1875, 0.1296)`. DLSS receives the scene Halton value. This is a concrete
+first-person/world jitter mismatch and a strong candidate for the observed
+shaking. The readings are CPU-side and do not by themselves prove the GPU read
+the same bytes. Identify where the first-person provider is built or copied and
+verify its own matrices and motion offsets before changing it; the existing
+scene-camera hook's match counters do not establish first-person coverage.
+The next report recorded zero matching two-phase perspective projections at
+the existing post-parameter writer with Halton motion offsets and detailed
+diagnostics enabled. This does not establish whether the weapon was visible
+throughout the session or whether its provider traverses that writer at a
+different stage. A temporary diagnostic at the existing camera builder also showed zero matching builder
+calls with detailed diagnostics enabled; this does not prove the first-person
+view was active during the whole measurement. In a short live trace of the
+provider copy constructor at `0x18063ea50`, 852 calls produced no source
+matching the observed full-size two-phase projection. Monitoring the mapped
+upload range produced no access events, so it did not identify its writer. The
+temporary instrumentation was detached. None of these negative results proves
+that the first-person provider can never traverse those paths.
+
+Offline x64 analysis identified another camera builder at `0x1806cb5b0`.
+It copies a viewport provider through `0x180644930`, then builds projection,
+view-projection, current clip and previous clip fields using the jitter pair at
+its third argument +`0x68`. The third argument's +`0x20` and +`0x24` dimensions
+are also read by the existing parameter writer, and direct call sites pass the
+same view object to both routines. The builder's fifth argument selects a
+no-jitter branch. These static facts do not yet prove that it creates the
+weapon view. An opt-in, version-checked experiment now supplies a copied view
+with Halton jitter to that builder only for full-render-size, two-phase views;
+it reports attempted calls, projection matches and motion-offset patches. The
+engine constructs the matrices itself. The user reported that this fixed the
+first-person shaking. Coverage across other weapons, motion, and unrelated views
+has not been established. Its source is specific to the DLL identified above.

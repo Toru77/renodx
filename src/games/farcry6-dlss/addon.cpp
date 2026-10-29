@@ -204,6 +204,17 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
     new renodx::utils::settings::Setting{
+        .key = "DLSSFirstPersonHalton",
+        .binding = &farcry6_dlss::dlss::dlss_first_person_halton,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "First-Person Halton Camera (test)",
+        .section = "Antialiasing",
+        .tooltip = "Experimental alternate camera builder hook for first-person jitter. Requires Halton Jitter. Check Copy Report for verified matches.",
+        .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f && farcry6_dlss::dlss::dlss_halton_jitter != 0.f; },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLSSHaltonMotionOffsets",
         .binding = &farcry6_dlss::dlss::dlss_halton_motion_offsets,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -241,7 +252,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Capture Motion Samples",
         .section = "Antialiasing",
-        .tooltip = "Captures four synchronized center-pixel motion samples. Hold the camera still, then use Copy Report.",
+        .tooltip = "Captures 16 center-pixel motion samples with GPU waits. Hold the camera still until complete, then use Copy Report.",
         .on_click = [] {
           using namespace farcry6_dlss::dlss;
           dlss_detailed_diagnostics = 1.f;

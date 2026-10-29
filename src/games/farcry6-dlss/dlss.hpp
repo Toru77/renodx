@@ -2139,11 +2139,17 @@ inline std::atomic<uint64_t> scene_matrix_wrong_projection{0u};
 
 using CameraBuilder = void (*)(void*, void*, void*, void*, void*, void*, void*, const float*, uint32_t);
 using CameraParametersWriter = void (*)(void*, void*, void*);
+using AlternateCameraBuilder = void (*)(void*, void*, void*, void*, bool);
 struct CameraBuilderTest {
   std::shared_mutex mutex;
   CameraBuilder original = nullptr;
   CameraParametersWriter offsets_original = nullptr;
+  AlternateCameraBuilder alternate_original = nullptr;
   bool offsets_hook_installed = false;
+  bool alternate_hook_installed = false;
+  uint64_t alternate_attempts = 0u;
+  uint64_t alternate_verified = 0u;
+  uint64_t alternate_offsets_patched = 0u;
   void* target = nullptr;
   enum class State { idle, unavailable, unsupported, install_failed, active } state = State::idle;
   uint64_t calls = 0u;
@@ -2152,6 +2158,10 @@ struct CameraBuilderTest {
   uint64_t motion_offset_patched = 0u;
   uint64_t motion_offset_rejected = 0u;
   float motion_offset_before[2] = {};
+  uint64_t two_phase_writer_calls = 0u;
+  uint64_t two_phase_writer_frame = UINT64_MAX;
+  float two_phase_writer_projection[2] = {};
+  float two_phase_writer_offsets[2] = {};
   uint64_t halton_frame = UINT64_MAX;
   float halton_pixels[2] = {};
   struct HaltonSample {
@@ -2175,6 +2185,7 @@ struct CameraBuilderTest {
 inline CameraBuilderTest camera_builder_test;
 inline float dlss_halton_jitter = 0.f;
 inline float dlss_halton_motion_offsets = 0.f;
+inline float dlss_first_person_halton = 0.f;
 inline std::atomic<bool> camera_builder_motion_offsets_enabled{false};
 inline std::atomic<bool> camera_builder_halton_enabled{false};
 inline std::atomic<uint64_t> camera_builder_frame{0u};
@@ -2254,6 +2265,55 @@ inline void HookCameraBuilder(void* provider, void* view, void* previous_view, v
   }
 }
 
+inline void HookAlternateCameraBuilder(void* provider, void* source, void* view, void* parameters, bool no_jitter) {
+  auto* original = camera_builder_test.alternate_original;
+  const uint32_t width = last_render_width.load();
+  const uint32_t height = last_render_height.load();
+  if (!camera_builder_halton_enabled.load(std::memory_order_acquire) || dlss_first_person_halton == 0.f
+      || no_jitter || provider == nullptr || view == nullptr || width == 0u || height == 0u) {
+    original(provider, source, view, parameters, no_jitter);
+    return;
+  }
+  alignas(16) std::array<uint8_t, 0xd8> view_copy = {};
+  std::memcpy(view_copy.data(), view, view_copy.size());
+  uint32_t viewport[2] = {};
+  float old_jitter[2] = {};
+  std::memcpy(viewport, view_copy.data() + 0x20u, sizeof(viewport));
+  std::memcpy(old_jitter, view_copy.data() + 0x68u, sizeof(old_jitter));
+  if (viewport[0] != width || viewport[1] != height || !std::isfinite(old_jitter[0]) || !std::isfinite(old_jitter[1])
+      || std::abs(std::abs(old_jitter[0]) * width - 0.5f) >= 0.01f
+      || std::abs(std::abs(old_jitter[1]) * height - 0.5f) >= 0.01f) {
+    original(provider, source, view, parameters, no_jitter);
+    return;
+  }
+  const uint64_t frame = camera_builder_frame.load(std::memory_order_acquire);
+  const uint32_t step = static_cast<uint32_t>(frame % 16u) + 1u;
+  const float pixels[2] = {HaltonValue(step, 2u) - 0.5f, HaltonValue(step, 3u) - 0.5f};
+  const float replacement[2] = {-2.f * pixels[0] / width, 2.f * pixels[1] / height};
+  std::memcpy(view_copy.data() + 0x68u, replacement, sizeof(replacement));
+  original(provider, source, view_copy.data(), parameters, no_jitter);
+  float projection[16] = {};
+  std::memcpy(projection, static_cast<const uint8_t*>(provider) + 0xa0u, sizeof(projection));
+  const bool verified = projection[14] == -1.f && projection[15] == 0.f
+      && std::abs(-projection[2] * width * 0.5f - pixels[0]) < 0.01f
+      && std::abs(projection[6] * height * 0.5f - pixels[1]) < 0.01f;
+  bool offsets_patched = false;
+  if (verified && camera_builder_motion_offsets_enabled.load(std::memory_order_acquire)) {
+    float offsets[2] = {};
+    auto* camera = static_cast<uint8_t*>(provider);
+    std::memcpy(offsets, camera + 0x2e0u, sizeof(offsets));
+    if (std::abs(std::abs(offsets[0]) - 0.25f) < 0.001f
+        && std::abs(std::abs(offsets[1]) - 0.25f) < 0.001f) {
+      std::memcpy(camera + 0x2e0u, pixels, sizeof(pixels));
+      offsets_patched = true;
+    }
+  }
+  std::unique_lock lock(camera_builder_test.mutex);
+  ++camera_builder_test.alternate_attempts;
+  if (verified) ++camera_builder_test.alternate_verified;
+  if (offsets_patched) ++camera_builder_test.alternate_offsets_patched;
+}
+
 // This writer copies the game's original two-phase offsets into the provider.
 // Only modify a render-sized camera whose projection matches this frame's Halton sample.
 inline void HookCameraParametersWriter(void* provider, void* view, void* parameters) {
@@ -2271,6 +2331,17 @@ inline void HookCameraParametersWriter(void* provider, void* view, void* paramet
   std::memcpy(old_offsets, camera + 0x2e0u, sizeof(old_offsets));
   std::unique_lock lock(camera_builder_test.mutex);
   const auto& sample = camera_builder_test.halton_history[frame % camera_builder_test.halton_history.size()];
+  if (dlss_detailed_diagnostics != 0.f && width != 0u && height != 0u
+      && viewport[0] == static_cast<float>(width) && viewport[1] == static_cast<float>(height)
+      && projection[14] == -1.f && projection[15] == 0.f
+      && std::abs(std::abs(-projection[2] * width * 0.5f) - 0.25f) < 0.001f
+      && std::abs(std::abs(projection[6] * height * 0.5f) - 0.25f) < 0.001f) {
+    ++camera_builder_test.two_phase_writer_calls;
+    camera_builder_test.two_phase_writer_frame = frame;
+    camera_builder_test.two_phase_writer_projection[0] = -projection[2] * width * 0.5f;
+    camera_builder_test.two_phase_writer_projection[1] = projection[6] * height * 0.5f;
+    std::copy(std::begin(old_offsets), std::end(old_offsets), camera_builder_test.two_phase_writer_offsets);
+  }
   const bool recognized = width != 0u && height != 0u && sample.frame == frame
       && sample.width == width && sample.height == height
       && viewport[0] == static_cast<float>(width) && viewport[1] == static_cast<float>(height)
@@ -2341,6 +2412,20 @@ inline void StartCameraBuilderTest() {
       return;
     }
     renodx::utils::minhook::Enable(hook);
+    constexpr uint32_t alternate_rva = 0x6cb5b0u;
+    constexpr uint8_t alternate_signature[] = {0x40, 0x55, 0x53, 0x56, 0x57, 0x48, 0x8d, 0xac,
+                                               0x24, 0x98, 0xfe, 0xff, 0xff, 0x48, 0x81, 0xec};
+    if (std::memcmp(base + alternate_rva, alternate_signature, sizeof(alternate_signature)) == 0) {
+      try {
+        const auto alternate_target = reinterpret_cast<AlternateCameraBuilder>(const_cast<uint8_t*>(base + alternate_rva));
+        const renodx::utils::minhook::Function alternate_hook(alternate_target, &HookAlternateCameraBuilder, &camera_builder_test.alternate_original);
+        renodx::utils::minhook::Create(alternate_hook);
+        renodx::utils::minhook::Enable(alternate_hook);
+        camera_builder_test.alternate_hook_installed = true;
+      } catch (const std::exception&) {
+        camera_builder_test.alternate_hook_installed = false;
+      }
+    }
     // A separate guarded hook handles the later offset copy; failure leaves
     // the established Halton camera hook active without changing offsets.
     constexpr uint32_t offsets_rva = 0x6cbe10u;
@@ -3267,7 +3352,7 @@ struct MotionCapture {
     float correction_delta[2] = {};
     uint64_t frame = 0u;
   };
-  std::array<Sample, 4> samples = {};
+  std::array<Sample, 16> samples = {};
   uint32_t count = 0u;
   uint32_t x = 0u, y = 0u;
   Sample pending = {};
@@ -5520,6 +5605,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   static bool previous_camera_override = false;
   static bool previous_builder_halton = false;
   static bool previous_motion_offsets = false;
+  static bool previous_first_person_halton = false;
   static bool previous_object_correction = false;
   static float previous_object_strength = 1.f;
   // A temporarily unavailable mask should not repeatedly erase DLSS history.
@@ -5529,6 +5615,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   if (current_jitter_source != previous_jitter_source || current_jitter_flip != previous_jitter_flip
       || camera_override_applied != previous_camera_override || builder_halton != previous_builder_halton
       || camera_builder_motion_offsets_enabled.load(std::memory_order_acquire) != previous_motion_offsets
+      || (dlss_first_person_halton != 0.f) != previous_first_person_halton
       || current_object_correction != previous_object_correction
       || (current_object_correction && object_strength != previous_object_strength)) {
     ngx.reset = true;
@@ -5537,6 +5624,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     previous_camera_override = camera_override_applied;
     previous_builder_halton = builder_halton;
     previous_motion_offsets = camera_builder_motion_offsets_enabled.load(std::memory_order_acquire);
+    previous_first_person_halton = dlss_first_person_halton != 0.f;
     previous_object_correction = current_object_correction;
     previous_object_strength = object_strength;
   }
@@ -6487,8 +6575,8 @@ inline std::string BuildDebugReport() {
       default: break;
     }
     char line[256];
-    snprintf(line, sizeof(line), "  motion samples   : %s %u/4, center=(%u,%u) input pixels\n",
-             state, motion_capture.count, motion_capture.x, motion_capture.y);
+    snprintf(line, sizeof(line), "  motion samples   : %s %u/%zu, center=(%u,%u) input pixels\n",
+             state, motion_capture.count, motion_capture.samples.size(), motion_capture.x, motion_capture.y);
     out += line;
     for (uint32_t i = 0u; i < motion_capture.count; ++i) {
       const auto& sample = motion_capture.samples[i];
@@ -6827,6 +6915,19 @@ inline std::string BuildDebugReport() {
              static_cast<unsigned long long>(camera_builder_test.motion_offset_patched),
              static_cast<unsigned long long>(camera_builder_test.motion_offset_rejected),
              camera_builder_test.motion_offset_before[0], camera_builder_test.motion_offset_before[1]);
+    out += line;
+    snprintf(line, sizeof(line), "    alternate camera: test=%s hook=%s attempts=%llu projection-verified=%llu offsets-patched=%llu\n",
+             dlss_first_person_halton != 0.f ? "on" : "off",
+             camera_builder_test.alternate_hook_installed ? "installed" : "unavailable",
+             static_cast<unsigned long long>(camera_builder_test.alternate_attempts),
+             static_cast<unsigned long long>(camera_builder_test.alternate_verified),
+             static_cast<unsigned long long>(camera_builder_test.alternate_offsets_patched));
+    out += line;
+    snprintf(line, sizeof(line), "    two-phase writer: calls=%llu frame=%llu projection=(%.4f,%.4f) offsets=(%.4f,%.4f); CPU provider, not draw identity\n",
+             static_cast<unsigned long long>(camera_builder_test.two_phase_writer_calls),
+             static_cast<unsigned long long>(camera_builder_test.two_phase_writer_frame),
+             camera_builder_test.two_phase_writer_projection[0], camera_builder_test.two_phase_writer_projection[1],
+             camera_builder_test.two_phase_writer_offsets[0], camera_builder_test.two_phase_writer_offsets[1]);
     out += line;
     snprintf(line, sizeof(line), "    halton at eval : %s step=%u camera px=(%.4f,%.4f) scene matches=%s; flip ignored; NGX px shown above\n",
              report.builder_halton_at_eval ? "yes" : "no", report.builder_halton_step_at_eval,
@@ -7984,7 +8085,7 @@ inline void OnPresent(
     }
     if (read_capture) {
       // OnExecuteCommandList identifies the submitting queue; Present occurs
-      // after submission. Waiting here is limited to the four requested samples.
+      // after submission. Waiting here is limited to the requested samples.
       queue->wait_idle();
       uint16_t values[2] = {};
       uint8_t mask_values[4] = {};
