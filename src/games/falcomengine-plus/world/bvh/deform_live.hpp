@@ -41,6 +41,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <include/reshade.hpp>
@@ -268,6 +269,7 @@ struct DynamicIdentity {
   std::string failure;
   uint32_t node_offset = 0u;
   uint32_t node_count = 0u;
+  uint32_t leaf_count = 0u;
   uint32_t leaf_offset = 0u;
   uint32_t refit_offset = 0u;
   uint32_t level_offset = 0u;
@@ -376,7 +378,9 @@ struct DeformLiveStats {
   uint32_t new_identities = 0u;
   uint32_t new_after_warmup = 0u;     // created more than kDynamicWarmupFrames after the first
   uint32_t resets_with_objects = 0u;
-  uint64_t reset_objects_dropped = 0u;  // traced objects dropped by BLAS store resets
+  uint64_t reset_objects_dropped = 0u;  // traced objects dropped by BLAS store resets (compaction keeps them: stays 0)
+  uint32_t compact_failures = 0u;  // store compactions whose new arenas could not be created (retried next present)
+  uint64_t reclaimed_bytes = 0u;   // retired BLAS bytes freed by store compactions
   std::string last_failure;
 };
 
@@ -1019,6 +1023,7 @@ inline void ResolveDynamicTopology(reshade::api::device* device, reshade::api::c
     identity.resident = true;
     identity.node_offset = entry.node_offset;
     identity.node_count = static_cast<uint32_t>(result.blas.nodes.size());
+    identity.leaf_count = static_cast<uint32_t>(result.blas.leaves.size());
     identity.leaf_offset = entry.leaf_offset;
     identity.refit_offset = entry.refit_offset;
     identity.level_offset = static_cast<uint32_t>(result.order.size());
@@ -1119,9 +1124,25 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
     uint64_t size;
   };
   std::vector<TopologyCopy> copies;
+  struct StoreMove {
+    uint64_t key;
+    uint32_t node_from;
+    uint32_t node_to;
+    uint32_t node_count;
+    uint32_t leaf_from;
+    uint32_t leaf_to;
+    uint32_t leaf_count;
+    uint32_t refit_from;
+    uint32_t refit_to;
+    uint32_t refit_count;
+  };
+  std::vector<StoreMove> moves;
+  uint64_t node_total = 0u;
+  uint64_t leaf_total = 0u;
+  uint64_t refit_total = 0u;
   reshade::api::resource arena = {0u};
   reshade::api::resource staging = {0u};
-  bool reset = false;
+  bool compact = false;
   std::vector<std::string> identity_lines;
   {
     std::lock_guard<std::mutex> lock(g_deform_live.mutex);
@@ -1198,7 +1219,7 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
     state.stats.frame_vertices = this_frame ? state.arena_used / kDynamicVertexBytes : 0u;
     state.stats.frame_objects = static_cast<uint32_t>(objects.size());
     state.stats.frame_pending = state.stats.frame_captures - static_cast<uint32_t>(objects.size());
-    // Retire identities not captured for a while; reset the BLAS store when
+    // Retire identities not captured for a while; compact the BLAS store when
     // its garbage dominates.
     for (auto it = state.identities.begin(); it != state.identities.end();) {
       if (frame - it->second.last_frame > kDynamicRetireFrames && !it->second.topology_pending) {
@@ -1214,26 +1235,26 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
                                 + state.refit.used * state.refit.stride;
     state.stats.used_bytes = used_bytes;
     if (state.stats.garbage_bytes > kDynamicResetGarbageBytes && state.stats.garbage_bytes * 2u > used_bytes) {
-      reset = true;
-      for (auto& [key, identity] : state.identities) {
-        (void)key;
-        identity.resident = false;  // rebuilt from a new topology read (in flight reads stay valid)
+      // Compact instead of dropping: the resident BLAS are copied to fresh arenas after the lock, so the
+      // identities stay resident and this present's objects stay traced.
+      compact = true;
+      for (const auto& [key, identity] : state.identities) {
+        if (!identity.resident) continue;
+        const uint32_t refit_count = identity.level_offset + identity.level_count + 1u;  // the order, then the level starts
+        moves.push_back({.key = key,
+                         .node_from = identity.node_offset,
+                         .node_to = static_cast<uint32_t>(node_total),
+                         .node_count = identity.node_count,
+                         .leaf_from = identity.leaf_offset,
+                         .leaf_to = static_cast<uint32_t>(leaf_total),
+                         .leaf_count = identity.leaf_count,
+                         .refit_from = identity.refit_offset,
+                         .refit_to = static_cast<uint32_t>(refit_total),
+                         .refit_count = refit_count});
+        node_total += identity.node_count;
+        leaf_total += identity.leaf_count;
+        refit_total += refit_count;
       }
-      state.nodes.used = 0u;
-      state.leaves.used = 0u;
-      state.refit.used = 0u;
-      state.stats.garbage_bytes = 0u;
-      state.stats.resets += 1u;
-      if (state.log_lines < kPoolLifecycleLogLines) {
-        state.log_lines += 1u;
-        identity_lines.push_back(renodx::utils::log::BuildString("falcom_world::deform: frame ", frame,
-                                                                 ": BLAS store reset, ", state.identities.size(),
-                                                                 " identities rebuilt"));
-      }
-      if (!objects.empty()) state.stats.resets_with_objects += 1u;
-      state.stats.reset_objects_dropped += objects.size();
-      objects.clear();
-      info.clear();
     }
     // Presence (diagnostic): presents without objects after presents with objects, and identities that dropped out.
     const bool traced = !info.empty();
@@ -1270,8 +1291,80 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
     state.capture_frame = frame + 1u;
   }
   for (const std::string& line : identity_lines) renodx::utils::log::i(line);
-  (void)reset;
   for (const TopologyCopy& copy : copies) cmd_list->copy_buffer_region(arena, copy.source_offset, staging, copy.dest_offset, copy.size);
+  // 2b. BLAS store compaction. Graphics calls, so not under the lock; the
+  // arenas are only touched on the present thread.
+  if (compact) {
+    stage.Set("present: deform live (compact)");
+    DynamicArena nodes = {.stride = g_deform_live.nodes.stride, .writable = g_deform_live.nodes.writable};
+    DynamicArena leaves = {.stride = g_deform_live.leaves.stride, .writable = g_deform_live.leaves.writable};
+    DynamicArena refit = {.stride = g_deform_live.refit.stride, .writable = g_deform_live.refit.writable};
+    const bool created = EnsureDynamicArena(device, cmd_list, &nodes, node_total)
+                         && EnsureDynamicArena(device, cmd_list, &leaves, leaf_total)
+                         && EnsureDynamicArena(device, cmd_list, &refit, refit_total);
+    if (created) {
+      const auto copy = [cmd_list](const DynamicArena& source, const DynamicArena& dest, uint32_t source_offset,
+                                   uint32_t dest_offset, uint32_t count) {
+        if (count == 0u) return;
+        cmd_list->copy_buffer_region(source.buffer, uint64_t{source_offset} * source.stride, dest.buffer,
+                                     uint64_t{dest_offset} * dest.stride, uint64_t{count} * source.stride);
+      };
+      for (const StoreMove& move : moves) {
+        copy(g_deform_live.nodes, nodes, move.node_from, move.node_to, move.node_count);
+        copy(g_deform_live.leaves, leaves, move.leaf_from, move.leaf_to, move.leaf_count);
+        copy(g_deform_live.refit, refit, move.refit_from, move.refit_to, move.refit_count);
+      }
+    }
+    std::string compact_line;
+    {
+      std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+      DeformLiveState& state = g_deform_live;
+      if (created) {
+        std::swap(state.nodes, nodes);
+        std::swap(state.leaves, leaves);
+        std::swap(state.refit, refit);
+        state.nodes.used = node_total;
+        state.leaves.used = leaf_total;
+        state.refit.used = refit_total;
+        for (const StoreMove& move : moves) {
+          const auto it = state.identities.find(move.key);
+          if (it == state.identities.end()) continue;
+          it->second.node_offset = move.node_to;
+          it->second.leaf_offset = move.leaf_to;
+          it->second.refit_offset = move.refit_to;
+        }
+        for (size_t i = 0; i < objects.size(); ++i) {
+          const auto it = state.identities.find(info[i].key);
+          if (it == state.identities.end()) continue;
+          objects[i] = MakeDynamicObjectGPU(it->second, objects[i].vertex_base);
+        }
+        state.stats.reclaimed_bytes += state.stats.garbage_bytes;
+        state.stats.garbage_bytes = 0u;
+        state.stats.used_bytes = node_total * state.nodes.stride + leaf_total * state.leaves.stride
+                                 + refit_total * state.refit.stride;
+        state.stats.resets += 1u;
+        if (!objects.empty()) state.stats.resets_with_objects += 1u;
+        if (state.log_lines < kPoolLifecycleLogLines) {
+          state.log_lines += 1u;
+          compact_line = renodx::utils::log::BuildString("falcom_world::deform: frame ", frame,
+                                                         ": BLAS store compacted, ", moves.size(), " BLAS kept, ",
+                                                         objects.size(), " objects traced");
+        }
+      } else {
+        state.stats.compact_failures += 1u;
+        const char* failed_arena =
+            nodes.capacity < node_total ? "nodes" : (leaves.capacity < leaf_total ? "leaves" : "refit");
+        state.stats.last_failure = renodx::utils::log::BuildString(
+            "BLAS store compaction: ", failed_arena, " arena not created (nodes ", node_total, " x ", nodes.stride,
+            " B, leaves ", leaf_total, " x ", leaves.stride, " B, refit ", refit_total, " x ", refit.stride, " B)");
+      }
+    }
+    if (!compact_line.empty()) renodx::utils::log::i(compact_line);
+    // The old arenas after a compaction; the partly created new ones after a failure.
+    DestroyDynamicArena(device, &nodes);
+    DestroyDynamicArena(device, &leaves);
+    DestroyDynamicArena(device, &refit);
+  }
 
   // 3. Objects and refit.
   stage.Set("present: deform live (refit)");
@@ -1386,6 +1479,8 @@ inline void DumpDeformLive() {
       << ", \"recreated\": " << stats.recreated << ", \"resets\": " << stats.resets
       << ", \"resets_with_objects\": " << stats.resets_with_objects
       << ", \"reset_objects_dropped\": " << stats.reset_objects_dropped
+      << ", \"compact_failures\": " << stats.compact_failures << ", \"reclaimed_bytes\": " << stats.reclaimed_bytes
+      << ", \"used_bytes\": " << stats.used_bytes << ", \"garbage_bytes\": " << stats.garbage_bytes
       << ", \"presents_no_objects\": " << stats.presents_no_objects
       << ", \"calls_max_per_frame\": " << stats.calls_max_per_frame << ", \"new_identities\": " << stats.new_identities
       << ", \"new_after_warmup\": " << stats.new_after_warmup << ", \"frame_captures\": " << stats.frame_captures << ", \"frame_objects\": " << stats.frame_objects

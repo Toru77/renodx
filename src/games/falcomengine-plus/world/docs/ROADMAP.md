@@ -59,6 +59,8 @@ M3a (CPU, pool hook timing), implemented, not validated in game: new Subset timi
 
 M3b (timing only), implemented, not validated in game: with GC owning RTAO and the pool reduced (G5), the CPU live TLAS is not rebuilt or refit, so tlas_rebuild/refit/skip/apply, blas_build and the phase rows are 0 and the tlas_instances gauge is stale. New Subset rows dxr_tlas_gpu, dxr_records_gpu, dxr_characters_gpu (rt12 lighting D3D12 timestamps) and gc_blas_build_gpu (GC BLAS build timestamps), not in gpu_total because gpu_rtao spans the fence-B wait; Subset blocks gc_present and rt12_present (OnWorldPresentBvh); gauge pool_reduced (1 while reduced). Owner check: 30 s rtao_dxr run at the village spot.
 
+Deform store compaction (skinned-mesh flicker fix), implemented, not validated in game: when retired BLAS garbage in bvh/deform_live.hpp passes 8 MB and half of the store, the store is compacted instead of reset: the resident BLAS are copied on the GPU to fresh arenas (sized to the live data), their offsets move, and they stay resident, so characters stay traced (compute and DXR) in the reset present. world_deform_live.json stats: resets still counts compactions; reset_objects_dropped stays 0; new compact_failures, reclaimed_bytes, used_bytes, garbage_bytes. Harness: test_deform_live step 6b. Owner check: play long enough for resets > 0, send world_deform_live.json and the ReShade log (lines "BLAS store compacted").
+
 | Feature | Owner test list | Where |
 |---|---|---|
 | Path 2: moving objects out of the static pool (P2a, P2a-rev) | Pool Scan near moving objects, rule line, Depth Compare | HISTORY: Path 2, round P2a; round P2a-rev |

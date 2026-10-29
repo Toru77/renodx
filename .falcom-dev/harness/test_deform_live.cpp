@@ -480,6 +480,36 @@ int main() {
   present();
   check_frame("after retirement");
 
+  HStage("6b. A store reset keeps the traced objects (compaction).");
+  // 6b. A store reset keeps the traced objects (compaction).
+  for (int i = 0; i < 4; ++i) { draw(kSkin, 0x11, 600); draw(kSkin, 0x18, 300000); present(); }
+  CHECK(bvh::g_deform_live.object_count == 2u && stats().resident == 2u, "big identity resident (%u objects, resident %u)",
+        bvh::g_deform_live.object_count, stats().resident);
+  {
+    const auto before = stats();
+    bool reset_seen = false, objects_kept = false;
+    for (int i = 0; i < 610; ++i) {
+      draw(kSkin, 0x11, 600);
+      present();
+      if (!reset_seen && stats().resets != before.resets) {
+        reset_seen = true;
+        objects_kept = bvh::g_deform_live.object_count == 1u && stats().resident == 1u;
+      }
+    }
+    const auto s = stats();
+    std::printf("compaction: resets %u, reclaimed %llu, used %llu, nodes used %llu\n", s.resets,
+                (unsigned long long)s.reclaimed_bytes, (unsigned long long)s.used_bytes,
+                (unsigned long long)bvh::g_deform_live.nodes.used);
+    CHECK(reset_seen && s.resets == before.resets + 1u, "one store reset (%u -> %u)", before.resets, s.resets);
+    CHECK(objects_kept, "the reset present still traces the object");
+    CHECK(s.reset_objects_dropped == 0u && s.resets_with_objects == before.resets_with_objects + 1u, "no object dropped by the reset");
+    CHECK(s.compact_failures == 0u && s.garbage_bytes == 0u && s.reclaimed_bytes > bvh::kDynamicResetGarbageBytes, "garbage reclaimed");
+    CHECK(s.presents_no_objects == before.presents_no_objects, "no present without objects (%u vs %u)", s.presents_no_objects,
+          before.presents_no_objects);
+    CHECK(bvh::g_deform_live.nodes.used < 1000u, "store holds only the small BLAS (%llu nodes)", (unsigned long long)bvh::g_deform_live.nodes.used);
+  }
+  check_frame("after compaction");
+
   HStage("8. World deform presence dump: identities with gaps, the stats and the dropout ring.");
   // 8. World deform presence dump: identities with gaps, the stats and the dropout ring.
   bvh::DumpDeformLive();
