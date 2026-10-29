@@ -4590,6 +4590,7 @@ static void TestPerfExtraGpu(Device* dev) {
     PerfPresentCosts(data);
     extra.rtao.ms_sum += 1.0;
     extra.rtao.samples += 1u;
+    extra.dxr_tlas_ms += 0.5;
     data->alpha.timer.ms_sum += 0.5;
     data->alpha.timer.samples += 1u;
     bvh::UpdatePerfRun(data, 9000u + static_cast<uint32_t>(k), base + std::chrono::milliseconds(16 * k), sw, extra);
@@ -4607,6 +4608,11 @@ static void TestPerfExtraGpu(Device* dev) {
   CHECK(text.find("\"gpu_rtls_denoise\": {\"basis\": \"not measured\"") != std::string::npos, "RTLS denoise without samples is not measured");
   CHECK(text.find("\"rtls_record_cpu\"") != std::string::npos, "perf file has rtls_record_cpu");
   CHECK(CountOf(text, "\"value\": ") == CountOf(text, "\"unit\": "), "every value object has a unit (extras)");
+  const double dxr_tlas_avg = ValueAt(text, "\"dxr_tlas_gpu\": {", "\"avg_per_present\"");
+  CHECK(text.find("\"dxr_tlas_gpu\": {\"avg_per_present\": {\"value\": ") != std::string::npos, "dxr_tlas_gpu is a Subset row (avg_per_present)");
+  CHECK(dxr_tlas_avg > 0.4 && dxr_tlas_avg <= 0.5, "dxr_tlas_gpu averages 0.5 ms per present (%f)", dxr_tlas_avg);
+  CHECK(FindAfter(text, "\"dxr_tlas_gpu\": {", "\"in_total\": false") != std::string::npos, "dxr_tlas_gpu is not in total");
+  CHECK(text.find("\"pool_reduced\": {\"avg\": {\"value\": 0,") != std::string::npos, "pool_reduced gauge is 0 (not reduced)");
   bvh::ResetCacheDiagCounters();
 }
 

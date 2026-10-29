@@ -377,11 +377,27 @@ inline void OnWorldPresentBvh(
       std::lock_guard<std::mutex> lock(g_deform_live.mutex);
       extra.deform_refit = {g_deform_live.refit_timer.ms_sum, g_deform_live.refit_timer.samples};
     }
+    {
+      std::lock_guard<std::mutex> lock(rt12::g_rt12_panel_mutex);
+      extra.dxr_tlas_ms = rt12::g_rt12_panel.tlas_ms_sum;
+      extra.dxr_records_ms = rt12::g_rt12_panel.records_ms_sum;
+      extra.dxr_characters_ms = rt12::g_rt12_panel.dynamic_ms_sum;
+    }
+    {
+      std::lock_guard<std::mutex> lock(rt12::g_gc_panel_mutex);
+      extra.gc_blas_ms = rt12::g_gc_panel.build_ms_sum;
+    }
   }
   const auto present_time = SamplePerfPresent(device, extra);
   UpdateLiveBvh(device, queue);
-  rt12::OnGcPresent(device, queue);
-  rt12::OnPresent(device);
+  {
+    const PoolCpuTimer gc_present_timer{&g_perf_gate.block_us[kPerfBlockGcPresent]};
+    rt12::OnGcPresent(device, queue);
+  }
+  {
+    const PoolCpuTimer rt12_present_timer{&g_perf_gate.block_us[kPerfBlockRt12Present]};
+    rt12::OnPresent(device);
+  }
   UpdateCacheDiag(device, present_time);
   UpdateDeformLive(device, queue);
   rtao::MaybeCaptureRtaoStats(device, queue);

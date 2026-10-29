@@ -57,6 +57,8 @@ M2 (CPU, draw records), implemented, not validated in game: QueryBufferInfo and 
 
 M3a (CPU, pool hook timing), implemented, not validated in game: new Subset timing rows pool_tail (OnPoolScanDraw: P2b slice copy and alpha source capture after the lock) and pool_ind_gate, pool_ind_lock, pool_ind_tail, pool_ind_copy, pool_ind_gc (OnPoolScanIndirectDraw, same phases as the direct rows); timers only. Owner check: the 30 s RTAO compute run at the village spot; pool_gate+pool_lock+pool_tail+pool_copy+pool_gc+the five pool_ind_* rows should cover at least 80% of pool_hooks, with pool_meshes about 726.
 
+M3b (timing only), implemented, not validated in game: with GC owning RTAO and the pool reduced (G5), the CPU live TLAS is not rebuilt or refit, so tlas_rebuild/refit/skip/apply, blas_build and the phase rows are 0 and the tlas_instances gauge is stale. New Subset rows dxr_tlas_gpu, dxr_records_gpu, dxr_characters_gpu (rt12 lighting D3D12 timestamps) and gc_blas_build_gpu (GC BLAS build timestamps), not in gpu_total because gpu_rtao spans the fence-B wait; Subset blocks gc_present and rt12_present (OnWorldPresentBvh); gauge pool_reduced (1 while reduced). Owner check: 30 s rtao_dxr run at the village spot.
+
 | Feature | Owner test list | Where |
 |---|---|---|
 | Path 2: moving objects out of the static pool (P2a, P2a-rev) | Pool Scan near moving objects, rule line, Depth Compare | HISTORY: Path 2, round P2a; round P2a-rev |

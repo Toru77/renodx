@@ -89,6 +89,10 @@ enum PerfCost : size_t {
   kPerfSlackPhase1,
   kPerfSlackPhase2,
   kPerfSlackPhase3,
+  kPerfDxrTlasGpu,
+  kPerfDxrRecordsGpu,
+  kPerfDxrCharactersGpu,
+  kPerfGcBlasBuildGpu,
   kPerfBlockRow,  // the block rows (PerfBlock order, perf_gate.hpp) follow: the first 12 are InPresent (disjoint), the rest Subset
   kPerfCostCount = kPerfBlockRow + kPerfBlockCount
 };
@@ -136,6 +140,10 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"slack_phase_1", true, kPerfSubset, false, "ops"},
     {"slack_phase_2", true, kPerfSubset, false, "refit+validate"},
     {"slack_phase_3", true, kPerfSubset, false, "upload"},
+    {"dxr_tlas_gpu", true, kPerfSubset, false, nullptr},
+    {"dxr_records_gpu", true, kPerfSubset, false, nullptr},
+    {"dxr_characters_gpu", true, kPerfSubset, false, nullptr},
+    {"gc_blas_build_gpu", true, kPerfSubset, false, nullptr},
     // Blocks (PerfBlock order). InPresent blocks are disjoint: they are in the InPresent sum, so they reduce the unattributed CPU.
     {"perf_sample", true, kPerfInPresent, false, nullptr},
     {"sync_live_meshes", true, kPerfInPresent, false, nullptr},
@@ -193,13 +201,15 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"pool_ind_tail", true, kPerfSubset, false, nullptr},
     {"pool_ind_copy", true, kPerfSubset, false, nullptr},
     {"pool_ind_gc", true, kPerfSubset, false, nullptr},
+    {"gc_present", true, kPerfSubset, false, nullptr},
+    {"rt12_present", true, kPerfSubset, false, nullptr},
 };
 inline constexpr bool PerfInTotal(const PerfCostInfo& info) {
   return info.role == kPerfInPresent || info.role == kPerfDrawTime || info.role == kPerfGpu;
 }
 
-enum PerfGauge : size_t { kPerfGaugeTlasInstances, kPerfGaugeTlasDynamic, kPerfGaugePoolInstances, kPerfGaugePoolMeshes, kPerfGaugeSlackHoles, kPerfGaugeHookDraws, kPerfGaugeHookDrawsIndirect, kPerfGaugeHookDrawsUnconsumed, kPerfGaugeRecordMismatchRtv0, kPerfGaugeRecordMismatchDsv, kPerfGaugeRecordMismatchTopology, kPerfGaugeRecordMismatchInputLayout, kPerfGaugeRecordMismatchHasViewport, kPerfGaugeRecordMismatchViewport, kPerfGaugeRecordMismatchBlendEnable, kPerfGaugeRecordMismatchDepthEnable, kPerfGaugeRecordMismatchDepthWrite, kPerfGaugeRecordMismatchCullMode, kPerfGaugeRecordMismatchFrontCounterClockwise, kPerfGaugeCount };
-inline constexpr const char* kPerfGaugeNames[kPerfGaugeCount] = {"tlas_instances", "tlas_dynamic_instances", "pool_instances", "pool_meshes", "slack_free_holes", "hook_draws", "hook_draws_indirect", "hook_draws_unconsumed", "record_mismatch_rtv0", "record_mismatch_dsv", "record_mismatch_topology", "record_mismatch_input_layout", "record_mismatch_has_viewport", "record_mismatch_viewport", "record_mismatch_blend_enable", "record_mismatch_depth_enable", "record_mismatch_depth_write", "record_mismatch_cull_mode", "record_mismatch_front_counter_clockwise"};
+enum PerfGauge : size_t { kPerfGaugeTlasInstances, kPerfGaugeTlasDynamic, kPerfGaugePoolInstances, kPerfGaugePoolMeshes, kPerfGaugeSlackHoles, kPerfGaugeHookDraws, kPerfGaugeHookDrawsIndirect, kPerfGaugeHookDrawsUnconsumed, kPerfGaugeRecordMismatchRtv0, kPerfGaugeRecordMismatchDsv, kPerfGaugeRecordMismatchTopology, kPerfGaugeRecordMismatchInputLayout, kPerfGaugeRecordMismatchHasViewport, kPerfGaugeRecordMismatchViewport, kPerfGaugeRecordMismatchBlendEnable, kPerfGaugeRecordMismatchDepthEnable, kPerfGaugeRecordMismatchDepthWrite, kPerfGaugeRecordMismatchCullMode, kPerfGaugeRecordMismatchFrontCounterClockwise, kPerfGaugePoolReduced, kPerfGaugeCount };
+inline constexpr const char* kPerfGaugeNames[kPerfGaugeCount] = {"tlas_instances", "tlas_dynamic_instances", "pool_instances", "pool_meshes", "slack_free_holes", "hook_draws", "hook_draws_indirect", "hook_draws_unconsumed", "record_mismatch_rtv0", "record_mismatch_dsv", "record_mismatch_topology", "record_mismatch_input_layout", "record_mismatch_has_viewport", "record_mismatch_viewport", "record_mismatch_blend_enable", "record_mismatch_depth_enable", "record_mismatch_depth_write", "record_mismatch_cull_mode", "record_mismatch_front_counter_clockwise", "pool_reduced"};
 
 struct PerfCounters {
   double cost[kPerfCostCount] = {};
@@ -347,6 +357,7 @@ struct PerfTimerSample {
 };
 struct PerfExtraGpu {
   PerfTimerSample rtao, rtao_filter, rtgi, rtgi_denoise, rtls, rtls_denoise, rtsun, rtsun_denoise, deform_refit;
+  double dxr_tlas_ms = 0.0, dxr_records_ms = 0.0, dxr_characters_ms = 0.0, gc_blas_ms = 0.0;  // D3D12 timestamp sums (rt12 panels); inside gpu_rtao, so Subset rows
 };
 
 // Performance tab: the last kPerfTabWindow presents. NaN means "--" (no value in the window).
@@ -523,6 +534,10 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.events[kPerfGpuRtsun] = extra.rtsun.samples;
   c.cost[kPerfGpuRtsunDenoise] = extra.rtsun_denoise.ms_sum;
   c.events[kPerfGpuRtsunDenoise] = extra.rtsun_denoise.samples;
+  c.cost[kPerfDxrTlasGpu] = extra.dxr_tlas_ms;
+  c.cost[kPerfDxrRecordsGpu] = extra.dxr_records_ms;
+  c.cost[kPerfDxrCharactersGpu] = extra.dxr_characters_ms;
+  c.cost[kPerfGcBlasBuildGpu] = extra.gc_blas_ms;
   for (size_t p = 0; p < 5u; ++p) c.cost[kPerfRebuildPhase0 + p] = timing.rebuild_phase_ms_sum[p];
   for (size_t p = 0; p < 4u; ++p) c.cost[kPerfRefitPhase0 + p] = timing.refit_phase_ms_sum[p];
   for (size_t p = 0; p < 4u; ++p) c.cost[kPerfSlackPhase0 + p] = live.slack_phase_ms_sum[p];
@@ -546,6 +561,7 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.gauge[kPerfGaugeRecordMismatchDepthWrite] = static_cast<double>(g_perf_gate.record_mismatch_depth_write_frame.load(std::memory_order_relaxed));
   c.gauge[kPerfGaugeRecordMismatchCullMode] = static_cast<double>(g_perf_gate.record_mismatch_cull_mode_frame.load(std::memory_order_relaxed));
   c.gauge[kPerfGaugeRecordMismatchFrontCounterClockwise] = static_cast<double>(g_perf_gate.record_mismatch_front_counter_clockwise_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugePoolReduced] = g_gpu_capture.pool_reduced.load(std::memory_order_relaxed) ? 1.0 : 0.0;
   return c;
 }
 

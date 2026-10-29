@@ -69,6 +69,8 @@ enum PerfBlock : size_t {
   kPerfBlockPoolIndTail,             // pool indirect hook: P2b copies and alpha source capture, after the lock
   kPerfBlockPoolIndCopy,             // pool indirect hook: IssuePoolCopies and LogPoolMeshCopies
   kPerfBlockPoolIndGc,               // pool indirect hook: GPU capture of the sub-draws and its stats
+  kPerfBlockGcPresent,     // rt12::OnGcPresent, whole (OnWorldPresentBvh)
+  kPerfBlockRt12Present,   // rt12::OnPresent, whole (OnWorldPresentBvh)
   kPerfBlockCount
 };
 
