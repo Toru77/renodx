@@ -5632,7 +5632,7 @@ static void OnPushDescriptorsCapture(
   const bool cbv = update.type == reshade::api::descriptor_type::constant_buffer;
   if (update.count == 0u || (!srv && !cbv)) return;
   if (cbv && update.binding != kLightingSceneCbRegister) return;
-  if (srv && update.binding > 5u && update.binding != kDynCubeRegister && !VbgiRunning()) return;
+  if (srv && update.binding != kDynCubeRegister && update.binding > (VbgiRunning() ? 16u : 5u)) return;
   renodx::utils::state::CommandListStateCache state_cache;
   std::optional<uint32_t> ps_hash;
   auto pixel_hash = [&]() {
@@ -5648,6 +5648,11 @@ static void OnPushDescriptorsCapture(
   // -- Capture depth/SSAO/CBV � unconditional (register-based, kai-style). --
   if (update.type == reshade::api::descriptor_type::texture_shader_resource_view) {
     auto* views = static_cast<const reshade::api::resource_view*>(update.descriptors);
+    std::optional<bool> vanilla_env_view;
+    auto is_vanilla_env_view = [&]() {
+      if (!vanilla_env_view.has_value()) vanilla_env_view = IsVanillaEnvCubeView(device, views[0]);
+      return *vanilla_env_view;
+    };
   // Capture depth: t4 (Sora) or t3 (Kai) � ONLY from lighting shader, game-specific binding.
     uint32_t depthBinding = IsKai() ? kLightingDepthRegisterKai : kLightingDepthRegister;
     if (update.binding == depthBinding && update.count >= 1
@@ -5786,27 +5791,30 @@ static void OnPushDescriptorsCapture(
           d->vbgi_in_frame[k] = d->frame_index;
         }
       }
-      uint32_t hash = pixel_hash();
-      if (hash == 0xFDAAF80Eu || hash == 0xCA3D8596u || (IsKai() && (hash == 0x430ED091u || hash == 0xF6C55E5Fu))) {
-        const bool kai = IsKai();
-        const uint32_t shadow_slot = kai ? 16u : (IsSora1st() ? 9u : 7u);
-        const uint32_t deferred_slot = kai ? 5u : 6u;
-        for (uint32_t i = 0; i < update.count; ++i) {
-          if (views[i].handle == 0u) continue;
-          const uint32_t slot = update.binding + i;
-          int k = -1;
-          if (slot == 2u) k = 0;
-          else if (slot == 3u && !kai) k = 1;
-          else if (slot == deferred_slot) k = 2;
-          else if (!kai && slot == shadow_slot) k = 3;
-          else if (!kai && slot == 11u) k = 4;
-          else if (!kai && slot == 12u) k = 5;
-          if (k < 0) continue;
-          if (views[i].handle != d->vbgi_in_srv[k].handle) d->vbgi_in_res[k] = device->get_resource_from_view(views[i]).handle;
-          d->vbgi_in_srv[k] = views[i];
-          d->vbgi_in_live[k] = true;
-          d->vbgi_in_frame[k] = d->frame_index;
+      const bool kai = IsKai();
+      const uint32_t shadow_slot = kai ? 16u : (IsSora1st() ? 9u : 7u);
+      const uint32_t deferred_slot = kai ? 5u : 6u;
+      std::optional<bool> vbgi_hash_gate;
+      for (uint32_t i = 0; i < update.count; ++i) {
+        if (views[i].handle == 0u) continue;
+        const uint32_t slot = update.binding + i;
+        int k = -1;
+        if (slot == 2u) k = 0;
+        else if (slot == 3u && !kai) k = 1;
+        else if (slot == deferred_slot) k = 2;
+        else if (!kai && slot == shadow_slot) k = 3;
+        else if (!kai && slot == 11u) k = 4;
+        else if (!kai && slot == 12u) k = 5;
+        if (k < 0) continue;
+        if (!vbgi_hash_gate.has_value()) {
+          const uint32_t hash = pixel_hash();
+          vbgi_hash_gate = hash == 0xFDAAF80Eu || hash == 0xCA3D8596u || (kai && (hash == 0x430ED091u || hash == 0xF6C55E5Fu));
         }
+        if (!*vbgi_hash_gate) continue;
+        if (views[i].handle != d->vbgi_in_srv[k].handle) d->vbgi_in_res[k] = device->get_resource_from_view(views[i]).handle;
+        d->vbgi_in_srv[k] = views[i];
+        d->vbgi_in_live[k] = true;
+        d->vbgi_in_frame[k] = d->frame_index;
       }
     }
     // Capture ssr2-draw t0 (vanilla ssr1 march result) for the SSR replacement
@@ -5852,7 +5860,7 @@ static void OnPushDescriptorsCapture(
         && views[0].handle != 0u && shader_injection.dynCube_enabled > 0.5f
         && IsDynCubeT17Game()
         && (static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))
-        && IsVanillaEnvCubeView(device, views[0])) {
+        && is_vanilla_env_view()) {
       d->captured_vanilla_env_srv = views[0];
     }
     // Global Dynamic Cubemap t17 override: any pixel-shader bind of a 512x512 or
@@ -5876,7 +5884,7 @@ static void OnPushDescriptorsCapture(
         && (static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) {
       static bool s_dynCubeT17SwapGuard = false;
       int swapDbg = (int)shader_injection.dynCube_debug;
-      if (!s_dynCubeT17SwapGuard && IsVanillaEnvCubeView(device, views[0])
+      if (!s_dynCubeT17SwapGuard && is_vanilla_env_view()
           && (swapDbg != 0 || d->captured_vanilla_env_srv.handle != 0u)
           && d && d->dyncube_resources_created) {
         // Lighting draws always sample sharp (own sample-time blur/brightness);
@@ -5887,7 +5895,7 @@ static void OnPushDescriptorsCapture(
         {
           uint32_t swapHash = pixel_hash();
           swapIsLighting = IsLightingShader(swapHash);
-          if (swapHash != 0u) {
+          if (swapHash != 0u && shader_injection.custom_shader_logging >= 0.5f) {
             std::ostringstream hs;
             hs << std::hex << swapHash;
             CSLog("draw", std::string("t17 draw hash=0x") + hs.str());
