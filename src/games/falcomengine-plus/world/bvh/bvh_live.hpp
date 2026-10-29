@@ -2507,6 +2507,8 @@ inline std::chrono::steady_clock::time_point SamplePerfPresent(reshade::api::dev
     g_perf_gate.hook_draws_unconsumed_frame = g_perf_gate.hook_draws_unconsumed.exchange(0u);
     g_perf_gate.bind_calls_frame = g_perf_gate.bind_calls.exchange(0u);
     g_perf_gate.bind_srv_resolves_frame = g_perf_gate.bind_srv_resolves.exchange(0u);
+    g_perf_gate.capture_calls_frame = g_perf_gate.capture_calls.exchange(0u);
+    g_perf_gate.capture_b0_calls_frame = g_perf_gate.capture_b0_calls.exchange(0u);
     g_perf_gate.record_mismatch_rtv0_frame = g_perf_gate.record_mismatch_rtv0.exchange(0u);
     g_perf_gate.record_mismatch_dsv_frame = g_perf_gate.record_mismatch_dsv.exchange(0u);
     g_perf_gate.record_mismatch_topology_frame = g_perf_gate.record_mismatch_topology.exchange(0u);

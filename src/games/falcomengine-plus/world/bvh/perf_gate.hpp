@@ -77,6 +77,7 @@ enum PerfBlock : size_t {
   kPerfBlockRt12D3d11Passes,  // RunRtaoPassA steps 10-11: D3D11 noise copy and passes
   kPerfBlockRt12Record,    // RunRtaoPassA step 13: D3D12 recording to Close
   kPerfBlockRt12Resolve,   // RunRtaoPassA step 15: D3D11 resolve
+  kPerfBlockCaptureHook,   // OnPushDescriptorsCapture, whole (addon.cpp), timed before its gate
   kPerfBlockCount
 };
 
@@ -103,6 +104,10 @@ struct PerfGate {
   std::atomic_uint64_t bind_calls_frame{0u};  // bind_calls of the last frame (moved by SamplePerfPresent)
   std::atomic_uint64_t bind_srv_resolves{0u};  // get_resource_from_view calls in OnPushDescriptorsWorld (gather only)
   std::atomic_uint64_t bind_srv_resolves_frame{0u};  // bind_srv_resolves of the last frame (moved by SamplePerfPresent)
+  std::atomic_uint64_t capture_calls{0u};  // push_descriptors calls that pass the OnPushDescriptorsCapture gate (gather only)
+  std::atomic_uint64_t capture_calls_frame{0u};  // capture_calls of the last frame (moved by SamplePerfPresent)
+  std::atomic_uint64_t capture_b0_calls{0u};  // of those, the calls with binding 0 (gather only)
+  std::atomic_uint64_t capture_b0_calls_frame{0u};  // capture_b0_calls of the last frame (moved by SamplePerfPresent)
   std::atomic_uint64_t record_native_seq{0u};  // draws seen by the native-record parity gate (gather only; every 64th also builds the framework state)
   std::atomic_uint64_t record_mismatch_rtv0{0u};  // rtv0 differs between the native read and the framework state (gather only; every 64th draw)
   std::atomic_uint64_t record_mismatch_rtv0_frame{0u};  // record_mismatch_rtv0 of the last frame (moved by SamplePerfPresent)

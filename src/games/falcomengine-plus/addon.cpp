@@ -5583,6 +5583,8 @@ static void OnPushDescriptorsCapture(
     reshade::api::pipeline_layout layout,
     uint32_t param_index,
     const reshade::api::descriptor_table_update& update) {
+  // Whole-hook timer, started before the gate so the calls the gate rejects are timed too.
+  const falcom_world::bvh::PoolCpuTimer capture_timer{&falcom_world::bvh::g_perf_gate.block_us[falcom_world::bvh::kPerfBlockCaptureHook]};
   if (!cmd_list) return;
   // Fast path: no feature consumes the captured snapshots -> skip ALL capture work.
   // (Fired on every push_descriptors in the frame; without this gate the body below
@@ -5610,6 +5612,12 @@ static void OnPushDescriptorsCapture(
       && !wantTAAMotionPush
       && !wantMotionBlurPush) {
     return;
+  }
+  if (capture_timer.armed) {
+    falcom_world::bvh::g_perf_gate.capture_calls.fetch_add(1u, std::memory_order_relaxed);
+    if (update.type == reshade::api::descriptor_type::texture_shader_resource_view && update.binding == 0u) {
+      falcom_world::bvh::g_perf_gate.capture_b0_calls.fetch_add(1u, std::memory_order_relaxed);
+    }
   }
   auto* device = cmd_list->get_device();
   auto* d = device->get_private_data<DeviceData>();
