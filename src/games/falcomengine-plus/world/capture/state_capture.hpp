@@ -8,12 +8,17 @@
 // its per-stage pipeline map. Capturing the descriptors here turns the bound
 // state handles into depth-write / blend-enable facts for census classification.
 
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 
 #include "../world_state.hpp"
 
 namespace falcom_world {
+
+// Moves whenever a native handle may be reused (pipeline, buffer or census reset). The per-thread record-fill caches
+// in draw_census.hpp drop their entries when it changes.
+inline std::atomic<uint32_t> g_record_cache_generation{0u};
 
 struct PipelineStateMaps {
   std::mutex mutex;
@@ -36,6 +41,7 @@ inline void OnInitPipelineState(
   (void)device;
   (void)layout;
   if (subobjects == nullptr || pipeline.handle == 0u) return;
+  g_record_cache_generation.fetch_add(1u, std::memory_order_release);
 
   auto& maps = StateMaps();
   std::lock_guard<std::mutex> lock(maps.mutex);
@@ -66,6 +72,8 @@ inline void OnDestroyPipelineState(reshade::api::device* device, reshade::api::p
   maps.blend.erase(pipeline.handle);
   maps.depth_stencil.erase(pipeline.handle);
   maps.rasterizer.erase(pipeline.handle);
+  // Also bumped at init: a reused handle is never served a value cached for the destroyed object (scene.hpp erases in its own handler).
+  g_record_cache_generation.fetch_add(1u, std::memory_order_release);
 }
 
 inline bool GetBlendDesc(uint64_t handle, reshade::api::blend_desc* out) {

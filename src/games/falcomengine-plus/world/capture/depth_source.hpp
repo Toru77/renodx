@@ -11,6 +11,7 @@
 #include <mutex>
 
 #include "../world_state.hpp"
+#include "state_capture.hpp"
 
 namespace falcom_world {
 
@@ -21,6 +22,7 @@ inline void OnDestroyResourceWorld(reshade::api::device* device, reshade::api::r
     g_state.depth_source = {};
   }
   g_state.buffer_info.erase(resource.handle);
+  g_record_cache_generation.fetch_add(1u, std::memory_order_release);
 }
 
 inline void OnDestroyResourceViewWorld(reshade::api::device* device, reshade::api::resource_view view) {

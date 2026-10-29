@@ -16,6 +16,7 @@
 #include <sstream>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "../world_state.hpp"
@@ -39,10 +40,21 @@ namespace falcom_world {
 
 inline BufferInfo QueryBufferInfo(reshade::api::device* device, reshade::api::resource resource) {
   if (device == nullptr || resource.handle == 0u) return {};
+  thread_local uint32_t cache_generation = 0u;
+  thread_local std::unordered_map<uint64_t, BufferInfo> cache;
+  const uint32_t generation = g_record_cache_generation.load(std::memory_order_acquire);
+  if (generation != cache_generation) {
+    cache.clear();
+    cache_generation = generation;
+  }
+  if (const auto cached = cache.find(resource.handle); cached != cache.end()) return cached->second;
   {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     const auto it = g_state.buffer_info.find(resource.handle);
-    if (it != g_state.buffer_info.end()) return it->second;
+    if (it != g_state.buffer_info.end()) {
+      cache.insert_or_assign(resource.handle, it->second);
+      return it->second;
+    }
   }
   const auto desc = device->get_resource_desc(resource);
   BufferInfo info;
@@ -69,12 +81,21 @@ inline void ResetCensus() {
   g_state.ring_head = 0u;
   g_state.families.clear();
   g_state.buffer_info.clear();
+  g_record_cache_generation.fetch_add(1u, std::memory_order_release);
   g_state.next_serial.store(0u);
   g_state.status = "census reset";
 }
 
 inline bool LayoutHasSkinInputs(const reshade::api::pipeline& input_layout) {
   if (input_layout.handle == 0u || renodx::utils::scene::shared.data == nullptr) return false;
+  thread_local uint32_t cache_generation = 0u;
+  thread_local std::unordered_map<uint64_t, bool> cache;
+  const uint32_t generation = g_record_cache_generation.load(std::memory_order_acquire);
+  if (generation != cache_generation) {
+    cache.clear();
+    cache_generation = generation;
+  }
+  if (const auto cached = cache.find(input_layout.handle); cached != cache.end()) return cached->second;
   bool has_skin = false;
   renodx::utils::scene::shared.data->input_layouts.if_contains(input_layout.handle, [&](const auto& pair) {
     for (const auto& element : pair.second.elements) {
@@ -84,6 +105,7 @@ inline bool LayoutHasSkinInputs(const reshade::api::pipeline& input_layout) {
         break;
       }
     }
+    cache.insert_or_assign(input_layout.handle, has_skin);
   });
   return has_skin;
 }

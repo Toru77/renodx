@@ -4251,6 +4251,7 @@ inline void OnPoolScanDraw(
   const bool deferred = IsPoolDeferredList(cmd_list);
   const bool reduced = g_gpu_capture.pool_reduced.load(std::memory_order_relaxed);  // G5: no slice staging, P2b record or wind read
 
+  const auto gate_start = PerfNow();
   const PoolDrawGate gate = GatePoolDraw(draw, true);
   if (gate.wind_rest) {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
@@ -4281,6 +4282,9 @@ inline void OnPoolScanDraw(
   uint8_t wind_fail[2] = {};
   TrackedCbInfo wind_info[2];
   const bool wind_read = wind_attempt && ReadPoolWindInputs(device, cmd_list, *cl_data, contract::LookupVertexTraits(draw.vs_pipeline).hash, &wind, wind_fail, wind_info);
+  if (gate_start != std::chrono::steady_clock::time_point{}) {
+    AddPerfBlockMs(kPerfBlockPoolGate, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gate_start).count());
+  }
   const uint32_t frame = g_state.frame.load();
   const uint64_t mesh_key = skip == PoolSkip::None ? PoolMeshKey(draw) : 0u;
 
@@ -4294,6 +4298,7 @@ inline void OnPoolScanDraw(
   PoolDynamicDraw dynamic_copy;  // P2b: the slice copy of this draw, reserved under the lock
   bool dynamic_ok = false;
   bool gc_tracked = false;
+  const auto lock_start = PerfNow();
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     if (gate.alpha_material) NotePoolAlphaMaterial(PoolMeshKey(draw), alpha_material, vbs_known ? &vbs : nullptr);
@@ -4400,6 +4405,9 @@ inline void OnPoolScanDraw(
                                        mesh_copies.data(), kPoolMeshCopiesPerDraw);
     command_count += mesh_count;
   }
+  if (lock_start != std::chrono::steady_clock::time_point{}) {
+    AddPerfBlockMs(kPerfBlockPoolLock, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lock_start).count());
+  }
   if (dynamic_ok) {
     cmd_list->copy_buffer_region(slice.instance_buffer, static_cast<uint64_t>(dynamic_copy.base) * kPoolInstanceStride,
                                  dynamic_copy.buffer, dynamic_copy.arena, static_cast<uint64_t>(dynamic_copy.count) * kPoolInstanceStride);
@@ -4416,14 +4424,22 @@ inline void OnPoolScanDraw(
       CapturePoolAlphaSource(device, cmd_list, mesh_key, alpha_material.view, !deferred);
     }
   }
+  const auto copy_start = PerfNow();
   stage.Set("direct draw: copy");
   IssuePoolCopies(cmd_list, commands.data(), command_count);
   LogPoolMeshCopies(mesh_copies.data(), mesh_count, frame);
+  if (copy_start != std::chrono::steady_clock::time_point{}) {
+    AddPerfBlockMs(kPerfBlockPoolCopy, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copy_start).count());
+  }
+  const auto gc_start = PerfNow();
   if (gc_tracked) {
     const GcInstanceSource instances = {.buffer = slice.instance_buffer, .base = slice.base, .count = count, .pass = gate.pass};
     GpuCaptureOnDraw(cmd_list, draw, mesh_key, uv, deferred, &instances);
   } else if (mesh_key != 0u) {
     GpuCaptureNoteNoEntry(mesh_key, "untracked");
+  }
+  if (gc_start != std::chrono::steady_clock::time_point{}) {
+    AddPerfBlockMs(kPerfBlockPoolGc, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gc_start).count());
   }
 }
 

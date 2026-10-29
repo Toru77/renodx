@@ -183,6 +183,10 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"record_skin_layout", true, kPerfSubset, false, nullptr},
     {"record_scene_query", true, kPerfSubset, false, nullptr},
     {"record_rest", true, kPerfSubset, false, nullptr},
+    {"pool_gate", true, kPerfSubset, false, nullptr},
+    {"pool_lock", true, kPerfSubset, false, nullptr},
+    {"pool_copy", true, kPerfSubset, false, nullptr},
+    {"pool_gc", true, kPerfSubset, false, nullptr},
 };
 inline constexpr bool PerfInTotal(const PerfCostInfo& info) {
   return info.role == kPerfInPresent || info.role == kPerfDrawTime || info.role == kPerfGpu;

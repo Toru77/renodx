@@ -59,6 +59,10 @@ enum PerfBlock : size_t {
   kPerfBlockRecordSkin,              // FillCommonDrawRecord: LayoutHasSkinInputs
   kPerfBlockRecordScene,             // FillCommonDrawRecord: scene read and QueryBufferInfo
   kPerfBlockRecordRest,              // WorldDrawCallback direct: candidate, FillDrawBindingMasks and CommitDrawRecord
+  kPerfBlockPoolGate,                // pool draw hook: GatePoolDraw and wind read
+  kPerfBlockPoolLock,                // pool draw hook: bookkeeping under the pool lock
+  kPerfBlockPoolCopy,                // pool draw hook: IssuePoolCopies and LogPoolMeshCopies
+  kPerfBlockPoolGc,                  // pool draw hook: GPU capture note
   kPerfBlockCount
 };
 

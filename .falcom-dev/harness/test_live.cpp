@@ -23,6 +23,8 @@
 #include "harness_timer.hpp"
 #include "json_check.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_live.hpp"
+#include "src/games/falcomengine-plus/world/capture/state_capture.hpp"
+#include "src/games/falcomengine-plus/world/capture/depth_source.hpp"
 
 using namespace reshade::api;
 namespace bvh = falcom_world::bvh;
@@ -5874,6 +5876,23 @@ static void TestGcPoolReduce() {
   reset();
 }
 
+static void TestRecordCacheGeneration() {
+  Stage("record cache generation");
+  using falcom_world::g_record_cache_generation;
+  blend_desc blend{};
+  pipeline_subobject sub{pipeline_subobject_type::blend_state, 1u, &blend};
+  uint32_t before = g_record_cache_generation.load();
+  falcom_world::OnInitPipelineState(nullptr, pipeline_layout{}, 1u, &sub, pipeline{0x7001u});
+  uint32_t after_init = g_record_cache_generation.load();
+  CHECK(after_init == before + 1u, "init bumps the generation by 1: %u -> %u", before, after_init);
+  falcom_world::OnInitPipelineState(nullptr, pipeline_layout{}, 1u, &sub, pipeline{0u});
+  CHECK(g_record_cache_generation.load() == after_init, "init with handle 0 does not bump: %u", g_record_cache_generation.load());
+  falcom_world::OnDestroyPipelineState(nullptr, pipeline{0x7001u});
+  uint32_t after_destroy = g_record_cache_generation.load();
+  CHECK(after_destroy == after_init + 1u, "pipeline destroy bumps the generation by 1: %u -> %u", after_init, after_destroy);
+  falcom_world::OnDestroyResourceWorld(nullptr, resource{0x7002u});
+  CHECK(g_record_cache_generation.load() == after_destroy + 1u, "resource destroy bumps the generation by 1: %u -> %u", after_destroy, g_record_cache_generation.load());
+}
 int main() {
   falcom_world::g_state.pool_capture_requested.store(true);
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -6963,6 +6982,7 @@ int main() {
   TestGcCompareInstances();
   TestGcRecordsBound();
   TestGcPoolReduce();
+  TestRecordCacheGeneration();
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);
