@@ -448,7 +448,9 @@ inline PerfTotalsValue PerfTotals(const double* values) {
   totals.unattr_raw = bracket - in;
   totals.unattr = std::max(0.0, totals.unattr_raw);
   // The draw hook and the lighting RT block enclose DrawTime rows: only their time outside those rows is added (clamped at
-  // zero; the enclosing and the inner clocks are separate reads). The bind, capture, cb and pool-write hooks are in no other row.
+  // zero; the enclosing and the inner clocks are separate reads). The bind, capture, cb and pool-write hooks are not inside the
+  // draw hook, but the bind and capture hooks also run nested inside lighting_rt (NullComputeSlots, compute restore) and inside
+  // the DynCube t17 swap, so hook_outer over-counts by that nested time when RT passes or DynCube are on. Known limitation.
   const double draw_hook_outer = values[kPerfBlockRow + kPerfBlockDrawHookTotal] - values[kPerfPoolHooks] - values[kPerfDeformHookCpu];
   const double lighting_rt_outer = values[kPerfBlockRow + kPerfBlockLightingRt] - values[kPerfRtaoRecordCpu] - values[kPerfRtgiRecordCpu]
                                    - values[kPerfRtlsRecordCpu] - values[kPerfRtsunRecordCpu];
