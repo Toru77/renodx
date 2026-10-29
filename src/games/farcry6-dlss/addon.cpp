@@ -310,6 +310,17 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
     new renodx::utils::settings::Setting{
+        .key = "FSRVersion",
+        .binding = &farcry6_dlss::dlss::fsr_version,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "FSR Version",
+        .section = "Antialiasing",
+        .tooltip = "FSR 3.1 is the default for stability. Auto lets AMD's runtime choose, which may pick FSR 4 on supported GPUs. FSR 4 forces FSR 4 if the runtime has it. Changes apply after restart.",
+        .labels = {"Auto", "FSR 3.1", "FSR 4"},
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported() && farcry6_dlss::dlss::upscaler_type >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLSSEnabled",
         .binding = &farcry6_dlss::dlss::dlss_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -511,6 +522,16 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Log DLSS evaluation parameters and jitter detection to ReShade.log (throttled).",
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "FSRDebugLogging",
+        .binding = &farcry6_dlss::dlss::fsr_debug_logging,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "FSR Debug Logging",
+        .section = "Antialiasing",
+        .tooltip = "Logs the whole addon path (device, inputs, FSR, present, Streamline) to ReShade.log. Set before launching the game.",
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported() && farcry6_dlss::dlss::upscaler_type >= 0.5f; },
     },
 };
 

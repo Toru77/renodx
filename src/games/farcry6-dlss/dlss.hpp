@@ -72,7 +72,9 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -130,6 +132,7 @@ static constexpr uint32_t kSlotCbv = 0u;       // b0: TAA knobs
 // ── Settings (written by the settings system in addon.cpp) ──
 inline float dlss_enabled = 1.f;
 inline float upscaler_type = 0.f;  // 0 = DLSS, 1 = FSR
+inline float fsr_version = 1.f;
 // 0=Auto, 1=DLAA, 2=Quality, 3=Balanced, 4=Performance, 5=UltraPerformance
 inline float dlss_mode = 0.f;
 // 0=Default, 1=F, 2=J, 3=K, 4=L, 5=M
@@ -177,6 +180,7 @@ inline float dlss_reset_every_frame = 0.f;
 // of correcting it, which is a visible failure rather than a subtle one.
 inline float dlss_jitter_flip = 0.f;
 inline float dlss_debug_logging = 0.f;
+inline float fsr_debug_logging = 0.f;
 inline float dlss_cpu_timing = 0.f;
 inline float dlss_detailed_diagnostics = 0.f;
 inline float fg_bootstrap_test = 0.f;
@@ -310,10 +314,29 @@ inline std::atomic<int> stat_fail_code{kFailNone};
 // Per-slot resolve result of the last TAA draw: 0=miss, 1=real, read by the UI.
 inline std::atomic<int> slot_hit[5];
 
+inline std::atomic<uint32_t> debug_trace_budget{8u};
+
+inline void DebugLog(const char* format, ...) {
+  if (fsr_debug_logging == 0.f) return;
+  char text[512];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(text, sizeof(text), format, args);
+  va_end(args);
+  const std::string line = "Far Cry 6 debug [present " + std::to_string(stat_presents.load()) + "]: " + text;
+  reshade::log::message(reshade::log::level::info, line.c_str());
+}
+inline bool DebugTrace() {
+  return fsr_debug_logging != 0.f && (debug_trace_budget > 0u || stat_presents % 600 == 0);
+}
+
 inline void NoteFail(int code) {
   stat_fail_code.store(code);
   if (code >= 0 && static_cast<uint32_t>(code) < kFailCodeCount) {
-    stat_fail_counts[code].fetch_add(1u, std::memory_order_relaxed);
+    const uint64_t count = stat_fail_counts[code].fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (fsr_debug_logging != 0.f && count == 1u) {
+      DebugLog("fail code %d first seen", code);
+    }
   }
 }
 inline void NoteSuccess() {
@@ -1866,6 +1889,7 @@ inline void SelectSceneDepth(reshade::api::device* device) {
   const uint32_t want_height = last_render_height.load();
   uint64_t best = 0u;
   uint32_t best_count = 0u;
+  reshade::api::resource_desc chosen = {};
   {
     const std::lock_guard<std::mutex> lock(depth_mutex);
     for (const auto& entry : depth_candidates) {
@@ -1881,11 +1905,19 @@ inline void SelectSceneDepth(reshade::api::device* device) {
     if (best == 0u || best_count < 100u) return;
     const reshade::api::resource_desc desc = device->get_resource_desc(reshade::api::resource{best});
     if (desc.type != reshade::api::resource_type::texture_2d) return;
+    chosen = desc;
     scene_depth_resource = best;
     scene_depth_draws = best_count;
     scene_depth_width = desc.texture.width;
     scene_depth_height = desc.texture.height;
     scene_depth_format = desc.texture.format;
+  }
+  static uint64_t logged_scene_depth = 0u;
+  if (best != logged_scene_depth) {
+    logged_scene_depth = best;
+    DebugLog("scene depth selected: handle=%p draws=%u required=%ux%u size=%ux%u format=%d", reinterpret_cast<void*>(best),
+             best_count, want_width, want_height, static_cast<uint32_t>(chosen.texture.width),
+             static_cast<uint32_t>(chosen.texture.height), static_cast<int>(chosen.texture.format));
   }
   // Its state has to be known to read it as a shader resource. Registering it
   // here, at the frame boundary, means the engine's transitions during the next
@@ -3227,6 +3259,9 @@ inline bool OnCreateDevice(reshade::api::device_api api, uint32_t& api_version) 
     farcry6_dlss::streamline::LoadRuntime(GetProcessDirectory());
     if (fg_bootstrap_test != 0.f) farcry6_dlss::streamline::StartBootstrap(GetProcessDirectory());
   }
+  DebugLog("create device: api=%d process=%ls runtime=%s fg_bootstrap_test=%.0f bootstrap=%s", static_cast<int>(api),
+           GetProcessDirectory().c_str(), farcry6_dlss::streamline::runtime.status, fg_bootstrap_test,
+           farcry6_dlss::streamline::bootstrap_status.load());
   return false;
 }
 
@@ -3234,9 +3269,11 @@ struct FsrContext {
   ffxContext context = nullptr;
   ffxCreateBackendDX12Desc backend = {};
   ffxCreateContextDescUpscale description = {};
+  ffxOverrideVersion override_version = {};
   uint32_t width = 0u;
   uint32_t height = 0u;
   uint32_t flags = 0u;
+  bool logged_dispatch = false;
 };
 struct RetiredFsrContext {
   std::unique_ptr<FsrContext> context;
@@ -3263,14 +3300,34 @@ struct FsrState {
   bool camera_live = false;
   std::string provider = "not initialized";
   bool load_failed = false;
+  std::array<uint64_t, 8> version_ids{};
+  std::array<std::string, 8> version_names{};
+  uint64_t version_count = 0u;
+  bool versions_queried = false;
+  bool version_warned = false;
 };
 inline FsrState fsr;
+
+inline void OnFfxMessage(uint32_t type, const wchar_t* message) {
+  if (message == nullptr) return;
+  static std::atomic<uint32_t> message_count{0u};
+  const uint32_t count = ++message_count;
+  if (count > 64u && count % 1000u != 0u) return;
+  const int length = WideCharToMultiByte(CP_UTF8, 0, message, -1, nullptr, 0, nullptr, nullptr);
+  std::string text(length, '\0');
+  WideCharToMultiByte(CP_UTF8, 0, message, -1, text.data(), length, nullptr, nullptr);
+  if (fsr_debug_logging != 0.f) {
+    reshade::log::message(type == 0u ? reshade::log::level::error : reshade::log::level::warning,
+                          ("Far Cry 6 FSR runtime: " + text).c_str());
+  }
+}
 
 inline bool EnsureFsrContext(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t flags) {
   if (device == nullptr || width == 0u || height == 0u) return false;
   if (fsr.load_failed) return false;
   if (fsr.loader == nullptr) {
     const std::wstring path = GetProcessDirectory() + L"\\amd_fidelityfx_loader_dx12.dll";
+    DebugLog("FSR: loading %ls", path.c_str());
     fsr.loader = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (fsr.loader != nullptr) {
       fsr.create = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(fsr.loader, "ffxCreateContext"));
@@ -3279,10 +3336,14 @@ inline bool EnsureFsrContext(ID3D12Device* device, uint32_t width, uint32_t heig
       fsr.query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(fsr.loader, "ffxQuery"));
     }
     if (fsr.loader == nullptr || fsr.create == nullptr || fsr.destroy == nullptr || fsr.dispatch == nullptr) {
+      DebugLog("FSR: loader missing or invalid: GetLastError=%lu loader=%p create=%p destroy=%p dispatch=%p query=%p",
+               GetLastError(), static_cast<void*>(fsr.loader), reinterpret_cast<void*>(fsr.create),
+               reinterpret_cast<void*>(fsr.destroy), reinterpret_cast<void*>(fsr.dispatch), reinterpret_cast<void*>(fsr.query));
       fsr.load_failed = true;
       fsr.provider = "AMD loader missing or invalid";
       return false;
     }
+    DebugLog("FSR: loader loaded");
   }
   if (fsr.current && fsr.current->width == width && fsr.current->height == height && fsr.current->flags == flags) return true;
   if (fsr.create_failed && fsr.failed_width == width && fsr.failed_height == height && fsr.failed_flags == flags) return false;
@@ -3290,6 +3351,40 @@ inline bool EnsureFsrContext(ID3D12Device* device, uint32_t width, uint32_t heig
     ++stat_retirement_limit;
     return false;
   }
+  if (!fsr.versions_queried && fsr.query != nullptr) {
+    fsr.versions_queried = true;
+    DebugLog("FSR: querying provider versions");
+    ffxQueryDescGetVersions versions = {};
+    uint64_t count = 0u;
+    versions.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    versions.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+    versions.device = device;
+    versions.outputCount = &count;
+    if (fsr.query(nullptr, &versions.header) == FFX_API_RETURN_OK && count > 0u) {
+      std::vector<uint64_t> ids(count);
+      std::vector<const char*> names(count);
+      uint64_t output_count = count;
+      versions.outputCount = &output_count;
+      versions.versionIds = ids.data();
+      versions.versionNames = names.data();
+      if (fsr.query(nullptr, &versions.header) == FFX_API_RETURN_OK) {
+        fsr.version_count = count < fsr.version_ids.size() ? count : fsr.version_ids.size();
+        for (uint64_t i = 0u; i < fsr.version_count; ++i) {
+          fsr.version_ids[i] = ids[i];
+          fsr.version_names[i] = names[i] != nullptr ? names[i] : "";
+        }
+      }
+    }
+    if (fsr_debug_logging != 0.f) {
+      std::ostringstream s;
+      s << "FSR: providers:";
+      for (uint64_t i = 0u; i < fsr.version_count; ++i) {
+        s << (i == 0u ? " " : ", ") << fsr.version_names[i] << "(" << fsr.version_ids[i] << ")";
+      }
+      DebugLog("%s", s.str().c_str());
+    }
+  }
+
   auto next = std::make_unique<FsrContext>();
   next->width = width;
   next->height = height;
@@ -3299,10 +3394,61 @@ inline bool EnsureFsrContext(ID3D12Device* device, uint32_t width, uint32_t heig
   next->description.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
   next->description.header.pNext = &next->backend.header;
   next->description.flags = flags;
+  if (fsr_debug_logging != 0.f) {
+    next->description.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
+    next->description.fpMessage = OnFfxMessage;
+  }
   next->description.maxRenderSize = {width, height};
   next->description.maxUpscaleSize = {width, height};
+
+  const int requested_version = static_cast<int>(fsr_version);
+  int override_index = -1;
+  if (requested_version != 0) {
+    for (uint64_t i = 0u; i < fsr.version_count; ++i) {
+      const std::string& name = fsr.version_names[i];
+      const size_t digit = name.find_first_of("0123456789");
+      int major = 0, minor = 0;
+      const bool parsed = digit != std::string::npos && std::sscanf(name.c_str() + digit, "%d.%d", &major, &minor) == 2;
+      const bool matches = parsed && (requested_version == 1 ? (major == 3 && minor == 1) : major == 4);
+      if (matches) {
+        override_index = static_cast<int>(i);
+        break;
+      }
+    }
+    if (override_index < 0 && !fsr.version_warned) {
+      fsr.version_warned = true;
+      if (fsr_debug_logging != 0.f) {
+        reshade::log::message(reshade::log::level::warning,
+                              "Far Cry 6 FSR: requested FSR version is not offered by the runtime, using auto");
+      }
+    }
+  }
+  if (override_index >= 0) {
+    next->override_version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    next->override_version.header.pNext = &next->backend.header;
+    next->override_version.versionId = fsr.version_ids[override_index];
+    next->description.header.pNext = &next->override_version.header;
+  }
+  if (fsr_debug_logging != 0.f) {
+    std::ostringstream s;
+    s << "FSR: create flags=0x" << std::hex << next->description.flags << std::dec << " size=" << width << "x"
+      << height << " version=";
+    if (override_index >= 0) {
+      s << fsr.version_names[override_index] << "(" << fsr.version_ids[override_index] << ")";
+    } else {
+      s << "auto";
+    }
+    DebugLog("%s", s.str().c_str());
+  }
+
   fsr.last_result = fsr.create(&next->context, &next->description.header, nullptr);
+  DebugLog("FSR: ffxCreateContext returned %u context=%p", fsr.last_result, static_cast<void*>(next->context));
   if (fsr.last_result != FFX_API_RETURN_OK || next->context == nullptr) {
+    if (fsr_debug_logging != 0.f) {
+      std::ostringstream s;
+      s << "Far Cry 6 FSR: ffxCreateContext failed: " << fsr.last_result;
+      reshade::log::message(reshade::log::level::error, s.str().c_str());
+    }
     if (next->context != nullptr) fsr.destroy(&next->context, nullptr);
     fsr.create_failed = true;
     fsr.failed_width = width;
@@ -3312,6 +3458,7 @@ inline bool EnsureFsrContext(ID3D12Device* device, uint32_t width, uint32_t heig
     return false;
   }
   fsr.create_failed = false;
+  DebugLog("FSR: context created");
   if (fsr.current) {
     fsr.retired.push_back({.context = std::move(fsr.current), .ticket = RetireGpuCommands()});
   }
@@ -3320,8 +3467,12 @@ inline bool EnsureFsrContext(ID3D12Device* device, uint32_t width, uint32_t heig
   if (fsr.query != nullptr) {
     ffxQueryGetProviderVersion version = {};
     version.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
-    if (fsr.query(&fsr.current->context, &version.header) == FFX_API_RETURN_OK && version.versionName != nullptr) {
+    DebugLog("FSR: querying provider version");
+    const auto query_result = fsr.query(&fsr.current->context, &version.header);
+    DebugLog("FSR: provider query returned %u", static_cast<unsigned>(query_result));
+    if (query_result == FFX_API_RETURN_OK && version.versionName != nullptr) {
       fsr.provider = version.versionName;
+      DebugLog("FSR: provider %s(%llu)", version.versionName, static_cast<unsigned long long>(version.versionId));
     }
   }
   fsr.last_time_ms = 0u;
@@ -3456,7 +3607,9 @@ inline bool EnsureNgxInitialized(reshade::api::device* device) {
     std::stringstream s;
     s << "Far Cry 6 DLSS: NGX init failed: " << ResultToString(init_result)
       << " (0x" << std::hex << static_cast<uint32_t>(init_result) << ")";
-    reshade::log::message(reshade::log::level::error, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::error, s.str().c_str());
+    }
     return false;
   }
 
@@ -3466,7 +3619,9 @@ inline bool EnsureNgxInitialized(reshade::api::device* device) {
     std::stringstream s;
     s << "Far Cry 6 DLSS: NGX capability parameters failed: " << ResultToString(params_result)
       << " (0x" << std::hex << static_cast<uint32_t>(params_result) << ")";
-    reshade::log::message(reshade::log::level::error, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::error, s.str().c_str());
+    }
     NVSDK_NGX_D3D12_Shutdown1(native_device);
     return false;
   }
@@ -3475,12 +3630,16 @@ inline bool EnsureNgxInitialized(reshade::api::device* device) {
   ngx.capability_parameters->Get(NVSDK_NGX_EParameter_SuperSampling_Available, &super_sampling_available);
   ngx.supported = super_sampling_available > 0;
   if (!ngx.supported) {
-    reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: NGX reports DLSS/DLAA is not supported");
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: NGX reports DLSS/DLAA is not supported");
+    }
   }
 
   ngx.device = native_device;
   ngx.initialized = true;
-  reshade::log::message(reshade::log::level::info, "Far Cry 6 DLSS: NGX initialized");
+  if (fsr_debug_logging != 0.f) {
+    reshade::log::message(reshade::log::level::info, "Far Cry 6 DLSS: NGX initialized");
+  }
   return ngx.supported;
 }
 
@@ -3525,13 +3684,17 @@ inline bool EnsureOutputTexture(ID3D12Device* device, uint32_t width, uint32_t h
   if (FAILED(hr)) {
     std::stringstream s;
     s << "Far Cry 6 DLSS: output texture creation failed: 0x" << std::hex << static_cast<uint32_t>(hr);
-    reshade::log::message(reshade::log::level::error, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::error, s.str().c_str());
+    }
     return false;
   }
 
   ngx.width = width;
   ngx.height = height;
   ngx.output_format = format;
+  DebugLog("output texture created: size=%ux%u format=%d hr=0x%x texture=%p", width, height, static_cast<int>(format),
+           static_cast<uint32_t>(hr), static_cast<void*>(ngx.output_texture.Get()));
   return true;
 }
 
@@ -3654,7 +3817,9 @@ inline bool EnsureFeature(
     std::stringstream s;
     s << "Far Cry 6 DLSS: runtime parameters allocation failed: " << ResultToString(params_result)
       << " (0x" << std::hex << static_cast<uint32_t>(params_result) << ")";
-    reshade::log::message(reshade::log::level::error, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::error, s.str().c_str());
+    }
     return false;
   }
 
@@ -3692,7 +3857,9 @@ inline bool EnsureFeature(
     std::stringstream s;
     s << "Far Cry 6 DLSS: feature creation failed: " << ResultToString(result)
       << " (0x" << std::hex << static_cast<uint32_t>(result) << ")";
-    reshade::log::message(reshade::log::level::error, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::error, s.str().c_str());
+    }
     return false;
   }
 
@@ -3710,7 +3877,9 @@ inline bool EnsureFeature(
     << " quality=" << GetPerfQualityName(ngx.perf_quality)
     << " preset=" << GetRenderPresetName(ngx.render_preset)
     << " flags=" << feature_flags;
-  reshade::log::message(reshade::log::level::info, s.str().c_str());
+  if (fsr_debug_logging != 0.f) {
+    reshade::log::message(reshade::log::level::info, s.str().c_str());
+  }
   return true;
 }
 
@@ -3832,12 +4001,16 @@ inline bool EnsureUnpackLayout(reshade::api::device* device) {
   params[2].push_constants = pc_range;
 
   if (!device->create_pipeline_layout(3, params, &unpack.layout)) {
-    reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: unpack pipeline layout creation failed");
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: unpack pipeline layout creation failed");
+    }
     return false;
   }
   for (uint32_t i = 0u; i < 2u; ++i) {
     if (!device->allocate_descriptor_table(unpack.layout, i, &unpack.tables[i])) {
-      reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: unpack descriptor table allocation failed");
+      if (fsr_debug_logging != 0.f) {
+        reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: unpack descriptor table allocation failed");
+      }
       return false;
     }
   }
@@ -3856,6 +4029,9 @@ inline bool EnsureUnpackResources(reshade::api::device* device, uint32_t width, 
       return false;
     }
     retired_unpack.push_back({.data = unpack, .ticket = RetireGpuCommands()});
+    DebugLog("unpack retired: size=%ux%u texture=%p srv=%p uav=%p pipeline=%p", unpack.width, unpack.height,
+             reinterpret_cast<void*>(unpack.texture.handle), reinterpret_cast<void*>(unpack.srv.handle),
+             reinterpret_cast<void*>(unpack.uav.handle), reinterpret_cast<void*>(unpack.pipeline.handle));
     unpack = {};
   }
   unpack.width = 0u;
@@ -3870,14 +4046,18 @@ inline bool EnsureUnpackResources(reshade::api::device* device, uint32_t width, 
   rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
   if (!device->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &unpack.texture)
       || unpack.texture.handle == 0u) {
-    reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: unpack texture creation failed");
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: unpack texture creation failed");
+    }
     return false;
   }
   reshade::api::resource_view_desc vd(
       reshade::api::resource_view_type::texture_2d, reshade::api::format::r16g16_float, 0, 1, 0, 1);
   if (!device->create_resource_view(unpack.texture, reshade::api::resource_usage::shader_resource, vd, &unpack.srv)
       || !device->create_resource_view(unpack.texture, reshade::api::resource_usage::unordered_access, vd, &unpack.uav)) {
-    reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: unpack view creation failed");
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: unpack view creation failed");
+    }
     return false;
   }
 
@@ -3889,7 +4069,9 @@ inline bool EnsureUnpackResources(reshade::api::device* device, uint32_t width, 
   if (!device->create_pipeline(unpack.layout, 1, &so, &unpack.pipeline) || unpack.pipeline.handle == 0u) {
     std::stringstream s;
     s << "Far Cry 6 DLSS: unpack pipeline creation failed (code_size=" << __dlss_mv_unpack.size() << ")";
-    reshade::log::message(reshade::log::level::warning, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::warning, s.str().c_str());
+    }
     return false;
   }
 
@@ -3901,6 +4083,10 @@ inline bool EnsureUnpackResources(reshade::api::device* device, uint32_t width, 
 
   unpack.width = width;
   unpack.height = height;
+  DebugLog("unpack created: size=%ux%u texture=%p srv=%p uav=%p pipeline=%p masked_pipeline=%p", width, height,
+           reinterpret_cast<void*>(unpack.texture.handle), reinterpret_cast<void*>(unpack.srv.handle),
+           reinterpret_cast<void*>(unpack.uav.handle), reinterpret_cast<void*>(unpack.pipeline.handle),
+           reinterpret_cast<void*>(unpack.masked_pipeline.handle));
   return true;
 }
 
@@ -4143,7 +4329,9 @@ inline bool FailInputs(
       << " motion=" << reinterpret_cast<void*>(motion)
       << " depth=" << reinterpret_cast<void*>(depth)
       << " target=" << reinterpret_cast<void*>(target);
-    reshade::log::message(reshade::log::level::warning, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::warning, s.str().c_str());
+    }
   }
   return false;
 }
@@ -4569,6 +4757,11 @@ inline bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
   fsr1_target_height.store(height);
   fsr1_target_format.store(format);
   fsr1_output_resource.store(output.handle);
+  static uint64_t logged_fsr1_output = 0u;
+  if (output.handle != logged_fsr1_output) {
+    logged_fsr1_output = output.handle;
+    DebugLog("fsr1 output recorded: handle=%p size=%ux%u format=%u", reinterpret_cast<void*>(output.handle), width, height, format);
+  }
   // NGX writes into this resource directly, at the evaluation point, so there is
   // nothing to copy: this only takes the game's dispatch out of the way once that
   // write has actually happened. A frame where it did not keeps the game's upscale.
@@ -4601,6 +4794,10 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     ngx.eval_failed = false;
     ngx.create_failed = false;
     ngx.reset = true;
+    DebugLog("upscaler toggled: previous_fsr=%d use_fsr=%d ngx.feature=%p fsr.current=%p retired ngx=%llu fsr=%llu",
+             previous_fsr, use_fsr, static_cast<void*>(ngx.feature), static_cast<void*>(fsr.current.get()),
+             static_cast<unsigned long long>(retired_ngx_features.size()), static_cast<unsigned long long>(fsr.retired.size()));
+    debug_trace_budget.store(8u);
     previous_fsr = use_fsr;
   }
   if (!use_fsr) {
@@ -4619,6 +4816,11 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   // The pause variant has a separate history output. Leave its TAA to the game
   // and resume DLSS with fresh history when gameplay returns.
   if (hash == kTaaPauseHash) {
+    static bool logged_pause_hash = false;
+    if (!logged_pause_hash) {
+      logged_pause_hash = true;
+      DebugLog("first pause TAA hash seen: 0x%08x", hash);
+    }
     pause_taa_last_frame.store(camera_builder_frame.load(std::memory_order_acquire), std::memory_order_release);
     ++stat_pause_taa_skipped;
     ngx.reset = true;
@@ -4696,7 +4898,16 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
   if (!b0_ok && !logged_missing_constants) {
     logged_missing_constants = true;
-    reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: TAA draw found, but b0 was not resolved");
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: TAA draw found, but b0 was not resolved");
+    }
+  }
+  if (DebugTrace()) {
+    DebugLog("inputs: hash=%08x color_ok=%d motion_ok=%d depth_a_ok=%d depth_b_ok=%d b0_ok=%d color=%p/%d motion=%p/%d depth_a=%p/%d depth_b=%p/%d",
+             hash, color_ok, motion_ok, depth_a_ok, depth_b_ok, b0_ok, reinterpret_cast<void*>(color_in.resource.handle),
+             static_cast<int>(color_in.format), reinterpret_cast<void*>(motion_in.resource.handle), static_cast<int>(motion_in.format),
+             reinterpret_cast<void*>(depth_a_in.resource.handle), static_cast<int>(depth_a_in.format),
+             reinterpret_cast<void*>(depth_b_in.resource.handle), static_cast<int>(depth_b_in.format));
   }
 
   // Input substitution. Both depth candidates are always resolved so the probe
@@ -4727,6 +4938,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     if (previous_width != 0u && previous_height != 0u
         && (previous_width != taa_width || previous_height != taa_height)) {
       ++stat_render_size_changes;
+      debug_trace_budget.store(8u);
       ngx.create_failed = false;
       ngx.eval_failed = false;
       ngx.reset = true;
@@ -4762,6 +4974,11 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       : (use_depth_mask ? reinterpret_cast<ID3D12Resource*>(depth_in.resource.handle) : scene_depth);
   const bool depth_ok = use_depth_placeholder
       || (use_depth_mask ? mask_ok : (scene_depth != nullptr));
+  if (DebugTrace()) {
+    DebugLog("taa: size=%ux%u color=%p motion=%p depth=%p scene_depth=%p depth_mode=%.0f", taa_width, taa_height,
+             static_cast<void*>(color), static_cast<void*>(motion), static_cast<void*>(depth), static_cast<void*>(scene_depth),
+             dlss_depth_source);
+  }
 
   if (!use_bypass && color == nullptr) {
     return FailInputs(color, motion, depth, output_target);
@@ -4805,6 +5022,11 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
           & static_cast<uint32_t>(reshade::api::resource_usage::unordered_access)) == 0u;
   const uint32_t target_width = fsr1_mode ? fsr1_target_width.load() : display_width.load();
   const uint32_t target_height = fsr1_mode ? fsr1_target_height.load() : display_height.load();
+  if (DebugTrace()) {
+    DebugLog("sizes: input=%ux%u target=%ux%u display=%ux%u fsr1_mode=%d fsr1 handle=%p state=%u", input_width, input_height,
+             target_width, target_height, display_width.load(), display_height.load(), fsr1_mode,
+             reinterpret_cast<void*>(fsr1_target_handle), static_cast<uint32_t>(fsr1_target_state));
+  }
   if (input_width == 0u || input_height == 0u
       || (use_fsr && (input_width > target_width || input_height > target_height))) {
     NoteFail(kFailSize);
@@ -4835,7 +5057,9 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
                  static_cast<uint32_t>(motion_desc_early.Width), motion_desc_early.Height,
                  static_cast<uint32_t>(depth_desc_early.Width), depth_desc_early.Height,
                  input_width, input_height);
-        reshade::log::message(reshade::log::level::warning, buf);
+        if (fsr_debug_logging != 0.f) {
+          reshade::log::message(reshade::log::level::warning, buf);
+        }
       }
       return false;
     }
@@ -4858,7 +5082,9 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
         snprintf(buf, sizeof(buf),
                  "Far Cry 6 DLSS: rejecting implausible sizes in=%ux%u target=%ux%u",
                  input_width, input_height, target_width, target_height);
-        reshade::log::message(reshade::log::level::warning, buf);
+        if (fsr_debug_logging != 0.f) {
+          reshade::log::message(reshade::log::level::warning, buf);
+        }
       }
       return false;
     }
@@ -4881,7 +5107,9 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
         snprintf(buf, sizeof(buf),
                  "Far Cry 6 DLSS: rejecting implausible sizes in=%ux%u target=%ux%u",
                  input_width, input_height, target_width, target_height);
-        reshade::log::message(reshade::log::level::warning, buf);
+        if (fsr_debug_logging != 0.f) {
+          reshade::log::message(reshade::log::level::warning, buf);
+        }
       }
       return false;
     }
@@ -4924,7 +5152,9 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       std::stringstream s;
       s << "Far Cry 6 DLSS: unsupported TAA target format " << static_cast<int>(output_desc.Format)
         << ", keeping vanilla TAA";
-      reshade::log::message(reshade::log::level::warning, s.str().c_str());
+      if (fsr_debug_logging != 0.f) {
+        reshade::log::message(reshade::log::level::warning, s.str().c_str());
+      }
     }
     return false;
   }
@@ -4956,7 +5186,9 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
         std::stringstream s;
         s << "Far Cry 6 DLSS: bypass needs a 16-bit float TAA target, this one is format "
           << static_cast<int>(output_desc.Format) << "; skipping";
-        reshade::log::message(reshade::log::level::warning, s.str().c_str());
+        if (fsr_debug_logging != 0.f) {
+          reshade::log::message(reshade::log::level::warning, s.str().c_str());
+        }
       }
       return false;
     }
@@ -5056,6 +5288,12 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     NoteFail(kFailFeature);
     return false;
   }
+  if (DebugTrace()) {
+    DebugLog("upscaler: use_fsr=%d fsr_flags=0x%x fsr.current=%p context=%p ngx.output_texture=%p output_format=%d", use_fsr,
+             fsr_flags, static_cast<void*>(fsr.current.get()),
+             fsr.current != nullptr ? fsr.current->context : nullptr, static_cast<void*>(ngx.output_texture.Get()),
+             static_cast<int>(output_format));
+  }
 
   // Jitter: read from the scene's own view constants, at the draws that apply it.
   // The ring-wide fallback only runs when that produced nothing and the value is
@@ -5144,6 +5382,11 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     jitter_x = 0.f;
     jitter_y = 0.f;
   }
+  if (DebugTrace()) {
+    DebugLog("jitter: source=%.0f x=%.6f y=%.6f scene_fresh=%d projection_valid=%d builder_halton=%d halton_step=%u temporal_valid=%d camera_override=%d",
+             dlss_jitter_source, jitter_x, jitter_y, scene_fresh, projection_jitter.valid, builder_halton, builder_halton_step,
+             temporal_jitter_valid, camera_override_applied);
+  }
 
   // Keep the existing correction as the default while allowing controlled A/B tests.
   float object_strength = 1.f;
@@ -5206,8 +5449,15 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       NoteFail(kFailUnpack);
       return false;
     }
-    if (!DispatchUnpack(device, cmd_list, motion_view, input_width, input_height,
-                        motion_src_width, motion_src_height, object_mask, object_delta_x, object_delta_y, object_strength)) {
+    if (DebugTrace()) {
+      DebugLog("unpack: begin input=%ux%u source=%ux%u", input_width, input_height, motion_src_width, motion_src_height);
+    }
+    const bool unpack_ok = DispatchUnpack(device, cmd_list, motion_view, input_width, input_height,
+                                          motion_src_width, motion_src_height, object_mask, object_delta_x, object_delta_y, object_strength);
+    if (DebugTrace()) {
+      DebugLog("unpack: result=%d", unpack_ok);
+    }
+    if (!unpack_ok) {
       NoteFail(kFailUnpack);
       return false;
     }
@@ -5423,7 +5673,9 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
                hash, input_width, input_height, target_width, target_height,
                GetPerfQualityName(ngx.perf_quality), GetRenderPresetName(ngx.render_preset),
                jitter_x, jitter_y, motion_src_width, motion_src_height, feature_flags, eval.InReset);
-      reshade::log::message(reshade::log::level::info, buf);
+      if (fsr_debug_logging != 0.f) {
+        reshade::log::message(reshade::log::level::info, buf);
+      }
     }
   }
 
@@ -5496,8 +5748,21 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     dispatch.cameraFar = fsr.camera_far;
     dispatch.cameraFovAngleVertical = fsr.camera_fov;
     dispatch.viewSpaceToMetersFactor = 1.f;
+    if (DebugTrace()) {
+      DebugLog("FSR dispatch: color=%p depth=%p motion=%p output=%p render=%ux%u upscale=%ux%u reset=%d frameTimeDelta=%.3f near=%.3f far=%.3f fov=%.3f",
+               static_cast<void*>(color), static_cast<void*>(depth), static_cast<void*>(motion_vectors),
+               static_cast<void*>(eval.Feature.pInOutput), input_width, input_height, target_width, target_height, dispatch.reset,
+               dispatch.frameTimeDelta, fsr.camera_near, fsr.camera_far, fsr.camera_fov);
+    }
+    if (fsr_debug_logging != 0.f && !fsr.current->logged_dispatch) {
+      DebugLog("FSR: first dispatch: begin");
+    }
     fsr.last_result = fsr.dispatch(&fsr.current->context, &dispatch.header);
     if (fsr.last_result == FFX_API_RETURN_OK) ++fsr.dispatches;
+    if (fsr_debug_logging != 0.f && !fsr.current->logged_dispatch) {
+      DebugLog("FSR: first dispatch: returned %u", fsr.last_result);
+      fsr.current->logged_dispatch = true;
+    }
   } else {
     result = NGX_D3D12_EVALUATE_DLSS_EXT(command_list, ngx.feature, ngx.runtime_parameters, &eval);
   }
@@ -5509,7 +5774,10 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
   // Restored before anything else: the evaluation dispatched on the native
   // command list, and the game's own commands follow ours on this same list.
-  if (use_fsr || dlss_restore_state != 0.f) RestoreGameDescriptorState(cmd_list);
+  if (use_fsr || dlss_restore_state != 0.f) {
+    RestoreGameDescriptorState(cmd_list);
+    if (DebugTrace()) DebugLog("descriptor state restored");
+  }
   if ((use_fsr && fsr.last_result != FFX_API_RETURN_OK) || (!use_fsr && NVSDK_NGX_FAILED(result))) {
     ngx.eval_failed = true;
     NoteFail(kFailEval);
@@ -5520,7 +5788,9 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       s << "Far Cry 6 DLSS: evaluation failed: " << ResultToString(result)
         << " (0x" << std::hex << static_cast<uint32_t>(result) << ")";
     }
-    reshade::log::message(reshade::log::level::error, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::error, s.str().c_str());
+    }
     return false;
   }
   ngx.reset = false;
@@ -5726,7 +5996,9 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     s << "Far Cry 6 DLSS: evaluated at TAA 0x" << std::hex << hash << std::dec
       << " at in=" << input_width << "x" << input_height
       << " target=" << target_width << "x" << target_height;
-    reshade::log::message(reshade::log::level::info, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::info, s.str().c_str());
+    }
   }
   if (!ngx.logged_jitter) {
     ngx.logged_jitter = true;
@@ -5736,7 +6008,9 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       << " depth=" << (use_depth_placeholder ? "placeholder"
           : (use_depth_mask ? (use_depth_mask_b ? "t6 mask" : "t5 mask") : "scene"))
       << " reset=" << eval.InReset;
-    reshade::log::message(reshade::log::level::info, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::info, s.str().c_str());
+    }
   }
   return true;
 }
@@ -6921,7 +7195,14 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
     return false;
   }
   auto* native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
-  if (!CopyThroughTaaTarget(cmd_list, native, target, source, reshade::api::resource_usage::unordered_access)) return false;
+  if (DebugTrace()) {
+    DebugLog("scene upscale copy: begin target=%p source=%p", static_cast<void*>(target), static_cast<void*>(source));
+  }
+  const bool copied = CopyThroughTaaTarget(cmd_list, native, target, source, reshade::api::resource_usage::unordered_access);
+  if (DebugTrace()) {
+    DebugLog("scene upscale copy: end copied=%d target=%p source=%p", copied, static_cast<void*>(target), static_cast<void*>(source));
+  }
+  if (!copied) return false;
   fg_last_scene_handoff_frame.store(frame_counter, std::memory_order_release);
   if (fg_input_test != 0.f && fg_camera_capture_enabled.load(std::memory_order_acquire)
       && !fg_hudless_retire_requested.load(std::memory_order_acquire)
@@ -7082,7 +7363,9 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
   static bool logged = false;
   if (!logged) {
     logged = true;
-    reshade::log::message(reshade::log::level::info, "Far Cry 6 DLSS: replaced 0x944489F5 with display-resolution DLSS output");
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::info, "Far Cry 6 DLSS: replaced 0x944489F5 with display-resolution DLSS output");
+    }
   }
   return true;
 }
@@ -7280,7 +7563,9 @@ inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uin
     logged_taa_draw_detected = true;
     std::stringstream s;
     s << "Far Cry 6 DLSS: detected TAA draw 0x" << std::hex << hash;
-    reshade::log::message(reshade::log::level::info, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::info, s.str().c_str());
+    }
   }
   // Keep TAA running as a fallback. A successful evaluation is handed to the
   // matching scene upscale draw or the game's FSR1 dispatch.
@@ -7318,7 +7603,9 @@ inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32
     logged_taa_draw_detected = true;
     std::stringstream s;
     s << "Far Cry 6 DLSS: detected TAA draw 0x" << std::hex << hash;
-    reshade::log::message(reshade::log::level::info, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::info, s.str().c_str());
+    }
   }
   // Keep TAA running as a fallback. A successful evaluation is handed to the
   // matching scene upscale draw or the game's FSR1 dispatch.
@@ -7338,6 +7625,96 @@ inline void OnPresent(
   cpu_timing_enabled.store(dlss_cpu_timing != 0.f, std::memory_order_relaxed);
   CpuTimingScope timing(CpuTimingCategory::present, 0u);
   ++stat_presents;
+  uint32_t budget = debug_trace_budget.load(std::memory_order_relaxed);
+  while (budget > 0u && !debug_trace_budget.compare_exchange_weak(budget, budget - 1u, std::memory_order_relaxed)) {}
+  if (fsr_debug_logging != 0.f) {
+    static uint32_t logged_display_width = 0u;
+    static uint32_t logged_display_height = 0u;
+    static int logged_camera_state = -1;
+    static std::string logged_fg_state;
+    static HRESULT logged_removed_reason = S_OK;
+    if (queue != nullptr && queue->get_device() != nullptr && queue->get_device()->get_api() == reshade::api::device_api::d3d12) {
+      const HRESULT removed = reinterpret_cast<ID3D12Device*>(queue->get_device()->get_native())->GetDeviceRemovedReason();
+      if (removed != logged_removed_reason) {
+        logged_removed_reason = removed;
+        DebugLog("device removed reason: 0x%08x", static_cast<unsigned>(removed));
+      }
+    }
+    const uint32_t width = display_width.load();
+    const uint32_t height = display_height.load();
+    if (width != logged_display_width || height != logged_display_height) {
+      logged_display_width = width;
+      logged_display_height = height;
+      DebugLog("display size: %ux%u", width, height);
+    }
+    int camera_state = 0;
+    uint64_t camera_calls = 0u;
+    uint64_t camera_halton_verified = 0u;
+    bool camera_offsets_installed = false;
+    {
+      std::shared_lock lock(camera_builder_test.mutex);
+      camera_state = static_cast<int>(camera_builder_test.state);
+      camera_calls = camera_builder_test.calls;
+      camera_halton_verified = camera_builder_test.halton_verified;
+      camera_offsets_installed = camera_builder_test.offsets_hook_installed;
+    }
+    if (camera_state != logged_camera_state) {
+      logged_camera_state = camera_state;
+      DebugLog("camera builder state=%d calls=%llu halton_verified=%llu offsets_hook=%d", camera_state,
+               static_cast<unsigned long long>(camera_calls), static_cast<unsigned long long>(camera_halton_verified),
+               camera_offsets_installed);
+    }
+    uint64_t streamline_count = 0u;
+    {
+      std::shared_lock lock(farcry6_dlss::streamline::streamline_messages.mutex);
+      streamline_count = farcry6_dlss::streamline::streamline_messages.count;
+    }
+    std::ostringstream fg_state;
+    fg_state << "bootstrap=" << farcry6_dlss::streamline::bootstrap_status.load()
+             << " result=" << farcry6_dlss::streamline::bootstrap_result.load()
+             << " factory_hook=" << farcry6_dlss::streamline::factory_hook_active.load()
+             << " fg_mode_report=" << fg_mode_report.load()
+             << " dlssg_support=" << farcry6_dlss::streamline::bootstrap_fg_support.load()
+             << " reflex_support=" << farcry6_dlss::streamline::bootstrap_reflex_support.load()
+             << " messages=" << streamline_count;
+    if (fg_state.str() != logged_fg_state) {
+      logged_fg_state = fg_state.str();
+      DebugLog("streamline: %s", logged_fg_state.c_str());
+    }
+    if (stat_presents.load() % 600u == 0u) {
+      DebugLog("heartbeat: frame=%llu display=%ux%u render=%ux%u fsr1_active=%d fail_code=%d dlss_ok=%llu taa_draws=%llu fsr_dispatches=%llu fsr_result=%u provider=%s retired_fsr=%llu ngx_outputs=%llu unpacks=%llu",
+               static_cast<unsigned long long>(frame_counter), width, height, last_render_width.load(), last_render_height.load(),
+               fsr1_active.load(), stat_fail_code.load(), static_cast<unsigned long long>(stat_dlss_ok.load()),
+               static_cast<unsigned long long>(stat_taa_draws.load()), static_cast<unsigned long long>(fsr.dispatches),
+               fsr.last_result, fsr.provider.c_str(), static_cast<unsigned long long>(fsr.retired.size()),
+               static_cast<unsigned long long>(retired_ngx_outputs.size()), static_cast<unsigned long long>(retired_unpack.size()));
+      uint64_t fence_failures = 0u;
+      {
+        std::unique_lock lock(gpu_retirement.mutex);
+        fence_failures = gpu_retirement.fence_failures;
+      }
+      uint64_t depth_resource = 0u;
+      uint32_t depth_width = 0u;
+      uint32_t depth_height = 0u;
+      int depth_format = 0;
+      {
+        const std::lock_guard<std::mutex> lock(depth_mutex);
+        depth_resource = scene_depth_resource;
+        depth_width = scene_depth_width;
+        depth_height = scene_depth_height;
+        depth_format = static_cast<int>(scene_depth_format);
+      }
+      DebugLog("heartbeat: fence_failures=%llu scene_handoffs=%llu handoff_misses=%llu jitter scene=%llu fallback=%llu zero=%llu synthetic=%llu temporal=%llu camera_live=%d near=%.6g far=%.6g fov=%.6g depth_best_draws=%u depth_handle=%p depth_size=%ux%u depth_format=%d required=%ux%u",
+               static_cast<unsigned long long>(fence_failures), static_cast<unsigned long long>(stat_scene_handoffs.load()),
+               static_cast<unsigned long long>(stat_scene_handoff_misses.load()), static_cast<unsigned long long>(stat_jitter_scene.load()),
+               static_cast<unsigned long long>(stat_jitter_fallback.load()), static_cast<unsigned long long>(stat_jitter_zero.load()),
+               static_cast<unsigned long long>(stat_jitter_synthetic.load()), static_cast<unsigned long long>(stat_jitter_temporal.load()),
+               fsr.camera_live, fsr.camera_near, fsr.camera_far, fsr.camera_fov, stat_depth_best_draws.load(),
+               reinterpret_cast<void*>(depth_resource), depth_width, depth_height, depth_format, last_render_width.load(),
+               last_render_height.load());
+      DebugLog("heartbeat: streamline %s", logged_fg_state.c_str());
+    }
+  }
   if (queue != nullptr) {
     {
       std::unique_lock lock(gpu_retirement.mutex);
@@ -7380,7 +7757,9 @@ inline void OnPresent(
     for (auto it = fsr.retired.begin(); it != fsr.retired.end();) {
       if (!it->ticket->complete) { ++it; continue; }
       if (it->context && it->context->context != nullptr && fsr.destroy != nullptr) {
+        DebugLog("FSR: destroying retired context %p", static_cast<void*>(it->context->context));
         fsr.destroy(&it->context->context, nullptr);
+        DebugLog("FSR: retired context destroyed");
       }
       it = fsr.retired.erase(it);
       ++gpu_retirement.reclaimed;
@@ -7794,6 +8173,14 @@ inline void OnFgDestroySwapchain(reshade::api::swapchain* swapchain, bool) {
       || swapchain == nullptr || swapchain->get_device() == nullptr
       || reinterpret_cast<void*>(swapchain->get_device()->get_native())
           != farcry6_dlss::streamline::bootstrap_device.load(std::memory_order_acquire)) return;
+  if (fsr_debug_logging != 0.f) {
+    const auto back_buffer = swapchain->get_back_buffer(0);
+    if (back_buffer.handle != 0u) {
+      const auto desc = swapchain->get_device()->get_resource_desc(back_buffer);
+      DebugLog("FG swapchain destroy: swapchain=%p back_buffer=%ux%u", static_cast<void*>(swapchain),
+               static_cast<uint32_t>(desc.texture.width), static_cast<uint32_t>(desc.texture.height));
+    }
+  }
   fg_enable_requested.store(false, std::memory_order_release);
   if (fg_mode_report.load(std::memory_order_relaxed) != 0) {
     fg_unsafe_transitions.fetch_add(1u, std::memory_order_relaxed);
@@ -7829,6 +8216,14 @@ inline void OnFgInitSwapchain(reshade::api::swapchain* swapchain, bool) {
       || swapchain == nullptr || swapchain->get_device() == nullptr
       || reinterpret_cast<void*>(swapchain->get_device()->get_native())
           != farcry6_dlss::streamline::bootstrap_device.load(std::memory_order_acquire)) return;
+  if (fsr_debug_logging != 0.f) {
+    const auto back_buffer = swapchain->get_back_buffer(0);
+    if (back_buffer.handle != 0u) {
+      const auto desc = swapchain->get_device()->get_resource_desc(back_buffer);
+      DebugLog("FG swapchain init: swapchain=%p back_buffer=%ux%u", static_cast<void*>(swapchain),
+               static_cast<uint32_t>(desc.texture.width), static_cast<uint32_t>(desc.texture.height));
+    }
+  }
   fg_last_scene_handoff_frame.store(UINT64_MAX, std::memory_order_release);
   fg_stable_gameplay_frames.store(0u, std::memory_order_relaxed);
   fg_swapchain_transition.store(false, std::memory_order_release);
@@ -7969,10 +8364,28 @@ inline void OnInitDevice(reshade::api::device* device) {
   std::stringstream s;
   if (supported_vendor && device->get_api() == reshade::api::device_api::d3d12) {
     s << "Far Cry 6: supported graphics device detected (" << device->get_native() << ", vendor=" << std::hex << vendor_id << ")";
-    reshade::log::message(reshade::log::level::info, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::info, s.str().c_str());
+    }
   } else {
     s << "Far Cry 6: ignoring unsupported device, vendor=0x" << std::hex << vendor_id;
-    reshade::log::message(reshade::log::level::info, s.str().c_str());
+    if (fsr_debug_logging != 0.f) {
+      reshade::log::message(reshade::log::level::info, s.str().c_str());
+    }
+  }
+  if (fsr_debug_logging != 0.f) {
+    uint32_t driver_version = 0u;
+    uint32_t device_id = 0u;
+    char description[256] = {};
+    device->get_property(reshade::api::device_properties::driver_version, &driver_version);
+    device->get_property(reshade::api::device_properties::device_id, &device_id);
+    device->get_property(reshade::api::device_properties::description, description);
+    DebugLog("init device: build=%s built=" __DATE__ " " __TIME__ " api=%d vendor=0x%x device=0x%x driver=%u description=%s native=%p",
+             std::string(renodx::build_info::kBuildVersion).c_str(), static_cast<int>(device->get_api()),
+             static_cast<unsigned>(vendor_id), device_id, driver_version, description, reinterpret_cast<void*>(device->get_native()));
+    DebugLog("init device: is_nvidia=%d supported_vendor=%d bootstrap=%s upscaler_type=%.0f fsr_version=%.0f dlss_enabled=%.0f jitter_source=%.0f depth_source=%.0f",
+             is_nvidia, supported_vendor, is_nvidia ? "register" : "stop", upscaler_type, fsr_version, dlss_enabled,
+             dlss_jitter_source, dlss_depth_source);
   }
 }
 
@@ -8049,6 +8462,7 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     any_gpu.store(!gpu_devices.empty());
     if (gpu_devices.empty()) device_summary = "none seen";
   }
+  DebugLog("destroy device: device=%p was_ours=%d", static_cast<void*>(device), was_ours);
   if (was_ours) {
     ReleaseFgHudless(device);
     ReleaseNgx();
@@ -8066,7 +8480,9 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     gpu_retirement.conflicting_submission = false;
   }
   RemoveGpuNative(device->get_native());
-  reshade::log::message(reshade::log::level::info, "Far Cry 6 DLSS: device destroyed");
+  if (fsr_debug_logging != 0.f) {
+    reshade::log::message(reshade::log::level::info, "Far Cry 6 DLSS: device destroyed");
+  }
 }
 
 inline void Use(DWORD fdw_reason) {
