@@ -134,8 +134,10 @@ inline constexpr uint32_t kPoolMaxRejectSamples = 2u;       // per family, for t
 inline constexpr size_t kPoolMaxNearIndex = 500000u;
 inline constexpr uint64_t kPoolMeshSlotBytes = 4ull * 1024ull * 1024ull;  // mesh copies per slot (frame)
 inline constexpr uint64_t kPoolMeshGuardBytes = 4096u;  // start of each mesh slot left unused (staging guard)
+inline constexpr uint64_t kPoolMeshLaneBytes = 64u;  // a whole-buffer vertex/uv copy this small is staged at offset 0 (the slot's lane)
 inline constexpr uint32_t kPoolPoisonWord = 0xFFC0DEADu;  // poison_staging: what a read leaves in the mesh staging
 inline constexpr uint64_t kPoolResidueCycles = 2u;        // poison_staging: cycles of heads kept per slot
+inline constexpr uint32_t kPoolGuardCopies = 8u;          // poison_staging: source-offset-0 copies kept per guard hit
 inline constexpr uint32_t kPoolMeshCopiesPerFrame = 64u;
 inline constexpr uint32_t kPoolMeshCopiesPerDraw = 4u;
 inline constexpr float kPoolMinScale = 0.001f;     // shorter axes: collapsed or hidden instances
@@ -627,6 +629,29 @@ struct PoolStagingDiag {
   const char* head_class = "";   // ClassifyPoolStagingHead
 };
 
+// poison_staging: a mesh copy from source offset 0 in a slot whose guard was written.
+struct PoolGuardCopy {
+  uint64_t mesh_key = 0u;
+  PoolMeshPhase phase = PoolMeshPhase::Indices;
+  uint32_t ordinal = 0u;      // the copy's place in its slot's read list
+  bool queued = false;        // its request was current when the slot was taken
+  uint64_t staging_offset = 0u;
+  uint64_t size = 0u;         // wanted bytes
+  uint64_t copied = 0u;       // bytes copied
+  uint64_t source_size = 0u;  // copied == source_size: the whole source buffer
+  bool all_poison = false;    // its own range held only poison words at resolve
+};
+
+// poison_staging: the last written guard and its slot's copies from source offset 0.
+struct PoolGuardScan {
+  uint32_t written_words = 0u;   // non-poison words in [0, kPoolMeshGuardBytes)
+  uint32_t extent = 0u;          // guard bytes up to and including the last non-poison byte
+  uint32_t zero_copies = 0u;     // copies in the slot from source offset 0
+  uint32_t unlanded = 0u;        // of those, ranges still all poison
+  uint32_t vertex_matches = 0u;  // of the unlanded, whole-buffer vertex copies of `extent` bytes
+  PoolGuardCopy copies[kPoolGuardCopies] = {};  // the first of them, in slot order
+};
+
 // poison_staging: a head read from a slot (per slot, the last kPoolResidueCycles cycles).
 struct PoolResidue {
   uint64_t offset = 0u;
@@ -769,6 +794,7 @@ struct PoolMeshCopy {
   uint64_t copied = 0u;  // bytes copied
   uint64_t source = 0u;  // VB or IB handle, for the log
   uint64_t source_offset = 0u;
+  uint64_t source_size = 0u;  // the source buffer's size (poison_staging guard scan)
 };
 
 struct PoolPendingCopy {
@@ -818,6 +844,7 @@ struct PoolStagingSlot {
   // Mesh copies of the same frame, in their own buffer.
   reshade::api::resource mesh_buffer = {0u};
   uint64_t mesh_used = 0u;
+  uint64_t mesh_lane = 0u;  // bytes of the copy staged at offset 0 (0: lane free)
   std::vector<PoolMeshCopy> mesh_copies;
 };
 
@@ -1157,7 +1184,11 @@ struct PoolStats {
   uint64_t mesh_copy_bytes = 0u;
   uint32_t mesh_budget_full = 0u;    // copies postponed: the frame's mesh staging was full
   uint32_t mesh_guard_hits = 0u;    // resolves whose guard held non-poison words (poison_staging)
-  PoolStagingDiag mesh_guard_last;  // the last such guard: slot, words written, first 48 bytes
+  uint32_t mesh_guard_explained = 0u;  // hits with one unlanded source-offset-0 copy, a whole-buffer vertex copy of the extent
+  uint32_t mesh_lane_copies = 0u;  // tiny whole-buffer vertex/uv copies staged at offset 0
+  uint32_t mesh_lane_busy = 0u;    // tiny copies postponed: the slot's lane was taken
+  PoolStagingDiag mesh_guard_last;  // the last such guard: slot, poison words, first 48 bytes
+  PoolGuardScan mesh_guard_scan;   // that guard's extent and its slot's copies from source offset 0
   uint32_t mesh_dropped = 0u;        // copies read after their mesh was released or re-queued
   uint32_t mesh_expired = 0u;        // requests not drawn for kPoolPruneAge frames
   uint64_t mesh_deferred_skips = 0u; // draws on a deferred context that could have served a copy
@@ -3872,7 +3903,15 @@ inline uint32_t ReservePoolMeshCopies(
       FailPoolMesh(request_it, error);
       continue;
     }
-    const uint64_t offset = (std::max)((slot.mesh_used + 15u) & ~uint64_t{15}, kPoolMeshGuardBytes);
+    // A tiny whole-buffer vertex or uv copy lands at staging offset 0 whatever offset it is given (owner dumps), so it is staged there.
+    const bool lane = !indices && aligned_begin == 0u && aligned_end == buffer_size
+                      && aligned_end - aligned_begin <= kPoolMeshLaneBytes && (aligned_end - aligned_begin) % 4u == 0u;
+    if (lane && slot.mesh_lane != 0u) {
+      g_pool.stats.mesh_lane_busy += 1u;
+      ++index;
+      continue;
+    }
+    const uint64_t offset = lane ? 0u : (std::max)((slot.mesh_used + 15u) & ~uint64_t{15}, kPoolMeshGuardBytes);
     if (offset + (aligned_end - aligned_begin) > kPoolMeshSlotBytes) {
       g_pool.stats.mesh_budget_full += 1u;
       break;
@@ -3887,7 +3926,14 @@ inline uint32_t ReservePoolMeshCopies(
     copy.copied = aligned_end - aligned_begin;
     copy.source = source.handle;
     copy.source_offset = aligned_begin;
-    slot.mesh_used = offset + copy.copied;
+    copy.source_size = buffer_size;
+    if (lane) {
+      slot.mesh_lane = copy.copied;
+      slot.mesh_used = (std::max)(slot.mesh_used, kPoolMeshGuardBytes);  // the resolve maps and scans the whole guard
+      g_pool.stats.mesh_lane_copies += 1u;
+    } else {
+      slot.mesh_used = offset + copy.copied;
+    }
     slot.mesh_copies.push_back(copy);
     commands[count] = {source, aligned_begin, slot.mesh_buffer, offset, copy.copied};
     copies[count] = copy;
@@ -5558,6 +5604,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
   reshade::api::resource mesh_buffer = {0u};
   uint64_t used = 0u;
   uint64_t mesh_used = 0u;
+  uint64_t mesh_lane = 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     PoolStagingSlot& slot = g_pool.slots[slot_index];
@@ -5565,6 +5612,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       slot.used = 0u;
       slot.follow_used = 0u;
       slot.mesh_used = 0u;
+      slot.mesh_lane = 0u;
       slot.indirect_draws.clear();
       slot.indirect_alpha.clear();
       slot.indirect_wind.clear();
@@ -5607,6 +5655,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     g_pool.stats.max_follow_used = (std::max)(g_pool.stats.max_follow_used, slot.follow_used);
     mesh_buffer = slot.mesh_buffer;
     mesh_used = slot.mesh_used;
+    mesh_lane = slot.mesh_lane;
     slot.resolving = true;
   }
   const auto is_indirect = [&indirect_draws](const PoolPendingCopy& copy) {
@@ -5667,6 +5716,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
   const bool poison = g_pool.poison_staging.load(std::memory_order_relaxed);
   PoolStagingDiag guard;
   bool guard_hit = false;
+  PoolGuardScan guard_scan;
   void* mesh_mapped = nullptr;
   const bool meshes_ok = jobs.empty()
                          || (mesh_buffer.handle != 0u && mesh_used != 0u
@@ -5682,13 +5732,56 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       guard.copied = kPoolMeshGuardBytes;
       guard.head_bytes = 48u;
       std::memcpy(guard.head, bytes, 48u);
-      for (uint64_t w = 0u; w < kPoolMeshGuardBytes / 4u; ++w) {
+      for (uint64_t w = mesh_lane / 4u; w < kPoolMeshGuardBytes / 4u; ++w) {
         uint32_t word = 0u;
         std::memcpy(&word, bytes + 4u * w, sizeof(word));
-        if (word != kPoolPoisonWord) guard.sentinel_words += 1u;
+        if (word == kPoolPoisonWord) {
+          guard.sentinel_words += 1u;
+        } else {
+          guard_scan.written_words += 1u;
+        }
       }
-      guard_hit = guard.sentinel_words != 0u;
+      guard_hit = guard_scan.written_words != 0u;
       guard.head_class = "guard";
+      if (guard_hit) {
+        for (uint64_t b = kPoolMeshGuardBytes; b > mesh_lane; --b) {
+          if (bytes[b - 1u] != static_cast<uint8_t>(kPoolPoisonWord >> (8u * ((b - 1u) % 4u)))) {
+            guard_scan.extent = static_cast<uint32_t>(b);
+            break;
+          }
+        }
+        for (const PoolMeshJob& job : jobs) {
+          if (job.copy.source_offset != 0u || job.copy.staging_offset == 0u) continue;
+          const uint8_t* raw = bytes + job.copy.staging_offset;
+          bool all_poison = true;
+          for (uint64_t w = 0u; w < job.copy.copied / 4u && all_poison; ++w) {
+            uint32_t word = 0u;
+            std::memcpy(&word, raw + 4u * w, sizeof(word));
+            all_poison = word == kPoolPoisonWord;
+          }
+          if (all_poison) {
+            guard_scan.unlanded += 1u;
+            if (job.copy.phase == PoolMeshPhase::Vertices && job.copy.copied == job.copy.source_size
+                && job.copy.copied == guard_scan.extent) {
+              guard_scan.vertex_matches += 1u;
+            }
+          }
+          if (guard_scan.zero_copies < kPoolGuardCopies) {
+            guard_scan.copies[guard_scan.zero_copies] = PoolGuardCopy{
+                .mesh_key = job.copy.mesh_key,
+                .phase = job.copy.phase,
+                .ordinal = job.staging.ordinal,
+                .queued = job.queued,
+                .staging_offset = job.copy.staging_offset,
+                .size = job.copy.size,
+                .copied = job.copy.copied,
+                .source_size = job.copy.source_size,
+                .all_poison = all_poison,
+            };
+          }
+          guard_scan.zero_copies += 1u;
+        }
+      }
     }
     for (PoolMeshJob& job : jobs) {
       if (!job.queued) continue;
@@ -5757,7 +5850,15 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     slot.used = 0u;
     slot.follow_used = 0u;
     slot.mesh_used = 0u;
-    if (guard_hit) { g_pool.stats.mesh_guard_hits += 1u; g_pool.stats.mesh_guard_last = guard; }
+    slot.mesh_lane = 0u;
+    if (guard_hit) {
+      g_pool.stats.mesh_guard_hits += 1u;
+      if (guard_scan.unlanded == 1u && guard_scan.vertex_matches == 1u) {
+        g_pool.stats.mesh_guard_explained += 1u;
+      }
+      g_pool.stats.mesh_guard_last = guard;
+      g_pool.stats.mesh_guard_scan = guard_scan;
+    }
 
     g_pool.resolve_camera_valid = camera.valid;
     std::memcpy(g_pool.resolve_camera, camera.position, sizeof(g_pool.resolve_camera));
@@ -6378,6 +6479,7 @@ inline void ResetWorldPool() {
       slot.follow_used = 0u;
       slot.mesh_copies.clear();
       slot.mesh_used = 0u;
+      slot.mesh_lane = 0u;
     }
   }
   g_pool.mesh_requests.clear();
@@ -7700,8 +7802,23 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"mesh_copy_bytes\": " << stats.mesh_copy_bytes
       << ", \"mesh_budget_full\": " << stats.mesh_budget_full
       << ", \"mesh_guard_hits\": " << stats.mesh_guard_hits
+      << ", \"mesh_guard_explained\": " << stats.mesh_guard_explained
+      << ", \"mesh_lane_copies\": " << stats.mesh_lane_copies << ", \"mesh_lane_busy\": " << stats.mesh_lane_busy
       << ", \"mesh_guard_last\": ";
   WritePoolStagingDiag(out, stats.mesh_guard_last);
+  const PoolGuardScan& guard_scan = stats.mesh_guard_scan;
+  out << ", \"mesh_guard_scan\": {\"written_words\": " << guard_scan.written_words << ", \"extent\": " << guard_scan.extent
+      << ", \"zero_copies\": " << guard_scan.zero_copies << ", \"unlanded\": " << guard_scan.unlanded
+      << ", \"vertex_matches\": " << guard_scan.vertex_matches << ", \"copies\": [";
+  for (uint32_t i = 0u; i < (std::min)(guard_scan.zero_copies, kPoolGuardCopies); ++i) {
+    const PoolGuardCopy& copy = guard_scan.copies[i];
+    out << (i != 0u ? ", " : "") << "{\"mesh_key\": \"" << renodx::utils::log::AsHex(copy.mesh_key)
+        << "\", \"phase\": \"" << PoolMeshPhaseName(copy.phase) << "\", \"ordinal\": " << copy.ordinal
+        << ", \"queued\": " << (copy.queued ? "true" : "false") << ", \"staging_offset\": " << copy.staging_offset
+        << ", \"size\": " << copy.size << ", \"copied\": " << copy.copied << ", \"source_size\": " << copy.source_size
+        << ", \"all_poison\": " << (copy.all_poison ? "true" : "false") << "}";
+  }
+  out << "]}";
   out << ", \"mesh_dropped\": " << stats.mesh_dropped
       << ", \"mesh_expired\": " << stats.mesh_expired
       << ", \"mesh_deferred_skips\": " << stats.mesh_deferred_skips
