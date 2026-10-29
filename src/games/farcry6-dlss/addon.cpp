@@ -107,16 +107,6 @@ renodx::utils::settings::Settings settings = {
         },
     },
     new renodx::utils::settings::Setting{
-        .key = "PortableDescriptorTest",
-        .binding = &farcry6_dlss::dlss::portable_descriptors_test,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f,
-        .label = "Portable Descriptor Tracking Test",
-        .section = "Antialiasing",
-        .tooltip = "Tests AMD/Intel descriptor tracking on NVIDIA. AMD and Intel use it automatically. Restart after changing this setting.",
-        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
-    },
-    new renodx::utils::settings::Setting{
         .key = "FGPresentationTest",
         .binding = &farcry6_dlss::dlss::fg_bootstrap_test,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
