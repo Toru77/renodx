@@ -200,6 +200,7 @@ inline reshade::api::swapchain* fg_mode_swapchain = nullptr;
 inline bool fg_mode_present_outstanding = false;
 inline bool fg_pending_retain_resources = false;
 inline std::atomic<bool> fg_resources_retained{false};
+inline std::atomic<uint64_t> fg_temporary_off_time_ms{0u};
 inline uint64_t fg_last_missing_hudless_ms = 0u;
 inline uint32_t fg_missing_hudless_restarts = 0u;
 inline std::atomic<bool> cpu_timing_enabled{false};
@@ -246,6 +247,9 @@ inline bool SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode mode) {
   fg_mode_result.store(static_cast<int>(result), std::memory_order_relaxed);
   if (result != sl::Result::eOk) return false;
   fg_pending_retain_resources = retain_resources;
+  if (mode == farcry6_dlss::frame_generation::ModeState::Mode::off) {
+    fg_temporary_off_time_ms.store(retain_resources ? GetTickCount64() : 0u, std::memory_order_release);
+  }
   fg_mode.OptionsAccepted(mode);
   fg_mode_report.store(mode == farcry6_dlss::frame_generation::ModeState::Mode::on ? 1 : 3, std::memory_order_relaxed);
   fg_mode_changes.fetch_add(1u, std::memory_order_relaxed);
@@ -8241,6 +8245,7 @@ inline void OnPresent(
           && runtime.free_resources != nullptr
           && runtime.free_resources(sl::kFeatureDLSS_G, viewport) == sl::Result::eOk) {
         fg_resources_retained.store(false, std::memory_order_release);
+        fg_temporary_off_time_ms.store(0u, std::memory_order_release);
       }
       const sl::ResourceTag clear_tags[] = {
           {nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent},
@@ -8331,6 +8336,11 @@ inline void OnPresent(
   const bool gameplay_handoff = fg_last_scene_handoff_frame.load(std::memory_order_acquire) == frame_counter
                              && !PauseTaaRecentlySeen() && frame_counter != 0u
                              && fg_successful_present_frame.load(std::memory_order_acquire) == frame_counter - 1u;
+  const uint64_t temporary_off_time = fg_temporary_off_time_ms.load(std::memory_order_acquire);
+  // A short missing-frame interruption can recover without the full startup delay.
+  // Keep the window open after requesting on so capture stays enabled as it settles.
+  const bool quick_recovery = fg_enable_requested.load(std::memory_order_acquire)
+                           && temporary_off_time != 0u && GetTickCount64() - temporary_off_time < 1000u;
   const uint32_t stable_frames = (gameplay_handoff ? (std::min)(fg_stable_gameplay_frames.load() + 1u, 8u) : 0u);
   fg_stable_gameplay_frames.store(stable_frames, std::memory_order_relaxed);
   fg_present_frame.store(frame_counter, std::memory_order_release);
@@ -8345,7 +8355,7 @@ inline void OnPresent(
                                         std::memory_order_release);
     fg_camera_capture_enabled.store(fg_bootstrap_test != 0.f && want_halton && dlss_halton_motion_offsets != 0.f
                                         && !fg_swapchain_transition.load(std::memory_order_acquire)
-                                        && stable_frames >= 8u && camera_builder_test.state == CameraBuilderTest::State::active
+                                        && stable_frames >= (quick_recovery ? 2u : 8u) && camera_builder_test.state == CameraBuilderTest::State::active
                                         && camera_builder_test.offsets_hook_installed
                                         && farcry6_dlss::streamline::factory_hook_active.load(std::memory_order_acquire),
                                     std::memory_order_release);
@@ -8526,7 +8536,10 @@ inline void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::sw
   if (complete_inputs) {
     fg_complete_input_frames.fetch_add(1u, std::memory_order_relaxed);
     const uint32_t streak = fg_complete_input_streak.fetch_add(1u, std::memory_order_relaxed) + 1u;
-    if (streak >= 8u && fg_enable_requested.load(std::memory_order_acquire)
+    const uint64_t temporary_off_time = fg_temporary_off_time_ms.load(std::memory_order_acquire);
+    const bool quick_recovery = fg_resources_retained.load(std::memory_order_acquire)
+                             && temporary_off_time != 0u && GetTickCount64() - temporary_off_time < 1000u;
+    if (streak >= (quick_recovery ? 2u : 8u) && fg_enable_requested.load(std::memory_order_acquire)
         && fg_mode.ReadyForDisplayChange() && farcry6_dlss::streamline::fg_set_options != nullptr
         && farcry6_dlss::streamline::reflex_set_options != nullptr
         && farcry6_dlss::streamline::bootstrap_fg_support.load() == 0
@@ -8628,6 +8641,7 @@ inline void OnDestroyDevice(reshade::api::device* device) {
       fg_mode_present_outstanding = false;
       fg_pending_retain_resources = false;
       fg_resources_retained.store(false, std::memory_order_release);
+      fg_temporary_off_time_ms.store(0u, std::memory_order_release);
       fg_last_missing_hudless_ms = 0u;
       fg_missing_hudless_restarts = 0u;
       fg_last_state_query_frame = UINT64_MAX;
