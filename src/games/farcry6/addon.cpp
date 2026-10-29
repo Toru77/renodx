@@ -72,15 +72,15 @@ renodx::utils::settings::Settings settings = {
         .is_enabled = []() { return shader_injection.tone_map_type != 0; },
     },
     new renodx::utils::settings::Setting{
-        .key = "ToneMapHueCorrection",
-        .binding = &shader_injection.tone_map_hue_correction,
-        .default_value = 0.f,
-        .label = "Hue Correction",
+        .key = "ToneMapHueClip",
+        .binding = &shader_injection.tone_map_hue_clip,
+        .default_value = 20.f,
+        .label = "Hue Clip",
         .section = "Tone Mapping",
-        .tooltip = "Hue retention strength.",
+        .tooltip = "Emulates highlight hue clipping before tonemapping.",
         .min = 0.f,
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type == 2.f; },
+        .is_enabled = []() { return shader_injection.tone_map_type != 0.f; },
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
@@ -223,7 +223,7 @@ void OnPresetOff() {
   renodx::utils::settings::UpdateSetting("ToneMapPeakNits", 1000.f);
   renodx::utils::settings::UpdateSetting("ToneMapGameNits", 203.f);
   renodx::utils::settings::UpdateSetting("ToneMapUINits", 203.f);
-  renodx::utils::settings::UpdateSetting("ToneMapHueCorrection", 0.f);
+  renodx::utils::settings::UpdateSetting("ToneMapHueClip", 0.f);
   renodx::utils::settings::UpdateSetting("ToneMapGammaCorrection", 0.f);
   renodx::utils::settings::UpdateSetting("ColorGradeExposure", 1.f);
   renodx::utils::settings::UpdateSetting("ColorGradeHighlights", 50.f);

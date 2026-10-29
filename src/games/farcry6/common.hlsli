@@ -197,8 +197,8 @@ float3 ApplyACESToneMap(float3 untonemapped_ap1) {
 
   float3 tonemapped_ap1 = renodx::tonemap::aces::ODT(untonemapped_ap1, aces_min * 48.f, aces_max * 48.f, renodx::color::IDENTITY_MAT) / 48.f;
 
-  // saturation, blowout, hue correction
-  if (RENODX_TONE_MAP_SATURATION != 1.f || RENODX_TONE_MAP_BLOWOUT != 0.f || RENODX_TONE_MAP_HUE_CORRECTION != 0.f) {
+  // saturation and blowout
+  if (RENODX_TONE_MAP_SATURATION != 1.f || RENODX_TONE_MAP_BLOWOUT != 0.f) {
     tonemapped_ap1 = renodx::color::ap1::from::BT709(
         renodx::color::grade::UserColorGrading(
             renodx::color::bt709::from::AP1(tonemapped_ap1),
@@ -208,14 +208,49 @@ float3 ApplyACESToneMap(float3 untonemapped_ap1) {
             1.f,
             RENODX_TONE_MAP_SATURATION,
             RENODX_TONE_MAP_BLOWOUT,
-            RENODX_TONE_MAP_HUE_CORRECTION,
-            renodx::color::bt709::from::AP1(untonemapped_ap1)));
+            0.f));
   }
 
   return tonemapped_ap1;
 }
 
+// CUSTOM: Transfer N2 channel-magnitude positions in linear BT.709,
+// restoring source signs and positive relative luminance.
+float3 ApplyHueClipEmulationBT709(float3 color, float strength, float clip_point) {
+  float3 custom_bent = color;
+  const float custom_source_y = renodx::color::y::from::BT709(color);
+  if (strength > 0.f && custom_source_y > 0.f) {
+    const float3 custom_magnitude = abs(color);
+    const float3 custom_reference = renodx::tonemap::neutwo::PerChannel(
+        custom_magnitude / max(clip_point, 0.01f));
+    const float custom_reference_min = renodx::math::Min(custom_reference);
+    const float custom_reference_range = renodx::math::Max(custom_reference) - custom_reference_min;
+    float3 custom_transferred = color;
+    if (custom_reference_range > 0.f) {
+      custom_transferred = renodx::math::Rescale(
+          custom_reference - custom_reference_min,
+          0.f,
+          custom_reference_range,
+          renodx::math::Min(custom_magnitude),
+          renodx::math::Max(custom_magnitude));
+      custom_transferred = renodx::math::CopySign(custom_transferred, color);
+    }
+    custom_bent = lerp(color, custom_transferred, saturate(strength));
+    const float custom_bent_y = renodx::color::y::from::BT709(custom_bent);
+    if (custom_bent_y > 0.f) {
+      custom_bent *= custom_source_y / custom_bent_y;
+    } else {
+      custom_bent = color;
+    }
+  }
+  return custom_bent;
+}
+
 float3 ApplyCustomToneMap(float3 untonemapped_ap1) {
+  if (RENODX_TONE_MAP_TYPE != 0.f && RENODX_TONE_MAP_HUE_CLIP > 0.f) {
+    untonemapped_ap1 = renodx::color::ap1::from::BT709(
+        ApplyHueClipEmulationBT709(renodx::color::bt709::from::AP1(untonemapped_ap1), RENODX_TONE_MAP_HUE_CLIP, 1.f));
+  }
   if (RENODX_TONE_MAP_TYPE == 2.f) {
     return ApplyACESToneMap(untonemapped_ap1);
   } else if (RENODX_TONE_MAP_TYPE == 1.f) {
