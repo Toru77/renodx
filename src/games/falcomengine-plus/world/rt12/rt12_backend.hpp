@@ -1411,6 +1411,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   using Microsoft::WRL::ComPtr;
   using DS = reshade::api::shader_stage;
   using DT = reshade::api::descriptor_type;
+  const bvh::PoolCpuTimer pass_a_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockRt12PassA]};
   // 1. Off, or the state belongs to another device.
   if (!g_rt12_enabled.load(std::memory_order_relaxed)) return RtFallback(Rt12Reason::Off);
   if (!g_rt12 || g_rt12->device != device) return RtFallback(Rt12Reason::NotCreated);
@@ -1588,6 +1589,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     cmd_list->bind_descriptor_tables(DS::all_compute, rd.layout, 0, 3, tables);
   };
 
+  const auto passes_start = bvh::PerfNow();
   // 10. D3D11 noise copy (once per IS-FAST source).
   if (isfast_view.handle != 0u && isfast_view.handle != s.noise_source) {
     reshade::api::resource_view srvs[rtao::kRtaoSrvCount] = {};
@@ -1635,6 +1637,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     cmd_list->dispatch((trace_w + 7u) / 8u, (trace_h + 7u) / 8u, 1u);
     rtao::NullComputeSlots(cmd_list, rtao::kRtaoSrvCount, rtao::kRtaoUavCount, 0u);
   }
+  bvh::AddPerfBlockMs(bvh::kPerfBlockRt12D3d11Passes, bvh::LiveElapsedMs(passes_start));
 
   // 12. Signal A (the D3D11 pack is ordered before it), flushed.
   uint64_t a = renodx::utils::gpu_fence::NO_SIGNAL;
@@ -1650,6 +1653,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     return RtFallback(Rt12Reason::FenceError);
   }
 
+  const auto record_start = bvh::PerfNow();
   // 13. Lighting submission. 13.1: recording starts; the slot is free (busy rule); timestamp.
   ID3D12GraphicsCommandList4* list = s.lighting_list.Get();
   if (FAILED(L.allocator->Reset()) || FAILED(list->Reset(L.allocator.Get(), nullptr))) {
@@ -2182,6 +2186,8 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     return RtFallback(Rt12Reason::SubmitFailed);
   }
 
+  bvh::AddPerfBlockMs(bvh::kPerfBlockRt12Record, bvh::LiveElapsedMs(record_start));
+
   // 13.8 Ordering: wait for the D3D11 signal A, then for the previous D3D12 submission; execute; signal B.
   // Nothing was executed when a wait fails (the compute pass A runs this frame).
   const auto submit_start = bvh::PerfNow();
@@ -2271,6 +2277,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     return RtFallback(Rt12Reason::SubmitFailed);
   }
 
+  const auto resolve_start = bvh::PerfNow();
   // 15. D3D11 resolve: the shared outputs into pass A's own targets (u0 AO or u2 raw, u1 stats).
   {
     reshade::api::resource_view srvs[rtao::kRtaoSrvCount] = {};
@@ -2282,6 +2289,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     cmd_list->dispatch((trace_w + 7u) / 8u, (trace_h + 7u) / 8u, 1u);
     rtao::NullComputeSlots(cmd_list, rtao::kRtaoSrvCount, rtao::kRtaoUavCount, 0u);
   }
+  bvh::AddPerfBlockMs(bvh::kPerfBlockRt12Resolve, bvh::LiveElapsedMs(resolve_start));
 
   if (!gc) {
     s.scene_frame = frame;

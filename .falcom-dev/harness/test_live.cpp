@@ -4136,6 +4136,15 @@ static void TestPerfDisjointBlocks() {
         "bracket 10 ms, disjoint block 4 ms: unattributed 6, CPU total 10 (%.4f, %.4f)", before.unattr, before.cpu);
   CHECK(Near(static_cast<float>(after.unattr), 6.f, 1e-4f) && Near(static_cast<float>(after.cpu), 10.f, 1e-4f),
         "a subset block of 6 ms changes neither the unattributed value nor the CPU total (%.4f, %.4f)", after.unattr, after.cpu);
+  values[bvh::kPerfBlockRow + bvh::kPerfBlockDrawHookTotal] = 3.0;
+  values[bvh::kPerfPoolHooks] = 1.0;
+  values[bvh::kPerfBlockRow + bvh::kPerfBlockBindHook] = 0.5;
+  const bvh::PerfTotalsValue hooks = bvh::PerfTotals(values);
+  CHECK(Near(static_cast<float>(hooks.hook_outer), 2.5f, 1e-4f) && Near(static_cast<float>(hooks.cpu), 13.5f, 1e-4f),
+        "draw hook 3 ms around pool hooks 1 ms, bind hook 0.5 ms: outer 2.5, CPU total 13.5 (%.4f, %.4f)", hooks.hook_outer, hooks.cpu);
+  values[bvh::kPerfBlockRow + bvh::kPerfBlockDrawHookTotal] = 0.0;
+  const bvh::PerfTotalsValue clamped = bvh::PerfTotals(values);
+  CHECK(Near(static_cast<float>(clamped.hook_outer), 0.5f, 1e-4f), "an inner row larger than the draw hook clamps its outer part at 0 (%.4f)", clamped.hook_outer);
 }
 
 // A 10 ms block in one present is the largest block of the attribution (a 3 ms block is over 2 ms, the largest is not).

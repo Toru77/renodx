@@ -330,6 +330,7 @@ inline void DrawPerformanceTab() {
     const bool clamped = view.unattr_raw_now < -0.01 || view.unattr_raw_avg < -0.01;
     // Dont change the name longer than unattributed_cpu (c)
     row(clamped ? "unattributed_cpu (c)" : "unattributed_cpu", "ms/present", view.unattr_now, view.unattr_avg, view.max.unattr, clamped);
+    row("hook_outer_cpu", "ms/present", view.hook_outer_now, view.hook_outer_avg, std::numeric_limits<double>::quiet_NaN(), false);
     for (size_t i = 0; i < kPerfCostCount; ++i) {
       if (kPerfCostInfo[i].role == kPerfGpu) row(kPerfCostInfo[i].name, "ms/measured frame", view.now[i], view.avg[i], view.max.row[i], false);
     }

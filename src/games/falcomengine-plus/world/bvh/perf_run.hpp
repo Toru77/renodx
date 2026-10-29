@@ -30,8 +30,8 @@ namespace falcom_world::bvh {
 
 inline constexpr double kPerfWindowSeconds = 30.0;
 
-// Where a cost counts. InPresent: runs inside a present bracket (with DrawTime and the unattributed row it makes the CPU
-// total). DrawTime: runs at draw time, outside both brackets. Bracket: the two present handlers (their sum minus the
+// Where a cost counts. InPresent: runs inside a present bracket (with DrawTime, the unattributed row and the hook outer row it
+// makes the CPU total). DrawTime: runs at draw time, outside both brackets. Bracket: the two present handlers (their sum minus the
 // InPresent rows is the unattributed CPU). Subset: BVH phases, parts of the rows above (never summed). Gpu: ms per
 // measured frame (summed into the GPU total).
 enum PerfRole : uint8_t { kPerfInPresent, kPerfDrawTime, kPerfBracket, kPerfSubset, kPerfGpu };
@@ -205,13 +205,19 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"pool_ind_gc", true, kPerfSubset, false, nullptr},
     {"gc_present", true, kPerfSubset, false, nullptr},
     {"rt12_present", true, kPerfSubset, false, nullptr},
+    {"draw_hook_pre", true, kPerfSubset, false, nullptr},
+    {"rtao_post", true, kPerfSubset, false, nullptr},
+    {"rt12_pass_a", true, kPerfSubset, false, nullptr},
+    {"rt12_d3d11_passes", true, kPerfSubset, false, nullptr},
+    {"rt12_record", true, kPerfSubset, false, nullptr},
+    {"rt12_resolve", true, kPerfSubset, false, nullptr},
 };
 inline constexpr bool PerfInTotal(const PerfCostInfo& info) {
   return info.role == kPerfInPresent || info.role == kPerfDrawTime || info.role == kPerfGpu;
 }
 
-enum PerfGauge : size_t { kPerfGaugeTlasInstances, kPerfGaugeTlasDynamic, kPerfGaugePoolInstances, kPerfGaugePoolMeshes, kPerfGaugeSlackHoles, kPerfGaugeHookDraws, kPerfGaugeHookDrawsIndirect, kPerfGaugeHookDrawsUnconsumed, kPerfGaugeRecordMismatchRtv0, kPerfGaugeRecordMismatchDsv, kPerfGaugeRecordMismatchTopology, kPerfGaugeRecordMismatchInputLayout, kPerfGaugeRecordMismatchHasViewport, kPerfGaugeRecordMismatchViewport, kPerfGaugeRecordMismatchBlendEnable, kPerfGaugeRecordMismatchDepthEnable, kPerfGaugeRecordMismatchDepthWrite, kPerfGaugeRecordMismatchCullMode, kPerfGaugeRecordMismatchFrontCounterClockwise, kPerfGaugePoolReduced, kPerfGaugeCount };
-inline constexpr const char* kPerfGaugeNames[kPerfGaugeCount] = {"tlas_instances", "tlas_dynamic_instances", "pool_instances", "pool_meshes", "slack_free_holes", "hook_draws", "hook_draws_indirect", "hook_draws_unconsumed", "record_mismatch_rtv0", "record_mismatch_dsv", "record_mismatch_topology", "record_mismatch_input_layout", "record_mismatch_has_viewport", "record_mismatch_viewport", "record_mismatch_blend_enable", "record_mismatch_depth_enable", "record_mismatch_depth_write", "record_mismatch_cull_mode", "record_mismatch_front_counter_clockwise", "pool_reduced"};
+enum PerfGauge : size_t { kPerfGaugeTlasInstances, kPerfGaugeTlasDynamic, kPerfGaugePoolInstances, kPerfGaugePoolMeshes, kPerfGaugeSlackHoles, kPerfGaugeHookDraws, kPerfGaugeHookDrawsIndirect, kPerfGaugeHookDrawsUnconsumed, kPerfGaugeRecordMismatchRtv0, kPerfGaugeRecordMismatchDsv, kPerfGaugeRecordMismatchTopology, kPerfGaugeRecordMismatchInputLayout, kPerfGaugeRecordMismatchHasViewport, kPerfGaugeRecordMismatchViewport, kPerfGaugeRecordMismatchBlendEnable, kPerfGaugeRecordMismatchDepthEnable, kPerfGaugeRecordMismatchDepthWrite, kPerfGaugeRecordMismatchCullMode, kPerfGaugeRecordMismatchFrontCounterClockwise, kPerfGaugePoolReduced, kPerfGaugeBindCalls, kPerfGaugeBindSrvResolves, kPerfGaugeCount };
+inline constexpr const char* kPerfGaugeNames[kPerfGaugeCount] = {"tlas_instances", "tlas_dynamic_instances", "pool_instances", "pool_meshes", "slack_free_holes", "hook_draws", "hook_draws_indirect", "hook_draws_unconsumed", "record_mismatch_rtv0", "record_mismatch_dsv", "record_mismatch_topology", "record_mismatch_input_layout", "record_mismatch_has_viewport", "record_mismatch_viewport", "record_mismatch_blend_enable", "record_mismatch_depth_enable", "record_mismatch_depth_write", "record_mismatch_cull_mode", "record_mismatch_front_counter_clockwise", "pool_reduced", "bind_calls", "bind_srv_resolves"};
 
 struct PerfCounters {
   double cost[kPerfCostCount] = {};
@@ -378,6 +384,8 @@ struct PerfTabView {
   double unattr_raw_avg = std::numeric_limits<double>::quiet_NaN();
   double cpu_now = std::numeric_limits<double>::quiet_NaN();  // DrawTime + InPresent rows + unattributed
   double cpu_avg = std::numeric_limits<double>::quiet_NaN();
+  double hook_outer_now = std::numeric_limits<double>::quiet_NaN();
+  double hook_outer_avg = std::numeric_limits<double>::quiet_NaN();
   double gpu_now = std::numeric_limits<double>::quiet_NaN();  // sum of the Gpu rows that have a value
   double gpu_avg = std::numeric_limits<double>::quiet_NaN();
   double frame_now = std::numeric_limits<double>::quiet_NaN();  // frame time: newest interval, and the mean over the window
@@ -409,11 +417,13 @@ struct PerfState {
 };
 
 // The totals of one row array (NaN: no value for a Gpu row). Unattributed CPU is the two present brackets minus the InPresent
-// rows (raw, then clamped at zero). CPU is the DrawTime and InPresent rows plus the clamped unattributed CPU. GPU is the sum
+// rows (raw, then clamped at zero). CPU is the DrawTime and InPresent rows plus the clamped unattributed CPU and the hook outer CPU
+// (the draw hook and lighting RT time outside their DrawTime rows, and the bind, cb and pool-write hooks). GPU is the sum
 // of the Gpu rows that have a value.
 struct PerfTotalsValue {
   double unattr_raw = std::numeric_limits<double>::quiet_NaN();
   double unattr = std::numeric_limits<double>::quiet_NaN();
+  double hook_outer = std::numeric_limits<double>::quiet_NaN();
   double cpu = std::numeric_limits<double>::quiet_NaN();
   double gpu = std::numeric_limits<double>::quiet_NaN();
 };
@@ -436,7 +446,14 @@ inline PerfTotalsValue PerfTotals(const double* values) {
   PerfTotalsValue totals;
   totals.unattr_raw = bracket - in;
   totals.unattr = std::max(0.0, totals.unattr_raw);
-  totals.cpu = draw + in + totals.unattr;
+  // The draw hook and the lighting RT block enclose DrawTime rows: only their time outside those rows is added (clamped at
+  // zero; the enclosing and the inner clocks are separate reads). The bind, cb and pool-write hooks are in no other row.
+  const double draw_hook_outer = values[kPerfBlockRow + kPerfBlockDrawHookTotal] - values[kPerfPoolHooks] - values[kPerfDeformHookCpu];
+  const double lighting_rt_outer = values[kPerfBlockRow + kPerfBlockLightingRt] - values[kPerfRtaoRecordCpu] - values[kPerfRtgiRecordCpu]
+                                   - values[kPerfRtlsRecordCpu] - values[kPerfRtsunRecordCpu];
+  totals.hook_outer = std::max(0.0, draw_hook_outer) + std::max(0.0, lighting_rt_outer) + values[kPerfBlockRow + kPerfBlockBindHook]
+                      + values[kPerfBlockRow + kPerfBlockCbHooks] + values[kPerfBlockRow + kPerfBlockPoolWriteHooks];
+  totals.cpu = draw + in + totals.unattr + totals.hook_outer;
   totals.gpu = gpu_any ? gpu : std::numeric_limits<double>::quiet_NaN();
   return totals;
 }
@@ -565,6 +582,8 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.gauge[kPerfGaugeRecordMismatchCullMode] = static_cast<double>(g_perf_gate.record_mismatch_cull_mode_frame.load(std::memory_order_relaxed));
   c.gauge[kPerfGaugeRecordMismatchFrontCounterClockwise] = static_cast<double>(g_perf_gate.record_mismatch_front_counter_clockwise_frame.load(std::memory_order_relaxed));
   c.gauge[kPerfGaugePoolReduced] = g_gpu_capture.pool_reduced.load(std::memory_order_relaxed) ? 1.0 : 0.0;
+  c.gauge[kPerfGaugeBindCalls] = static_cast<double>(g_perf_gate.bind_calls_frame.load(std::memory_order_relaxed));
+  c.gauge[kPerfGaugeBindSrvResolves] = static_cast<double>(g_perf_gate.bind_srv_resolves_frame.load(std::memory_order_relaxed));
   return c;
 }
 
@@ -654,6 +673,13 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
   out << "  \"label\": \"" << PoolJsonEscape(label) << "\",\n  \"label_raw\": \"" << PoolJsonEscape(run.label) << "\",\n";
   out << "  \"timestamp\": \"" << DiagTimestamp(when) << "\",\n";
   out << "  \"perf_gather\": " << (g_perf_gate.gather.load(std::memory_order_relaxed) ? "true" : "false") << ",\n";
+  const char* reduce_reason = "";
+  {
+    std::lock_guard lock(g_gpu_capture.mutex);
+    reduce_reason = g_gpu_capture.pool_reduce.full_reason;
+  }
+  out << "  \"gc_trace\": " << (g_gpu_capture.enabled.load(std::memory_order_relaxed) && g_gpu_capture.trace.load(std::memory_order_relaxed) ? "true" : "false") << ",\n";
+  out << "  \"pool_reduce_full_reason_at_end\": \"" << PoolJsonEscape(reduce_reason) << "\",\n";
   out << "  \"sample_alignment\": \"work of present N, sampled at the start of present N+1\",\n";
   out << "  \"status\": \"" << (run.abort_reason.empty() ? "complete" : "aborted") << "\",\n  \"abort_reason\": \"" << PoolJsonEscape(run.abort_reason)
       << "\",\n";
@@ -747,6 +773,11 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
   WritePerfValue(&out, totals.unattr, "ms");
   out << ", \"clamped\": " << (totals.unattr_raw < -0.01 * presents ? "true" : "false") << ", \"raw_total\": ";
   WritePerfValue(&out, totals.unattr_raw, "ms");
+  out << ", \"in_total\": true}";
+  out << ", \"hook_outer_cpu\": {\"avg_per_present\": ";
+  WritePerfValue(&out, run.presents != 0u ? totals.hook_outer / presents : nan, "ms/present");
+  out << ", \"total\": ";
+  WritePerfValue(&out, totals.hook_outer, "ms");
   out << ", \"in_total\": true}";
   const double cpu_total = totals.cpu;
   out << ", \"cpu_total\": {\"avg_per_present\": ";
@@ -878,6 +909,10 @@ inline void ClearPerfGathered(BvhDeviceData* data) {
   g_perf_gate.hook_draws_indirect_frame.store(0u);
   g_perf_gate.hook_draws_unconsumed.store(0u);
   g_perf_gate.hook_draws_unconsumed_frame.store(0u);
+  g_perf_gate.bind_calls.store(0u);
+  g_perf_gate.bind_calls_frame.store(0u);
+  g_perf_gate.bind_srv_resolves.store(0u);
+  g_perf_gate.bind_srv_resolves_frame.store(0u);
   g_perf_gate.record_mismatch_rtv0.store(0u);
   g_perf_gate.record_mismatch_rtv0_frame.store(0u);
   g_perf_gate.record_mismatch_dsv.store(0u);
@@ -1181,10 +1216,12 @@ inline void UpdatePerfTab(const PerfCounters& now, double frame_ms = std::numeri
   view.unattr_raw_now = now_totals.unattr_raw;
   view.unattr_now = now_totals.unattr;
   view.cpu_now = now_totals.cpu;
+  view.hook_outer_now = now_totals.hook_outer;
   view.gpu_now = now_totals.gpu;
   view.unattr_raw_avg = avg_totals.unattr_raw;
   view.unattr_avg = avg_totals.unattr;
   view.cpu_avg = avg_totals.cpu;
+  view.hook_outer_avg = avg_totals.hook_outer;
   view.gpu_avg = avg_totals.gpu;
   view.spike = spike != nullptr ? MakePerfSpike(*spike, 0u, 0u) : PerfSpike{};
 }

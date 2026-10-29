@@ -289,6 +289,7 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     NullComputeSlots(cmd_list, kRtaoSrvCount, kRtaoUavCount, 0u);
   }
 
+  const bvh::PoolCpuTimer post_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockRtaoPost]};
   if (d > 1u) {
     // Pass A wrote the trace-size raw AO through u2; the upsample reads it through t0 and writes the full-size AO.
     cmd_list->barrier(data.trace_texture, reshade::api::resource_usage::unordered_access,

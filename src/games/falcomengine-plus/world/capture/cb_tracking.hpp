@@ -65,6 +65,9 @@ inline void OnPushDescriptorsWorld(
     const reshade::api::descriptor_table_update& update) {
   const bvh::PoolCpuTimer bind_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockBindHook]};
   if (!WorldDrawHookNeeded()) return;
+  if (bind_timer.armed) {
+    bvh::g_perf_gate.bind_calls.fetch_add(1u, std::memory_order_relaxed);
+  }
   (void)layout;
   (void)param_index;
   if (update.count == 0u || update.descriptors == nullptr) return;
@@ -102,6 +105,9 @@ inline void OnPushDescriptorsWorld(
       if (slot >= kSrvSlotCapacity) continue;
       const reshade::api::resource_view view = views[i];
       const reshade::api::resource resource = (view.handle != 0u) ? device->get_resource_from_view(view) : reshade::api::resource{0u};
+      if (bind_timer.armed && view.handle != 0u) {
+        bvh::g_perf_gate.bind_srv_resolves.fetch_add(1u, std::memory_order_relaxed);
+      }
       if (vertex_stage) {
         data->vs_srv_view[slot] = view;
         data->vs_srv[slot] = resource;

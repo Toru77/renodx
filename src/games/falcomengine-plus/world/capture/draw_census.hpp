@@ -777,6 +777,9 @@ struct WorldDrawCallback {
       if (!consumed) bvh::g_perf_gate.hook_draws_unconsumed.fetch_add(1u, std::memory_order_relaxed);
     }
     const auto record_start = bvh::PerfNow();
+    if (hook_timer.armed && record_start != std::chrono::steady_clock::time_point{}) {
+      bvh::AddPerfBlockMs(bvh::kPerfBlockDrawHookPre, std::chrono::duration<double, std::milli>(record_start - hook_timer.start).count());
+    }
 
     DrawRecord record;
     record.method = method;

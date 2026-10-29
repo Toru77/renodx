@@ -71,6 +71,12 @@ enum PerfBlock : size_t {
   kPerfBlockPoolIndGc,               // pool indirect hook: GPU capture of the sub-draws and its stats
   kPerfBlockGcPresent,     // rt12::OnGcPresent, whole (OnWorldPresentBvh)
   kPerfBlockRt12Present,   // rt12::OnPresent, whole (OnWorldPresentBvh)
+  kPerfBlockDrawHookPre,   // WorldDrawCallback direct: hook start to record start
+  kPerfBlockRtaoPost,      // rtao::Dispatch after pass A: upsample, pass B, filter, table nulls
+  kPerfBlockRt12PassA,     // rt12::RunRtaoPassA, whole
+  kPerfBlockRt12D3d11Passes,  // RunRtaoPassA steps 10-11: D3D11 noise copy and passes
+  kPerfBlockRt12Record,    // RunRtaoPassA step 13: D3D12 recording to Close
+  kPerfBlockRt12Resolve,   // RunRtaoPassA step 15: D3D11 resolve
   kPerfBlockCount
 };
 
@@ -93,6 +99,10 @@ struct PerfGate {
   std::atomic_uint64_t hook_draws_indirect_frame{0u};  // hook_draws_indirect of the last frame (moved by SamplePerfPresent)
   std::atomic_uint64_t hook_draws_unconsumed{0u};  // direct draws the M1 consumed rule would skip (count only; gather only)
   std::atomic_uint64_t hook_draws_unconsumed_frame{0u};  // hook_draws_unconsumed of the last frame (moved by SamplePerfPresent)
+  std::atomic_uint64_t bind_calls{0u};  // push_descriptors calls past WorldDrawHookNeeded (gather only)
+  std::atomic_uint64_t bind_calls_frame{0u};  // bind_calls of the last frame (moved by SamplePerfPresent)
+  std::atomic_uint64_t bind_srv_resolves{0u};  // get_resource_from_view calls in OnPushDescriptorsWorld (gather only)
+  std::atomic_uint64_t bind_srv_resolves_frame{0u};  // bind_srv_resolves of the last frame (moved by SamplePerfPresent)
   std::atomic_uint64_t record_native_seq{0u};  // draws seen by the native-record parity gate (gather only; every 64th also builds the framework state)
   std::atomic_uint64_t record_mismatch_rtv0{0u};  // rtv0 differs between the native read and the framework state (gather only; every 64th draw)
   std::atomic_uint64_t record_mismatch_rtv0_frame{0u};  // record_mismatch_rtv0 of the last frame (moved by SamplePerfPresent)
