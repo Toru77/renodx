@@ -134,6 +134,7 @@ static constexpr uint32_t kSlotCbv = 0u;       // b0: TAA knobs
 // ── Settings (written by the settings system in addon.cpp) ──
 inline float dlss_enabled = 1.f;
 inline float dlss_rcas_strength = 0.5f;
+inline float dlss_linear_bt2020 = 1.f;
 inline float upscaler_type = 0.f;  // 0 = DLSS, 1 = FSR
 inline float fsr_version = 1.f;
 inline float fsr_descriptor_guard = 0.f;
@@ -4097,6 +4098,26 @@ struct RcasState {
   std::atomic<uint64_t> skipped{0u};
 };
 inline RcasState rcas;
+inline RcasState color_conversion;
+inline void ReleaseColorConversion(reshade::api::device* device) {
+  std::unique_lock lock(color_conversion.mutex);
+  if (device == nullptr || color_conversion.device != device) return;
+  for (auto& slot : color_conversion.slots) {
+    if (slot.source_view.handle != 0u) device->destroy_resource_view(slot.source_view);
+    if (slot.target_view.handle != 0u) device->destroy_resource_view(slot.target_view);
+    if (slot.texture.handle != 0u) device->destroy_resource(slot.texture);
+    for (auto& table : slot.tables) {
+      if (table.handle != 0u) device->free_descriptor_table(table);
+    }
+    slot = {};
+  }
+  if (color_conversion.pipeline.handle != 0u) device->destroy_pipeline(color_conversion.pipeline);
+  if (color_conversion.layout.handle != 0u) device->destroy_pipeline_layout(color_conversion.layout);
+  color_conversion.pipeline = {};
+  color_conversion.layout = {};
+  color_conversion.pipeline_attempted = false;
+  color_conversion.device = nullptr;
+}
 inline std::atomic<bool> fg_hudless_slots_allocated{false};
 inline std::atomic<bool> fg_hudless_retire_requested{false};
 
@@ -5825,8 +5846,130 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     }
   }
 
+  // Reserve both conversions before dispatching either one: a partial conversion
+  // must never allow a linear BT.2020 output to reach the game's gamma pipeline.
+  const bool convert_color = dlss_linear_bt2020 != 0.f && !use_fsr;
+  std::unique_lock conversion_lock(color_conversion.mutex, std::defer_lock);
+  RcasSlot* conversion_slots[2] = {};
+  if (convert_color) {
+    if (data->in_render_pass || color_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || color_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || color_desc.DepthOrArraySize != 1u
+        || color_desc.MipLevels != 1u || color_desc.SampleDesc.Count != 1u
+        || !conversion_lock.try_lock()) return false;
+    auto* output = (fsr1_mode ? reinterpret_cast<ID3D12Resource*>(fsr1_target_handle) : ngx.output_texture.Get());
+    if (output == nullptr) return false;
+    const auto output_desc = output->GetDesc();
+    if (output_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || output_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || output_desc.Width != target_width
+        || output_desc.Height != target_height || output_desc.DepthOrArraySize != 1u
+        || output_desc.MipLevels != 1u || output_desc.SampleDesc.Count != 1u) return false;
+    if (color_conversion.device == nullptr) color_conversion.device = device;
+    if (color_conversion.device != device) return false;
+    if (!color_conversion.pipeline_attempted) {
+      color_conversion.pipeline_attempted = true;
+      using DS = reshade::api::shader_stage;
+      using DT = reshade::api::descriptor_type;
+      using PT = reshade::api::pipeline_layout_param_type;
+      reshade::api::descriptor_range srv = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_shader_resource_view};
+      reshade::api::descriptor_range uav = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};
+      reshade::api::constant_range constants = {};
+      constants.count = 3u;
+      constants.visibility = DS::all_compute;
+      reshade::api::pipeline_layout_param params[3] = {};
+      params[0].type = PT::descriptor_table;
+      params[0].descriptor_table = {1u, &srv};
+      params[1].type = PT::descriptor_table;
+      params[1].descriptor_table = {1u, &uav};
+      params[2].type = PT::push_constants;
+      params[2].push_constants = constants;
+      if (device->create_pipeline_layout(3u, params, &color_conversion.layout)) {
+        reshade::api::shader_desc shader = {};
+        shader.code = __dlss_color_convert.data();
+        shader.code_size = __dlss_color_convert.size();
+        shader.entry_point = "main";
+        const reshade::api::pipeline_subobject subobject = {reshade::api::pipeline_subobject_type::compute_shader, 1u, &shader};
+        (void)device->create_pipeline(color_conversion.layout, 1u, &subobject, &color_conversion.pipeline);
+      }
+    }
+    if (color_conversion.pipeline.handle == 0u) return false;
+    {
+      std::shared_lock retirement_lock(gpu_retirement.mutex);
+      uint32_t found = 0u;
+      for (auto& candidate : color_conversion.slots) {
+        if (!candidate.ticket || candidate.ticket->complete) {
+          conversion_slots[found++] = &candidate;
+          if (found == 2u) break;
+        }
+      }
+    }
+    if (conversion_slots[1] == nullptr) return false;
+    const reshade::api::resource_view_desc view_desc(
+        reshade::api::resource_view_type::texture_2d, reshade::api::format::r16g16b16a16_float, 0u, 1u, 0u, 1u);
+    for (uint32_t i = 0u; i < 2u; ++i) {
+      auto& slot = *conversion_slots[i];
+      slot.ticket.reset();
+      auto* source = (i == 0u ? color : output);
+      const uint64_t source_handle = reinterpret_cast<uint64_t>(source);
+      const uint32_t width = (i == 0u ? input_width : target_width);
+      const uint32_t height = (i == 0u ? input_height : target_height);
+      if (slot.source != source_handle && slot.source_view.handle != 0u) {
+        device->destroy_resource_view(slot.source_view);
+        slot.source_view = {};
+        slot.source = 0u;
+      }
+      if ((slot.width != width || slot.height != height) && slot.texture.handle != 0u) {
+        if (slot.target_view.handle != 0u) device->destroy_resource_view(slot.target_view);
+        device->destroy_resource(slot.texture);
+        slot.texture = {};
+        slot.target_view = {};
+        slot.width = slot.height = 0u;
+      }
+      if (slot.source_view.handle == 0u
+          && device->create_resource_view(reshade::api::resource{source_handle}, reshade::api::resource_usage::shader_resource,
+                                          view_desc, &slot.source_view)) {
+        slot.source = source_handle;
+      }
+      if (slot.texture.handle == 0u) {
+        reshade::api::resource_desc desc = {};
+        desc.type = reshade::api::resource_type::texture_2d;
+        desc.texture = {width, height, 1u, 1u, reshade::api::format::r16g16b16a16_float, 1u};
+        desc.heap = reshade::api::memory_heap::gpu_only;
+        desc.usage = reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_source;
+        if (device->create_resource(desc, nullptr, reshade::api::resource_usage::unordered_access, &slot.texture)) {
+          slot.width = width;
+          slot.height = height;
+        }
+      }
+      if (slot.texture.handle != 0u && slot.target_view.handle == 0u) {
+        (void)device->create_resource_view(slot.texture, reshade::api::resource_usage::unordered_access, view_desc, &slot.target_view);
+      }
+      for (uint32_t j = 0u; j < 2u; ++j) {
+        if (slot.tables[j].handle == 0u) (void)device->allocate_descriptor_table(color_conversion.layout, j, &slot.tables[j]);
+      }
+      if (!slot.source_view.handle || !slot.target_view.handle || !slot.tables[0].handle || !slot.tables[1].handle) return false;
+      const reshade::api::descriptor_table_update updates[] = {
+          {slot.tables[0], 0u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.source_view},
+          {slot.tables[1], 0u, 0u, 1u, reshade::api::descriptor_type::texture_unordered_access_view, &slot.target_view},
+      };
+      device->update_descriptor_tables(2u, updates);
+    }
+    const auto stage = reshade::api::shader_stage::all_compute;
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, color_conversion.pipeline);
+    cmd_list->bind_descriptor_tables(stage, color_conversion.layout, 0u, 2u, conversion_slots[0]->tables);
+    const uint32_t constants[] = {input_width, input_height, 1u};
+    cmd_list->push_constants(stage, color_conversion.layout, 2u, 0u, 3u, constants);
+    cmd_list->dispatch((input_width + 7u) / 8u, (input_height + 7u) / 8u, 1u);
+    cmd_list->barrier(conversion_slots[0]->texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    RestoreGameDescriptorState(cmd_list);
+    conversion_slots[0]->ticket = RetireGpuCommands(cmd_list);
+  }
+  static bool previous_color_conversion = false;
+  if (convert_color != previous_color_conversion) {
+    ngx.reset = true;
+    previous_color_conversion = convert_color;
+  }
   NVSDK_NGX_D3D12_DLSS_Eval_Params eval = {};
-  eval.Feature.pInColor = color;
+  eval.Feature.pInColor = (convert_color ? reinterpret_cast<ID3D12Resource*>(conversion_slots[0]->texture.handle) : color);
   eval.Feature.pInOutput = fsr1_mode
       ? reinterpret_cast<ID3D12Resource*>(fsr1_target_handle)
       : ngx.output_texture.Get();
@@ -5966,6 +6109,29 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   if (use_fsr || dlss_restore_state != 0.f) {
     RestoreGameDescriptorState(cmd_list);
     if (DebugTrace()) DebugLog("descriptor state restored");
+  }
+  if (convert_color) {
+    cmd_list->barrier(conversion_slots[0]->texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+    if (!NVSDK_NGX_FAILED(result)) {
+      const auto stage = reshade::api::shader_stage::all_compute;
+      const reshade::api::resource output_resource{reinterpret_cast<uint64_t>(eval.Feature.pInOutput)};
+      const auto output_state = (fsr1_mode ? fsr1_target_state : reshade::api::resource_usage::unordered_access);
+      if (output_state != reshade::api::resource_usage::shader_resource_non_pixel) {
+        cmd_list->barrier(output_resource, output_state, reshade::api::resource_usage::shader_resource_non_pixel);
+      }
+      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, color_conversion.pipeline);
+      cmd_list->bind_descriptor_tables(stage, color_conversion.layout, 0u, 2u, conversion_slots[1]->tables);
+      const uint32_t constants[] = {target_width, target_height, 0u};
+      cmd_list->push_constants(stage, color_conversion.layout, 2u, 0u, 3u, constants);
+      cmd_list->dispatch((target_width + 7u) / 8u, (target_height + 7u) / 8u, 1u);
+      cmd_list->barrier(conversion_slots[1]->texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::copy_source);
+      cmd_list->barrier(output_resource, reshade::api::resource_usage::shader_resource_non_pixel, reshade::api::resource_usage::copy_dest);
+      command_list->CopyResource(eval.Feature.pInOutput, reinterpret_cast<ID3D12Resource*>(conversion_slots[1]->texture.handle));
+      cmd_list->barrier(output_resource, reshade::api::resource_usage::copy_dest, output_state);
+      cmd_list->barrier(conversion_slots[1]->texture, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::unordered_access);
+      RestoreGameDescriptorState(cmd_list);
+      conversion_slots[1]->ticket = RetireGpuCommands(cmd_list);
+    }
   }
   if ((use_fsr && fsr.last_result != FFX_API_RETURN_OK) || (!use_fsr && NVSDK_NGX_FAILED(result))) {
     ngx.eval_failed = true;
@@ -9019,6 +9185,7 @@ inline void OnDestroyDevice(reshade::api::device* device) {
         rcas.device = nullptr;
       }
     }
+    ReleaseColorConversion(device);
     ReleaseNgx();
     ReleaseObjectMasks(device);
     ReleaseUnpack(unpack_device);
@@ -9119,6 +9286,7 @@ inline void Use(DWORD fdw_reason) {
         reshade::api::device* device = unpack_device != nullptr ? unpack_device
             : (placeholder_device != nullptr ? placeholder_device : object_mask_state.device);
         ReleaseFgHudless(device);
+        ReleaseColorConversion(color_conversion.device);
         ReleaseObjectMasks(device);
         unpack_device = nullptr;
         ReleaseUnpack(device);
