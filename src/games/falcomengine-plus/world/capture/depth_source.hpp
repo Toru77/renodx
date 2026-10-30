@@ -27,6 +27,7 @@ inline void OnDestroyResourceWorld(reshade::api::device* device, reshade::api::r
 
 inline void OnDestroyResourceViewWorld(reshade::api::device* device, reshade::api::resource_view view) {
   (void)device;
+  g_state.view_generation.fetch_add(1u, std::memory_order_release);
   std::lock_guard<std::mutex> lock(g_state.mutex);
   if (g_state.depth_source.view.handle == view.handle) {
     g_state.depth_source = {};

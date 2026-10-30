@@ -202,6 +202,7 @@ struct State {
   // Frame index at which each sun cascade slice was last cleared to lit (draw_census.hpp).
   std::atomic<uint32_t> rt_sun_cleared_frame[4]{UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
   std::atomic<uint32_t> tracking_epoch{0u};
+  std::atomic<uint32_t> view_generation{0u};  // moves at every resource-view destroy; cb_tracking reuses an SRV slot's resource only within one generation
   uint32_t draw_counter = 0u;
 
   std::mutex mutex;

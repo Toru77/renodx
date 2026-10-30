@@ -27,6 +27,8 @@ struct __declspec(uuid("e0b7d0f1-3f6a-4b21-9c8e-5a1d2f3b4c50")) WorldCommandList
   std::array<reshade::api::resource_view, kSrvSlotCapacity> vs_srv_view = {};
   std::array<reshade::api::resource, kSrvSlotCapacity> ps_srv = {};
   std::array<reshade::api::resource_view, kSrvSlotCapacity> ps_srv_view = {};
+  std::array<uint32_t, kSrvSlotCapacity> vs_srv_generation = {};  // view_generation when vs_srv[slot] was resolved
+  std::array<uint32_t, kSrvSlotCapacity> ps_srv_generation = {};  // view_generation when ps_srv[slot] was resolved
   uint32_t epoch = 0u;
 };
 
@@ -105,17 +107,33 @@ inline void OnPushDescriptorsWorld(
       if (slot >= kSrvSlotCapacity) continue;
       const reshade::api::resource_view view = views[i];
       const bool resolve = view.handle != 0u && (vertex_stage || (kPsSrvResourceSlots & (1u << slot)) != 0u);
-      const reshade::api::resource resource = (resolve ? device->get_resource_from_view(view) : reshade::api::resource{0u});
-      if (bind_timer.armed && resolve) {
-        bvh::g_perf_gate.bind_srv_resolves.fetch_add(1u, std::memory_order_relaxed);
+      // Destroy-view hook present (HookOffMask bit 128 clear): a slot's resource is reused within one view generation.
+      static const bool view_reuse = (HookOffMask() & 128u) == 0u;
+      const uint32_t view_generation = g_state.view_generation.load(std::memory_order_acquire);
+      reshade::api::resource resource = {0u};
+      if (resolve) {
+        if (view_reuse && vertex_stage && data->vs_srv_view[slot].handle == view.handle && data->vs_srv[slot].handle != 0u
+            && data->vs_srv_generation[slot] == view_generation) {
+          resource = data->vs_srv[slot];
+        } else if (view_reuse && !vertex_stage && data->ps_srv_view[slot].handle == view.handle && data->ps_srv[slot].handle != 0u
+                   && data->ps_srv_generation[slot] == view_generation) {
+          resource = data->ps_srv[slot];
+        } else {
+          resource = device->get_resource_from_view(view);
+          if (bind_timer.armed) {
+            bvh::g_perf_gate.bind_srv_resolves.fetch_add(1u, std::memory_order_relaxed);
+          }
+        }
       }
       if (vertex_stage) {
         data->vs_srv_view[slot] = view;
         data->vs_srv[slot] = resource;
+        data->vs_srv_generation[slot] = view_generation;
       }
       if (pixel_stage) {
         data->ps_srv_view[slot] = view;
         data->ps_srv[slot] = ((kPsSrvResourceSlots & (1u << slot)) != 0u ? resource : reshade::api::resource{0u});
+        data->ps_srv_generation[slot] = view_generation;
       }
     }
   }

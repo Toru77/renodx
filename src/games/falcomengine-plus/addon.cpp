@@ -5586,6 +5586,10 @@ static bool IsSceneCbvCandidateValid(reshade::api::device* device,
 
 // -- Push-descriptors event ? capture lighting inputs (kai pattern) --
 
+// Scene CB (b0) whose size passed the capture check, per thread. g_scene_cbv_desc_generation moves at every
+// destroy_resource (OnDestroyResource), so a reused handle is always checked again.
+static std::atomic<uint32_t> g_scene_cbv_desc_generation{0u};
+
 static void OnPushDescriptorsCapture(
     reshade::api::command_list* cmd_list,
     reshade::api::shader_stage stages,
@@ -5946,16 +5950,31 @@ static void OnPushDescriptorsCapture(
       auto* cbv_views = static_cast<const reshade::api::resource_view*>(update.descriptors);
       if (cbv_views[0].handle != 0u) {
         reshade::api::resource buf = { cbv_views[0].handle };
-        auto desc = device->get_resource_desc(buf);
-        if (desc.type == reshade::api::resource_type::buffer
-            && desc.buffer.size >= 200u
-            && desc.buffer.size <= (64u * 1024u)) {
-          if (d->captured_scene_cbv_view.handle != cbv_views[0].handle) {
-            CSLog("capture", std::string("cbv handle -> buf:") + std::to_string(desc.buffer.size));
-            d->captured_cbv_res = buf.handle;
-            d->captured_cbv_dims = std::string("buf:") + std::to_string(desc.buffer.size);
+        thread_local uint64_t s_desc_buffer = 0u;
+        thread_local uint64_t s_desc_size = 0u;
+        thread_local uint32_t s_desc_generation = 0u;
+        const uint32_t desc_generation = g_scene_cbv_desc_generation.load(std::memory_order_acquire);
+        uint64_t buffer_size = 0u;
+        if (s_desc_generation == desc_generation && s_desc_buffer == buf.handle) {
+          buffer_size = s_desc_size;
+        } else {
+          auto desc = device->get_resource_desc(buf);
+          if (desc.type == reshade::api::resource_type::buffer
+              && desc.buffer.size >= 200u
+              && desc.buffer.size <= (64u * 1024u)) {
+            buffer_size = desc.buffer.size;
+            s_desc_buffer = buf.handle;
+            s_desc_size = buffer_size;
+            s_desc_generation = desc_generation;
           }
-          d->captured_scene_cbv = { buf, 0, desc.buffer.size };
+        }
+        if (buffer_size != 0u) {
+          if (d->captured_scene_cbv_view.handle != cbv_views[0].handle) {
+            CSLog("capture", std::string("cbv handle -> buf:") + std::to_string(buffer_size));
+            d->captured_cbv_res = buf.handle;
+            d->captured_cbv_dims = std::string("buf:") + std::to_string(buffer_size);
+          }
+          d->captured_scene_cbv = { buf, 0, buffer_size };
           d->captured_scene_cbv_valid = true;
           d->captured_cbv_live = true;
           d->captured_scene_cbv_frame = d->frame_index;
@@ -6275,6 +6294,7 @@ static void OnDestroyResourceView(reshade::api::device* device, reshade::api::re
   KillAllTracked(d, view.handle, 0u);
 }
 static void OnDestroyResource(reshade::api::device* device, reshade::api::resource res) {
+  g_scene_cbv_desc_generation.fetch_add(1u, std::memory_order_release);
   if (!device || !res.handle) return;
   auto* d = device->get_private_data<DeviceData>();
   if (!d) return;

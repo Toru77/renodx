@@ -42,18 +42,34 @@ inline BufferInfo QueryBufferInfo(reshade::api::device* device, reshade::api::re
   if (device == nullptr || resource.handle == 0u) return {};
   thread_local uint32_t cache_generation = 0u;
   thread_local std::unordered_map<uint64_t, BufferInfo> cache;
+  thread_local std::array<std::pair<uint64_t, BufferInfo>, 2> recent{};
+  thread_local uint32_t recent_next = 0u;
   const uint32_t generation = g_record_cache_generation.load(std::memory_order_acquire);
   if (generation != cache_generation) {
     cache.clear();
+    recent = {};
+    recent_next = 0u;
     cache_generation = generation;
   }
-  if (const auto cached = cache.find(resource.handle); cached != cache.end()) return cached->second;
+  for (const auto& [recent_handle, recent_info] : recent) {
+    if (recent_handle == resource.handle) return recent_info;
+  }
+  const auto remember = [&](const BufferInfo& info) {
+    recent[recent_next] = {resource.handle, info};
+    recent_next ^= 1u;
+    return info;
+  };
+  if (const auto cached = cache.find(resource.handle); cached != cache.end()) {
+    const auto& [cached_handle, cached_info] = *cached;
+    return remember(cached_info);
+  }
   {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     const auto it = g_state.buffer_info.find(resource.handle);
     if (it != g_state.buffer_info.end()) {
-      cache.insert_or_assign(resource.handle, it->second);
-      return it->second;
+      const auto& [found_handle, found_info] = *it;
+      cache.insert_or_assign(resource.handle, found_info);
+      return remember(found_info);
     }
   }
   const auto desc = device->get_resource_desc(resource);
@@ -67,7 +83,7 @@ inline BufferInfo QueryBufferInfo(reshade::api::device* device, reshade::api::re
     std::lock_guard<std::mutex> lock(g_state.mutex);
     g_state.buffer_info.insert_or_assign(resource.handle, info);
   }
-  return info;
+  return remember(info);
 }
 
 inline void SetStatus(const std::string& status) {
@@ -90,12 +106,21 @@ inline bool LayoutHasSkinInputs(const reshade::api::pipeline& input_layout) {
   if (input_layout.handle == 0u || renodx::utils::scene::shared.data == nullptr) return false;
   thread_local uint32_t cache_generation = 0u;
   thread_local std::unordered_map<uint64_t, bool> cache;
+  thread_local uint64_t last_handle = 0u;
+  thread_local bool last_value = false;
   const uint32_t generation = g_record_cache_generation.load(std::memory_order_acquire);
   if (generation != cache_generation) {
     cache.clear();
+    last_handle = 0u;
     cache_generation = generation;
   }
-  if (const auto cached = cache.find(input_layout.handle); cached != cache.end()) return cached->second;
+  if (input_layout.handle == last_handle) return last_value;
+  if (const auto cached = cache.find(input_layout.handle); cached != cache.end()) {
+    const auto& [cached_handle, cached_value] = *cached;
+    last_handle = input_layout.handle;
+    last_value = cached_value;
+    return last_value;
+  }
   bool has_skin = false;
   renodx::utils::scene::shared.data->input_layouts.if_contains(input_layout.handle, [&](const auto& pair) {
     for (const auto& element : pair.second.elements) {
@@ -106,6 +131,8 @@ inline bool LayoutHasSkinInputs(const reshade::api::pipeline& input_layout) {
       }
     }
     cache.insert_or_assign(input_layout.handle, has_skin);
+    last_handle = input_layout.handle;
+    last_value = has_skin;
   });
   return has_skin;
 }
@@ -550,6 +577,18 @@ inline bool OnCopyTextureRegionDepthLog(
   return false;
 }
 
+// With the census and RTAO discovery off, no consumer (lighting capture, pool, deform) reads a draw of another VS class or
+// PS: such a draw skips the record. Only diagnostics change: the pool's per-class draw statistics, the record parity gauges
+// and timers, and the census serials.
+inline bool IsDrawConsumed(reshade::api::command_list* cmd_list) {
+  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  const uint64_t vs_pipeline = (shader_state != nullptr ? shader_state->stage_states[renodx::utils::shader::VERTEX_INDEX].pipeline.handle : 0u);
+  const uint32_t ps_hash = (shader_state != nullptr ? renodx::utils::shader::GetCurrentPixelShaderHash(shader_state) : 0u);
+  const auto vs_class = static_cast<contract::VsClass>(contract::LookupVertexTraits(vs_pipeline).cls);
+  return CensusEnabled() || rtao::g_rtao_discovery > 0.5f || IsLightingHash(ps_hash)
+         || vs_class == contract::VsClass::Rigid || vs_class == contract::VsClass::Wind || contract::IsDeformingClass(vs_class);
+}
+
 struct WorldDrawCallback {
   template <typename Arguments>
   renodx::utils::command_action::CallbackResult<renodx::utils::command_action::CommandContext<Arguments>>
@@ -765,15 +804,7 @@ struct WorldDrawCallback {
     }
 
     if (!CaptureActive()) return {.bypass = skip_cascade_draw};
-    auto* shader_state = renodx::utils::shader::GetCurrentState(context.cmd_list);
-    const uint64_t vs_pipeline = (shader_state != nullptr ? shader_state->stage_states[renodx::utils::shader::VERTEX_INDEX].pipeline.handle : 0u);
-    const uint32_t ps_hash = (shader_state != nullptr ? renodx::utils::shader::GetCurrentPixelShaderHash(shader_state) : 0u);
-    const auto vs_class = static_cast<contract::VsClass>(contract::LookupVertexTraits(vs_pipeline).cls);
-    // With the census and RTAO discovery off, no consumer (lighting capture, pool, deform) reads a draw of another VS class or
-    // PS: it skips the record. Only diagnostics change: the pool's per-class draw statistics, the record parity gauges and
-    // timers, and the census serials.
-    const bool consumed = CensusEnabled() || rtao::g_rtao_discovery > 0.5f || IsLightingHash(ps_hash)
-                          || vs_class == contract::VsClass::Rigid || vs_class == contract::VsClass::Wind || contract::IsDeformingClass(vs_class);
+    const bool consumed = IsDrawConsumed(context.cmd_list);
     if (bvh::g_perf_gate.gather.load(std::memory_order_relaxed)) {
       bvh::g_perf_gate.hook_draws.fetch_add(1u, std::memory_order_relaxed);
       if (!consumed) {
@@ -858,6 +889,7 @@ struct WorldDrawCallback {
       default:
         return {};
     }
+    if (!IsDrawConsumed(context.cmd_list)) return {};
     const bool indexed = args.command != reshade::api::indirect_command::draw;
     // D3D11 reports a single draw with stride 0 (the args layout is implied):
     // 20 bytes for indexed draws, 16 for non-indexed. Other APIs pass the
