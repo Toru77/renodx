@@ -221,8 +221,15 @@ float3 ApplyHueClipEmulationBT709(float3 color, float strength, float clip_point
   const float custom_source_y = renodx::color::y::from::BT709(color);
   if (strength > 0.f && custom_source_y > 0.f) {
     const float3 custom_magnitude = abs(color);
-    const float3 custom_reference = renodx::tonemap::neutwo::PerChannel(
-        custom_magnitude / max(clip_point, 0.01f));
+    float3 custom_reference;
+    if (RENODX_HUE_CLIP_C_INFINITY != 0.f) {
+      const float custom_clip = max(clip_point, 0.01f);
+      custom_reference = renodx::tonemap::CInfinityRollOff(
+          custom_magnitude / custom_clip, 1.f, min(0.18f / custom_clip, 0.999f));
+    } else {
+      custom_reference = renodx::tonemap::neutwo::PerChannel(
+          custom_magnitude / max(clip_point, 0.01f));
+    }
     const float custom_reference_min = renodx::math::Min(custom_reference);
     const float custom_reference_range = renodx::math::Max(custom_reference) - custom_reference_min;
     float3 custom_transferred = color;

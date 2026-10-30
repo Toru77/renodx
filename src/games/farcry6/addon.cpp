@@ -84,6 +84,16 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
+        .key = "ToneMapHueClipCInfinity",
+        .binding = &shader_injection.tone_map_hue_clip_c_infinity,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Hue Clip C-Infinity (test)",
+        .section = "Tone Mapping",
+        .tooltip = "Use C-infinity rolloff for Hue Clip instead of Neutwo. Temporary comparison control.",
+        .is_enabled = []() { return shader_injection.tone_map_type != 0.f && shader_injection.tone_map_hue_clip > 0.f; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "ToneMapGammaCorrection",
         .binding = &shader_injection.gamma_correction,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -224,6 +234,7 @@ void OnPresetOff() {
   renodx::utils::settings::UpdateSetting("ToneMapGameNits", 203.f);
   renodx::utils::settings::UpdateSetting("ToneMapUINits", 203.f);
   renodx::utils::settings::UpdateSetting("ToneMapHueClip", 0.f);
+  renodx::utils::settings::UpdateSetting("ToneMapHueClipCInfinity", 0.f);
   renodx::utils::settings::UpdateSetting("ToneMapGammaCorrection", 0.f);
   renodx::utils::settings::UpdateSetting("ColorGradeExposure", 1.f);
   renodx::utils::settings::UpdateSetting("ColorGradeHighlights", 50.f);

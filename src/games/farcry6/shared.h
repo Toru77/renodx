@@ -29,6 +29,10 @@ struct ShaderInjectData {
   float tone_map_contrast;
   float tone_map_saturation;
   float tone_map_blowout;
+  float tone_map_hue_clip_c_infinity;
+  float padding0;
+  float padding1;
+  float padding2;
 };
 
 #ifndef __cplusplus
@@ -41,6 +45,7 @@ cbuffer shader_injection : register(b13, space50) {
 #define RENODX_DIFFUSE_WHITE_NITS      shader_injection.diffuse_white_nits
 #define RENODX_GRAPHICS_WHITE_NITS     shader_injection.graphics_white_nits
 #define RENODX_TONE_MAP_HUE_CLIP shader_injection.tone_map_hue_clip
+#define RENODX_HUE_CLIP_C_INFINITY shader_injection.tone_map_hue_clip_c_infinity
 #define RENODX_GAMMA_CORRECTION        shader_injection.gamma_correction
 #define RENODX_TONE_MAP_EXPOSURE       shader_injection.tone_map_exposure
 #define RENODX_TONE_MAP_HIGHLIGHTS     shader_injection.tone_map_highlights
