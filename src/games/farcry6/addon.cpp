@@ -187,7 +187,7 @@ renodx::utils::settings::Settings settings = {
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f,
         .label = "Frame Generation",
-        .section = "Antialiasing",
+        .section = "DLSS",
         .tooltip = "Choose a frame multiplier. The supported maximum depends on your GPU and driver; higher selections use the maximum supported. Requires DLSS and HDR10 or SDR output.",
         .labels = {"Off", "2x", "3x", "4x", "5x", "6x"},
         .on_change_value = [](float, float) { SyncFrameGenerationSetting(); },
@@ -199,7 +199,7 @@ renodx::utils::settings::Settings settings = {
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f,
         .label = "DLSS Super Resolution",
-        .section = "Antialiasing",
+        .section = "DLSS",
         .tooltip = "Replaces the game's TAA with DLSS when its inputs are available.",
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
@@ -208,7 +208,7 @@ renodx::utils::settings::Settings settings = {
         .binding = &farcry6_dlss::dlss::dlss_rcas_strength,
         .default_value = 0.5f,
         .label = "RCAS Sharpening",
-        .section = "Antialiasing",
+        .section = "DLSS",
         .tooltip = "AMD RCAS after upscaling, with noise reduction enabled. Zero disables sharpening.",
         .min = 0.f,
         .max = 1.f,
@@ -222,7 +222,7 @@ renodx::utils::settings::Settings settings = {
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 3.f,
         .label = "DLSS Preset",
-        .section = "Antialiasing",
+        .section = "DLSS",
         .labels = {"Default", "F - CNN", "J - Transformer 1", "K - Transformer 1", "L - Transformer 2", "M - Transformer 2"},
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
@@ -341,12 +341,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   }
 
   if (fdw_reason == DLL_PROCESS_DETACH) {
-    farcry6_dlss::dlss::Use(fdw_reason);
+    farcry6_dlss::dlss::Use(fdw_reason, &shader_injection);
   }
   renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff, &SyncFrameGenerationSetting);
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
   if (fdw_reason == DLL_PROCESS_ATTACH) {
-    farcry6_dlss::dlss::Use(fdw_reason);
+    farcry6_dlss::dlss::Use(fdw_reason, &shader_injection);
   }
 
   return TRUE;

@@ -33,6 +33,7 @@
 #include "../../../utils/pipeline_layout.hpp"
 #include "../../../utils/shader.hpp"
 #include "../../../utils/state.hpp"
+#include "../shared.h"
 #include "./streamline_runtime.hpp"
 #include "./fg_camera.hpp"
 #include "./fg_factory.hpp"
@@ -58,6 +59,7 @@ static constexpr uint32_t kSlotCbv = 0u;       // b0: TAA knobs
 inline float dlss_enabled = 1.f;
 inline float dlss_rcas_strength = 0.5f;
 inline float dlss_render_preset = 3.f;
+inline const ShaderInjectData* output_settings = nullptr;
 inline float fg_multiplier_setting = 0.f;  // 0=off, 1..5=generated frames
 inline std::atomic<bool> fg_enable_requested{false};
 inline std::atomic<uint32_t> fg_requested_generated{0u};
@@ -878,6 +880,9 @@ struct FgCameraEvaluation {
   bool conflicting_queue = false;
   uint32_t hdr_slot = UINT32_MAX;
   float hdr_brightness = 0.f;
+  float tone_map_type = 0.f;
+  float diffuse_white_nits = 0.f;
+  float gamma_correction = 0.f;
   reshade::api::color_space output_color_space = reshade::api::color_space::unknown;
   uint64_t scene_output = 0u;
   bool hudless_tagged = false;
@@ -3007,7 +3012,7 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
 
   if (!copied) return false;
   fg_last_scene_handoff_frame.store(frame_counter, std::memory_order_release);
-  if (FgInputsEnabled() && fg_camera_capture_enabled.load(std::memory_order_acquire)
+  if (output_settings != nullptr && FgInputsEnabled() && fg_camera_capture_enabled.load(std::memory_order_acquire)
       && !fg_hudless_retire_requested.load(std::memory_order_acquire)
       && !data->in_render_pass && src.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && src.Width <= UINT32_MAX) {
     const uint64_t frame = camera_builder_frame.load(std::memory_order_acquire);
@@ -3053,7 +3058,7 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
             reshade::api::descriptor_range srv = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_shader_resource_view};
             reshade::api::descriptor_range uav = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};
             reshade::api::constant_range constants = {};
-            constants.count = 3u;
+            constants.count = 4u;
             constants.visibility = DS::all_compute;
             reshade::api::pipeline_layout_param params[3] = {};
             params[0].type = PT::descriptor_table;
@@ -3138,8 +3143,15 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
               const auto stage = reshade::api::shader_stage::all_compute;
               cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, fg_hudless.pipeline);
               cmd_list->bind_descriptor_tables(stage, fg_hudless.layout, 0u, 2u, slot.tables);
-              const struct { uint32_t width, height; float brightness; } constants = {slot.width, slot.height, is_sdr ? 0.f : (is_scrgb ? -brightness : brightness)};
-              cmd_list->push_constants(stage, fg_hudless.layout, 2u, 0u, 3u, &constants);
+              const float tone_map_type = output_settings->tone_map_type;
+              const float diffuse_white_nits = output_settings->diffuse_white_nits;
+              const float gamma_correction = output_settings->gamma_correction;
+              // The conversion shader multiplies this value by two, like the game's output pass.
+              const float output_brightness = (tone_map_type == 0.f ? brightness : diffuse_white_nits * 0.5f);
+              const struct { uint32_t width, height; float brightness; uint32_t decode_mode; } constants = {
+                  slot.width, slot.height, is_sdr ? 0.f : (is_scrgb ? -output_brightness : output_brightness),
+                  tone_map_type == 0.f ? 0u : (gamma_correction != 0.f ? 1u : 2u)};
+              cmd_list->push_constants(stage, fg_hudless.layout, 2u, 0u, 4u, &constants);
               const reshade::api::resource source_resource{reinterpret_cast<uint64_t>(source)};
               cmd_list->barrier(source_resource, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource_non_pixel);
               cmd_list->barrier(slot.texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
@@ -3153,6 +3165,9 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
               if (evaluation.frame == frame && evaluation.input_list == cmd_list) {
                 evaluation.hdr_slot = slot_index;
                 evaluation.hdr_brightness = (is_sdr ? 0.f : brightness);
+                evaluation.tone_map_type = tone_map_type;
+                evaluation.diffuse_white_nits = diffuse_white_nits;
+                evaluation.gamma_correction = gamma_correction;
                 evaluation.output_color_space = output_space;
                 evaluation.scene_output = reinterpret_cast<uint64_t>(target);
                 fg_hudless_converted.fetch_add(1u, std::memory_order_relaxed);
@@ -3199,6 +3214,9 @@ inline void TagFgHudless(reshade::api::command_list* cmd_list, uint32_t output_h
   if (evaluation.frame != frame || evaluation.token == nullptr || evaluation.input_list != cmd_list
       || evaluation.hdr_slot >= fg_hudless.slots.size() || evaluation.hudless_tagged
       || evaluation.output_color_space != fg_output_color_space.load(std::memory_order_relaxed)
+      || output_settings == nullptr || evaluation.tone_map_type != output_settings->tone_map_type
+      || evaluation.diffuse_white_nits != output_settings->diffuse_white_nits
+      || evaluation.gamma_correction != output_settings->gamma_correction
       || (!is_sdr && !is_hdr10 && !is_scrgb) || (is_sdr && output_hash != kSdrOutputHash)
       || ((is_hdr10 || is_scrgb) && ((is_hdr10 ? output_hash != kHdrOutputHash : output_hash != kScRgbOutputHash)
                        || fg_hdr_parameter_frame.load(std::memory_order_acquire) != frame
@@ -3885,11 +3903,12 @@ inline void OnDestroyDevice(reshade::api::device* device) {
 
 }
 
-inline void Use(DWORD fdw_reason) {
+inline void Use(DWORD fdw_reason, const ShaderInjectData* settings) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:
       if (attached) return;
       attached = true;
+      output_settings = settings;
       reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
@@ -3953,6 +3972,7 @@ inline void Use(DWORD fdw_reason) {
             ReleaseViewCache(device);
       }
       ReleaseNgx();
+      output_settings = nullptr;
       break;
   }
 }

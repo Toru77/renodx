@@ -1,11 +1,15 @@
 // Matches the game's SDR, HDR10, or scRGB output pass for the HUD-less image.
 // Brightness is positive for HDR10, negative for scRGB, and zero for SDR.
+#include "../../../shaders/color/gamma.hlsl"
+#include "../../../shaders/color/srgb.hlsl"
+
 Texture2D<float4> source : register(t0);
 RWTexture2D<float4> target : register(u0);
 
 cbuffer OutputParameters : register(b0) {
   uint2 output_size;
   float output_brightness;
+  uint decode_mode;
 };
 
 [numthreads(8, 8, 1)]
@@ -18,11 +22,14 @@ void main(uint3 id : SV_DispatchThreadID) {
     target[id.xy] = float4(saturate(encoded), 1.f);
     return;
   }
-  if (output_brightness < 0.f) encoded = max(encoded, 0.f);
-  float3 linear_color = float3(
-      encoded.r >= 0.03928571194410324f ? pow(abs((encoded.r + 0.055f) * 0.9478673338890076f), 2.4f) : encoded.r * 0.0773801133f,
-      encoded.g >= 0.03928571194410324f ? pow(abs((encoded.g + 0.055f) * 0.9478673338890076f), 2.4f) : encoded.g * 0.0773801133f,
-      encoded.b >= 0.03928571194410324f ? pow(abs((encoded.b + 0.055f) * 0.9478673338890076f), 2.4f) : encoded.b * 0.0773801133f);
+  float3 linear_color;
+  if (decode_mode == 0u) {
+    linear_color = renodx::color::srgb::Decode(max(0.f, encoded));
+  } else if (decode_mode == 1u) {
+    linear_color = renodx::color::gamma::DecodeSafe(encoded, 2.2f);
+  } else {
+    linear_color = renodx::color::srgb::DecodeSafe(encoded);
+  }
 
   if (output_brightness < 0.f) {
     target[id.xy] = float4(linear_color * (-output_brightness * 2.f / 80.f), 1.f);
