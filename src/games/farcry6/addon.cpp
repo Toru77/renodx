@@ -41,6 +41,7 @@ void SyncFrameGenerationSetting() {
   const uint32_t requested = static_cast<uint32_t>((std::clamp)(farcry6_dlss::dlss::fg_multiplier_setting, 0.f, 5.f));
   farcry6_dlss::dlss::fg_requested_generated.store(requested, std::memory_order_release);
   farcry6_dlss::dlss::fg_enable_requested.store(requested != 0u, std::memory_order_release);
+  farcry6_dlss::dlss::fg_debug_log_enabled.store(farcry6_dlss::dlss::fg_debug_log_setting != 0.f, std::memory_order_release);
 }
 
 renodx::utils::settings::Settings settings = {
@@ -194,6 +195,17 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
     new renodx::utils::settings::Setting{
+        .key = "FrameGenerationDebugLog",
+        .binding = &farcry6_dlss::dlss::fg_debug_log_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Frame Generation Debug Log",
+        .section = "DLSS",
+        .tooltip = "Log missing or rejected frame generation inputs to ReShade.log.",
+        .on_change_value = [](float, float value) { farcry6_dlss::dlss::fg_debug_log_enabled.store(value != 0.f, std::memory_order_release); },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLSSEnabled",
         .binding = &farcry6_dlss::dlss::dlss_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -344,6 +356,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     farcry6_dlss::dlss::Use(fdw_reason, &shader_injection);
   }
   renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff, &SyncFrameGenerationSetting);
+  if (fdw_reason == DLL_PROCESS_ATTACH) {
+    farcry6_dlss::dlss::fg_debug_log_enabled.store(farcry6_dlss::dlss::fg_debug_log_setting != 0.f, std::memory_order_release);
+  }
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
   if (fdw_reason == DLL_PROCESS_ATTACH) {
     farcry6_dlss::dlss::Use(fdw_reason, &shader_injection);

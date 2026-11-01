@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -61,6 +62,8 @@ inline float dlss_rcas_strength = 0.5f;
 inline float dlss_render_preset = 3.f;
 inline const ShaderInjectData* output_settings = nullptr;
 inline float fg_multiplier_setting = 0.f;  // 0=off, 1..5=generated frames
+inline float fg_debug_log_setting = 0.f;
+inline std::atomic<bool> fg_debug_log_enabled{false};
 inline std::atomic<bool> fg_enable_requested{false};
 inline std::atomic<uint32_t> fg_requested_generated{0u};
 inline std::atomic<uint32_t> fg_applied_generated{0u};
@@ -665,6 +668,11 @@ struct GpuRetirementState {
   bool conflicting_submission = false;
   std::atomic<uint64_t> reclaimed{0u};
   uint64_t fence_failures = 0u;
+  uint64_t last_fence_failure_frame = UINT64_MAX;
+  const char* last_fence_failure = "none";
+  reshade::api::command_queue* last_present_queue = nullptr;
+  DWORD last_present_thread = 0u;
+  uint64_t last_present_frame = UINT64_MAX;
 };
 inline GpuRetirementState gpu_retirement;
 
@@ -934,6 +942,64 @@ inline std::atomic<uint64_t> fg_hudless_tagged{0u};
 inline std::atomic<uint64_t> fg_hudless_busy{0u};
 inline std::atomic<uint64_t> fg_hudless_no_slot{0u};
 inline std::atomic<uint64_t> fg_hudless_rejected{0u};
+inline std::atomic<uint64_t> fg_missing_dlss_inputs{0u};
+
+inline void LogFgFailure(uint64_t frame, const std::string& detail) {
+  if (!fg_debug_log_enabled.load(std::memory_order_acquire)) return;
+  char prefix[96];
+  std::snprintf(prefix, sizeof(prefix), "Far Cry 6 FG input: frame=%llu ", static_cast<unsigned long long>(frame));
+  reshade::log::message(reshade::log::level::warning, (std::string(prefix) + detail).c_str());
+}
+
+// Sample cumulative counters at present so render-thread diagnostics stay cheap.
+inline void LogFgInputFailures(uint64_t frame) {
+  static std::mutex log_mutex;
+  const std::lock_guard lock(log_mutex);
+  struct Counter {
+    const char* name;
+    std::atomic<uint64_t>* value;
+  };
+  const Counter counters[] = {
+      {"dlss_color_motion_or_depth_missing", &fg_missing_dlss_inputs},
+      {"camera_capture_busy", &fg_camera_capture_busy},
+      {"camera_missing_at_evaluation", &fg_camera_missing_frame},
+      {"camera_invalid_at_evaluation", &fg_camera_invalid_data},
+      {"camera_missing_at_present", &fg_camera_present_missing},
+      {"camera_invalid_or_jitter_mismatch_at_present", &fg_camera_present_invalid},
+      {"scene_handoff_missing", &fg_frame_missing_handoff},
+      {"hdr_parameters_missing", &fg_frame_missing_hdr},
+      {"hudless_busy", &fg_hudless_busy},
+      {"hudless_no_slot", &fg_hudless_no_slot},
+      {"hudless_rejected", &fg_hudless_rejected},
+      {"streamline_input_or_marker_failure", &fg_input_failed},
+      {"present_unpaired", &fg_present_unpaired},
+      {"input_queue_skipped", &fg_input_queue_skips},
+  };
+  static std::array<uint64_t, std::size(counters)> previous = {};
+  static uint64_t last_report_ms = 0u;
+  static bool was_enabled = false;
+  const bool enabled = fg_debug_log_enabled.load(std::memory_order_acquire);
+  const uint64_t now = GetTickCount64();
+  if (!enabled || !was_enabled) {
+    for (size_t i = 0; i < std::size(counters); ++i) previous[i] = counters[i].value->load(std::memory_order_relaxed);
+    last_report_ms = now;
+    was_enabled = enabled;
+    return;
+  }
+  if (now - last_report_ms < 1000u) return;
+  last_report_ms = now;
+  for (size_t i = 0; i < std::size(counters); ++i) {
+    const uint64_t current = counters[i].value->load(std::memory_order_relaxed);
+    if (current > previous[i]) {
+      char message[256];
+      std::snprintf(message, sizeof(message), "Far Cry 6 FG input: through_frame=%llu %s=%llu last_streamline_result=%d",
+                    static_cast<unsigned long long>(frame), counters[i].name,
+                    static_cast<unsigned long long>(current - previous[i]), fg_input_last_result.load(std::memory_order_relaxed));
+      reshade::log::message(reshade::log::level::warning, message);
+    }
+    previous[i] = current;
+  }
+}
 struct FgPendingPresent {
   sl::FrameToken* token = nullptr;
   reshade::api::command_queue* queue = nullptr;
@@ -1712,6 +1778,7 @@ struct RcasSlot {
   uint32_t width = 0u;
   uint32_t height = 0u;
   std::shared_ptr<GpuRetirementTicket> ticket;
+  uint64_t ticket_frame = UINT64_MAX;
 };
 struct RcasState {
   std::shared_mutex mutex;
@@ -2130,36 +2197,48 @@ inline bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
 }
 
 inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandListData* data, uint32_t hash) {
-
+  struct EvaluationDiagnostic {
+    uint64_t frame;
+    bool enabled;
+    const char* failure = "initial prerequisites";
+    ~EvaluationDiagnostic() {
+      if (enabled && failure != nullptr) LogFgFailure(frame, std::string("DLSS evaluation skipped: ") + failure);
+    }
+  } diagnostic{frame_counter, hash == kTaaMainHash && fg_debug_log_enabled.load(std::memory_order_acquire)
+                                  && fg_camera_capture_enabled.load(std::memory_order_acquire) && FgInputsEnabled()};
   if (cmd_list == nullptr || data == nullptr || dlss_enabled == 0.f || !IsSupported()) return false;
+  diagnostic.failure = "invalid or non-D3D12 device";
   auto* device = cmd_list->get_device();
   if (device == nullptr || device->get_api() != reshade::api::device_api::d3d12) return false;
-    bool nvidia_device = false;
-    for (const auto& native : nvidia_devs) {
-      if (native.load(std::memory_order_relaxed) == device->get_native()) nvidia_device = true;
-    }
+  diagnostic.failure = "device not in NVIDIA device list";
+  bool nvidia_device = false;
+  for (const auto& native : nvidia_devs) {
+    if (native.load(std::memory_order_relaxed) == device->get_native()) nvidia_device = true;
+  }
     if (!nvidia_device) {
 
       return false;
     }
 
-  auto* command_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
-  if (command_list == nullptr) return false;
-  // The pause variant has a separate history output. Leave its TAA to the game
-  // and resume DLSS with fresh history when gameplay returns.
-  if (hash == kTaaPauseHash) {
-
-    pause_taa_last_frame.store(camera_builder_frame.load(std::memory_order_acquire), std::memory_order_release);
-    ngx.reset = true;
-    return false;
-  }
-  if (PauseTaaRecentlySeen()) {
-    ngx.reset = true;
-    return false;
-  }
+    diagnostic.failure = "native command list missing";
+    auto* command_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+    if (command_list == nullptr) return false;
+    // The pause variant has a separate history output. Leave its TAA to the game
+    // and resume DLSS with fresh history when gameplay returns.
+    if (hash == kTaaPauseHash) {
+      pause_taa_last_frame.store(camera_builder_frame.load(std::memory_order_acquire), std::memory_order_release);
+      ngx.reset = true;
+      return false;
+    }
+    diagnostic.failure = "pause TAA recently seen";
+    if (PauseTaaRecentlySeen()) {
+      ngx.reset = true;
+      return false;
+    }
   TrackGpuCommands(cmd_list);
 
   // Per-device gate: a non-NVIDIA device's command lists keep vanilla TAA.
+  diagnostic.failure = "device not registered as GPU";
   if (!IsKnownGpuNative(device->get_native())) {
 
     return false;
@@ -2190,6 +2269,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     }
   }
 
+  diagnostic.failure = "TAA output target missing";
   auto* output_target = GetNativeResource(device, data->rtvs[0]);
   if (output_target == nullptr) {
     return false;
@@ -2210,6 +2290,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       ngx.reset = true;
     }
   }
+  diagnostic.failure = "prior NGX evaluation failed";
   if (ngx.eval_failed) return false;
 
   auto* color = color_ok ? reinterpret_cast<ID3D12Resource*>(color_in.resource.handle) : nullptr;
@@ -2223,7 +2304,18 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
   auto* scene_depth = scene_depth_owned.Get();
   auto* depth = scene_depth;
+  diagnostic.failure = "color, motion or scene depth missing";
   if (color == nullptr || motion == nullptr || depth == nullptr) {
+    if (fg_camera_capture_enabled.load(std::memory_order_relaxed)) {
+      fg_missing_dlss_inputs.fetch_add(1u, std::memory_order_relaxed);
+      if (fg_debug_log_enabled.load(std::memory_order_relaxed)) {
+        std::string detail = "DLSS input missing:";
+        if (color == nullptr) detail += " color";
+        if (motion == nullptr) detail += " motion";
+        if (depth == nullptr) detail += " depth";
+        LogFgFailure(frame_counter, detail);
+      }
+    }
     return false;
   }
 
@@ -2254,6 +2346,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   const uint32_t target_width = game_upscale_mode ? game_upscale_target_width.load() : display_width.load();
   const uint32_t target_height = game_upscale_mode ? game_upscale_target_height.load() : display_height.load();
 
+  diagnostic.failure = "input or output dimensions invalid";
   if (input_width == 0u || input_height == 0u
       || (input_width > target_width || input_height > target_height)) {
 
@@ -2262,10 +2355,12 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   const bool color_matches = color_desc.Width == input_width && color_desc.Height == input_height;
   const bool motion_matches = (motion_desc_early.Width == input_width / 2u && motion_desc_early.Height == input_height / 2u)
       || (motion_desc_early.Width == input_width && motion_desc_early.Height == input_height);
+  diagnostic.failure = "color or motion dimensions do not match TAA";
   if (!color_matches || !motion_matches) {
 
     return false;
   }
+  diagnostic.failure = "render or target dimensions outside supported range";
   if (input_width < 256u || input_height < 256u || target_width < 256u || target_height < 256u
       || target_width > 7680u || target_height > 4320u
       || target_width > input_width * 4u || target_height > input_height * 4u) {
@@ -2299,6 +2394,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     default:
       break;
   }
+  diagnostic.failure = "unsupported output format";
   if (output_format == DXGI_FORMAT_UNKNOWN) {
 
     return false;
@@ -2306,10 +2402,12 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
 
   if (!game_upscale_mode && hash != kTaaMainHash) return false;
 
+  diagnostic.failure = "NGX initialization unavailable";
   if (!EnsureNgxInitialized(device)) {
 
     return false;
   }
+  diagnostic.failure = "DLSS output texture unavailable";
   if (!EnsureOutputTexture(reinterpret_cast<ID3D12Device*>(device->get_native()), target_width, target_height, output_format)) return false;
 
   const uint32_t motion_src_width = static_cast<uint32_t>(motion->GetDesc().Width);
@@ -2332,6 +2430,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   // Zero motion does not span jittered frames, so the flag is dropped to match
   // the substitute rather than left describing motion that is no longer there.
   int feature_flags = GetFeatureFlags();
+  diagnostic.failure = "DLSS feature unavailable";
   if (!EnsureFeature(command_list, input_width, input_height, target_width, target_height,
                      render_preset, feature_flags, perf_quality)) {
 
@@ -2361,12 +2460,14 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     jitter_y = 0.f;
   }
 
+  diagnostic.failure = "motion view or unpack unavailable";
   const reshade::api::resource_view motion_view = GetOrCreateTextureView(device, motion_in.resource, motion_in.format);
   if (motion_view.handle == 0u || !DispatchUnpack(device, cmd_list, motion_view, input_width, input_height,
                                                    motion_src_width, motion_src_height)) {
 
     return false;
   }
+  diagnostic.failure = "unpacked motion texture missing";
   auto* motion_vectors = reinterpret_cast<ID3D12Resource*>(unpack.texture.handle);
   if (motion_vectors == nullptr) return false;
 
@@ -2385,17 +2486,22 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   std::unique_lock conversion_lock(color_conversion.mutex, std::defer_lock);
   RcasSlot* conversion_slots[2] = {};
   if (convert_color) {
+    diagnostic.failure = "color conversion input invalid or render pass active";
     if (data->in_render_pass || color_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
         || color_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || color_desc.DepthOrArraySize != 1u
-        || color_desc.MipLevels != 1u || color_desc.SampleDesc.Count != 1u
-        || !conversion_lock.try_lock()) return false;
+        || color_desc.MipLevels != 1u || color_desc.SampleDesc.Count != 1u) return false;
+    diagnostic.failure = "color conversion lock busy";
+    if (!conversion_lock.try_lock()) return false;
+    diagnostic.failure = "color conversion output missing";
     auto* output = (game_upscale_mode ? reinterpret_cast<ID3D12Resource*>(game_upscale_target_handle) : ngx.output_texture.Get());
     if (output == nullptr) return false;
+    diagnostic.failure = "color conversion output format or dimensions invalid";
     const auto output_desc = output->GetDesc();
     if (output_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
         || output_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || output_desc.Width != target_width
         || output_desc.Height != target_height || output_desc.DepthOrArraySize != 1u
         || output_desc.MipLevels != 1u || output_desc.SampleDesc.Count != 1u) return false;
+    diagnostic.failure = "color conversion device mismatch";
     if (color_conversion.device == nullptr) color_conversion.device = device;
     if (color_conversion.device != device) return false;
     if (!color_conversion.pipeline_attempted) {
@@ -2424,6 +2530,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
         (void)device->create_pipeline(color_conversion.layout, 1u, &subobject, &color_conversion.pipeline);
       }
     }
+    diagnostic.failure = "color conversion pipeline unavailable";
     if (color_conversion.pipeline.handle == 0u) return false;
     {
       std::shared_lock retirement_lock(gpu_retirement.mutex);
@@ -2435,7 +2542,77 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
         }
       }
     }
-    if (conversion_slots[1] == nullptr) return false;
+    if (conversion_slots[1] == nullptr) {
+      std::unique_lock retirement_lock(gpu_retirement.mutex);
+      uint64_t completed_fence = UINT64_MAX;
+      if (gpu_retirement.fence != nullptr) {
+        try {
+          completed_fence = gpu_retirement.fence->GetCompletedValue();
+        } catch (const std::exception&) {
+          // Leave tickets busy when completion cannot be observed safely.
+        }
+      }
+      conversion_slots[0] = nullptr;
+      uint32_t found = 0u;
+      for (auto& candidate : color_conversion.slots) {
+        if (candidate.ticket && !candidate.ticket->complete && completed_fence != UINT64_MAX
+            && candidate.ticket->pending_lists.empty() && !candidate.ticket->conflicting_submission
+            && candidate.ticket->queue != nullptr && candidate.ticket->fence_value != renodx::utils::gpu_fence::NO_SIGNAL
+            && candidate.ticket->fence_value <= completed_fence) {
+          candidate.ticket->complete = true;
+        }
+        if (!candidate.ticket || candidate.ticket->complete) {
+          conversion_slots[found++] = &candidate;
+          if (found == 2u) break;
+        }
+      }
+      if (found < 2u) conversion_slots[1] = nullptr;
+    }
+    diagnostic.failure = "color conversion slots busy";
+    if (conversion_slots[1] == nullptr) {
+      if (diagnostic.enabled) {
+        std::array<std::string, std::tuple_size_v<decltype(color_conversion.slots)> + 1u> messages;
+        {
+          std::shared_lock retirement_lock(gpu_retirement.mutex);
+          uint64_t completed_fence = UINT64_MAX;
+          bool fence_read_failed = false;
+          if (gpu_retirement.fence != nullptr) {
+            try {
+              completed_fence = gpu_retirement.fence->GetCompletedValue();
+            } catch (const std::exception&) {
+              fence_read_failed = true;
+            }
+          }
+          char line[512];
+          std::snprintf(line, sizeof(line), "conversion pool: last_present_frame=%llu present_queue=%p present_thread=%lu fence_present=%d fence_completed=%llu fence_read_failed=%d fence_failures=%llu last_failure=%s last_failure_frame=%llu recorded_lists=%llu",
+                        static_cast<unsigned long long>(gpu_retirement.last_present_frame), static_cast<void*>(gpu_retirement.last_present_queue),
+                        static_cast<unsigned long>(gpu_retirement.last_present_thread), gpu_retirement.fence != nullptr,
+                        static_cast<unsigned long long>(completed_fence), fence_read_failed,
+                        static_cast<unsigned long long>(gpu_retirement.fence_failures),
+                        gpu_retirement.last_fence_failure, static_cast<unsigned long long>(gpu_retirement.last_fence_failure_frame),
+                        static_cast<unsigned long long>(gpu_retirement.recorded_lists.size()));
+          messages[0] = line;
+          for (size_t i = 0; i < color_conversion.slots.size(); ++i) {
+            const auto& slot = color_conversion.slots[i];
+            if (!slot.ticket) {
+              std::snprintf(line, sizeof(line), "conversion slot=%llu free=no_ticket", static_cast<unsigned long long>(i));
+            } else {
+              const auto& ticket = *slot.ticket;
+              std::snprintf(line, sizeof(line), "conversion slot=%llu ticket_frame=%llu size=%ux%u complete=%d pending_lists=%llu pending_first=%p pending_current=%d queue=%p submit_thread=%lu conflicting=%d fence_value=%llu",
+                            static_cast<unsigned long long>(i), static_cast<unsigned long long>(slot.ticket_frame), slot.width, slot.height,
+                            ticket.complete, static_cast<unsigned long long>(ticket.pending_lists.size()),
+                            ticket.pending_lists.empty() ? nullptr : static_cast<void*>(*ticket.pending_lists.begin()),
+                            ticket.pending_lists.contains(cmd_list), static_cast<void*>(ticket.queue),
+                            static_cast<unsigned long>(ticket.submit_thread), ticket.conflicting_submission,
+                            static_cast<unsigned long long>(ticket.fence_value));
+            }
+            messages[i + 1u] = line;
+          }
+        }
+        for (const auto& message : messages) LogFgFailure(frame_counter, message);
+      }
+      return false;
+    }
     const reshade::api::resource_view_desc view_desc(
         reshade::api::resource_view_type::texture_2d, reshade::api::format::r16g16b16a16_float, 0u, 1u, 0u, 1u);
     for (uint32_t i = 0u; i < 2u; ++i) {
@@ -2479,6 +2656,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       for (uint32_t j = 0u; j < 2u; ++j) {
         if (slot.tables[j].handle == 0u) (void)device->allocate_descriptor_table(color_conversion.layout, j, &slot.tables[j]);
       }
+      diagnostic.failure = "color conversion resource or descriptor unavailable";
       if (!slot.source_view.handle || !slot.target_view.handle || !slot.tables[0].handle || !slot.tables[1].handle) return false;
       const reshade::api::descriptor_table_update updates[] = {
           {slot.tables[0], 0u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.source_view},
@@ -2495,6 +2673,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     cmd_list->barrier(conversion_slots[0]->texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
     RestoreGameDescriptorState(cmd_list);
     conversion_slots[0]->ticket = RetireGpuCommands(cmd_list);
+    conversion_slots[0]->ticket_frame = frame_counter;
   }
   static bool previous_color_conversion = false;
   if (convert_color != previous_color_conversion) {
@@ -2580,14 +2759,17 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       cmd_list->barrier(conversion_slots[1]->texture, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::unordered_access);
       RestoreGameDescriptorState(cmd_list);
       conversion_slots[1]->ticket = RetireGpuCommands(cmd_list);
+      conversion_slots[1]->ticket_frame = frame_counter;
     }
   }
+  diagnostic.failure = "NGX evaluation returned failure";
   if (NVSDK_NGX_FAILED(result)) {
     ngx.eval_failed = true;
 
     return false;
   }
   ngx.reset = false;
+  diagnostic.failure = nullptr;
   last_upscaler_eval_frame.store(frame_counter, std::memory_order_relaxed);
   auto* rcas_source = eval.Feature.pInOutput;
   const D3D12_RESOURCE_DESC rcas_source_desc = (rcas_source != nullptr ? rcas_source->GetDesc() : D3D12_RESOURCE_DESC{});
@@ -2762,6 +2944,19 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     (fg_camera_valid ? fg_camera_valid_evals : fg_camera_unavailable_evals).fetch_add(1u, std::memory_order_relaxed);
   }
 
+  if (fg_debug_log_enabled.load(std::memory_order_acquire) && FgInputsEnabled()
+      && fg_camera_capture_enabled.load(std::memory_order_acquire)) {
+    std::string detail = "FG token skipped:";
+    if (!fg_camera_valid) detail += " camera_unavailable";
+    if (game_upscale_mode) detail += " game_upscale_mode";
+    if (camera_builder_frame.load(std::memory_order_acquire) != fg_eval_frame) detail += " camera_frame_mismatch";
+    if (depth_state == reshade::api::resource_usage::undefined) detail += " depth_state_unknown";
+    if (fg_input_attempt_frame.load(std::memory_order_relaxed) == fg_eval_frame) detail += " token_already_attempted";
+    if (!farcry6_dlss::streamline::factory_hook_active.load(std::memory_order_acquire)) detail += " factory_hook_inactive";
+    if (fg_swapchain_transition.load(std::memory_order_acquire)) detail += " swapchain_transition";
+    if (detail != "FG token skipped:") LogFgFailure(fg_eval_frame, detail);
+  }
+
   // Both source buffers may be reused, so the tags must be volatile.
   // FG remains off, so Streamline does not need to retain their contents yet.
   if (FgInputsEnabled() && fg_camera_capture_enabled.load(std::memory_order_acquire) && fg_camera_valid
@@ -2775,10 +2970,12 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
         && !fg_swapchain_transition.load(std::memory_order_acquire)) {
       sl::FrameToken* token = nullptr;
       const uint32_t frame_index = static_cast<uint32_t>(fg_eval_frame);
+      const char* failed_stage = "get_frame_token";
       sl::Result fg_result = streamline.get_frame_token(token, &frame_index);
       if (fg_result == sl::Result::eOk && token == nullptr) fg_result = sl::Result::eErrorInvalidParameter;
       if (fg_result == sl::Result::eOk && token != nullptr) {
         const sl::ViewportHandle viewport(0u);
+        failed_stage = "set_constants";
         fg_result = streamline.set_constants(fg_camera, *token, viewport);
         if (fg_result == sl::Result::eOk) {
           const auto read_state = reshade::api::resource_usage::shader_resource_non_pixel;
@@ -2791,6 +2988,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
               {&depth_tag_resource, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &extent},
               {&motion_tag_resource, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &extent},
           };
+          failed_stage = "tag_depth_motion";
           fg_result = streamline.set_tag(*token, viewport, tags, 2u, command_list);
           if (depth_state != read_state) cmd_list->barrier(depth_resource, read_state, depth_state);
           RestoreGameDescriptorState(cmd_list);
@@ -2811,6 +3009,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
           }
         }
         if (!recorded) {
+          LogFgFailure(fg_eval_frame, "FG token discarded: evaluation or camera frame changed");
           const sl::ResourceTag clear_tags[] = {
               {nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent},
               {nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent},
@@ -2820,6 +3019,9 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
           fg_present_unpaired.fetch_add(1u, std::memory_order_relaxed);
         }
       } else {
+        if (fg_debug_log_enabled.load(std::memory_order_acquire)) {
+          LogFgFailure(fg_eval_frame, std::string("Streamline ") + failed_stage + " failed: result=" + std::to_string(static_cast<int>(fg_result)));
+        }
         fg_input_failed.fetch_add(1u, std::memory_order_relaxed);
         if (token != nullptr) {
           const sl::ResourceTag clear_tags[] = {
@@ -3176,6 +3378,7 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
               }
             } else {
               fg_hudless_rejected.fetch_add(1u, std::memory_order_relaxed);
+              LogFgFailure(frame, "HUD-less conversion rejected: texture, view or descriptor allocation failed");
             }
           } else {
             fg_hudless_busy.fetch_add(1u, std::memory_order_relaxed);
@@ -3224,12 +3427,38 @@ inline void TagFgHudless(reshade::api::command_list* cmd_list, uint32_t output_h
                        || fg_hdr_parameter_frame.load(std::memory_order_acquire) != frame
                        || fg_hdr_brightness.load(std::memory_order_relaxed) != evaluation.hdr_brightness))) {
     fg_hudless_rejected.fetch_add(1u, std::memory_order_relaxed);
+    if (fg_debug_log_enabled.load(std::memory_order_acquire)) {
+      std::string detail = "HUD-less tag rejected:";
+      if (evaluation.frame != frame) detail += " frame_mismatch";
+      if (evaluation.token == nullptr) detail += " token_missing";
+      if (evaluation.input_list != cmd_list) detail += " command_list_mismatch";
+      if (evaluation.hdr_slot >= fg_hudless.slots.size()) detail += " conversion_slot_missing";
+      if (evaluation.hudless_tagged) detail += " already_tagged";
+      if (evaluation.output_color_space != fg_output_color_space.load(std::memory_order_relaxed)) detail += " output_color_space_changed";
+      if (output_settings == nullptr) {
+        detail += " output_settings_missing";
+      } else if (evaluation.tone_map_type != output_settings->tone_map_type
+                 || evaluation.diffuse_white_nits != output_settings->diffuse_white_nits
+                 || evaluation.gamma_correction != output_settings->gamma_correction) {
+        detail += " output_settings_changed";
+      }
+      if (!is_sdr && !is_hdr10 && !is_scrgb) detail += " unsupported_color_space";
+      if ((is_sdr && output_hash != kSdrOutputHash)
+          || ((is_hdr10 || is_scrgb) && (is_hdr10 ? output_hash != kHdrOutputHash : output_hash != kScRgbOutputHash))) {
+        detail += " output_shader_mismatch";
+      }
+      if ((is_hdr10 || is_scrgb) && fg_hdr_parameter_frame.load(std::memory_order_acquire) != frame) detail += " hdr_parameters_frame_mismatch";
+      if ((is_hdr10 || is_scrgb) && fg_hdr_brightness.load(std::memory_order_relaxed) != evaluation.hdr_brightness) detail += " hdr_brightness_changed";
+      detail += " evaluation_frame=" + std::to_string(evaluation.frame);
+      LogFgFailure(frame, detail);
+    }
     return;
   }
   if (is_sdr) {
     SlotInput input;
     if (!ResolveSlot(cmd_list, data, 0u, input) || input.resource.handle != evaluation.scene_output) {
       fg_hudless_rejected.fetch_add(1u, std::memory_order_relaxed);
+      LogFgFailure(frame, "HUD-less tag rejected: SDR output resource missing or mismatched");
       return;
     }
   }
@@ -3241,6 +3470,7 @@ inline void TagFgHudless(reshade::api::command_list* cmd_list, uint32_t output_h
   const auto& slot = fg_hudless.slots[evaluation.hdr_slot];
   if (slot.texture.handle == 0u || slot.width != evaluation.output_width || slot.height != evaluation.output_height) {
     fg_hudless_rejected.fetch_add(1u, std::memory_order_relaxed);
+    LogFgFailure(frame, "HUD-less tag rejected: conversion texture missing or wrong size");
     return;
   }
   std::lock_guard frame_lock(farcry6_dlss::streamline::frame_api_mutex);
@@ -3347,6 +3577,9 @@ inline void OnPresent(
   if (queue != nullptr) {
     {
       std::unique_lock lock(gpu_retirement.mutex);
+      gpu_retirement.last_present_queue = queue;
+      gpu_retirement.last_present_thread = GetCurrentThreadId();
+      gpu_retirement.last_present_frame = frame_counter;
       for (auto it = gpu_retirement.tickets.begin(); it != gpu_retirement.tickets.end();) {
         auto ticket = it->lock();
         if (!ticket) {
@@ -3366,6 +3599,8 @@ inline void OnPresent(
             ticket->fence_value = renodx::utils::gpu_fence::QueueSignal(queue, gpu_retirement.fence.get());
             if (ticket->fence_value == renodx::utils::gpu_fence::NO_SIGNAL) {
               ++gpu_retirement.fence_failures;
+              gpu_retirement.last_fence_failure = "signal_rejected";
+              gpu_retirement.last_fence_failure_frame = frame_counter;
               continue;
             }
           }
@@ -3373,6 +3608,8 @@ inline void OnPresent(
           ticket->complete = completed != UINT64_MAX && completed >= ticket->fence_value;
         } catch (const std::exception&) {
           ++gpu_retirement.fence_failures;
+          gpu_retirement.last_fence_failure = "exception";
+          gpu_retirement.last_fence_failure_frame = frame_counter;
         }
       }
     }
@@ -3604,10 +3841,25 @@ inline void OnPresent(
                                | (present_input.submit_queue != queue || present_input.conflicting_queue ? 256u : 0u)
                                | (!fg_camera_capture_enabled.load(std::memory_order_acquire) ? 512u : 0u);
 
+        if (fg_debug_log_enabled.load(std::memory_order_acquire) && fg_enable_requested.load(std::memory_order_acquire)
+            && !fg_swapchain_transition.load(std::memory_order_acquire) && !PauseTaaRecentlySeen()) {
+          char message[512];
+          std::snprintf(message, sizeof(message), "Far Cry 6 FG input: frame=%llu disabling FG, reason_mask=0x%X taa_seen=%d dlss_evaluated=%d fg_evaluated=%d token_attempted=%d evaluation_frame=%llu camera_valid=%d handoff=%d hudless_tagged=%d",
+                        static_cast<unsigned long long>(frame_counter), reasons,
+                        last_taa_draw_frame.load(std::memory_order_relaxed) == frame_counter,
+                        last_upscaler_eval_frame.load(std::memory_order_relaxed) == frame_counter,
+                        fg_camera_eval_frame.load(std::memory_order_relaxed) == frame_counter,
+                        fg_input_attempt_frame.load(std::memory_order_relaxed) == frame_counter,
+                        static_cast<unsigned long long>(present_input.frame), present_input.camera_valid,
+                        present_input.handoff, present_input.hudless_tagged);
+          reshade::log::message(reshade::log::level::warning, message);
+        }
+
         if (reasons == 2u) {
           const uint64_t now = GetTickCount64();
           fg_missing_hudless_restarts = (fg_last_missing_hudless_ms != 0u && now - fg_last_missing_hudless_ms < 5000u
-                                             ? fg_missing_hudless_restarts + 1u : 1u);
+                                             ? fg_missing_hudless_restarts + 1u
+                                             : 1u);
           fg_last_missing_hudless_ms = now;
           if (fg_missing_hudless_restarts >= 3u) {
             fg_enable_requested.store(false, std::memory_order_release);
@@ -3646,6 +3898,7 @@ inline void OnPresent(
   const uint32_t stable_frames = (gameplay_handoff ? (std::min)(fg_stable_gameplay_frames.load() + 1u, 8u) : 0u);
   fg_stable_gameplay_frames.store(stable_frames, std::memory_order_relaxed);
   fg_present_frame.store(frame_counter, std::memory_order_release);
+  LogFgInputFailures(frame_counter);
   ++frame_counter;
   camera_builder_frame.store(frame_counter, std::memory_order_release);
   const bool want_halton = dlss_enabled != 0.f && IsSupported();
