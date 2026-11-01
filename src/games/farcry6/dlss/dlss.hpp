@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -64,6 +65,10 @@ inline const ShaderInjectData* output_settings = nullptr;
 inline float fg_multiplier_setting = 0.f;  // 0=off, 1..5=generated frames
 inline float fg_debug_log_setting = 0.f;
 inline std::atomic<bool> fg_debug_log_enabled{false};
+inline float fg_zero_ui_alpha_setting = 0.f;
+inline std::atomic<bool> fg_zero_ui_alpha_enabled{false};
+inline float fg_ui_alpha_setting = 0.f;
+inline std::atomic<bool> fg_ui_alpha_enabled{false};
 inline std::atomic<bool> fg_enable_requested{false};
 inline std::atomic<uint32_t> fg_requested_generated{0u};
 inline std::atomic<uint32_t> fg_applied_generated{0u};
@@ -85,6 +90,10 @@ inline uint32_t fg_missing_hudless_restarts = 0u;
 inline bool FgInputsEnabled() {
   return fg_enable_requested.load(std::memory_order_acquire)
       || fg_mode_status.load(std::memory_order_acquire) != 0;
+}
+
+inline bool FgUsesUiAlpha() {
+  return fg_zero_ui_alpha_enabled.load(std::memory_order_acquire) || fg_ui_alpha_enabled.load(std::memory_order_acquire);
 }
 
 inline bool SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode mode, uint32_t generated_frames = 0u, bool retain = true) {
@@ -311,13 +320,16 @@ static constexpr uint32_t kTrackedDepthSlots = 4u;
 inline std::atomic<uint64_t> tracked_depth_resources[kTrackedDepthSlots];
 inline std::atomic<uint32_t> tracked_depth_states[kTrackedDepthSlots];
 inline std::atomic<uint32_t> tracked_depth_next{0u};
+inline void NoteUiAlphaBarriers(reshade::api::command_list* cmd_list, uint32_t count,
+                                const reshade::api::resource* resources, const reshade::api::resource_usage* new_states);
 
 inline void OnBarrier(
-    reshade::api::command_list*, uint32_t count,
+    reshade::api::command_list* cmd_list, uint32_t count,
     const reshade::api::resource* resources,
     const reshade::api::resource_usage*,
     const reshade::api::resource_usage* new_states) {
   if (count == 0u || resources == nullptr || new_states == nullptr) return;
+  if (fg_ui_alpha_enabled.load(std::memory_order_relaxed)) NoteUiAlphaBarriers(cmd_list, count, resources, new_states);
   bool any_known = false;
   for (uint32_t slot = 0u; slot < kTrackedDepthSlots && !any_known; ++slot) {
     if (tracked_depth_resources[slot].load(std::memory_order_relaxed) != 0u) any_known = true;
@@ -639,12 +651,24 @@ struct __declspec(uuid("7f3e2a1c-9b4d-4e8f-a6c2-d5f1b0e98341")) CommandListData 
   uint64_t dlss_taa_resource = 0u;
   uint64_t dlss_frame = UINT64_MAX;
   bool gpu_tracked = false;
+  reshade::api::resource ui_alpha_scene = {};
+  reshade::api::resource_usage ui_alpha_scene_state = reshade::api::resource_usage::undefined;
 };
 
 inline CommandListData* Get(reshade::api::command_list* cmd_list) {
   if (cmd_list == nullptr) return nullptr;
   auto* data = cmd_list->get_private_data<CommandListData>();
   return data != nullptr ? data : cmd_list->create_private_data<CommandListData>();
+}
+
+inline void NoteUiAlphaBarriers(reshade::api::command_list* cmd_list, uint32_t count,
+                                const reshade::api::resource* resources, const reshade::api::resource_usage* new_states) {
+  if (cmd_list == nullptr) return;
+  auto* data = cmd_list->get_private_data<CommandListData>();
+  if (data == nullptr || data->ui_alpha_scene.handle == 0u) return;
+  for (uint32_t i = 0u; i < count; ++i) {
+    if (resources[i].handle == data->ui_alpha_scene.handle) data->ui_alpha_scene_state = new_states[i];
+  }
 }
 
 // ReShade's execute callback runs before the native submission. A retirement
@@ -901,6 +925,136 @@ inline std::array<FgCameraEvaluation, 4> fg_camera_evaluations = {};
 inline std::atomic<uint64_t> fg_camera_sample_frame{UINT64_MAX};
 inline std::atomic<bool> fg_camera_capture_enabled{false};
 inline std::atomic<uint64_t> fg_last_scene_handoff_frame{UINT64_MAX};
+inline std::atomic<uint64_t> fg_last_scene_handoff_resource{0u};
+inline std::atomic<uint64_t> fg_ui_alpha_pipeline_failed_frame{UINT64_MAX};
+struct UiAlphaPipeline {
+  reshade::api::device* device = nullptr;
+  reshade::api::pipeline original = {};
+  uint64_t generation = 0u;
+  reshade::api::pipeline replacement = {};
+};
+struct UiAlphaPipelineSource {
+  reshade::api::device* device = nullptr;
+  reshade::api::pipeline original = {};
+  uint64_t generation = 0u;
+  reshade::api::pipeline_layout layout = {};
+  reshade::api::pipeline_subobject* subobjects = nullptr;
+  uint32_t count = 0u;
+  uint32_t pixel_index = UINT32_MAX;
+};
+inline std::mutex ui_alpha_pipeline_mutex;
+inline std::vector<UiAlphaPipeline> ui_alpha_pipelines;
+inline std::vector<UiAlphaPipelineSource> ui_alpha_pipeline_sources;
+
+inline void OnInitUiAlphaPipeline(renodx::utils::pipeline::PipelineInfo* info, uint32_t count,
+                                  const reshade::api::pipeline_subobject* subobjects) {
+  if (info == nullptr || info->device == nullptr || info->device->get_api() != reshade::api::device_api::d3d12
+      || count == 0u || subobjects == nullptr) return;
+  uint32_t pixel_index = UINT32_MAX;
+  for (const auto& shader : info->shader_details) {
+    if (shader.stage == reshade::api::pipeline_stage::pixel_shader
+        && (shader.shader_hash == 0x3ED32776u || shader.shader_hash == 0x7C01563Du || shader.shader_hash == 0xDC4619B1u)) {
+      pixel_index = shader.subobject_index;
+      break;
+    }
+  }
+  if (pixel_index >= count) return;
+  auto layout = info->details.injection_layout.handle != 0u ? info->details.injection_layout : info->layout;
+  if (info->details.replacement_layout.handle != 0u) layout = info->details.replacement_layout;
+  auto* cloned = renodx::utils::pipeline::ClonePipelineSubObjects(subobjects, count);
+  std::lock_guard lock(ui_alpha_pipeline_mutex);
+  ui_alpha_pipeline_sources.push_back({info->device, info->pipeline, info->generation, layout, cloned, count, pixel_index});
+}
+
+inline void NoteUiAlphaPipelineFailure(uint64_t frame, const char* reason) {
+  if (fg_ui_alpha_pipeline_failed_frame.exchange(frame, std::memory_order_acq_rel) == frame
+      || !fg_debug_log_enabled.load(std::memory_order_acquire)) return;
+  char message[256];
+  std::snprintf(message, sizeof(message), "Far Cry 6 FG input: frame=%llu UI alpha pipeline unavailable: %s",
+                static_cast<unsigned long long>(frame), reason);
+  reshade::log::message(reshade::log::level::warning, message);
+}
+
+inline reshade::api::pipeline GetUiAlphaPipeline(reshade::api::command_list* cmd_list, uint32_t shader_hash, std::span<const uint8_t> shader_code) {
+  if (!fg_ui_alpha_enabled.load(std::memory_order_acquire) || cmd_list == nullptr
+      || fg_last_scene_handoff_frame.load(std::memory_order_acquire) != frame_counter) return {};
+  const auto* data = cmd_list->get_private_data<CommandListData>();
+  auto* device = cmd_list->get_device();
+  if (data == nullptr || device == nullptr || data->rtvs[0].handle == 0u
+      || device->get_resource_from_view(data->rtvs[0]).handle != fg_last_scene_handoff_resource.load(std::memory_order_acquire)) return {};
+  if (shader_code.empty()) {
+    NoteUiAlphaPipelineFailure(frame_counter, "replacement shader missing");
+    return {};
+  }
+  const auto original = renodx::utils::state::GetBoundShaderPipeline(cmd_list, reshade::api::pipeline_stage::pixel_shader);
+  reshade::api::pipeline_subobject* subobjects = nullptr;
+  reshade::api::pipeline_layout layout = {};
+  uint32_t count = 0u;
+  uint32_t pixel_index = UINT32_MAX;
+  uint64_t generation = 0u;
+  renodx::utils::pipeline::GetPipelineInfo(original, [&](const auto& info) {
+    if (info.device != device) return;
+    for (const auto& shader : info.shader_details) {
+      if (shader.stage == reshade::api::pipeline_stage::pixel_shader && shader.shader_hash == shader_hash) pixel_index = shader.subobject_index;
+    }
+    if (pixel_index == UINT32_MAX) return;
+    generation = info.generation;
+  });
+  if (generation == 0u) {
+    NoteUiAlphaPipelineFailure(frame_counter, "original pipeline metadata missing");
+    return {};
+  }
+  {
+    std::lock_guard lock(ui_alpha_pipeline_mutex);
+    for (const auto& cached : ui_alpha_pipelines) {
+      if (cached.device == device && cached.original.handle == original.handle && cached.generation == generation) {
+        return cached.replacement;
+      }
+    }
+  }
+  {
+    std::lock_guard lock(ui_alpha_pipeline_mutex);
+    for (const auto& source : ui_alpha_pipeline_sources) {
+      if (source.device != device || source.original.handle != original.handle || source.generation != generation
+          || source.pixel_index != pixel_index) continue;
+      layout = source.layout;
+      count = source.count;
+      subobjects = renodx::utils::pipeline::ClonePipelineSubObjects(source.subobjects, count);
+      break;
+    }
+  }
+  if (subobjects == nullptr) {
+    NoteUiAlphaPipelineFailure(frame_counter, "UI pipeline source was not captured");
+    return {};
+  }
+  bool compatible_blend = false;
+  for (uint32_t i = 0u; i < count; ++i) {
+    if (subobjects[i].type != reshade::api::pipeline_subobject_type::blend_state || subobjects[i].count != 1u) continue;
+    auto* blend = static_cast<reshade::api::blend_desc*>(subobjects[i].data);
+    if (!blend->blend_enable[0] || blend->render_target_write_mask[0] != 0x7u
+        || blend->source_color_blend_factor[0] != reshade::api::blend_factor::source_alpha
+        || blend->dest_color_blend_factor[0] != reshade::api::blend_factor::one_minus_source_alpha
+        || blend->color_blend_op[0] != reshade::api::blend_op::add) continue;
+    blend->render_target_write_mask[0] |= 0x8u;
+    blend->source_alpha_blend_factor[0] = reshade::api::blend_factor::one;
+    blend->dest_alpha_blend_factor[0] = reshade::api::blend_factor::one_minus_source_alpha;
+    blend->alpha_blend_op[0] = reshade::api::blend_op::add;
+    compatible_blend = true;
+  }
+  reshade::api::pipeline replacement = {};
+  if (compatible_blend && layout.handle != 0u && subobjects[pixel_index].type == reshade::api::pipeline_subobject_type::pixel_shader) {
+    renodx::utils::shader::AddShaderReplacement(&subobjects[pixel_index], shader_code, device->get_api());
+    (void)device->create_pipeline(layout, count, subobjects, &replacement);
+  }
+  renodx::utils::pipeline::DestroyPipelineSubobjects(subobjects, count);
+  if (replacement.handle != 0u) {
+    std::lock_guard lock(ui_alpha_pipeline_mutex);
+    ui_alpha_pipelines.push_back({device, original, generation, replacement});
+  } else {
+    NoteUiAlphaPipelineFailure(frame_counter, compatible_blend ? "pipeline creation failed" : "unsupported UI blend state");
+  }
+  return replacement;
+}
 inline std::atomic<uint64_t> last_taa_draw_frame{UINT64_MAX};
 inline std::atomic<uint64_t> last_upscaler_eval_frame{UINT64_MAX};
 inline std::atomic<uint32_t> fg_stable_gameplay_frames{0u};
@@ -1769,6 +1923,14 @@ struct FgHudlessState {
   std::array<FgHudlessSlot, 12> slots = {};
 };
 inline FgHudlessState fg_hudless;
+struct FgZeroUiAlpha {
+  reshade::api::device* device = nullptr;
+  reshade::api::resource texture = {};
+  uint32_t width = 0u;
+  uint32_t height = 0u;
+};
+inline std::mutex fg_zero_ui_alpha_mutex;
+inline std::vector<FgZeroUiAlpha> fg_zero_ui_alpha_textures;
 struct RcasSlot {
   reshade::api::resource texture = {};
   reshade::api::resource_view source_view = {};
@@ -1780,6 +1942,24 @@ struct RcasSlot {
   std::shared_ptr<GpuRetirementTicket> ticket;
   uint64_t ticket_frame = UINT64_MAX;
 };
+struct UiAlphaMaskSlot {
+  reshade::api::resource texture = {};
+  reshade::api::resource_view source_view = {};
+  reshade::api::resource_view target_view = {};
+  reshade::api::descriptor_table tables[2] = {};
+  uint32_t width = 0u;
+  uint32_t height = 0u;
+  std::shared_ptr<GpuRetirementTicket> ticket;
+};
+struct UiAlphaMaskState {
+  std::shared_mutex mutex;
+  reshade::api::device* device = nullptr;
+  reshade::api::pipeline_layout layout = {};
+  reshade::api::pipeline pipeline = {};
+  bool pipeline_attempted = false;
+  std::array<UiAlphaMaskSlot, 12> slots = {};
+};
+inline UiAlphaMaskState ui_alpha_mask;
 struct RcasState {
   std::shared_mutex mutex;
   reshade::api::device* device = nullptr;
@@ -1836,6 +2016,26 @@ inline void ReleaseFgHudless(reshade::api::device* device) {
   fg_hudless.slot_limit = 0u;
   fg_hudless_slots_allocated.store(false, std::memory_order_release);
   fg_hudless_retire_requested.store(false, std::memory_order_release);
+}
+
+inline void ReleaseUiAlphaMask(reshade::api::device* device) {
+  std::unique_lock lock(ui_alpha_mask.mutex);
+  if (device == nullptr || ui_alpha_mask.device != device) return;
+  for (auto& slot : ui_alpha_mask.slots) {
+    if (slot.source_view.handle) device->destroy_resource_view(slot.source_view);
+    if (slot.target_view.handle) device->destroy_resource_view(slot.target_view);
+    if (slot.texture.handle) device->destroy_resource(slot.texture);
+    for (auto& table : slot.tables) {
+      if (table.handle) device->free_descriptor_table(table);
+    }
+    slot = {};
+  }
+  if (ui_alpha_mask.pipeline.handle) device->destroy_pipeline(ui_alpha_mask.pipeline);
+  if (ui_alpha_mask.layout.handle) device->destroy_pipeline_layout(ui_alpha_mask.layout);
+  ui_alpha_mask.device = nullptr;
+  ui_alpha_mask.pipeline = {};
+  ui_alpha_mask.layout = {};
+  ui_alpha_mask.pipeline_attempted = false;
 }
 
 inline void ReleaseUnpack(reshade::api::device* device) {
@@ -2512,7 +2712,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       reshade::api::descriptor_range srv = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_shader_resource_view};
       reshade::api::descriptor_range uav = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};
       reshade::api::constant_range constants = {};
-      constants.count = 3u;
+      constants.count = 4u;
       constants.visibility = DS::all_compute;
       reshade::api::pipeline_layout_param params[3] = {};
       params[0].type = PT::descriptor_table;
@@ -2667,8 +2867,8 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     const auto stage = reshade::api::shader_stage::all_compute;
     cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, color_conversion.pipeline);
     cmd_list->bind_descriptor_tables(stage, color_conversion.layout, 0u, 2u, conversion_slots[0]->tables);
-    const uint32_t constants[] = {input_width, input_height, 1u};
-    cmd_list->push_constants(stage, color_conversion.layout, 2u, 0u, 3u, constants);
+    const uint32_t constants[] = {input_width, input_height, 1u, 0u};
+    cmd_list->push_constants(stage, color_conversion.layout, 2u, 0u, 4u, constants);
     cmd_list->dispatch((input_width + 7u) / 8u, (input_height + 7u) / 8u, 1u);
     cmd_list->barrier(conversion_slots[0]->texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
     RestoreGameDescriptorState(cmd_list);
@@ -2749,8 +2949,9 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
       }
       cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, color_conversion.pipeline);
       cmd_list->bind_descriptor_tables(stage, color_conversion.layout, 0u, 2u, conversion_slots[1]->tables);
-      const uint32_t constants[] = {target_width, target_height, 0u};
-      cmd_list->push_constants(stage, color_conversion.layout, 2u, 0u, 3u, constants);
+      const uint32_t constants[] = {target_width, target_height, 0u,
+                                    fg_ui_alpha_enabled.load(std::memory_order_acquire) && !game_upscale_mode ? 1u : 0u};
+      cmd_list->push_constants(stage, color_conversion.layout, 2u, 0u, 4u, constants);
       cmd_list->dispatch((target_width + 7u) / 8u, (target_height + 7u) / 8u, 1u);
       cmd_list->barrier(conversion_slots[1]->texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::copy_source);
       cmd_list->barrier(output_resource, reshade::api::resource_usage::shader_resource_non_pixel, reshade::api::resource_usage::copy_dest);
@@ -3014,8 +3215,9 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
               {nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent},
               {nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent},
               {nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent},
+              {nullptr, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent},
           };
-          (void)streamline.set_tag(*token, sl::ViewportHandle(0u), clear_tags, 3u, nullptr);
+          (void)streamline.set_tag(*token, sl::ViewportHandle(0u), clear_tags, FgUsesUiAlpha() ? 4u : 3u, nullptr);
           fg_present_unpaired.fetch_add(1u, std::memory_order_relaxed);
         }
       } else {
@@ -3028,8 +3230,9 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
               {nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent},
               {nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent},
               {nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent},
+              {nullptr, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent},
           };
-          (void)streamline.set_tag(*token, sl::ViewportHandle(0u), clear_tags, 3u, nullptr);
+          (void)streamline.set_tag(*token, sl::ViewportHandle(0u), clear_tags, FgUsesUiAlpha() ? 4u : 3u, nullptr);
         }
       }
     }
@@ -3103,6 +3306,8 @@ inline void OnResetCommandList(reshade::api::command_list* cmd_list) {
   }
   if (auto* data = cmd_list->get_private_data<CommandListData>()) {
     data->in_render_pass = false;
+    data->ui_alpha_scene = {};
+    data->ui_alpha_scene_state = reshade::api::resource_usage::undefined;
     data->coverage_pass_dsv = {};
     data->dsv = {};
     data->dsv_draws = 0u;
@@ -3215,6 +3420,9 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
   const bool copied = CopyThroughTaaTarget(cmd_list, native, target, source, reshade::api::resource_usage::unordered_access);
 
   if (!copied) return false;
+  data->ui_alpha_scene = {reinterpret_cast<uint64_t>(target)};
+  data->ui_alpha_scene_state = reshade::api::resource_usage::render_target;
+  fg_last_scene_handoff_resource.store(reinterpret_cast<uint64_t>(target), std::memory_order_release);
   fg_last_scene_handoff_frame.store(frame_counter, std::memory_order_release);
   if (output_settings != nullptr && FgInputsEnabled() && fg_camera_capture_enabled.load(std::memory_order_acquire)
       && !fg_hudless_retire_requested.load(std::memory_order_acquire)
@@ -3403,6 +3611,147 @@ inline bool ReplaceSceneUpscale(reshade::api::command_list* cmd_list) {
   return true;
 }
 
+inline reshade::api::resource CaptureFgUiAlpha(reshade::api::command_list* cmd_list, const CommandListData& data,
+                                               const FgCameraEvaluation& evaluation) {
+  if (data.ui_alpha_scene.handle != evaluation.scene_output
+      || (static_cast<uint32_t>(data.ui_alpha_scene_state) & static_cast<uint32_t>(reshade::api::resource_usage::shader_resource_pixel)) == 0u
+      || fg_ui_alpha_pipeline_failed_frame.load(std::memory_order_acquire) == evaluation.frame) {
+    if (fg_debug_log_enabled.load(std::memory_order_acquire)) {
+      LogFgFailure(evaluation.frame, "UI alpha capture rejected: scene_match="
+                                         + std::to_string(data.ui_alpha_scene.handle == evaluation.scene_output)
+                                         + " scene_state=" + std::to_string(static_cast<uint32_t>(data.ui_alpha_scene_state))
+                                         + " pipeline_failed=" + std::to_string(fg_ui_alpha_pipeline_failed_frame.load(std::memory_order_acquire) == evaluation.frame));
+    }
+    return {};
+  }
+  SlotInput input;
+  if (!ResolveSlot(cmd_list, &data, 0u, input) || input.resource.handle != evaluation.scene_output) {
+    LogFgFailure(evaluation.frame, "UI alpha capture rejected: final scene resource mismatch");
+    return {};
+  }
+  auto* device = cmd_list->get_device();
+  std::unique_lock lock(ui_alpha_mask.mutex, std::try_to_lock);
+  if (!lock.owns_lock() || device == nullptr) {
+    LogFgFailure(evaluation.frame, "UI alpha capture rejected: device missing or mask lock busy");
+    return {};
+  }
+  if (ui_alpha_mask.device == nullptr) ui_alpha_mask.device = device;
+  if (ui_alpha_mask.device != device) {
+    LogFgFailure(evaluation.frame, "UI alpha capture rejected: device mismatch");
+    return {};
+  }
+  if (!ui_alpha_mask.pipeline_attempted) {
+    ui_alpha_mask.pipeline_attempted = true;
+    reshade::api::descriptor_range srv = {0, 0, 0, 1, reshade::api::shader_stage::all_compute, 1, reshade::api::descriptor_type::texture_shader_resource_view};
+    reshade::api::descriptor_range uav = {0, 0, 0, 1, reshade::api::shader_stage::all_compute, 1, reshade::api::descriptor_type::texture_unordered_access_view};
+    reshade::api::constant_range constants = {};
+    constants.count = 2u;
+    constants.visibility = reshade::api::shader_stage::all_compute;
+    reshade::api::pipeline_layout_param params[3] = {};
+    params[0].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    params[0].descriptor_table = {1u, &srv};
+    params[1].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    params[1].descriptor_table = {1u, &uav};
+    params[2].type = reshade::api::pipeline_layout_param_type::push_constants;
+    params[2].push_constants = constants;
+    if (device->create_pipeline_layout(3u, params, &ui_alpha_mask.layout)) {
+      reshade::api::shader_desc shader = {};
+      shader.code = __fg_ui_alpha_extract.data();
+      shader.code_size = __fg_ui_alpha_extract.size();
+      shader.entry_point = "main";
+      const reshade::api::pipeline_subobject subobject = {reshade::api::pipeline_subobject_type::compute_shader, 1u, &shader};
+      (void)device->create_pipeline(ui_alpha_mask.layout, 1u, &subobject, &ui_alpha_mask.pipeline);
+    }
+  }
+  if (ui_alpha_mask.pipeline.handle == 0u) {
+    LogFgFailure(evaluation.frame, "UI alpha capture rejected: extraction pipeline unavailable");
+    return {};
+  }
+  UiAlphaMaskSlot* slot = nullptr;
+  {
+    std::unique_lock retirement_lock(gpu_retirement.mutex);
+    uint64_t completed = UINT64_MAX;
+    if (gpu_retirement.fence != nullptr) {
+      try {
+        completed = gpu_retirement.fence->GetCompletedValue();
+      } catch (const std::exception&) {
+      }
+    }
+    for (auto& candidate : ui_alpha_mask.slots) {
+      if (candidate.ticket && !candidate.ticket->complete && completed != UINT64_MAX
+          && candidate.ticket->pending_lists.empty() && !candidate.ticket->conflicting_submission
+          && candidate.ticket->queue != nullptr && candidate.ticket->fence_value != renodx::utils::gpu_fence::NO_SIGNAL
+          && candidate.ticket->fence_value <= completed) candidate.ticket->complete = true;
+      if (!candidate.ticket || candidate.ticket->complete) {
+        slot = &candidate;
+        break;
+      }
+    }
+  }
+  if (slot == nullptr) {
+    LogFgFailure(evaluation.frame, "UI alpha capture rejected: all mask slots busy");
+    return {};
+  }
+  slot->ticket.reset();
+  if (slot->source_view.handle) {
+    device->destroy_resource_view(slot->source_view);
+    slot->source_view = {};
+  }
+  if ((slot->width != evaluation.output_width || slot->height != evaluation.output_height) && slot->texture.handle) {
+    if (slot->target_view.handle) device->destroy_resource_view(slot->target_view);
+    device->destroy_resource(slot->texture);
+    slot->texture = {};
+    slot->target_view = {};
+    slot->width = slot->height = 0u;
+  }
+  const reshade::api::resource_view_desc source_view(reshade::api::resource_view_type::texture_2d,
+                                                     reshade::api::format::r16g16b16a16_float, 0u, 1u, 0u, 1u);
+  const reshade::api::resource_view_desc target_view(reshade::api::resource_view_type::texture_2d,
+                                                     reshade::api::format::r8_unorm, 0u, 1u, 0u, 1u);
+  (void)device->create_resource_view(input.resource, reshade::api::resource_usage::shader_resource, source_view, &slot->source_view);
+  if (slot->texture.handle == 0u) {
+    reshade::api::resource_desc desc = {};
+    desc.type = reshade::api::resource_type::texture_2d;
+    desc.texture = {evaluation.output_width, evaluation.output_height, 1u, 1u, reshade::api::format::r8_unorm, 1u};
+    desc.heap = reshade::api::memory_heap::gpu_only;
+    desc.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+    if (device->create_resource(desc, nullptr, reshade::api::resource_usage::shader_resource, &slot->texture)) {
+      slot->width = evaluation.output_width;
+      slot->height = evaluation.output_height;
+    }
+  }
+  if (slot->texture.handle && slot->target_view.handle == 0u) {
+    (void)device->create_resource_view(slot->texture, reshade::api::resource_usage::unordered_access, target_view, &slot->target_view);
+  }
+  for (uint32_t i = 0u; i < 2u; ++i) {
+    if (slot->tables[i].handle == 0u) (void)device->allocate_descriptor_table(ui_alpha_mask.layout, i, &slot->tables[i]);
+  }
+  if (!slot->source_view.handle || !slot->target_view.handle || !slot->tables[0].handle || !slot->tables[1].handle) {
+    LogFgFailure(evaluation.frame, "UI alpha capture rejected: mask texture, view or descriptor unavailable");
+    return {};
+  }
+  const reshade::api::descriptor_table_update updates[] = {
+      {slot->tables[0], 0u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot->source_view},
+      {slot->tables[1], 0u, 0u, 1u, reshade::api::descriptor_type::texture_unordered_access_view, &slot->target_view},
+  };
+  device->update_descriptor_tables(2u, updates);
+  const auto read_state = reshade::api::resource_usage::shader_resource_non_pixel;
+  const auto source_state = data.ui_alpha_scene_state;
+  const bool transition_source = (static_cast<uint32_t>(source_state) & static_cast<uint32_t>(read_state)) == 0u;
+  if (transition_source) cmd_list->barrier(input.resource, source_state, read_state);
+  cmd_list->barrier(slot->texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, ui_alpha_mask.pipeline);
+  cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, ui_alpha_mask.layout, 0u, 2u, slot->tables);
+  const uint32_t constants[] = {evaluation.output_width, evaluation.output_height};
+  cmd_list->push_constants(reshade::api::shader_stage::all_compute, ui_alpha_mask.layout, 2u, 0u, 2u, constants);
+  cmd_list->dispatch((evaluation.output_width + 7u) / 8u, (evaluation.output_height + 7u) / 8u, 1u);
+  cmd_list->barrier(slot->texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  if (transition_source) cmd_list->barrier(input.resource, read_state, source_state);
+  RestoreGameDescriptorState(cmd_list);
+  slot->ticket = RetireGpuCommands(cmd_list);
+  return slot->texture;
+}
+
 inline void TagFgHudless(reshade::api::command_list* cmd_list, uint32_t output_hash) {
   if (cmd_list == nullptr || !FgInputsEnabled() || !fg_camera_capture_enabled.load(std::memory_order_acquire)) return;
   const auto* data = cmd_list->get_private_data<CommandListData>();
@@ -3473,16 +3822,74 @@ inline void TagFgHudless(reshade::api::command_list* cmd_list, uint32_t output_h
     LogFgFailure(frame, "HUD-less tag rejected: conversion texture missing or wrong size");
     return;
   }
+  const bool zero_ui_alpha = fg_zero_ui_alpha_enabled.load(std::memory_order_acquire);
+  const bool real_ui_alpha = fg_ui_alpha_enabled.load(std::memory_order_acquire);
+  reshade::api::resource alpha_texture = {};
+  renodx::utils::state::PipelineBind output_bind = {};
+  reshade::api::pipeline output_pipeline = {};
+  if (real_ui_alpha) {
+    output_pipeline = renodx::utils::state::GetBoundShaderPipeline(cmd_list, reshade::api::pipeline_stage::pixel_shader, nullptr, &output_bind);
+    if (output_pipeline.handle == 0u
+        || !renodx::utils::shader::WithReplacementPipeline(output_pipeline, [&](reshade::api::pipeline replacement, reshade::api::pipeline_stage stages) {
+             if (replacement.handle != 0u && renodx::utils::bitwise::HasFlag(stages, reshade::api::pipeline_stage::pixel_shader)) {
+               output_pipeline = replacement;
+             }
+           })) {
+      LogFgFailure(frame, "UI alpha capture rejected: output pipeline unavailable");
+      return;
+    }
+    alpha_texture = CaptureFgUiAlpha(cmd_list, *data, evaluation);
+    if (alpha_texture.handle == 0u) {
+      LogFgFailure(frame, "UI alpha extraction failed");
+      return;
+    }
+    // A compute PSO replaces the active D3D12 graphics PSO. Restore the
+    // output draw even if the Streamline tag is subsequently skipped.
+    cmd_list->bind_pipeline(output_bind.stages, output_pipeline);
+    RestoreGameDescriptorState(cmd_list);
+  } else if (zero_ui_alpha) {
+    auto* device = cmd_list->get_device();
+    std::lock_guard alpha_lock(fg_zero_ui_alpha_mutex);
+    for (const auto& alpha : fg_zero_ui_alpha_textures) {
+      if (alpha.device == device && alpha.width == slot.width && alpha.height == slot.height) {
+        alpha_texture = alpha.texture;
+        break;
+      }
+    }
+    if (alpha_texture.handle == 0u) {
+      std::vector<uint8_t> zeroes(static_cast<size_t>(slot.width) * slot.height, 0u);
+      const reshade::api::subresource_data initial = {zeroes.data(), slot.width, slot.width * slot.height};
+      reshade::api::resource_desc desc = {};
+      desc.type = reshade::api::resource_type::texture_2d;
+      desc.texture = {slot.width, slot.height, 1u, 1u, reshade::api::format::r8_unorm, 1u};
+      desc.heap = reshade::api::memory_heap::gpu_only;
+      desc.usage = reshade::api::resource_usage::shader_resource;
+      if (device->create_resource(desc, &initial, reshade::api::resource_usage::shader_resource, &alpha_texture)) {
+        fg_zero_ui_alpha_textures.push_back({device, alpha_texture, slot.width, slot.height});
+      } else {
+        LogFgFailure(frame, "zero UI alpha texture creation failed");
+        return;
+      }
+    }
+  }
   std::lock_guard frame_lock(farcry6_dlss::streamline::frame_api_mutex);
   if (!farcry6_dlss::streamline::factory_hook_active.load(std::memory_order_acquire)
       || fg_swapchain_transition.load(std::memory_order_acquire)) return;
-  sl::Resource resource(sl::ResourceType::eTex2d, reinterpret_cast<void*>(slot.texture.handle),
-                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  sl::Resource hudless_resource(sl::ResourceType::eTex2d, reinterpret_cast<void*>(slot.texture.handle),
+                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  sl::Resource alpha_resource(sl::ResourceType::eTex2d, reinterpret_cast<void*>(alpha_texture.handle),
+                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   const sl::Extent extent{0u, 0u, slot.width, slot.height};
-  const sl::ResourceTag tag(&resource, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eOnlyValidNow, &extent);
+  const sl::ResourceTag tags[] = {
+      {zero_ui_alpha && !real_ui_alpha ? &alpha_resource : &hudless_resource,
+       zero_ui_alpha && !real_ui_alpha ? sl::kBufferTypeUIAlpha : sl::kBufferTypeHUDLessColor,
+       zero_ui_alpha && !real_ui_alpha ? sl::ResourceLifecycle::eValidUntilPresent : sl::ResourceLifecycle::eOnlyValidNow, &extent},
+      {&alpha_resource, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eOnlyValidNow, &extent},
+  };
   const auto result = farcry6_dlss::streamline::runtime.set_tag(
-      *evaluation.token, sl::ViewportHandle(0u), &tag, 1u,
+      *evaluation.token, sl::ViewportHandle(0u), tags, real_ui_alpha ? 2u : 1u,
       reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
+  if (real_ui_alpha) cmd_list->bind_pipeline(output_bind.stages, output_pipeline);
   RestoreGameDescriptorState(cmd_list);
   fg_input_last_result.store(static_cast<int>(result), std::memory_order_relaxed);
   if (result == sl::Result::eOk) {
@@ -3781,6 +4188,7 @@ inline void OnPresent(
           {nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent},
           {nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent},
           {nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent},
+          {nullptr, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent},
       };
       if (fg_mode_present_outstanding && fg_mode_swapchain == swapchain) {
         fg_mode.PresentCompleted(false);
@@ -3794,7 +4202,7 @@ inline void OnPresent(
       if (fg_pending_present.token != nullptr) {
         fg_mode.PresentCompleted(false);
         if (!fg_mode.ReadyForDisplayChange()) fg_mode_status.store(4, std::memory_order_relaxed);
-        (void)runtime.set_tag(*fg_pending_present.token, viewport, clear_tags, 3u, nullptr);
+        (void)runtime.set_tag(*fg_pending_present.token, viewport, clear_tags, FgUsesUiAlpha() ? 4u : 3u, nullptr);
         fg_pending_present = {};
         fg_has_pending_present.store(false, std::memory_order_release);
         fg_present_unpaired.fetch_add(1u, std::memory_order_relaxed);
@@ -3814,12 +4222,12 @@ inline void OnPresent(
             fg_has_pending_present.store(true, std::memory_order_release);
             fg_present_started.fetch_add(1u, std::memory_order_relaxed);
           } else {
-            (void)runtime.set_tag(*present_input.token, viewport, clear_tags, 3u, nullptr);
+            (void)runtime.set_tag(*present_input.token, viewport, clear_tags, FgUsesUiAlpha() ? 4u : 3u, nullptr);
             fg_input_failed.fetch_add(1u, std::memory_order_relaxed);
             fg_complete_input_streak.store(0u, std::memory_order_relaxed);
           }
         } else {
-          (void)runtime.set_tag(*present_input.token, viewport, clear_tags, 3u, nullptr);
+          (void)runtime.set_tag(*present_input.token, viewport, clear_tags, FgUsesUiAlpha() ? 4u : 3u, nullptr);
           fg_present_unpaired.fetch_add(1u, std::memory_order_relaxed);
           fg_complete_input_streak.store(0u, std::memory_order_relaxed);
         }
@@ -4007,9 +4415,10 @@ inline void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::sw
       {nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent},
       {nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent},
       {nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent},
+      {nullptr, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent},
   };
   const auto clear_result = farcry6_dlss::streamline::runtime.set_tag(
-      *fg_pending_present.token, sl::ViewportHandle(0u), clear_tags, 3u, nullptr);
+      *fg_pending_present.token, sl::ViewportHandle(0u), clear_tags, FgUsesUiAlpha() ? 4u : 3u, nullptr);
   const bool complete_inputs = fg_pending_present.hudless_tagged && state_healthy
                             && result == sl::Result::eOk && clear_result == sl::Result::eOk
                             && FgInputsEnabled() && fg_camera_capture_enabled.load(std::memory_order_acquire)
@@ -4151,7 +4560,42 @@ inline void OnDestroyDevice(reshade::api::device* device) {
   }
 
   if (was_ours) {
+    std::vector<reshade::api::pipeline> ui_pipelines_to_destroy;
+    std::vector<UiAlphaPipelineSource> ui_sources_to_destroy;
+    {
+      std::lock_guard lock(ui_alpha_pipeline_mutex);
+      for (auto it = ui_alpha_pipelines.begin(); it != ui_alpha_pipelines.end();) {
+        if (it->device == device) {
+          ui_pipelines_to_destroy.push_back(it->replacement);
+          it = ui_alpha_pipelines.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      for (auto it = ui_alpha_pipeline_sources.begin(); it != ui_alpha_pipeline_sources.end();) {
+        if (it->device == device) {
+          ui_sources_to_destroy.push_back(*it);
+          it = ui_alpha_pipeline_sources.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    for (const auto pipeline : ui_pipelines_to_destroy) device->destroy_pipeline(pipeline);
+    for (const auto& source : ui_sources_to_destroy) renodx::utils::pipeline::DestroyPipelineSubobjects(source.subobjects, source.count);
+    {
+      std::lock_guard alpha_lock(fg_zero_ui_alpha_mutex);
+      for (auto it = fg_zero_ui_alpha_textures.begin(); it != fg_zero_ui_alpha_textures.end();) {
+        if (it->device == device) {
+          device->destroy_resource(it->texture);
+          it = fg_zero_ui_alpha_textures.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
     ReleaseFgHudless(device);
+    ReleaseUiAlphaMask(device);
     {
       std::unique_lock lock(rcas.mutex);
       if (rcas.device == device) {
@@ -4195,6 +4639,7 @@ inline void Use(DWORD fdw_reason, const ShaderInjectData* settings) {
       if (attached) return;
       attached = true;
       output_settings = settings;
+      renodx::utils::pipeline::RegisterOnInitCallback(OnInitUiAlphaPipeline);
       reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
@@ -4224,6 +4669,7 @@ inline void Use(DWORD fdw_reason, const ShaderInjectData* settings) {
 
       if (!attached) return;
       attached = false;
+      renodx::utils::pipeline::UnregisterOnInitCallback(OnInitUiAlphaPipeline);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::finish_present>(OnFinishPresent);
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnFgDestroySwapchain);

@@ -42,6 +42,8 @@ void SyncFrameGenerationSetting() {
   farcry6_dlss::dlss::fg_requested_generated.store(requested, std::memory_order_release);
   farcry6_dlss::dlss::fg_enable_requested.store(requested != 0u, std::memory_order_release);
   farcry6_dlss::dlss::fg_debug_log_enabled.store(farcry6_dlss::dlss::fg_debug_log_setting != 0.f, std::memory_order_release);
+  farcry6_dlss::dlss::fg_zero_ui_alpha_enabled.store(farcry6_dlss::dlss::fg_zero_ui_alpha_setting != 0.f, std::memory_order_release);
+  farcry6_dlss::dlss::fg_ui_alpha_enabled.store(farcry6_dlss::dlss::fg_ui_alpha_setting != 0.f, std::memory_order_release);
 }
 
 renodx::utils::settings::Settings settings = {
@@ -195,6 +197,30 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
     new renodx::utils::settings::Setting{
+        .key = "FrameGenerationUIAlpha",
+        .binding = &farcry6_dlss::dlss::fg_ui_alpha_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Frame Generation UI Alpha (Test)",
+        .section = "DLSS",
+        .tooltip = "Accumulate UI coverage for frame generation. Takes precedence over the zero-alpha test. Turn Frame Generation off before changing.",
+        .is_enabled = []() { return !farcry6_dlss::dlss::FgInputsEnabled(); },
+        .on_change_value = [](float, float value) { farcry6_dlss::dlss::fg_ui_alpha_enabled.store(value != 0.f, std::memory_order_release); },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "FrameGenerationZeroUIAlpha",
+        .binding = &farcry6_dlss::dlss::fg_zero_ui_alpha_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Frame Generation Zero UI Alpha (Test)",
+        .section = "DLSS",
+        .tooltip = "Test a zero UI alpha mask instead of HUD-less color. HUD elements may ghost. Turn Frame Generation off before changing.",
+        .is_enabled = []() { return !farcry6_dlss::dlss::FgInputsEnabled(); },
+        .on_change_value = [](float, float value) { farcry6_dlss::dlss::fg_zero_ui_alpha_enabled.store(value != 0.f, std::memory_order_release); },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
         .key = "FrameGenerationDebugLog",
         .binding = &farcry6_dlss::dlss::fg_debug_log_setting,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -344,6 +370,14 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       renodx::mods::shader::expected_constant_buffer_index = 13;
       renodx::mods::shader::expected_constant_buffer_space = 50;
 
+      for (const uint32_t hash : {0x3ED32776u, 0x7C01563Du, 0xDC4619B1u}) {
+        const auto it = custom_shaders.find(hash);
+        if (it == custom_shaders.end()) continue;
+        it->second.get_replacement_pipeline = [hash](reshade::api::command_list* cmd_list) {
+          return farcry6_dlss::dlss::GetUiAlphaPipeline(cmd_list, hash, custom_shaders.at(hash).code);
+        };
+      }
+
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       break;
     case DLL_PROCESS_DETACH:
@@ -358,6 +392,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff, &SyncFrameGenerationSetting);
   if (fdw_reason == DLL_PROCESS_ATTACH) {
     farcry6_dlss::dlss::fg_debug_log_enabled.store(farcry6_dlss::dlss::fg_debug_log_setting != 0.f, std::memory_order_release);
+    farcry6_dlss::dlss::fg_zero_ui_alpha_enabled.store(farcry6_dlss::dlss::fg_zero_ui_alpha_setting != 0.f, std::memory_order_release);
+    farcry6_dlss::dlss::fg_ui_alpha_enabled.store(farcry6_dlss::dlss::fg_ui_alpha_setting != 0.f, std::memory_order_release);
   }
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
   if (fdw_reason == DLL_PROCESS_ATTACH) {

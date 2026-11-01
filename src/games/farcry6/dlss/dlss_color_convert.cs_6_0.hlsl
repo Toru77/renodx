@@ -5,6 +5,7 @@ RWTexture2D<float4> target : register(u0);
 cbuffer Parameters : register(b0) {
   uint2 extent;
   uint to_linear;
+  uint clear_alpha;
 };
 
 [numthreads(8, 8, 1)]
@@ -15,6 +16,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     color.rgb = renodx::color::bt2020::from::BT709(renodx::color::srgb::DecodeSafe(color.rgb));
   } else {
     color.rgb = renodx::color::srgb::EncodeSafe(renodx::color::bt709::from::BT2020(color.rgb));
+    if (clear_alpha != 0u) color.a = 0.f;
   }
   target[id.xy] = color;
 }
