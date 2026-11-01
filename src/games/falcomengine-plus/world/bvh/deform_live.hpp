@@ -47,6 +47,7 @@
 #include <include/reshade.hpp>
 
 #include "../../../../utils/log.hpp"
+#include "../debug/pool_log_gate.hpp"
 #include "../debug/pool_stage.hpp"
 #include "../world_state.hpp"
 #include "bvh_build.hpp"
@@ -1290,7 +1291,7 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
     state.arena_used = 0u;
     state.capture_frame = frame + 1u;
   }
-  for (const std::string& line : identity_lines) renodx::utils::log::i(line);
+  for (const std::string& line : identity_lines) pool_log::i(line);
   for (const TopologyCopy& copy : copies) cmd_list->copy_buffer_region(arena, copy.source_offset, staging, copy.dest_offset, copy.size);
   // 2b. BLAS store compaction. Graphics calls, so not under the lock; the
   // arenas are only touched on the present thread.
@@ -1359,7 +1360,7 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
             " B, leaves ", leaf_total, " x ", leaves.stride, " B, refit ", refit_total, " x ", refit.stride, " B)");
       }
     }
-    if (!compact_line.empty()) renodx::utils::log::i(compact_line);
+    if (!compact_line.empty()) pool_log::i(compact_line);
     // The old arenas after a compaction; the partly created new ones after a failure.
     DestroyDynamicArena(device, &nodes);
     DestroyDynamicArena(device, &leaves);

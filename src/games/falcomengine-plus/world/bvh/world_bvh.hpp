@@ -21,6 +21,7 @@
 
 #include "../contract/shader_registry.hpp"
 #include "../debug/crash_log.hpp"
+#include "../rr/rr_guides.hpp"
 #include "bvh_debug.hpp"
 #include "bvh_pool.hpp"
 #include "cache_diag.hpp"
@@ -37,6 +38,7 @@ inline void OnDestroyDeviceBvh(reshade::api::device* device) {
   rtgi::DestroyRtgiDeviceData(device);
   rtls::DestroyRtlsDeviceData(device);
   rtsun::DestroyRtSunDeviceData(device);
+  rr::DestroyRrDeviceData(device);
   DestroyBvhDeviceData(device);
 }
 

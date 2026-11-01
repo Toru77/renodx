@@ -24,6 +24,7 @@
 #include "debug/crash_log.hpp"
 #include "world_settings.hpp"
 #include "bvh/world_bvh.hpp"
+#include "rr/rr_ngx.hpp"
 
 #include "../../../utils/command_action.hpp"
 #include "../../../utils/constants.hpp"
@@ -101,6 +102,7 @@ inline void Use(DWORD fdw_reason, bool supported) {
       if ((hook_off & 64u) == 0u) {
         reshade::register_event<reshade::addon_event::present>(OnCrashLogPresent);
       }
+      rr::Use(fdw_reason);
       break;
     }
     case DLL_PROCESS_DETACH: {
@@ -151,6 +153,7 @@ inline void Use(DWORD fdw_reason, bool supported) {
       if ((hook_off & 1u) == 0u) {
         renodx::utils::scene::Use(fdw_reason);
       }
+      rr::Use(fdw_reason);
       break;
     }
     default:

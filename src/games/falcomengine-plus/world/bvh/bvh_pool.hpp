@@ -85,6 +85,7 @@
 #include <vector>
 
 #include "../../../../utils/log.hpp"
+#include "../debug/pool_log_gate.hpp"
 #include "../../../../utils/path.hpp"
 #include "../../../../utils/scene.hpp"
 #include "../capture/buffer_readback.hpp"
@@ -3328,7 +3329,7 @@ inline PoolDrawGate GatePoolDraw(const DrawRecord& draw, bool check_index_count)
 // Caller holds g_pool.mutex. Logs a PixelUnknown pipeline pair once per session.
 inline void NotePoolPixelUnknown(const DrawRecord& draw, const char* reason) {
   if (!g_pool.pixel_unknown_logged.insert({draw.vs_pipeline, draw.ps_pipeline}).second) return;
-  renodx::utils::log::i("[world-bvh] pixel_unknown: vs=", PoolHashText(draw.vs_hash), " ps=", PoolHashText(draw.ps_hash),
+  pool_log::i("[world-bvh] pixel_unknown: vs=", PoolHashText(draw.vs_hash), " ps=", PoolHashText(draw.ps_hash),
                         " reason=", reason);
 }
 
@@ -4088,7 +4089,7 @@ inline uint64_t CapturePoolAlphaSource(
     }
     if (!g_pool.alpha_capture_logged) {
       g_pool.alpha_capture_logged = true;
-      renodx::utils::log::i("[world-bvh] alpha stage: first source capture since alpha foliage was switched on (draw key ",
+      pool_log::i("[world-bvh] alpha stage: first source capture since alpha foliage was switched on (draw key ",
                             mesh_key, ")");
     }
   }
@@ -4120,7 +4121,7 @@ inline uint64_t CapturePoolAlphaSource(
       first = g_pool.alpha_format_logged.insert(texture.handle).second;
     }
     if (first) {
-      renodx::utils::log::w("[world-bvh] alpha source: bound view format unknown or typeless (texture ", texture.handle,
+      pool_log::w("[world-bvh] alpha source: bound view format unknown or typeless (texture ", texture.handle,
                             "), draw key not copied");
     }
     return 0u;
@@ -5298,7 +5299,7 @@ inline const char* DecodePoolMeshVertices(
 inline void LogPoolSwitches() {
   if (!g_pool.log_captures.load(std::memory_order_relaxed)) return;
   const auto on = [](const std::atomic_bool& value) { return value.load(std::memory_order_relaxed) ? "on" : "off"; };
-  renodx::utils::log::i("falcom_world::pool: frame ", g_state.frame.load(), " switches: pool scan ", on(g_pool.scan_active),
+  pool_log::i("falcom_world::pool: frame ", g_state.frame.load(), " switches: pool scan ", on(g_pool.scan_active),
                         ", capture meshes ", on(g_pool.capture_meshes), ", scan indirect draws ", on(g_pool.scan_indirect),
                         ", verify mesh captures ", on(g_pool.verify_meshes), ", legacy scale limits ",
                         on(g_pool.legacy_scale), ", keep moving objects out ", on(g_pool.exclude_moving),
@@ -6167,8 +6168,8 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       }
     }
   }
-  for (const std::string& line : log_lines) renodx::utils::log::i(line);
-  for (const std::string& line : warning_lines) renodx::utils::log::w(line);
+  for (const std::string& line : log_lines) pool_log::i(line);
+  for (const std::string& line : warning_lines) pool_log::w(line);
 }
 
 // Caller holds g_pool.mutex.
@@ -6452,11 +6453,11 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
       }
     }
   }
-  if (!summary.empty()) renodx::utils::log::i(summary);
-  for (const std::string& line : failure_lines) renodx::utils::log::w(line);
+  if (!summary.empty()) pool_log::i(summary);
+  for (const std::string& line : failure_lines) pool_log::w(line);
   if (trace_done) WritePoolPrevTrace(trace_out);
   if (released != 0u && g_pool.log_captures.load(std::memory_order_relaxed)) {
-    renodx::utils::log::i("falcom_world::pool: frame ", frame, ": ", released,
+    pool_log::i("falcom_world::pool: frame ", frame, ": ", released,
                           " tracked vertex/index buffers released, ", mesh_waiting, " meshes waiting");
   }
 }
@@ -7542,7 +7543,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
     diag_conflict_scroll += (entry.state.conflict_fields & kPoolAlphaDiffScroll) != 0u ? 1u : 0u;
     diag_conflict_any += entry.state.conflict ? 1u : 0u;
   }
-  renodx::utils::log::i("[world-bvh] alpha diag: keys=", alpha_keys.size(), " ok=", diag_ok, " no_texcoord=", diag_no_texcoord,
+  pool_log::i("[world-bvh] alpha diag: keys=", alpha_keys.size(), " ok=", diag_ok, " no_texcoord=", diag_no_texcoord,
                         " other_slot=", diag_other_slot, " conflict_view=", diag_conflict_view,
                         " conflict_threshold=", diag_conflict_threshold, " conflict_swizzle=", diag_conflict_swizzle,
                         " conflict_scroll=", diag_conflict_scroll, " conflict_any=", diag_conflict_any);

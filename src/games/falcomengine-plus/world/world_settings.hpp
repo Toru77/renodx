@@ -12,8 +12,11 @@
 
 #include <Windows.h>
 
+#include <deps/imgui/imgui.h>
+
 #include "world_state.hpp"
 #include "bvh/world_bvh.hpp"
+#include "rr/rr_state.hpp"
 #include "rtao/rtao.hpp"
 #include "rtao/rtao_panel.hpp"
 #include "rtgi/rtgi.hpp"
@@ -273,6 +276,101 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "Ray Tracing",
       .on_draw = []() { return bvh::DrawRayTracingRows(); },
       .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RrEnable",
+      .binding = &rr::g_rr_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "DLSS Ray Reconstruction",
+      .section = "Ray Tracing",
+      .tooltip = "Replaces the game's DLSS Super Resolution with DLSS Ray Reconstruction (preset F) as the denoiser of the ray-traced effects. Needs an NVIDIA RTX GPU and DLSS selected in the game's graphics options; on other GPUs it stays off. The RT, GTVBAO and GTVBGI denoisers stay on in this build.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return rr::g_rr_gpu_nvidia.load() == 1; },
+      .is_visible = [visible]() { return rr::g_rr_perf_rows > 0.5f && visible(); },  // TEMP perf test (remove)
+  });
+  settings->push_back(new Setting{
+      .key = "RrPreset",
+      .binding = &rr::g_rr_preset_index,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 0.f,
+      .label = "RR preset",
+      .section = "Ray Tracing",
+      .labels = {"Default", "D", "E", "F"},
+      .is_enabled = []() { return rr::g_rr_gpu_nvidia.load() == 1; },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RrDebugLog",
+      .binding = &rr::g_rr_debug_log,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Ray Reconstruction debug logging",
+      .section = "Ray Tracing",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return rr::g_rr_gpu_nvidia.load() == 1; },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RrProbeEnable",
+      .binding = &rr::g_rr_probe_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Ray Reconstruction create probe",
+      .section = "Ray Tracing",
+      .tooltip = "Diagnostic. Creates and releases one DLSS Ray Reconstruction feature per session, at the first DLSS evaluate, to test whether it can be created. Leave Off unless asked to test it.",
+      .labels = {"Off", "On"},
+      .is_visible = [visible]() { return rr::g_rr_perf_rows > 0.5f && visible(); },  // TEMP perf test (remove)
+  });
+  settings->push_back(new Setting{  // TEMP perf test (remove)
+      .key = "RrPerfPresent",
+      .binding = &rr::g_rr_perf_present,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "[perf test] RR present handler",
+      .section = "Ray Tracing",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{  // TEMP perf test (remove)
+      .key = "RrPerfGuides",
+      .binding = &rr::g_rr_perf_guides,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "[perf test] RR guide pass and snapshot",
+      .section = "Ray Tracing",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{  // TEMP perf test (remove)
+      .key = "RrPerfRows",
+      .binding = &rr::g_rr_perf_rows,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "[perf test] RR settings rows",
+      .section = "Ray Tracing",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "WorldRrStatus",
+      .value_type = SettingValueType::CUSTOM,
+      .can_reset = false,
+      .label = "Ray Reconstruction status",
+      .section = "Ray Tracing",
+      .on_draw = []() {
+        if (rr::g_rr_gpu_nvidia.load() == 0) {
+          ImGui::TextDisabled("Ray Reconstruction needs an NVIDIA RTX GPU.");
+        } else {
+          ImGui::Text("Ray Reconstruction: %s", rr::RrReasonName(rr::g_rr_reason.load()));
+          ImGui::Text("Ray Reconstruction guides: %s", rr::GuideReasonName(rr::g_rr_guide_reason.load()));
+          if (rr::g_rr_failed.load()) {
+            ImGui::Text("NGX result 0x%08X, exception 0x%08X", rr::g_rr_failed_result.load(), rr::g_rr_failed_exception.load());
+          }
+        }
+        return false;
+      },
+      .is_visible = []() { return rr::g_rr_perf_rows > 0.5f && g_state.supported && (rr::RrRequested() || rr::g_rr_gpu_nvidia.load() == 0); },  // TEMP perf test (remove)
   });
   // Ray Tracing tab row values ("What enters the BVH"). Hidden from the UI (drawn
   // inline by DrawRayTracingRows) but persisted so they survive a restart.

@@ -40,6 +40,7 @@
 #include "./fast_noise_ea.h"  // baked-in fast_noise_ea.dds (embed_file.exe output)
 #include "./world/world.hpp"  // Phase 0 world-space research module (DevKit-only)
 #include "./world/rtao/rtao.hpp"  // RTAO round 1 (inline lighting-hook dispatch)
+#include "./world/rr/rr_state.hpp"
 
 namespace {
 
@@ -3435,7 +3436,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOQuality", .binding = &shader_injection.gtvbao_quality_level,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Quality Level", .section = "GTVBAO",
+      .default_value = 2.f, .label = "Quality Level", .section = "GTVBAO",
       .tooltip = "Slices x steps per side. Low 2x4, Medium 3x4, High 3x6, Ultra 4x10.",
       .labels = {"Low", "Medium", "High", "Ultra"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
@@ -3475,7 +3476,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOFinalPower", .binding = &shader_injection.gtvbao_final_power,
-      .default_value = 1.f, .label = "Final Power", .section = "GTVBAO",
+      .default_value = 0.8f, .label = "Final Power", .section = "GTVBAO",
       .min = 0.5f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3751,7 +3752,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIResolution", .binding = &g_vbgi_resolution,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "GTVBGI Resolution", .section = "GTVBGI",
+      .default_value = 2.f, .label = "GTVBGI Resolution", .section = "GTVBGI",
       .tooltip = "Full = native. Half = half size per axis (a quarter of the pixels). Quarter = a quarter size per axis (one per 4 x 4 block); fastest, softest. Default Half.",
       .labels = {"Full", "Half", "Quarter"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
@@ -3785,7 +3786,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIRadius", .binding = &g_vbgi_radius,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.5f, .label = "Radius", .section = "GTVBGI",
+      .default_value = 0.5f, .label = "Radius", .section = "GTVBGI",
       .tooltip = "World-space radius of the visibility search.",
       .min = 0.1f, .max = 10.0f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
@@ -3836,7 +3837,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGILights", .binding = &g_vbgi_lights,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Light Contribution", .section = "GTVBGI",
+      .default_value = 2.0f, .label = "Light Contribution", .section = "GTVBGI",
       .min = 0.0f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
@@ -5447,6 +5448,10 @@ renodx::utils::settings::Settings settings = {
 static void OnInitDevice(reshade::api::device* device) {
   reshade::log::message(reshade::log::level::info, "[sora-vanillaplus] Device init � addon loaded.");
   auto* d = renodx::utils::data::Create<DeviceData>(device);
+  // DLSS Ray Reconstruction needs an NVIDIA GPU: the adapter this device runs on decides (rr::RrRequested).
+  uint32_t vendor_id = 0u;
+  const bool vendor_known = device->get_property(reshade::api::device_properties::vendor_id, &vendor_id);
+  falcom_world::rr::g_rr_gpu_nvidia.store((vendor_known && vendor_id == 0x10DEu) ? 1 : 0);
 
   // 1�1 white fallback texture so t22 is never bound to null.
   uint32_t white = 0xFFFFFFFF;
@@ -5620,6 +5625,7 @@ static void OnPushDescriptorsCapture(
   const bool wantMotionBlurPush = shader_injection.mb_mode > 0.5f;
   if (shader_injection.gtvbao_mode < 0.5f
       && !falcom_world::rtao::RtaoRequested()
+      && !falcom_world::rr::RrRequested()
       && !VbgiRunning()
       && shader_injection.dynCube_enabled < 0.5f
       && !wantTAAMotionPush
@@ -9756,6 +9762,42 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   push_gi();
 }
 
+// DLSS Ray Reconstruction guides (M1): the compute pass at the lighting hook. Runs on the first lighting draw of the frame.
+static void RunRrGuidesInline(reshade::api::command_list* cmd_list) {
+  if (falcom_world::rr::g_rr_perf_guides < 0.5f) return;  // TEMP perf test (remove)
+  namespace rr = falcom_world::rr;
+  namespace rtgi = falcom_world::rtgi;
+  if (!rr::RrRequested() || !IsSora2nd()) return;
+  auto* dev = cmd_list->get_device();
+  auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
+  auto* world_cl = falcom_world::GetWorldCommandListData(cmd_list);
+  if (dd == nullptr || world_cl == nullptr || cmd_list != dd->immediate_cmd_list) return;
+  // One attempt per frame: the first lighting draw decides, even when its inputs are missing (M2a falls back to SR).
+  const uint32_t frame = falcom_world::g_state.frame.load();
+  if (rr::g_rr_guides_attempt_frame.exchange(frame) == frame) return;
+  const bool inputs_ready = dd->captured_color_srv.handle != 0u && dd->captured_color_live.load()
+      && dd->captured_color_frame == dd->frame_index
+      && dd->captured_depth_srv.handle != 0u && dd->captured_depth_live.load()
+      && dd->captured_mrt_normal_srv.handle != 0u && dd->captured_mrt_live.load()
+      && dd->captured_scene_cbv_valid
+      && world_cl->ps_srv_view[rtgi::kLightingMrt2Register].handle != 0u
+      && world_cl->ps_srv_view[rtgi::kLightingDeferredRegister].handle != 0u;
+  if (!inputs_ready) {
+    rr::SetGuideReason(rr::GuideReason::InputsMissing);
+    return;
+  }
+  rr::DispatchGuides(dev, cmd_list, {
+      .color_view = dd->captured_color_srv,
+      .mrt0_view = dd->captured_mrt_normal_srv,
+      .mrt2_view = world_cl->ps_srv_view[rtgi::kLightingMrt2Register],
+      .deferred_view = world_cl->ps_srv_view[rtgi::kLightingDeferredRegister],
+      .depth_view = dd->captured_depth_srv,
+      .scene_cbv_view = dd->captured_scene_cbv_view,
+      .width = dd->captured_depth_w,
+      .height = dd->captured_depth_h,
+  });
+}
+
 // RTGI: copies the lighting output after the draw; the next frame's RTGI trace reads it for on-screen hits.
 static void OnDrawnLightingShader(reshade::api::command_list* cmd_list) {
   auto* dev = cmd_list->get_device();
@@ -9815,7 +9857,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // RT dispatches null most compute slots and rebind their own. Snapshot the game's compute state
   // once here and restore it after RTGI: the engine's volumetric-fog compute reads those bindings.
   std::optional<renodx::utils::state::CommandListSnapshot> game_compute_state;
-  if (falcom_world::rtao::RtaoRequested() || falcom_world::rtls::RtlsRequested() || falcom_world::rtsun::RtSunRequested()) {
+  if (falcom_world::rtao::RtaoRequested() || falcom_world::rtls::RtlsRequested() || falcom_world::rtsun::RtSunRequested()
+      || (falcom_world::rr::RrRequested() && falcom_world::rr::g_rr_perf_guides > 0.5f  // TEMP perf test (remove)
+          && falcom_world::rr::g_rr_guides_attempt_frame.load() != falcom_world::g_state.frame.load())) {
     game_compute_state = renodx::utils::state::GetSnapshot(cmd_list);
   }
   // RTAO runs before the shadows so micro shadows read this frame's AO.
@@ -9829,6 +9873,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
   // RTGI after RTAO: it runs only on a frame where RTAO dispatched.
   RunRtgiInline(cmd_list);
+  // DLSS Ray Reconstruction guides: builds the RR guide buffers; the lighting output is not changed.
+  RunRrGuidesInline(cmd_list);
   if (game_compute_state) {
     game_compute_state->ApplyCompute(true);
   }
@@ -13359,7 +13405,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                   .depth_rejection = &g_gtvbao_depth_rejection,
                                   .depth_rejection_default = 0.2f,
                                   .normal_rejection = &g_gtvbao_normal_rejection,
-                                  .normal_rejection_default = 0.f,
+                                  .normal_rejection_default = 0.5f,
                                   .history_clamp = &g_gtvbao_history_clamp,
                                   .history_clamp_default = 0.3f});
     falcom_world::AddSpatialRows(&settings, IsAdvancedSettingsMode, {.prefix = "Gtvbao",
@@ -13368,7 +13414,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                  .enabled = &shader_injection.gtvbao_atrous_enabled,
                                  .enabled_default = 1.f,
                                  .filter_type = &g_gtvbao_filter_type,
-                                 .filter_type_default = 0.f,
+                                 .filter_type_default = 1.f,
                                  .filter_radius = &g_gtvbao_filter_radius,
                                  .filter_radius_default = 8.f,
                                  .filter_passes = &shader_injection.gtvbao_atrous_passes,
@@ -13380,7 +13426,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                  .enabled_key = "GTVBAOAtrousEnabled",
                                  .passes_key = "GTVBAOAtrousPasses",
                                  .filter_passes_lowres = &g_gtvbao_filter_passes_lowres,
-                                 .filter_passes_lowres_default = 4.f,
+                                 .filter_passes_lowres_default = 2.f,
                                  .passes_lowres_key = "GTVBAOAtrousPassesLowRes"});
     falcom_world::AddTemporalRows(&settings, []() { return VbgiRowVisible(); }, {.prefix = "Vbgi",
                                   .section = "GTVBGI Temporal Accumulation",
@@ -13388,13 +13434,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                   .enabled = &g_vbgi_temporal_enabled,
                                   .enabled_default = 1.f,
                                   .history_weight = &g_vbgi_history_weight,
-                                  .history_weight_default = 0.9f,
+                                  .history_weight_default = 0.99f,
                                   .depth_rejection = &g_vbgi_depth_rejection,
-                                  .depth_rejection_default = 0.05f,
+                                  .depth_rejection_default = 0.2f,
                                   .normal_rejection = &g_vbgi_normal_rejection,
-                                  .normal_rejection_default = 0.9f,
+                                  .normal_rejection_default = 0.5f,
                                   .history_clamp = &g_vbgi_history_clamp,
-                                  .history_clamp_default = 1.f});
+                                  .history_clamp_default = 0.3f});
     falcom_world::AddSpatialRows(&settings, []() { return VbgiRowVisible(); }, {.prefix = "Vbgi",
                                  .section = "GTVBGI Spatial Filter",
                                  .enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.",
@@ -13403,13 +13449,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                  .filter_type = &g_vbgi_filter_type,
                                  .filter_type_default = 1.f,
                                  .filter_radius = &g_vbgi_filter_radius,
-                                 .filter_radius_default = 2.f,
+                                 .filter_radius_default = 8.f,
                                  .filter_passes = &g_vbgi_filter_passes,
-                                 .filter_passes_default = 1.f,
+                                 .filter_passes_default = 3.f,
                                  .taps_separable = &g_vbgi_filter_taps_separable,
-                                 .taps_separable_default = 5.f,
+                                 .taps_separable_default = 8.f,
                                  .taps_atrous = &g_vbgi_filter_taps_atrous,
-                                 .taps_atrous_default = 5.f});
+                                 .taps_atrous_default = 8.f});
     falcom_world::AddSettings(&settings, IsSora2nd(), IsAdvancedSettingsMode);
   }
   falcom_world::Use(fdw_reason, IsSora2nd());

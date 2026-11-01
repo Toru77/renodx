@@ -66,6 +66,8 @@ inline std::atomic<uint32_t> fg_requested_generated{0u};
 inline std::atomic<uint32_t> fg_applied_generated{0u};
 inline uint32_t fg_pending_generated = 0u;
 inline std::atomic<bool> fg_swapchain_transition{false};
+inline std::atomic<bool> fg_swapchain_recovery{false};
+inline std::atomic<bool> fg_resume_after_transition{false};
 inline std::atomic<int> fg_mode_status{0};
 // Accessed under frame_api_mutex on the presenting thread.
 inline farcry6_dlss::frame_generation::ModeState fg_mode;
@@ -82,7 +84,7 @@ inline bool FgInputsEnabled() {
       || fg_mode_status.load(std::memory_order_acquire) != 0;
 }
 
-inline bool SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode mode, uint32_t generated_frames = 0u) {
+inline bool SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode mode, uint32_t generated_frames = 0u, bool retain = true) {
   auto* set_options = farcry6_dlss::streamline::fg_set_options;
   if (set_options == nullptr) return false;
   sl::DLSSGOptions options = {};
@@ -91,7 +93,7 @@ inline bool SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode mode, uint
     if (generated_frames == 0u) return false;
     options.numFramesToGenerate = generated_frames;
   }
-  const bool retain_resources = mode == farcry6_dlss::frame_generation::ModeState::Mode::off
+  const bool retain_resources = retain && mode == farcry6_dlss::frame_generation::ModeState::Mode::off
                              && fg_enable_requested.load(std::memory_order_acquire)
                              && FgInputsEnabled() && !fg_swapchain_transition.load(std::memory_order_acquire)
                              && farcry6_dlss::streamline::runtime.free_resources != nullptr;
@@ -3501,12 +3503,35 @@ inline void OnPresent(
     fg_input_recording_list.store(nullptr, std::memory_order_release);
   }
   if (present_input.token != nullptr || fg_has_pending_present.load(std::memory_order_acquire)
+      || fg_swapchain_recovery.load(std::memory_order_acquire)
       || fg_resources_retained.load(std::memory_order_acquire)
       || fg_mode_status.load(std::memory_order_relaxed) != 0) {
     std::lock_guard frame_lock(farcry6_dlss::streamline::frame_api_mutex);
     if (farcry6_dlss::streamline::factory_hook_active.load(std::memory_order_acquire)) {
       auto& runtime = farcry6_dlss::streamline::runtime;
       const sl::ViewportHandle viewport(0u);
+      const bool recovering = queue != nullptr && swapchain != nullptr && queue->get_device() != nullptr
+                           && reinterpret_cast<void*>(queue->get_device()->get_native())
+                               == farcry6_dlss::streamline::bootstrap_device.load(std::memory_order_acquire)
+                           && !fg_swapchain_transition.load(std::memory_order_acquire)
+                           && fg_swapchain_recovery.exchange(false, std::memory_order_acq_rel);
+      if (recovering) {
+        // The old swapchain may not have completed its last present. Require an
+        // off present on this swapchain before enabling with fresh inputs.
+        fg_mode.PresentCompleted(false);
+        fg_mode.applied = farcry6_dlss::frame_generation::ModeState::Mode::unknown;
+        fg_mode_swapchain = swapchain;
+        fg_mode_present_outstanding = false;
+        fg_pending_generated = 0u;
+        fg_pending_retain_resources = false;
+        fg_applied_generated.store(0u, std::memory_order_release);
+        fg_temporary_off_time_ms.store(0u, std::memory_order_release);
+        fg_mode_status.store(4, std::memory_order_relaxed);
+        if (fg_resume_after_transition.exchange(false, std::memory_order_acq_rel)
+            && fg_requested_generated.load(std::memory_order_acquire) != 0u) {
+          fg_enable_requested.store(true, std::memory_order_release);
+        }
+      }
       if (fg_resources_retained.load(std::memory_order_relaxed) && fg_mode.ReadyForDisplayChange()
           && (!fg_enable_requested.load(std::memory_order_acquire) || !FgInputsEnabled()
               || fg_swapchain_transition.load(std::memory_order_acquire))
@@ -3562,7 +3587,7 @@ inline void OnPresent(
           fg_complete_input_streak.store(0u, std::memory_order_relaxed);
         }
       }
-      const bool usable = fg_has_pending_present.load(std::memory_order_acquire) && fg_pending_present.hudless_tagged
+      const bool usable = !recovering && fg_has_pending_present.load(std::memory_order_acquire) && fg_pending_present.hudless_tagged
                        && FgInputsEnabled() && fg_enable_requested.load(std::memory_order_acquire)
                        && dlss_enabled != 0.f
                        && !fg_swapchain_transition.load(std::memory_order_acquire) && !PauseTaaRecentlySeen();
@@ -3591,7 +3616,7 @@ inline void OnPresent(
 
           }
         }
-        if (!SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode::off)) {
+        if (!SetFgMode(farcry6_dlss::frame_generation::ModeState::Mode::off, 0u, !recovering)) {
           fg_mode_status.store(4, std::memory_order_relaxed);
           fg_enable_requested.store(false, std::memory_order_release);
         }
@@ -3647,6 +3672,12 @@ inline void OnFgDestroySwapchain(reshade::api::swapchain* swapchain, bool) {
           != farcry6_dlss::streamline::bootstrap_device.load(std::memory_order_acquire)) return;
 
   fg_swapchain_transition.store(true, std::memory_order_release);
+  if (fg_enable_requested.load(std::memory_order_acquire) || fg_mode_status.load(std::memory_order_relaxed) != 0) {
+    if (fg_enable_requested.load(std::memory_order_acquire)) {
+      fg_resume_after_transition.store(true, std::memory_order_release);
+    }
+    fg_swapchain_recovery.store(true, std::memory_order_release);
+  }
   fg_hudless_retire_requested.store(true, std::memory_order_release);
   fg_camera_capture_enabled.store(false, std::memory_order_release);
   fg_complete_input_streak.store(0u, std::memory_order_relaxed);
@@ -3841,6 +3872,8 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     fg_complete_input_streak.store(0u, std::memory_order_relaxed);
     fg_completed_input_on_gpu.store(false, std::memory_order_release);
     fg_swapchain_transition.store(false, std::memory_order_release);
+    fg_swapchain_recovery.store(false, std::memory_order_release);
+    fg_resume_after_transition.store(false, std::memory_order_release);
     fg_output_color_space.store(reshade::api::color_space::unknown, std::memory_order_relaxed);
     fg_output_format.store(0u, std::memory_order_relaxed);
     fg_present_frame.store(UINT64_MAX, std::memory_order_release);
