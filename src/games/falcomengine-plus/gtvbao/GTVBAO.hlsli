@@ -307,7 +307,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
     lpfloat4 edgesLRTB  = GTVBAO_CalculateEdges( (lpfloat)viewspaceZ, (lpfloat)pixLZ, (lpfloat)pixRZ, (lpfloat)pixTZ, (lpfloat)pixBZ );
     // ── Foliage detection (toggle on) ──
-    // Foliage PS sets o1.w bit 15 (0x8000) to mark the pixel.
+    // Foliage PS sets bit 15 (0x8000) of the marker channel to mark the pixel: o1.w on Sora, o1.z on Kai.
     // When detected: normal AO is fully computed, then blended toward
     // fully bright (255) by (1 - foliage_ao_value) after GTVBAO_OutputWorkingTerm.
     //   foliage_ao_value = 1.0 → keep normal AO (blend factor 0)

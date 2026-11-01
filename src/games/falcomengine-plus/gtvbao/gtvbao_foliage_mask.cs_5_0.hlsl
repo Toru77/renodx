@@ -1,7 +1,7 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // GTVBAO foliage mask pre-pass — reads MRT normal, checks bit 15, writes a binary mask to u0.
-// The mask is consumed by the main pass (t4) per depth sample to prevent foliage from casting AO.
-// Sora only; Kai uses o1.w for normal data (bit 15 reserved by other fields).
+// The mask is consumed by the main pass (t3) per horizon sample to prevent foliage from casting AO.
+// The marker channel depends on GTVBAO_foliage_channel_mode: Sora .w, Kai .z (see GTVBAO_FoliageMarked).
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #define GT_VBAO_USE_HALF_FLOAT_PRECISION 0
