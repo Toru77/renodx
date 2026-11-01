@@ -51,4 +51,6 @@ For human discoverability, `.agents/skills/README.md` summarizes the skills and 
 - For C++ parameters, use pointers for modifiable/out values and `const&` for non-modified inputs that should not be copied; avoid non-const references except established callback/API signatures.
 - Validate changes with the smallest relevant build target or manual verification path.
 
-
+- Follow the repository `.clang-format` and `.clang-tidy` rules when writing or editing C++; do not leave new formatting or lint violations for later cleanup.
+- Before handing off changes for commit, run `clang-format` on changed C++ files and `clang-tidy` on their affected translation units using the active compilation database. Include changed headers in the lint scope, fix diagnostics introduced by the changes, and verify formatting with `clang-format --dry-run --Werror`.
+- Keep formatting and lint fixes scoped to the requested changes. Do not weaken checks or add suppressions merely to silence diagnostics; report unavailable tooling, analysis failures, or unresolved diagnostics instead of claiming the checks passed.
