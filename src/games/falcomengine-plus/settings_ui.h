@@ -536,12 +536,17 @@ static bool DrawSettingRow(Setting* setting) {
     case SettingValueType::INTEGER:
       if (!setting->labels.empty()) {
         std::string items;
-        for (const auto& label : setting->labels) {
-          items += label;
+        const int first = static_cast<int>(setting->min);  // labels below min are hidden (e.g. GTVBGI Full)
+        for (int i = first; i < static_cast<int>(setting->labels.size()); ++i) {
+          items += setting->labels[i];
           items.push_back('\0');
         }
         items.push_back('\0');
-        changed |= ImGui::Combo("##Value", &setting->value_as_int, items.c_str());
+        int selected = setting->value_as_int - first;
+        if (ImGui::Combo("##Value", &selected, items.c_str())) {
+          setting->value_as_int = selected + first;
+          changed = true;
+        }
       } else {
         changed |= ImGui::SliderInt(
             "##Value",
