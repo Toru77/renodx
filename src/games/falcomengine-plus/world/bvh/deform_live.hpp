@@ -324,6 +324,8 @@ struct DynamicTopologySlot {
   reshade::api::resource staging = {0u};
   uint64_t used = 0u;
   std::vector<DynamicTopologyRequest> requests;
+  uint64_t event = 0u;
+  bool waiting = false;
 };
 
 // The object list of the last present (for the trace and the inspect tool).
@@ -656,6 +658,7 @@ inline void DestroyDynamicResources(reshade::api::device* device, DeformLiveStat
   state.arena = {0u};
   for (DynamicTopologySlot& slot : state.topology) {
     if (slot.staging.handle != 0u) device->destroy_resource(slot.staging);
+    if (slot.event != 0u && g_deform.backend.destroy_query != nullptr) g_deform.backend.destroy_query(slot.event);
     slot = DynamicTopologySlot{};
   }
   DestroyDynamicArena(device, &state.nodes);
@@ -697,6 +700,7 @@ inline bool CreateDynamicResources(reshade::api::device* device, DeformLiveState
     ok = ok && device->create_resource(
                    reshade::api::resource_desc(kDynamicTopologySlotBytes, memory_heap::gpu_to_cpu, resource_usage::copy_dest),
                    nullptr, resource_usage::copy_dest, &slot.staging);
+    slot.event = g_deform.backend.create_event != nullptr ? g_deform.backend.create_event(device) : 0u;
   }
   DynamicArena objects;
   ok = ok && CreateDynamicBuffer(device, kDynamicMaxObjects, sizeof(DynamicObjectGPU), false, &objects);
@@ -907,9 +911,26 @@ inline void ResolveDynamicTopology(reshade::api::device* device, reshade::api::c
   std::vector<DynamicTopologyRequest> requests;
   reshade::api::resource staging = {0u};
   uint64_t used = 0u;
+  uint64_t event = 0u;
   {
     std::lock_guard<std::mutex> lock(g_deform_live.mutex);
     DynamicTopologySlot& slot = g_deform_live.topology[slot_index];
+    if (slot.requests.empty()) {
+      slot.used = 0u;
+      return;
+    }
+    event = slot.event;
+  }
+  if (event != 0u && g_deform.backend.poll_event != nullptr && cmd_list != nullptr
+      && g_deform.backend.poll_event(cmd_list, event) == 0) {
+    std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+    g_deform_live.topology[slot_index].waiting = true;  // requests kept; read 3 presents later
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+    DynamicTopologySlot& slot = g_deform_live.topology[slot_index];
+    slot.waiting = false;
     requests.swap(slot.requests);
     staging = slot.staging;
     used = slot.used;
@@ -1143,6 +1164,8 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
   uint64_t refit_total = 0u;
   reshade::api::resource arena = {0u};
   reshade::api::resource staging = {0u};
+  bool topology_waiting = false;
+  uint64_t topology_event = 0u;
   bool compact = false;
   std::vector<std::string> identity_lines;
   {
@@ -1151,6 +1174,8 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
     arena = state.arena;
     DynamicTopologySlot& slot = state.topology[state.topology_write];
     staging = slot.staging;
+    topology_waiting = slot.waiting;
+    topology_event = slot.event;
     const bool this_frame = state.capture_frame == frame;
     if (this_frame) {
       for (const DynamicCapture& capture : state.captures) {
@@ -1206,7 +1231,7 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
           continue;
         }
         identity.pending_frames += 1u;
-        if (identity.failed || identity.topology_pending) continue;
+        if (identity.failed || identity.topology_pending || topology_waiting) continue;
         const uint64_t size = static_cast<uint64_t>(capture.triangles) * 3u * kDynamicVertexBytes;
         const uint64_t dest = (slot.used + 15u) & ~uint64_t{15};
         if (dest + size > kDynamicTopologySlotBytes) continue;  // next frame
@@ -1293,6 +1318,9 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
   }
   for (const std::string& line : identity_lines) pool_log::i(line);
   for (const TopologyCopy& copy : copies) cmd_list->copy_buffer_region(arena, copy.source_offset, staging, copy.dest_offset, copy.size);
+  if (!copies.empty() && topology_event != 0u && g_deform.backend.end_query != nullptr) {
+    g_deform.backend.end_query(cmd_list, topology_event);
+  }
   // 2b. BLAS store compaction. Graphics calls, so not under the lock; the
   // arenas are only touched on the present thread.
   if (compact) {

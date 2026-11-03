@@ -78,6 +78,8 @@ enum PerfBlock : size_t {
   kPerfBlockRt12Record,    // RunRtaoPassA step 13: D3D12 recording to Close
   kPerfBlockRt12Resolve,   // RunRtaoPassA step 15: D3D11 resolve
   kPerfBlockCaptureHook,   // OnPushDescriptorsCapture, whole (addon.cpp), timed before its gate
+  kPerfBlockDeformProbeMap,   // ResolveDeformSlot: map_buffer_region of the staging copy
+  kPerfBlockDeformProbeEval,  // ResolveDeformSlot: the judging loop over the mapped capture
   kPerfBlockCount
 };
 

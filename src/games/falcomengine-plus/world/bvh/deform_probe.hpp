@@ -332,6 +332,10 @@ struct DeformBackend {
   void (*begin_query)(reshade::api::command_list* cmd_list, uint64_t query) = nullptr;
   void (*end_query)(reshade::api::command_list* cmd_list, uint64_t query) = nullptr;
   int (*read_query)(reshade::api::command_list* immediate, uint64_t query, uint64_t* out) = nullptr;
+  // Event query (D3D11_QUERY_EVENT): ended with end_query, released with
+  // destroy_query. poll_event: 1 = done, 0 = not yet, -1 = error.
+  uint64_t (*create_event)(reshade::api::device* device) = nullptr;
+  int (*poll_event)(reshade::api::command_list* immediate, uint64_t event) = nullptr;
 };
 
 #if defined(_WIN32)
@@ -399,15 +403,23 @@ inline DeformSkip CheckDeformGameStateD3D11(reshade::api::command_list* cmd_list
   return skip;
 }
 
-inline uint64_t CreateDeformQueryD3D11(reshade::api::device* device) {
+inline uint64_t CreateDeformQueryTypeD3D11(reshade::api::device* device, D3D11_QUERY type) {
   if (device == nullptr || device->get_api() != reshade::api::device_api::d3d11) return 0u;
   auto* native = reinterpret_cast<ID3D11Device*>(static_cast<uintptr_t>(device->get_native()));  // NOLINT(performance-no-int-to-ptr)
   if (native == nullptr) return 0u;
   D3D11_QUERY_DESC desc = {};
-  desc.Query = D3D11_QUERY_SO_STATISTICS_STREAM0;
+  desc.Query = type;
   ID3D11Query* query = nullptr;
   if (FAILED(native->CreateQuery(&desc, &query)) || query == nullptr) return 0u;
   return reinterpret_cast<uint64_t>(query);
+}
+
+inline uint64_t CreateDeformQueryD3D11(reshade::api::device* device) {
+  return CreateDeformQueryTypeD3D11(device, D3D11_QUERY_SO_STATISTICS_STREAM0);
+}
+
+inline uint64_t CreateDeformEventD3D11(reshade::api::device* device) {
+  return CreateDeformQueryTypeD3D11(device, D3D11_QUERY_EVENT);
 }
 
 inline void DestroyDeformQueryD3D11(uint64_t query) {
@@ -443,9 +455,21 @@ inline int ReadDeformQueryD3D11(reshade::api::command_list* immediate, uint64_t 
   return 1;
 }
 
+inline int PollDeformEventD3D11(reshade::api::command_list* immediate, uint64_t event) {
+  auto* context = DeformContextD3D11(immediate);
+  if (context == nullptr || event == 0u) return -1;
+  BOOL done = FALSE;
+  const HRESULT result = context->GetData(reinterpret_cast<ID3D11Query*>(event), &done, sizeof(done),  // NOLINT(performance-no-int-to-ptr)
+                                          D3D11_ASYNC_GETDATA_DONOTFLUSH);
+  if (result == S_FALSE) return 0;
+  if (result != S_OK) return -1;
+  return done ? 1 : 0;
+}
+
 inline DeformBackend DefaultDeformBackend() {
   return {CreateDeformSoShaderD3D11, DestroyDeformSoShaderD3D11, CheckDeformGameStateD3D11, CreateDeformQueryD3D11,
-          DestroyDeformQueryD3D11,   BeginDeformQueryD3D11,      EndDeformQueryD3D11,       ReadDeformQueryD3D11};
+          DestroyDeformQueryD3D11,   BeginDeformQueryD3D11,      EndDeformQueryD3D11,       ReadDeformQueryD3D11,
+          CreateDeformEventD3D11, PollDeformEventD3D11};
 }
 #else
 inline DeformBackend DefaultDeformBackend() { return {}; }
@@ -506,7 +530,9 @@ struct DeformSlot {
   std::array<uint64_t, kDeformProbesPerFrame> queries = {};  // DeformBackend queries
   uint64_t used = 0u;
   bool copied = false;  // staging copy recorded at present
+  // Set while the slot is read or waits for its event query.
   bool resolving = false;
+  uint64_t event = 0u;
   bool closed = false;  // an indirect capture took the rest of the slot
   // Camera of the frame the probes ran in (stamped when the slot is closed at
   // that frame's present; the lighting pass captured it during the frame).
@@ -632,6 +658,7 @@ inline void DeformProbeDraw(
       CountDeformSkip(&shader, DeformSkip::Interval);
       return;
     }
+    if (shader.matched > 0u && !shader.inconsistent && shader.chosen >= 0) return;  // confirmed: no re-probe
     if (deferred) {
       CountDeformSkip(&shader, DeformSkip::Deferred);
       return;
@@ -797,6 +824,7 @@ inline void DestroyDeformResources(reshade::api::device* device, std::array<Defo
     for (const uint64_t query : slot.queries) {
       if (query != 0u && g_deform.backend.destroy_query != nullptr) g_deform.backend.destroy_query(query);
     }
+    if (slot.event != 0u && g_deform.backend.destroy_query != nullptr) g_deform.backend.destroy_query(slot.event);
     slot = DeformSlot{};
   }
 }
@@ -824,6 +852,7 @@ inline bool CreateDeformResources(reshade::api::device* device, std::array<Defor
       DestroyDeformResources(device, *slots);
       return false;
     }
+    slot.event = g_deform.backend.create_event != nullptr ? g_deform.backend.create_event(device) : 0u;
   }
   return true;
 }
@@ -870,6 +899,24 @@ inline void ResolveDeformSlot(reshade::api::device* device, reshade::api::comman
   uint64_t used = 0u;
   bool copied = false;
   std::unordered_map<uint64_t, DeformSoLayout> layouts;
+  uint64_t event = 0u;
+  {
+    std::lock_guard<std::mutex> lock(g_deform.mutex);
+    DeformSlot& slot = g_deform.slots[slot_index];
+    if (slot.pending.empty()) {
+      slot.used = 0u;
+      slot.copied = false;
+      slot.closed = false;
+      return;
+    }
+    copied = slot.copied;
+    event = slot.event;
+    slot.resolving = true;
+  }
+  if (copied && event != 0u && g_deform.backend.poll_event != nullptr && immediate != nullptr
+      && g_deform.backend.poll_event(immediate, event) == 0) {
+    return;  // the staging copy has not finished: the slot stays reserved and is read 3 presents later
+  }
   {
     std::lock_guard<std::mutex> lock(g_deform.mutex);
     DeformSlot& slot = g_deform.slots[slot_index];
@@ -877,17 +924,9 @@ inline void ResolveDeformSlot(reshade::api::device* device, reshade::api::comman
     staging = slot.staging;
     queries = slot.queries;
     used = slot.used;
-    copied = slot.copied;
     camera_valid = slot.camera_valid;
     camera_frame = slot.camera_frame;
     std::memcpy(view_proj, slot.view_proj, sizeof(view_proj));
-    if (pending.empty()) {
-      slot.used = 0u;
-      slot.copied = false;
-      slot.closed = false;
-      return;
-    }
-    slot.resolving = true;
     for (const DeformPending& entry : pending) {
       const auto it = g_deform.shaders.find(entry.vs_pipeline);
       if (it != g_deform.shaders.end() && it->second.hash == entry.hash) layouts[entry.vs_pipeline] = it->second.layout;
@@ -897,18 +936,22 @@ inline void ResolveDeformSlot(reshade::api::device* device, reshade::api::comman
   std::vector<DeformJudged> judged;
   judged.reserve(pending.size());
   void* mapped = nullptr;
-  const bool mapped_ok = copied && used != 0u && immediate != nullptr && g_deform.backend.read_query != nullptr
-                         && device->map_buffer_region(staging, 0u, used, reshade::api::map_access::read_only, &mapped)
-                         && mapped != nullptr;
+  bool mapped_ok = false;
+  {
+    const PoolCpuTimer map_timer{&g_perf_gate.block_us[kPerfBlockDeformProbeMap]};
+    mapped_ok = copied && used != 0u && immediate != nullptr && g_deform.backend.read_query != nullptr
+                && device->map_buffer_region(staging, 0u, used, reshade::api::map_access::read_only, &mapped)
+                && mapped != nullptr;
+  }
   if (mapped_ok) {
     const auto* bytes = static_cast<const uint8_t*>(mapped);
+    const PoolCpuTimer eval_timer{&g_perf_gate.block_us[kPerfBlockDeformProbeEval]};
     for (const DeformPending& entry : pending) {
       const auto layout = layouts.find(entry.vs_pipeline);
       if (layout == layouts.end()) continue;  // shader gone or replaced since
       DeformJudged result;
       result.pending = entry;
-      // Read after the map: the map waited for the frame's GPU work, so the
-      // statistics are normally ready.
+      // Read after the map: the staging copy's event completed, so the statistics are normally ready.
       uint64_t statistics[2] = {};  // primitives written, storage needed
       const int read = g_deform.backend.read_query(immediate, queries[entry.query], statistics);
       if (read == 0) {
@@ -1012,23 +1055,28 @@ inline void DrainDeformProbe(reshade::api::device* device, reshade::api::command
   reshade::api::resource so_buffer = {0u};
   reshade::api::resource staging = {0u};
   uint64_t used = 0u;
+  uint64_t event = 0u;
   uint32_t written = 0u;
   {
     std::lock_guard<std::mutex> lock(g_deform.mutex);
     written = g_deform.write_slot;
     DeformSlot& slot = g_deform.slots[written];
-    slot.camera_valid = camera.valid;
-    slot.camera_frame = camera.frame;
-    std::memcpy(slot.view_proj, camera.view_proj, sizeof(slot.view_proj));
-    if (!slot.pending.empty() && slot.used != 0u) {
-      so_buffer = slot.so_buffer;
-      staging = slot.staging;
-      used = slot.used;
+    if (!slot.resolving) {
+      slot.camera_valid = camera.valid;
+      slot.camera_frame = camera.frame;
+      std::memcpy(slot.view_proj, camera.view_proj, sizeof(slot.view_proj));
+      if (!slot.pending.empty() && slot.used != 0u) {
+        so_buffer = slot.so_buffer;
+        staging = slot.staging;
+        used = slot.used;
+        event = slot.event;
+      }
     }
   }
   if (used != 0u) {
     if (auto* cmd_list = queue->get_immediate_command_list(); cmd_list != nullptr) {
       cmd_list->copy_buffer_region(so_buffer, 0u, staging, 0u, used);
+      if (event != 0u && g_deform.backend.end_query != nullptr) g_deform.backend.end_query(cmd_list, event);
       std::lock_guard<std::mutex> lock(g_deform.mutex);
       g_deform.slots[written].copied = true;
     }

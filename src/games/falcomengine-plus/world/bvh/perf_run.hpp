@@ -212,6 +212,8 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"rt12_record", true, kPerfSubset, false, nullptr},
     {"rt12_resolve", true, kPerfSubset, false, nullptr},
     {"capture_hook", true, kPerfSubset, false, nullptr},
+    {"deform_probe_map", true, kPerfSubset, false, nullptr},
+    {"deform_probe_eval", true, kPerfSubset, false, nullptr},
 };
 inline constexpr bool PerfInTotal(const PerfCostInfo& info) {
   return info.role == kPerfInPresent || info.role == kPerfDrawTime || info.role == kPerfGpu;

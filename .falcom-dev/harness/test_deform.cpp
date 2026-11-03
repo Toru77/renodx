@@ -268,6 +268,13 @@ int main() {
     CHECK(shader.last.candidates.size() == 6u && shader.last.candidates[4].error[0] > 1.f, "TEXCOORD5 (clip copy) rejected");
   }
 
+  // A confirmed shader is not probed again: another draw adds no probe.
+  cl.calls.clear();
+  bvh::OnDeformProbeDraw(&dev, &cl, draw_for(kSkin, 300, 2));
+  for (int i = 0; i < 3; ++i) present();
+  CHECK(row(kSkin).probes == 1u && row(kSkin).reads == 1u && cl.calls.empty(), "confirmed: not re-probed");
+  // Re-arm kSkin (confirmed above): sections 4-9 keep testing the read paths of a probed shader.
+  bvh::ResetDeformProbeResults();
   HStage("4. Light-view, rigid and deferred draws.");
   // 4. Light-view, rigid and deferred draws.
   cl.calls.clear();
@@ -337,6 +344,8 @@ int main() {
     CHECK(row(kSkin).convention == 1u && row(kSkin).last.chosen == 2, "transposed found");
   }
 
+  // Re-arm kSkin (confirmed in section 8).
+  bvh::ResetDeformProbeResults();
   HStage("9. Too large for a slot; create failure for another shader.");
   // 9. Too large for a slot; create failure for another shader.
   {
@@ -380,7 +389,8 @@ int main() {
     auto shader = row(kSkinIndirect);
     CHECK(shader.matched == 1u && shader.last_indirect && shader.last.triangles == 100u && bvh::DeformChosenText(shader) == "TEXCOORD1.xyzw",
           "indirect matched (%u, tris %u)", shader.matched, shader.last.triangles);
-    // Empty args: not judged, and the shader may probe again right away.
+    // Re-arm kSkinIndirect (confirmed above). Empty args: not judged, and the shader may probe again right away.
+    bvh::ResetDeformProbeResults();
     for (int i = 0; i < 30; ++i) present();
     set_args(300, 0);
     indirect_draw(kSkinIndirect);
@@ -388,16 +398,18 @@ int main() {
     set_args(300, 1);
     indirect_draw(kSkinIndirect);
     shader = row(kSkinIndirect);
-    CHECK(shader.read_fails[(size_t)bvh::DeformReadFail::Empty] == 1u && shader.reads == 1u && shader.probes == 3u,
+    // Counts start from the reset: the empty read (not judged) and the probe that follows it.
+    CHECK(shader.read_fails[(size_t)bvh::DeformReadFail::Empty] == 1u && shader.reads == 0u && shader.probes == 2u,
           "empty then re-probed (empty %u reads %u probes %u)", shader.read_fails[(size_t)bvh::DeformReadFail::Empty], shader.reads, shader.probes);
     for (int i = 0; i < 3; ++i) present();
-    CHECK(row(kSkinIndirect).matched == 2u, "second indirect matched");
+    CHECK(row(kSkinIndirect).matched == 1u, "second indirect matched");  // after the reset: one match
     // Larger than the slot: overflow is detected, nothing judged.
+    bvh::ResetDeformProbeResults();  // re-arm kSkinIndirect (matched in the step above)
     for (int i = 0; i < 30; ++i) present();
     set_args(3u * 400000u, 1);
     indirect_draw(kSkinIndirect);
     for (int i = 0; i < 3; ++i) present();
-    CHECK(row(kSkinIndirect).read_fails[(size_t)bvh::DeformReadFail::QueryMismatch] == 1u && row(kSkinIndirect).matched == 2u, "overflow");
+    CHECK(row(kSkinIndirect).read_fails[(size_t)bvh::DeformReadFail::QueryMismatch] == 1u && row(kSkinIndirect).matched == 0u, "overflow");
     CHECK(cl.binds_under_lock == 0, "lock rule (indirect)");
     dev.destroy_resource(args);
   }
@@ -414,8 +426,9 @@ int main() {
     bvh::DumpDeformProbe();
     std::ifstream f(bvh::PoolOutputDir() / "world_deform.json");
     const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    CHECK(text.find("\"schema\": 2") != std::string::npos && text.find("\"shader_failures\": 1") != std::string::npos, "dump stats");
-    CHECK(text.find("\"world_output\": \"-\"") != std::string::npos && text.find("\"light_view\": 1") != std::string::npos, "dump rows");
+    // The stats were re-armed with the last reset (step 9b): they hold the overflow read only.
+    CHECK(text.find("\"schema\": 2") != std::string::npos && text.find("\"query_mismatch\": 1") != std::string::npos, "dump stats");
+    CHECK(text.find("\"world_output\": \"-\"") != std::string::npos, "dump rows");
   }
 
   HStage("11. Re-classified handle with another bytecode resets its entry.");
