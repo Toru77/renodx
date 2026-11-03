@@ -749,6 +749,8 @@ static float g_vbgi_far_enabled = 0.f;
 static float g_vbgi_far_distance = 6.f;
 static float g_vbgi_far_intensity = 1.f;
 static float g_vbgi_far_hit_window = 1.f;
+static float g_vbgi_far_temporal = 1.f;
+static float g_vbgi_far_history_length = 20.f;
 
 // -- IS-FAST noise --
 static float g_isfast_enabled       = 0.f;
@@ -930,7 +932,7 @@ constexpr int kGtvbaoDebugModes[7] = {0, 1, 22, 23, 24, 25, 26};
 // VBGI Debug View row (0=Off, 1..6) maps to GTVBAO debug modes 30..35 while g_vbgi_enabled.
 static int VbgiGtvbaoDebugMode() {
   if (!VbgiRunning()) return 0;
-  const int row = std::clamp((int)g_vbgi_debug_mode, 0, 8);
+  const int row = std::clamp((int)g_vbgi_debug_mode, 0, 9);
   return row == 0 ? 0 : 29 + row;
 }
 // AO-only: the VBGI row replaces the AO debug view, never mixes with it.
@@ -942,7 +944,7 @@ static int ActiveGtvbaoDebugMode() {
   const int v = VbgiGtvbaoDebugMode();
   return v != 0 ? v : GtvbaoDebugMode();
 }
-static bool IsGtvbaoComputeDebug(int mode) { return mode >= 22 && mode <= 37; }
+static bool IsGtvbaoComputeDebug(int mode) { return mode >= 22 && mode <= 38; }
 
 using GTVBAODescriptorTableSet =
     std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount>;
@@ -1059,7 +1061,14 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool vbgi_far_was_on = false;                                  // far state last RunVBGI (near history resets on a change)
   uint64_t vbgi_far_frame = UINT64_MAX;                          // last frame the far resolve ran
   bool vbgi_far_prev_params_valid = false;
-  std::array<float, 1> vbgi_far_prev_params = {};
+  std::array<float, 9> vbgi_far_prev_params = {};
+  reshade::api::pipeline vbgi_far_temporal_pipeline = {};
+  falcom_world::rtgi::RtgiTextureSet<2> vbgi_far_res_pos = {};  // rgba32f, trace size: temporal reservoir sample point, W
+  falcom_world::rtgi::RtgiTextureSet<2> vbgi_far_res_rad = {};  // rgba16f, trace size: sender radiance, M
+  falcom_world::rtgi::RtgiTextureSet<2> vbgi_far_res_nrm = {};  // rgba16f, trace size: sender normal, refreshed flag
+  uint32_t vbgi_far_res_index = 0u;                             // [index] holds last frame's temporal reservoir
+  bool vbgi_far_reuse_last = false;                             // temporal reuse ran in the last far frame
+  uint64_t vbgi_far_reuse_frame = UINT64_MAX;                   // last frame the far reservoir step ran
 
   reshade::api::resource_view captured_depth_srv = {};
   std::atomic<bool> captured_depth_live{true};  // destroy-event driven; false = target freed since capture
@@ -3933,13 +3942,31 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
     },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIFarTemporal", .binding = &g_vbgi_far_temporal,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Far Temporal Reuse", .section = "GTVBGI",
+      .tooltip = "Reuses last frame's far-field sample per texel (ReSTIR). Runs only with inline dispatch (Deferred Dispatch Off).",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIFarHistory", .binding = &g_vbgi_far_history_length,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 20.f, .label = "Far History Length", .section = "GTVBGI",
+      .tooltip = "Frames of far-field history a texel can keep. Lower = faster response to light changes, more noise.",
+      .min = 4.f, .max = 30.f, .format = "%.0f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && g_vbgi_far_temporal > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
     // �� VBGI debug ��
     new renodx::utils::settings::Setting{
       .key = "VBGIDebugMode", .binding = &g_vbgi_debug_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "GTVBGI Debug View", .section = "GTVBGI",
       .tooltip = "Replace scene with GTVBGI debug textures. While not Off this replaces the GTVBAO debug view.",
-      .labels = {"Off", "Final GI", "Raw GI", "Radiance Input", "Bitmask", "Temporal Confidence", "Term Split", "Far Field", "Far Samples"},
+      .labels = {"Off", "Final GI", "Raw GI", "Radiance Input", "Bitmask", "Temporal Confidence", "Term Split", "Far Field", "Far Samples", "Far Reservoir"},
       .is_visible = []() { return VbgiRowVisible(); },
     },
     // -- Kai: GTVBAO VBGI Falcom SSGI consumption --
@@ -10557,6 +10584,13 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   d->vbgi_far_was_on = false;
   d->vbgi_far_frame = UINT64_MAX;
   d->vbgi_far_prev_params_valid = false;
+  dp(d->vbgi_far_temporal_pipeline);
+  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_res_pos);
+  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_res_rad);
+  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_res_nrm);
+  d->vbgi_far_res_index = 0u;
+  d->vbgi_far_reuse_last = false;
+  d->vbgi_far_reuse_frame = UINT64_MAX;
   DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
   DestroyGTVBAODescriptorTables(dev, &d->main_tables);
   DestroyGTVBAODescriptorTables(dev, &d->foliage_mask_tables);
@@ -12568,6 +12602,7 @@ static std::array<float, kVbgiFarPushConstantFloats> BuildVbgiFarPushConstants(D
   const auto base = BuildGTVBAOPushConstants(data, {.history_valid = history_valid, .vbgi = true});
   std::copy(base.begin(), base.end(), c.begin());
   c[48] = std::max(g_vbgi_far_distance, 0.1f);
+  c[49] = std::max(g_vbgi_far_history_length, 1.f);
   c[51] = std::max(g_vbgi_far_intensity, 0.f);
   c[52] = g_vbgi_far_hit_window > 0.5f ? 1.f : 0.f;
   return c;
@@ -12598,6 +12633,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   dl(d->vbgi_main_layout); dl(d->vbgi_radiance_layout); dl(d->vbgi_mips_layout);
   dp(d->vbgi_far_main_pipeline); dp(d->vbgi_far_resolve_pipeline);
   dl(d->vbgi_far_main_layout); dl(d->vbgi_far_layout);
+  dp(d->vbgi_far_temporal_pipeline);
   if (g_cpuopt_ensure_pipelines < 0.5f) {
     DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
     DestroyGTVBAODescriptorTables(dev, &d->main_tables);
@@ -12690,6 +12726,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!d->vbgi_mips_pipeline.handle) mkcs(__vbgi_radiance_mips, "main", d->vbgi_mips_layout, &d->vbgi_mips_pipeline);
   if (!d->vbgi_far_main_pipeline.handle) mkcs(__gtvbao_vbgi_far_main, "main", d->vbgi_far_main_layout, &d->vbgi_far_main_pipeline);
   if (!d->vbgi_far_resolve_pipeline.handle) mkcs(__vbgi_far_resolve, "main", d->vbgi_far_layout, &d->vbgi_far_resolve_pipeline);
+  if (!d->vbgi_far_temporal_pipeline.handle) mkcs(__vbgi_far_temporal, "main", d->vbgi_far_layout, &d->vbgi_far_temporal_pipeline);
   // �-trous wavelet spatial filter (R3)
   if (!d->filter_pipeline.handle) mkcs(__gtvbao_filter, "main", d->filter_layout, &d->filter_pipeline);
   if (!d->temporal_pipeline.handle) mkcs(__gtvbao_temporal, "main", d->temporal_layout, &d->temporal_pipeline);
@@ -13325,13 +13362,31 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     if (!far_on) {
       CSLog("vbgi", "far skipped: psos=" + std::to_string(far_psos) + " tables=" + std::to_string(far_tables) + " textures=" + std::to_string(far_textures), true);
     }
-    const std::array<float, 1> far_params = {g_vbgi_far_distance};
+    const std::array<float, 9> far_params = {g_vbgi_far_distance, g_vbgi_far_history_length, g_vbgi_far_hit_window,
+                                             g_vbgi_quality_level, g_vbgi_resolution, g_vbgi_radius,
+                                             g_vbgi_bitmask_thickness, g_vbgi_noise_type, g_vbgi_mrt_normal};
     far_params_changed = d->vbgi_far_prev_params_valid && far_params != d->vbgi_far_prev_params;
     d->vbgi_far_prev_params = far_params;
     d->vbgi_far_prev_params_valid = true;
   }
   const bool far_toggled = far_on != d->vbgi_far_was_on;
   d->vbgi_far_was_on = far_on;
+  // Binds the far-pass layout (12 SRVs, 4 UAVs, far push block) and dispatches one 8x8 far pass over gw x gh.
+  auto dispatch_far = [&](reshade::api::pipeline pso, const std::array<reshade::api::resource_view, 12>& srvs,
+                          const std::array<reshade::api::resource_view, 4>& uavs, bool history_valid, uint32_t gw, uint32_t gh) {
+    GtvbaoBindPipeline(cl, pso);
+    reshade::api::descriptor_table_update u[4] = {
+      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
+      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
+      {{},0,0,12,reshade::api::descriptor_type::texture_shader_resource_view,srvs.data()},
+      {{},0,0,4,reshade::api::descriptor_type::texture_unordered_access_view,uavs.data()},
+    };
+    GtvbaoApplyDescriptors(dev, cl, d->vbgi_far_layout, &d->vbgi_far_tables, 4, u);
+    const auto pc = BuildVbgiFarPushConstants(d, history_valid);
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->vbgi_far_layout, kGtvbaoPushConstantsLayoutParam, 0, kVbgiFarPushConstantFloats, pc.data());
+    cl->dispatch((gw + 7u) / 8u, (gh + 7u) / 8u, 1);
+    falcom_world::rtao::NullComputeSlots(cl, 12, 4, 1);
+  };
 
   if (!prefilter_done) RunGTVBAOSharedPrep(cl, d, false);
 
@@ -13387,34 +13442,66 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
   GtvbaoBarrier(cl, d->vbgi_raw_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   falcom_world::rtao::NullComputeSlots(cl, 5, 2, 1);
   if (far_on) {
+    namespace rtao = falcom_world::rtao;
     const auto UA = reshade::api::resource_usage::unordered_access;
     const auto SR = reshade::api::resource_usage::shader_resource;
-    falcom_world::rtao::NullComputeSlots(cl, 5, 5, 1);
+    rtao::NullComputeSlots(cl, 5, 5, 1);
     GtvbaoBarrier(cl, d->vbgi_far_cand_pos.texture[0], UA, SR);
     GtvbaoBarrier(cl, d->vbgi_far_cand_rad.texture[0], UA, SR);
     GtvbaoBarrier(cl, d->vbgi_far_cand_nrm.texture[0], UA, SR);
-    GtvbaoBindPipeline(cl, d->vbgi_far_resolve_pipeline);
-    reshade::api::resource_view far_srvs[12] = {
-        d->depth_mips_srv,
-        d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
-        d->vbgi_raw_srv, d->fallback_srv, d->vbgi_radiance_srv, d->fallback_srv,
-        d->vbgi_far_cand_pos.srv[0], d->vbgi_far_cand_rad.srv[0], d->vbgi_far_cand_nrm.srv[0],
-        d->fallback_srv, d->fallback_srv, d->fallback_srv
-    };
-    reshade::api::resource_view far_uavs[4] = {
-        d->vbgi_far_joint.uav[0], d->vbgi_far_raw.uav[0], d->fallback_uav, vbgi_dbg ? d->debug_uav : d->fallback_uav
-    };
-    reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,12,reshade::api::descriptor_type::texture_shader_resource_view,far_srvs},
-      {{},0,0,4,reshade::api::descriptor_type::texture_unordered_access_view,far_uavs},
-    };
-    GtvbaoApplyDescriptors(dev, cl, d->vbgi_far_layout, &d->vbgi_far_tables, 4, u);
-    const auto pc = BuildVbgiFarPushConstants(d, false);
-    cl->push_constants(reshade::api::shader_stage::all_compute, d->vbgi_far_layout, kGtvbaoPushConstantsLayoutParam, 0, kVbgiFarPushConstantFloats, pc.data());
-    cl->dispatch((d->vbgi_width + 7) / 8, (d->vbgi_height + 7) / 8, 1);
-    falcom_world::rtao::NullComputeSlots(cl, 12, 4, 1);
+    const reshade::api::resource_view mrt = d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv;
+    // Temporal reuse (M2): merge the candidate with last frame's temporal reservoir (double-buffered, swapped after).
+    const bool far_temporal_on = g_vbgi_far_temporal > 0.5f && g_cpuopt_deferred_dispatch < 0.5f;
+    bool far_temporal_ran = false;
+    if (far_temporal_on) {
+      const uint32_t tw = d->vbgi_width, th = d->vbgi_height;
+      const bool res_resized = d->vbgi_far_res_pos.width != tw || d->vbgi_far_res_pos.height != th;
+      const bool temporal_pso = d->vbgi_far_temporal_pipeline.handle != 0u;
+      const bool res_textures = temporal_pso
+                                && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_res_pos, reshade::api::format::r32g32b32a32_float, 16u, tw, th)
+                                && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_res_rad, reshade::api::format::r16g16b16a16_float, 8u, tw, th)
+                                && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_res_nrm, reshade::api::format::r16g16b16a16_float, 8u, tw, th);
+      if (!res_textures) {
+        CSLog("vbgi", "far temporal skipped: pso=" + std::to_string(temporal_pso) + " textures=" + std::to_string(res_textures), true);
+      } else {
+        const bool far_motion_ok = UpdateRtMotion(dev, d, true);
+        const rtao::ResetReason far_res_reset = rtao::TemporalResetReason(rtao::TemporalFrame{
+            .temporal_on = true,
+            .was_on = d->vbgi_far_reuse_last,
+            .resized = res_resized,
+            .frame = d->frame_index,
+            .last_frame = d->vbgi_far_reuse_frame,
+            .guard = d->dyncube_loadingWipePending || d->frame_index < d->resize_guard_until_frame,
+            .scaled = false,
+            .params_changed = far_params_changed,
+            .motion_ok = far_motion_ok});
+        const uint32_t rd = d->vbgi_far_res_index;
+        const uint32_t wr = rd ^ 1u;
+        dispatch_far(d->vbgi_far_temporal_pipeline,
+                     {d->depth_mips_srv, mrt, d->fallback_srv, d->captured_depth_srv, d->vbgi_radiance_srv,
+                      far_motion_ok ? d->mb_rtv4_owned_srv : d->fallback_srv,
+                      d->vbgi_far_cand_pos.srv[0], d->vbgi_far_cand_rad.srv[0], d->vbgi_far_cand_nrm.srv[0],
+                      d->vbgi_far_res_pos.srv[rd], d->vbgi_far_res_rad.srv[rd], d->vbgi_far_res_nrm.srv[rd]},
+                     {d->vbgi_far_res_pos.uav[wr], d->vbgi_far_res_rad.uav[wr], d->vbgi_far_res_nrm.uav[wr], d->fallback_uav},
+                     far_res_reset == rtao::ResetReason::None, tw, th);
+        GtvbaoBarrier(cl, d->vbgi_far_res_pos.texture[wr], UA, SR);
+        GtvbaoBarrier(cl, d->vbgi_far_res_rad.texture[wr], UA, SR);
+        GtvbaoBarrier(cl, d->vbgi_far_res_nrm.texture[wr], UA, SR);
+        d->vbgi_far_res_index = wr;
+        far_temporal_ran = true;
+      }
+    }
+    d->vbgi_far_reuse_last = far_temporal_ran;
+    d->vbgi_far_reuse_frame = d->frame_index;
+    const uint32_t ri = d->vbgi_far_res_index;
+    dispatch_far(d->vbgi_far_resolve_pipeline,
+                 {d->depth_mips_srv, mrt, d->vbgi_raw_srv, d->fallback_srv, d->vbgi_radiance_srv, d->fallback_srv,
+                  far_temporal_ran ? d->vbgi_far_res_pos.srv[ri] : d->vbgi_far_cand_pos.srv[0],
+                  far_temporal_ran ? d->vbgi_far_res_rad.srv[ri] : d->vbgi_far_cand_rad.srv[0],
+                  far_temporal_ran ? d->vbgi_far_res_nrm.srv[ri] : d->vbgi_far_cand_nrm.srv[0],
+                  d->fallback_srv, d->fallback_srv, d->fallback_srv},
+                 {d->vbgi_far_joint.uav[0], d->vbgi_far_raw.uav[0], d->fallback_uav, vbgi_dbg ? d->debug_uav : d->fallback_uav},
+                 false, d->vbgi_width, d->vbgi_height);
     GtvbaoBarrier(cl, d->vbgi_far_joint.texture[0], UA, SR);
     GtvbaoBarrier(cl, d->vbgi_far_raw.texture[0], UA, SR);
     d->vbgi_far_frame = d->frame_index;
