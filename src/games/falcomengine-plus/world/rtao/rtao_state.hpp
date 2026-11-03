@@ -396,9 +396,10 @@ inline Fade RtaoEffectiveFade(float built_range, float slider_range, float start
   return {std::min(start_req, end_eff), end_eff, built_range, start_req, end_req};
 }
 
-// Trace Resolution setting (0 Full, 1 Half, 2 Quarter) to the block side d: one trace pixel per d x d pixels.
-inline uint32_t RtgiTraceDivisor(float setting) {
-  return 1u << std::clamp(static_cast<int>(setting + 0.5f), 0, 2);
+// Trace Resolution setting (0 Full, 1 Half, 2 Quarter; GTVBGI also 3 = 1/8) to the block side d: one trace
+// pixel per d x d pixels. max_index caps the setting (2 for the RT effects).
+inline uint32_t RtgiTraceDivisor(float setting, int max_index = 2) {
+  return 1u << std::clamp(static_cast<int>(setting + 0.5f), 0, max_index);
 }
 
 // Trace pixels along one axis of full pixels (the last block may be partial).

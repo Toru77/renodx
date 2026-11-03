@@ -120,7 +120,7 @@ Texture2D<float4> g_srcRadiance : register(t4);
 // pixel is the block centre, clamped for odd full dims (e.g. full=5, d=2, ao=3: tq=2 -> min(5,4)=4).
 float GTVBAO_Divisor() {
 #ifdef GTVBAO_GI
-  return exp2(round(clamp(GTVBAO_resolution, 0.f, 2.f)));   // GI: Full, Half, Quarter
+  return exp2(round(clamp(GTVBAO_resolution, 0.f, 3.f)));   // GI: Full, 1/2, 1/4, 1/8
 #else
   return exp2(round(clamp(GTVBAO_resolution, 0.f, 1.f)));
 #endif
@@ -351,7 +351,13 @@ GTAOConstants BuildGTAOConstants(uint2 viewport_size)
   consts.FinalValuePower = max(0.5, GTVBAO_final_value_power);
   consts.SampleDistributionPower = max(1.0, GTVBAO_sample_distribution_power);
   consts.BitmaskThickness = max(0.0, GTVBAO_bitmask_thickness);
+#ifdef GTVBAO_GI
+  // GI offsets are in trace texels but sample the full-res depth mips: shift by 2 - r (r = c[35] = log2 divisor) so every
+  // resolution gets the full-res footprint of 1/4 (r = 2, unchanged).
+  consts.DepthMIPSamplingOffset = max(0.0, GTVBAO_depth_mip_sampling_offset) + (2.0 - GTVBAO_resolution);
+#else
   consts.DepthMIPSamplingOffset = max(0.0, GTVBAO_depth_mip_sampling_offset);
+#endif
   consts.NoiseIndex = (int)GTVBAO_noise_index;
 
   return consts;

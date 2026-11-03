@@ -60,6 +60,11 @@ void main(uint3 id : SV_DispatchThreadID)
         const float2 f = lp - floor(lp);
         float sum_w = 0.0;
         float3 sum_v = float3(0.0, 0.0, 0.0);
+#if defined(RTGI_UPSAMPLE_NEAREST_FALLBACK)
+        // GTVBGI (vbgi_upsample.cs_5_0.hlsl): the valid tap with the largest bilinear weight, used when all taps are edge-stopped.
+        float best_w = -1.0;
+        float3 best_v = float3(0.0, 0.0, 0.0);
+#endif
         [unroll]
         for (int t = 0; t < 4; ++t)
         {
@@ -72,6 +77,13 @@ void main(uint3 id : SV_DispatchThreadID)
             const float rep_depth = g_game_depth.Load(int3(rep, 0)).x;
             const float3 Nt = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(rep, 0)).xy);
             if (rep_depth <= 0.0 || dot(Nt, Nt) < 0.5) continue;
+#if defined(RTGI_UPSAMPLE_NEAREST_FALLBACK)
+            if (w > best_w)
+            {
+                best_w = w;
+                best_v = v.rgb;
+            }
+#endif
             const float2 rep_uv = (float2(rep) + 0.5) / float2(full_size);
             const float4 rep_h = mul(float4(rep_uv.x * 2.0 - 1.0, 1.0 - rep_uv.y * 2.0, rep_depth, 1.0), viewProjInv_g);
             const float wt = w * FilterPlaneNormalWeight(Pc, N, dist_c, rep_h.xyz / rep_h.w, Nt);
@@ -82,6 +94,12 @@ void main(uint3 id : SV_DispatchThreadID)
         {
             gi = sum_v / sum_w;
         }
+#if defined(RTGI_UPSAMPLE_NEAREST_FALLBACK)
+        else if (best_w >= 0.0)
+        {
+            gi = best_v;
+        }
+#endif
     }
     if (u_extra.x != 1.0)
     {

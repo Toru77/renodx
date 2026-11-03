@@ -733,6 +733,7 @@ static uint32_t DynCubeResolveSize(float v);
 static float g_vbgi_enabled = 0.f;
 static float g_vbgi_quality_level = 1.f;
 static float g_vbgi_resolution = 1.f;
+constexpr int kVbgiMaxResolutionIndex = 3;  // VBGIResolution label count - 1 (1/8)
 static float g_vbgi_noise_type = 2.f;
 static float g_vbgi_radius = 1.5f;
 static float g_vbgi_bitmask_thickness = 0.30f;
@@ -3796,8 +3797,9 @@ renodx::utils::settings::Settings settings = {
       .key = "VBGIResolution", .binding = &g_vbgi_resolution,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 2.f, .label = "GTVBGI Resolution", .section = "GTVBGI",
-      .tooltip = "Full = native. Half = half size per axis (a quarter of the pixels). Quarter = a quarter size per axis (one per 4 x 4 block); fastest, softest. Default Half.",
-      .labels = {"Full", "Half", "Quarter"},
+      .tooltip = "Trace size per axis relative to the render size: 1/2 = one trace pixel per 2 x 2 block, 1/4 = per 4 x 4, 1/8 = per 8 x 8. Lower is faster and softer; the depth and light sampling covers the same screen area at every size. Default 1/4.",
+      .labels = {"Full", "1/2", "1/4", "1/8"},
+      .min = 1.f,  // index = log2 divisor; Full (0) is hidden and a saved 0 loads as 1/2
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
     },
@@ -6722,7 +6724,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     }
     const bool too_small = d->working_width < 320u || d->working_height < 320u;
     const float want_res = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 1.f);
-    const float want_vbgi_res = std::clamp(std::round(g_vbgi_resolution), 0.f, 2.f);
+    const float want_vbgi_res = std::clamp(std::round(g_vbgi_resolution), 0.f, static_cast<float>(kVbgiMaxResolutionIndex));
     if (gw > 0u && gh > 0u
         && (!d->resources_created || too_small
             || gw != d->last_created_game_width
@@ -10549,7 +10551,7 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
     mk(aw, ah, reshade::api::format::r16g16b16a16_float,
        &d->temporal_history_texture[i], &d->temporal_history_srv[i], &d->temporal_history_uav[i]);
   // VBGI raw gather target: always allocated; RunVBGI never resizes it.
-  const uint32_t vdiv = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution);
+  const uint32_t vdiv = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex);
   const uint32_t vw = (w + vdiv - 1u) / vdiv;
   const uint32_t vh = (h + vdiv - 1u) / vdiv;
   d->vbgi_width = vw; d->vbgi_height = vh;
@@ -12649,7 +12651,7 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
     c[26] = 2.f;
     c[27] = 0.f;
     c[30] = 0.f;
-    c[35] = std::clamp(std::round(g_vbgi_resolution), 0.f, 2.f);
+    c[35] = std::clamp(std::round(g_vbgi_resolution), 0.f, static_cast<float>(kVbgiMaxResolutionIndex));
     c[36] = 0.f;
     c[43] = 1.f;
     c[44] = IsSora1st() ? 0.f : (IsSora2nd() ? 1.f : 2.f);
@@ -12667,7 +12669,7 @@ static std::array<float, kVbgiFarPushConstantFloats> BuildVbgiFarPushConstants(D
   std::copy(base.begin(), base.end(), c.begin());
   c[48] = std::max(g_vbgi_far_distance, 0.1f);
   c[49] = std::max(g_vbgi_far_history_length, 1.f);
-  c[50] = std::max(4.f, 30.f / static_cast<float>(falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution)))
+  c[50] = std::max(2.f, 30.f / static_cast<float>(falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex)))
           * std::clamp(g_vbgi_far_spatial_radius, 0.5f, 2.f);
   c[51] = std::max(g_vbgi_far_intensity, 0.f);
   c[52] = g_vbgi_far_hit_window > 0.5f ? 1.f : 0.f;
@@ -13321,7 +13323,7 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
   const uint32_t w = d->vbgi_width, h = d->vbgi_height;
-  const uint32_t div = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution);
+  const uint32_t div = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex);
   const bool kai = IsKai();
 
   // Multi-Bounce (M7.6): last frame's denoised GI (the newest output, not written until this frame's denoise) re-enters as
@@ -13682,12 +13684,15 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
   {
     namespace rtgi = falcom_world::rtgi;
     namespace rtao = falcom_world::rtao;
-    const uint32_t divisor = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution);
+    // GTVBGI's upsample: world_rtgi_upsample built with the nearest valid tap fallback (vbgi_upsample.cs_5_0.hlsl).
+    static constexpr rtgi::RtgiPipelineDesc kVbgiUpsamplePipelineDesc = {
+        .srv_count = rtgi::kRtgiUpsampleSrvCount, .uav_count = rtgi::kRtgiUpsampleUavCount, .sampler_count = 0u, .push_count = rtgi::kRtgiUpsamplePushCount, .code = __vbgi_upsample, .name = "vbgi upsample"};
+    const uint32_t divisor = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex);
     const uint32_t full_w = d->captured_depth_w, full_h = d->captured_depth_h;
     bool denoise_ok = full_w != 0u && full_h != 0u
         && d->vbgi_width == rtao::RtgiTraceExtent(full_w, divisor) && d->vbgi_height == rtao::RtgiTraceExtent(full_h, divisor);
     if (!denoise_ok) CSLog("vbgi", "denoise skipped: size mismatch", true);
-    if (denoise_ok && !rtgi::EnsureRtgiPipeline(dev, &d->vbgi_denoise.upsample_pipeline, rtgi::kRtgiUpsamplePipelineDesc)) {
+    if (denoise_ok && !rtgi::EnsureRtgiPipeline(dev, &d->vbgi_denoise.upsample_pipeline, kVbgiUpsamplePipelineDesc)) {
       denoise_ok = false;
       CSLog("vbgi", "denoise skipped: upsample pipeline", true);
     }
