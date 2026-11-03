@@ -246,6 +246,9 @@ void GTVBAO_OutputWorkingTerm( const uint2 pixCoord, lpfloat visibility, GTVBAO_
     visibility = saturate( visibility );
     outWorkingAOTerm[pixCoord] = uint(visibility * 255.0 + 0.5);
 }
+#ifdef GTVBAO_GI_FAR
+#include "vbgi_far.hlsli"
+#endif
 
 void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPerSlice, const lpfloat2 localNoise, lpfloat3 viewspaceNormal, const GTAOConstants consts, 
     Texture2D<lpfloat> sourceViewspaceDepth, SamplerState depthSampler, GTVBAO_AO_OUT_TYPE outWorkingAOTerm,
@@ -294,6 +297,11 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 #ifdef GTVBAO_GI
     if (viewspaceZ >= 60000.0) {
         outWorkingAOTerm[pixCoord] = float4(0.0f, 0.0f, 0.0f, -1.0f);
+#ifdef GTVBAO_GI_FAR
+        g_outFarPos[pixCoord] = 0.0f;
+        g_outFarRad[pixCoord] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        g_outFarNrm[pixCoord] = 0.0f;
+#endif
         return;
     }
 #endif
@@ -360,6 +368,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 #ifdef GTVBAO_GI
     float3 giSum = 0.0f;               // sum of per-slice GI
 #endif
+#ifdef GTVBAO_GI_FAR
+    float4 dbgFar = float4(0.0f, 0.0f, 0.0f, 1.0f);   // view 37: hit, F/32, mismatch
+#endif
 
     {
         // quality settings / tweaks / hacks
@@ -422,6 +433,11 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             if (projNSqrLen < 1e-12f) {
 #ifdef GTVBAO_GI
                 outWorkingAOTerm[pixCoord] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+#ifdef GTVBAO_GI_FAR
+                g_outFarPos[pixCoord] = 0.0f;
+                g_outFarRad[pixCoord] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+                g_outFarNrm[pixCoord] = 0.0f;
+#endif
                 return;
 #else
                 degenerate = true;
@@ -554,6 +570,72 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
             // ── Slice AO and weight (bufferc.txt:797-809) ──
             const float occ = (float)countbits(occBits) / (float)GT_VBAO_BITMASK_SECTOR_COUNT;
+#ifdef GTVBAO_GI_FAR
+            if (slice == 0)
+            {
+                // Far field: one direction from the sectors slice 0 left open, marched from Radius to the far distance.
+                const float2 pfar = frac(float2(nz.x + 7.0f * 0.7548776662466927f, nz.y + 7.0f * 0.5698402909980532f));
+                const float3 rf = float3(pfar.x, pfar.y, frac(pfar.x + 2.0f * pfar.y));
+                const uint freeBits = ~occBits;
+                const uint freeCount = countbits(freeBits);
+                float4 farPos = 0.0f;
+                float4 farRad = float4(0.0f, 0.0f, 0.0f, 1.0f);
+                float4 farNrm = 0.0f;
+                bool mismatch = false;
+                if (freeCount != 0u)
+                {
+                    uint fb = freeBits;
+                    const uint pick = min((uint)(rf.x * (float)freeCount), freeCount - 1u);
+                    for (uint fk = 0u; fk < pick; ++fk) fb &= fb - 1u;
+                    const uint sector = firstbitlow(fb);
+                    const float target = saturate(((float)sector + rf.y - rnd.w) / 32.0f);
+                    float lo = 0.0f, hi = 1.0f;
+                    [loop] for (int fi = 0; fi < 14; ++fi)
+                    {
+                        const float x = 0.5f * (lo + hi);
+                        const float c = useUniform ? GTVBAO_SliceRelCDF_Uniform(x, angN, x > angOff)
+                                                   : GTVBAO_SliceRelCDF_Cos(x, angN, cosN, x > angOff);
+                        if (c < target) lo = x; else hi = x;
+                    }
+                    const float a = (0.5f * (lo + hi) - angOff) * GT_VBAO_PI;
+                    const float3 dir = cos(a) * V + sin(a) * normalize(smplDirVS);
+                    float hc = saturate(a * GT_VBAO_RCP_PI + angOff);
+                    hc = useUniform ? GTVBAO_SliceRelCDF_Uniform(hc, angN, a > 0.0f) : GTVBAO_SliceRelCDF_Cos(hc, angN, cosN, a > 0.0f);
+                    mismatch = min((uint)floor(saturate(hc + rnd.w * (1.0f / 32.0f)) * 32.0f), 31u) != sector;
+                    const float2 rt = VbgiFarViewToUv(VbgiFarWorldToView(VbgiFarViewToWorld(positionVS)), consts);
+                    mismatch = mismatch || any(abs(rt - normalizedScreenPos) > 0.5f * consts.ViewportPixelSize);
+                    const float tStart = (float)effectRadius;
+                    const float tEnd = max(GTVBAO_far_distance, tStart * 1.01f);
+                    float prevPz = positionVS.z + dir.z * tStart;
+                    [loop] for (uint fs = 0u; fs < kVbgiFarSteps && !mismatch; ++fs)
+                    {
+                        const float3 Pm = positionVS + dir * (tStart + (tEnd - tStart) * (((float)fs + rf.z) / (float)kVbgiFarSteps));
+                        const float window = GTVBAO_far_hit_wide > 0.5f ? max(bitmaskThickness, Pm.z - prevPz) : bitmaskThickness;
+                        prevPz = Pm.z;
+                        if (Pm.z <= 0.0f) break;
+                        const float2 uvm = VbgiFarViewToUv(Pm, consts);
+                        if (any(uvm < 0.0f) || any(uvm > 1.0f)) break;
+                        const float offsetPx = length((uvm - normalizedScreenPos) / consts.ViewportPixelSize);
+                        const float mip = clamp(log2(max(offsetPx, 1.0f)) - consts.DepthMIPSamplingOffset, 0.0f, (float)GT_VBAO_DEPTH_MIP_LEVELS);
+                        const float SZm = sourceViewspaceDepth.SampleLevel(depthSampler, uvm, mip).x;
+                        if (SZm >= 60000.0f || Pm.z < SZm || Pm.z > SZm + window) continue;
+                        const float3 nW = DecodeFalcomMrtNormal(mrtNormalTexture.Load(int3(GTVBAO_MrtTexel(uvm * float2(g_mrtW, g_mrtH), float2(g_mrtW, g_mrtH)), 0)).xy);
+                        if (!FalcomNormalValid(nW) || dot(TransformNormalToView(nW), dir) >= 0.0f) break;
+                        const float3 L = g_srcRadiance.SampleLevel(depthSampler, uvm, max(mip - GTVBAO_resolution, 0.0f)).rgb;
+                        farPos = float4(VbgiFarViewToWorld(GTVBAO_ComputeViewspacePosition(uvm, SZm, consts)),
+                                        VbgiFarLuminance(L) > 0.0f ? (float)freeCount / 32.0f : 0.0f);
+                        farRad.rgb = L;
+                        farNrm.xyz = nW;
+                        break;
+                    }
+                }
+                farNrm.w = mismatch ? 1.0f : 0.0f;
+                g_outFarPos[pixCoord] = farPos;
+                g_outFarRad[pixCoord] = farRad;
+                g_outFarNrm[pixCoord] = farNrm;
+                dbgFar = float4(farPos.w > 0.0f ? 1.0f : 0.0f, (float)freeCount / 32.0f, farNrm.w, 1.0f);
+            }
+#endif
 #ifdef GTVBAO_GI
             giSum += gi0;
 #else
@@ -589,6 +671,11 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         } else if ((int)GTVBAO_debug_mode == 32) {
             dbgValue = float4(g_srcRadiance.Load(int3(pixCoord, 0)).rgb, 1.0f);
         }
+#ifdef GTVBAO_GI_FAR
+        else if ((int)GTVBAO_debug_mode == 37) {
+            dbgValue = dbgFar;
+        }
+#endif
         GTVBAO_WriteDebug(outDebug, pixCoord, dbgValue);
     }
 #else

@@ -99,6 +99,16 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_radiance_mip_shift;       // c[45]
   float GTVBAO_radiance_clamp;           // c[46]
   float GTVBAO_vbgi_backface_mode;       // c[47] - 0=Off, 1=Simple, 2=Exact
+#if defined(GTVBAO_GI_FAR) || defined(VBGI_FAR_PASS)
+  float GTVBAO_far_distance;             // c[48] - far-field march end, view units (BuildVbgiFarPushConstants)
+  float GTVBAO_far_history_length;       // c[49] - temporal reservoir M cap
+  float GTVBAO_far_spatial_radius;       // c[50] - spatial reuse radius, trace texels
+  float GTVBAO_far_intensity;            // c[51] - far-field term scale (Far Intensity)
+  float GTVBAO_far_hit_wide;             // c[52] - 1 = Wide far hit window, 0 = Thin
+  float GTVBAO_far_reserved53;           // c[53]
+  float GTVBAO_far_reserved54;           // c[54]
+  float GTVBAO_far_reserved55;           // c[55]
+#endif
 };
 
 #ifdef GTVBAO_GI
