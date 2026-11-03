@@ -128,7 +128,7 @@ ShaderInjectData shader_injection = {
   .vbgi_intensity = 1.0f,
   .vbgi_saturation = 1.0f,
   .vbgi_char_mask_strength = 0.f,
-  .vbgi_multibounce = 0.f,
+  .vbgi_multibounce = 1.f,
   .vbgi_multibounce_strength = 1.f,
   .vbgi_multibounce_bounce_fraction = 0.15f,
   .vbgi_multibounce_saturation = 1.f,
@@ -745,16 +745,17 @@ static float g_vbgi_emissive = 1.f;
 static float g_vbgi_multibounce_strength = 0.5f;
 static float g_vbgi_debug_mode = 0.f;
 static float g_vbgi_backface_mode = 0.f;
-static float g_vbgi_far_enabled = 0.f;
-static float g_vbgi_far_distance = 6.f;
-static float g_vbgi_far_intensity = 1.f;
-static float g_vbgi_far_hit_window = 1.f;
+static float g_vbgi_far_enabled = 1.f;
+static float g_vbgi_far_distance = 3.f;
+static float g_vbgi_far_intensity = 2.f;
+static float g_vbgi_far_hit_window = 0.f;
 static float g_vbgi_far_temporal = 1.f;
 static float g_vbgi_far_history_length = 20.f;
 static float g_vbgi_far_spatial = 1.f;
-static float g_vbgi_far_candidates = 2.f;
+static float g_vbgi_far_candidates = 4.f;
 static float g_vbgi_far_spatial_neighbors = 4.f;
 static float g_vbgi_far_spatial_radius = 1.f;
+static float g_vbgi_far_multibounce_strength = 0.25f;
 
 // -- IS-FAST noise --
 static float g_isfast_enabled       = 0.f;
@@ -1000,6 +1001,9 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline vbgi_mips_pipeline = {};
   GTVBAODescriptorTableSet vbgi_radiance_tables = {};
   GTVBAODescriptorTableSet vbgi_mips_tables = {};
+  reshade::api::pipeline_layout vbgi_radiance_far_layout = {};  // radiance prepass with far feedback: 14 SRVs, 1 UAV
+  reshade::api::pipeline vbgi_radiance_far_pipeline = {};
+  GTVBAODescriptorTableSet vbgi_radiance_far_tables = {};
   // -- �-trous wavelet spatial filter (R3) --
   reshade::api::pipeline_layout temporal_layout = {};
   reshade::api::pipeline temporal_pipeline = {};
@@ -3900,7 +3904,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIMultiBounce", .binding = &shader_injection.vbgi_multibounce,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Multi-Bounce", .section = "GTVBGI",
+      .default_value = 1.f, .label = "Multi-Bounce", .section = "GTVBGI",
       .tooltip = "Enables multi-bounce GI: previous frame's indirect light feeds back into the GI computation.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
@@ -3917,7 +3921,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIFarField", .binding = &g_vbgi_far_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Far Field", .section = "GTVBGI",
+      .default_value = 1.f, .label = "Far Field", .section = "GTVBGI",
       .tooltip = "Adds bounce light from beyond Radius: one screen-space ray per texel through the directions the near field left open. Off = GTVBGI unchanged.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
@@ -3926,7 +3930,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIFarDistance", .binding = &g_vbgi_far_distance,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 6.f, .label = "Far Distance", .section = "GTVBGI",
+      .default_value = IsKai() ? 1.f : 3.f, .label = "Far Distance", .section = "GTVBGI",
       .tooltip = "World-space end of the far-field ray.",
       .min = 1.f, .max = 30.f, .format = "%.1f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
@@ -3935,7 +3939,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIFarIntensity", .binding = &g_vbgi_far_intensity,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Far Intensity", .section = "GTVBGI",
+      .default_value = 2.f, .label = "Far Intensity", .section = "GTVBGI",
       .tooltip = "Scales the far-field bounce light before the denoise. 1 = physically matched to the near field.",
       .min = 0.f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
@@ -3944,7 +3948,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIFarHitWindow", .binding = &g_vbgi_far_hit_window,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Far Hit Window", .section = "GTVBGI",
+      .default_value = 0.f, .label = "Far Hit Window", .section = "GTVBGI",
       .tooltip = "How a far ray decides it hit a surface. Thin = only within Bitmask Thickness behind the depth buffer (fewer hits). Wide = also counts a surface crossed between two march steps (more hits; may add faint halos behind thin objects).",
       .labels = {"Thin", "Wide"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
@@ -3953,7 +3957,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIFarCandidates", .binding = &g_vbgi_far_candidates,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 2.f, .label = "Far Candidates", .section = "GTVBGI",
+      .default_value = 4.f, .label = "Far Candidates", .section = "GTVBGI",
       .tooltip = "Fresh far-field rays per texel each frame (at most the Quality's slice count). More = less boiling, more cost.",
       .min = 1.f, .max = 4.f, .format = "%.0f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
@@ -4002,6 +4006,15 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Scale of the spatial reuse radius. Larger = calmer, but more rejections and possible halos at edges.",
       .min = 0.5f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && g_vbgi_far_spatial > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIFarMultiBounceStrength", .binding = &g_vbgi_far_multibounce_strength,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.25f, .label = "Far Multi-Bounce Strength", .section = "GTVBGI",
+      .tooltip = "Feeds the far field's share of last frame's GI back as sender light. 0 = only the near field feeds back.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
     },
     // �� VBGI debug ��
@@ -10606,6 +10619,9 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   dp(d->vbgi_radiance_pipeline); dp(d->vbgi_mips_pipeline);
   dl(d->vbgi_radiance_layout); dl(d->vbgi_mips_layout);
   DestroyGTVBAODescriptorTables(dev, &d->vbgi_radiance_tables); DestroyGTVBAODescriptorTables(dev, &d->vbgi_mips_tables);
+  dp(d->vbgi_radiance_far_pipeline);
+  dl(d->vbgi_radiance_far_layout);
+  DestroyGTVBAODescriptorTables(dev, &d->vbgi_radiance_far_tables);
   for (auto& v : d->vbgi_radiance_mip_srv) dv(v);
   for (auto& u : d->vbgi_radiance_mip_uav) dv(u);
   dv(d->vbgi_radiance_srv); dr(d->vbgi_radiance_texture);
@@ -12685,6 +12701,8 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   dp(d->vbgi_main_pipeline);
   dp(d->vbgi_radiance_pipeline); dp(d->vbgi_mips_pipeline);
   dl(d->vbgi_main_layout); dl(d->vbgi_radiance_layout); dl(d->vbgi_mips_layout);
+  dp(d->vbgi_radiance_far_pipeline);
+  dl(d->vbgi_radiance_far_layout);
   dp(d->vbgi_far_main_pipeline); dp(d->vbgi_far_resolve_pipeline);
   dl(d->vbgi_far_main_layout); dl(d->vbgi_far_layout);
   dp(d->vbgi_far_temporal_pipeline);
@@ -12694,6 +12712,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     DestroyGTVBAODescriptorTables(dev, &d->main_tables);
     DestroyGTVBAODescriptorTables(dev, &d->vbgi_main_tables);
     DestroyGTVBAODescriptorTables(dev, &d->vbgi_radiance_tables);
+    DestroyGTVBAODescriptorTables(dev, &d->vbgi_radiance_far_tables);
     DestroyGTVBAODescriptorTables(dev, &d->vbgi_mips_tables);
     DestroyGTVBAODescriptorTables(dev, &d->vbgi_far_main_tables);
     DestroyGTVBAODescriptorTables(dev, &d->vbgi_far_tables);
@@ -12760,6 +12779,8 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   // VBGI radiance prepass: 9 SRVs + 1 UAV. Radiance mip chain: 1 SRV + 1 UAV.
   if (!make_layout(12u, 1u, &d->vbgi_radiance_layout)) return false;
   EnsureGTVBAODescriptorTables(dev, d->vbgi_radiance_layout, &d->vbgi_radiance_tables);
+  // Radiance prepass with far feedback: 14 SRVs (t12 far raw, t13 joint raw) + 1 UAV. Optional: a failure leaves far feedback off.
+  if (make_layout(14u, 1u, &d->vbgi_radiance_far_layout)) EnsureGTVBAODescriptorTables(dev, d->vbgi_radiance_far_layout, &d->vbgi_radiance_far_tables);
   if (!make_layout(1u, 1u, &d->vbgi_mips_layout)) return false;
   EnsureGTVBAODescriptorTables(dev, d->vbgi_mips_layout, &d->vbgi_mips_tables);
   // VBGI far field: main variant (5 SRVs, 5 UAVs) and far passes (12 SRVs, 4 UAVs), 56-float push block. Optional: a failure leaves far off.
@@ -12778,6 +12799,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!d->main_pipeline.handle)         mkcs(__gtvbao_main, "main", d->main_layout, &d->main_pipeline);
   if (!d->vbgi_main_pipeline.handle) mkcs(__gtvbao_vbgi_main, "main", d->vbgi_main_layout, &d->vbgi_main_pipeline);
   if (!d->vbgi_radiance_pipeline.handle) mkcs(__vbgi_radiance, "main", d->vbgi_radiance_layout, &d->vbgi_radiance_pipeline);
+  if (!d->vbgi_radiance_far_pipeline.handle) mkcs(__vbgi_radiance_far, "main", d->vbgi_radiance_far_layout, &d->vbgi_radiance_far_pipeline);
   if (!d->vbgi_mips_pipeline.handle) mkcs(__vbgi_radiance_mips, "main", d->vbgi_mips_layout, &d->vbgi_mips_pipeline);
   if (!d->vbgi_far_main_pipeline.handle) mkcs(__gtvbao_vbgi_far_main, "main", d->vbgi_far_main_layout, &d->vbgi_far_main_pipeline);
   if (!d->vbgi_far_resolve_pipeline.handle) mkcs(__vbgi_far_resolve, "main", d->vbgi_far_layout, &d->vbgi_far_resolve_pipeline);
@@ -13268,6 +13290,8 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
 // VBGI radiance prepass (M7.4 step 3): sender radiance and its mip chain, once per frame, from the lighting draw.
 constexpr float kVbgiRadianceClamp = 16.f;  // HDR cap per channel
 constexpr float kVbgiFeedbackMax = 0.9f;  // Multi-Bounce Strength x Intensity limit (RTGI rule)
+constexpr float kVbgiFarFeedbackMax = 0.75f;  // Far Multi-Bounce Strength x Intensity limit (M4)
+constexpr float kVbgiFireflyK = 4.0f;         // fed-back luminance limit, x the 8-neighbour mean (M4)
 static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
   if (d->vbgi_radiance_frame == d->frame_index) return true;
   if (!VbgiRunning() || !d->captured_depth_srv.handle || !d->captured_mrt_normal_srv.handle
@@ -13315,6 +13339,30 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
     motion_srv = d->mb_rtv4_owned_srv;
   }
 
+  // Far feedback (M4): with the far field on, the radiance variant splits last frame's joint denoised GI into near and
+  // far shares (far raw / joint raw) with separate weights and firefly-clamps it. prev_gi_srv is only set when the
+  // near feedback gate above passed (Multi-Bounce on, fresh denoise, no guard, motion valid).
+  const bool far_fb = VbgiFarRunning() && shader_injection.vbgi_multibounce > 0.5f
+                      && d->vbgi_radiance_far_pipeline.handle != 0u
+                      && EnsureGTVBAODescriptorTables(dev, d->vbgi_radiance_far_layout, &d->vbgi_radiance_far_tables);
+  float far_feedback_w = 0.f;
+  reshade::api::resource_view prev_far_raw_srv = d->fallback_srv;
+  reshade::api::resource_view prev_joint_raw_srv = d->fallback_srv;
+  if (far_fb && prev_gi_srv.handle != d->fallback_srv.handle && d->vbgi_far_frame != UINT64_MAX
+      && d->frame_index - d->vbgi_far_frame <= 1u && d->vbgi_far_raw.srv[0].handle != 0u
+      && d->vbgi_far_joint.srv[0].handle != 0u) {
+    far_feedback_w = std::min(g_vbgi_far_multibounce_strength * shader_injection.vbgi_intensity, kVbgiFarFeedbackMax);
+    prev_far_raw_srv = d->vbgi_far_raw.srv[0];
+    prev_joint_raw_srv = d->vbgi_far_joint.srv[0];
+  }
+  static float s_far_fb_logged[2] = {-1.f, -1.f};
+  if (far_fb && (s_far_fb_logged[0] != feedback_w || s_far_fb_logged[1] != far_feedback_w)) {
+    s_far_fb_logged[0] = feedback_w;
+    s_far_fb_logged[1] = far_feedback_w;
+    CSLog("vbgi", "far feedback w_near=" + std::to_string(feedback_w) + " w_far=" + std::to_string(far_feedback_w)
+                      + " far_cap=" + std::to_string(kVbgiFarFeedbackMax) + " firefly_k=" + std::to_string(kVbgiFireflyK));
+  }
+
   // Mip 0: the radiance itself.
   GtvbaoBindPipeline(cl, d->vbgi_radiance_pipeline);
   {
@@ -13348,6 +13396,41 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
     pc[7] = IsSora1st() ? 0.f : (IsSora2nd() ? 1.f : 2.f);
     cl->push_constants(reshade::api::shader_stage::all_compute, d->vbgi_radiance_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
   }
+  if (far_fb) {
+    GtvbaoBindPipeline(cl, d->vbgi_radiance_far_pipeline);
+    reshade::api::resource_view far_srvs[14] = {
+        d->captured_color_srv,
+        d->captured_mrt_normal_srv,
+        d->vbgi_in_srv[0],
+        kai ? d->fallback_srv : d->vbgi_in_srv[1],
+        d->captured_depth_srv,
+        d->vbgi_in_srv[2],
+        kai ? d->fallback_srv : d->vbgi_in_srv[3],
+        d->vbgi_in_srv[4], d->vbgi_in_srv[5],
+        prev_gi_srv, motion_srv,
+        kai ? d->vbgi_in_srv[3] : d->fallback_srv,
+        prev_far_raw_srv, prev_joint_raw_srv
+    };
+    reshade::api::descriptor_table_update u[4] = {
+      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
+      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
+      {{},0,0,14,reshade::api::descriptor_type::texture_shader_resource_view,far_srvs},
+      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->vbgi_radiance_mip_uav[0]},
+    };
+    GtvbaoApplyDescriptors(dev, cl, d->vbgi_radiance_far_layout, &d->vbgi_radiance_far_tables, 4, u);
+    std::array<float, kGtvbaoPushConstantFloats> pc = {};
+    pc[0] = g_vbgi_ambient;
+    pc[1] = g_vbgi_lights;
+    pc[2] = g_vbgi_sun;
+    pc[3] = g_vbgi_emissive;
+    pc[4] = kVbgiRadianceClamp;
+    pc[5] = (float)div;
+    pc[6] = feedback_w;
+    pc[7] = IsSora1st() ? 0.f : (IsSora2nd() ? 1.f : 2.f);
+    pc[8] = far_feedback_w;
+    pc[9] = kVbgiFireflyK;
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->vbgi_radiance_far_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
+  }
   cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
 
   // Mips 1-4: 2x2 box filter of the level above.
@@ -13366,6 +13449,7 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
   }
 
   falcom_world::rtao::NullComputeSlots(cl, 12, 1, 1);
+  if (far_fb) falcom_world::rtao::NullComputeSlots(cl, 14, 1, 1);
   GtvbaoBarrier(cl, d->vbgi_radiance_texture, UA, SR);
   d->vbgi_radiance_frame = d->frame_index;
   static bool s_logged = false;

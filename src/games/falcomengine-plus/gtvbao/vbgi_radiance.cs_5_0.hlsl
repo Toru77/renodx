@@ -29,6 +29,10 @@ StructuredBuffer<LightIndexData>    g_lamp_tiles : register(t8);  // lightIndice
 Texture2D<float4>                   g_prev_gi    : register(t9);   // previous frame's denoised VBGI (depth size)
 Texture2D<float4>                   g_motion     : register(t10);  // RTV4 motion, texel units
 Texture2DArray<float4>              g_csm        : register(t11);  // Kai cascade shadow maps (3 layers)
+#ifdef VBGI_FAR_FEEDBACK
+Texture2D<float4>                   g_prev_far_raw   : register(t12);  // last frame's far raw GI (trace size)
+Texture2D<float4>                   g_prev_joint_raw : register(t13);  // last frame's joint raw GI (trace size)
+#endif
 SamplerState                        g_samp_point : register(s0);
 
 RWTexture2D<float4> g_radiance : register(u0);
@@ -60,12 +64,34 @@ cbuffer cb_vbgi_radiance : register(b13)
   float g_divisor;        // c5 - domain divisor (1 Full, 2 Half)
   float g_feedback_w;     // c6 - Multi-Bounce Strength x Intensity capped at 0.9; 0 = off
   float g_game_profile;   // c7 - 0 Sora 1st, 1 Sora 2nd, 2 Kai
+#ifdef VBGI_FAR_FEEDBACK
+  float g_far_feedback_w; // c8 - Far Multi-Bounce Strength x Intensity capped at 0.75
+  float g_firefly_k;      // c9 - fed-back luminance limit, x the 8-neighbour mean
+#endif
 };
 
 uint2 VbgiTexel(float2 uv, uint2 size)
 {
   return min(uint2(uv * float2(size)), size - 1u);
 }
+#ifdef VBGI_FAR_FEEDBACK
+// Scales c down so its luminance is at most g_firefly_k x the mean of its 8 neighbours, one trace texel (g_divisor) apart.
+float3 VbgiFireflyClamp(Texture2D<float4> tex, uint2 t, uint2 size)
+{
+  const float3 c = tex.Load(int3(t, 0)).rgb;
+  const int s = (int)max(g_divisor, 1.0f);
+  float sum = 0.0f;
+  [unroll] for (int y = -1; y <= 1; ++y)
+    [unroll] for (int x = -1; x <= 1; ++x)
+    {
+      if (x == 0 && y == 0) continue;
+      sum += dot(tex.Load(int3(clamp(int2(t) + int2(x, y) * s, int2(0, 0), int2(size) - 1), 0)).rgb, float3(0.2126f, 0.7152f, 0.0722f));
+    }
+  const float limit = g_firefly_k * sum * 0.125f;
+  const float l = dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+  return l > limit ? c * (limit / max(l, 1e-6f)) : c;
+}
+#endif
 
 static const float kKaiPenumbra = 2.0f;
 
@@ -208,19 +234,44 @@ void main(uint2 p : SV_DispatchThreadID)
 
   // Multi-bounce: last frame's GI at this sender (reprojected), re-emitted as light.
   float3 prev_gi = float3(0.0f, 0.0f, 0.0f);
+#ifdef VBGI_FAR_FEEDBACK
+  float far_share = 0.0f;
+  if (g_feedback_w > 0.0f || g_far_feedback_w > 0.0f) {
+#else
   if (g_feedback_w > 0.0f) {
+#endif
     float motion_px, depth_spread;
     const float2 hist_uv = CustomTAA_Reproject(uv, g_depth, g_samp_point, g_motion, g_samp_point,
                                                1.0f / float2(dw, dh), float2(1.0f, 1.0f), motion_px, depth_spread);
     if (all(hist_uv >= 0.0f) && all(hist_uv <= 1.0f)) {
       uint gw, gh;
       g_prev_gi.GetDimensions(gw, gh);
+#ifdef VBGI_FAR_FEEDBACK
+      prev_gi = VbgiFireflyClamp(g_prev_gi, VbgiTexel(hist_uv, uint2(gw, gh)), uint2(gw, gh));
+      uint rw, rh;
+      g_prev_far_raw.GetDimensions(rw, rh);
+      const int2 rt = int2(VbgiTexel(hist_uv, uint2(rw, rh)));
+      float lf = 0.0f, lj = 0.0f;
+      [unroll] for (int y = -1; y <= 1; ++y)
+        [unroll] for (int x = -1; x <= 1; ++x)
+        {
+          const int3 q = int3(clamp(rt + int2(x, y), int2(0, 0), int2(rw, rh) - 1), 0);
+          lf += dot(g_prev_far_raw.Load(q).rgb, float3(0.2126f, 0.7152f, 0.0722f));
+          lj += dot(g_prev_joint_raw.Load(q).rgb, float3(0.2126f, 0.7152f, 0.0722f));
+        }
+      far_share = saturate(lf / max(lj, 1e-6f));
+#else
       prev_gi = g_prev_gi.Load(int3(VbgiTexel(hist_uv, uint2(gw, gh)), 0)).rgb;
+#endif
     }
   }
 
   const float3 light = g_ambient_w * probe + g_lights_w * lamps + g_sun_w * sun;
   const float3 lit = light + g_emissive_w * e * (1.0f - light);
+#ifdef VBGI_FAR_FEEDBACK
+  const float3 radiance = clamp(albedo * (lit + lerp(g_feedback_w, g_far_feedback_w, far_share) * prev_gi), 0.0f, g_radiance_clamp);
+#else
   const float3 radiance = clamp(albedo * (lit + g_feedback_w * prev_gi), 0.0f, g_radiance_clamp);
+#endif
   g_radiance[p] = float4(radiance, 1.0f);
 }
