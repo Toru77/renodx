@@ -70,16 +70,11 @@ struct RtSunDispatchInputs {
   uint32_t trace_width = 0u;
   uint32_t trace_height = 0u;
   RtSunPushConstants push = {};     // sun[3] is the trace divisor
-  int debug_mode = 0;               // RT Sun Debug: 1 raw shadow, 2 pixel classes, 4 to 6 denoise views
+  int debug_mode = 0;               // RT Sun Debug: 1 raw shadow, 2 pixel classes, 4 to 6 denoise views, 7 SVGF variance
   reshade::api::resource_view motion_view = {0u};  // null: the temporal pass does not run
   bool temporal = false;
-  rtgi::RtgiTemporalPushConstants temporal_push = {};  // params and size[3] (history valid) set by the caller
   bool spatial = false;
-  int filter_type = 1;
-  int filter_radius = 2;
-  int filter_passes = 1;
-  int filter_taps = 5;
-  float filter_value_stop = 0.f;   // filter c2.w: penumbra edge stop k
+  rtgi::SvgfSettings svgf = {};  // SVGF settings (history valid set by the owner)
   bvh::DynamicTraceInputs dynamic = {};
 };
 struct RtSunDispatchResult { bool ok = false; bool debug_written = false; bool temporal_ran = false; bool filter_ran = false; };
@@ -103,7 +98,7 @@ inline RtSunDispatchResult Dispatch(reshade::api::device* device, reshade::api::
       return {};
     }
   }
-  bool debug_ready = (in.debug_mode >= 1 && in.debug_mode <= 2) || (in.debug_mode >= 4 && in.debug_mode <= 6);
+  bool debug_ready = (in.debug_mode >= 1 && in.debug_mode <= 2) || (in.debug_mode >= 4 && in.debug_mode <= 7);
   if (debug_ready && !rtgi::EnsureRtgiTextureSet(device, &data.debug, reshade::api::format::r8g8b8a8_unorm, 4u, in.full_width, in.full_height)) {
     renodx::utils::log::w("[world-rtsun] debug texture creation failed");
     debug_ready = false;
@@ -122,7 +117,6 @@ inline RtSunDispatchResult Dispatch(reshade::api::device* device, reshade::api::
                                                                   .full_height = in.full_height,
                                                                   .temporal = in.temporal && in.motion_view.handle != 0u,
                                                                   .spatial = in.spatial,
-                                                                  .filter_code = rtls::kRtlsFilterShader,
                                                                   .log_prefix = "[world-rtsun]"});
   if (!denoise.ok) return {};
 
@@ -167,8 +161,9 @@ inline RtSunDispatchResult Dispatch(reshade::api::device* device, reshade::api::
   cmd_list->barrier(data.raw.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   bvh::EndGpuTimer(cmd_list, &data.timer);
 
-  // RT Sun Debug 4 to 6 are the chain's views 4 (accumulated), 5 (history confidence) and 6 (final, after the upsample).
-  const int denoise_debug = in.debug_mode >= 4 && in.debug_mode <= 6 ? in.debug_mode : 0;
+  // RT Sun Debug 4 to 6 are the chain's views 4 (accumulated), 5 (history confidence) and 6 (final, after the upsample);
+  // RT Sun Debug 7 is the chain's SVGF variance view 11.
+  const int denoise_debug = in.debug_mode == 7 ? 11 : (in.debug_mode >= 4 && in.debug_mode <= 6 ? in.debug_mode : 0);
   const reshade::api::resource_view table_null_views[kRtSunSrvCount] = {};
   std::vector<reshade::api::descriptor_table_update> table_nulls = {
       {trace.srv_table, 0, 0, kRtSunSrvCount, kSrv, table_null_views},
@@ -191,12 +186,8 @@ inline RtSunDispatchResult Dispatch(reshade::api::device* device, reshade::api::
        .full_height = in.full_height,
        .divisor = in.push.sun[3],
        .debug_mode = denoise_debug,
-       .temporal_push = in.temporal_push,
-       .filter_type = in.filter_type,
-       .filter_radius = in.filter_radius,
-       .filter_passes = in.filter_passes,
-       .filter_taps = in.filter_taps,
-       .filter_value_stop = in.filter_value_stop,
+       .svgf = in.svgf,
+       .luminance_weights = rtgi::kSvgfLuminanceShadow,
        .upsample_intensity = 1.f,
        .upsample_char_intensity = 1.f,
        .upsample_saturation = 1.f},
@@ -204,7 +195,7 @@ inline RtSunDispatchResult Dispatch(reshade::api::device* device, reshade::api::
   // App-side tables: null contents (ReShade keeps descriptors in the table object). The CBV tables keep their view.
   device->update_descriptor_tables(static_cast<uint32_t>(table_nulls.size()), table_nulls.data());
   return {.ok = true,
-          .debug_written = trace_debug || denoised.temporal_debug || denoised.upsample_debug,
+          .debug_written = trace_debug || denoised.temporal_debug || denoised.variance_debug || denoised.upsample_debug,
           .temporal_ran = denoise.temporal,
           .filter_ran = denoise.spatial};
 }
@@ -237,10 +228,9 @@ inline std::string BuildRtSunJson(const RtSunJsonInput& in) {
   }
   out << "]},\n";
   out << "  \"spatial_filter\": {\"on\": " << (g_rtsun_spatial_enabled > 0.5f ? "true" : "false")
-      << ", \"ran\": " << (f.filter_ran ? "true" : "false") << ", \"type\": " << g_rtsun_filter_type
-      << ", \"radius\": " << g_rtsun_filter_radius << ", \"passes\": " << g_rtsun_filter_passes
-      << ", \"taps\": " << (g_rtsun_filter_type > 0.5f ? g_rtsun_filter_taps_atrous : g_rtsun_filter_taps_separable)
-      << ", \"value_stop\": " << g_rtsun_filter_value_stop << "},\n";
+      << ", \"ran\": " << (f.filter_ran ? "true" : "false") << ", \"iterations\": " << g_rtsun_svgf_iterations
+      << ", \"iterations_effective\": " << rtgi::SvgfEffectiveIterations(g_rtsun_svgf_iterations, f.divisor)
+      << ", \"luminance_edge_stop\": " << g_rtsun_svgf_luminance_edge_stop << "},\n";
   out << "  \"cascades\": {\"requested\": " << f.cascades_requested << ", \"effective\": " << f.cascades_effective
       << ", \"camera\": " << f.cascades_camera << ", \"covered_m\": " << f.covered_m
       << ", \"built_range_m\": " << f.built_range << "},\n";

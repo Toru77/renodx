@@ -33,17 +33,12 @@ inline float g_rtls_fade_start_pct = 12.5f;    // Fade Start (RTLS Distance Fade
 inline float g_rtls_fade_end_pct = 25.f;       // Fade End (RTLS Distance Fade)
 inline float g_rtls_trace_resolution = 1.f;    // Trace Resolution: 0 Full, 1 Half, 2 Quarter
 inline float g_rtls_temporal_enabled = 1.f;    // RTLS Temporal Accumulation rows
-inline float g_rtls_history_weight = 0.9f;
+inline float g_rtls_history_weight = 0.8f;
 inline float g_rtls_depth_rejection = 0.05f;
 inline float g_rtls_normal_rejection = 0.9f;
-inline float g_rtls_history_clamp = 1.f;
 inline float g_rtls_spatial_enabled = 1.f;     // RTLS Denoising rows
-inline float g_rtls_filter_type = 1.f;         // 0 separable bilateral, 1 a-trous
-inline float g_rtls_filter_radius = 2.f;
-inline float g_rtls_filter_passes = 1.f;
-inline float g_rtls_filter_taps_separable = 5.f;
-inline float g_rtls_filter_taps_atrous = 5.f;
-inline float g_rtls_filter_value_stop = 4.f;   // Penumbra Edge Stop k (spatial filter only; not in the snapshot)
+inline float g_rtls_svgf_iterations = 5.f;     // Iterations: a-trous iterations of the SVGF filter, 1..5 (not in the snapshot)
+inline float g_rtls_svgf_luminance_edge_stop = 4.f;  // Luminance Edge Stop: sigma_l of the SVGF luminance weight (not in the snapshot)
 
 enum class Reason : uint8_t { Off = 0, NotSora2nd, InputsMissing, DeferredList, RangeTooSmall, NoLights, NoKinds, PipelineFailed };
 
@@ -79,7 +74,7 @@ inline constexpr uint32_t kRtlsFlagCharacter = 64u;  // character pixels get the
 struct ParameterSnapshot {
   float samples, max_point_lights, ray_max, light_size, light_clearance, normal_bias, trace_characters, isfast;
   float point, spot, env_point, env_spot, fade_start, fade_end, trace_resolution;
-  float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug;
+  float temporal_enabled, history_weight, depth_rejection, normal_rejection, debug;
   float characters, character_normal_bias;
   bool operator==(const ParameterSnapshot&) const = default;
 };

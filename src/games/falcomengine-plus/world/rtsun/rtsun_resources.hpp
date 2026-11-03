@@ -97,4 +97,14 @@ inline void DestroyRtSunDeviceData(reshade::api::device* device) {
   g_rtsun_devices.erase(found);
 }
 
+// Releases the RT Sun textures when RT Sun is switched off; the pipelines, samplers, stats buffer and timer stay.
+inline void ReleaseRtSunTextures(reshade::api::device* device) {
+  const auto found = g_rtsun_devices.find(device);
+  if (found == g_rtsun_devices.end()) return;
+  RtSunDeviceData& data = found->second;
+  rtgi::DestroyRtgiTextureSet(device, &data.raw);
+  rtgi::DestroyRtgiTextureSet(device, &data.debug);
+  rtgi::ReleaseRtgiDenoiseTextures(device, &data.denoise);
+}
+
 }  // namespace falcom_world::rtsun

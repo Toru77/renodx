@@ -1,10 +1,12 @@
 #pragma once
 
-// RTGI GPU resources: the four compute pipelines (trace world_rtgi, temporal world_rtgi_temporal, spatial filter
-// world_rtgi_filter, upsample world_rtgi_upsample), the stats buffer, the debug texture (r8g8b8a8_unorm at the depth
-// size, created while RTGI Debug is 1 to 10), the raw GI, the history, the filter targets, the final GI and the radiance
+// RTGI GPU resources: the trace pipeline (world_rtgi), the SVGF denoise chain (world_svgf_reproject, world_svgf_variance,
+// world_svgf_atrous) and the upsample (world_rtgi_upsample), the stats buffer, the debug texture (r8g8b8a8_unorm at the depth
+// size, created while RTGI Debug is 1 to 11), the raw GI, the history, the SVGF targets, the final GI and the radiance
 // copy. Created lazily from the lighting hook (rtgi.hpp); no module mutex is held around any graphics call here.
 
+#include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -63,20 +65,26 @@ inline constexpr uint32_t kRtgiFlagGameSun = 32u;  // b12 c2.z bit: fallback sun
 inline constexpr uint32_t kRtgiFlagFeedback = 64u;  // b12 c2.z bit: add back the feedback share (c7.y) of last frame's bounce
 inline constexpr uint32_t kRtgiFlagRealRays = 128u;  // b12 c2.z bit: Extra Bounces on, extra bounce rays from c7.z
 inline constexpr uint32_t kRtgiFlagLampShadows = 256u;  // b12 c2.z bit: fallback lamp light gets a shadow ray per lamp
-// Temporal pass counters, matching RTGI_STAT_* in world_rtgi_temporal.cs_5_0.hlsl.
+// Reprojection pass counters, matching RTGI_STAT_* in world_svgf_reproject.cs_5_0.hlsl.
 inline constexpr uint32_t kRtgiStatTemporalPixels = 20u;
 inline constexpr uint32_t kRtgiStatNoHistory = 21u;
 inline constexpr uint32_t kRtgiStatResetPixels = 22u;
-// Temporal: t0 raw GI, t1 depth, t2 MRT normal, t3 motion, t4 history colour, t5 history normal; u0 history colour
-// write, u1 stats, u2 history normal write, u3 debug; s0 point, s1 linear.
-inline constexpr uint32_t kRtgiTemporalSrvCount = 6u;
-inline constexpr uint32_t kRtgiTemporalUavCount = 4u;
-inline constexpr uint32_t kRtgiTemporalSamplerCount = 2u;
-inline constexpr uint32_t kRtgiTemporalPushCount = 20u;
-// Filter: t0 depth, t1 MRT normal, t2 input; u0 output.
-inline constexpr uint32_t kRtgiFilterSrvCount = 3u;
-inline constexpr uint32_t kRtgiFilterUavCount = 1u;
-inline constexpr uint32_t kRtgiFilterPushCount = 12u;
+// SVGF (world_svgf.hlsli). Reproject: t0 raw GI, t1 depth, t2 MRT normal, t3 motion, t4 history colour, t5 history
+// moments, t6 history guide, t7 history normal; u0 colour write (or integrated), u1 stats, u2 moments write, u3 guide
+// write, u4 normal write, u5 debug; s0 point, s1 linear.
+inline constexpr uint32_t kSvgfReprojectSrvCount = 8u;
+inline constexpr uint32_t kSvgfReprojectUavCount = 6u;
+inline constexpr uint32_t kSvgfReprojectSamplerCount = 2u;
+// Variance: t0 integrated, t1 moments, t2 guide, t3 normal; u0 atrous[0], u1 debug.
+inline constexpr uint32_t kSvgfVarianceSrvCount = 4u;
+inline constexpr uint32_t kSvgfVarianceUavCount = 2u;
+// A-trous: t0 input, t1 guide, t2 normal; u0 output.
+inline constexpr uint32_t kSvgfAtrousSrvCount = 3u;
+inline constexpr uint32_t kSvgfAtrousUavCount = 1u;
+inline constexpr uint32_t kSvgfPushCount = 16u;
+inline constexpr uint32_t kSvgfMaxIterations = 5u;
+inline constexpr float kSvgfLuminanceRgb[3] = {0.2126f, 0.7152f, 0.0722f};  // RTGI and GTVBGI luminance weights
+inline constexpr float kSvgfLuminanceShadow[3] = {1.f, 1.f, 0.f};          // RT Local Shadows and RT Sun
 // Upsample: t0 depth, t1 MRT normal, t2 input, t3 G-buffer colour (Debug 7); u0 final GI, u1 debug.
 inline constexpr uint32_t kRtgiUpsampleSrvCount = 4u;
 inline constexpr uint32_t kRtgiUpsampleUavCount = 2u;
@@ -108,15 +116,20 @@ inline constexpr std::span<const std::uint8_t> kRtgiTraceShader = __world_rtgi;
 #else
 inline constexpr std::span<const std::uint8_t> kRtgiTraceShader = {};
 #endif
-#if defined(__world_rtgi_temporal_EMBED_FILE)
-inline constexpr std::span<const std::uint8_t> kRtgiTemporalShader = __world_rtgi_temporal;
+#if defined(__world_svgf_reproject_EMBED_FILE)
+inline constexpr std::span<const std::uint8_t> kSvgfReprojectShader = __world_svgf_reproject;
 #else
-inline constexpr std::span<const std::uint8_t> kRtgiTemporalShader = {};
+inline constexpr std::span<const std::uint8_t> kSvgfReprojectShader = {};
 #endif
-#if defined(__world_rtgi_filter_EMBED_FILE)
-inline constexpr std::span<const std::uint8_t> kRtgiFilterShader = __world_rtgi_filter;
+#if defined(__world_svgf_variance_EMBED_FILE)
+inline constexpr std::span<const std::uint8_t> kSvgfVarianceShader = __world_svgf_variance;
 #else
-inline constexpr std::span<const std::uint8_t> kRtgiFilterShader = {};
+inline constexpr std::span<const std::uint8_t> kSvgfVarianceShader = {};
+#endif
+#if defined(__world_svgf_atrous_EMBED_FILE)
+inline constexpr std::span<const std::uint8_t> kSvgfAtrousShader = __world_svgf_atrous;
+#else
+inline constexpr std::span<const std::uint8_t> kSvgfAtrousShader = {};
 #endif
 #if defined(__world_rtgi_upsample_EMBED_FILE)
 inline constexpr std::span<const std::uint8_t> kRtgiUpsampleShader = __world_rtgi_upsample;
@@ -148,23 +161,17 @@ static_assert(offsetof(RtgiPushConstants, size) == 16 * sizeof(float), "b12 c4 o
 static_assert(offsetof(RtgiPushConstants, shading) == 20 * sizeof(float), "b12 c5 offset");
 static_assert(offsetof(RtgiPushConstants, sun) == 24 * sizeof(float), "b12 c6 offset");
 
-// b12 for the RTGI temporal pass, matching cbuffer cb_rtgi_temporal in world_rtgi_temporal.cs_5_0.hlsl.
-struct RtgiTemporalPushConstants {
-  float params[4];    // c0: history weight, depth rejection, normal rejection, history clamp (sigma)
-  float texel[4];     // c1: full-res texel size xy, prevResolutionScale xy (1, 1)
-  float size[4];      // c2: trace width, trace height, debug mode, history valid (0 = reset)
-  float full[4];      // c3: full width, full height, trace divisor, unused
-  float reserved[4];  // c4: unused
+// b12 for the SVGF passes (reproject, variance, a-trous), matching cbuffer cb_svgf in world_svgf.hlsli.
+struct SvgfPushConstants {
+  float size[4];      // c0: trace width, trace height, full width, full height
+  float params[4];    // c1: trace divisor, debug mode (RTGI numbering), history valid (0 = reset), a-trous step (2^i, 0 otherwise)
+  float temporal[4];  // c2: alpha = 1 - History Weight, depth rejection, normal rejection, luminance edge stop sigma_l
+  float luminance[4]; // c3: luminance weights rgb, unused
 };
-static_assert(sizeof(RtgiTemporalPushConstants) == kRtgiTemporalPushCount * sizeof(float), "temporal b12 must be 20 floats");
-
-// b12 for the RTGI spatial filter, matching cbuffer cb_rtgi_filter in world_rtgi_filter.cs_5_0.hlsl.
-struct RtgiFilterPushConstants {
-  float size[4];  // c0: trace width, trace height, radius, kind (0 separable, 1 a-trous)
-  float pass[4];  // c1: direction (0 horizontal, 1 vertical, 2 2D), step, taps (odd), last pass
-  float full[4];  // c2: full width, full height, trace divisor, unused
-};
-static_assert(sizeof(RtgiFilterPushConstants) == kRtgiFilterPushCount * sizeof(float), "filter b12 must be 12 floats");
+static_assert(sizeof(SvgfPushConstants) == kSvgfPushCount * sizeof(float), "svgf b12 must be 16 floats");
+static_assert(offsetof(SvgfPushConstants, params) == 4 * sizeof(float), "svgf b12 c1 offset");
+static_assert(offsetof(SvgfPushConstants, temporal) == 8 * sizeof(float), "svgf b12 c2 offset");
+static_assert(offsetof(SvgfPushConstants, luminance) == 12 * sizeof(float), "svgf b12 c3 offset");
 
 // b12 for the RTGI upsample, matching cbuffer cb_rtgi_upsample in world_rtgi_upsample.cs_5_0.hlsl.
 struct RtgiUpsamplePushConstants {
@@ -332,21 +339,52 @@ inline bool EnsureRtgiTextureSet(reshade::api::device* device, RtgiTextureSet<Co
   return true;
 }
 
-// The objects of the shared denoise chain (temporal, spatial filter, upsample); RTGI and RT Local Shadows each own one.
+// The objects of the shared denoise chain (SVGF reproject, variance, a-trous, upsample); RTGI, RT Local Shadows, RT Sun
+// and GTVBGI each own one.
 struct RtgiDenoiseSet {
-  RtgiPipeline temporal_pipeline;
-  RtgiPipeline filter_pipeline;
+  RtgiPipeline reproject_pipeline;
+  RtgiPipeline variance_pipeline;
+  RtgiPipeline atrous_pipeline;
   RtgiPipeline upsample_pipeline;
   reshade::api::sampler point_sampler = {0u};
   reshade::api::sampler linear_sampler = {0u};
-  RtgiTextureSet<2> history_color;   // rgba16f, trace size: rgb accumulated value, a = distance (0 = invalid)
+  RtgiTextureSet<2> history_color;   // rgba16f, trace size: rgb colour, a = variance
   RtgiTextureSet<2> history_normal;  // r16g16_float, trace size: octahedral normal
-  uint32_t history_index = 0u;       // history[history_index] is read by the temporal pass; the other one is written
-  RtgiTextureSet<3> filter;          // rgba16f, trace size: F0, F1, B; created while the spatial filter is on
+  RtgiTextureSet<2> history_moments; // r32g32b32a32_float, trace size: mu1, mu2, h (history length), 0
+  RtgiTextureSet<2> history_guide;   // r32g32b32a32_float, trace size: z, dz/dx, dz/dy, dist (z = 0: no surface)
+  uint32_t history_index = 0u;       // history[history_index] is read by the reproject pass; the other one is written
+  RtgiTextureSet<1> integrated;      // rgba16f, trace size: integrated colour C' and sigma'^2 (a = -1: not traced)
+  RtgiTextureSet<2> atrous;          // rgba16f, trace size: a-trous ping-pong
   RtgiTextureSet<2> output;          // full size, the owner's format (RTGI r11g11b10_float, RTLS r8g8b8a8_unorm)
   uint32_t output_index = 0u;        // output[output_index] is the newest
-  bvh::GpuTimer timer = {};          // temporal, filter and upsample
+  uint32_t atrous_iterations = 0u;   // effective a-trous iterations of the last run
+  bvh::GpuTimer timer = {};          // reproject, variance, a-trous and upsample
 };
+
+// Per-owner SVGF settings for one dispatch (the values fed to the passes).
+struct SvgfSettings {
+  float history_weight = 0.8f;      // alpha = 1 - history_weight
+  float depth_rejection = 0.2f;
+  float normal_rejection = 0.f;
+  bool history_valid = false;       // false: reset (ResetReason != None)
+  float iterations = 5.f;           // requested a-trous iterations (1 to 5)
+  float luminance_edge_stop = 4.f;  // sigma_l
+};
+
+// Effective a-trous iterations: clamp(iterations, 1, 5) - log2(divisor), at least 1.
+inline uint32_t SvgfEffectiveIterations(float iterations, uint32_t divisor) {
+  const int requested = std::clamp(static_cast<int>(iterations + 0.5f), 1, static_cast<int>(kSvgfMaxIterations));
+  const int shift = static_cast<int>(std::bit_width(std::max(divisor, 1u))) - 1;
+  return static_cast<uint32_t>(std::max(1, requested - shift));
+}
+
+// Bytes of the denoise textures: the trace-size sets, and the full-size output (4 bytes per pixel, two sets).
+inline uint64_t RtgiDenoiseTextureBytes(const RtgiDenoiseSet& set) {
+  const auto bytes = [](const auto& s, uint32_t bpp) { return static_cast<uint64_t>(s.width) * s.height * bpp; };
+  return bytes(set.history_color, 8u * 2u) + bytes(set.history_normal, 4u * 2u) + bytes(set.history_moments, 16u * 2u)
+      + bytes(set.history_guide, 16u * 2u) + bytes(set.integrated, 8u) + bytes(set.atrous, 8u * 2u)
+      + bytes(set.output, 4u * 2u);
+}
 
 struct RtgiDeviceData {
   RtgiPipeline trace_pipeline;
@@ -389,17 +427,29 @@ inline void DestroyRtgiPipeline(reshade::api::device* device, const RtgiPipeline
   if (p.layout.handle != 0u) device->destroy_pipeline_layout(p.layout);
 }
 
-// Destroys a denoise set (DestroyRtgiDeviceData and DestroyRtlsDeviceData).
-inline void DestroyRtgiDenoiseSet(reshade::api::device* device, RtgiDenoiseSet* set) {
+// Destroys the denoise textures and the history; the pipelines, samplers and timer stay. The next run recreates them.
+inline void ReleaseRtgiDenoiseTextures(reshade::api::device* device, RtgiDenoiseSet* set) {
   DestroyRtgiTextureSet(device, &set->history_color);
   DestroyRtgiTextureSet(device, &set->history_normal);
-  DestroyRtgiTextureSet(device, &set->filter);
+  DestroyRtgiTextureSet(device, &set->history_moments);
+  DestroyRtgiTextureSet(device, &set->history_guide);
+  DestroyRtgiTextureSet(device, &set->integrated);
+  DestroyRtgiTextureSet(device, &set->atrous);
   DestroyRtgiTextureSet(device, &set->output);
+  set->history_index = 0u;
+  set->output_index = 0u;
+  set->atrous_iterations = 0u;
+}
+
+// Destroys a denoise set (DestroyRtgiDeviceData and DestroyRtlsDeviceData).
+inline void DestroyRtgiDenoiseSet(reshade::api::device* device, RtgiDenoiseSet* set) {
+  ReleaseRtgiDenoiseTextures(device, set);
   bvh::DestroyGpuTimer(&set->timer);
   if (set->point_sampler.handle != 0u) device->destroy_sampler(set->point_sampler);
   if (set->linear_sampler.handle != 0u) device->destroy_sampler(set->linear_sampler);
-  DestroyRtgiPipeline(device, set->temporal_pipeline);
-  DestroyRtgiPipeline(device, set->filter_pipeline);
+  DestroyRtgiPipeline(device, set->reproject_pipeline);
+  DestroyRtgiPipeline(device, set->variance_pipeline);
+  DestroyRtgiPipeline(device, set->atrous_pipeline);
   DestroyRtgiPipeline(device, set->upsample_pipeline);
 }
 
@@ -420,6 +470,22 @@ inline void DestroyRtgiDeviceData(reshade::api::device* device) {
   DestroyRtgiPipeline(device, data.trace_pipeline);
   DestroyRtgiPipeline(device, data.lamp_type_pipeline);
   g_rtgi_devices.erase(found);
+}
+
+// Releases the RTGI textures when RTGI is switched off; the pipelines, samplers, stats buffer and timers stay.
+inline void ReleaseRtgiTextures(reshade::api::device* device) {
+  const auto found = g_rtgi_devices.find(device);
+  if (found == g_rtgi_devices.end()) return;
+  RtgiDeviceData& data = found->second;
+  DestroyRtgiTextureSet(device, &data.debug);
+  DestroyRtgiTextureSet(device, &data.raw);
+  ReleaseRtgiDenoiseTextures(device, &data.denoise);
+  bvh::DestroyBuffer(device, &data.radiance_srv, &data.radiance_texture);
+  data.radiance_width = 0u;
+  data.radiance_height = 0u;
+  data.radiance_format = reshade::api::format::unknown;
+  data.radiance_frame = UINT64_MAX;
+  data.radiance_failed = false;
 }
 
 }  // namespace falcom_world::rtgi

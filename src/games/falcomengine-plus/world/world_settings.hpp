@@ -258,6 +258,118 @@ inline void AddSpatialRows(renodx::utils::settings::Settings* settings, const st
   });
 }
 
+// Adds the SVGF rows of RTGI, GTVBGI, RT Local Shadows and RT Sun: Temporal Accumulation (the reprojection, paper Sec. 4.1)
+// and Denoising (Iterations, the a-trous count of Sec. 4.3; Luminance Edge Stop, sigma_l of Sec. 4.4). The sigma_z and
+// sigma_n values are fixed by the paper and not shown. A plain function, as AddTemporalRows (MSVC C2326).
+struct SvgfRows {
+  const char* prefix;  // key prefix: "Rtgi", "Vbgi", "Rtls" or "RtSun"
+  const char* temporal_section;
+  const char* temporal_enabled_tooltip;
+  float* temporal_enabled;
+  float* history_weight;
+  float* depth_rejection;
+  float* normal_rejection;
+  const char* spatial_section;
+  const char* spatial_enabled_tooltip;
+  float* spatial_enabled;
+  float* iterations;
+  float* luminance_edge_stop;
+};
+inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::function<bool()>& visible,
+                        const std::function<bool()>& advanced, const SvgfRows& rows) {
+  using Setting = renodx::utils::settings::Setting;
+  using SettingValueType = renodx::utils::settings::SettingValueType;
+  const std::string prefix = rows.prefix;
+  settings->push_back(new Setting{
+      .key = prefix + "TemporalEnabled",
+      .binding = rows.temporal_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Temporal Accumulation",
+      .section = rows.temporal_section,
+      .tooltip = rows.temporal_enabled_tooltip,
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "HistoryWeight",
+      .binding = rows.history_weight,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.8f,
+      .label = "History Weight",
+      .section = rows.temporal_section,
+      .tooltip = "Weight of the reprojected history: alpha = 1 - History Weight (0 to 0.99). Higher = smoother, slower to follow changes.",
+      .min = 0.f,
+      .max = 0.99f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "DepthRejection",
+      .binding = rows.depth_rejection,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.2f,
+      .label = "Depth Rejection",
+      .section = rows.temporal_section,
+      .tooltip = "Relative distance difference allowed between history and current (0.001 to 0.2).",
+      .min = 0.001f,
+      .max = 0.2f,
+      .format = "%.3f",
+      .is_visible = visible,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "NormalRejection",
+      .binding = rows.normal_rejection,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.f,
+      .label = "Normal Rejection",
+      .section = rows.temporal_section,
+      .tooltip = "Binary normal test: a history tap counts only when the dot product of its normal with the current normal is at or above this value (0 accepts any normal facing the same way).",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "SpatialEnabled",
+      .binding = rows.spatial_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Spatial Filter",
+      .section = rows.spatial_section,
+      .tooltip = rows.spatial_enabled_tooltip,
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "SvgfIterations",
+      .binding = rows.iterations,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 5.f,
+      .label = "Iterations",
+      .section = rows.spatial_section,
+      .tooltip = "A-trous iterations of the SVGF filter (1 to 5). The effective count is this minus log2 of the trace divisor (Half: minus 1, Quarter: minus 2), at least 1; the panel shows the effective count.",
+      .min = 1.f,
+      .max = 5.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "SvgfLuminanceEdgeStop",
+      .binding = rows.luminance_edge_stop,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 4.f,
+      .label = "Luminance Edge Stop",
+      .section = rows.spatial_section,
+      .tooltip = "Sigma of the luminance edge stop, in units of the local luminance standard deviation (0.5 to 16). Lower = sharper edges, more noise; higher = smoother, more blur across edges.",
+      .min = 0.5f,
+      .max = 16.f,
+      .format = "%.1f",
+      .is_visible = [visible, advanced]() { return visible() && advanced(); },
+  });
+}
+
 inline void AddSettings(renodx::utils::settings::Settings* settings, bool supported, std::function<bool()> advanced_visible = nullptr) {
   if (settings == nullptr) return;
   g_state.supported = supported && IsDevkitPresent();
@@ -980,8 +1092,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RTGI Debug",
       .section = "RTGI",
-      .tooltip = "Views 1 to 10 are drawn over the whole image when the frame is presented, while RTGI runs and no BVH GPU debug mode is selected. Off = normal image. 1 hit classes: red = off-screen hits, green = on-screen hits, blue = hits hidden behind other geometry on screen, black = misses (fractions of the samples). 2 hit distance: mean hit distance / effective Max Ray Distance (white = far), black = no hit. Dark purple = not traced (sky, invalid normal, scaled, outside the region or beyond Fade End). 3 raw GI: this frame's traced bounce radiance before any denoising, shown as rgb / (1 + rgb). 4 accumulated GI after the temporal pass (needs RTGI Temporal on). 5 history confidence = valid history fraction (needs RTGI Temporal on). 6 final GI after the filter and the upsample, as the composite reads it. 7 applied GI: the bounce the Sora 2nd composite adds (final GI, after GI Saturation, x the surface colour x GI Intensity, Character GI Intensity on character shading pixels), shown as rgb / (1 + rgb); black at GI Intensity 0, dark purple where the surface colour was not captured this frame. The image underneath and the next frame's GI are not affected. 8 pixel classes: grey = scaled frame, dark blue = sky, magenta = no G-buffer normal, dark green = outside the BVH region, dark purple = beyond Fade End, yellow = traced but the normal faces away from the camera, cyan = traced with a hit within 1 cm, black = traced with neither. 9 Sun GI estimate: the sun bounce this pixel would give (surface colour x sun colour x the game's stored sun factor x the screen shadow mask), as rgb / (1 + rgb); black where the sun inputs are not captured. 10 Extra bounce light: only the light Extra Bounces adds (Feedback: the fed-back part; Real Extra Rays: bounces 1 and 2), after Bounce Saturation, raw and at trace resolution, as rgb / (1 + rgb) like view 3. Black with Extra Bounces Off. Not-traced pixels are dark purple, as the other views do. Compare with view 3 (all bounce light) and view 7 (what is added to the image).",
-      .labels = {"Off", "Hit classes", "Hit distance", "Raw GI", "Accumulated GI", "History confidence", "Final GI", "Applied GI", "Pixel classes", "Sun GI estimate", "Extra bounce light"},
+      .tooltip = "Views 1 to 11 are drawn over the whole image when the frame is presented, while RTGI runs and no BVH GPU debug mode is selected. Off = normal image. 1 hit classes: red = off-screen hits, green = on-screen hits, blue = hits hidden behind other geometry on screen, black = misses (fractions of the samples). 2 hit distance: mean hit distance / effective Max Ray Distance (white = far), black = no hit. Dark purple = not traced (sky, invalid normal, scaled, outside the region or beyond Fade End). 3 raw GI: this frame's traced bounce radiance before any denoising, shown as rgb / (1 + rgb). 4 accumulated GI after the temporal pass (needs RTGI Temporal on). 5 history confidence = valid history fraction (needs RTGI Temporal on). 6 final GI after the filter and the upsample, as the composite reads it. 7 applied GI: the bounce the Sora 2nd composite adds (final GI, after GI Saturation, x the surface colour x GI Intensity, Character GI Intensity on character shading pixels), shown as rgb / (1 + rgb); black at GI Intensity 0, dark purple where the surface colour was not captured this frame. The image underneath and the next frame's GI are not affected. 8 pixel classes: grey = scaled frame, dark blue = sky, magenta = no G-buffer normal, dark green = outside the BVH region, dark purple = beyond Fade End, yellow = traced but the normal faces away from the camera, cyan = traced with a hit within 1 cm, black = traced with neither. 9 Sun GI estimate: the sun bounce this pixel would give (surface colour x sun colour x the game's stored sun factor x the screen shadow mask), as rgb / (1 + rgb); black where the sun inputs are not captured. 10 Extra bounce light: only the light Extra Bounces adds (Feedback: the fed-back part; Real Extra Rays: bounces 1 and 2), after Bounce Saturation, raw and at trace resolution, as rgb / (1 + rgb) like view 3. Black with Extra Bounces Off. Not-traced pixels are dark purple, as the other views do. Compare with view 3 (all bounce light) and view 7 (what is added to the image). 11 SVGF variance (needs RTGI Denoising on): grey = sigma / (1 + sigma) of the luminance variance the a-trous filter steers by; blue = 1 where the history is shorter than 4 frames.",
+      .labels = {"Off", "Hit classes", "Hit distance", "Raw GI", "Accumulated GI", "History confidence", "Final GI", "Applied GI", "Pixel classes", "Sun GI estimate", "Extra bounce light", "SVGF variance"},
       .is_visible = advanced,
   });
   settings->push_back(new Setting{
@@ -1242,34 +1354,18 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_enabled = []() { return rtgi::g_rtgi_dynamic_lights > 0.5f; },
       .is_visible = visible,
   });
-  AddTemporalRows(settings, visible, {.prefix = "Rtgi",
-                                      .section = "RTGI Temporal Accumulation",
-                                      .enabled_tooltip = "Reprojects the previous frame GI with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
-                                      .enabled = &rtgi::g_rtgi_temporal_enabled,
-                                      .enabled_default = 1.f,
-                                      .history_weight = &rtgi::g_rtgi_history_weight,
-                                      .history_weight_default = 0.95f,
-                                      .depth_rejection = &rtgi::g_rtgi_depth_rejection,
-                                      .depth_rejection_default = 0.2f,
-                                      .normal_rejection = &rtgi::g_rtgi_normal_rejection,
-                                      .normal_rejection_default = 0.f,
-                                      .history_clamp = &rtgi::g_rtgi_history_clamp,
-                                      .history_clamp_default = 1.f});
-  AddSpatialRows(settings, visible, {.prefix = "Rtgi",
-                                     .section = "RTGI Denoising",
-                                     .enabled_tooltip = "Denoises the RTGI output at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered GI. Off = no filter.",
-                                     .enabled = &rtgi::g_rtgi_spatial_enabled,
-                                     .enabled_default = 1.f,
-                                     .filter_type = &rtgi::g_rtgi_filter_type,
-                                     .filter_type_default = 1.f,
-                                     .filter_radius = &rtgi::g_rtgi_filter_radius,
-                                     .filter_radius_default = 8.f,
-                                     .filter_passes = &rtgi::g_rtgi_filter_passes,
-                                     .filter_passes_default = 4.f,
-                                     .taps_separable = &rtgi::g_rtgi_filter_taps_separable,
-                                     .taps_separable_default = 9.f,
-                                     .taps_atrous = &rtgi::g_rtgi_filter_taps_atrous,
-                                     .taps_atrous_default = 9.f});
+  AddSvgfRows(settings, visible, advanced, {.prefix = "Rtgi",
+                                            .temporal_section = "RTGI Temporal Accumulation",
+                                            .temporal_enabled_tooltip = "Reprojects the previous frame GI with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
+                                            .temporal_enabled = &rtgi::g_rtgi_temporal_enabled,
+                                            .history_weight = &rtgi::g_rtgi_history_weight,
+                                            .depth_rejection = &rtgi::g_rtgi_depth_rejection,
+                                            .normal_rejection = &rtgi::g_rtgi_normal_rejection,
+                                            .spatial_section = "RTGI Denoising",
+                                            .spatial_enabled_tooltip = "Denoises the RTGI output at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered GI. Off = no filter.",
+                                            .spatial_enabled = &rtgi::g_rtgi_spatial_enabled,
+                                            .iterations = &rtgi::g_rtgi_svgf_iterations,
+                                            .luminance_edge_stop = &rtgi::g_rtgi_svgf_luminance_edge_stop});
   settings->push_back(new Setting{
       .key = "RtgiFadeStartPct",
       .binding = &rtgi::g_rtgi_fade_start_pct,
@@ -1327,8 +1423,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RTLS Debug",
       .section = "RT Local Shadows",
-      .tooltip = "Session only (not saved). 1 shadow term (red point, green spot, blue coverage), 2 lamps lighting the pixel (white = 10), 3 red = lamps over the budget, green = lamps traced, 4 red = rays blocked within 0.5 m of the lamp, green = all blocked rays, 5 pixel classes (grey scaled, dark blue sky, magenta no normal, olive character, dark green outside the region, dark purple beyond Fade End, white traced with lamps, black traced without). Dark purple = not traced. 6 accumulated term after the temporal pass, 7 history confidence (both need RTLS Temporal on), 8 final term after the filter and the upsample (the value t38 holds); 6 and 8 show x / (1 + x) of the shadow term, so a full shadow reads 0.5.",
-      .labels = {"Off", "Raw shadow", "Lamps per pixel", "Traced / over budget", "Blocked near lamp", "Pixel classes", "Accumulated", "History confidence", "Final"},
+      .tooltip = "Session only (not saved). 1 shadow term (red point, green spot, blue coverage), 2 lamps lighting the pixel (white = 10), 3 red = lamps over the budget, green = lamps traced, 4 red = rays blocked within 0.5 m of the lamp, green = all blocked rays, 5 pixel classes (grey scaled, dark blue sky, magenta no normal, olive character, dark green outside the region, dark purple beyond Fade End, white traced with lamps, black traced without). Dark purple = not traced. 6 accumulated term after the temporal pass, 7 history confidence (both need RTLS Temporal on), 8 final term after the filter and the upsample (the value t38 holds); 6 and 8 show x / (1 + x) of the shadow term, so a full shadow reads 0.5. 9 SVGF variance (needs RT Local Shadows Denoising on): grey = sigma / (1 + sigma) of the luminance variance the a-trous filter steers by; blue = 1 where the history is shorter than 4 frames.",
+      .labels = {"Off", "Raw shadow", "Lamps per pixel", "Traced / over budget", "Blocked near lamp", "Pixel classes", "Accumulated", "History confidence", "Final", "SVGF variance"},
       .is_visible = advanced,
   });
   settings->push_back(new Setting{
@@ -1542,48 +1638,18 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RT Local Shadows",
       .is_visible = visible,
   });
-  AddTemporalRows(settings, visible, {.prefix = "Rtls",
-                                      .section = "RTLS Temporal Accumulation",
-                                      .enabled_tooltip = "Reprojects the previous frame's RT local shadow term with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
-                                      .enabled = &rtls::g_rtls_temporal_enabled,
-                                      .enabled_default = 1.f,
-                                      .history_weight = &rtls::g_rtls_history_weight,
-                                      .history_weight_default = 0.9f,
-                                      .depth_rejection = &rtls::g_rtls_depth_rejection,
-                                      .depth_rejection_default = 0.2f,
-                                      .normal_rejection = &rtls::g_rtls_normal_rejection,
-                                      .normal_rejection_default = 0.f,
-                                      .history_clamp = &rtls::g_rtls_history_clamp,
-                                      .history_clamp_default = 1.f});
-  AddSpatialRows(settings, visible, {.prefix = "Rtls",
-                                     .section = "RTLS Denoising",
-                                     .enabled_tooltip = "Denoises the RT local shadow term at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered term. Off = no filter.",
-                                     .enabled = &rtls::g_rtls_spatial_enabled,
-                                     .enabled_default = 1.f,
-                                     .filter_type = &rtls::g_rtls_filter_type,
-                                     .filter_type_default = 1.f,
-                                     .filter_radius = &rtls::g_rtls_filter_radius,
-                                     .filter_radius_default = 2.f,
-                                     .filter_passes = &rtls::g_rtls_filter_passes,
-                                     .filter_passes_default = 4.f,
-                                     .taps_separable = &rtls::g_rtls_filter_taps_separable,
-                                     .taps_separable_default = 9.f,
-                                     .taps_atrous = &rtls::g_rtls_filter_taps_atrous,
-                                     .taps_atrous_default = 9.f});
-  settings->push_back(new Setting{
-      .key = "RtlsFilterValueStop",
-      .binding = &rtls::g_rtls_filter_value_stop,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 0.f,
-      .label = "Penumbra Edge Stop",
-      .section = "RTLS Denoising",
-      .tooltip = "Keeps shadow edges sharp in the spatial filter: taps whose shadow value differs from the centre count less (weight exp(-k x difference)). 0 = off (depth and normal edges only, as before). Higher = sharper but noisier penumbrae.",
-      .min = 0.f,
-      .max = 32.f,
-      .format = "%.1f",
-      .is_enabled = []() { return rtls::g_rtls_spatial_enabled > 0.5f; },
-      .is_visible = visible,
-  });
+  AddSvgfRows(settings, visible, advanced, {.prefix = "Rtls",
+                                            .temporal_section = "RTLS Temporal Accumulation",
+                                            .temporal_enabled_tooltip = "Reprojects the previous frame's RT local shadow term with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
+                                            .temporal_enabled = &rtls::g_rtls_temporal_enabled,
+                                            .history_weight = &rtls::g_rtls_history_weight,
+                                            .depth_rejection = &rtls::g_rtls_depth_rejection,
+                                            .normal_rejection = &rtls::g_rtls_normal_rejection,
+                                            .spatial_section = "RTLS Denoising",
+                                            .spatial_enabled_tooltip = "Denoises the RT local shadow term at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered term. Off = no filter.",
+                                            .spatial_enabled = &rtls::g_rtls_spatial_enabled,
+                                            .iterations = &rtls::g_rtls_svgf_iterations,
+                                            .luminance_edge_stop = &rtls::g_rtls_svgf_luminance_edge_stop});
   settings->push_back(new Setting{
       .key = "RtlsFadeStartPct",
       .binding = &rtls::g_rtls_fade_start_pct,
@@ -1638,8 +1704,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RT Sun Debug",
       .section = "RT Sun Shadows",
-      .tooltip = "Session only (not saved). 1 raw sun term (grey = shadow x cascade weight). 2 pixel classes (grey scaled, dark blue sky, magenta no normal, olive character, dark green outside the region, dark purple beyond the cascade range, white traced). 3 unused. 4 accumulated term after the temporal pass, 5 history confidence (both need RT Sun Temporal Accumulation on), 6 final denoised term (the value the lighting shader reads).",
-      .labels = {"Off", "Raw shadow", "Pixel classes", "Unused", "Accumulated", "History confidence", "Final"},
+      .tooltip = "Session only (not saved). 1 raw sun term (grey = shadow x cascade weight). 2 pixel classes (grey scaled, dark blue sky, magenta no normal, olive character, dark green outside the region, dark purple beyond the cascade range, white traced). 3 unused. 4 accumulated term after the temporal pass, 5 history confidence (both need RT Sun Temporal Accumulation on), 6 final denoised term (the value the lighting shader reads). 7 SVGF variance (needs RT Sun Denoising on): grey = sigma / (1 + sigma) of the luminance variance the a-trous filter steers by; blue = 1 where the history is shorter than 4 frames.",
+      .labels = {"Off", "Raw shadow", "Pixel classes", "Unused", "Accumulated", "History confidence", "Final", "SVGF variance"},
       .is_visible = advanced,
   });
   settings->push_back(new Setting{
@@ -1832,49 +1898,18 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .labels = {"Full", "Half", "Quarter"},
       .is_visible = visible,
   });
-  AddTemporalRows(settings, visible, {.prefix = "RtSun",
-                                      .section = "RT Sun Temporal Accumulation",
-                                      .enabled_tooltip = "Reprojects the previous frame's RT sun term with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes (Trace Resolution, Cascade Range, samples and the other trace settings).",
-                                      .enabled = &rtsun::g_rtsun_temporal_enabled,
-                                      .enabled_default = 1.f,
-                                      .history_weight = &rtsun::g_rtsun_history_weight,
-                                      .history_weight_default = 0.9f,
-                                      .depth_rejection = &rtsun::g_rtsun_depth_rejection,
-                                      .depth_rejection_default = 0.2f,
-                                      .normal_rejection = &rtsun::g_rtsun_normal_rejection,
-                                      .normal_rejection_default = 0.f,
-                                      .history_clamp = &rtsun::g_rtsun_history_clamp,
-                                      .history_clamp_default = 1.f});
-  AddSpatialRows(settings, visible, {.prefix = "RtSun",
-                                     .section = "RT Sun Denoising",
-                                     .enabled_tooltip = "Denoises the RT sun term at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered term. Off = no filter.",
-                                     .enabled = &rtsun::g_rtsun_spatial_enabled,
-                                     .enabled_default = 1.f,
-                                     .filter_type = &rtsun::g_rtsun_filter_type,
-                                     .filter_type_default = 1.f,
-                                     .filter_radius = &rtsun::g_rtsun_filter_radius,
-                                     .filter_radius_default = 2.f,
-                                     .filter_passes = &rtsun::g_rtsun_filter_passes,
-                                     .filter_passes_default = 4.f,
-                                     .taps_separable = &rtsun::g_rtsun_filter_taps_separable,
-                                     .taps_separable_default = 9.f,
-                                     .taps_atrous = &rtsun::g_rtsun_filter_taps_atrous,
-                                     .taps_atrous_default = 9.f});
-  // The shared filter's edge stop uses x and y; the sun writes y = 0, so the stop effectively acts on x (the shadow).
-  settings->push_back(new Setting{
-      .key = "RtSunFilterValueStop",
-      .binding = &rtsun::g_rtsun_filter_value_stop,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 4.f,
-      .label = "Penumbra Edge Stop",
-      .section = "RT Sun Denoising",
-      .tooltip = "Keeps shadow edges sharp in the spatial filter: taps whose shadow value differs from the centre count less (weight exp(-k x difference)). 0 = off (depth and normal edges only). Higher = sharper but noisier penumbrae.",
-      .min = 0.f,
-      .max = 32.f,
-      .format = "%.1f",
-      .is_enabled = []() { return rtsun::g_rtsun_spatial_enabled > 0.5f; },
-      .is_visible = visible,
-  });
+  AddSvgfRows(settings, visible, advanced, {.prefix = "RtSun",
+                                            .temporal_section = "RT Sun Temporal Accumulation",
+                                            .temporal_enabled_tooltip = "Reprojects the previous frame's RT sun term with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes (Trace Resolution, Cascade Range, samples and the other trace settings).",
+                                            .temporal_enabled = &rtsun::g_rtsun_temporal_enabled,
+                                            .history_weight = &rtsun::g_rtsun_history_weight,
+                                            .depth_rejection = &rtsun::g_rtsun_depth_rejection,
+                                            .normal_rejection = &rtsun::g_rtsun_normal_rejection,
+                                            .spatial_section = "RT Sun Denoising",
+                                            .spatial_enabled_tooltip = "Denoises the RT sun term at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered term. Off = no filter.",
+                                            .spatial_enabled = &rtsun::g_rtsun_spatial_enabled,
+                                            .iterations = &rtsun::g_rtsun_svgf_iterations,
+                                            .luminance_edge_stop = &rtsun::g_rtsun_svgf_luminance_edge_stop});
 }
 
 }  // namespace falcom_world

@@ -923,16 +923,12 @@ static float g_gtvbao_filter_taps_separable = 5.f;
 static float g_gtvbao_filter_taps_atrous = 5.f;
 static float g_gtvbao_filter_passes_lowres = 1.f;
 static float g_vbgi_temporal_enabled = 1.f;
-static float g_vbgi_history_weight = 0.9f;
+static float g_vbgi_history_weight = 0.8f;
 static float g_vbgi_depth_rejection = 0.05f;
 static float g_vbgi_normal_rejection = 0.9f;
-static float g_vbgi_history_clamp = 1.f;
 static float g_vbgi_spatial_enabled = 1.f;
-static float g_vbgi_filter_type = 1.f;
-static float g_vbgi_filter_radius = 2.f;
-static float g_vbgi_filter_passes = 1.f;
-static float g_vbgi_filter_taps_separable = 5.f;
-static float g_vbgi_filter_taps_atrous = 5.f;
+static float g_vbgi_svgf_iterations = 5.f;
+static float g_vbgi_svgf_luminance_edge_stop = 4.f;
 static float g_gtvbao_debug_ui = 0.f;  // GTVBAODebugMode index into kGtvbaoDebugModes
 constexpr int kGtvbaoDebugModes[7] = {0, 1, 22, 23, 24, 25, 26};
 // VBGI Debug View row (0=Off, 1..6) maps to GTVBAO debug modes 30..35 while g_vbgi_enabled.
@@ -1054,7 +1050,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool vbgi_temporal_last = false;
   uint64_t vbgi_last_frame = UINT64_MAX;
   bool vbgi_prev_params_valid = false;
-  std::array<float, 18> vbgi_prev_params = {};
+  std::array<float, 17> vbgi_prev_params = {};
   // -- VBGI far field (one candidate per texel, resolve into the joint raw GI) --
   reshade::api::pipeline_layout vbgi_far_main_layout = {};  // far main variant: 5 SRVs, 5 UAVs, 56-float push
   reshade::api::pipeline vbgi_far_main_pipeline = {};
@@ -9285,7 +9281,10 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
   frame.input_reason = rtao::Reason::Off;  // set again only by a failing guard this call
   frame.isfast_unavailable = false;
   shader_injection.rtls_flags = 0.f;  // set again below: requested (contact march off), and bound when this draw gets the term
-  if (!rtls::RtlsRequested()) return;
+  if (!rtls::RtlsRequested()) {
+    rtls::ReleaseRtlsTextures(cmd_list->get_device());
+    return;
+  }
   shader_injection.rtls_flags = static_cast<float>(rtls::kRtlsFlagRequested);
   if (!IsSora2nd()) {
     frame.reason = rtls::Reason::NotSora2nd;
@@ -9386,7 +9385,7 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
       rtls::g_rtls_light_clearance, rtls::g_rtls_normal_bias, rtls::g_rtls_trace_characters, rtls::g_rtls_isfast,
       rtls::g_rtls_point, rtls::g_rtls_spot, rtls::g_rtls_env_point, rtls::g_rtls_env_spot, rtls::g_rtls_fade_start_pct,
       rtls::g_rtls_fade_end_pct, rtls::g_rtls_trace_resolution, rtls::g_rtls_temporal_enabled, rtls::g_rtls_history_weight,
-      rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection, rtls::g_rtls_history_clamp, rtls::g_rtls_debug, rtls::g_rtls_characters, rtls::g_rtls_character_normal_bias};
+      rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection, rtls::g_rtls_debug, rtls::g_rtls_characters, rtls::g_rtls_character_normal_bias};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;
@@ -9428,16 +9427,9 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
       .debug_mode = static_cast<int>(rtls::g_rtls_debug),
       .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
       .temporal = temporal_on,
-      .temporal_push = {.params = {rtls::g_rtls_history_weight, rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection,
-                                   rtls::g_rtls_history_clamp},
-                        .size = {0.f, 0.f, 0.f, reset == rtao::ResetReason::None ? 1.f : 0.f}},
       .spatial = rtls::g_rtls_spatial_enabled > 0.5f,
-      .filter_type = static_cast<int>(rtls::g_rtls_filter_type),
-      .filter_radius = static_cast<int>(rtls::g_rtls_filter_radius),
-      .filter_passes = static_cast<int>(rtls::g_rtls_filter_passes),
-      .filter_taps = static_cast<int>(rtls::g_rtls_filter_type > 0.5f ? rtls::g_rtls_filter_taps_atrous
-                                                                     : rtls::g_rtls_filter_taps_separable),
-      .filter_value_stop = rtls::g_rtls_filter_value_stop};
+      .svgf = {rtls::g_rtls_history_weight, rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection,
+               reset == rtao::ResetReason::None, rtls::g_rtls_svgf_iterations, rtls::g_rtls_svgf_luminance_edge_stop}};
   if (rtls::g_rtls_trace_characters > 0.5f) {
     in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
   }
@@ -9464,10 +9456,7 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
   frame.isfast_used = isfast_used;
   frame.texture_bytes = static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
       + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
-      + static_cast<uint64_t>(rd.denoise.history_color.width) * rd.denoise.history_color.height * 8u * 2u
-      + static_cast<uint64_t>(rd.denoise.history_normal.width) * rd.denoise.history_normal.height * 4u * 2u
-      + static_cast<uint64_t>(rd.denoise.filter.width) * rd.denoise.filter.height * 8u * 3u
-      + static_cast<uint64_t>(rd.denoise.output.width) * rd.denoise.output.height * 4u * 2u
+      + rtgi::RtgiDenoiseTextureBytes(rd.denoise)
       + sizeof(uint32_t) * rtls::kRtlsStatsCount;
   push_rtls();
 }
@@ -9484,7 +9473,10 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
   frame.input_reason = rtao::Reason::Off;  // set again only by a failing guard this call
   frame.isfast_unavailable = false;
   shader_injection.rtsun_flags = 0.f;  // set again by push_rtsun when this lighting draw gets the term
-  if (!rtsun::RtSunRequested()) return;
+  if (!rtsun::RtSunRequested()) {
+    rtsun::ReleaseRtSunTextures(cmd_list->get_device());
+    return;
+  }
   if (!IsSora2nd()) {
     frame.reason = rtsun::Reason::NotSora2nd;
     return;
@@ -9583,7 +9575,7 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
       rtsun::g_rtsun_cascade_range, rtsun::g_rtsun_samples, rtsun::g_rtsun_ray_max, rtsun::g_rtsun_light_size,
       rtsun::g_rtsun_normal_bias, rtsun::g_rtsun_trace_characters, rtsun::g_rtsun_isfast, rtsun::g_rtsun_trace_resolution,
       rtsun::g_rtsun_temporal_enabled, rtsun::g_rtsun_history_weight, rtsun::g_rtsun_depth_rejection,
-      rtsun::g_rtsun_normal_rejection, rtsun::g_rtsun_history_clamp, rtsun::g_rtsun_debug,
+      rtsun::g_rtsun_normal_rejection, rtsun::g_rtsun_debug,
       rtsun::g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias, rtsun::g_rtsun_foliage_intensity};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
@@ -9625,16 +9617,9 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
       .debug_mode = static_cast<int>(rtsun::g_rtsun_debug),
       .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
       .temporal = temporal_on,
-      .temporal_push = {.params = {rtsun::g_rtsun_history_weight, rtsun::g_rtsun_depth_rejection, rtsun::g_rtsun_normal_rejection,
-                                   rtsun::g_rtsun_history_clamp},
-                        .size = {0.f, 0.f, 0.f, reset == rtao::ResetReason::None ? 1.f : 0.f}},
       .spatial = rtsun::g_rtsun_spatial_enabled > 0.5f,
-      .filter_type = static_cast<int>(rtsun::g_rtsun_filter_type),
-      .filter_radius = static_cast<int>(rtsun::g_rtsun_filter_radius),
-      .filter_passes = static_cast<int>(rtsun::g_rtsun_filter_passes),
-      .filter_taps = static_cast<int>(rtsun::g_rtsun_filter_type > 0.5f ? rtsun::g_rtsun_filter_taps_atrous
-                                                                       : rtsun::g_rtsun_filter_taps_separable),
-      .filter_value_stop = rtsun::g_rtsun_filter_value_stop,
+      .svgf = {rtsun::g_rtsun_history_weight, rtsun::g_rtsun_depth_rejection, rtsun::g_rtsun_normal_rejection,
+               reset == rtao::ResetReason::None, rtsun::g_rtsun_svgf_iterations, rtsun::g_rtsun_svgf_luminance_edge_stop},
   };
   if (rtsun::g_rtsun_trace_characters > 0.5f) {
     in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
@@ -9659,10 +9644,7 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
   frame.isfast_used = isfast_used;
   frame.texture_bytes = static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
       + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
-      + static_cast<uint64_t>(rd.denoise.history_color.width) * rd.denoise.history_color.height * 8u * 2u
-      + static_cast<uint64_t>(rd.denoise.history_normal.width) * rd.denoise.history_normal.height * 4u * 2u
-      + static_cast<uint64_t>(rd.denoise.filter.width) * rd.denoise.filter.height * 8u * 3u
-      + static_cast<uint64_t>(rd.denoise.output.width) * rd.denoise.output.height * 4u * 2u
+      + falcom_world::rtgi::RtgiDenoiseTextureBytes(rd.denoise)
       + sizeof(uint32_t) * rtsun::kRtSunStatsCount;
   push_rtsun();
 }
@@ -9678,8 +9660,12 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.producing = false;
   frame.reason = rtgi::Reason::Off;
   shader_injection.rtgi_gi_bound = 0.f;  // set again by push_gi when this lighting draw gets the bounce
-  if (rtgi::g_rtgi_enabled < 0.5f) return;
+  if (rtgi::g_rtgi_enabled < 0.5f) {
+    rtgi::ReleaseRtgiTextures(cmd_list->get_device());
+    return;
+  }
   if (!rtao::RtaoRequested()) {
+    rtgi::ReleaseRtgiTextures(cmd_list->get_device());
     frame.reason = rtgi::Reason::RtaoOff;
     return;
   }
@@ -9747,7 +9733,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       rtgi::g_rtgi_samples, rtgi::g_rtgi_ray_max, rtao::g_rtao_normal_bias, rtgi::g_rtgi_trace_resolution, rtao::g_rtao_isfast,
       rtgi::g_rtgi_fade_start_pct, rtgi::g_rtgi_fade_end_pct, rtgi::g_rtgi_radiance_clamp, rtgi::g_rtgi_ambient,
       rtgi::g_rtgi_temporal_enabled, rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
-      rtgi::g_rtgi_history_clamp, rtgi::g_rtgi_debug, rtgi::g_rtgi_sun_distance, rtgi::g_rtgi_trace_characters,
+      rtgi::g_rtgi_debug, rtgi::g_rtgi_sun_distance, rtgi::g_rtgi_trace_characters,
       rtgi::g_rtgi_sun_casters_only, rtgi::g_rtgi_sun_contribution, rtgi::g_rtgi_fallback_no_albedo,
       rtgi::g_rtgi_dynamic_lights, rtgi::g_rtgi_dynamic_light_contribution, rtgi::g_rtgi_game_sun, rtgi::g_rtgi_lamp_shadows,
       rtgi::g_rtgi_extra_bounces, rtgi::g_rtgi_feedback_strength,
@@ -9834,16 +9820,9 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       .debug_mode = static_cast<int>(rtgi::g_rtgi_debug),
       .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
       .temporal = temporal_on,
-      .temporal_push = {
-          .params = {rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
-                     rtgi::g_rtgi_history_clamp},
-          .size = {0.f, 0.f, 0.f, reset == rtao::ResetReason::None ? 1.f : 0.f},
-      },
+      .svgf = {rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
+               reset == rtao::ResetReason::None, rtgi::g_rtgi_svgf_iterations, rtgi::g_rtgi_svgf_luminance_edge_stop},
       .spatial = rtgi::g_rtgi_spatial_enabled > 0.5f,
-      .filter_type = static_cast<int>(rtgi::g_rtgi_filter_type),
-      .filter_radius = static_cast<int>(rtgi::g_rtgi_filter_radius),
-      .filter_passes = static_cast<int>(rtgi::g_rtgi_filter_passes),
-      .filter_taps = static_cast<int>(rtgi::g_rtgi_filter_type > 0.5f ? rtgi::g_rtgi_filter_taps_atrous : rtgi::g_rtgi_filter_taps_separable),
       .lights = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightsRegister] : reshade::api::resource{0u},
       .light_indices = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightIndicesRegister] : reshade::api::resource{0u},
       .lights_view = dynamic_lights ? world_cl->ps_srv_view[rtgi::kLightingLightsRegister]
@@ -9896,10 +9875,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.texture_bytes = sizeof(uint32_t) * rtgi::kRtgiStatsCount
       + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
       + static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
-      + static_cast<uint64_t>(rd.denoise.history_color.width) * rd.denoise.history_color.height * 8u * 2u
-      + static_cast<uint64_t>(rd.denoise.history_normal.width) * rd.denoise.history_normal.height * 4u * 2u
-      + static_cast<uint64_t>(rd.denoise.filter.width) * rd.denoise.filter.height * 8u * 3u
-      + static_cast<uint64_t>(rd.denoise.output.width) * rd.denoise.output.height * 4u * 2u
+      + rtgi::RtgiDenoiseTextureBytes(rd.denoise)
       + (rd.radiance_texture.handle != 0u
              ? static_cast<uint64_t>(reshade::api::format_row_pitch(rd.radiance_format, rd.radiance_width)) * rd.radiance_height
              : 0u);
@@ -13706,10 +13682,10 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     if (denoise_ok) {
       const bool temporal_on = g_vbgi_temporal_enabled > 0.5f && g_cpuopt_deferred_dispatch < 0.5f;
       const bool motion_ok = temporal_on && UpdateRtMotion(dev, d, true);
-      const std::array<float, 18> params = {g_vbgi_quality_level, g_vbgi_resolution, g_vbgi_radius, g_vbgi_bitmask_thickness,
+      const std::array<float, 17> params = {g_vbgi_quality_level, g_vbgi_resolution, g_vbgi_radius, g_vbgi_bitmask_thickness,
           g_vbgi_depth_mip_offset, g_vbgi_noise_type, g_vbgi_mrt_normal, g_vbgi_ambient, g_vbgi_lights, g_vbgi_sun,
           g_vbgi_emissive, g_vbgi_backface_mode, g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
-          g_vbgi_history_clamp, shader_injection.vbgi_multibounce, g_vbgi_multibounce_strength};
+          shader_injection.vbgi_multibounce, g_vbgi_multibounce_strength};
       const bool params_changed = d->vbgi_prev_params_valid && !(params == d->vbgi_prev_params);
       d->vbgi_prev_params = params;
       d->vbgi_prev_params_valid = true;
@@ -13733,12 +13709,15 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
            .full_height = full_h,
            .temporal = motion_ok,
            .spatial = g_vbgi_spatial_enabled > 0.5f,
-           .filter_code = rtgi::kRtgiFilterShader,
            .log_prefix = "[vbgi]"});
       if (!ready.ok) {
         CSLog("vbgi", "denoise skipped: chain not ready", true);
       } else {
         std::vector<reshade::api::descriptor_table_update> table_nulls;
+        // Temporal Confidence (GTVBAO debug mode 34): the chain writes the debug view 5 (history confidence) into the
+        // GTVBAO debug texture; the texture is in shader-read state after the gather, so it goes back to unordered access.
+        const bool vbgi_conf = VbgiGtvbaoDebugMode() == 34 && d->debug_uav.handle != 0u;
+        if (vbgi_conf) GtvbaoBarrier(cl, d->debug_texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
         rtgi::DispatchRtgiDenoise(dev, cl, &d->vbgi_denoise,
             {.raw_view = far_on ? d->vbgi_far_joint.srv[0] : d->vbgi_raw_srv,
              .depth_view = d->captured_depth_srv,
@@ -13747,21 +13726,17 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
              .motion_view = d->mb_rtv4_owned_srv,
              .albedo_view = reshade::api::resource_view{0u},
              .stats_uav = d->vbgi_stats_uav,
-             .debug_uav = reshade::api::resource_view{0u},
-             .debug_texture = reshade::api::resource{0u},
+             .debug_uav = vbgi_conf ? d->debug_uav : reshade::api::resource_view{0u},
+             .debug_texture = d->debug_texture,
              .trace_width = d->vbgi_width,
              .trace_height = d->vbgi_height,
              .full_width = full_w,
              .full_height = full_h,
              .divisor = static_cast<float>(divisor),
-             .debug_mode = 0,
-             .temporal_push = {.params = {g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection, g_vbgi_history_clamp},
-                               .size = {0.f, 0.f, 0.f, reset == rtao::ResetReason::None ? 1.f : 0.f}},
-             .filter_type = g_vbgi_filter_type > 0.5f ? 1 : 0,
-             .filter_radius = static_cast<int>(g_vbgi_filter_radius),
-             .filter_passes = static_cast<int>(g_vbgi_filter_passes),
-             .filter_taps = static_cast<int>(g_vbgi_filter_type > 0.5f ? g_vbgi_filter_taps_atrous : g_vbgi_filter_taps_separable),
-             .filter_value_stop = 0.f,
+             .debug_mode = vbgi_conf ? 5 : 0,
+             .svgf = {g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
+                      reset == rtao::ResetReason::None, g_vbgi_svgf_iterations, g_vbgi_svgf_luminance_edge_stop},
+             .luminance_weights = rtgi::kSvgfLuminanceRgb,
              .upsample_intensity = 1.f,
              .upsample_char_intensity = 1.f,
              .upsample_saturation = 1.f},
@@ -13866,34 +13841,18 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                  .filter_passes_lowres = &g_gtvbao_filter_passes_lowres,
                                  .filter_passes_lowres_default = 2.f,
                                  .passes_lowres_key = "GTVBAOAtrousPassesLowRes"});
-    falcom_world::AddTemporalRows(&settings, []() { return VbgiRowVisible(); }, {.prefix = "Vbgi",
-                                  .section = "GTVBGI Temporal Accumulation",
-                                  .enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.",
-                                  .enabled = &g_vbgi_temporal_enabled,
-                                  .enabled_default = 1.f,
-                                  .history_weight = &g_vbgi_history_weight,
-                                  .history_weight_default = 0.99f,
-                                  .depth_rejection = &g_vbgi_depth_rejection,
-                                  .depth_rejection_default = 0.2f,
-                                  .normal_rejection = &g_vbgi_normal_rejection,
-                                  .normal_rejection_default = 0.5f,
-                                  .history_clamp = &g_vbgi_history_clamp,
-                                  .history_clamp_default = 0.3f});
-    falcom_world::AddSpatialRows(&settings, []() { return VbgiRowVisible(); }, {.prefix = "Vbgi",
-                                 .section = "GTVBGI Spatial Filter",
-                                 .enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.",
-                                 .enabled = &g_vbgi_spatial_enabled,
-                                 .enabled_default = 1.f,
-                                 .filter_type = &g_vbgi_filter_type,
-                                 .filter_type_default = 1.f,
-                                 .filter_radius = &g_vbgi_filter_radius,
-                                 .filter_radius_default = 8.f,
-                                 .filter_passes = &g_vbgi_filter_passes,
-                                 .filter_passes_default = 3.f,
-                                 .taps_separable = &g_vbgi_filter_taps_separable,
-                                 .taps_separable_default = 8.f,
-                                 .taps_atrous = &g_vbgi_filter_taps_atrous,
-                                 .taps_atrous_default = 8.f});
+    falcom_world::AddSvgfRows(&settings, []() { return VbgiRowVisible(); }, IsAdvancedSettingsMode, {.prefix = "Vbgi",
+                              .temporal_section = "GTVBGI Temporal Accumulation",
+                              .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.",
+                              .temporal_enabled = &g_vbgi_temporal_enabled,
+                              .history_weight = &g_vbgi_history_weight,
+                              .depth_rejection = &g_vbgi_depth_rejection,
+                              .normal_rejection = &g_vbgi_normal_rejection,
+                              .spatial_section = "GTVBGI Spatial Filter",
+                              .spatial_enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.",
+                              .spatial_enabled = &g_vbgi_spatial_enabled,
+                              .iterations = &g_vbgi_svgf_iterations,
+                              .luminance_edge_stop = &g_vbgi_svgf_luminance_edge_stop});
     falcom_world::AddSettings(&settings, IsSora2nd(), IsAdvancedSettingsMode);
   }
   falcom_world::Use(fdw_reason, IsSora2nd());

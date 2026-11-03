@@ -55,7 +55,7 @@ inline void DrawRtlsPanel() {
   if (g_rtls_spatial_enabled < 0.5f) {
     ImGui::TextDisabled("Spatial filter: off");
   } else if (frame.filter_ran) {
-    ImGui::Text("Spatial filter: on");
+    ImGui::Text("Spatial filter: on (SVGF, %u a-trous iterations)", rtgi::SvgfEffectiveIterations(g_rtls_svgf_iterations, frame.divisor));
   } else {
     ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "Spatial filter: on, not run (pipeline or target failed)");
   }

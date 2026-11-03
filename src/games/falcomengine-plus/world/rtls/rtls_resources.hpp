@@ -64,12 +64,6 @@ inline constexpr std::span<const std::uint8_t> kRtlsTraceShader = __world_rtls;
 inline constexpr std::span<const std::uint8_t> kRtlsTraceShader = {};
 #endif
 
-#if defined(__world_rtls_filter_EMBED_FILE)
-inline constexpr std::span<const std::uint8_t> kRtlsFilterShader = __world_rtls_filter;
-#else
-inline constexpr std::span<const std::uint8_t> kRtlsFilterShader = {};
-#endif
-
 // b12 for the RTLS trace, matching cbuffer cb_rtls in world_rtls.cs_5_0.hlsl (seven float4 registers).
 struct RtlsPushConstants {
   float params[4];    // c0: effective ray max (m), normal bias (m), samples per light, trace divisor (1 in M2)
@@ -110,6 +104,16 @@ inline void DestroyRtlsDeviceData(reshade::api::device* device) {
   bvh::DestroyGpuTimer(&data.timer);
   rtgi::DestroyRtgiPipeline(device, data.trace_pipeline);
   g_rtls_devices.erase(found);
+}
+
+// Releases the RTLS textures when RTLS is switched off; the pipelines, samplers, stats buffer and timer stay.
+inline void ReleaseRtlsTextures(reshade::api::device* device) {
+  const auto found = g_rtls_devices.find(device);
+  if (found == g_rtls_devices.end()) return;
+  RtlsDeviceData& data = found->second;
+  rtgi::DestroyRtgiTextureSet(device, &data.raw);
+  rtgi::DestroyRtgiTextureSet(device, &data.debug);
+  rtgi::ReleaseRtgiDenoiseTextures(device, &data.denoise);
 }
 
 }  // namespace falcom_world::rtls

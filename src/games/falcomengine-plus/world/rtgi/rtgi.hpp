@@ -1,6 +1,6 @@
 #pragma once
 
-// RTGI dispatch: the trace, the temporal pass, the spatial filter and the upsample, and the stats readback. Called
+// RTGI dispatch: the trace, the SVGF chain (reprojection, variance, a-trous) and the upsample, and the stats readback. Called
 // inline from the lighting hook (addon.cpp RunRtgiInline), which owns the guards. No module mutex is held around any
 // graphics call here.
 
@@ -93,12 +93,8 @@ struct RtgiDispatchInputs {
   int debug_mode = 0;
   reshade::api::resource_view motion_view = {0u};  // RTV4 motion; null: the temporal pass does not run
   bool temporal = false;
-  RtgiTemporalPushConstants temporal_push = {};  // params and history valid (size[3]) set by the caller
+  SvgfSettings svgf = {};  // SVGF settings (history valid set by the owner)
   bool spatial = false;
-  int filter_type = 1;    // 0 separable bilateral, 1 a-trous
-  int filter_radius = 4;
-  int filter_passes = 2;
-  int filter_taps = 5;    // samples per direction (separable) or kernel side (a-trous)
   reshade::api::resource lights = {0u};         // Sora 2nd dynamicLights_g (t11); copied for the stats request, null otherwise
   reshade::api::resource light_indices = {0u};  // Sora 2nd lightIndices_g (t12); copied for the stats request, null otherwise
   reshade::api::resource_view lights_view = {0u};         // t23 lamps (Sora 2nd dynamicLights_g); null: no lamps
@@ -130,59 +126,66 @@ struct RtgiDenoiseRequest {
   uint32_t full_height;
   bool temporal;           // Temporal on and a motion view available
   bool spatial;            // Spatial filter on
-  std::span<const std::uint8_t> filter_code;  // RTGI kRtgiFilterShader; RTLS kRtlsFilterShader (penumbra edge stop)
   const char* log_prefix;  // "[world-rtgi]" or "[world-rtls]"
 };
 
 // The passes the chain can run this frame (ok: the output exists).
 struct RtgiDenoiseReady {
   bool ok = false;
+  bool reproject = false;  // the reprojection runs (needed by the temporal and the spatial filter)
   bool temporal = false;
   bool spatial = false;
 };
 
-// Creates the chain's objects for this frame's sizes, in this order: the output (full size), the temporal pipeline,
-// history and samplers when requested, the spatial filter pipeline and targets when requested. A new or resized
-// history starts at index 0 (all invalid). The owner ensures the upsample pipeline itself (kRtgiUpsamplePipelineDesc).
+// Creates the chain's objects for this frame's sizes, in this order: the output (full size), the reprojection pipeline,
+// history (colour, normal, moments, guide) and samplers when requested, the variance and a-trous pipelines and the
+// integrated and a-trous targets when the spatial filter is requested. A new or resized history starts at index 0 (all
+// invalid). The owner ensures the upsample pipeline itself (kRtgiUpsamplePipelineDesc).
 inline RtgiDenoiseReady EnsureRtgiDenoise(reshade::api::device* device, RtgiDenoiseSet* set, const RtgiDenoiseRequest& request) {
   if (!EnsureRtgiTextureSet(device, &set->output, request.output_format, request.output_bytes_per_pixel, request.full_width,
                             request.full_height)) {
     renodx::utils::log::w(request.log_prefix, " final texture creation failed");
     return {};
   }
-  bool temporal_run = request.temporal
-      && EnsureRtgiPipeline(device, &set->temporal_pipeline, {.srv_count = kRtgiTemporalSrvCount, .uav_count = kRtgiTemporalUavCount,
-                                                              .sampler_count = kRtgiTemporalSamplerCount, .push_count = kRtgiTemporalPushCount,
-                                                              .code = kRtgiTemporalShader, .name = "temporal"});
-  if (temporal_run) {
+  bool reproject_run = (request.temporal || request.spatial)
+      && EnsureRtgiPipeline(device, &set->reproject_pipeline, {.srv_count = kSvgfReprojectSrvCount, .uav_count = kSvgfReprojectUavCount,
+                                                              .sampler_count = kSvgfReprojectSamplerCount, .push_count = kSvgfPushCount,
+                                                              .code = kSvgfReprojectShader, .name = "reproject"});
+  if (reproject_run) {
     const bool history_recreated = set->history_color.texture[0].handle == 0u || set->history_color.width != request.trace_width
         || set->history_color.height != request.trace_height;
-    temporal_run = EnsureRtgiTextureSet(device, &set->history_color, reshade::api::format::r16g16b16a16_float, 8u, request.trace_width, request.trace_height)
-        && EnsureRtgiTextureSet(device, &set->history_normal, reshade::api::format::r16g16_float, 4u, request.trace_width, request.trace_height);
-    if (!temporal_run) {
+    reproject_run = EnsureRtgiTextureSet(device, &set->history_color, reshade::api::format::r16g16b16a16_float, 8u, request.trace_width, request.trace_height)
+        && EnsureRtgiTextureSet(device, &set->history_normal, reshade::api::format::r16g16_float, 4u, request.trace_width, request.trace_height)
+        && EnsureRtgiTextureSet(device, &set->history_moments, reshade::api::format::r32g32b32a32_float, 16u, request.trace_width, request.trace_height)
+        && EnsureRtgiTextureSet(device, &set->history_guide, reshade::api::format::r32g32b32a32_float, 16u, request.trace_width, request.trace_height);
+    if (!reproject_run) {
       renodx::utils::log::w(request.log_prefix, " history texture creation failed");
     } else if (history_recreated) {
       set->history_index = 0u;
     }
   }
-  if (temporal_run && set->point_sampler.handle == 0u) {
+  if (reproject_run && set->point_sampler.handle == 0u) {
     reshade::api::sampler_desc sd = {};
     sd.filter = reshade::api::filter_mode::min_mag_mip_point;
     sd.address_u = sd.address_v = sd.address_w = reshade::api::texture_address_mode::clamp;
-    temporal_run = device->create_sampler(sd, &set->point_sampler);
+    reproject_run = device->create_sampler(sd, &set->point_sampler);
   }
-  if (temporal_run && set->linear_sampler.handle == 0u) {
+  if (reproject_run && set->linear_sampler.handle == 0u) {
     reshade::api::sampler_desc sd = {};
     sd.filter = reshade::api::filter_mode::min_mag_mip_linear;
     sd.address_u = sd.address_v = sd.address_w = reshade::api::texture_address_mode::clamp;
-    temporal_run = device->create_sampler(sd, &set->linear_sampler);
+    reproject_run = device->create_sampler(sd, &set->linear_sampler);
   }
-  const bool spatial_run = request.spatial
-      && EnsureRtgiPipeline(device, &set->filter_pipeline, {.srv_count = kRtgiFilterSrvCount, .uav_count = kRtgiFilterUavCount,
-                                                            .sampler_count = 0u, .push_count = kRtgiFilterPushCount,
-                                                            .code = request.filter_code, .name = "filter"})
-      && EnsureRtgiTextureSet(device, &set->filter, reshade::api::format::r16g16b16a16_float, 8u, request.trace_width, request.trace_height);
-  return {.ok = true, .temporal = temporal_run, .spatial = spatial_run};
+  const bool spatial_run = reproject_run && request.spatial
+      && EnsureRtgiPipeline(device, &set->variance_pipeline, {.srv_count = kSvgfVarianceSrvCount, .uav_count = kSvgfVarianceUavCount,
+                                                             .sampler_count = 0u, .push_count = kSvgfPushCount,
+                                                             .code = kSvgfVarianceShader, .name = "variance"})
+      && EnsureRtgiPipeline(device, &set->atrous_pipeline, {.srv_count = kSvgfAtrousSrvCount, .uav_count = kSvgfAtrousUavCount,
+                                                            .sampler_count = 0u, .push_count = kSvgfPushCount,
+                                                            .code = kSvgfAtrousShader, .name = "atrous"})
+      && EnsureRtgiTextureSet(device, &set->integrated, reshade::api::format::r16g16b16a16_float, 8u, request.trace_width, request.trace_height)
+      && EnsureRtgiTextureSet(device, &set->atrous, reshade::api::format::r16g16b16a16_float, 8u, request.trace_width, request.trace_height);
+  return {.ok = true, .reproject = reproject_run, .temporal = reproject_run && request.temporal, .spatial = spatial_run};
 }
 
 // The inputs of one run of the chain.
@@ -202,25 +205,24 @@ struct RtgiDenoiseInputs {
   uint32_t full_height;
   float divisor;                                // trace divisor d (1, 2 or 4)
   int debug_mode;                               // RTGI numbering: 4 accumulated, 5 history confidence, 6 and 7 upsample views
-  RtgiTemporalPushConstants temporal_push;      // params and size[3] (history valid) set by the owner
-  int filter_type;
-  int filter_radius;
-  int filter_passes;
-  int filter_taps;
-  float filter_value_stop;                      // filter c2.w: RTLS penumbra edge stop k; RTGI 0
+  SvgfSettings svgf;                            // SVGF settings of this run (history valid set by the owner)
+  const float* luminance_weights;               // rgb luminance weights of the edge stop (push c3)
   float upsample_intensity;                     // upsample c1.z (Debug 7 only)
   float upsample_char_intensity;                // upsample c1.w (Debug 7 only)
   float upsample_saturation;                    // upsample c2.x; 1 = unchanged
 };
 
 struct RtgiDenoiseResult {
-  bool temporal_debug = false;  // the temporal pass wrote the debug texture
+  bool temporal_debug = false;  // the reprojection wrote the debug texture
+  bool variance_debug = false;  // the variance pass wrote the debug texture
   bool upsample_debug = false;  // the upsample wrote the debug texture
 };
 
-// Runs temporal (reads history[history_index], writes the other one), the spatial filter (rtao::MakeFilterPlan over F0,
-// F1 and B) and the upsample into output[output_index ^ 1], which becomes the newest. Appends the null updates of its
-// own tables to *table_nulls (upsample, then temporal, then filter); the owner applies them with its own.
+// Runs the SVGF chain and the upsample into output[output_index ^ 1], which becomes the newest. The reprojection (Sec. 4.1
+// and the guide data of Sec. 4.2 and 4.4) writes integrated (spatial on) or history colour (spatial off), the moments, the
+// guide and the normal of history[history_index ^ 1], which becomes the read history. The variance (Sec. 4.2) and the
+// a-trous iterations (Sec. 4.3) run only with the reprojection. Appends the null updates of its own tables to
+// *table_nulls (upsample, then reprojection, then variance and a-trous); the owner applies them with its own.
 inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, reshade::api::command_list* cmd_list,
                                              RtgiDenoiseSet* set, const RtgiDenoiseInputs& in, const RtgiDenoiseReady& ready,
                                              std::vector<reshade::api::descriptor_table_update>* table_nulls) {
@@ -229,91 +231,132 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
   const reshade::api::descriptor_type kUav = reshade::api::descriptor_type::unordered_access_view;
   const uint32_t trace_groups_x = (in.trace_width + 7u) / 8u;
   const uint32_t trace_groups_y = (in.trace_height + 7u) / 8u;
-  const bool temporal_debug = in.debug_uav.handle != 0u && ready.temporal && (in.debug_mode == 4 || in.debug_mode == 5);
+  const bool reproject_debug = in.debug_uav.handle != 0u && ready.reproject && (in.debug_mode == 4 || in.debug_mode == 5);
+  const bool variance_debug = in.debug_uav.handle != 0u && ready.spatial && in.debug_mode == 11;
   const bool upsample_debug = in.debug_uav.handle != 0u && (in.debug_mode == 6 || in.debug_mode == 7);
+  const reshade::api::buffer_range scene_cbv = rtao::SceneCbvRange(in.scene_cbv_view);
   bvh::BeginGpuTimer(device, cmd_list, &set->timer);
+  // Push constants shared by the passes; each pass sets params[2] (history valid) and params[3] (a-trous step).
+  SvgfPushConstants push = {};
+  push.size[0] = static_cast<float>(in.trace_width);
+  push.size[1] = static_cast<float>(in.trace_height);
+  push.size[2] = static_cast<float>(in.full_width);
+  push.size[3] = static_cast<float>(in.full_height);
+  push.params[0] = in.divisor;
+  push.params[1] = static_cast<float>(in.debug_mode);
+  push.temporal[0] = 1.f - in.svgf.history_weight;  // alpha
+  push.temporal[1] = in.svgf.depth_rejection;
+  push.temporal[2] = in.svgf.normal_rejection;
+  push.temporal[3] = in.svgf.luminance_edge_stop;  // sigma_l
+  push.luminance[0] = in.luminance_weights[0];
+  push.luminance[1] = in.luminance_weights[1];
+  push.luminance[2] = in.luminance_weights[2];
   reshade::api::resource_view input = in.raw_view;
-  // Temporal: reads history[history_index], writes the other one; that written history is the pass output.
-  if (ready.temporal) {
-    const RtgiPipeline& temporal = set->temporal_pipeline;
-    const uint32_t read = set->history_index;
-    const uint32_t write = set->history_index ^ 1u;
-    const reshade::api::resource_view temporal_srvs[kRtgiTemporalSrvCount] = {
-        in.raw_view, in.depth_view, in.mrt_normal_view, in.motion_view, set->history_color.srv[read], set->history_normal.srv[read]};
-    const reshade::api::resource_view temporal_uavs[kRtgiTemporalUavCount] = {
-        set->history_color.uav[write], in.stats_uav, set->history_normal.uav[write],
-        temporal_debug ? in.debug_uav : reshade::api::resource_view{0u}};
-    const reshade::api::sampler samplers[kRtgiTemporalSamplerCount] = {set->point_sampler, set->linear_sampler};
-    const reshade::api::buffer_range scene_cbv = rtao::SceneCbvRange(in.scene_cbv_view);
-    reshade::api::descriptor_table_update temporal_updates[4] = {
-        {temporal.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
-        {temporal.srv_table, 0, 0, kRtgiTemporalSrvCount, kSrv, temporal_srvs},
-        {temporal.uav_table, 0, 0, kRtgiTemporalUavCount, kUav, temporal_uavs},
-        {temporal.sampler_table, 0, 0, kRtgiTemporalSamplerCount, reshade::api::descriptor_type::sampler, samplers},
+  const uint32_t read = set->history_index;
+  const uint32_t write = set->history_index ^ 1u;
+
+  // Reprojection: reads history[read], writes history[write] (and integrated when the spatial filter runs).
+  if (ready.reproject) {
+    const RtgiPipeline& reproject = set->reproject_pipeline;
+    const reshade::api::resource_view reproject_srvs[kSvgfReprojectSrvCount] = {
+        in.raw_view, in.depth_view, in.mrt_normal_view, in.motion_view, set->history_color.srv[read],
+        set->history_moments.srv[read], set->history_guide.srv[read], set->history_normal.srv[read]};
+    const reshade::api::resource_view reproject_uavs[kSvgfReprojectUavCount] = {
+        ready.spatial ? set->integrated.uav[0] : set->history_color.uav[write], in.stats_uav, set->history_moments.uav[write],
+        set->history_guide.uav[write], set->history_normal.uav[write],
+        reproject_debug ? in.debug_uav : reshade::api::resource_view{0u}};
+    const reshade::api::sampler samplers[kSvgfReprojectSamplerCount] = {set->point_sampler, set->linear_sampler};
+    reshade::api::descriptor_table_update reproject_updates[4] = {
+        {reproject.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
+        {reproject.srv_table, 0, 0, kSvgfReprojectSrvCount, kSrv, reproject_srvs},
+        {reproject.uav_table, 0, 0, kSvgfReprojectUavCount, kUav, reproject_uavs},
+        {reproject.sampler_table, 0, 0, kSvgfReprojectSamplerCount, reshade::api::descriptor_type::sampler, samplers},
     };
-    device->update_descriptor_tables(4, temporal_updates);
-    RtgiTemporalPushConstants tpush = in.temporal_push;
-    tpush.texel[0] = 1.f / static_cast<float>(in.full_width);
-    tpush.texel[1] = 1.f / static_cast<float>(in.full_height);
-    tpush.texel[2] = 1.f;  // prevResolutionScale (1, 1)
-    tpush.texel[3] = 1.f;
-    tpush.size[0] = static_cast<float>(in.trace_width);
-    tpush.size[1] = static_cast<float>(in.trace_height);
-    tpush.size[2] = static_cast<float>(in.debug_mode);
-    tpush.full[0] = static_cast<float>(in.full_width);
-    tpush.full[1] = static_cast<float>(in.full_height);
-    tpush.full[2] = in.divisor;  // trace divisor
-    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, temporal.pipeline);
-    const reshade::api::descriptor_table temporal_tables[4] = {
-        temporal.cbv_table, temporal.srv_table, temporal.uav_table, temporal.sampler_table};
-    cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, temporal.layout, 0, 4, temporal_tables);
-    cmd_list->push_constants(reshade::api::shader_stage::all_compute, temporal.layout, 4, 0, kRtgiTemporalPushCount, &tpush);
+    device->update_descriptor_tables(4, reproject_updates);
+    SvgfPushConstants rpush = push;
+    rpush.params[2] = in.svgf.history_valid && ready.temporal ? 1.f : 0.f;
+    rpush.params[3] = 0.f;
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reproject.pipeline);
+    const reshade::api::descriptor_table reproject_tables[4] = {
+        reproject.cbv_table, reproject.srv_table, reproject.uav_table, reproject.sampler_table};
+    cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, reproject.layout, 0, 4, reproject_tables);
+    cmd_list->push_constants(reshade::api::shader_stage::all_compute, reproject.layout, 4, 0, kSvgfPushCount, &rpush);
     cmd_list->dispatch(trace_groups_x, trace_groups_y, 1u);
-    rtao::NullComputeSlots(cmd_list, kRtgiTemporalSrvCount, kRtgiTemporalUavCount, kRtgiTemporalSamplerCount);
-    cmd_list->barrier(set->history_color.texture[write], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
-    cmd_list->barrier(set->history_normal.texture[write], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
-    if (temporal_debug) {
+    rtao::NullComputeSlots(cmd_list, kSvgfReprojectSrvCount, kSvgfReprojectUavCount, kSvgfReprojectSamplerCount);
+    cmd_list->barrier(ready.spatial ? set->integrated.texture[0] : set->history_color.texture[write],
+                      reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    cmd_list->barrier(set->history_moments.texture[write], reshade::api::resource_usage::unordered_access,
+                      reshade::api::resource_usage::shader_resource);
+    cmd_list->barrier(set->history_guide.texture[write], reshade::api::resource_usage::unordered_access,
+                      reshade::api::resource_usage::shader_resource);
+    cmd_list->barrier(set->history_normal.texture[write], reshade::api::resource_usage::unordered_access,
+                      reshade::api::resource_usage::shader_resource);
+    if (reproject_debug) {
       cmd_list->barrier(in.debug_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
     }
     set->history_index = write;
-    input = set->history_color.srv[write];
+    if (!ready.spatial) input = set->history_color.srv[write];
   }
 
-  // Spatial filter: the RTAO filter plan (rtao::MakeFilterPlan) over F0, F1 and B; the first pass reads the input.
+  // Variance: the 7x7 estimate while the history is short (Sec. 4.2), into atrous[0].
   if (ready.spatial) {
-    const RtgiPipeline& filter = set->filter_pipeline;
-    const rtao::FilterPlan plan = rtao::MakeFilterPlan(in.filter_type, in.filter_radius, in.filter_passes, in.filter_taps);
-    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, filter.pipeline);
-    for (uint32_t i = 0u; i < plan.pass_count; ++i) {
-      const rtao::FilterPass& pass = plan.passes[i];
-      // F0 = 0, F1 = 1, B = 2 (FilterSlot values 1..3), as rtao.hpp DispatchSpatialFilter.
-      const uint32_t out_index = static_cast<uint32_t>(pass.output) - 1u;
-      const reshade::api::resource_view filter_srvs[kRtgiFilterSrvCount] = {
-          in.depth_view, in.mrt_normal_view,
-          pass.input == rtao::FilterSlot::A ? input : set->filter.srv[static_cast<uint32_t>(pass.input) - 1u]};
-      const reshade::api::resource_view filter_uavs[kRtgiFilterUavCount] = {set->filter.uav[out_index]};
-      const reshade::api::buffer_range scene_cbv = rtao::SceneCbvRange(in.scene_cbv_view);
-      reshade::api::descriptor_table_update filter_updates[3] = {
-          {filter.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
-          {filter.srv_table, 0, 0, kRtgiFilterSrvCount, kSrv, filter_srvs},
-          {filter.uav_table, 0, 0, kRtgiFilterUavCount, kUav, filter_uavs},
-      };
-      device->update_descriptor_tables(3, filter_updates);
-      const RtgiFilterPushConstants fpush = {
-          .size = {static_cast<float>(in.trace_width), static_cast<float>(in.trace_height), static_cast<float>(in.filter_radius),
-                   plan.kind == rtao::FilterKind::Separable ? 0.f : 1.f},
-          .pass = {static_cast<float>(pass.direction), static_cast<float>(pass.step), static_cast<float>(plan.taps_side),
-                   i + 1u == plan.pass_count ? 1.f : 0.f},
-          .full = {static_cast<float>(in.full_width), static_cast<float>(in.full_height), in.divisor, in.filter_value_stop},
-      };
-      const reshade::api::descriptor_table filter_tables[3] = {filter.cbv_table, filter.srv_table, filter.uav_table};
-      cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, filter.layout, 0, 3, filter_tables);
-      cmd_list->push_constants(reshade::api::shader_stage::all_compute, filter.layout, 3, 0, kRtgiFilterPushCount, &fpush);
-      cmd_list->dispatch(trace_groups_x, trace_groups_y, 1u);
-      rtao::NullComputeSlots(cmd_list, kRtgiFilterSrvCount, kRtgiFilterUavCount, 0u);
-      cmd_list->barrier(set->filter.texture[out_index], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    const RtgiPipeline& variance = set->variance_pipeline;
+    const reshade::api::resource_view variance_srvs[kSvgfVarianceSrvCount] = {
+        set->integrated.srv[0], set->history_moments.srv[write], set->history_guide.srv[write], set->history_normal.srv[write]};
+    const reshade::api::resource_view variance_uavs[kSvgfVarianceUavCount] = {
+        set->atrous.uav[0], variance_debug ? in.debug_uav : reshade::api::resource_view{0u}};
+    reshade::api::descriptor_table_update variance_updates[3] = {
+        {variance.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
+        {variance.srv_table, 0, 0, kSvgfVarianceSrvCount, kSrv, variance_srvs},
+        {variance.uav_table, 0, 0, kSvgfVarianceUavCount, kUav, variance_uavs},
+    };
+    device->update_descriptor_tables(3, variance_updates);
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, variance.pipeline);
+    const reshade::api::descriptor_table variance_tables[3] = {variance.cbv_table, variance.srv_table, variance.uav_table};
+    cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, variance.layout, 0, 3, variance_tables);
+    cmd_list->push_constants(reshade::api::shader_stage::all_compute, variance.layout, 3, 0, kSvgfPushCount, &push);
+    cmd_list->dispatch(trace_groups_x, trace_groups_y, 1u);
+    rtao::NullComputeSlots(cmd_list, kSvgfVarianceSrvCount, kSvgfVarianceUavCount, 0u);
+    cmd_list->barrier(set->atrous.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    if (variance_debug) {
+      cmd_list->barrier(in.debug_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
     }
-    input = set->filter.srv[2];
+  }
+
+  // A-trous: N = max(1, clamp(iterations, 1, 5) - log2(d)) iterations of step 2^i. Iteration 0 reads atrous[0] and writes
+  // history[write] (the feedback colour); iteration 1 reads history[write] and writes atrous[1]; from 2 on it reads
+  // atrous[(i - 1) & 1] and writes atrous[i & 1]. The last one written is the input of the upsample.
+  set->atrous_iterations = ready.spatial ? SvgfEffectiveIterations(in.svgf.iterations, static_cast<uint32_t>(in.divisor + 0.5f)) : 0u;
+  if (ready.spatial) {
+    const RtgiPipeline& atrous = set->atrous_pipeline;
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, atrous.pipeline);
+    for (uint32_t i = 0u; i < set->atrous_iterations; ++i) {
+      const bool to_history = i == 0u;
+      const uint32_t slot = i & 1u;
+      const reshade::api::resource_view atrous_in = i == 0u ? set->atrous.srv[0]
+          : (i == 1u ? set->history_color.srv[write] : set->atrous.srv[(i - 1u) & 1u]);
+      const reshade::api::resource_view atrous_srvs[kSvgfAtrousSrvCount] = {
+          atrous_in, set->history_guide.srv[write], set->history_normal.srv[write]};
+      const reshade::api::resource_view atrous_uavs[kSvgfAtrousUavCount] = {
+          to_history ? set->history_color.uav[write] : set->atrous.uav[slot]};
+      reshade::api::descriptor_table_update atrous_updates[3] = {
+          {atrous.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
+          {atrous.srv_table, 0, 0, kSvgfAtrousSrvCount, kSrv, atrous_srvs},
+          {atrous.uav_table, 0, 0, kSvgfAtrousUavCount, kUav, atrous_uavs},
+      };
+      device->update_descriptor_tables(3, atrous_updates);
+      SvgfPushConstants apush = push;
+      apush.params[2] = 0.f;
+      apush.params[3] = static_cast<float>(1u << i);
+      const reshade::api::descriptor_table atrous_tables[3] = {atrous.cbv_table, atrous.srv_table, atrous.uav_table};
+      cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, atrous.layout, 0, 3, atrous_tables);
+      cmd_list->push_constants(reshade::api::shader_stage::all_compute, atrous.layout, 3, 0, kSvgfPushCount, &apush);
+      cmd_list->dispatch(trace_groups_x, trace_groups_y, 1u);
+      rtao::NullComputeSlots(cmd_list, kSvgfAtrousSrvCount, kSvgfAtrousUavCount, 0u);
+      cmd_list->barrier(to_history ? set->history_color.texture[write] : set->atrous.texture[slot],
+                        reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+      input = to_history ? set->history_color.srv[write] : set->atrous.srv[slot];
+    }
   }
 
   // Upsample to the depth size: writes final_gi[final_index ^ 1], which becomes the newest.
@@ -322,7 +365,6 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
   const reshade::api::resource_view upsample_srvs[kRtgiUpsampleSrvCount] = {in.depth_view, in.mrt_normal_view, input, in.albedo_view};
   const reshade::api::resource_view upsample_uavs[kRtgiUpsampleUavCount] = {
       set->output.uav[final_write], upsample_debug ? in.debug_uav : reshade::api::resource_view{0u}};
-  const reshade::api::buffer_range scene_cbv = rtao::SceneCbvRange(in.scene_cbv_view);
   reshade::api::descriptor_table_update upsample_updates[3] = {
       {upsample.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
       {upsample.srv_table, 0, 0, kRtgiUpsampleSrvCount, kSrv, upsample_srvs},
@@ -347,21 +389,23 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
   }
   set->output_index = final_write;
   bvh::EndGpuTimer(cmd_list, &set->timer);
-  static const reshade::api::resource_view null_views[kRtgiTemporalSrvCount] = {};
-  static const reshade::api::sampler null_samplers[kRtgiTemporalSamplerCount] = {};
+  static const reshade::api::resource_view null_views[kSvgfReprojectSrvCount] = {};
+  static const reshade::api::sampler null_samplers[kSvgfReprojectSamplerCount] = {};
   table_nulls->push_back({upsample.srv_table, 0, 0, kRtgiUpsampleSrvCount, kSrv, null_views});
   table_nulls->push_back({upsample.uav_table, 0, 0, kRtgiUpsampleUavCount, kUav, null_views});
-  if (ready.temporal) {
-    table_nulls->push_back({set->temporal_pipeline.srv_table, 0, 0, kRtgiTemporalSrvCount, kSrv, null_views});
-    table_nulls->push_back({set->temporal_pipeline.uav_table, 0, 0, kRtgiTemporalUavCount, kUav, null_views});
-    table_nulls->push_back({set->temporal_pipeline.sampler_table, 0, 0, kRtgiTemporalSamplerCount,
+  if (ready.reproject) {
+    table_nulls->push_back({set->reproject_pipeline.srv_table, 0, 0, kSvgfReprojectSrvCount, kSrv, null_views});
+    table_nulls->push_back({set->reproject_pipeline.uav_table, 0, 0, kSvgfReprojectUavCount, kUav, null_views});
+    table_nulls->push_back({set->reproject_pipeline.sampler_table, 0, 0, kSvgfReprojectSamplerCount,
                             reshade::api::descriptor_type::sampler, null_samplers});
   }
   if (ready.spatial) {
-    table_nulls->push_back({set->filter_pipeline.srv_table, 0, 0, kRtgiFilterSrvCount, kSrv, null_views});
-    table_nulls->push_back({set->filter_pipeline.uav_table, 0, 0, kRtgiFilterUavCount, kUav, null_views});
+    table_nulls->push_back({set->variance_pipeline.srv_table, 0, 0, kSvgfVarianceSrvCount, kSrv, null_views});
+    table_nulls->push_back({set->variance_pipeline.uav_table, 0, 0, kSvgfVarianceUavCount, kUav, null_views});
+    table_nulls->push_back({set->atrous_pipeline.srv_table, 0, 0, kSvgfAtrousSrvCount, kSrv, null_views});
+    table_nulls->push_back({set->atrous_pipeline.uav_table, 0, 0, kSvgfAtrousUavCount, kUav, null_views});
   }
-  return {.temporal_debug = temporal_debug, .upsample_debug = upsample_debug};
+  return {.temporal_debug = reproject_debug, .variance_debug = variance_debug, .upsample_debug = upsample_debug};
 }
 
 inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::command_list* cmd_list, const RtgiDispatchInputs& in) {
@@ -404,7 +448,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     }
   }
   bool debug_ready = false;
-  if (in.debug_mode >= 1 && in.debug_mode <= 10) {
+  if (in.debug_mode >= 1 && in.debug_mode <= 11) {
     debug_ready = EnsureRtgiTextureSet(device, &data.debug, reshade::api::format::r8g8b8a8_unorm, 4u, in.full_width, in.full_height);
     if (!debug_ready) {
       renodx::utils::log::w("[world-rtgi] debug texture creation failed");
@@ -427,7 +471,6 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
                                                       .full_height = in.full_height,
                                                       .temporal = in.temporal && in.motion_view.handle != 0u,
                                                       .spatial = in.spatial,
-                                                      .filter_code = kRtgiFilterShader,
                                                       .log_prefix = "[world-rtgi]"});
   if (!denoise.ok) return {};
 
@@ -579,12 +622,8 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
        .full_height = in.full_height,
        .divisor = in.push.params[3],
        .debug_mode = in.debug_mode,
-       .temporal_push = in.temporal_push,
-       .filter_type = in.filter_type,
-       .filter_radius = in.filter_radius,
-       .filter_passes = in.filter_passes,
-       .filter_taps = in.filter_taps,
-       .filter_value_stop = 0.f,
+       .svgf = in.svgf,
+       .luminance_weights = kSvgfLuminanceRgb,
        .upsample_intensity = g_rtgi_intensity,
        .upsample_char_intensity = g_rtgi_char_intensity,
        .upsample_saturation = g_rtgi_saturation},
@@ -624,7 +663,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   }
   device->update_descriptor_tables(static_cast<uint32_t>(table_nulls.size()), table_nulls.data());
   return {.ok = true,
-          .debug_written = trace_debug || denoised.temporal_debug || denoised.upsample_debug,
+          .debug_written = trace_debug || denoised.temporal_debug || denoised.variance_debug || denoised.upsample_debug,
           .temporal_ran = denoise.temporal,
           .filter_ran = denoise.spatial};
 }
@@ -772,9 +811,9 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   }
   out << "]},\n";
   out << "  \"spatial_filter\": {\"on\": " << (g_rtgi_spatial_enabled > 0.5f ? "true" : "false")
-      << ", \"ran\": " << (f.filter_ran ? "true" : "false") << ", \"type\": " << g_rtgi_filter_type
-      << ", \"radius\": " << g_rtgi_filter_radius << ", \"passes\": " << g_rtgi_filter_passes
-      << ", \"taps\": " << (g_rtgi_filter_type > 0.5f ? g_rtgi_filter_taps_atrous : g_rtgi_filter_taps_separable) << "},\n";
+      << ", \"ran\": " << (f.filter_ran ? "true" : "false") << ", \"iterations\": " << g_rtgi_svgf_iterations
+      << ", \"iterations_effective\": " << SvgfEffectiveIterations(g_rtgi_svgf_iterations, f.divisor)
+      << ", \"luminance_edge_stop\": " << g_rtgi_svgf_luminance_edge_stop << "},\n";
   out << "  \"stats\": {\n";
   out << "    \"rays\": " << v[kRtgiStatRays] << ",\n";
   out << "    \"hits\": " << v[kRtgiStatHits] << ",\n";

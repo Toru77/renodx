@@ -1,6 +1,6 @@
 // world_rtgi_upsample.cs_5_0.hlsl - RTGI upsample to the depth size (world/docs/ROADMAP.md, RTGI M3b).
 //
-// One thread per full pixel. Joint bilateral upsample of the trace-resolution GI (t2; a <= 0 = not traced): the 2x2
+// One thread per full pixel. Joint bilateral upsample of the trace-resolution GI (t2; a < 0 = not traced): the 2x2
 // trace pixels around the pixel's position in trace space, each weighted by its bilinear weight times
 // FilterPlaneNormalWeight (world_rt_denoise.hlsli) between this pixel and the tap's representative pixel
 // min(tq * d + d / 2, size - 1). With d = 1 it is a pass-through. Writes the final GI (u0, r11g11b10_float; 0 where
@@ -72,7 +72,7 @@ void main(uint3 id : SV_DispatchThreadID)
             const float w = (offset.x == 1 ? f.x : 1.0 - f.x) * (offset.y == 1 ? f.y : 1.0 - f.y);
             const int2 tq = clamp(base + offset, int2(0, 0), trace_size - 1);
             const float4 v = g_in[tq];
-            if (v.a <= 0.0) continue;
+            if (v.a < 0.0) continue;
             const uint2 rep = min(uint2(tq) * d + d / 2u, full_size - 1u);
             const float rep_depth = g_game_depth.Load(int3(rep, 0)).x;
             const float3 Nt = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(rep, 0)).xy);

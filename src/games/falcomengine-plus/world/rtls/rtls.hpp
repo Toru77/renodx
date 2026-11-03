@@ -67,17 +67,12 @@ struct RtlsDispatchInputs {
   uint32_t trace_width = 0u;
   uint32_t trace_height = 0u;
   RtlsPushConstants push = {};      // params[3] is the trace divisor
-  int debug_mode = 0;               // RTLS Debug: 1-5 trace views, 6-8 denoise views
+  int debug_mode = 0;               // RTLS Debug: 1-5 trace views, 6-9 denoise views
   bvh::DynamicTraceInputs dynamic = {};
   reshade::api::resource_view motion_view = {0u};  // null: the temporal pass does not run
   bool temporal = false;
-  rtgi::RtgiTemporalPushConstants temporal_push = {};  // params and size[3] (history valid) set by the caller
   bool spatial = false;
-  int filter_type = 1;
-  int filter_radius = 2;
-  int filter_passes = 1;
-  int filter_taps = 5;
-  float filter_value_stop = 0.f;   // filter c2.w: penumbra edge stop k
+  rtgi::SvgfSettings svgf = {};  // SVGF settings (history valid set by the owner)
 };
 struct RtlsDispatchResult { bool ok = false; bool debug_written = false; bool temporal_ran = false; bool filter_ran = false; };
 
@@ -100,7 +95,7 @@ inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
       return {};
     }
   }
-  bool debug_ready = in.debug_mode >= 1 && in.debug_mode <= 8;
+  bool debug_ready = in.debug_mode >= 1 && in.debug_mode <= 9;
   if (debug_ready && !rtgi::EnsureRtgiTextureSet(device, &data.debug, reshade::api::format::r8g8b8a8_unorm, 4u, in.full_width, in.full_height)) {
     renodx::utils::log::w("[world-rtls] debug texture creation failed");
     debug_ready = false;
@@ -119,7 +114,6 @@ inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
                                                                   .full_height = in.full_height,
                                                                   .temporal = in.temporal && in.motion_view.handle != 0u,
                                                                   .spatial = in.spatial,
-                                                                  .filter_code = kRtlsFilterShader,
                                                                   .log_prefix = "[world-rtls]"});
   if (!denoise.ok) return {};
 
@@ -169,12 +163,14 @@ inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   cmd_list->barrier(data.raw.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   bvh::EndGpuTimer(cmd_list, &data.timer);
 
-  // RTLS Debug 6 to 8 are the chain's views 4 (accumulated), 5 (history confidence) and 6 (final, after the upsample).
+  // RTLS Debug 6 to 8 are the chain's views 4 (accumulated), 5 (history confidence) and 6 (final, after the upsample);
+  // RTLS Debug 9 is the chain's SVGF variance view 11.
   int denoise_debug = 0;
   switch (in.debug_mode) {
     case 6: denoise_debug = 4; break;
     case 7: denoise_debug = 5; break;
     case 8: denoise_debug = 6; break;
+    case 9: denoise_debug = 11; break;
     default: break;
   }
   const reshade::api::resource_view table_null_views[kRtlsSrvCount] = {};
@@ -199,12 +195,8 @@ inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
        .full_height = in.full_height,
        .divisor = in.push.params[3],
        .debug_mode = denoise_debug,
-       .temporal_push = in.temporal_push,
-       .filter_type = in.filter_type,
-       .filter_radius = in.filter_radius,
-       .filter_passes = in.filter_passes,
-       .filter_taps = in.filter_taps,
-       .filter_value_stop = in.filter_value_stop,
+       .svgf = in.svgf,
+       .luminance_weights = rtgi::kSvgfLuminanceShadow,
        .upsample_intensity = 1.f,
        .upsample_char_intensity = 1.f,
        .upsample_saturation = 1.f},
@@ -212,7 +204,7 @@ inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   // App-side tables: null contents (ReShade keeps descriptors in the table object). The CBV tables keep their view.
   device->update_descriptor_tables(static_cast<uint32_t>(table_nulls.size()), table_nulls.data());
   return {.ok = true,
-          .debug_written = trace_debug || denoised.temporal_debug || denoised.upsample_debug,
+          .debug_written = trace_debug || denoised.temporal_debug || denoised.variance_debug || denoised.upsample_debug,
           .temporal_ran = denoise.temporal,
           .filter_ran = denoise.spatial};
 }
@@ -245,10 +237,9 @@ inline std::string BuildRtlsJson(const RtlsJsonInput& in) {
   }
   out << "]},\n";
   out << "  \"spatial_filter\": {\"on\": " << (g_rtls_spatial_enabled > 0.5f ? "true" : "false")
-      << ", \"ran\": " << (f.filter_ran ? "true" : "false") << ", \"type\": " << g_rtls_filter_type
-      << ", \"radius\": " << g_rtls_filter_radius << ", \"passes\": " << g_rtls_filter_passes
-      << ", \"taps\": " << (g_rtls_filter_type > 0.5f ? g_rtls_filter_taps_atrous : g_rtls_filter_taps_separable)
-      << ", \"value_stop\": " << g_rtls_filter_value_stop << "},\n";
+      << ", \"ran\": " << (f.filter_ran ? "true" : "false") << ", \"iterations\": " << g_rtls_svgf_iterations
+      << ", \"iterations_effective\": " << rtgi::SvgfEffectiveIterations(g_rtls_svgf_iterations, f.divisor)
+      << ", \"luminance_edge_stop\": " << g_rtls_svgf_luminance_edge_stop << "},\n";
   out << "  \"ray_max\": {\"requested\": " << f.ray_max_requested << ", \"effective\": " << f.ray_max_effective << "},\n";
   out << "  \"fade\": {\"start_eff\": " << f.fade.start << ", \"end_eff\": " << f.fade.end
       << ", \"coverage\": " << f.fade.coverage << ", \"requested_start\": " << f.fade.start_req

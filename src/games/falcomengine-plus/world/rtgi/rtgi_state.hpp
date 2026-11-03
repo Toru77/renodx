@@ -29,16 +29,12 @@ inline float g_rtgi_dynamic_light_contribution = 1.f;  // Dynamic Light Contribu
 inline float g_rtgi_lamp_shadows = 0.f;  // Off-screen Lamp Shadows: fallback lamp light gets shadow rays
 inline float g_rtgi_game_sun = 0.f;  // Game-Style Fallback Sun: fallback sun gets the game's shadow floor
 inline float g_rtgi_temporal_enabled = 1.f;
-inline float g_rtgi_history_weight = 0.95f;
+inline float g_rtgi_history_weight = 0.8f;
 inline float g_rtgi_depth_rejection = 0.05f;
 inline float g_rtgi_normal_rejection = 0.9f;
-inline float g_rtgi_history_clamp = 1.f;
 inline float g_rtgi_spatial_enabled = 1.f;
-inline float g_rtgi_filter_type = 1.f;            // Filter Type: 0 separable bilateral, 1 a-trous
-inline float g_rtgi_filter_radius = 4.f;
-inline float g_rtgi_filter_passes = 2.f;          // Filter Passes: 1..4
-inline float g_rtgi_filter_taps_separable = 5.f;  // Filter Taps (separable): 3..17
-inline float g_rtgi_filter_taps_atrous = 5.f;     // Filter Taps (a-trous): 3..9
+inline float g_rtgi_svgf_iterations = 5.f;        // Iterations: a-trous iterations of the SVGF filter, 1..5 (divisor reduces them)
+inline float g_rtgi_svgf_luminance_edge_stop = 4.f;  // Luminance Edge Stop: sigma_l of the SVGF luminance weight
 inline float g_rtgi_intensity = 1.f;              // GI Intensity: scale of the bounce added to the image (0 = none)
 inline float g_rtgi_char_intensity = 1.f;         // Character GI Intensity: on the character shading path
 inline float g_rtgi_saturation = 1.f;             // GI Saturation: saturation of the added diffuse GI (upsample pass)
@@ -122,7 +118,7 @@ inline uint32_t RtgiExtraBounceRaysEffective() {
 // RTGI settings that shape the GI; a change resets the RTGI history for one frame. Never part of RTAO's snapshot.
 struct ParameterSnapshot {
   float samples, ray_max, normal_bias, trace_resolution, isfast, fade_start, fade_end, radiance_clamp, ambient;
-  float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug, sun_distance;
+  float temporal_enabled, history_weight, depth_rejection, normal_rejection, debug, sun_distance;
   float trace_characters;
   float sun_casters_only, sun_contribution, fallback_no_albedo, dynamic_lights, dynamic_light_contribution, game_sun, lamp_shadows;
   float extra_bounces, feedback_strength, extra_bounce_rays, bounce_saturation;

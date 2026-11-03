@@ -30,12 +30,18 @@ inline constexpr std::span<const std::uint8_t> __world_rtao_filter{__world_rtao_
 #define __world_rtgi_EMBED_FILE
 inline constexpr std::uint8_t __world_rtgi_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_rtgi{__world_rtgi_base};
-#define __world_rtgi_temporal_EMBED_FILE
-inline constexpr std::uint8_t __world_rtgi_temporal_base[] = {0};
-inline constexpr std::span<const std::uint8_t> __world_rtgi_temporal{__world_rtgi_temporal_base};
-#define __world_rtgi_filter_EMBED_FILE
-inline constexpr std::uint8_t __world_rtgi_filter_base[] = {0};
-inline constexpr std::span<const std::uint8_t> __world_rtgi_filter{__world_rtgi_filter_base};
+#define __world_svgf_reproject_EMBED_FILE
+inline constexpr std::uint8_t __world_svgf_reproject_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_svgf_reproject{__world_svgf_reproject_base};
+#define __world_svgf_variance_EMBED_FILE
+inline constexpr std::uint8_t __world_svgf_variance_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_svgf_variance{__world_svgf_variance_base};
+#define __world_svgf_atrous_EMBED_FILE
+inline constexpr std::uint8_t __world_svgf_atrous_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_svgf_atrous{__world_svgf_atrous_base};
+#define __world_rtgi_lights_EMBED_FILE
+inline constexpr std::uint8_t __world_rtgi_lights_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_rtgi_lights{__world_rtgi_lights_base};
 #define __world_rtgi_upsample_EMBED_FILE
 inline constexpr std::uint8_t __world_rtgi_upsample_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_rtgi_upsample{__world_rtgi_upsample_base};
@@ -93,8 +99,8 @@ static void TestPushLayout() {
   CHECK(sizeof(rtgi::RtgiPushConstants) == 32u * sizeof(float), "b12 is 32 floats");
   CHECK(offsetof(rtgi::RtgiPushConstants, shading) == 20u * sizeof(float), "b12 c5 offset");
   CHECK(offsetof(rtgi::RtgiPushConstants, sun) == 24u * sizeof(float), "b12 c6 offset");
-  CHECK(sizeof(rtgi::RtgiTemporalPushConstants) == 20u * sizeof(float), "temporal b12 is 20 floats");
-  CHECK(sizeof(rtgi::RtgiFilterPushConstants) == 12u * sizeof(float), "filter b12 is 12 floats");
+  CHECK(sizeof(rtgi::SvgfPushConstants) == 16u * sizeof(float), "svgf b12 is 16 floats");
+  CHECK(offsetof(rtgi::SvgfPushConstants, temporal) == 8u * sizeof(float), "svgf b12 c2 offset");
   CHECK(sizeof(rtgi::RtgiUpsamplePushConstants) == 12u * sizeof(float), "upsample b12 is 12 floats");
 }
 
@@ -158,8 +164,8 @@ static void TestShaderDefines() {
         "game sun flag define matches kRtgiFlagGameSun");
   CHECK(text.find("g_rtgi_sun : packoffset(c6)") != std::string::npos, "trace cb_rtgi has c6 (Sun Shadow Distance)");
   CHECK(text.find("RTGI_SUN_RAY_MAX") == std::string::npos, "the fixed sun ray length is gone");
-  const std::string temporal = ReadText("src/games/falcomengine-plus/world/shaders/world_rtgi_temporal.cs_5_0.hlsl");
-  CHECK(!temporal.empty(), "temporal shader copy readable");
+  const std::string temporal = ReadText("src/games/falcomengine-plus/world/shaders/world_svgf_reproject.cs_5_0.hlsl");
+  CHECK(!temporal.empty(), "reproject shader copy readable");
   const struct {
     const char* name;
     uint32_t value;
@@ -172,11 +178,13 @@ static void TestShaderDefines() {
     const std::string line = std::string("#define RTGI_STAT_") + stat.name + " " + std::to_string(stat.value) + "u";
     CHECK(temporal.find(line) != std::string::npos, "%s", line.c_str());
   }
-  for (const char* path : {"src/games/falcomengine-plus/world/shaders/world_rtgi_temporal.cs_5_0.hlsl",
-                           "src/games/falcomengine-plus/world/shaders/world_rtgi_filter.cs_5_0.hlsl",
-                           "src/games/falcomengine-plus/world/shaders/world_rtgi_upsample.cs_5_0.hlsl"}) {
-    CHECK(ReadText(path).find("#include \"world_rt_denoise.hlsli\"") != std::string::npos, "%s includes the shared denoise math", path);
+  for (const char* path : {"src/games/falcomengine-plus/world/shaders/world_svgf_reproject.cs_5_0.hlsl",
+                           "src/games/falcomengine-plus/world/shaders/world_svgf_variance.cs_5_0.hlsl",
+                           "src/games/falcomengine-plus/world/shaders/world_svgf_atrous.cs_5_0.hlsl"}) {
+    CHECK(ReadText(path).find("#include \"world_svgf.hlsli\"") != std::string::npos, "%s includes the SVGF header", path);
   }
+  CHECK(ReadText("src/games/falcomengine-plus/world/shaders/world_rtgi_upsample.cs_5_0.hlsl").find("#include \"world_rt_denoise.hlsli\"") != std::string::npos,
+        "the upsample includes the shared denoise math");
 }
 
 // Lighting shaders are outside world/ (not copied by refresh_world.ps1): read from the repo, two levels up from the
@@ -489,10 +497,11 @@ struct GoldenCmdList : mock::CommandListBase {
   }
 };
 
-// The command log and dispatch count of five fixed rtgi::Dispatch calls (trace, spatial, temporal, lamps with debug 4,
-// trace debug 9) on the recording mock. Recorded at HEAD; the refactors must reproduce them exactly.
-static constexpr uint64_t kDispatchGoldenHash = 0x22868adf1653e774ull;
-static constexpr int kDispatchGoldenCount = 16;
+// The command log and dispatch count of five fixed rtgi::Dispatch calls (trace and upsample; plus the SVGF chain with
+// spatial; plus temporal; lamps with debug 4 and no spatial; trace debug 9) on the recording mock. SVGF M1 counts:
+// 2 + 8 + 8 + 4 + 2 = 24 (trace, reproject, variance, 4 a-trous, upsample at Iterations 5 and divisor 2).
+static constexpr uint64_t kDispatchGoldenHash = 0xce5510e6fa6e3b30ull;
+static constexpr int kDispatchGoldenCount = 24;
 
 static void TestDispatchGolden() {
   GoldenDevice dev;

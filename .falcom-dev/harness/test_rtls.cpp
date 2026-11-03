@@ -25,18 +25,18 @@
 #define __world_rtls_EMBED_FILE
 inline constexpr std::uint8_t __world_rtls_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_rtls{__world_rtls_base};
-#define __world_rtls_filter_EMBED_FILE
-inline constexpr std::uint8_t __world_rtls_filter_base[] = {0};
-inline constexpr std::span<const std::uint8_t> __world_rtls_filter{__world_rtls_filter_base};
 #define __world_rtgi_EMBED_FILE
 inline constexpr std::uint8_t __world_rtgi_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_rtgi{__world_rtgi_base};
-#define __world_rtgi_temporal_EMBED_FILE
-inline constexpr std::uint8_t __world_rtgi_temporal_base[] = {0};
-inline constexpr std::span<const std::uint8_t> __world_rtgi_temporal{__world_rtgi_temporal_base};
-#define __world_rtgi_filter_EMBED_FILE
-inline constexpr std::uint8_t __world_rtgi_filter_base[] = {0};
-inline constexpr std::span<const std::uint8_t> __world_rtgi_filter{__world_rtgi_filter_base};
+#define __world_svgf_reproject_EMBED_FILE
+inline constexpr std::uint8_t __world_svgf_reproject_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_svgf_reproject{__world_svgf_reproject_base};
+#define __world_svgf_variance_EMBED_FILE
+inline constexpr std::uint8_t __world_svgf_variance_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_svgf_variance{__world_svgf_variance_base};
+#define __world_svgf_atrous_EMBED_FILE
+inline constexpr std::uint8_t __world_svgf_atrous_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_svgf_atrous{__world_svgf_atrous_base};
 #define __world_rtgi_upsample_EMBED_FILE
 inline constexpr std::uint8_t __world_rtgi_upsample_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_rtgi_upsample{__world_rtgi_upsample_base};
@@ -463,7 +463,7 @@ struct RecCmdList : mock::CommandListBase {
   struct Snap { resource_view srv[32]; resource_view uav[8]; };
   std::vector<Snap> snaps;   // the slots at each dispatch
   std::vector<float> push;   // the last push of kRtlsPushConstantCount floats
-  std::vector<std::vector<float>> pushes12;  // the 12-float pushes in order (filter passes, then the upsample)
+  std::vector<std::vector<float>> pushes12;  // the 16-float SVGF pushes and the 12-float upsample push, in order
   std::vector<uint32_t> null_srv_counts;  // the count of each all-null SRV push, in order
   std::vector<uint32_t> null_uav_counts;
   device *get_device() override { return dev; }
@@ -478,7 +478,7 @@ struct RecCmdList : mock::CommandListBase {
   }
   void push_constants(shader_stage, pipeline_layout, uint32_t, uint32_t, uint32_t count, const void *values) override {
     const float* f = static_cast<const float *>(values);
-    if (count == 12u) pushes12.emplace_back(f, f + count);
+    if (count == 12u || count == 16u) pushes12.emplace_back(f, f + count);  // 12: upsample; 16: SVGF passes
     if (count != rtls::kRtlsPushConstantCount) return;
     push.assign(f, f + count);
   }
@@ -598,18 +598,14 @@ static void TestDenoiseDispatch() {
   in.push.params[3] = 2.f;
   in.motion_view = {0x9800u};
   in.temporal = true;
-  in.temporal_push.size[3] = 1.f;
+  in.svgf.history_valid = true;
   in.spatial = true;
-  in.filter_type = 1;
-  in.filter_radius = 2;
-  in.filter_passes = 1;
-  in.filter_taps = 5;
-  in.filter_value_stop = 4.f;
   const rtls::RtlsDispatchResult first = rtls::Dispatch(&dev, &cl, in);
   const rtls::RtlsDeviceData& data = rtls::GetRtlsDeviceData(&dev);
-  CHECK(first.ok && first.temporal_ran && first.filter_ran, "Half: temporal and filter ran");
-  CHECK(cl.dispatches == 4, "trace, temporal, filter, upsample (%d)", cl.dispatches);
-  CHECK(cl.pushes12.size() == 2u && cl.pushes12[0][11] == 4.f, "filter push c2.w carries the penumbra edge stop (%zu pushes)", cl.pushes12.size());
+  CHECK(first.ok && first.temporal_ran && first.filter_ran, "Half: reprojection and SVGF filter ran");
+  CHECK(cl.dispatches == 8, "trace, reproject, variance, 4 a-trous, upsample (%d)", cl.dispatches);
+  CHECK(cl.pushes12.size() == 7u && cl.pushes12[0][11] == 4.f && cl.pushes12[0][12] == 1.f && cl.pushes12[0][14] == 0.f,
+        "SVGF pushes carry sigma_l 4 and the shadow luminance weights (%zu pushes)", cl.pushes12.size());
   CHECK(cl.push.size() == rtls::kRtlsPushConstantCount && cl.push[16] == 32.f && cl.push[17] == 16.f && cl.push[18] == 64.f
             && cl.push[19] == 32.f && cl.push[3] == 2.f,
         "trace push: trace 32x16, full 64x32, divisor 2");
@@ -617,23 +613,23 @@ static void TestDenoiseDispatch() {
   CHECK(data.denoise.history_color.width == 32u && data.denoise.history_color.height == 16u, "history at trace size");
   CHECK(data.denoise.output.width == 64u && data.denoise.output.height == 32u, "output at full size");
   CHECK(data.denoise.history_index == 1u && data.denoise.output_index == 1u, "first run writes history 1 and output 1");
-  CHECK(cl.snaps.size() == 4u && cl.snaps[1].srv[0].handle == data.raw.srv[0].handle && cl.snaps[1].srv[3].handle == 0x9800u,
-        "temporal reads the raw term and the motion view");
-  CHECK(cl.snaps[3].srv[2].handle == data.denoise.filter.srv[2].handle, "upsample reads the filter output B");
-  CHECK(cl.snaps[3].uav[0].handle == data.denoise.output.uav[1].handle, "upsample writes output 1");
+  CHECK(cl.snaps.size() == 8u && cl.snaps[1].srv[0].handle == data.raw.srv[0].handle && cl.snaps[1].srv[3].handle == 0x9800u,
+        "reprojection reads the raw term and the motion view");
+  CHECK(cl.snaps[7].srv[2].handle == data.denoise.atrous.srv[1].handle, "upsample reads the last a-trous output (atrous 1, four iterations)");
+  CHECK(cl.snaps[7].uav[0].handle == data.denoise.output.uav[1].handle, "upsample writes output 1");
   const rtls::RtlsDispatchResult second = rtls::Dispatch(&dev, &cl, in);
   CHECK(second.ok && data.denoise.history_index == 0u && data.denoise.output_index == 0u, "second run swaps back to 0");
   in.motion_view = {0u};
   const rtls::RtlsDispatchResult no_motion = rtls::Dispatch(&dev, &cl, in);
-  CHECK(no_motion.ok && !no_motion.temporal_ran && cl.dispatches == 11, "no motion: trace, filter, upsample (%d)", cl.dispatches);
+  CHECK(no_motion.ok && !no_motion.temporal_ran && cl.dispatches == 24, "no motion: spatial still runs, 8 dispatches (%d)", cl.dispatches);
   in.motion_view = {0x9800u};
   in.debug_mode = 6;
   const size_t debug_at = cl.snaps.size();
   const rtls::RtlsDispatchResult debug6 = rtls::Dispatch(&dev, &cl, in);
-  CHECK(debug6.ok && debug6.debug_written, "Debug 6 written by the temporal pass");
-  CHECK(cl.snaps.size() == debug_at + 4u && cl.snaps[debug_at].uav[0].handle == 0u
-            && cl.snaps[debug_at + 1u].uav[3].handle == data.debug.uav[0].handle && data.debug.uav[0].handle != 0u,
-        "Debug 6: the trace has no debug UAV, the temporal pass has it at u3");
+  CHECK(debug6.ok && debug6.debug_written, "Debug 6 written by the reprojection");
+  CHECK(cl.snaps.size() == debug_at + 8u && cl.snaps[debug_at].uav[0].handle == 0u
+            && cl.snaps[debug_at + 1u].uav[5].handle == data.debug.uav[0].handle && data.debug.uav[0].handle != 0u,
+        "Debug 6: the trace has no debug UAV, the reprojection has it at u5");
   rtls::DestroyRtlsDeviceData(&dev);
   CHECK(dev.res.empty(), "destroy releases every RTLS object (%zu left)", dev.res.size());
 }
@@ -657,36 +653,16 @@ static void TestParameterSnapshot() {
   CHECK(!SnapshotHasStrength<rtls::ParameterSnapshot>, "Strength is not in the snapshot (no history reset)");
   CHECK(!SnapshotHasMaxDarkening<rtls::ParameterSnapshot>, "Max Darkening is not in the snapshot (no history reset)");
   CHECK(!SnapshotHasSpatial<rtls::ParameterSnapshot>, "no spatial filter field is in the snapshot");
-  // Exactly the 21 float fields of rtls_state.hpp; each one takes part in the comparison.
-  CHECK(sizeof(rtls::ParameterSnapshot) == 23u * sizeof(float), "snapshot is 23 floats (%zu bytes)", sizeof(rtls::ParameterSnapshot));
-  for (size_t i = 0u; i < 23u; ++i) {
+  // Exactly the 22 float fields of rtls_state.hpp (History Clamp removed); each one takes part in the comparison.
+  CHECK(sizeof(rtls::ParameterSnapshot) == 22u * sizeof(float), "snapshot is 22 floats (%zu bytes)", sizeof(rtls::ParameterSnapshot));
+  for (size_t i = 0u; i < 22u; ++i) {
     rtls::ParameterSnapshot changed = {};
-    float fields[23] = {};
+    float fields[22] = {};
     std::memcpy(fields, &changed, sizeof(fields));
     fields[i] = 1.f;
     std::memcpy(&changed, fields, sizeof(fields));
     CHECK(!(changed == rtls::ParameterSnapshot{}), "field %zu takes part in the comparison", i);
   }
-}
-
-// M5 item 2: the shared filter source has the three guarded blocks, the RTLS filter defines the stop, RTGI does not.
-static void TestValueStop() {
-  const std::string filter = ReadText("src/games/falcomengine-plus/world/shaders/world_rtgi_filter.cs_5_0.hlsl");
-  const std::string rtls_filter = ReadText("src/games/falcomengine-plus/world/shaders/world_rtls_filter.cs_5_0.hlsl");
-  CHECK(Count(filter, "#if defined(WORLD_FILTER_VALUE_STOP)") == 3, "three guarded blocks in the shared filter");
-  CHECK(Count(filter, "#define WORLD_FILTER_VALUE_STOP") == 0, "the shared filter does not define the stop itself");
-  CHECK(Count(filter, "edge *= exp(-f_full.w * max(value_diff.x, value_diff.y));") == 1, "one edge stop line");
-  CHECK(Count(rtls_filter, "#define WORLD_FILTER_VALUE_STOP") == 1 && Count(rtls_filter, "#include \"world_rtgi_filter.cs_5_0.hlsl\"") == 1,
-        "the RTLS filter is the shared source with the define");
-  CHECK(Count(filter, "g_filter_centre_value = centre.rgb;") == 1, "the centre value is stored once in main");
-  // k = 0 is the identity: the stop multiplies the weight by exp(0) = 1 only through f_full.w (RTGI pushes 0 in its own build).
-  const std::string rtgi_push = ReadText("src/games/falcomengine-plus/world/rtgi/rtgi.hpp");
-  const std::string rtls_push = ReadText("src/games/falcomengine-plus/world/rtls/rtls.hpp");
-  CHECK(Count(rtgi_push, ".filter_value_stop = 0.f,") == 1, "RTGI dispatch pushes penumbra stop 0");
-  CHECK(Count(rtls_push, ".filter_code = kRtlsFilterShader,") == 1, "RTLS dispatch uses the RTLS filter shader");
-  // The setting is not in the history snapshot (the filter acts after the history).
-  rtls::ParameterSnapshot a = {};
-  CHECK(sizeof(a) == 23u * sizeof(float), "snapshot size unchanged by the edge stop (%zu)", sizeof(a));
 }
 
 int main() {
@@ -710,8 +686,6 @@ int main() {
   TestLightingMath();
   HStage("parameter snapshot");
   TestParameterSnapshot();
-  HStage("penumbra edge stop");
-  TestValueStop();
   HStage("characters");
   TestCharacters();
   HStage("json");

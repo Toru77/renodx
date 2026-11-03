@@ -185,11 +185,11 @@ static void TestSunParameterSnapshot() {
   CHECK(!SunSnapshotHasStrength<rtsun::ParameterSnapshot>, "Strength is not in the snapshot (no history reset)");
   CHECK(!SunSnapshotHasMaxDarkening<rtsun::ParameterSnapshot>, "Max Darkening is not in the snapshot (no history reset)");
   CHECK(!SunSnapshotHasSpatial<rtsun::ParameterSnapshot>, "no spatial filter field or edge stop is in the snapshot");
-  // Exactly the 14 float fields listed in rtsun_state.hpp; each one takes part in the comparison.
-  CHECK(sizeof(rtsun::ParameterSnapshot) == 17u * sizeof(float), "snapshot is 17 floats (%zu bytes)", sizeof(rtsun::ParameterSnapshot));
-  for (size_t i = 0u; i < 17u; ++i) {
+  // Exactly the 16 float fields listed in rtsun_state.hpp (History Clamp removed); each one takes part in the comparison.
+  CHECK(sizeof(rtsun::ParameterSnapshot) == 16u * sizeof(float), "snapshot is 16 floats (%zu bytes)", sizeof(rtsun::ParameterSnapshot));
+  for (size_t i = 0u; i < 16u; ++i) {
     rtsun::ParameterSnapshot changed = {};
-    float fields[17] = {};
+    float fields[16] = {};
     std::memcpy(fields, &changed, sizeof(fields));
     fields[i] = 1.f;
     std::memcpy(&changed, fields, sizeof(fields));
@@ -219,10 +219,10 @@ static void TestSunDenoiseText() {
   const std::string rtao_state = ReadText("src/games/falcomengine-plus/world/rtao/rtao_state.hpp");
   CHECK(Count(rtao_state, "return (full + divisor - 1u) / divisor;") == 1, "RtgiTraceExtent arithmetic");
   const std::string sun = ReadText("src/games/falcomengine-plus/world/rtsun/rtsun.hpp");
-  CHECK(Count(sun, "in.debug_mode >= 4 && in.debug_mode <= 6 ? in.debug_mode : 0") == 1, "denoise views 4 to 6 map to the chain");
+  CHECK(Count(sun, "in.debug_mode == 7 ? 11 : (in.debug_mode >= 4 && in.debug_mode <= 6 ? in.debug_mode : 0)") == 1, "denoise views 4 to 6 map to the chain, 7 is the SVGF variance (11)");
   CHECK(Count(sun, "debug_mode == 3") == 0, "debug view 3 is unused in the C++");
   CHECK(Count(sun, "rtao::SceneCbvRange(in.scene_cbv_view)") == 1 && Count(sun, "&in.scene_cbv_view") == 0, "scene CBV is a buffer_range (SceneCbvRange), never a resource_view pointer");
-  CHECK(Count(sun, "rtls::kRtlsFilterShader") == 1, "the spatial filter source is the RTLS filter (edge stop)");
+  CHECK(Count(sun, "rtgi::kSvgfLuminanceShadow") == 1 && Count(sun, "rtls::kRtlsFilterShader") == 0, "the luminance weights are the shared SVGF shadow weights");
   const std::string addon = ReadText("../../src/games/falcomengine-plus/addon.cpp");  // the harness copy has no addon.cpp
   // Scoped to RunRtSunInline (RTLS and RTGI have the same expressions).
   const size_t sun_begin = addon.find("static void RunRtSunInline(");
@@ -251,7 +251,8 @@ static void TestSunDenoiseText() {
   }
   const std::string settings = ReadText("src/games/falcomengine-plus/world/world_settings.hpp");
   CHECK(Count(settings, "\"RtSunReceiveCharacters\"") == 1 && Count(settings, "\"RtSunCharacterNormalBias\"") == 1 && Count(settings, "\"RtSunCharacterIntensity\"") == 1, "R4 rows: receive, character bias, character intensity");
-  CHECK(Count(settings, "\"RtSunFilterValueStop\"") == 1 && Count(settings, "\"RtSunTraceResolution\"") == 1, "RT sun rows: edge stop and trace resolution");
+  CHECK(Count(settings, "\"RtSunFilterValueStop\"") == 0 && Count(settings, "{.prefix = \"RtSun\",") == 1 && Count(settings, "\"RtSunTraceResolution\"") == 1,
+        "RT sun rows: the SVGF rows (prefix RtSun) replace the edge stop row; trace resolution stays");
   CHECK(Count(settings, "\"RtSunCharacterMaxDarkening\"") == 1, "MC row: RtSunCharacterMaxDarkening");
   CHECK(Count(settings, "\"RtSunFoliageIntensity\"") == 1, "F1 row: RtSunFoliageIntensity");
   // R5: Performance rows (RTLS pattern) and the GPU column sum by role.
