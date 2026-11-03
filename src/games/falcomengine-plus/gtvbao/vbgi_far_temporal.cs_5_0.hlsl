@@ -1,5 +1,5 @@
 // falcomengine-plus VBGI far field - temporal reservoir reuse (M2). Biased ReSTIR GI: this frame's candidate merged with
-// last frame's temporal reservoir at the reprojected texel, 1/M normalization, M capped at GTVBAO_far_history_length.
+// last frame's temporal reservoir at the reprojected texel, 1/M normalization, M capped at GTVBAO_far_history_length x GTVBAO_far_candidates.
 // The reused sender's radiance is re-read from this frame's radiance texture when it is on screen and unoccluded; the
 // pair must pass VbgiFarUsable and the near-segment check. nrm.w of the output = 1 where the radiance was refreshed.
 #include "vbgi_far_pass.hlsli"
@@ -46,7 +46,7 @@ void main(uint2 p : SV_DispatchThreadID)
         if (VbgiFarUsable(P, N, S, TransformNormalToView(h2.xyz), radius, cosR, cosS, d2)
             && VbgiFarNearClear(P, S, radius, consts.BitmaskThickness, uv, consts, g_farDepth, g_farSamp, VbgiFarRand(p, 2u)))
           VbgiFarMerge(r, h0.xyz, h1.rgb, h2.xyz, VbgiFarLuminance(h1.rgb), h0.w,
-                       min(h1.a, max(GTVBAO_far_history_length, 1.0f)), VbgiFarRand(p, 1u));
+                       min(h1.a, max(GTVBAO_far_history_length * GTVBAO_far_candidates, 1.0f)), VbgiFarRand(p, 1u));
       }
     }
   }

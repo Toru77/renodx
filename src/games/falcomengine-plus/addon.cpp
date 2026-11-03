@@ -752,6 +752,9 @@ static float g_vbgi_far_hit_window = 1.f;
 static float g_vbgi_far_temporal = 1.f;
 static float g_vbgi_far_history_length = 20.f;
 static float g_vbgi_far_spatial = 1.f;
+static float g_vbgi_far_candidates = 2.f;
+static float g_vbgi_far_spatial_neighbors = 4.f;
+static float g_vbgi_far_spatial_radius = 1.f;
 
 // -- IS-FAST noise --
 static float g_isfast_enabled       = 0.f;
@@ -3948,6 +3951,15 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "VBGIFarCandidates", .binding = &g_vbgi_far_candidates,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 2.f, .label = "Far Candidates", .section = "GTVBGI",
+      .tooltip = "Fresh far-field rays per texel each frame (at most the Quality's slice count). More = less boiling, more cost.",
+      .min = 1.f, .max = 4.f, .format = "%.0f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "VBGIFarTemporal", .binding = &g_vbgi_far_temporal,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Far Temporal Reuse", .section = "GTVBGI",
@@ -3972,6 +3984,24 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Shares far-field samples between nearby texels (ReSTIR).",
       .labels = {"Off", "On"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIFarSpatialNeighbors", .binding = &g_vbgi_far_spatial_neighbors,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 4.f, .label = "Far Spatial Neighbours", .section = "GTVBGI",
+      .tooltip = "Nearby texels each texel borrows far samples from. More = less noise, slightly more cost.",
+      .min = 1.f, .max = 8.f, .format = "%.0f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && g_vbgi_far_spatial > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIFarSpatialRadius", .binding = &g_vbgi_far_spatial_radius,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Far Spatial Radius", .section = "GTVBGI",
+      .tooltip = "Scale of the spatial reuse radius. Larger = calmer, but more rejections and possible halos at edges.",
+      .min = 0.5f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && g_vbgi_far_spatial > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
     },
     // �� VBGI debug ��
@@ -12621,9 +12651,14 @@ static std::array<float, kVbgiFarPushConstantFloats> BuildVbgiFarPushConstants(D
   std::copy(base.begin(), base.end(), c.begin());
   c[48] = std::max(g_vbgi_far_distance, 0.1f);
   c[49] = std::max(g_vbgi_far_history_length, 1.f);
-  c[50] = std::max(4.f, 30.f / static_cast<float>(falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution)));
+  c[50] = std::max(4.f, 30.f / static_cast<float>(falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution)))
+          * std::clamp(g_vbgi_far_spatial_radius, 0.5f, 2.f);
   c[51] = std::max(g_vbgi_far_intensity, 0.f);
   c[52] = g_vbgi_far_hit_window > 0.5f ? 1.f : 0.f;
+  const int vbgi_quality = static_cast<int>(std::lround(std::clamp(g_vbgi_quality_level, 0.f, 3.f)));
+  constexpr float kVbgiSlices[4] = {2.f, 3.f, 3.f, 4.f};  // main pass slices per Quality (gtvbao_main.cs_5_0.hlsl)
+  c[53] = std::min(std::clamp(std::round(g_vbgi_far_candidates), 1.f, 4.f), kVbgiSlices[vbgi_quality]);
+  c[54] = std::clamp(std::round(g_vbgi_far_spatial_neighbors), 1.f, 8.f);
   return c;
 }
 

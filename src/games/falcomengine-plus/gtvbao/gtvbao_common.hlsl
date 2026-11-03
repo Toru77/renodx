@@ -105,8 +105,8 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_far_spatial_radius;       // c[50] - spatial reuse radius, trace texels
   float GTVBAO_far_intensity;            // c[51] - far-field term scale (Far Intensity)
   float GTVBAO_far_hit_wide;             // c[52] - 1 = Wide far hit window, 0 = Thin
-  float GTVBAO_far_reserved53;           // c[53]
-  float GTVBAO_far_reserved54;           // c[54]
+  float GTVBAO_far_candidates;           // c[53] - far candidates per texel (K, already clamped to the slice count)
+  float GTVBAO_far_spatial_neighbors;    // c[54] - spatial reuse neighbours
   float GTVBAO_far_reserved55;           // c[55]
 #endif
 };

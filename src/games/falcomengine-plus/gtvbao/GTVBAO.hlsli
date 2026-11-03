@@ -370,6 +370,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 #endif
 #ifdef GTVBAO_GI_FAR
     float4 dbgFar = float4(0.0f, 0.0f, 0.0f, 1.0f);   // view 37: hit, F/32, mismatch
+    VbgiFarReservoir farRes = (VbgiFarReservoir)0;   // resampled over the K far candidates (slices 0..K-1)
+    bool farAnyMismatch = false;
+    float farFree0 = 0.0f;
 #endif
 
     {
@@ -571,10 +574,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             // ── Slice AO and weight (bufferc.txt:797-809) ──
             const float occ = (float)countbits(occBits) / (float)GT_VBAO_BITMASK_SECTOR_COUNT;
 #ifdef GTVBAO_GI_FAR
-            if (slice == 0)
+            if ((float)slice < clamp(GTVBAO_far_candidates, 1.0f, (float)sliceCount))
             {
                 // Far field: one direction from the sectors slice 0 left open, marched from Radius to the far distance.
-                const float2 pfar = frac(float2(nz.x + 7.0f * 0.7548776662466927f, nz.y + 7.0f * 0.5698402909980532f));
+                const float2 pfar = frac(float2(nz.x + (7.0f + k) * 0.7548776662466927f, nz.y + (7.0f + k) * 0.5698402909980532f));
                 const float3 rf = float3(pfar.x, pfar.y, frac(pfar.x + 2.0f * pfar.y));
                 const uint freeBits = ~occBits;
                 const uint freeCount = countbits(freeBits);
@@ -630,10 +633,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     }
                 }
                 farNrm.w = mismatch ? 1.0f : 0.0f;
-                g_outFarPos[pixCoord] = farPos;
-                g_outFarRad[pixCoord] = farRad;
-                g_outFarNrm[pixCoord] = farNrm;
-                dbgFar = float4(farPos.w > 0.0f ? 1.0f : 0.0f, (float)freeCount / 32.0f, farNrm.w, 1.0f);
+                VbgiFarMerge(farRes, farPos.xyz, farRad.rgb, farNrm.xyz, VbgiFarLuminance(farRad.rgb), farPos.w, 1.0f,
+                             frac(2.0f * pfar.x + pfar.y));
+                farAnyMismatch = farAnyMismatch || mismatch;
+                if (slice == 0) farFree0 = (float)freeCount / 32.0f;
             }
 #endif
 #ifdef GTVBAO_GI
@@ -652,6 +655,13 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                 dbgSliceN      += 1.0f;
             }
         }
+#ifdef GTVBAO_GI_FAR
+        const float farW = VbgiFarFinalW(farRes);
+        g_outFarPos[pixCoord] = float4(farRes.pos, farW);
+        g_outFarRad[pixCoord] = float4(farRes.rad, farRes.M);
+        g_outFarNrm[pixCoord] = float4(farRes.nrm, farAnyMismatch ? 1.0f : 0.0f);
+        dbgFar = float4(farW > 0.0f ? 1.0f : 0.0f, farFree0, farAnyMismatch ? 1.0f : 0.0f, 1.0f);
+#endif
 
         // bufferc.txt:812 (a degenerate slice makes the pixel fully visible, bufferc.txt:689)
         if (degenerate) visibility = 1.0f;

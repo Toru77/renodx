@@ -14,5 +14,5 @@ void main(uint2 p : SV_DispatchThreadID)
   g_farOut0[p] = float4(nr.rgb + far_gi, nr.a);   // joint raw GI -> the existing VBGI denoise chain
   g_farOut1[p] = float4(far_gi, nr.a);            // far raw GI -> debug and the M4 far share
   if ((int)GTVBAO_debug_mode == 36) GTVBAO_WriteDebug(g_farDebug, p, float4(far_gi, 1.0f));
-  if ((int)GTVBAO_debug_mode == 38) GTVBAO_WriteDebug(g_farDebug, p, float4(saturate(s1.a / max(GTVBAO_far_history_length, 1.0f)), saturate(s0.w), g_farIn2.Load(int3(p, 0)).w, 1.0f));
+  if ((int)GTVBAO_debug_mode == 38) GTVBAO_WriteDebug(g_farDebug, p, float4(saturate(s1.a / max(GTVBAO_far_history_length * GTVBAO_far_candidates, 1.0f)), saturate(s0.w), g_farIn2.Load(int3(p, 0)).w, 1.0f));
 }
