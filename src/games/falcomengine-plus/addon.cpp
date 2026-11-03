@@ -751,6 +751,7 @@ static float g_vbgi_far_intensity = 1.f;
 static float g_vbgi_far_hit_window = 1.f;
 static float g_vbgi_far_temporal = 1.f;
 static float g_vbgi_far_history_length = 20.f;
+static float g_vbgi_far_spatial = 1.f;
 
 // -- IS-FAST noise --
 static float g_isfast_enabled       = 0.f;
@@ -1069,6 +1070,10 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t vbgi_far_res_index = 0u;                             // [index] holds last frame's temporal reservoir
   bool vbgi_far_reuse_last = false;                             // temporal reuse ran in the last far frame
   uint64_t vbgi_far_reuse_frame = UINT64_MAX;                   // last frame the far reservoir step ran
+  reshade::api::pipeline vbgi_far_spatial_pipeline = {};
+  falcom_world::rtgi::RtgiTextureSet<1> vbgi_far_sp_pos = {};  // rgba32f, trace size: spatial reservoir sample point, W
+  falcom_world::rtgi::RtgiTextureSet<1> vbgi_far_sp_rad = {};  // rgba16f, trace size: sender radiance, M
+  falcom_world::rtgi::RtgiTextureSet<1> vbgi_far_sp_nrm = {};  // rgba16f, trace size: sender normal, accepted fraction
 
   reshade::api::resource_view captured_depth_srv = {};
   std::atomic<bool> captured_depth_live{true};  // destroy-event driven; false = target freed since capture
@@ -3958,6 +3963,15 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Frames of far-field history a texel can keep. Lower = faster response to light changes, more noise.",
       .min = 4.f, .max = 30.f, .format = "%.0f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && g_vbgi_far_temporal > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIFarSpatial", .binding = &g_vbgi_far_spatial,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Far Spatial Reuse", .section = "GTVBGI",
+      .tooltip = "Shares far-field samples between nearby texels (ReSTIR).",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
     },
     // �� VBGI debug ��
@@ -10591,6 +10605,10 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   d->vbgi_far_res_index = 0u;
   d->vbgi_far_reuse_last = false;
   d->vbgi_far_reuse_frame = UINT64_MAX;
+  dp(d->vbgi_far_spatial_pipeline);
+  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_sp_pos);
+  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_sp_rad);
+  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_sp_nrm);
   DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
   DestroyGTVBAODescriptorTables(dev, &d->main_tables);
   DestroyGTVBAODescriptorTables(dev, &d->foliage_mask_tables);
@@ -12603,6 +12621,7 @@ static std::array<float, kVbgiFarPushConstantFloats> BuildVbgiFarPushConstants(D
   std::copy(base.begin(), base.end(), c.begin());
   c[48] = std::max(g_vbgi_far_distance, 0.1f);
   c[49] = std::max(g_vbgi_far_history_length, 1.f);
+  c[50] = std::max(4.f, 30.f / static_cast<float>(falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution)));
   c[51] = std::max(g_vbgi_far_intensity, 0.f);
   c[52] = g_vbgi_far_hit_window > 0.5f ? 1.f : 0.f;
   return c;
@@ -12634,6 +12653,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   dp(d->vbgi_far_main_pipeline); dp(d->vbgi_far_resolve_pipeline);
   dl(d->vbgi_far_main_layout); dl(d->vbgi_far_layout);
   dp(d->vbgi_far_temporal_pipeline);
+  dp(d->vbgi_far_spatial_pipeline);
   if (g_cpuopt_ensure_pipelines < 0.5f) {
     DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
     DestroyGTVBAODescriptorTables(dev, &d->main_tables);
@@ -12727,6 +12747,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!d->vbgi_far_main_pipeline.handle) mkcs(__gtvbao_vbgi_far_main, "main", d->vbgi_far_main_layout, &d->vbgi_far_main_pipeline);
   if (!d->vbgi_far_resolve_pipeline.handle) mkcs(__vbgi_far_resolve, "main", d->vbgi_far_layout, &d->vbgi_far_resolve_pipeline);
   if (!d->vbgi_far_temporal_pipeline.handle) mkcs(__vbgi_far_temporal, "main", d->vbgi_far_layout, &d->vbgi_far_temporal_pipeline);
+  if (!d->vbgi_far_spatial_pipeline.handle) mkcs(__vbgi_far_spatial, "main", d->vbgi_far_layout, &d->vbgi_far_spatial_pipeline);
   // �-trous wavelet spatial filter (R3)
   if (!d->filter_pipeline.handle) mkcs(__gtvbao_filter, "main", d->filter_layout, &d->filter_pipeline);
   if (!d->temporal_pipeline.handle) mkcs(__gtvbao_temporal, "main", d->temporal_layout, &d->temporal_pipeline);
@@ -13494,11 +13515,37 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     d->vbgi_far_reuse_last = far_temporal_ran;
     d->vbgi_far_reuse_frame = d->frame_index;
     const uint32_t ri = d->vbgi_far_res_index;
+    const reshade::api::resource_view in_pos = far_temporal_ran ? d->vbgi_far_res_pos.srv[ri] : d->vbgi_far_cand_pos.srv[0];
+    const reshade::api::resource_view in_rad = far_temporal_ran ? d->vbgi_far_res_rad.srv[ri] : d->vbgi_far_cand_rad.srv[0];
+    const reshade::api::resource_view in_nrm = far_temporal_ran ? d->vbgi_far_res_nrm.srv[ri] : d->vbgi_far_cand_nrm.srv[0];
+    // Spatial reuse (M3): 3 neighbours' temporal reservoirs (or candidates); per frame, read only by the resolve.
+    bool far_spatial_ran = false;
+    if (g_vbgi_far_spatial > 0.5f) {
+      const uint32_t tw = d->vbgi_width, th = d->vbgi_height;
+      const bool spatial_pso = d->vbgi_far_spatial_pipeline.handle != 0u;
+      const bool sp_textures = spatial_pso
+                               && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_sp_pos, reshade::api::format::r32g32b32a32_float, 16u, tw, th)
+                               && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_sp_rad, reshade::api::format::r16g16b16a16_float, 8u, tw, th)
+                               && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_sp_nrm, reshade::api::format::r16g16b16a16_float, 8u, tw, th);
+      if (!sp_textures) {
+        CSLog("vbgi", "far spatial skipped: pso=" + std::to_string(spatial_pso) + " textures=" + std::to_string(sp_textures), true);
+      } else {
+        dispatch_far(d->vbgi_far_spatial_pipeline,
+                     {d->depth_mips_srv, mrt, d->fallback_srv, d->fallback_srv, d->fallback_srv, d->fallback_srv,
+                      in_pos, in_rad, in_nrm, d->fallback_srv, d->fallback_srv, d->fallback_srv},
+                     {d->vbgi_far_sp_pos.uav[0], d->vbgi_far_sp_rad.uav[0], d->vbgi_far_sp_nrm.uav[0], d->fallback_uav},
+                     false, tw, th);
+        GtvbaoBarrier(cl, d->vbgi_far_sp_pos.texture[0], UA, SR);
+        GtvbaoBarrier(cl, d->vbgi_far_sp_rad.texture[0], UA, SR);
+        GtvbaoBarrier(cl, d->vbgi_far_sp_nrm.texture[0], UA, SR);
+        far_spatial_ran = true;
+      }
+    }
     dispatch_far(d->vbgi_far_resolve_pipeline,
                  {d->depth_mips_srv, mrt, d->vbgi_raw_srv, d->fallback_srv, d->vbgi_radiance_srv, d->fallback_srv,
-                  far_temporal_ran ? d->vbgi_far_res_pos.srv[ri] : d->vbgi_far_cand_pos.srv[0],
-                  far_temporal_ran ? d->vbgi_far_res_rad.srv[ri] : d->vbgi_far_cand_rad.srv[0],
-                  far_temporal_ran ? d->vbgi_far_res_nrm.srv[ri] : d->vbgi_far_cand_nrm.srv[0],
+                  far_spatial_ran ? d->vbgi_far_sp_pos.srv[0] : in_pos,
+                  far_spatial_ran ? d->vbgi_far_sp_rad.srv[0] : in_rad,
+                  far_spatial_ran ? d->vbgi_far_sp_nrm.srv[0] : in_nrm,
                   d->fallback_srv, d->fallback_srv, d->fallback_srv},
                  {d->vbgi_far_joint.uav[0], d->vbgi_far_raw.uav[0], d->fallback_uav, vbgi_dbg ? d->debug_uav : d->fallback_uav},
                  false, d->vbgi_width, d->vbgi_height);
