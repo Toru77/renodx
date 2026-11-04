@@ -54,7 +54,8 @@ struct ShaderInjectData {
   float char_shadow_world_strength;
 
   // Environment "Sun SSS" ray-march. RETIRED across the whole mod; unread.
-  float env_sss_enabled;
+  // The first slot of this block (formerly the Sun SSS enable) now holds cs_bend_char_bias.
+  float cs_bend_char_bias;  // world units, default 0.02: receiver start-depth offset on character pixels
   float env_sss_strength;
   float env_sss_sample_count;
   float env_sss_hard_shadow_samples; // RETIRED, unread
@@ -249,7 +250,7 @@ struct ShaderInjectData {
   float gtvbao_normal_input_mode;      // Kai: 0=off, 1=on (mirrors global g_gtvbao_normal_input_mode)
   // Kai char shadow / misc
   // RETIRED and unread: no .hlsl file has ever read this. The per-technique
-  // character control the mod needs is cs_contact_char_strength (cs_micro_char_strength is RETIRED).
+  // character control the mod needs is cs_contact_char_strength (the micro slots now hold Bend settings).
   // Kept so the packoffsets after it do not move.
   float char_shadow_strength;
   // Foliage/character mask debug views. View 2 now shows the Contact Shadow term
@@ -577,38 +578,32 @@ struct ShaderInjectData {
    // which is why the earlier 22-25 views pushed the texture but rendered the
    // fallback instead. Set only while the push is active; reset every frame.
   float gtvbao_mrt_normal_debug;
-  // ---- Contact Shadows compute pass (appended last: do not insert above) ----
-  // The contact term is computed in shadows/*.cs_5_0.hlsl and consumed by the lighting shaders; it supersedes the inline raymarches (char_shadow_* / env_sss_* / local_sss_* above, now retired).
+  // ---- Contact Shadows (appended last: do not insert above) ---- The sun term is Bend Studio's screen-space shadows (shadows/bend_shadows*.hlsl), written to t34 and applied to the sun by FalcomApplyContactToSun; it supersedes the inline raymarches (char_shadow_* / env_sss_* / local_sss_*, retired).
 
-  // RETIRED micro shadow slots (kept for the layout)
-  float cs_micro_enabled;           // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_strength;          // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_env_strength;      // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_char_strength;     // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_opacity;           // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_aperture_scale;    // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_debug;             // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_ao_source;  // RETIRED: micro shadows removed, unread, kept for the layout
+  // Bend sun settings (these slots were the micro shadow fields)
+  float cs_bend_ignore_edge_pixels;  // Bend IgnoreEdgePixels 0/1, default 0
+  float cs_bend_use_precision_offset;  // Bend UsePrecisionOffset 0/1, default 0
+  float cs_bend_bilinear_offset_mode;  // Bend BilinearSamplingOffsetMode 0/1, default 0
+  float cs_bend_dispatch_index;  // runtime: slot * 8 + dispatch of the current Bend push
+  float cs_bend_world_space;  // 0/1, default 1: thickness and length in world units
+  float cs_bend_world_thickness;  // world units, default 0.05
+  float cs_bend_world_length;  // world units, default 1.0
+  float cs_bend_isfast;  // 0/1, default 1: IS-FAST start-depth dither
 
   // Contact Shadows
   float cs_contact_enabled;         // 0=Off, 1=On
   float cs_contact_strength;        // [0..1] global blend of the contact term
   float cs_contact_env_strength;    // [0..1] strength on non-character pixels
   float cs_contact_char_strength;   // [0..1] strength on character pixels
-  float cs_contact_sample_count;    // march steps; quality tiers 4/8/12/16, default 8
-                                     // (Medium). 8 is the count the reference settled on
-                                     // (same count UE uses).
-  float cs_contact_ray_length;      // world units the ray travels [1..200], default 50
-  float cs_contact_thickness;       // [0.001..4] world-space occluder thickness
-  float cs_contact_bias;            // [0..0.2] minimum penetration before a hit counts
-  float cs_contact_normal_bias;     // [0..1] world units to lift the origin along N
-  // Early-out for the sky: a device depth linearizing beyond this is treated as
-  // no geometry, so the march is skipped. Lower = cheaper, higher = less sky.
-  float cs_contact_sky_depth;       // world units [100..1e6]
+  float cs_bend_sample_count;  // Bend SAMPLE_COUNT (runtime): multiple of 4, 16..252, default 60
+  float cs_bend_surface_thickness;  // Bend SurfaceThickness, used when World-Space Scale is off, default 0.005
+  float cs_contact_thickness;       // Local inline march only (renamed in M3)
+  float cs_contact_bias;            // Local inline march only (renamed in M3)
+  float cs_bend_bilinear_threshold;  // Bend BilinearThreshold, default 0.02
+  float cs_bend_shadow_contrast;  // Bend ShadowContrast, default 4 (>= 1)
   float cs_contact_max_darkening;   // [0..1] floor on the contact term (0 = full black)
-  float cs_contact_isfast_enabled;  // 0=Off, 1=On — IS-FAST jitter (no IGN fallback by
-                                    // design: without it the march is unjittered)
-  float cs_contact_debug;           // 0=Off, 1=raw contact term (white = lit)
+  float cs_contact_isfast_enabled;  // Local inline march only (renamed in M3)
+  float cs_contact_debug;           // 0 Off, 1 Term, 2 Edge Mask, 3 Thread Index, 4 Wave Index, 5 Coverage, 6 Character Mask, 7 Bend Character Mask
   // Local (point/spot) contact shadows, evaluated inside the dynamic light loop.
   // Off by default: it is per-light work in a pixel shader, so the cost scales
   // with the per-pixel light count rather than being one full-screen pass.
@@ -623,10 +618,10 @@ struct ShaderInjectData {
   float cs_noise_frame;            // IS-FAST volume slice (frame_index % 32), or -1 when
                                    // the volume is unusable and the caller must not sample
   float cs_working_w, cs_working_h; // shadow output / depth texture dims
-  float cs_ao_bound;               // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_dedicated_bound;  // RETIRED: micro shadows removed, unread, kept for the layout
+  float cs_bend_isfast_amount;  // [0..1] dither range as a fraction of the shadow window, default 0.5
+  float cs_bend_char_receive;  // 0/1, default 1: character pixels receive (and self-shadow) like RT Sun
   float cs_contact_dedicated_bound;// 0/1 — t34 holds a valid contact term this frame
-  float cs_micro_isfast_enabled;  // RETIRED: micro shadows removed, unread, kept for the layout
+  float cs_bend_char_mask_mode;  // runtime: 0 Sora (mrt0.w & 8 == 0), 1 Kai/Kyoto ((mrt0.z >> 8) & 1)
   // Manual override for the sun-contact range gate, in world units. 0 = derive the
   // cutoff from the engine's own last-cascade split. The override exists because
   // that split is only read in-shader by Kai and Kai soft; the Sora shaders
@@ -639,7 +634,7 @@ struct ShaderInjectData {
   // Count buys noise reduction without also changing how dark the contact reads.
   // At Sample Count 4 with this at 4 the estimator is exactly the old binary
   // any-hit test, value for value, which is what makes it a safe default.
-  float cs_contact_response_scale;
+  float cs_contact_response_scale;  // Local inline march only (renamed in M3)
   // Which of the four local light loops the contact march runs on. All four
   // march identically -- each derives its direction from lightPos - worldPos --
   // so this is a cost/appearance selection, not a different technique. The spot
@@ -690,7 +685,7 @@ struct ShaderInjectData {
   float char_cam_enabled;             // 0/1 — run the camera-facing march
   float char_cam_strength;            // [0..1] blend of the resulting term
   float char_cam_sample_count;        // [1..32] march steps
-  // World-space march length, in the same units as cs_contact_ray_length. 1 unit is
+  // World-space march length, in world units. 1 unit is
   // about 1 metre and a human head is ~0.18, so this is a SILHOUETTE reach and the
   // engine's own march is in the same neighbourhood. It is not, and cannot be, a real
   // contact shadow: this axis is the camera axis, so the ray always heads into the
