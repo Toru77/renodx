@@ -211,6 +211,9 @@ Texture3D<float2> csIsfastNoise : register(t35);
 // at t4; the shadow path takes its own binding to the same resource so the
 // element type can be fixed in the shared helper (see shadows_common.hlsli).
 Texture2D<float4> csDepthTex : register(t36);
+// t40 is the local contact term (shadows/contact_local.cs_5_0.hlsl; depth size): x point, z spot share of the lamp
+// light the march blocks. Bound by DeployShadows while cs_contact_local_bound is set.
+Texture2D<float4> csLocalContactTex : register(t40);
 
 #include "../../shared.h"
 #include "../../shadows/shadows_common.hlsli"
@@ -1114,40 +1117,19 @@ void main(
   r1.w = exp2(r1.w);
   r1.w = min(1, r1.w);
   r8.xyz = r10.xyz * r1.www + r9.xyz;
-  // -- Local contact shadows: setup shared by all four light loops below --
-  // The budget is per pixel and shared by every loop, so a pixel covered by many
-  // lights pays for a bounded number of marches rather than one per light. Every
-  // value here is loop-invariant; only the budget counter changes per light.
-  const bool csLocalOn = shader_injection_data.cs_contact_local_enabled > 0.5f;
-  // Four toggles pick which of the loops below are instrumented. All four march
-  // identically -- each derives its direction from the light's position -- so a
-  // disabled loop is simply never called and therefore never spends budget.
-  // Point/Spot are the specular-enabled material path; EnvPoint/EnvSpot are the
-  // diffuse-only path whose specular comes from the environment cube. All four
-  // default to true, which is the behaviour that had no setting at all.
-  const bool csLocalPointOn    = csLocalOn && shader_injection_data.cs_contact_local_point > 0.5f;
-  const bool csLocalSpotOn     = csLocalOn && shader_injection_data.cs_contact_local_spot > 0.5f;
-  const bool csLocalEnvPointOn = csLocalOn && shader_injection_data.cs_contact_local_env_point > 0.5f;
-  const bool csLocalEnvSpotOn  = csLocalOn && shader_injection_data.cs_contact_local_env_spot > 0.5f;
-  FalcomContactParams csLocalParams;
-  csLocalParams.rayLength = max(0.0, shader_injection_data.cs_contact_local_ray_length);
-  csLocalParams.thickness = max(0.0, shader_injection_data.cs_contact_thickness);
-  csLocalParams.bias = max(0.0, shader_injection_data.cs_contact_bias);
-  csLocalParams.sampleCount =
-      max(1.0, floor(shader_injection_data.cs_contact_local_sample_count + 0.5));
-  csLocalParams.strength = saturate(shader_injection_data.cs_contact_local_strength);
-  float csLocalBudget = csLocalOn
-      ? max(0.0, floor(shader_injection_data.cs_contact_local_max_lights + 0.5)) : 0.0;
-  const float2 csDepthUnpack = FalcomDepthUnpackConsts();
-  const float csLocalJitter = shader_injection_data.cs_contact_isfast_enabled > 0.5f
-      ? FalcomSampleISFAST(csIsfastNoise, samPoint_s, uint2(v0.xy), 
-                           (uint)max(shader_injection_data.cs_noise_frame, 0.0f),
-                           128.0, 32.0,
-                           shader_injection_data.shadow_isfast_spatial_scale,
-                           shader_injection_data.shadow_isfast_temporal_speed,
-                           shader_injection_data.shadow_isfast_seed_offset,
-                           shader_injection_data.shadow_isfast_texture_loaded)
-      : 0.5f;
+  // -- Local contact shadows (shadows/contact_local.cs_5_0.hlsl): x point, z spot share of the lamp light the march
+  // blocks; 0 = the game's behaviour. The material path (r16.y) picks Point/Spot or Env Point/Env Spot, as RTLS does.
+  float2 csLocalShare = float2(0, 0);
+  if (shader_injection_data.cs_contact_local_bound > 0.5f) {
+    csLocalShare = csLocalContactTex.SampleLevel(samPoint_s, v1.xy, 0).xz;
+  }
+  const float csLocalStrength = saturate(shader_injection_data.cs_contact_local_strength);
+  const bool csLocalPointOn = (r16.y != 0 ? shader_injection_data.cs_contact_local_point
+                                          : shader_injection_data.cs_contact_local_env_point) > 0.5f;
+  const bool csLocalSpotOn = (r16.y != 0 ? shader_injection_data.cs_contact_local_spot
+                                         : shader_injection_data.cs_contact_local_env_spot) > 0.5f;
+  const float csLocalPointVis = csLocalPointOn ? 1.0 - csLocalShare.x * csLocalStrength : 1.0;
+  const float csLocalSpotVis = csLocalSpotOn ? 1.0 - csLocalShare.y * csLocalStrength : 1.0;
   if (r16.y != 0) {
     r1.w = lightIndices_g[r3.y].pointLightCount;
     r1.w = min(63, (uint)r1.w);
@@ -1187,14 +1169,7 @@ void main(
         r13.y = dynamicLights_g[r2.w].color.x;
         r13.z = dynamicLights_g[r2.w].color.y;
         r13.w = dynamicLights_g[r2.w].color.z;
-        if (csLocalPointOn && csLocalBudget > 0.0) {
-          csLocalBudget -= 1.0;
-          float3 csLightPos = float3(dynamicLights_g[r2.w].pos.x, dynamicLights_g[r2.w].pos.y,
-                                     dynamicLights_g[r2.w].pos.z);
-          r13.yzw = FalcomApplyLocalContactShadow(r13.yzw, csLightPos, r5.xyz, csLocalParams,
-                                                  csDepthUnpack, csLocalJitter,
-                                                  csDepthTex, samPoint_s);
-        }
+        r13.yzw *= csLocalPointVis;
         // ── BRDF Diffuse (Hammon) ──
         float3 brdf_vanilla_diffuse_pt = r13.yzw * brdf_combinedAtten_pt;
         if (brdf_use_hammon) {
@@ -1316,14 +1291,7 @@ void main(
           r16.x = dynamicLights_g[r2.w].color.x;
           r16.y = dynamicLights_g[r2.w].color.y;
         r16.z = dynamicLights_g[r2.w].color.z;
-        if (csLocalSpotOn && csLocalBudget > 0.0) {
-            csLocalBudget -= 1.0;
-            float3 csLightPos = float3(dynamicLights_g[r2.w].pos.x, dynamicLights_g[r2.w].pos.y,
-                                       dynamicLights_g[r2.w].pos.z);
-            r16.xyz = FalcomApplyLocalContactShadow(r16.xyz, csLightPos, r5.xyz, csLocalParams,
-                                                    csDepthUnpack, csLocalJitter,
-                                                    csDepthTex, samPoint_s);
-          }
+        r16.xyz *= csLocalSpotVis;
           // ── BRDF Diffuse (Hammon) ──
           float3 brdf_vanilla_diffuse_sp = r16.xyz * brdf_combinedAtten_sp;
           if (brdf_use_hammon) {
@@ -1399,14 +1367,7 @@ void main(
         // its local lights at all. r10.xyz holds the colour, r11.xyz still holds
         // the normalised light vector but brdf_rawNdotL_env has already consumed
         // it by now, and r1.w is the light index.
-        if (csLocalEnvPointOn && csLocalBudget > 0.0) {
-          csLocalBudget -= 1.0;
-          float3 csLightPos = float3(dynamicLights_g[r1.w].pos.x, dynamicLights_g[r1.w].pos.y,
-                                     dynamicLights_g[r1.w].pos.z);
-          r10.xyz = FalcomApplyLocalContactShadow(r10.xyz, csLightPos, r5.xyz, csLocalParams,
-                                                  csDepthUnpack, csLocalJitter,
-                                                  csDepthTex, samPoint_s);
-        }
+        r10.xyz *= csLocalPointVis;
         // ── BRDF Diffuse (Hammon) ──
         float3 brdf_vanilla_diffuse_env = r10.xyz * brdf_combinedAtten_env;
         if (brdf_use_hammon) {
@@ -1510,14 +1471,7 @@ void main(
           // as the light vector, so the colour that overwrote it is free to be
           // scaled here, and the spot shadow map if shadowmapIndex != -1 has
           // already been folded into r3.z.
-          if (csLocalEnvSpotOn && csLocalBudget > 0.0) {
-            csLocalBudget -= 1.0;
-            float3 csLightPos = float3(dynamicLights_g[r1.w].pos.x, dynamicLights_g[r1.w].pos.y,
-                                       dynamicLights_g[r1.w].pos.z);
-            r11.xyz = FalcomApplyLocalContactShadow(r11.xyz, csLightPos, r5.xyz, csLocalParams,
-                                                    csDepthUnpack, csLocalJitter,
-                                                    csDepthTex, samPoint_s);
-          }
+          r11.xyz *= csLocalSpotVis;
           // ── BRDF Diffuse (Hammon) ──
           float3 brdf_vanilla_diffuse_env_sp = r11.xyz * brdf_combinedAtten_env_sp;
           if (brdf_use_hammon) {

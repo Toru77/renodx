@@ -568,11 +568,9 @@ float3 FalcomApplyShadowTerms(float3 lit, float2 screenUV, bool isCharacter,
 }
 
 // ── Local (point / spot) contact shadows ──
-// The compute pass covers the sun once per pixel. Local lights are a different
-// problem: they are evaluated inside the dynamic light loop, once per light, so
-// the same march has to run there. That is also where it is worth the most --
-// local lights in this engine mostly have shadow casting disabled, so the march
-// is the only shadow detail they get.
+// The march toward one local light. Sora 1st, Sora 2nd and Kai run it in a compute pass (contact_local.cs_5_0.hlsl)
+// that calls FalcomApplyLocalContactShadow with a unit colour per lamp; Kyoto still calls it inside its dynamic light
+// loops. Local lights in this engine mostly have shadow casting disabled, so the march is the only shadow detail they get.
 //
 // Which loops are marched is a CALLER-SIDE decision (cs_contact_local_point /
 // _spot / _env_point / _env_spot), not one made in here: the engine evaluates

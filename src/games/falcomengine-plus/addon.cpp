@@ -543,7 +543,7 @@ constexpr uint32_t kLightingContactShadowRegister = 34u;
 // noise registers on their behalf.
 constexpr uint32_t kLightingShadowNoiseRegister = 35u;
 constexpr uint32_t kLightingShadowDepthRegister = 36u;
-// The lighting shaders read the local contact term from this slot. Only Sora 2nd's lighting shader declares t40 (csLocalContactTex), for this term alone, and no other push claims it.
+// The lighting shaders read the local contact term from this slot. Sora 1st, Sora 2nd, Kai and Kai soft's lighting shaders declare t40 (csLocalContactTex), for this term alone, and no other push claims it.
 constexpr uint32_t kLightingLocalContactRegister = 40u;
 // The character and SSAO passes bind the same noise volume at the same register as
 // the lighting shaders. One number, not two, so the two families of shaders cannot
@@ -894,7 +894,7 @@ static bool VbgiFarRunning() { return VbgiRunning() && g_vbgi_far_enabled > 0.5f
 // Local contact shadows run as a compute pass (shadows/contact_local.cs_5_0.hlsl) on the titles whose lighting shaders
 // read the term at t40. Off while RT Local Shadows is requested, as the Local Lights row is.
 static bool LocalContactComputeRunning() {
-  return shader_injection.cs_contact_local_enabled > 0.5f && IsSora2nd() && !falcom_world::rtls::RtlsRequested();
+  return shader_injection.cs_contact_local_enabled > 0.5f && (IsSora1st() || IsSora2nd() || IsKai()) && !falcom_world::rtls::RtlsRequested();
 }
 
 // -- Lighting shader identification (Sora + Kai) --
@@ -4698,7 +4698,7 @@ renodx::utils::settings::Settings settings = {
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 16.f, .label = "Local Light Budget", .section = "Contact Shadows",
       .tooltip = "Per-pixel cap on how many local lights get a march, so a crowded scene "
-                 "cannot multiply the cost without limit.",
+                 "cannot multiply the cost without limit. Sora and Kai march the strongest lights first.",
       .min = 1.f, .max = 16.f, .format = "%d",
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },

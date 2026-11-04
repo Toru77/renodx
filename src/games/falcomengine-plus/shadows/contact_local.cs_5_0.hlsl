@@ -12,8 +12,8 @@
 // The origin is lifted along the MRT normal by Local Normal Bias, and along the negated normal for a lamp behind the
 // surface (lit through translucency), as RT Local Shadows does.
 //
-// Runs on Sora 2nd only (IsSora2nd in LocalContactComputeRunning, addon.cpp). It reads lightTileSizeInv_g at cb_scene c29
-// and LightIndexData.tileDepthInv, which Sora 1st and Kai lay out the same way. Kyoto keeps the inline march in its lighting shader.
+// Runs on Sora 1st, Sora 2nd and Kai (Kai and Kai soft share the Kai path). It reads lightTileSizeInv_g at cb_scene c29
+// and LightIndexData.tileDepthInv, which these games lay out the same way. Kyoto keeps the inline march in its lighting shader.
 //
 // Bindings (root param 2 / 3 of the host layout):
 //   t0 depth        scene depth, reversed-Z, device Z in .x
@@ -21,7 +21,7 @@
 //   t2 IS-FAST      128x128x32 blue noise volume
 //   t3 lamps        the game's dynamicLights_g (LightParam)
 //   t4 light cells  the game's lightIndices_g (LightIndexData)
-//   t5 material     the game's material index texture, index in .x (Sora mrtTexture2, Kai mrtTexture1)
+//   t5 material     the game's material index texture, index in .x of a uint4 (Sora's uint2 mrtTexture2 and Kai's uint4 mrtTexture1 both bind to it)
 //   t6 materials    the game's deferredParams_g (DeferredParam, 144 bytes)
 //   u0 output       rgba8_unorm: .x point share, .y diagnostic code / 255, .z spot share, .w 1 = written
 
@@ -50,7 +50,7 @@ Texture2D<uint4>  g_srcMrtNormal                : register(t1);
 Texture3D<float2> g_isfastNoise                 : register(t2);
 StructuredBuffer<LightParam> g_lamps            : register(t3);
 StructuredBuffer<LightIndexData> g_lampCells    : register(t4);
-Texture2D<uint2>  g_srcMaterialIndex            : register(t5);
+Texture2D<uint4>  g_srcMaterialIndex            : register(t5);
 StructuredBuffer<GameDeferredParam> g_materials : register(t6);
 SamplerState g_samplerPointClamp                : register(s0);
 
