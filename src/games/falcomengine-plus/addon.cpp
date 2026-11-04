@@ -919,6 +919,7 @@ static float g_gtvbao_depth_rejection = 0.2f;
 static float g_gtvbao_normal_rejection = 0.f;
 static float g_gtvbao_svgf_spatial_enabled = 1.f;
 static float g_gtvbao_svgf_iterations = 5.f;
+static float g_gtvbao_svgf_half_res_iterations = 4.f;
 static float g_gtvbao_svgf_luminance_edge_stop = 4.f;
 static float g_vbgi_temporal_enabled = 1.f;
 static float g_vbgi_history_weight = 0.8f;
@@ -13088,6 +13089,8 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       table_nulls.push_back({ip.uav_table, 0, 0, 1u, reshade::api::descriptor_type::texture_unordered_access_view, kNull});
     }
     const bool gt_conf = GtvbaoDebugMode() == 23 && d->debug_uav.handle != 0u;
+    // Half: DispatchRtgiDenoise subtracts log2(divisor) = 1, so + 1 makes Half Res Iterations the effective count.
+    const float svgf_iterations = low_res ? g_gtvbao_svgf_half_res_iterations + 1.f : g_gtvbao_svgf_iterations;
     rtgi::DispatchRtgiDenoise(dev, cl, &d->gtvbao_denoise,
                               {.raw_view = d->gtvbao_svgf_raw.srv[0],
                                .depth_view = d->captured_depth_srv,
@@ -13105,7 +13108,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
                                .divisor = static_cast<float>(divisor),
                                .debug_mode = gt_conf ? 5 : 0,
                                .svgf = {g_gtvbao_history_weight, g_gtvbao_depth_rejection, g_gtvbao_normal_rejection,
-                                        history_valid, g_gtvbao_svgf_iterations, g_gtvbao_svgf_luminance_edge_stop},
+                                        history_valid, svgf_iterations, g_gtvbao_svgf_luminance_edge_stop},
                                .luminance_weights = rtgi::kSvgfLuminanceAo,
                                .upsample_intensity = 1.f,
                                .upsample_char_intensity = 1.f,
@@ -13668,7 +13671,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
   }
   if (fdw_reason == DLL_PROCESS_ATTACH) {
-    falcom_world::AddSvgfRows(&settings, IsAdvancedSettingsMode, IsAdvancedSettingsMode, {.prefix = "Gtvbao", .temporal_section = "GTVBAO Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Runs on Sora 1st, Sora 2nd and Kai only; off while Deferred Dispatch is On. Resets on camera cuts, frame gaps and parameter changes.", .temporal_enabled = &g_gtvbao_temporal_enabled, .history_weight = &g_gtvbao_history_weight, .depth_rejection = &g_gtvbao_depth_rejection, .normal_rejection = &g_gtvbao_normal_rejection, .spatial_section = "GTVBAO Spatial Filter", .spatial_enabled_tooltip = "Denoises the GTVBAO AO with the SVGF a-trous filter (depth, normal and AO edge stops). Off = no filter.", .spatial_enabled = &g_gtvbao_svgf_spatial_enabled, .iterations = &g_gtvbao_svgf_iterations, .luminance_edge_stop = &g_gtvbao_svgf_luminance_edge_stop});
+    falcom_world::AddSvgfRows(&settings, IsAdvancedSettingsMode, IsAdvancedSettingsMode, {.prefix = "Gtvbao", .temporal_section = "GTVBAO Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Runs on Sora 1st, Sora 2nd and Kai only; off while Deferred Dispatch is On. Resets on camera cuts, frame gaps and parameter changes.", .temporal_enabled = &g_gtvbao_temporal_enabled, .history_weight = &g_gtvbao_history_weight, .depth_rejection = &g_gtvbao_depth_rejection, .normal_rejection = &g_gtvbao_normal_rejection, .spatial_section = "GTVBAO Spatial Filter", .spatial_enabled_tooltip = "Denoises the GTVBAO AO with the SVGF a-trous filter (depth, normal and AO edge stops). Off = no filter.", .spatial_enabled = &g_gtvbao_svgf_spatial_enabled, .iterations = &g_gtvbao_svgf_iterations, .luminance_edge_stop = &g_gtvbao_svgf_luminance_edge_stop, .half_res_iterations = &g_gtvbao_svgf_half_res_iterations});
     falcom_world::AddSvgfRows(&settings, []() { return VbgiRowVisible(); }, IsAdvancedSettingsMode, {.prefix = "Vbgi", .temporal_section = "GTVBGI Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.", .temporal_enabled = &g_vbgi_temporal_enabled, .history_weight = &g_vbgi_history_weight, .depth_rejection = &g_vbgi_depth_rejection, .normal_rejection = &g_vbgi_normal_rejection, .spatial_section = "GTVBGI Spatial Filter", .spatial_enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.", .spatial_enabled = &g_vbgi_spatial_enabled, .iterations = &g_vbgi_svgf_iterations, .luminance_edge_stop = &g_vbgi_svgf_luminance_edge_stop});
     falcom_world::AddSettings(&settings, IsSora2nd(), IsAdvancedSettingsMode);
   }

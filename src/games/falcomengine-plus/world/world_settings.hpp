@@ -66,6 +66,7 @@ struct SvgfRows {
   float* spatial_enabled;
   float* iterations;
   float* luminance_edge_stop;
+  float* half_res_iterations = nullptr;  // GTVBAO only: Half Res Iterations row; Iterations then applies at Full only
 };
 inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::function<bool()>& visible,
                         const std::function<bool()>& advanced, const SvgfRows& rows) {
@@ -139,14 +140,29 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
       .binding = rows.iterations,
       .value_type = SettingValueType::INTEGER,
       .default_value = 5.f,
-      .label = "Iterations",
+      .label = rows.half_res_iterations != nullptr ? "Full Res Iterations" : "Iterations",
       .section = rows.spatial_section,
-      .tooltip = "A-trous iterations of the SVGF filter (1 to 5). The effective count is this minus log2 of the trace divisor (Half: minus 1, Quarter: minus 2), at least 1; the panel shows the effective count.",
+      .tooltip = rows.half_res_iterations != nullptr ? "A-trous iterations of the SVGF filter at Full resolution (1 to 5). Half resolution uses Half Res Iterations." : "A-trous iterations of the SVGF filter (1 to 5). The effective count is this minus log2 of the trace divisor (Half: minus 1, Quarter: minus 2), at least 1; the panel shows the effective count.",
       .min = 1.f,
       .max = 5.f,
       .format = "%d",
       .is_visible = visible,
   });
+  if (rows.half_res_iterations != nullptr) {
+    settings->push_back(new Setting{
+        .key = prefix + "SvgfHalfResIterations",
+        .binding = rows.half_res_iterations,
+        .value_type = SettingValueType::INTEGER,
+        .default_value = 4.f,
+        .label = "Half Res Iterations",
+        .section = rows.spatial_section,
+        .tooltip = "A-trous iterations of the SVGF filter at Half resolution (1 to 4). Each iteration doubles the step, so 4 at Half covers the same screen area as 5 at Full.",
+        .min = 1.f,
+        .max = 4.f,
+        .format = "%d",
+        .is_visible = visible,
+    });
+  }
   settings->push_back(new Setting{
       .key = prefix + "SvgfLuminanceEdgeStop",
       .binding = rows.luminance_edge_stop,
