@@ -38,8 +38,8 @@ struct ShaderInjectData {
   // read on `char_shadow_mode >= 0.5f` and not on `== 1`. That engine code is
   // still in the Sora and Kai character/SSAO shaders.
   float char_shadow_mode;
-  float cs_contact_local_char_lamp;      // [0..2] Local Character Lamp Light: the game's lamp light added to characters, shadowed by the local contact term (Sora); was the retired char_shadow_sample_count
-  float cs_contact_local_char_strength;  // [0..1] Local Character Strength: scales the local contact term on characters, on top of cs_contact_local_strength; was the retired char_shadow_hard_shadow_samples
+  float char_shadow_sample_count;   // RETIRED: Bend_SSS, unread
+  float char_shadow_hard_shadow_samples;   // RETIRED: Bend_SSS, unread
   float char_shadow_fade_out_samples;       // RETIRED: Bend_SSS, unread
   float rtao_debug_show;                    // RTAO: 1 = the lighting shader shows the RTAO texel (t22) as an image (RunRtaoInline); 0 off
   float char_shadow_contrast;               // RETIRED: Bend_SSS, unread

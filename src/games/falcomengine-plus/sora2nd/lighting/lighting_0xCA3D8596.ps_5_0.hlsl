@@ -673,29 +673,29 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             - min(rtlsCharTerm.x * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening * rtlsCharTerm.z);
         const float rtlsCharSpotVis = rtlsCharTerm.z
             - min(rtlsCharTerm.y * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening * rtlsCharTerm.z);
-        charColor += r0.xyz * CharacterLampLight(dynamicLights_g, lightIndices_g, lightTileSizeInv_g.xy, v0.xy, r1.w, r4.xyz,
-                                                 DecodeFalcomMrtNormalAsGame((uint2)r1.xy),
-                                                 (rtlsCharFlags & RTLS_FLAG_POINT) != 0u, (rtlsCharFlags & RTLS_FLAG_SPOT) != 0u,
-                                                 rtlsCharPointVis, rtlsCharSpotVis)
-            * shader_injection_data.rtls_char_lamp;
+        const float3 rtlsCharN = DecodeFalcomMrtNormalAsGame((uint2)r1.xy);
+        // Tile cell as the environment path computes it (lines 829-840): screen tile, then depth slice from r1.w.
+        const uint2 rtlsTile = (uint2)(lightTileSizeInv_g.xy * v0.xy);
+        const uint rtlsRow = rtlsTile.y << 5;
+        const uint rtlsSlice = (uint)clamp(lightIndices_g[rtlsTile.x + rtlsRow].tileDepthInv * -r1.w, 0.0, 7.0);
+        const uint rtlsCell = min(4607u, rtlsSlice * 576u + rtlsRow + rtlsTile.x);
+        // One loop over the point list, then the spot list (the environment loops' formulas).
+        const uint rtlsPoints = (rtlsCharFlags & RTLS_FLAG_POINT) != 0u ? min(63u, lightIndices_g[rtlsCell].pointLightCount) : 0u;
+        const uint rtlsSpots = (rtlsCharFlags & RTLS_FLAG_SPOT) != 0u ? min(63u, lightIndices_g[rtlsCell].spotLightCount) : 0u;
+        float3 rtlsLamp = float3(0, 0, 0);
+        for (uint i = 0u; i < rtlsPoints + rtlsSpots; ++i) {
+          const bool spot = i >= rtlsPoints;
+          const LightParam lamp = dynamicLights_g[spot ? lightIndices_g[rtlsCell].spotLightIndices[i - rtlsPoints]
+                                                       : lightIndices_g[rtlsCell].pointLightIndices[i]];
+          if (lamp.radius <= 0.0) continue;
+          const float3 toLamp = lamp.pos - r4.xyz;
+          const float3 lampDir = normalize(toLamp);
+          const float att = LampDistanceAttenuation(lamp, toLamp) * (spot ? LampSpotCone(lamp, lampDir) : 1.0);
+          if (att <= 0.0) continue;
+          rtlsLamp += lamp.charaColor * (att * max(lamp.translucency, dot(rtlsCharN, lampDir)) * (spot ? rtlsCharSpotVis : rtlsCharPointVis));
+        }
+        charColor += r0.xyz * rtlsLamp * shader_injection_data.rtls_char_lamp;
       }
-    }
-    // Local contact shadows on characters (shadows/contact_local.cs_5_0.hlsl, t40): the same lamp light, each class weighted
-    // by 1 - its share of the local term x Local Strength x Local Character Strength. A class counts when either of its
-    // material paths is on. Not bound, or Local Character Lamp Light 0: charColor unchanged.
-    if (shader_injection_data.cs_contact_local_bound > 0.5f && shader_injection_data.cs_contact_local_char_lamp > 0.0f) {
-      const float2 csLocalCharShare = csLocalContactTex.SampleLevel(samPoint_s, v1.xy, 0).xz;
-      const float csLocalCharStrength = saturate(shader_injection_data.cs_contact_local_strength)
-          * saturate(shader_injection_data.cs_contact_local_char_strength);
-      charColor += r0.xyz * CharacterLampLight(dynamicLights_g, lightIndices_g, lightTileSizeInv_g.xy, v0.xy, r1.w, r4.xyz,
-                                               DecodeFalcomMrtNormalAsGame((uint2)r1.xy),
-                                               shader_injection_data.cs_contact_local_point > 0.5f
-                                                   || shader_injection_data.cs_contact_local_env_point > 0.5f,
-                                               shader_injection_data.cs_contact_local_spot > 0.5f
-                                                   || shader_injection_data.cs_contact_local_env_spot > 0.5f,
-                                               1.0 - csLocalCharShare.x * csLocalCharStrength,
-                                               1.0 - csLocalCharShare.y * csLocalCharStrength)
-          * shader_injection_data.cs_contact_local_char_lamp;
     }
     // RTAO on characters, whatever "Allow GTVBAO" says: RTAO replaces GTVBAO, whose character settings do not
     // apply while it produces. Character Intensity scales it after the temporal pass and the filter.
