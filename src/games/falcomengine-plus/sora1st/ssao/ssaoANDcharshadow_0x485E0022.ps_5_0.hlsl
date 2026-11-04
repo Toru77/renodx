@@ -307,8 +307,8 @@ void main(
       } else {
         // Off, and Custom with the camera pass switched off. The camera and world
         // screen-space shadow raymarchs that used to run here are replaced by the
-        // Contact / Micro Shadow compute passes, which the lighting shader reads at
-        // t33/t34 with the environment/character split. This pass therefore no longer
+        // Contact Shadow compute pass, which the lighting shader reads at
+        // t34 with the environment/character split. This pass therefore no longer
         // writes a shadow into the .z channel on this path; Custom writes 1.0, which
         // the lighting shader's `char_shadow_mode >= 0.5f` gate still multiplies in as
         // a no-op.

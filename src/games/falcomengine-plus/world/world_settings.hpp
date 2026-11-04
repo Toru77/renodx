@@ -757,7 +757,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.5f,
       .label = "Max Darkening",
       .section = "RTAO",
-      .tooltip = "Caps the darkest RTAO: no pixel goes below 1 - Max Darkening; lighter pixels are unchanged. 1 = no cap. Micro shadows read the uncapped AO.",
+      .tooltip = "Caps the darkest RTAO: no pixel goes below 1 - Max Darkening; lighter pixels are unchanged. 1 = no cap.",
       .min = 0.f,
       .max = 1.f,
       .format = "%.2f",

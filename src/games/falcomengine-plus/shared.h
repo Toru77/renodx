@@ -72,8 +72,8 @@ struct ShaderInjectData {
   float env_sss_bright_reject_fade;
   float env_sss_csm_gate;
   // Foliage / character mask debug view. Still live: view 1 is the mask the
-  // GTVBAO character options act on, 2 the contact term, 3 the AO the micro
-  // pass reads, 4 raw mrt0.z.
+  // GTVBAO character options act on, 2 the contact term, 3 the full game SSAO
+  // texture, 4 raw mrt0.z.
   float debug_show_env_sss;
 
   // —— Local Screen Space Shadows (Bend_SSS for point/spot lights) ——
@@ -249,7 +249,7 @@ struct ShaderInjectData {
   float gtvbao_normal_input_mode;      // Kai: 0=off, 1=on (mirrors global g_gtvbao_normal_input_mode)
   // Kai char shadow / misc
   // RETIRED and unread: no .hlsl file has ever read this. The per-technique
-  // character control the mod needs is cs_micro_char_strength / cs_contact_char_strength.
+  // character control the mod needs is cs_contact_char_strength (cs_micro_char_strength is RETIRED).
   // Kept so the packoffsets after it do not move.
   float char_shadow_strength;
   // Foliage/character mask debug views. View 2 now shows the Contact Shadow term
@@ -577,34 +577,18 @@ struct ShaderInjectData {
    // which is why the earlier 22-25 views pushed the texture but rendered the
    // fallback instead. Set only while the push is active; reset every frame.
   float gtvbao_mrt_normal_debug;
-  // ---- Contact Shadows + Micro Shadows compute passes (appended last: do not insert above) ----
-  // Two independent screen-space shadow techniques computed in shadows/*.cs_5_0.hlsl
-  // and consumed by the lighting shaders. They supersede the inline screen-space
-  // shadow raymarchs (char_shadow_* / env_sss_* / local_sss_* above, now retired).
-  //
-  // Micro Shadows: an AO-driven aperture term (Uncharted 4) applied to NdotL.
-  // Contact Shadows: a clip-space depth march toward the light, jittered with
-  // IS-FAST blue noise and resolved by the game's TAA.
-  //
-  // The two passes are separate because they need different inputs and have very
-  // different cost: micro is a handful of ALU ops, contact is a raymarch.
+  // ---- Contact Shadows compute pass (appended last: do not insert above) ----
+  // The contact term is computed in shadows/*.cs_5_0.hlsl and consumed by the lighting shaders; it supersedes the inline raymarches (char_shadow_* / env_sss_* / local_sss_* above, now retired).
 
-  // Micro Shadows
-  float cs_micro_enabled;           // 0=Off, 1=On
-  float cs_micro_strength;          // [0..1] global blend of the micro term
-  float cs_micro_env_strength;      // [0..1] strength on non-character pixels
-  float cs_micro_char_strength;     // [0..1] strength on character pixels
-  float cs_micro_opacity;           // [0..1] lerp(1, microshadow, opacity) from the paper
-  float cs_micro_aperture_scale;    // [0..2], default 1 — scales the 2*AO*AO aperture
-  float cs_micro_debug;             // 0=Off, 1=raw micro term, 2=diagnostic channels
-  // AO source for the micro pass: 0 = the game's deferred AO (a float channel),
-  // 1 = the GTVBAO AO (visibility in byte 0 of an r32_uint). Both are bound every
-  // frame and the shader decodes each in its own encoding, because reading either
-  // as the wrong type yields plausible garbage rather than an error.
-  // 1 is the default: the game AO capture is not reliably available every frame,
-  // and with AO = 1 the micro term saturate(NdotL + 2*AO*AO - 1) is identically
-  // 1 at every pixel, i.e. the effect does nothing at all.
-  float cs_micro_ao_source;
+  // RETIRED micro shadow slots (kept for the layout)
+  float cs_micro_enabled;           // RETIRED: micro shadows removed, unread, kept for the layout
+  float cs_micro_strength;          // RETIRED: micro shadows removed, unread, kept for the layout
+  float cs_micro_env_strength;      // RETIRED: micro shadows removed, unread, kept for the layout
+  float cs_micro_char_strength;     // RETIRED: micro shadows removed, unread, kept for the layout
+  float cs_micro_opacity;           // RETIRED: micro shadows removed, unread, kept for the layout
+  float cs_micro_aperture_scale;    // RETIRED: micro shadows removed, unread, kept for the layout
+  float cs_micro_debug;             // RETIRED: micro shadows removed, unread, kept for the layout
+  float cs_micro_ao_source;  // RETIRED: micro shadows removed, unread, kept for the layout
 
   // Contact Shadows
   float cs_contact_enabled;         // 0=Off, 1=On
@@ -639,21 +623,10 @@ struct ShaderInjectData {
   float cs_noise_frame;            // IS-FAST volume slice (frame_index % 32), or -1 when
                                    // the volume is unusable and the caller must not sample
   float cs_working_w, cs_working_h; // shadow output / depth texture dims
-  float cs_ao_bound;               // 0/1 — a usable AO capture was bound to the micro pass
-  float cs_micro_dedicated_bound;  // 0/1 — t33 holds a valid micro term this frame
+  float cs_ao_bound;               // RETIRED: micro shadows removed, unread, kept for the layout
+  float cs_micro_dedicated_bound;  // RETIRED: micro shadows removed, unread, kept for the layout
   float cs_contact_dedicated_bound;// 0/1 — t34 holds a valid contact term this frame
-  // IS-FAST dither for the micro pass. Appended last, and OFF by default.
-  //
-  // The micro term is a closed-form function of NdotL and AO with no ray to march,
-  // so there is no sample position to jitter. What this actually dithers is the AO
-  // QUANTISATION: GTVBAO stores visibility in a single byte, so a slowly varying
-  // surface steps through discrete AO cells and the aperture term turns that into
-  // visible banding. Offsetting the AO read by the blue-noise value walks
-  // neighbouring cells per pixel and lets TAA average them back out.
-  //
-  // Off by default because it trades visible noise for that, and most scenes do
-  // not band. On for users who see stepping on large smooth surfaces under GTVBAO.
-  float cs_micro_isfast_enabled;
+  float cs_micro_isfast_enabled;  // RETIRED: micro shadows removed, unread, kept for the layout
   // Manual override for the sun-contact range gate, in world units. 0 = derive the
   // cutoff from the engine's own last-cascade split. The override exists because
   // that split is only read in-shader by Kai and Kai soft; the Sora shaders

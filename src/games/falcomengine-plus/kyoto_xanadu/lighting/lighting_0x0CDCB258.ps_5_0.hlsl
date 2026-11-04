@@ -185,7 +185,6 @@ Texture2DArray<float4> spotShadowMaps : register(t24);
 Texture2D<float4> texMirror_g : register(t26);
 Texture2D<uint4> gtvbaoTexture : register(t22);  // GTVBAO AO (r32_uint, packed 0-255)
 Texture2D<float4> vbgiTexture : register(t23);   // VBGI indirect diffuse (R16G16B16A16)
-Texture2D<float4> microShadowTex : register(t33); // Micro Shadows term + diagnostics (rgba8_unorm)
 Texture2D<float4> contactShadowTex : register(t34); // Contact Shadows term + diagnostics (rgba8_unorm)
 // t35/t36 are the local-light march's own inputs: the IS-FAST volume and the
 // scene depth. Deliberately not the game's own registers, so the shared helper
@@ -1483,12 +1482,12 @@ void main(
   // diffuse by lightColor_g and adds ambient to it the way Kai / Sora 1st / Sora 2nd
   // do, and it has no CSM sample at all. So contact cannot be attached to a sun term
   // here, and it is deliberately NOT applied to the final colour either -- that is
-  // the bug that put contact shadows in interiors. Micro applies normally.
+  // the bug that put contact shadows in interiors.
   //
   // Kyoto is also hidden for both techniques (see the is_visible gates in addon.cpp),
   // so this path is reachable only if a saved config forces the terms on.
   o0.xyz = FalcomApplyShadowTerms(r1.xyz, v1.xy, csIsCharacter, samPoint_s,
-                                  microShadowTex, contactShadowTex);
+                                  contactShadowTex);
   o0.w = 1;
   o2.y = 0;
   return;

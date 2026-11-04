@@ -60,7 +60,7 @@ ShaderInjectData shader_injection = {
     .volfog_noise_strength = 1.f,
     .volfog_isfast_dedicated_sampler = 0.f,
   // 0 = off, 1 = the engine's own character shadow march. Default off, matching
-  // the CharShadowMode setting: the contact/micro terms own character shadowing
+  // the CharShadowMode setting: the contact term owns character shadowing
   // unless the user deliberately turns the engine's own back on.
   .char_shadow_mode = 0.f,
   .char_shadow_sample_count = 32.f,
@@ -404,12 +404,7 @@ ShaderInjectData shader_injection = {
         .mb_camera_jitter = 1.f,
         .mb_camera_cut = 1.f,
         .mb_camera_cut_px = 120.f,
-  // -- Contact / Micro Shadows --
-  // Defaults are the settled values from the reference implementation, not
-  // experimental ones: micro at full opacity with the paper's aperture, contact
-  // at 8 samples over 50 world units with a jittered clip-space march. Both are
-  // OFF by default so enabling them is a deliberate act, and both have to be
-  // enabled separately because they are separate passes with separate costs.
+  // -- Contact Shadows -- (the cs_micro_* slots are RETIRED and unread)
   .cs_micro_enabled = 0.f,
   .cs_micro_strength = 1.f,
   .cs_micro_env_strength = 1.f,
@@ -417,8 +412,6 @@ ShaderInjectData shader_injection = {
   .cs_micro_opacity = 1.f,
   .cs_micro_aperture_scale = 1.f,
   .cs_micro_debug = 0.f,
-  // GTVBAO AO rather than the game AO: the game capture is not frame-reliable,
-  // and AO = 1 makes the micro term identically 1 at every pixel.
   .cs_micro_ao_source = 1.f,
   .cs_contact_enabled = 0.f,
   .cs_contact_strength = 1.f,
@@ -448,8 +441,6 @@ ShaderInjectData shader_injection = {
   .cs_ao_bound = 0.f,
   .cs_micro_dedicated_bound = 0.f,
   .cs_contact_dedicated_bound = 0.f,
-  // The AO-quantisation dither is off by default: it only helps on surfaces where
-  // GTVBAO's 8-bit visibility visibly bands, and it costs a noise sample per pixel.
   .cs_micro_isfast_enabled = 0.f,
   // 0 = derive the sun-contact range gate from the engine's last cascade split.
   .cs_contact_sun_range = 0.f,
@@ -531,20 +522,18 @@ constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
 constexpr uint64_t kDynCubeLoadingStaleFrames = 5u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
 
-// -- Contact / Micro Shadows (shadows/*.cs_5_0.hlsl) --
+// -- Contact Shadows (shadows/*.cs_5_0.hlsl) --
 // Two independent compute passes, so two layout/pipeline/table slots. The index
 // is fixed and used to size the DeviceData arrays, so the shader, the host and
 // the two resource sets cannot drift apart.
 enum ShadowsPass : uint32_t {
-  kShadowsPassMicro = 0u,    // micro_shadows.cs_5_0.hlsl    (t0 mrt, t1 aoU, t2 aoF -> u0)
-  kShadowsPassContact = 1u,  // contact_shadows.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 noise -> u0)
-  kShadowsPassCount = 2u,
+  kShadowsPassContact = 0u,  // contact_shadows.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 noise -> u0)
+  kShadowsPassCount = 1u,
 };
-// The lighting pixel shaders read the two results from these slots. t33/t34 are
-// declared by no game's lighting shader and claimed by no existing push, so they
-// are free in Sora 1st, Sora 2nd, Kai, Kai-soft, Kyoto and Daybreak 2 alike (the
-// addon already owns t17, t22, t23, t24, t28-t32).
-constexpr uint32_t kLightingMicroShadowRegister = 33u;
+// The lighting pixel shaders read the result from this slot. t34 is declared by no
+// game's lighting shader and claimed by no existing push, so it is free in Sora 1st,
+// Sora 2nd, Kai, Kai-soft, Kyoto and Daybreak 2 alike (the addon already owns t17,
+// t22, t23, t24, t28-t32).
 constexpr uint32_t kLightingContactShadowRegister = 34u;
 // Inputs for the local-light march, which runs inside the dynamic light loop
 // rather than in a pass. Declared by the lighting shaders and the character pass
@@ -559,8 +548,8 @@ constexpr uint32_t kLightingShadowDepthRegister = 36u;
 // shaders, which is where it was first needed.
 constexpr uint32_t kCharShadowNoiseRegister = kLightingShadowNoiseRegister;
 // SRV counts per pass, matching the register() declarations in each shader.
-constexpr uint32_t kShadowsSrvPerPass[kShadowsPassCount] = {4u, 3u};
-constexpr uint32_t kShadowsUavPerPass[kShadowsPassCount] = {1u, 1u};
+constexpr uint32_t kShadowsSrvPerPass[kShadowsPassCount] = {3u};
+constexpr uint32_t kShadowsUavPerPass[kShadowsPassCount] = {1u};
 
 // -- Motion Blur (Guertin et al. 2013) --
 // Fixed pass order; the indices address the layout/pipeline/table arrays in
@@ -1061,7 +1050,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   std::string captured_depth_dims = "none";     // cached at capture (push context only)
   uint32_t captured_depth_w = 0u, captured_depth_h = 0u;  // same, numeric (shadow pass sizing)
   reshade::api::resource_view captured_ssao_srv = {};
-  // The game SSAO is only ever an OPTIONAL micro-shadow input, so unlike depth
+  // The game SSAO is only ever an OPTIONAL input, so unlike depth
   // and the MRT normal it has no recorded resource and no destroy-event
   // tracking. The frame stamp is what tells a consumer "captured this frame"
   // from "left over from an earlier frame, possibly a different resolution".
@@ -1457,16 +1446,13 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // Frame in which the Sora 2nd DoF gather last drew; the "Cutscene Only" gate.
   uint64_t mb_dof_drew_frame = UINT64_MAX;
 
-  // -- Contact / Micro Shadows --
+  // -- Contact Shadows --
   // One rgba8_unorm target per technique, sized to the depth buffer. RGBA8_UNORM
   // is in the D3D11.0 guaranteed UAV type-write set; R8_UNORM and R16_FLOAT are
   // not, and a rejected UAV write leaves the target holding whatever was there
   // before, which reads as a plausible image rather than as a failure. The spare
   // channels carry the per-pixel diagnostic that makes the pass debuggable; see
   // the layout block in shadows/shadows_common.hlsli.
-  reshade::api::resource micro_shadow_texture = {};
-  reshade::api::resource_view micro_shadow_srv = {};
-  reshade::api::resource_view micro_shadow_uav = {};
   reshade::api::resource contact_shadow_texture = {};
   reshade::api::resource_view contact_shadow_srv = {};
   reshade::api::resource_view contact_shadow_uav = {};
@@ -1493,7 +1479,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // lighting pass before the main lighting pass, and the answer decides whether
   // the char pass is reading a same-frame result or last frame's.
   int shadows_ran_from = -1;  // 0 = char lighting, 1 = main lighting
-  bool shadows_logged_ao_fallback = false;
   bool shadows_logged_isfast_missing = false;
   // -- Custom TAA cross-addon slot ownership (compat with the falcomengine addon,
   // which replaces the same TAA hashes unconditionally) --
@@ -1537,7 +1522,7 @@ static bool RunGTVBAO(reshade::api::command_list* cmd_list, DeviceData* data);
 static bool RunVBGI(reshade::api::command_list* cmd_list, DeviceData* data, bool prefilter_done);
 static bool RunVbgiRadiance(reshade::api::command_list* cmd_list, DeviceData* data);
 static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d);
-// -- Contact / Micro Shadows -- forward decls
+// -- Contact Shadows -- forward decls
 static void CreateShadowsResources(reshade::api::device* dev, DeviceData* d,
                                    uint32_t w, uint32_t h);
 static void DestroyShadowsResources(reshade::api::device* dev, DeviceData* d);
@@ -1879,7 +1864,7 @@ static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list) {
 //
 // Split out of DeployShadows purely for readability -- it is one gate and two pushes.
 // It is called from the same place the inline block used to live, after the contact
-// and micro enables are known.
+// and the contact enables are known.
 static void pushInlineShadowInputs(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (!(shader_injection.cs_contact_enabled > 0.5f
         && shader_injection.cs_contact_local_enabled > 0.5f)) {
@@ -1903,8 +1888,8 @@ static void pushInlineShadowInputs(reshade::api::command_list* cmd_list, DeviceD
   }
 }
 
-// -- Contact / Micro Shadows: shared deploy step --
-// The two techniques are consumed by BOTH a character lighting pass and a main
+// -- Contact Shadows: shared deploy step --
+// The contact term is consumed by BOTH a character lighting pass and a main
 // lighting pass. Whichever draw happens first in the frame dispatches the compute
 // passes; the other only reads the result. Doing it this way means the frame does
 // not depend on the relative order of those two draws, which differs between
@@ -1918,16 +1903,14 @@ static void pushInlineShadowInputs(reshade::api::command_list* cmd_list, DeviceD
 // flag left set from an earlier frame would make it sample a texture that no
 // longer matches the current resolution.
 static void DeployShadows(reshade::api::command_list* cmd_list, int fromHook) {
-  shader_injection.cs_micro_dedicated_bound = 0.f;
   shader_injection.cs_contact_dedicated_bound = 0.f;
   if (!cmd_list) return;
   auto* dev = cmd_list->get_device();
   auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
   if (!d) return;
 
-  const bool micro_on = shader_injection.cs_micro_enabled > 0.5f;
   const bool contact_on = shader_injection.cs_contact_enabled > 0.5f;
-  if (!micro_on && !contact_on) return;
+  if (!contact_on) return;
 
   // The local-light march runs inside the dynamic light loop rather than in a pass,
   // so it needs the two resources a pass would have supplied: the depth buffer and
@@ -1966,15 +1949,6 @@ static void DeployShadows(reshade::api::command_list* cmd_list, int fromHook) {
   ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
   if (!ok) return;
 
-  if (micro_on && d->micro_shadow_srv.handle) {
-    cmd_list->push_descriptors(
-        reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
-        reshade::api::descriptor_table_update{
-            {}, kLightingMicroShadowRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &d->micro_shadow_srv});
-    shader_injection.cs_micro_dedicated_bound = 1.f;
-  }
   if (contact_on && d->contact_shadow_srv.handle) {
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
@@ -3432,9 +3406,8 @@ renodx::utils::settings::Settings settings = {
       .label = "Foliage / Char Mask Debug",
       .section = "GTVBAO",
       .tooltip = "Inspects the foliage and character mask the GTVBAO character "
-                 "options act on, and the occlusion the micro pass reads. View 2 "
-                 "now shows the Contact Shadow term; it used to show the "
-                 "retired screen-space shadow channel.",
+                 "options act on. View 2 now shows the Contact Shadow term; it used to "
+                 "show the retired screen-space shadow channel.",
       .labels = {"Off", "Mask", "Contact Term", "SSAO Sample", "Raw mrt0.z"},
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -4367,97 +4340,6 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "Penumbra Mask", "Tint Color", "Result", "Sun Color"},
       .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
-    },
-    // -- Micro Shadows --------------------------------------------------
-    // An AO-driven aperture term applied to NdotL. Replaces the retired Bend_SSS
-    // character ray-march as the soft half of contact shading.
-    new renodx::utils::settings::Setting{
-      .key = "MicroShadowsEnabled", .binding = &shader_injection.cs_micro_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Micro Shadows", .section = "Micro Shadows",
-      .tooltip = "An AO-driven aperture term applied to NdotL (Uncharted 4). A surface "
-                 "buried in ambient occlusion stops receiving as much key light, which "
-                 "restores the soft darkening a rasteriser cannot produce on its own.",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "MicroShadowsEnvStrength", .binding = &shader_injection.cs_micro_env_strength,
-      .default_value = 1.f, .label = "Environment Strength", .section = "Micro Shadows",
-      .tooltip = "Strength of the micro term on non-character pixels.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "MicroShadowsCharStrength", .binding = &shader_injection.cs_micro_char_strength,
-      .default_value = 1.f, .label = "Character Strength", .section = "Micro Shadows",
-      .tooltip = "Strength of the micro term on character pixels, selected by the "
-                 "foliage/character mask.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "MicroShadowsOpacity", .binding = &shader_injection.cs_micro_opacity,
-      .default_value = 1.f, .label = "Opacity", .section = "Micro Shadows",
-      .tooltip = "How far the micro term replaces the diffuse NdotL term. 1 applies it "
-                 "fully; 0 leaves the surface unshadowed.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "MicroShadowsAperture", .binding = &shader_injection.cs_micro_aperture_scale,
-      .default_value = 1.f, .label = "Aperture", .section = "Micro Shadows",
-      .tooltip = "Scales the 2*AO*AO aperture. RAISE it to open the aperture, i.e. to "
-                 "let more light in and REDUCE the micro shadow. LOWER it to deepen the "
-                 "shadow; 0 disables the term entirely without turning the pass off.",
-      .min = 0.f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "MicroShadowsAOSource", .binding = &shader_injection.cs_micro_ao_source,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "AO Source", .section = "Micro Shadows",
-      .tooltip = "Which occlusion the pass reads. Both sources are bound every frame and "
-                 "decoded in their own encoding, because reading either as the wrong type "
-                 "yields plausible garbage rather than an error. GTVBAO is the default "
-                 "because the game's own deferred AO is not captured on every frame, and "
-                 "with AO = 1 the micro term saturate(NdotL + 2*AO*AO - 1) is identically "
-                 "1 everywhere, i.e. no visible effect. The log warns if you pick GTVBAO "
-                 "while GTVBAO is disabled.",
-      .labels = {"Game SSAO", "GTVBAO"},
-      .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "MicroShadowsISFAST", .binding = &shader_injection.cs_micro_isfast_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "IS-FAST Dither", .section = "Micro Shadows",
-      .tooltip = "Off by default. The micro term has no ray to jitter, so this does NOT "
-                 "dither a march. It dithers the AO QUANTISATION: GTVBAO stores "
-                 "visibility in a single byte, so a slowly varying surface steps through "
-                 "discrete AO cells and 2*AO*AO turns that into visible banding. This "
-                 "reads the AO one texel off in a blue-noise direction and lets TAA "
-                 "average it back. Turn it on only if you see stepping on large smooth "
-                 "surfaces under GTVBAO; it trades a little noise for that.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "MicroShadowsDebug", .binding = &shader_injection.cs_micro_debug,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Debug View", .section = "Micro Shadows",
-      .tooltip = "1 shows the raw micro term (white = lit). 2 shows diagnostics: R = term, "
-                 "G = the AO actually used, B = marker. G reading 1 everywhere means the "
-                 "occlusion source was not captured, which is the one failure mode that is "
-                 "indistinguishable from 'the effect does nothing'.",
-      .labels = {"Off", "Raw Term", "Diagnostics"},
-      .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // -- Contact Shadows ------------------------------------------------
     new renodx::utils::settings::Setting{
@@ -5816,7 +5698,7 @@ static void OnPushDescriptorsCapture(
   // Capture SSAO: t5 (Sora) or t4 (Kai) — game-specific binding. Hash-gated for
   // the same reason depth and the MRT normal are: the binding number alone is
   // not unique, so any other shader pushing an SRV at that slot would otherwise
-  // silently replace the AO the micro-shadow pass reads.
+  // silently replace the captured AO.
     uint32_t ssaoBinding = IsKai() ? kLightingSsaoRegisterKai : kLightingSsaoRegister;
     if (update.binding == ssaoBinding && update.count >= 1
         && views[0].handle != 0u) {
@@ -9036,8 +8918,8 @@ static bool UpdateRtMotion(reshade::api::device* dev, DeviceData* dd, bool tempo
   return dd->mb_rtv4_owned_srv.handle != 0u && !rf.motion_conflict && rf.motion_dims_ok;
 }
 
-// RTAO round 1 (world/rtao): dispatched inline before DeployShadows so the micro
-// shadows read this frame's AO. A failed guard leaves the frame on vanilla SSAO and
+// RTAO round 1 (world/rtao): dispatched inline before DeployShadows so the RTAO
+// consumers read this frame's AO. A failed guard leaves the frame on vanilla SSAO and
 // records its reason in rtao::g_rtao_frame.
 static void PushRtaoAo(reshade::api::command_list* cmd_list, reshade::api::resource_view ao_srv) {
   shader_injection.rtao_debug_show = falcom_world::rtao::g_rtao_debug > 0.5f ? 1.f : 0.f;
@@ -9950,7 +9832,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           && falcom_world::rr::g_rr_guides_attempt_frame.load() != falcom_world::g_state.frame.load())) {
     game_compute_state = renodx::utils::state::GetSnapshot(cmd_list);
   }
-  // RTAO runs before the shadows so micro shadows read this frame's AO.
+  // RTAO runs before the shadow pass.
   RunRtaoInline(cmd_list);
 
   // RT Local Shadows after RTAO and before RTGI (order RTAO -> RTLS -> RTGI); independent of both.
@@ -9969,7 +9851,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   perf::AddPerfBlockMs(perf::kPerfBlockLightingRt, perf::LiveElapsedMs(rt_start));
   if (perf_immediate) perf::g_perf_gate.rt_end = perf::PerfNow();
 
-  // Contact / Micro Shadows. Placed here, before the GTVBAO/DynCube early-out
+  // Contact Shadows. Placed here, before the GTVBAO/DynCube early-out
   // below, because those two are entirely independent of the shadow passes: on a
   // frame where only the shadows are enabled this hook must still run them.
   DeployShadows(cmd_list, 1);
@@ -10602,7 +10484,7 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   d->resources_created = false;
 }
 
-// ----------- Contact / Micro Shadows (shadows/*.cs_5_0.hlsl) -----------
+// ----------- Contact Shadows (shadows/*.cs_5_0.hlsl) -----------
 
 // Rebuilds the two rgba8_unorm targets at the depth buffer's resolution. The depth
 // buffer is the authority: both passes read it and both sample the G-buffer on the
@@ -10655,10 +10537,6 @@ static void CreateShadowsResources(reshade::api::device* dev, DeviceData* d,
     return true;
   };
 
-  if (!mk(&d->micro_shadow_texture, &d->micro_shadow_srv, &d->micro_shadow_uav)) {
-    DestroyShadowsResources(dev, d);
-    return;
-  }
   if (!mk(&d->contact_shadow_texture, &d->contact_shadow_srv, &d->contact_shadow_uav)) {
     DestroyShadowsResources(dev, d);
     return;
@@ -10677,7 +10555,6 @@ static void DestroyShadowsResources(reshade::api::device* dev, DeviceData* d) {
   auto dp = [&](reshade::api::pipeline& p) { if (p.handle) { dev->destroy_pipeline(p); p = {}; } };
   auto dl = [&](reshade::api::pipeline_layout& l) { if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; } };
 
-  dv(d->micro_shadow_srv); dv(d->micro_shadow_uav); dr(d->micro_shadow_texture);
   dv(d->contact_shadow_srv); dv(d->contact_shadow_uav); dr(d->contact_shadow_texture);
   if (d->shadows_point_clamp_sampler.handle) {
     dev->destroy_sampler(d->shadows_point_clamp_sampler);
@@ -10700,7 +10577,7 @@ static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData
   using P = reshade::api::pipeline_layout_param;
   if (!dev || !d) return false;
   static const std::span<const uint8_t> kBytecode[kShadowsPassCount] = {
-      __micro_shadows, __contact_shadows};
+      __contact_shadows};
 
   if (!d->shadows_point_clamp_sampler.handle) {
     reshade::api::sampler_desc sd = {};
@@ -10762,22 +10639,15 @@ static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData
   return true;
 }
 
-// Runs whichever of the two passes the user has enabled, and only those.
-//
-// The two are independent by construction: micro needs the G-buffer normal and an
-// occlusion term, contact needs depth, the normal and the noise volume. So each
-// is dispatched only if its own toggle is on, and neither waits for the other's
-// output. That is what lets a user turn one on without paying for the other's
-// memory traffic.
+// Runs the contact pass when it is enabled.
 static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHook) {
   if (!cl || !d) return false;
   if (d->shadows_ran_frame == d->frame_index) return true;  // already done this frame
   auto* dev = cl->get_device();
   if (!dev) return false;
 
-  const bool micro_on = shader_injection.cs_micro_enabled > 0.5f;
   const bool contact_on = shader_injection.cs_contact_enabled > 0.5f;
-  if (!micro_on && !contact_on) return true;
+  if (!contact_on) return true;
 
   // Name whichever condition is currently blocking, at most once a frame. Every
   // early return here used to be silent, which made "the pass never ran" and "the
@@ -10787,9 +10657,7 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
     d->shadows_log_frame = d->frame_index;
     reshade::log::message(reshade::log::level::warning,
         (std::string("[Shadows] blocked: ") + why
-         + " (micro=" + (micro_on ? "on" : "off")
-         + " contact=" + (contact_on ? "on" : "off")
-         + " depth=" + (d->captured_depth_srv.handle ? "ok" : "null")
+         + " (depth=" + (d->captured_depth_srv.handle ? "ok" : "null")
          + " mrt=" + (d->captured_mrt_normal_srv.handle ? "ok" : "null")
          + " cbv=" + (d->captured_scene_cbv_view.handle ? "ok" : "null")
          + " live=" + std::to_string(d->captured_depth_live.load()
@@ -10811,7 +10679,7 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
     return false;
   }
 
-  // The IS-FAST volume is an input to the contact march, not to micro shadows.
+  // The IS-FAST volume is an input to the contact march.
   // There is deliberately no IGN fallback: if the volume is missing the march
   // runs unjittered, which bands visibly, and that is the honest result.
   const bool isfast_wanted = shader_injection.cs_contact_isfast_enabled > 0.5f;
@@ -10823,39 +10691,6 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
         "[Shadows] IS-FAST requested but the volume is unavailable: contact "
         "shadows will run unjittered. Enable the IS-FAST master in the IS-FAST "
         "section to fix the banding.");
-  }
-
-  // The micro pass takes BOTH occlusion sources and picks between them, because
-  // the two have genuinely different encodings: GTVBAO quantises visibility into
-  // byte 0 of an r32_uint, the game's deferred AO is a float channel. Binding
-  // either as the wrong type yields plausible garbage, so both are bound and the
-  // shader decodes each correctly.
-  //
-  // GTVBAO is resolved with exactly the same expression the t22 push uses, so the
-  // AO the pass reads and the AO a user can compare against are guaranteed to be
-  // the same buffer, in Full and in low-res modes alike.
-  reshade::api::resource_view ao_gtvbao = {};
-  if (falcom_world::rtao::g_rtao_frame.producing) {
-    ao_gtvbao = falcom_world::rtao::OutputSrv(dev);
-  } else if (shader_injection.gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested()) {
-    ao_gtvbao = d->gtvbao_denoise.output.srv[d->gtvbao_denoise.output_index];
-  }
-  reshade::api::resource_view ao_ssao = d->captured_ssao_srv;
-  if (!ao_ssao.handle) ao_ssao = d->fallback_srv;  // AO = 1, the no-occlusion floor
-
-  if (micro_on && !ao_gtvbao.handle && !ao_ssao.handle) {
-    blocked("no AO source bound for the micro pass");
-    return false;
-  }
-  if (micro_on && shader_injection.cs_micro_ao_source > 0.5f && !ao_gtvbao.handle
-      && !d->shadows_logged_ao_fallback) {
-    // Asked for GTVBAO AO but there is none. Say so once rather than quietly
-    // substituting the other source, which would make the setting a lie.
-    d->shadows_logged_ao_fallback = true;
-    reshade::log::message(reshade::log::level::warning,
-        "[Shadows] Micro Shadows AO source is set to GTVBAO, but no GTVBAO AO "
-        "buffer is available (is GTVBAO enabled?). Switch the source to Game "
-        "SSAO, or enable GTVBAO.");
   }
 
   const uint32_t w = std::max(d->shadows_w, 1u);
@@ -10875,7 +10710,6 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
   shader_injection.cs_working_h = static_cast<float>(h);
   shader_injection.cs_noise_frame = isfast_ready
       ? static_cast<float>(d->frame_index % 32u) : -1.f;
-  shader_injection.cs_ao_bound = (ao_gtvbao.handle || ao_ssao.handle) ? 1.f : 0.f;
 
   const auto CS = reshade::api::shader_stage::all_compute;
   const auto AC = reshade::api::pipeline_stage::all_compute;
@@ -10910,19 +10744,6 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
     if (out_tex.handle) cl->barrier(out_tex, UA, SR);
   };
 
-  if (micro_on) {
-    // Four SRVs: the normal, both AO sources, and the IS-FAST volume. The volume is
-    // bound even when the dither is off, because a null descriptor is not a legal
-    // binding; the shader gates its use on cs_micro_isfast_enabled so the 1x1
-    // stand-in is never actually sampled when the toggle is off.
-    reshade::api::resource_view micro_srvs[4] = {
-        d->captured_mrt_normal_srv,
-        ao_gtvbao.handle ? ao_gtvbao : d->fallback_srv,
-        ao_ssao.handle ? ao_ssao : d->fallback_srv,
-        isfast_ready ? d->isfast_noise_srv : d->fallback_srv};
-    run_pass(kShadowsPassMicro, micro_srvs, 4, d->micro_shadow_uav,
-             d->micro_shadow_texture);
-  }
   if (contact_on) {
     // The noise slot is filled with the real 3D volume when it is usable. When it
     // is not, the fallback is a 1x1 2D stand-in: the shader declares t2 as a
@@ -10941,10 +10762,7 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
   if (!d->shadows_logged_first_dispatch) {
     d->shadows_logged_first_dispatch = true;
     CSLog("shadows", "first dispatch ok at " + std::to_string(w) + "x" + std::to_string(h)
-        + " (micro=" + (micro_on ? "on" : "off")
-        + " contact=" + (contact_on ? "on" : "off")
-        + " ao=" + (shader_injection.cs_micro_ao_source > 0.5f ? "gtvbao" : "ssao")
-        + " isfast=" + (isfast_ready ? "ready" : "missing") + ")");
+        + " (isfast=" + (isfast_ready ? "ready" : "missing") + ")");
   }
   if (d->shadows_ran_from != fromHook) {
     // Report the first dispatch point once. Kai runs a character lighting pass

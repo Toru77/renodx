@@ -50,7 +50,6 @@ static constexpr std::string_view kCategories[] = {
 static const std::unordered_map<std::string_view, std::string_view> kSectionCategory = {
     {"Shadow Maps", "Shadows"},
     {"Shadows", "Shadows"},
-    {"Micro Shadows", "Shadows"},
     {"Contact Shadows", "Shadows"},
     {"GTVBAO", "Ambient Occlusion"},
     {"GTVBAO Temporal Accumulation", "Ambient Occlusion"},

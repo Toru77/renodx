@@ -48,10 +48,9 @@ SVGF M2a (GTVBAO), implemented, not validated in game: GTVBAO AO runs the main p
 3. Iterations 1 to 5 at Full and at Half.
 4. Debug Temporal Confidence ramps from black to white over about 32 frames after a camera cut; Debug Raw AO matches HEAD.
 5. 60 seconds standing still: no creep. Then pan, and let a character walk past: no ghosting.
-6. Micro shadows with the GTVBAO AO source.
-7. GTVBGI on: GI is unchanged, and debug 34 still ramps.
-8. Deferred Dispatch on: AO renders and the game does not crash.
-9. Sora 2nd with the DevKit: RTAO on, then off. GTVBAO comes back.
+6. GTVBGI on: GI is unchanged, and debug 34 still ramps.
+7. Deferred Dispatch on: AO renders and the game does not crash.
+8. Sora 2nd with the DevKit: RTAO on, then off. GTVBAO comes back.
 Send back: screenshots, the `[gtvbao]` and `[world-rtgi]` log lines (no "svgf chain not ready" line), FPS against HEAD, and GPU memory.
 
 GTVBAO perf P1 (skip texels the upsample does not read), implemented, not validated in game: the GTVBAO main pass skips the texels the AO upsample does not read, writing byte 255 without tracing. Mode 2 (the SVGF chain does not reproject, or resolution scaling is active) uses the upsample's tap test at the texel's representative pixel; mode 1 (the chain reprojects) skips only texels without depth. The main pass reads the game depth at t4 (AO only), and the mode, full size and divisor come from `GtvbaoPassPush` (c[31..34]). The tap test's normal term never rejects today (`DecodeFalcomMrtNormalAsGame` returns a unit vector); it is kept so the skip uses the upsample's own rule (`RtUpsampleTapRejected`), and test_gpu_gtvbao models mode 2 by depth only. Off while a debug view (22 and up) is shown. Owner test list (Sora 1st, Sora 2nd and Kai):
@@ -89,7 +88,7 @@ SVGF M2b (RTAO), implemented, not validated in game: RTAO pass A writes the trac
 1. RTAO at Full, Half and Quarter, DXR on and off: screenshots of the final image and of Debug Raw AO and Denoised AO against HEAD; no seams and no black or white blocks at silhouettes.
 2. Temporal off, spatial off, both off; Iterations 1 to 5 (the panel shows the effective count).
 3. 60 seconds standing still: no creep. Then pan, and let a character walk past: no ghosting.
-4. Micro shadows with the RTAO AO source; Deferred Dispatch on: AO renders and the game does not crash.
+4. Deferred Dispatch on: AO renders and the game does not crash.
 5. Two-Sided discovery on: the Denoising (SVGF) panel lines and the GPU counts still show.
 Send back: screenshots, the `[world-rtao]` log lines, the RTAO panel lines (Denoising (SVGF)) and the gpu_rtao and gpu_rtao_filter rows.
 
@@ -312,7 +311,7 @@ Owner test order (in game). Since 2026-10-09 the switches start ON; to get a bas
 - Skinned characters in RTAO: dropped by the owner (2026-10-20). Characters as occluders stay out of RTAO. The planned design for the first occlusion effect that needs them (RT shadows) is one per-frame refit of this frame's skinned captures at lighting time, shared by consumers and cached per frame, with RTAO as one consumer switch. Tracked as a future item, not implemented.
 - Known cost to check: with RTAO on, character and water capture and the present refit are switched on (`ApplyBvhInputs`, which forces them on while any RT effect is on), although RTAO does not trace them. Owner to compare the Performance tab with "Deforming meshes" off.
 - Code: `world/rtao/` (`rtao_state.hpp` settings, reason codes, `RtaoEffectiveFade`; `rtao_resources.hpp` pipeline, AO target, stats; `rtao.hpp` dispatch and stats readback; `rtao_panel.hpp` panel). Shader: `world/shaders/world_rtao.cs_5_0.hlsl`. Hook wrapper: `RunRtaoInline` in `addon.cpp`, called from `OnBeforeLightingShaderDraw` before `DeployShadows`.
-- Placement: inline in the lighting hook (zero latency). Micro shadows read this frame's RTAO AO when it is produced. The shader reads the game scene CBV (b0), not `g_state.camera`.
+- Placement: inline in the lighting hook (zero latency). The shader reads the game scene CBV (b0), not `g_state.camera`.
 - Early-out: the sample loop stops once the pixel's camera distance reaches Fade End (`g_rtao_fade.y`). Beyond Fade End the fade is 0 and ao is exactly 1.0, so no ray is traced there.
 - The RTAO `rays` and `hits` stats now count only the faded range (pixels beyond Fade End add nothing); the AO output is unchanged.
 - Gate: `shader_injection.rtao_active` is latched once per present in `OnPresent`: 0 off, 1 requested but not producing (vanilla SSAO), 2 producing (neutral SSAO, RTAO AO at t22). When RTAO is on, GTVBAO and VBGI do not run, their modes are greyed, and `gtvbao_vbgi_bound` and `gtvbao_vbgi_debug` are 0. Their stored values are untouched.

@@ -183,7 +183,6 @@ Texture2D<float4> texSSRMap_g : register(t24);
 Texture2D<float4> ssrMarchTex : register(t28);  // captured vanilla ssr1 result (replacement debug view 2)
   Texture3D<float4> volumeFogTexture_g : register(t26);
 Texture2D<float4> texCloudShadow : register(t27);
-Texture2D<float4> microShadowTex : register(t33);       // Micro Shadows term + diagnostics (rgba8_unorm)
 Texture2D<float4> contactShadowTex : register(t34);     // Contact Shadows term + diagnostics (rgba8_unorm)
 // t35 carries the IS-FAST volume for the local-light contact march. It cannot
 // reuse t24: on Sora 2nd that is texSSRMap_g, which the game samples.
@@ -720,9 +719,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     // Early return BEFORE the sun composite at 1177, and charColor is built from
     // the character/SSGI/GI terms with no isolable sun contribution. Contact is
     // therefore not applied here: attaching it to the final colour instead is the
-    // bug that put contact shadows in interiors. Micro still applies.
+    // bug that put contact shadows in interiors.
     o0.xyz = FalcomApplyShadowTerms(charColor, v1.xy, csIsCharacter > 0.5, samPoint_s,
-                                    microShadowTex, contactShadowTex);
+                                    contactShadowTex);
     // RTGI bounce: Character GI Intensity on the character shading path (csCharacterShading, which RTAO's Character
     // Intensity also scales above); the map-AO pixels of characters get the full bounce.
     if (shader_injection_data.rtgi_gi_bound > 0.5f) {
@@ -1732,7 +1731,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r1.xyw = r1.xyw + -r0.xyz;
   o0.xyz = FalcomApplyShadowTerms(r1.zzz * r1.xyw + r0.xyz, v1.xy,
                                   csIsCharacter > 0.5, samPoint_s,
-                                  microShadowTex, contactShadowTex);
+                                  contactShadowTex);
   // Probe ambient debug — character pixel path
   if (shader_injection_data.vbgi_cascade_debug > 0.5f) {
     float3 probeAmbient = lightProbe_g[0].xyz;

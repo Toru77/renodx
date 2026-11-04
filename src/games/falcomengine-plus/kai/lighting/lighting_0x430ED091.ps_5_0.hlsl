@@ -231,7 +231,6 @@ TextureCube<float4> dynCubeHistPosTex : register(t29);   // temporal history wor
 TextureCube<float4> dynCubeVanillaTex : register(t30);   // vanilla reflection fallback
 Texture2D<float4> dynCubeSSRTex : register(t31);         // blurred SSR (rgb = color, a = confidence)
 Texture2D<float4> dynCubeSSRRawTex : register(t32);      // raw SSR result (debug views)
-Texture2D<float4> microShadowTex : register(t33);        // Micro Shadows term + diagnostics (rgba8_unorm)
 Texture2D<float4> contactShadowTex : register(t34);      // Contact Shadows term + diagnostics (rgba8_unorm)
 // t35 carries the IS-FAST volume for the local-light contact march, so the
 // march can jitter independently of the compute pass's own sample.
@@ -902,10 +901,9 @@ void main(
     // colour from the character/SSGI terms with no isolable sun contribution. So
     // contact shadows are NOT applied here -- there is no sun term to attach them
     // to, and applying them to the final colour instead is exactly the bug that put
-    // contact shadows in interiors. Micro still applies: it is an AO-driven aperture
-    // term and belongs on the resolved colour.
+    // contact shadows in interiors.
     o0.xyz = FalcomApplyShadowTerms(r4.yzw, v1.xy, is_character_pixel, samPoint_s,
-                                    microShadowTex, contactShadowTex);
+                                    contactShadowTex);
     // GTVBGI (M7.7): added after the shadow terms like the Sora composite; no fog on this path.
     o0.xyz += r24.xyz * vbgi_plain_scale;
     o0.w = 1;
@@ -2238,7 +2236,7 @@ void main(
   r4.xyz = r5.xyz * r6.xyz + -r5.xyz;
   r4.xyz = r0.yyy * r4.xyz + r5.xyz;
   // The old Env SSS block that used to sit here multiplied r4.xyz by the
-  // raymarched shadow from ssaoTexture.z. That is now the Contact / Micro Shadow
+  // raymarched shadow from ssaoTexture.z. That is now the Contact Shadow
   // compute term, applied with the environment/character split at the output
   // site below -- once, for every game, instead of per game and per pixel here.
 
@@ -2640,7 +2638,7 @@ void main(
     return;
   }
   o0.xyz = FalcomApplyShadowTerms(r3.xyz, v1.xy, is_character_pixel, samPoint_s,
-                                  microShadowTex, contactShadowTex);
+                                  contactShadowTex);
   // GTVBGI (M7.7): after the shadow terms, attenuated by the fog and haze transmittance like the Sora RTGI bounce.
   o0.xyz += r24.xyz * vbgi_plain_scale * kaiFogKeep * kaiExtinction;
   o0.w = 1;

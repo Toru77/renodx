@@ -85,7 +85,6 @@ SamplerState samLinear_s : register(s1);
 Texture2D<float4> depthTexture : register(t0);
 Texture2D<uint4> mrtTexture0 : register(t2);
 Texture2D<float4> prevTexture : register(t3);
-Texture2D<float4> microShadowTex : register(t33);      // Micro Shadows term + diagnostics (rgba8_unorm)
 Texture2D<float4> contactShadowTex : register(t34);    // Contact Shadows term + diagnostics (rgba8_unorm)
 Texture3D<float2> csIsfastNoise : register(t35);       // IS-FAST volume, custom camera pass dither
 
@@ -303,8 +302,8 @@ void main(
     } else {
       // Off, and Custom with the camera pass switched off. The environment
       // screen-space shadow raymarchs that used to run here are replaced by the
-      // Contact / Micro Shadow compute passes, which the lighting shader reads at
-      // t33/t34. This pass therefore no longer writes a shadow into the .z channel
+      // Contact Shadow compute pass, which the lighting shader reads at
+      // t34. This pass therefore no longer writes a shadow into the .z channel
       // on this path; Custom writes 1.0, which the lighting shader's
       // `char_shadow_mode >= 0.5f` gate still multiplies in as a no-op.
       r1.x = 1;
@@ -345,13 +344,12 @@ void main(
   r1.xyz = r2.zxy + -r0.xyz;
   // The character pass output is the character AO/history blend, not a sun-lit
   // colour: there is no lightColor_g multiply and no ambient add to separate, so
-  // contact has no sun term to attach to here. Micro still applies -- it is an
-  // AO-driven aperture term and belongs on the resolved colour. This is also the
+  // contact has no sun term to attach to here. This is also the
   // pass that writes the character shadow into the AO target's .z, which the
   // lighting shader's "Character Shadowing -> Mode" toggle consumes.
   o0.xyz = FalcomApplyShadowTerms(r1.xyz * float3(0.25,0.25,1) + r0.xyz, v1.zw,
                                   ((mrt0_z_class >> 8u) & 1u) != 0u, samPoint_s,
-                                  microShadowTex, contactShadowTex);
+                                  contactShadowTex);
   o0.w = 1;
 
   // --- Foliage / character mask debug in char shader ---

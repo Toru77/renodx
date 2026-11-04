@@ -203,7 +203,6 @@ TextureCube<float4> dynCubeHistPosTex : register(t29);  // dynamic cube history 
 TextureCube<float4> dynCubeVanillaTex : register(t30);  // game's vanilla cubemap (fallback layer)
 Texture2D<float4> dynCubeSSRTex : register(t31);        // blurred SSR result (rgb=color, a=confidence)
 Texture2D<float4> dynCubeSSRRawTex : register(t32);     // raw SSR result (debug 12)
-Texture2D<float4> microShadowTex : register(t33);       // Micro Shadows term + diagnostics (rgba8_unorm)
 Texture2D<float4> contactShadowTex : register(t34);     // Contact Shadows term + diagnostics (rgba8_unorm)
 // t35 carries the IS-FAST volume for the local-light contact march. It cannot
 // reuse t24: on Sora 1st that is texSSRMap_g, which the game samples.
@@ -340,8 +339,8 @@ void main(
       r7.xyz = r6.xyz * r5.xyz;
       // Vanilla used ao.y * ao.z here: ssao.z is the ENGINE's own screen-space
       // character shadow, and it is exactly what "Character Shadowing -> Mode"
-      // drives. With the engine mode off, the Contact / Micro Shadow compute
-      // passes own character shadowing, so only the AO term is kept. Folding it
+      // drives. With the engine mode off, the Contact Shadow compute
+      // pass owns character shadowing, so only the AO term is kept. Folding it
       // into this weight (as vanilla did) cannot darken the AO itself or
       // double-count against the GTVBAO character mask.
       r1.w = r4.y;
@@ -599,9 +598,9 @@ void main(
     // Early return BEFORE the sun composite at 1152, and r6.xyz is built from the
     // character/SSGI/GI terms with no isolable sun contribution. Contact is
     // therefore not applied here: attaching it to the final colour instead is the
-    // bug that put contact shadows in interiors. Micro still applies.
+    // bug that put contact shadows in interiors.
     o0.xyz = FalcomApplyShadowTerms(r6.xyz, v1.xy, csIsCharacter > 0.5, samPoint_s,
-                                    microShadowTex, contactShadowTex);
+                                    contactShadowTex);
     // VBGI (M7.5): added after the shadow terms; Character Mask Strength scales it on this (character) path.
     if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
       o0.xyz += cachedVBGI * (1.0 - saturate(shader_injection_data.char_gtvbgi_mask_strength));
@@ -1723,7 +1722,7 @@ void main(
   r0.x = (uint)r0.x;
   o2.y = min(0x0000ffff, (uint)r0.x);
   o0.xyz = FalcomApplyShadowTerms(r0.yzw, v1.xy, csIsCharacter > 0.5, samPoint_s,
-                                  microShadowTex, contactShadowTex);
+                                  contactShadowTex);
 
   // Probe ambient debug — character pixel path
   if (shader_injection_data.vbgi_cascade_debug > 0.5f) {

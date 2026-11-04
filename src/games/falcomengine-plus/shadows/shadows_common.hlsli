@@ -3,8 +3,7 @@
 
 // ── falcomengine-plus screen-space shadow passes — shared core ──
 //
-// Two compute passes consume this (micro_shadows.cs_5_0.hlsl and
-// contact_shadows.cs_5_0.hlsl), and the lighting pixel shaders include it again
+// The contact compute pass (contact_shadows.cs_5_0.hlsl) consumes this, and the lighting pixel shaders include it again
 // to run the same contact march per local light. Everything here is therefore
 // free of stage-specific assumptions: no compute-only intrinsics, no
 // pixel-only intrinsics, and no globals of its own -- every entry point takes
@@ -67,11 +66,10 @@ cbuffer cb_scene : register(b0)
 //     which returns -light_dir_view * rsqrt(len2).
 //
 // This is a named function rather than a bare negation at each call site because
-// the sun passes got it wrong: micro shaded with an inverted NdotL and contact
-// marched AWAY from the light, which reported occlusion when looking one way and
-// none when looking the other. The local-light path never had the bug because it
-// derives the direction from lightPos - worldPos, where the sign is fixed by the
-// definition of the subtraction.
+// the sun pass got it wrong: contact marched AWAY from the light, which reported
+// occlusion when looking one way and none when looking the other. The local-light
+// path never had the bug because it derives the direction from lightPos - worldPos,
+// where the sign is fixed by the definition of the subtraction.
 //
 // Returns a zero vector when there is no light this frame; callers must treat that
 // as "no light", not as a direction.
@@ -137,25 +135,6 @@ float FalcomSampleISFAST(Texture3D<float2> volume, SamplerState noiseSampler,
       (float)((frame + (uint)seedOffset) % (uint)temporalSlices) / temporalSlices);
   return volume.SampleLevel(noiseSampler,
                             float3(uvw.xy * spatialScale, uvw.z * temporalSpeed), 0).x;
-}
-
-// The two-channel form, for a caller that needs an independent pair rather than
-// one jitter value. The IS-FAST volume is RG8, so both channels are real noise and
-// using them separately decorrelates two axes. The single-channel form above is
-// this one's .x, so there is one definition of the uvw maths.
-float2 FalcomSampleISFAST2(Texture3D<float2> volume, SamplerState noiseSampler,
-                           uint2 pixel, uint frame, float volumeSize,
-                           float temporalSlices, float spatialScale,
-                           float temporalSpeed, float seedOffset,
-                           float volumeLoaded)
-{
-  if (volumeLoaded < 0.5f) return float2(0.5, 0.5);
-  const float3 uvw = float3(
-      (float)(pixel.x % (uint)volumeSize) / volumeSize,
-      (float)(pixel.y % (uint)volumeSize) / volumeSize,
-      (float)((frame + (uint)seedOffset) % (uint)temporalSlices) / temporalSlices);
-  return volume.SampleLevel(noiseSampler,
-                            float3(uvw.xy * spatialScale, uvw.z * temporalSpeed), 0).xy;
 }
 
 // ── Screen-Space Contact Shadows, clip space ──
@@ -376,8 +355,7 @@ bool FalcomCharCamDebugView(float rawTerm, float axisLength, float valid,
 //       never ran produce the same .x, and from outside the shader they are
 //       indistinguishable -- which is exactly the trap this layout exists to
 //       remove. See the decode in FalcomApplyShadowTerms.
-//   .z  a pass-specific extra: the occlusion term that was actually read
-//       (micro), or the linearised scene depth (contact).
+//   .z  the linearised scene depth.
 //   .w  1 whenever the pass ran at all. 0 means the target was never written,
 //       which points at resource creation rather than at the algorithm.
 
@@ -389,11 +367,6 @@ bool FalcomCharCamDebugView(float rawTerm, float axisLength, float valid,
 #define kContactDiagSky          3u  // linear depth beyond the sky cutoff
 #define kContactDiagBadDepth     4u  // device depth or the unpack consts are not finite
 #define kContactDiagNoLightDir  5u  // lightDirection_g was zero-length (no sun this frame)
-
-// Micro .y codes.
-#define kMicroDiagOk            0u
-#define kMicroDiagNoNormal      1u  // MRT0 decoded to a zero vector
-#define kMicroDiagNoLightDir    2u  // lightDirection_g was zero-length
 
 // ── Per-pixel strength selection ──
 // The two techniques share this because the environment/character split is a
@@ -421,27 +394,6 @@ float FalcomShadowStrength(float rawTerm, float strength, bool isCharacter,
   // and can never brighten anything.
   const float darkening = (1.0 - saturate(rawTerm)) * saturate(maxDarkening);
   return 1.0 - darkening * s;
-}
-
-// ── Micro Shadows: applied to the resolved colour ──
-//
-// Micro is an APERTURE term derived from ambient occlusion, so it belongs on the
-// final colour: it models how much light a surface occludes, not where the sun is.
-// Keeping it here is what makes it correct indoors, where the sun term is already
-// ~0 and the ambient is the whole story.
-//
-// Contact Shadows are the opposite case -- a directional light march -- and are
-// applied by FalcomApplyContactToSun instead. Multiplying contact by the final
-// colour was the original bug: indoors the CSM has already zeroed the sun, so a
-// sun contact shadow had no sun left to shadow and went on darkening the ambient
-// instead, which is what made contact shadows appear in interiors.
-float3 FalcomApplyMicroShadows(float3 lit, bool isCharacter, float4 micro)
-{
-  if (shader_injection_data.cs_micro_dedicated_bound < 0.5f) return lit;
-  return lit * FalcomShadowStrength(
-      micro.x, shader_injection_data.cs_micro_strength, isCharacter,
-      shader_injection_data.cs_micro_env_strength,
-      shader_injection_data.cs_micro_char_strength, 1.0);
 }
 
 // ── Sun-contact range gate ──
@@ -555,7 +507,7 @@ float3 FalcomApplyContactToSun(float3 sunDiffuse, bool isCharacter, float4 conta
       shader_injection_data.cs_contact_max_darkening);
 }
 
-// ── Diagnostic views + micro, for the final output site ──
+// ── Diagnostic views, for the final output site ──
 //
 // Runs at the end of the lighting shader, after every contribution is summed.
 // The views override the colour outright so a broken pass can never hide behind a
@@ -573,63 +525,38 @@ float3 FalcomApplyContactToSun(float3 sunDiffuse, bool isCharacter, float4 conta
 // the IS-FAST push in OnBeforeLightingShaderDraw), so this reuses the game's own
 // samPoint_s at s0.
 float3 FalcomApplyShadowTerms(float3 lit, float2 screenUV, bool isCharacter,
-                              SamplerState pointSampler,
-                              Texture2D<float4> microTex, Texture2D<float4> contactTex)
+                              SamplerState pointSampler, Texture2D<float4> contactTex)
 {
-  const bool micro_on = shader_injection_data.cs_micro_dedicated_bound > 0.5f;
   const bool contact_on = shader_injection_data.cs_contact_dedicated_bound > 0.5f;
-
-  const float4 micro = micro_on ? microTex.SampleLevel(pointSampler, screenUV, 0) : float4(1, 0, 1, 1);
   const float4 contact = contact_on ? contactTex.SampleLevel(pointSampler, screenUV, 0) : float4(1, 0, 1, 1);
 
   // ---- diagnostic views ----
   const int contactDbg = (int)shader_injection_data.cs_contact_debug;
-  if (contactDbg > 0 && contact_on) {
-    if (contactDbg == 1) {
-      // Stage ladder. See the kContactDiag* block above.
-      const uint code = (uint)(contact.y * 255.0 + 0.5);
-      if (contact.w < 0.5)        return float3(0.15, 0.15, 0.15);  // never written
-      if (code == kContactDiagNoNormal)      return float3(1.0, 0.0, 1.0);  // magenta
-      if (code == kContactDiagBadProjection) return float3(1.0, 1.0, 0.0);  // yellow
-      if (code == kContactDiagSky)           return float3(0.0, 1.0, 1.0);  // cyan
-      if (code == kContactDiagBadDepth)      return float3(1.0, 0.5, 0.0);  // orange
-      if (code == kContactDiagNoLightDir)    return float3(0.0, 0.0, 1.0);  // blue
-      if (contact.x < 0.5) return float3(1.0, 0.0, 0.0);                      // red = occluded
-      return float3(contact.x, contact.x, contact.x);
-    }
-    if (contactDbg == 2) {
-      // Linearised scene depth, 0..1 over 1000 world units. A uniformly white
-      // frame means the linearisation is wrong; a uniformly black frame means it
-      // is returning 0 for everything.
-      return float3(contact.z, contact.z, contact.z);
-    }
-  }
-  const int microDbg = (int)shader_injection_data.cs_micro_debug;
-  if (microDbg > 0 && micro_on) {
-    if (microDbg == 1) {
-      // The occlusion term that was actually read. White means AO = 1, which
-      // makes the micro term identically 1 at every pixel -- the pass is running
-      // but cannot produce a shadow.
-      return float3(micro.z, micro.z, micro.z);
-    }
-    if (microDbg == 2) {
-      const uint code = (uint)(micro.y * 255.0 + 0.5);
-      if (micro.w < 0.5)      return float3(0.15, 0.15, 0.15);
-      if (code == kMicroDiagNoNormal)   return float3(1.0, 0.0, 1.0);
-      if (code == kMicroDiagNoLightDir) return float3(0.0, 1.0, 1.0);
-      return float3(micro.x, micro.x, micro.x);
-    }
-  }
-  if (shader_injection_data.cs_contact_debug > 2.5f) {
+  float3 result = lit;
+  if (contactDbg == 1 && contact_on) {
+    // Stage ladder. See the kContactDiag* block above.
+    const uint code = (uint)(contact.y * 255.0 + 0.5);
+    if (contact.w < 0.5) result = float3(0.15, 0.15, 0.15);
+    else if (code == kContactDiagNoNormal) result = float3(1.0, 0.0, 1.0);
+    else if (code == kContactDiagBadProjection) result = float3(1.0, 1.0, 0.0);
+    else if (code == kContactDiagSky) result = float3(0.0, 1.0, 1.0);
+    else if (code == kContactDiagBadDepth) result = float3(1.0, 0.5, 0.0);
+    else if (code == kContactDiagNoLightDir) result = float3(0.0, 0.0, 1.0);
+    else if (contact.x < 0.5) result = float3(1.0, 0.0, 0.0);
+    else result = contact.xxx;
+  } else if (contactDbg == 2 && contact_on) {
+    // Linearised scene depth, 0..1 over 1000 world units. A uniformly white
+    // frame means the linearisation is wrong; a uniformly black frame means it
+    // is returning 0 for everything.
+    result = contact.zzz;
+  } else if (contactDbg >= 3) {
     // Character mask, independent of either pass: the per-game flag-bit
     // convention is the one input here that no other shader in the repo can
     // corroborate for every game, and an all-one-colour frame is the unambiguous
     // symptom of getting it wrong.
-    return isCharacter ? float3(1.0, 0.0, 1.0) : float3(0.0, 0.0, 0.0);
+    result = isCharacter ? float3(1.0, 0.0, 1.0) : float3(0.0, 0.0, 0.0);
   }
-
-  // Micro only. Contact was applied to the sun at its own composite site.
-  return FalcomApplyMicroShadows(lit, isCharacter, micro);
+  return result;
 }
 
 // ── Local (point / spot) contact shadows ──
