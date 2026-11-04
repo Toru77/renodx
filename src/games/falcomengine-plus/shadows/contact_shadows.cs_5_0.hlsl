@@ -37,7 +37,7 @@
 //   t0 depth        scene depth, reversed-Z, device Z in .x
 //   t1 mrtTexture0  world normal
 //   t2 IS-FAST      128x128x32 blue noise volume
-//   u0 output       rgba8_unorm: .x term, .y diagnostic, .z linear depth / 1000
+//   u0 output       rgba8_unorm: .x term, .y diagnostic code / 255, .z linear depth / 1000
 
 #define RENODX_SHADOWS_DECLARE_CB_SCENE
 #include "shadows_common.hlsli"
@@ -69,7 +69,7 @@ void main(uint2 p : SV_DispatchThreadID)
   // numbers that cannot be right.
   if (!isfinite(deviceDepth) || !isfinite(unpack.x) || !isfinite(unpack.y)
       || abs(unpack.x) < 1e-8) {
-    g_outContact[p] = float4(1.0, kContactDiagBadDepth, 0.0, 1.0);
+    g_outContact[p] = float4(1.0, kContactDiagBadDepth / 255.0, 0.0, 1.0);
     return;
   }
 
@@ -82,13 +82,13 @@ void main(uint2 p : SV_DispatchThreadID)
   // channel is what tells you when the threshold is set too high and is eating
   // real geometry.
   if (linearDepth > shader_injection_data.cs_contact_sky_depth) {
-    g_outContact[p] = float4(1.0, kContactDiagSky, saturate(linearDepth * 0.001), 1.0);
+    g_outContact[p] = float4(1.0, kContactDiagSky / 255.0, saturate(linearDepth * 0.001), 1.0);
     return;
   }
 
   float3 worldNormal = DecodeFalcomMrtNormal(g_srcMrtNormal.Load(int3(p, 0)).xy);
   if (!FalcomNormalValid(worldNormal)) {
-    g_outContact[p] = float4(1.0, kContactDiagNoNormal, saturate(linearDepth * 0.001), 1.0);
+    g_outContact[p] = float4(1.0, kContactDiagNoNormal / 255.0, saturate(linearDepth * 0.001), 1.0);
     return;
   }
 
@@ -98,7 +98,7 @@ void main(uint2 p : SV_DispatchThreadID)
   // when looking the other. See FalcomDirectionToLight for the engine-side proof.
   const float3 lightDir = FalcomDirectionToLight();
   if (!FalcomNormalValid(lightDir)) {
-    g_outContact[p] = float4(1.0, kContactDiagNoLightDir, saturate(linearDepth * 0.001), 1.0);
+    g_outContact[p] = float4(1.0, kContactDiagNoLightDir / 255.0, saturate(linearDepth * 0.001), 1.0);
     return;
   }
 
@@ -113,7 +113,7 @@ void main(uint2 p : SV_DispatchThreadID)
   const float4 clipHere = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, deviceDepth, 1.0);
   const float4 worldH = mul(clipHere, viewProjInv_g);
   if (abs(worldH.w) <= 1e-6 || !isfinite(worldH.w)) {
-    g_outContact[p] = float4(1.0, kContactDiagBadProjection, saturate(linearDepth * 0.001), 1.0);
+    g_outContact[p] = float4(1.0, kContactDiagBadProjection / 255.0, saturate(linearDepth * 0.001), 1.0);
     return;
   }
   const float3 worldPos = worldH.xyz / worldH.w
@@ -124,7 +124,7 @@ void main(uint2 p : SV_DispatchThreadID)
   const float4 clipEnd = mul(float4(worldPos + lightDir * rayLength, 1.0), viewProj_g);
   if (abs(clipStart.w) <= 1e-6 || abs(clipEnd.w) <= 1e-6
       || !isfinite(clipStart.w) || !isfinite(clipEnd.w)) {
-    g_outContact[p] = float4(1.0, kContactDiagBadProjection, saturate(linearDepth * 0.001), 1.0);
+    g_outContact[p] = float4(1.0, kContactDiagBadProjection / 255.0, saturate(linearDepth * 0.001), 1.0);
     return;
   }
 
@@ -146,5 +146,5 @@ void main(uint2 p : SV_DispatchThreadID)
                               max(1.0, floor(shader_injection_data.cs_contact_sample_count + 0.5)),
                               jitter,
                               max(0.0, shader_injection_data.cs_contact_response_scale)),
-      kContactDiagMarched, saturate(linearDepth * 0.001), 1.0);
+      kContactDiagMarched / 255.0, saturate(linearDepth * 0.001), 1.0);
 }
