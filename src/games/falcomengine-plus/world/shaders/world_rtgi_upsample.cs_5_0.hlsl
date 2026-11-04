@@ -7,6 +7,7 @@
 // there is no surface or no valid tap) and debug views 6 and 7 (u1). View 7 (Applied GI) is what the Sora 2nd composite
 // adds: final GI x the G-buffer colour (t3) x GI Intensity, with Character GI Intensity where MRT0.w has bit 3 clear and
 // bit 0 set (the lighting shader's csIsCharacter and csCharacterShading).
+// RTGI_UPSAMPLE_AO_BYTE (gtvbao_svgf_upsample): u0 is r32_uint, the AO byte saturate(r) x 255; no surface or no valid tap = 255.
 
 #include "../../include/mrt_normal.hlsli"
 #include "world_rt_denoise.hlsli"
@@ -16,7 +17,11 @@ Texture2D<uint4> g_mrt_normal : register(t1);
 Texture2D<float4> g_in : register(t2);
 Texture2D<float4> g_albedo : register(t3);  // the lighting draw's colorTexture (G-buffer colour), for Debug 7
 
+#if defined(RTGI_UPSAMPLE_AO_BYTE)
+RWTexture2D<uint> g_final : register(u0);
+#else
 RWTexture2D<float4> g_final : register(u0);
+#endif
 RWTexture2D<float4> g_rtgi_debug : register(u1);
 
 cbuffer cb_scene : register(b0)
@@ -47,7 +52,11 @@ void main(uint3 id : SV_DispatchThreadID)
     const float depth = g_game_depth.Load(int3(px, 0)).x;
     const float3 N = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(px, 0)).xy);
     const bool surface = depth > 0.0 && dot(N, N) >= 0.5 && all(resolutionScaling_g == float2(1.0, 1.0));
+#if defined(RTGI_UPSAMPLE_AO_BYTE)
+    float3 gi = float3(1.0, 1.0, 1.0);  // AO: no surface or no valid tap = no occlusion
+#else
     float3 gi = float3(0.0, 0.0, 0.0);
+#endif
     if (surface)
     {
         const float2 uv = (float2(px) + 0.5) / float2(full_size);
@@ -106,7 +115,11 @@ void main(uint3 id : SV_DispatchThreadID)
         float luma = dot(gi, float3(0.2126, 0.7152, 0.0722));
         gi = max(0.0, luma + (gi - luma) * u_extra.x);
     }
+#if defined(RTGI_UPSAMPLE_AO_BYTE)
+    g_final[px] = (uint)(saturate(gi.r) * 255.0 + 0.5);
+#else
     g_final[px] = float4(gi, 1.0);
+#endif
     if (debug_mode == 6)
     {
         // Not traced (no surface): dark purple, as in the other debug views.

@@ -913,15 +913,12 @@ static float g_cpuopt_deferred_dispatch   = 1.f;  // dispatch GTVBAO/VBGI in OnP
 static float g_cpuopt_ensure_pipelines    = 0.f;  // kai-style: don't destroy/recreate pipelines every frame
 
 static float g_gtvbao_temporal_enabled = 1.f;
-static float g_gtvbao_history_weight = 0.9f;
+static float g_gtvbao_history_weight = 0.8f;
 static float g_gtvbao_depth_rejection = 0.2f;
 static float g_gtvbao_normal_rejection = 0.f;
-static float g_gtvbao_history_clamp = 0.1f;
-static float g_gtvbao_filter_type = 1.f;
-static float g_gtvbao_filter_radius = 8.f;
-static float g_gtvbao_filter_taps_separable = 5.f;
-static float g_gtvbao_filter_taps_atrous = 5.f;
-static float g_gtvbao_filter_passes_lowres = 1.f;
+static float g_gtvbao_svgf_spatial_enabled = 1.f;
+static float g_gtvbao_svgf_iterations = 5.f;
+static float g_gtvbao_svgf_luminance_edge_stop = 4.f;
 static float g_vbgi_temporal_enabled = 1.f;
 static float g_vbgi_history_weight = 0.8f;
 static float g_vbgi_depth_rejection = 0.05f;
@@ -962,9 +959,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource ao_term_a_texture = {};
   reshade::api::resource_view ao_term_a_srv = {};
   reshade::api::resource_view ao_term_a_uav = {};
-  reshade::api::resource ao_term_b_texture = {};
-  reshade::api::resource_view ao_term_b_srv = {};
-  reshade::api::resource_view ao_term_b_uav = {};
 
   // 1�1 white fallback � always valid, returned when GTVBAO is off / not ready.
   reshade::api::resource fallback_texture = {};
@@ -981,10 +975,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t ao_height = 0u;
   float last_created_gtvbao_resolution = -1.f;
   float last_created_vbgi_resolution = -1.f;
-  reshade::api::resource upscale_ao_texture = {};
-  reshade::api::resource_view upscale_ao_srv = {};
-  reshade::api::resource_view upscale_ao_uav = {};
-  reshade::api::pipeline upscale_pipeline = {};  // joint reconstruction (low-res modes)
 
   reshade::api::pipeline_layout prefilter_layout = {};
   reshade::api::pipeline_layout main_layout = {};
@@ -1001,30 +991,12 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline_layout vbgi_radiance_far_layout = {};  // radiance prepass with far feedback: 14 SRVs, 1 UAV
   reshade::api::pipeline vbgi_radiance_far_pipeline = {};
   GTVBAODescriptorTableSet vbgi_radiance_far_tables = {};
-  // -- �-trous wavelet spatial filter (R3) --
-  reshade::api::pipeline_layout temporal_layout = {};
-  reshade::api::pipeline temporal_pipeline = {};
-  GTVBAODescriptorTableSet temporal_tables = {};
-  reshade::api::pipeline_layout filter_layout = {};
-  reshade::api::pipeline filter_pipeline = {};
-  GTVBAODescriptorTableSet filter_tables = {};
-  reshade::api::resource temporal_history_texture[2] = {};
-  reshade::api::resource_view temporal_history_srv[2] = {};
-  reshade::api::resource_view temporal_history_uav[2] = {};
-  uint32_t temporal_history_index = 0u;
   uint32_t temporal_seen_w = 0u;
   uint32_t temporal_seen_h = 0u;
   bool gtvbao_temporal_last = false;
   uint64_t gtvbao_last_frame = UINT64_MAX;
   std::array<float, kGtvbaoSnapshotFloats> gtvbao_prev_params = {};
   bool gtvbao_prev_params_valid = false;
-  // Normal pre-decode pass (�-trous perf): decoded MRT normals, RGBA16F
-  reshade::api::pipeline_layout normal_prep_layout = {};
-  reshade::api::pipeline normal_prep_pipeline = {};
-  GTVBAODescriptorTableSet normal_prep_tables = {};
-  reshade::api::resource normal_prep_texture = {};
-  reshade::api::resource_view normal_prep_srv = {};
-  reshade::api::resource_view normal_prep_uav = {};
 
   // Descriptor tables � pre-allocated per pass.
   GTVBAODescriptorTableSet prefilter_tables = {};
@@ -1044,6 +1016,9 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view vbgi_radiance_mip_uav[5] = {};
   uint64_t vbgi_radiance_frame = UINT64_MAX;
   falcom_world::rtgi::RtgiDenoiseSet vbgi_denoise = {};
+  falcom_world::rtgi::RtgiDenoiseSet gtvbao_denoise = {};
+  falcom_world::rtgi::RtgiTextureSet<1> gtvbao_svgf_raw = {};  // rgba16f, AO size: rgb = visibility, a = 1
+  falcom_world::rtgi::RtgiPipeline gtvbao_svgf_input_pipeline = {};
   reshade::api::resource vbgi_stats_buffer = {};
   reshade::api::resource_view vbgi_stats_uav = {};
   uint64_t vbgi_gi_frame = UINT64_MAX;
@@ -1155,8 +1130,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool isfast_texture_attempted = false;  // only try DDS load once
   bool vbgi_bound = false;
   bool foliage_drawn_this_frame = false;  // set by foliage shader on_draw, reset per frame
-  // -- GTVBAO: which ao_term buffer holds the latest final AO result --
-  bool gtvbao_final_in_b = true;
 
   // CPU optimization tracking
   uint64_t last_bound_pipeline_handle = 0u;
@@ -3627,12 +3600,15 @@ renodx::utils::settings::Settings settings = {
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAODebugMode", .binding = &g_gtvbao_debug_ui,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Debug View", .section = "GTVBAO",
-      .tooltip = "Off: normal output.\nAO Only: the final AO on the lighting pass.\nRaw AO: this frame's AO before temporal and filter.\nTemporal Confidence: valid history fraction (blue when temporal does not run). Purple = sky, orange = no MRT normal (depth normal used), cyan = foliage, black = history rejected, gray = history weight.\nSlice AO: mean unoccluded slice fraction (flat surface ~1.0).\nBitmask: first slice's horizon mask (R popcount, G first set bit, B last set bit).\nAO Normal: the view-space normal the AO uses.\nKyoto and Daybreak 2 do not support the compute views (Raw AO, Temporal Confidence, Slice AO, Bitmask, AO Normal).",
-      .labels = {"Off", "AO Only", "Raw AO", "Temporal Confidence", "Slice AO", "Bitmask", "AO Normal"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAODebugMode",
+        .binding = &g_gtvbao_debug_ui,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Debug View",
+        .section = "GTVBAO",
+        .tooltip = "Off: normal output.\nAO Only: the final AO on the lighting pass.\nRaw AO: this frame's AO before the SVGF denoise.\nTemporal Confidence: SVGF history length, black (new or no surface) to white (32 frames); blue = the reprojection did not run. Purple = sky, orange = no MRT normal (depth normal used), cyan = foliage.\nSlice AO: mean unoccluded slice fraction (flat surface ~1.0).\nBitmask: first slice's horizon mask (R popcount, G first set bit, B last set bit).\nAO Normal: the view-space normal the AO uses.\nKyoto and Daybreak 2 do not support the compute views (Raw AO, Temporal Confidence, Slice AO, Bitmask, AO Normal).",
+        .labels = {"Off", "AO Only", "Raw AO", "Temporal Confidence", "Slice AO", "Bitmask", "AO Normal"},
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAODebugLogging", .binding = &shader_injection.gtvbao_debug_logging,
@@ -10097,18 +10073,17 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     }
   }
 
+  if (!gtvbao_active && dd->gtvbao_svgf_raw.texture[0].handle != 0u) {
+    falcom_world::rtgi::ReleaseRtgiDenoiseTextures(dev, &dd->gtvbao_denoise);
+    falcom_world::rtgi::DestroyRtgiTextureSet(dev, &dd->gtvbao_svgf_raw);
+  }
+
   // Push the GTVBAO AO result at t22.
   // In inline mode: fresh from dispatch above.
   // In deferred mode: result from previous frame's OnPresent dispatch.
-  // The buffer is tracked by RunGTVBAO (gtvbao_final_in_b) � parity depends on
-  // the active denoiser path (legacy / R2 two-stage / �-trous).
+  // The buffer is the newest SVGF chain output (gtvbao_denoise.output).
   if (gtvbao_active) {
-    // Low-res mode: lighting sees the reconstructed full-res AO (same t22 slot).
-    const bool half_active = shader_injection.gtvbao_resolution > 0.5f
-        && dd->upscale_ao_srv.handle;
-    reshade::api::resource_view srv = half_active
-        ? dd->upscale_ao_srv
-        : (dd->gtvbao_final_in_b ? dd->ao_term_b_srv : dd->ao_term_a_srv);
+    const reshade::api::resource_view srv = dd->gtvbao_denoise.output.srv[dd->gtvbao_denoise.output_index];
     if (srv.handle) {
       cmd_list->push_descriptors(
           reshade::api::shader_stage::pixel,
@@ -10522,10 +10497,6 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
   d->ao_width = aw; d->ao_height = ah;
   d->last_created_gtvbao_resolution = std::log2((float)div);
   mk(aw, ah, reshade::api::format::r32_uint, &d->ao_term_a_texture, &d->ao_term_a_srv, &d->ao_term_a_uav);
-  mk(aw, ah, reshade::api::format::r32_uint, &d->ao_term_b_texture, &d->ao_term_b_srv, &d->ao_term_b_uav);
-  for (int i = 0; i < 2; ++i)
-    mk(aw, ah, reshade::api::format::r16g16b16a16_float,
-       &d->temporal_history_texture[i], &d->temporal_history_srv[i], &d->temporal_history_uav[i]);
   // VBGI raw gather target: always allocated; RunVBGI never resizes it.
   const uint32_t vdiv = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex);
   const uint32_t vw = (w + vdiv - 1u) / vdiv;
@@ -10557,25 +10528,11 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
                                 &d->vbgi_radiance_mip_uav[m]);
   }
 
-  if (div > 1u) {
-    mk(w, h, reshade::api::format::r32_uint,
-       &d->upscale_ao_texture, &d->upscale_ao_srv, &d->upscale_ao_uav);
-    // Texture/SRV/UAV are separate create calls; report partial failure
-    // explicitly instead of letting the GI chain degrade silently later.
-    if (!d->upscale_ao_uav.handle) {
-      reshade::log::message(reshade::log::level::error,
-          "[GTVBAO] Low-res reconstruction resources incomplete � "
-          "reconstruction will be unavailable in low-resolution mode.");
-    }
-  }
   // Foliage mask (AO working domain R8_UINT: full in Full, AO-sized in low-res modes)
   mk(aw, ah, reshade::api::format::r8_uint,
      &d->foliage_mask_texture, &d->foliage_mask_srv, &d->foliage_mask_uav);
   mk(w, h, reshade::api::format::r8g8b8a8_unorm,
      &d->debug_texture, &d->debug_srv, &d->debug_uav);
-  // �-trous normal pre-decode target (full-res RGBA16F)
-  mk(w, h, reshade::api::format::r16g16b16a16_float,
-     &d->normal_prep_texture, &d->normal_prep_srv, &d->normal_prep_uav);
 }
 
 static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
@@ -10587,7 +10544,6 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
 
   dv(d->depth_mips_srv); for (auto& u : d->depth_mips_uavs) dv(u); dr(d->depth_mips_texture);
   dv(d->ao_term_a_srv); dv(d->ao_term_a_uav); dr(d->ao_term_a_texture);
-  dv(d->ao_term_b_srv); dv(d->ao_term_b_uav); dr(d->ao_term_b_texture);
   if (d->point_clamp_sampler.handle) { dev->destroy_sampler(d->point_clamp_sampler); d->point_clamp_sampler = {}; }
   dp(d->prefilter_pipeline); dp(d->main_pipeline);
   dl(d->prefilter_layout); dl(d->main_layout);
@@ -10610,6 +10566,11 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   d->vbgi_temporal_last = false;
   d->vbgi_last_frame = UINT64_MAX;
   d->vbgi_prev_params_valid = false;
+  falcom_world::rtgi::DestroyRtgiDenoiseSet(dev, &d->gtvbao_denoise);
+  d->gtvbao_denoise = falcom_world::rtgi::RtgiDenoiseSet{};
+  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->gtvbao_svgf_raw);
+  falcom_world::rtgi::DestroyRtgiPipeline(dev, d->gtvbao_svgf_input_pipeline);
+  d->gtvbao_svgf_input_pipeline = {};
   dp(d->vbgi_far_main_pipeline); dp(d->vbgi_far_resolve_pipeline);
   dl(d->vbgi_far_main_layout); dl(d->vbgi_far_layout);
   DestroyGTVBAODescriptorTables(dev, &d->vbgi_far_main_tables);
@@ -10637,21 +10598,10 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   DestroyGTVBAODescriptorTables(dev, &d->main_tables);
   DestroyGTVBAODescriptorTables(dev, &d->foliage_mask_tables);
   // GI resources (now integrated � no separate VBGI pipeline)
-  dv(d->upscale_ao_srv); dv(d->upscale_ao_uav); dr(d->upscale_ao_texture);
-  dp(d->upscale_pipeline);
   dv(d->foliage_mask_srv); dv(d->foliage_mask_uav); dr(d->foliage_mask_texture);
   dp(d->foliage_mask_pipeline); dl(d->foliage_mask_layout);
   dv(d->debug_srv); dv(d->debug_uav); dr(d->debug_texture);
-  // �-trous wavelet filter + normal pre-decode
-  dp(d->temporal_pipeline); dl(d->temporal_layout);
-  DestroyGTVBAODescriptorTables(dev, &d->temporal_tables);
-  dp(d->filter_pipeline); dl(d->filter_layout);
-  DestroyGTVBAODescriptorTables(dev, &d->filter_tables);
-  for (int i = 0; i < 2; ++i) { dv(d->temporal_history_srv[i]); dv(d->temporal_history_uav[i]); dr(d->temporal_history_texture[i]); }
   if (d->linear_clamp_sampler.handle) { dev->destroy_sampler(d->linear_clamp_sampler); d->linear_clamp_sampler = {}; }
-  dp(d->normal_prep_pipeline); dl(d->normal_prep_layout);
-  DestroyGTVBAODescriptorTables(dev, &d->normal_prep_tables);
-  dv(d->normal_prep_srv); dv(d->normal_prep_uav); dr(d->normal_prep_texture);
   // IS-FAST noise
   dv(d->isfast_noise_srv); dr(d->isfast_noise_texture);
   if (d->isfast_sampler.handle) { dev->destroy_sampler(d->isfast_sampler); d->isfast_sampler = {}; }
@@ -10898,11 +10848,7 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
   if (falcom_world::rtao::g_rtao_frame.producing) {
     ao_gtvbao = falcom_world::rtao::OutputSrv(falcom_world::rtao::GetRtaoDeviceData(dev));
   } else if (shader_injection.gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested()) {
-    const bool half_active = shader_injection.gtvbao_resolution > 0.5f
-                          && d->upscale_ao_srv.handle;
-    ao_gtvbao = half_active
-        ? d->upscale_ao_srv
-        : (d->gtvbao_final_in_b ? d->ao_term_b_srv : d->ao_term_a_srv);
+    ao_gtvbao = d->gtvbao_denoise.output.srv[d->gtvbao_denoise.output_index];
   }
   reshade::api::resource_view ao_ssao = d->captured_ssao_srv;
   if (!ao_ssao.handle) ao_ssao = d->fallback_srv;  // AO = 1, the no-occlusion floor
@@ -12592,18 +12538,19 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   // c[30] - foliage mask is only fresh when the pre-pass dispatched this frame.
   c[30] = pass.foliage_mask_valid ? 1.f : 0.f;
   // -- Denoiser upgrades (R1-R4) --
-  c[31] = (float)pass.filter_kind;
-  c[32] = std::clamp(g_gtvbao_filter_radius, 1.f, 8.f);
-  c[33] = (float)pass.filter_taps;
-  c[34] = std::clamp((float)pass.filter_step, 1.f, 8.f);                           // �-trous stride (1/2/4)
+  c[31] = 0.f;  // unused: GTVBAO filter removed (SVGF M2a)
+  c[32] = 0.f;  // unused: GTVBAO filter removed (SVGF M2a)
+  c[33] = 0.f;  // unused: GTVBAO filter removed (SVGF M2a)
+  c[34] = 0.f;  // unused: GTVBAO filter removed (SVGF M2a)
   // �� Low-resolution spatial pipeline (appended; Full path ignores these) ��
   c[35] = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 1.f);
   c[36] = g_gtvbao_hemisphere_weighting;       // hemisphere weighting 0=Cosine, 1=Uniform
-  c[37] = (float)pass.filter_direction;
+  // unused: GTVBAO filter removed (SVGF M2a)
+  c[37] = 0.f;
   c[38] = g_gtvbao_history_weight;
   c[39] = g_gtvbao_depth_rejection;
   c[40] = g_gtvbao_normal_rejection;
-  c[41] = g_gtvbao_history_clamp;
+  c[41] = 0.f;  // unused: GTVBAO temporal removed (SVGF M2a)
   c[42] = pass.history_valid ? 1.f : 0.f;
   if (pass.vbgi) {
     c[0] = g_vbgi_quality_level;
@@ -12670,12 +12617,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; }
   };
   dl(d->prefilter_layout); dl(d->main_layout);
-  dl(d->temporal_layout); dl(d->filter_layout);
-  dl(d->normal_prep_layout);
   dp(d->prefilter_pipeline); dp(d->main_pipeline);
-  dp(d->temporal_pipeline); dp(d->filter_pipeline);
-  dp(d->normal_prep_pipeline);
-  dp(d->upscale_pipeline);
   dp(d->vbgi_main_pipeline);
   dp(d->vbgi_radiance_pipeline); dp(d->vbgi_mips_pipeline);
   dl(d->vbgi_main_layout); dl(d->vbgi_radiance_layout); dl(d->vbgi_mips_layout);
@@ -12694,9 +12636,6 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     DestroyGTVBAODescriptorTables(dev, &d->vbgi_mips_tables);
     DestroyGTVBAODescriptorTables(dev, &d->vbgi_far_main_tables);
     DestroyGTVBAODescriptorTables(dev, &d->vbgi_far_tables);
-    DestroyGTVBAODescriptorTables(dev, &d->temporal_tables);
-    DestroyGTVBAODescriptorTables(dev, &d->filter_tables);
-    DestroyGTVBAODescriptorTables(dev, &d->normal_prep_tables);
   }
 
   auto mkcs = [&](std::span<const uint8_t> bc, const char* ep,
@@ -12764,14 +12703,6 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   // VBGI far field: main variant (5 SRVs, 5 UAVs) and far passes (12 SRVs, 4 UAVs), 56-float push block. Optional: a failure leaves far off.
   make_layout(5u, 5u, &d->vbgi_far_main_layout, 1u, kVbgiFarPushConstantFloats);
   make_layout(12u, 4u, &d->vbgi_far_layout, 1u, kVbgiFarPushConstantFloats);
-  // �-trous: 3 SRVs (AO src, depth MIP0, pre-decoded normals) + 1 UAV (AO dst)
-  if (!make_layout(3u, 1u, &d->filter_layout)) return false;
-  EnsureGTVBAODescriptorTables(dev, d->filter_layout, &d->filter_tables);
-  // Temporal (optional): 5 SRVs + 3 UAVs + 2 samplers. A failure turns temporal off for the frame, not AO.
-  if (make_layout(5u, 3u, &d->temporal_layout, 2u)) EnsureGTVBAODescriptorTables(dev, d->temporal_layout, &d->temporal_tables);
-  // Normal prep: 2 SRVs (MRT normal, depth mip 0) + 1 UAV (decoded normals)
-  if (!make_layout(2u, 1u, &d->normal_prep_layout)) return false;
-  EnsureGTVBAODescriptorTables(dev, d->normal_prep_layout, &d->normal_prep_tables);
   EnsureGTVBAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables);
   if (!d->prefilter_pipeline.handle) mkcs(__gtvbao_prefilter, "main", d->prefilter_layout, &d->prefilter_pipeline);
   if (!d->main_pipeline.handle)         mkcs(__gtvbao_main, "main", d->main_layout, &d->main_pipeline);
@@ -12783,16 +12714,9 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!d->vbgi_far_resolve_pipeline.handle) mkcs(__vbgi_far_resolve, "main", d->vbgi_far_layout, &d->vbgi_far_resolve_pipeline);
   if (!d->vbgi_far_temporal_pipeline.handle) mkcs(__vbgi_far_temporal, "main", d->vbgi_far_layout, &d->vbgi_far_temporal_pipeline);
   if (!d->vbgi_far_spatial_pipeline.handle) mkcs(__vbgi_far_spatial, "main", d->vbgi_far_layout, &d->vbgi_far_spatial_pipeline);
-  // �-trous wavelet spatial filter (R3)
-  if (!d->filter_pipeline.handle) mkcs(__gtvbao_filter, "main", d->filter_layout, &d->filter_pipeline);
-  if (!d->temporal_pipeline.handle) mkcs(__gtvbao_temporal, "main", d->temporal_layout, &d->temporal_pipeline);
-  // Normal pre-decode (�-trous perf)
-  if (!d->normal_prep_pipeline.handle) mkcs(__gtvbao_normal_prep, "main", d->normal_prep_layout, &d->normal_prep_pipeline);
-  if (!d->upscale_pipeline.handle) mkcs(__gtvbao_upscale, "main", d->filter_layout, &d->upscale_pipeline);
 
   // -- Main pass: visibility bitmask AO only (GI removed; VBGI inactive). --
-  return d->prefilter_pipeline.handle && d->main_pipeline.handle
-      && d->filter_pipeline.handle && d->normal_prep_pipeline.handle;
+  return d->prefilter_pipeline.handle && d->main_pipeline.handle;
 }
 
 // -- IS-FAST DDS loader (64�64�64, RG8_UNORM Texture3D) --
@@ -12948,8 +12872,8 @@ static void GtvbaoApplyDescriptors(reshade::api::device* dev, reshade::api::comm
   cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, lo, 0, count, b.data());
 }
 
-// Depth prefilter and, when requested, the normal pre-decode.
-static void RunGTVBAOSharedPrep(reshade::api::command_list* cl, DeviceData* d, bool want_normals) {
+// Depth prefilter.
+static void RunGTVBAOSharedPrep(reshade::api::command_list* cl, DeviceData* d) {
   auto* dev = cl->get_device();
   const uint32_t w = d->working_width, h = d->working_height;
   const auto UA = reshade::api::resource_usage::unordered_access;
@@ -12977,27 +12901,6 @@ static void RunGTVBAOSharedPrep(reshade::api::command_list* cl, DeviceData* d, b
   GtvbaoBarrier(cl, d->depth_mips_texture, UA, SR);
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 1 (prefilter) done.");
-
-  if (want_normals) {
-    // Pre-decode MRT normals once so the à-trous taps skip the sincos/sqrt
-    // decode. Defined before the atrous and upscale call sites that read it.
-    // texture is consumed by the atrous taps and the half-mode upscale.
-    GtvbaoBindPipeline(cl, d->normal_prep_pipeline);
-    reshade::api::resource_view np_srvs[2] = {
-        d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
-        d->depth_mips_srv};
-    reshade::api::descriptor_table_update nu[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,2,reshade::api::descriptor_type::texture_shader_resource_view,np_srvs},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->normal_prep_uav},
-    };
-    GtvbaoApplyDescriptors(dev, cl, d->normal_prep_layout, &d->normal_prep_tables, 4, nu);
-    auto pc_np = BuildGTVBAOPushConstants(d);
-    cl->push_constants(CS, d->normal_prep_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_np.data());
-    cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
-    GtvbaoBarrier(cl, d->normal_prep_texture, UA, SR);
-  }
 }
 
 // -- Dispatch --
@@ -13022,9 +12925,6 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   if (!EnsureGTVBAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables)) return false;
   if (!EnsureGTVBAODescriptorTables(dev, d->main_layout, &d->main_tables)) return false;
   if (!EnsureGTVBAODescriptorTables(dev, d->foliage_mask_layout, &d->foliage_mask_tables)) return false;
-  if (!EnsureGTVBAODescriptorTables(dev, d->filter_layout, &d->filter_tables)) return false;
-  const bool temporal_tables_ok = d->temporal_layout.handle != 0u
-      && EnsureGTVBAODescriptorTables(dev, d->temporal_layout, &d->temporal_tables);
 
   uint32_t w = d->working_width, h = d->working_height;
   if (w < 64 || h < 64) {
@@ -13036,7 +12936,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   // denoise, and �-trous while depth/MRT/light stay full.
   const bool low_res = shader_injection.gtvbao_resolution > 0.5f
       && d->ao_width >= 32u && d->ao_height >= 32u
-      && d->ao_term_a_texture.handle && d->upscale_ao_texture.handle;
+      && d->ao_term_a_texture.handle;
   const uint32_t aw = low_res ? d->ao_width : w;
   const uint32_t ah = low_res ? d->ao_height : h;
   {
@@ -13065,8 +12965,25 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
   const auto CS = reshade::api::shader_stage::all_compute;
-  const bool spatial_run = shader_injection.gtvbao_atrous_enabled > 0.5f;
-  RunGTVBAOSharedPrep(cl, d, spatial_run || low_res);
+  namespace rtgi = falcom_world::rtgi;
+  static constexpr rtgi::RtgiPipelineDesc kGtvbaoUpsampleDesc = {.srv_count = rtgi::kRtgiUpsampleSrvCount, .uav_count = rtgi::kRtgiUpsampleUavCount, .sampler_count = 0u, .push_count = rtgi::kRtgiUpsamplePushCount, .code = __gtvbao_svgf_upsample, .name = "gtvbao upsample"};
+  static constexpr rtgi::RtgiPipelineDesc kGtvbaoInputDesc = {.srv_count = 1u, .uav_count = 1u, .sampler_count = 0u, .push_count = 4u, .code = __gtvbao_svgf_input, .name = "gtvbao svgf input"};
+  const bool motion_ok = temporal_wanted && UpdateRtMotion(dev, d, true);
+  const uint32_t divisor = low_res ? 2u : 1u;
+  const uint32_t full_w = d->captured_depth_w, full_h = d->captured_depth_h;
+  rtgi::RtgiDenoiseReady ready = {};
+  if (d->captured_mrt_normal_srv.handle != 0u && d->captured_scene_cbv_view.handle != 0u && full_w != 0u && full_h != 0u
+      && aw == rtao::RtgiTraceExtent(full_w, divisor) && ah == rtao::RtgiTraceExtent(full_h, divisor)
+      && rtgi::EnsureRtgiPipeline(dev, &d->gtvbao_denoise.upsample_pipeline, kGtvbaoUpsampleDesc)
+      && rtgi::EnsureRtgiPipeline(dev, &d->gtvbao_svgf_input_pipeline, kGtvbaoInputDesc)
+      && rtgi::EnsureRtgiTextureSet(dev, &d->gtvbao_svgf_raw, reshade::api::format::r16g16b16a16_float, 8u, aw, ah)) {
+    ready = rtgi::EnsureRtgiDenoise(dev, &d->gtvbao_denoise, {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = aw, .trace_height = ah, .full_width = full_w, .full_height = full_h, .temporal = motion_ok, .spatial = g_gtvbao_svgf_spatial_enabled > 0.5f, .log_prefix = "[gtvbao]"});
+  }
+  if (!ready.ok) {
+    CSLog("gtvbao", "svgf chain not ready (normal, cbv, size, pipelines or targets)", true);
+    return false;
+  }
+  RunGTVBAOSharedPrep(cl, d);
 
   // -- Foliage mask pre-pass (AO working domain, reads MRT normal, writes R8_UINT) --
   if (foliage_mask_valid) {
@@ -13091,9 +13008,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
 
   // Temporal accumulation: the reset rule shared with RTAO and RTGI over this pass's own state.
   // Motion is checked only while Temporal is wanted; without motion the AO stays spatial only.
-  const bool motion_ok = temporal_wanted && UpdateRtMotion(dev, d, true);
   std::array<float, kGtvbaoSnapshotFloats> snapshot = {};
-  bool temporal_run = false;
   rtao::ResetReason reset = rtao::ResetReason::Disabled;
   if (temporal_wanted) {
     const auto pc_all = BuildGTVBAOPushConstants(d);
@@ -13110,16 +13025,8 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         .motion_ok = motion_ok});
     if (reset != rtao::ResetReason::None)
       CSLog("gtvbao", std::string("temporal reset: ") + rtao::ResetReasonName(reset), true);
-    temporal_run = motion_ok && temporal_tables_ok && d->temporal_pipeline.handle
-        && d->temporal_history_uav[0].handle && d->temporal_history_uav[1].handle
-        && d->captured_depth_srv.handle && d->captured_mrt_normal_srv.handle && d->captured_scene_cbv_view.handle;
   }
   const bool history_valid = reset == rtao::ResetReason::None;
-  const int filter_type = g_gtvbao_filter_type > 0.5f ? 1 : 0;
-  const rtao::FilterPlan filter_plan = rtao::MakeFilterPlan(filter_type, (int)g_gtvbao_filter_radius,
-      (int)(low_res ? g_gtvbao_filter_passes_lowres : shader_injection.gtvbao_atrous_passes),
-      (int)(filter_type == 1 ? g_gtvbao_filter_taps_atrous : g_gtvbao_filter_taps_separable));
-  const bool main_final = !temporal_run && !spatial_run;
 
   // Pass 2: Main
   reshade::api::pipeline mp = d->main_pipeline;
@@ -13147,7 +13054,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       {{},0,0,2,reshade::api::descriptor_type::texture_unordered_access_view,main_uavs},
     };
     GtvbaoApplyDescriptors(dev, cl, d->main_layout, &d->main_tables, 4, u);
-    auto pc = BuildGTVBAOPushConstants(d, {.final_pass = main_final, .foliage_mask_valid = foliage_mask_valid});
+    auto pc = BuildGTVBAOPushConstants(d, {.final_pass = false, .foliage_mask_valid = foliage_mask_valid});
     cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
   }
   cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
@@ -13159,7 +13066,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   // Skip barriers for UAVs nothing reads. debug_texture is only read by the
   // gtvbao debug views (see t23 pushes).
   {
-    const bool dbgRead = IsGtvbaoComputeDebug(GtvbaoDebugMode()) && !(GtvbaoDebugMode() == 23 && temporal_run);
+    const bool dbgRead = IsGtvbaoComputeDebug(GtvbaoDebugMode()) && !(GtvbaoDebugMode() == 23 && ready.reproject);
     if (dbgRead)
       GtvbaoBarrier(cl, d->debug_texture, UA, SR);         // Debug output ready for read
   }
@@ -13167,95 +13074,56 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 2 (main) done.");
 
   {
-    bool cur_b = false;  // false = ao_term_a, true = ao_term_b
-    if (temporal_run) {
-      const uint32_t read_i = d->temporal_history_index & 1u;
-      const uint32_t write_i = read_i ^ 1u;
-      const bool temporal_dbg = GtvbaoDebugMode() == 23;
-      GtvbaoBindPipeline(cl, d->temporal_pipeline);
-      reshade::api::resource_view t_srvs[5] = {
-          d->ao_term_a_srv, d->captured_depth_srv, d->captured_mrt_normal_srv,
-          d->mb_rtv4_owned_srv, d->temporal_history_srv[read_i]};
-      reshade::api::resource_view t_uavs[3] = {
-          d->temporal_history_uav[write_i], d->ao_term_b_uav,
-          (temporal_dbg && d->debug_uav.handle) ? d->debug_uav : d->fallback_uav};
-      reshade::api::sampler t_samplers[2] = {d->point_clamp_sampler, d->linear_clamp_sampler};
-      reshade::api::descriptor_table_update tu[4] = {
-        {{},0,0,2,reshade::api::descriptor_type::sampler,t_samplers},
-        {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-        {{},0,0,5,reshade::api::descriptor_type::texture_shader_resource_view,t_srvs},
-        {{},0,0,3,reshade::api::descriptor_type::texture_unordered_access_view,t_uavs},
+    static const reshade::api::resource_view kNull[1] = {};
+    std::vector<reshade::api::descriptor_table_update> table_nulls;
+    // Input pass: the main pass AO byte (t0) to the SVGF raw layout (u0, rgba16f); x 1.5 applied once here.
+    {
+      const rtgi::RtgiPipeline& ip = d->gtvbao_svgf_input_pipeline;
+      reshade::api::descriptor_table_update iu[2] = {
+          {ip.srv_table, 0, 0, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &d->ao_term_a_srv},
+          {ip.uav_table, 0, 0, 1u, reshade::api::descriptor_type::texture_unordered_access_view, &d->gtvbao_svgf_raw.uav[0]},
       };
-      GtvbaoApplyDescriptors(dev, cl, d->temporal_layout, &d->temporal_tables, 4, tu);
-      auto pc_t = BuildGTVBAOPushConstants(d, {.final_pass = temporal_run && !spatial_run, .history_valid = history_valid});
-      cl->push_constants(CS, d->temporal_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_t.data());
+      dev->update_descriptor_tables(2, iu);
+      GtvbaoBindPipeline(cl, ip.pipeline);
+      const reshade::api::descriptor_table ip_tables[2] = {ip.srv_table, ip.uav_table};
+      cl->bind_descriptor_tables(CS, ip.layout, 1, 2, ip_tables);
+      const float ipush[4] = {(float)aw, (float)ah, 0.f, 0.f};
+      cl->push_constants(CS, ip.layout, 3, 0, 4, ipush);
       cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
-      rtao::NullComputeSlots(cl, 5, 3, 2);
-      GtvbaoBarrier(cl, d->temporal_history_texture[write_i], UA, SR);
-      GtvbaoBarrier(cl, d->ao_term_b_texture, UA, SR);
-      if (temporal_dbg) GtvbaoBarrier(cl, d->debug_texture, UA, SR);
-      d->temporal_history_index = write_i;
-      cur_b = true;
+      rtao::NullComputeSlots(cl, 1, 1, 0);
+      GtvbaoBarrier(cl, d->gtvbao_svgf_raw.texture[0], UA, SR);
+      table_nulls.push_back({ip.srv_table, 0, 0, 1u, reshade::api::descriptor_type::texture_shader_resource_view, kNull});
+      table_nulls.push_back({ip.uav_table, 0, 0, 1u, reshade::api::descriptor_type::texture_unordered_access_view, kNull});
     }
-    if (spatial_run) {
-      for (uint32_t i = 0; i < filter_plan.pass_count; ++i) {
-        const rtao::FilterPass& fp = filter_plan.passes[i];
-        const bool last = i + 1u == filter_plan.pass_count;
-        GtvbaoBindPipeline(cl, d->filter_pipeline);
-        reshade::api::resource_view f_srvs[3] = {
-            cur_b ? d->ao_term_b_srv : d->ao_term_a_srv, d->depth_mips_srv,
-            d->normal_prep_srv.handle ? d->normal_prep_srv : d->fallback_srv};
-        reshade::api::resource_view f_uav = cur_b ? d->ao_term_a_uav : d->ao_term_b_uav;
-        reshade::api::resource f_dst = cur_b ? d->ao_term_a_texture : d->ao_term_b_texture;
-        reshade::api::descriptor_table_update fu[4] = {
-          {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-          {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-          {{},0,0,3,reshade::api::descriptor_type::texture_shader_resource_view,f_srvs},
-          {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&f_uav},
-        };
-        GtvbaoApplyDescriptors(dev, cl, d->filter_layout, &d->filter_tables, 4, fu);
-        auto pc_f = BuildGTVBAOPushConstants(d, {.final_pass = last, .filter_kind = filter_type,
-            .filter_direction = static_cast<int>(fp.direction), .filter_step = static_cast<int>(fp.step),
-            .filter_taps = static_cast<int>(filter_plan.taps_side)});
-        cl->push_constants(CS, d->filter_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_f.data());
-        cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
-        rtao::NullComputeSlots(cl, 3, 1, 1);
-        GtvbaoBarrier(cl, f_dst, UA, SR);
-        cur_b = !cur_b;
-      }
-    }
-    d->gtvbao_final_in_b = cur_b;
-
-
-    // �� Low-res mode: full-resolution joint reconstruction (RTGI structure) ��
-    // Low-res AO (+ denoise above) -> full AO for t22/t23.
-    reshade::api::pipeline up_pipe = d->upscale_pipeline;
-    if (low_res && up_pipe.handle && d->upscale_ao_uav.handle) {
-      GtvbaoBindPipeline(cl, up_pipe);
-      reshade::api::resource_view up_ao_src = d->gtvbao_final_in_b
-          ? d->ao_term_b_srv : d->ao_term_a_srv;
-      reshade::api::resource_view up_srvs[3] = {
-          up_ao_src.handle ? up_ao_src : d->fallback_srv,                    // t0 final AO
-          d->depth_mips_srv,                                                 // t1 depth mip 0
-          d->normal_prep_srv.handle ? d->normal_prep_srv : d->fallback_srv}; // t2 view-space normals
-      reshade::api::resource_view up_uavs[1] = {d->upscale_ao_uav};
-      reshade::api::descriptor_table_update uu[4] = {
-        {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-        {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-        {{},0,0,3,reshade::api::descriptor_type::texture_shader_resource_view,up_srvs},
-        {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,up_uavs},
-      };
-      GtvbaoApplyDescriptors(dev, cl, d->filter_layout, &d->filter_tables, 4, uu);
-      auto pc_u = BuildGTVBAOPushConstants(d, {});
-      cl->push_constants(CS, d->filter_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_u.data());
-      cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
-      rtao::NullComputeSlots(cl, 3, 1, 1);
-      GtvbaoBarrier(cl, d->upscale_ao_texture, UA, SR);
-    }
+    const bool gt_conf = GtvbaoDebugMode() == 23 && d->debug_uav.handle != 0u;
+    rtgi::DispatchRtgiDenoise(dev, cl, &d->gtvbao_denoise,
+                              {.raw_view = d->gtvbao_svgf_raw.srv[0],
+                               .depth_view = d->captured_depth_srv,
+                               .mrt_normal_view = d->captured_mrt_normal_srv,
+                               .scene_cbv_view = d->captured_scene_cbv_view,
+                               .motion_view = d->mb_rtv4_owned_srv,
+                               .albedo_view = reshade::api::resource_view{0u},
+                               .stats_uav = reshade::api::resource_view{0u},
+                               .debug_uav = gt_conf ? d->debug_uav : reshade::api::resource_view{0u},
+                               .debug_texture = d->debug_texture,
+                               .trace_width = aw,
+                               .trace_height = ah,
+                               .full_width = full_w,
+                               .full_height = full_h,
+                               .divisor = static_cast<float>(divisor),
+                               .debug_mode = gt_conf ? 5 : 0,
+                               .svgf = {g_gtvbao_history_weight, g_gtvbao_depth_rejection, g_gtvbao_normal_rejection,
+                                        history_valid, g_gtvbao_svgf_iterations, g_gtvbao_svgf_luminance_edge_stop},
+                               .luminance_weights = rtgi::kSvgfLuminanceAo,
+                               .upsample_intensity = 1.f,
+                               .upsample_char_intensity = 1.f,
+                               .upsample_saturation = 1.f},
+                              ready, &table_nulls);
+    dev->update_descriptor_tables(static_cast<uint32_t>(table_nulls.size()), table_nulls.data());
   }
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[GTVBAO] All passes complete.");
-  d->gtvbao_temporal_last = temporal_run;
+  d->gtvbao_temporal_last = ready.temporal;
   d->gtvbao_last_frame = d->frame_index;
   d->temporal_seen_w = aw;
   d->temporal_seen_h = ah;
@@ -13506,7 +13374,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     falcom_world::rtao::NullComputeSlots(cl, 12, 4, 1);
   };
 
-  if (!prefilter_done) RunGTVBAOSharedPrep(cl, d, false);
+  if (!prefilter_done) RunGTVBAOSharedPrep(cl, d);
 
   if (vbgi_dbg) GtvbaoBarrier(cl, d->debug_texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
   GtvbaoBindPipeline(cl, d->vbgi_main_pipeline);
@@ -13808,51 +13676,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
   }
   if (fdw_reason == DLL_PROCESS_ATTACH) {
-    falcom_world::AddTemporalRows(&settings, IsAdvancedSettingsMode, {.prefix = "Gtvbao",
-                                  .section = "GTVBAO Temporal Accumulation",
-                                  .enabled_tooltip = "Reprojects the previous frame GTVBAO AO with the game motion (RTV4 target) and blends it in after validation. Runs on Sora 1st, Sora 2nd and Kai only; off while Deferred Dispatch is On. Resets on camera cuts, frame gaps and parameter changes.",
-                                  .enabled = &g_gtvbao_temporal_enabled,
-                                  .enabled_default = 1.f,
-                                  .history_weight = &g_gtvbao_history_weight,
-                                  .history_weight_default = 0.99f,
-                                  .depth_rejection = &g_gtvbao_depth_rejection,
-                                  .depth_rejection_default = 0.2f,
-                                  .normal_rejection = &g_gtvbao_normal_rejection,
-                                  .normal_rejection_default = 0.5f,
-                                  .history_clamp = &g_gtvbao_history_clamp,
-                                  .history_clamp_default = 0.3f});
-    falcom_world::AddSpatialRows(&settings, IsAdvancedSettingsMode, {.prefix = "Gtvbao",
-                                 .section = "GTVBAO Spatial Filter",
-                                 .enabled_tooltip = "Denoises the final GTVBAO output with edge-aware weights (depth plane and normal). The temporal history keeps the unfiltered AO. Off = no filter.",
-                                 .enabled = &shader_injection.gtvbao_atrous_enabled,
-                                 .enabled_default = 1.f,
-                                 .filter_type = &g_gtvbao_filter_type,
-                                 .filter_type_default = 1.f,
-                                 .filter_radius = &g_gtvbao_filter_radius,
-                                 .filter_radius_default = 8.f,
-                                 .filter_passes = &shader_injection.gtvbao_atrous_passes,
-                                 .filter_passes_default = 2.f,
-                                 .taps_separable = &g_gtvbao_filter_taps_separable,
-                                 .taps_separable_default = 8.f,
-                                 .taps_atrous = &g_gtvbao_filter_taps_atrous,
-                                 .taps_atrous_default = 8.f,
-                                 .enabled_key = "GTVBAOAtrousEnabled",
-                                 .passes_key = "GTVBAOAtrousPasses",
-                                 .filter_passes_lowres = &g_gtvbao_filter_passes_lowres,
-                                 .filter_passes_lowres_default = 2.f,
-                                 .passes_lowres_key = "GTVBAOAtrousPassesLowRes"});
-    falcom_world::AddSvgfRows(&settings, []() { return VbgiRowVisible(); }, IsAdvancedSettingsMode, {.prefix = "Vbgi",
-                              .temporal_section = "GTVBGI Temporal Accumulation",
-                              .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.",
-                              .temporal_enabled = &g_vbgi_temporal_enabled,
-                              .history_weight = &g_vbgi_history_weight,
-                              .depth_rejection = &g_vbgi_depth_rejection,
-                              .normal_rejection = &g_vbgi_normal_rejection,
-                              .spatial_section = "GTVBGI Spatial Filter",
-                              .spatial_enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.",
-                              .spatial_enabled = &g_vbgi_spatial_enabled,
-                              .iterations = &g_vbgi_svgf_iterations,
-                              .luminance_edge_stop = &g_vbgi_svgf_luminance_edge_stop});
+    falcom_world::AddSvgfRows(&settings, IsAdvancedSettingsMode, IsAdvancedSettingsMode, {.prefix = "Gtvbao", .temporal_section = "GTVBAO Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Runs on Sora 1st, Sora 2nd and Kai only; off while Deferred Dispatch is On. Resets on camera cuts, frame gaps and parameter changes.", .temporal_enabled = &g_gtvbao_temporal_enabled, .history_weight = &g_gtvbao_history_weight, .depth_rejection = &g_gtvbao_depth_rejection, .normal_rejection = &g_gtvbao_normal_rejection, .spatial_section = "GTVBAO Spatial Filter", .spatial_enabled_tooltip = "Denoises the GTVBAO AO with the SVGF a-trous filter (depth, normal and AO edge stops). Off = no filter.", .spatial_enabled = &g_gtvbao_svgf_spatial_enabled, .iterations = &g_gtvbao_svgf_iterations, .luminance_edge_stop = &g_gtvbao_svgf_luminance_edge_stop});
+    falcom_world::AddSvgfRows(&settings, []() { return VbgiRowVisible(); }, IsAdvancedSettingsMode, {.prefix = "Vbgi", .temporal_section = "GTVBGI Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.", .temporal_enabled = &g_vbgi_temporal_enabled, .history_weight = &g_vbgi_history_weight, .depth_rejection = &g_vbgi_depth_rejection, .normal_rejection = &g_vbgi_normal_rejection, .spatial_section = "GTVBGI Spatial Filter", .spatial_enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.", .spatial_enabled = &g_vbgi_spatial_enabled, .iterations = &g_vbgi_svgf_iterations, .luminance_edge_stop = &g_vbgi_svgf_luminance_edge_stop});
     falcom_world::AddSettings(&settings, IsSora2nd(), IsAdvancedSettingsMode);
   }
   falcom_world::Use(fdw_reason, IsSora2nd());

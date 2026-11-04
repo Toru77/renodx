@@ -85,6 +85,8 @@ inline constexpr uint32_t kSvgfPushCount = 16u;
 inline constexpr uint32_t kSvgfMaxIterations = 5u;
 inline constexpr float kSvgfLuminanceRgb[3] = {0.2126f, 0.7152f, 0.0722f};  // RTGI and GTVBGI luminance weights
 inline constexpr float kSvgfLuminanceShadow[3] = {1.f, 1.f, 0.f};          // RT Local Shadows and RT Sun
+// GTVBAO and RTAO: scalar AO (rgb equal), l = r
+inline constexpr float kSvgfLuminanceAo[3] = {1.f, 0.f, 0.f};
 // Upsample: t0 depth, t1 MRT normal, t2 input, t3 G-buffer colour (Debug 7); u0 final GI, u1 debug.
 inline constexpr uint32_t kRtgiUpsampleSrvCount = 4u;
 inline constexpr uint32_t kRtgiUpsampleUavCount = 2u;

@@ -42,6 +42,18 @@ SVGF M1 (the shared denoise chain of RTGI, GTVBGI, RT Local Shadows and RT Sun),
 9. Perf tab: gpu_*_denoise from a 30-second performance test.
 Non-paper choices (each marked in the code): history length cap 32, alpha floor 1/h, eps_z = 1e-3 z, eps_l = 1e-6. Falcor differences recorded in code comments (reference\svgf\.referencecode), not implemented: depth gradient form, spatial luminance term and 4/h boost, moments alpha, tap renormalisation, fwidth consistency tests.
 
+SVGF M2a (GTVBAO), implemented, not validated in game: GTVBAO AO runs the main pass (byte), then the input pass (float, x 1.5 applied once), then the shared SVGF chain (`EnsureRtgiDenoise` and `DispatchRtgiDenoise`, r32_uint output), then the byte upsample. It runs at Full and Half on every game that runs GTVBAO. The main pass is never final; the x 1.5 scale is applied only in `gtvbao_svgf_input`. Removed: the GTVBAO temporal, filter, upscale and normal-prep shaders with their pipelines, textures and settings rows (GtvbaoHistoryClamp, GtvbaoFilterType, GtvbaoFilterRadius, GTVBAOAtrous*, GtvbaoFilterTaps*). New rows: GtvbaoSpatialEnabled, GtvbaoSvgfIterations, GtvbaoSvgfLuminanceEdgeStop. Owner test list (Sora 1st, Sora 2nd and Kai):
+1. Defaults at Full, then at Half: screenshots of the final image and of Debug AO Only against HEAD; no seams and no white or black blocks at silhouettes.
+2. Temporal off, spatial off, both off.
+3. Iterations 1 to 5 at Full and at Half.
+4. Debug Temporal Confidence ramps from black to white over about 32 frames after a camera cut; Debug Raw AO matches HEAD.
+5. 60 seconds standing still: no creep. Then pan, and let a character walk past: no ghosting.
+6. Micro shadows with the GTVBAO AO source.
+7. GTVBGI on: GI is unchanged, and debug 34 still ramps.
+8. Deferred Dispatch on: AO renders and the game does not crash.
+9. Sora 2nd with the DevKit: RTAO on, then off. GTVBAO comes back.
+Send back: screenshots, the `[gtvbao]` and `[world-rtgi]` log lines (no "svgf chain not ready" line), FPS against HEAD, and GPU memory.
+
 RR M2a (DLSS Ray Reconstruction, first live evaluate), implemented, not validated in game: with "DLSS Ray Reconstruction" on, the SR evaluate of the lighting denoise becomes the RR evaluate (preset 6, all six RayReconstruction.Hint keys, guides from M1 and camera matrices). Every RR create goes through `CreateRrFeature` then `CreateFeatureGuarded`; the RR handle is released with the SR handle, at shutdown and when RR is switched off. Any create or evaluate failure latches `g_rr_failed` and returns the SR evaluate. The status row shows the reason (`RrReasonName`) and, once latched, the NGX result and exception. Temporary "[perf test]" rows (Ray Tracing tab) gate the hooks, the present handler, the guide pass and the rows themselves; remove them with the M2a cleanup. Owner test: (1) RR on, DLSS selected: the status row reads "running" within a few seconds and the guides line is "ready"; (2) RR off: the status row reads "off" and the log has no `[world-rr] RR created` line; (3) switch RR off and on mid-session: the status row follows and the log shows one `[world-rr] release` for the RR handle; (4) send the status row text, the `[world-rr]` lines of ReShade.log, and any "NGX result" line.
 
 R1 (zero-cost BVH gating), implemented, not validated in game: with RTAO, RTGI and RTLS all off, the BVH, pool, deform and census path does not run (`RtBvhDemanded`, `ApplyBvhInputs` in `world/bvh/bvh_debug.hpp`). Owner test list:
