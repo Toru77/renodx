@@ -75,7 +75,7 @@ ShaderInjectData shader_injection = {
   .char_shadow_type = 1.f,
   .char_shadow_camera_strength = 1.f,
   .char_shadow_world_strength = 1.f,
-  .cs_bend_char_bias = 0.02f,
+  .env_sss_enabled = 1.f,
   .env_sss_strength = 1.0f,
   .env_sss_sample_count = 24.f,
   .env_sss_hard_shadow_samples = 0.f,
@@ -404,25 +404,25 @@ ShaderInjectData shader_injection = {
         .mb_camera_jitter = 1.f,
         .mb_camera_cut = 1.f,
         .mb_camera_cut_px = 120.f,
-  // -- Contact Shadows (Bend) -- Bend's SetDefaults() values where Bend has one.
-  .cs_bend_ignore_edge_pixels = 0.f,
-  .cs_bend_use_precision_offset = 0.f,
-  .cs_bend_bilinear_offset_mode = 0.f,
-  .cs_bend_dispatch_index = 0.f,
-  .cs_bend_world_space = 1.f,
-  .cs_bend_world_thickness = 0.05f,
-  .cs_bend_world_length = 1.f,
-  .cs_bend_isfast = 1.f,
+  // -- Contact Shadows -- (the cs_micro_* slots are RETIRED and unread)
+  .cs_micro_enabled = 0.f,
+  .cs_micro_strength = 1.f,
+  .cs_micro_env_strength = 1.f,
+  .cs_micro_char_strength = 1.f,
+  .cs_micro_opacity = 1.f,
+  .cs_micro_aperture_scale = 1.f,
+  .cs_micro_debug = 0.f,
+  .cs_micro_ao_source = 1.f,
   .cs_contact_enabled = 0.f,
   .cs_contact_strength = 1.f,
   .cs_contact_env_strength = 1.f,
   .cs_contact_char_strength = 1.f,
-  .cs_bend_sample_count = 60.f,
-  .cs_bend_surface_thickness = 0.005f,
+  .cs_contact_sample_count = 8.f,
+  .cs_contact_ray_length = 50.f,
   .cs_contact_thickness = 0.35f,
   .cs_contact_bias = 0.0001f,
-  .cs_bend_bilinear_threshold = 0.02f,
-  .cs_bend_shadow_contrast = 4.f,
+  .cs_contact_normal_bias = 0.0001f,
+  .cs_contact_sky_depth = 100000.f,
   .cs_contact_max_darkening = 1.f,
   .cs_contact_isfast_enabled = 1.f,
   .cs_contact_debug = 0.f,
@@ -438,10 +438,10 @@ ShaderInjectData shader_injection = {
   .cs_noise_frame = -1.f,
   .cs_working_w = 0.f,
   .cs_working_h = 0.f,
-  .cs_bend_isfast_amount = 0.5f,
-  .cs_bend_char_receive = 1.f,
+  .cs_ao_bound = 0.f,
+  .cs_micro_dedicated_bound = 0.f,
   .cs_contact_dedicated_bound = 0.f,
-  .cs_bend_char_mask_mode = 0.f,
+  .cs_micro_isfast_enabled = 0.f,
   // 0 = derive the sun-contact range gate from the engine's last cascade split.
   .cs_contact_sun_range = 0.f,
   // 4 reproduces the original 4-sample appearance exactly, so the estimator change is
@@ -522,13 +522,13 @@ constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
 constexpr uint64_t kDynCubeLoadingStaleFrames = 5u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
 
-// -- Contact Shadows (Bend, shadows/bend_shadows*.hlsl) --
-// A setup pass builds the sun's dispatch block, then the shadow pass runs once per dispatch. The index sizes the
-// DeviceData arrays, so the shaders, the host and the resource sets cannot drift apart.
+// -- Contact Shadows (shadows/*.cs_5_0.hlsl) --
+// Two independent compute passes, so two layout/pipeline/table slots. The index
+// is fixed and used to size the DeviceData arrays, so the shader, the host and
+// the two resource sets cannot drift apart.
 enum ShadowsPass : uint32_t {
-  kShadowsPassBendSetup = 0u,  // bend_shadows_setup.cs_5_0.hlsl (b0 scene -> u0 sun dispatch block)
-  kShadowsPassBendSun = 1u,    // bend_shadows_sun.cs_5_0.hlsl (t0 depth, t1 dispatch block, t2 mrt0, t3 IS-FAST -> u0 term)
-  kShadowsPassCount = 2u,
+  kShadowsPassContact = 0u,  // contact_shadows.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 noise -> u0)
+  kShadowsPassCount = 1u,
 };
 // The lighting pixel shaders read the result from this slot. t34 is declared by no
 // game's lighting shader and claimed by no existing push, so it is free in Sora 1st,
@@ -548,12 +548,8 @@ constexpr uint32_t kLightingShadowDepthRegister = 36u;
 // shaders, which is where it was first needed.
 constexpr uint32_t kCharShadowNoiseRegister = kLightingShadowNoiseRegister;
 // SRV counts per pass, matching the register() declarations in each shader.
-constexpr uint32_t kShadowsSrvPerPass[kShadowsPassCount] = {1u, 4u};
-constexpr uint32_t kShadowsUavPerPass[kShadowsPassCount] = {1u, 1u};
-// Mirrors BEND_DISPATCH_UINTS / BEND_MAX_DISPATCHES in shadows/shadows_common.hlsli.
-constexpr uint32_t kBendDispatchBufferUints = 48u;
-constexpr uint32_t kBendMaxDispatches = 8u;
-constexpr uint32_t kBendIndirectArgsStride = 3u * sizeof(uint32_t);
+constexpr uint32_t kShadowsSrvPerPass[kShadowsPassCount] = {3u};
+constexpr uint32_t kShadowsUavPerPass[kShadowsPassCount] = {1u};
 
 // -- Motion Blur (Guertin et al. 2013) --
 // Fixed pass order; the indices address the layout/pipeline/table arrays in
@@ -1460,17 +1456,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource contact_shadow_texture = {};
   reshade::api::resource_view contact_shadow_srv = {};
   reshade::api::resource_view contact_shadow_uav = {};
-  reshade::api::resource bend_dispatch_buffer = {};
-  reshade::api::resource_view bend_dispatch_srv = {};
-  reshade::api::resource_view bend_dispatch_uav = {};
   // Owned by this chain. GTVBAO creates and destroys point_clamp_sampler inside
   // its own resource lifecycle, so borrowing it meant the shadow passes could not
   // dispatch at all with GTVBAO off -- a failure that looks exactly like "the
   // feature does nothing". Same reasoning as mb_point_clamp_sampler.
   reshade::api::sampler shadows_point_clamp_sampler = {};
-  // Point, border colour 0 = the reversed-Z far depth (Bend: off-screen depth reads must be far). s0 of the Bend passes;
-  // shadows_point_clamp_sampler is s1 (IS-FAST).
-  reshade::api::sampler shadows_point_border_sampler = {};
   std::array<reshade::api::pipeline_layout, kShadowsPassCount> shadows_layouts = {};
   std::array<reshade::api::pipeline, kShadowsPassCount> shadows_pipelines = {};
   std::array<GTVBAODescriptorTableSet, kShadowsPassCount> shadows_tables = {};
@@ -1870,15 +1860,17 @@ static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list) {
 // The local-light march runs inside the dynamic light loops rather than in a pass, so
 // it needs the two resources a pass would have supplied: the depth buffer and the
 // noise volume. They go to slots the lighting shaders declare for the shadow path
-// alone (t35/t36), never to the game's own registers. t36 serves both the sun range gate and the local march.
+// alone (t35/t36), never to the game's own registers.
 //
 // Split out of DeployShadows purely for readability -- it is one gate and two pushes.
 // It is called from the same place the inline block used to live, after the contact
 // and the contact enables are known.
 static void pushInlineShadowInputs(reshade::api::command_list* cmd_list, DeviceData* d) {
-  if (shader_injection.cs_contact_enabled <= 0.5f) return;
-  // t36 also feeds the sun contact range gate (FalcomApplyContactToSun), so it is pushed whenever contact is on.
-  if (shader_injection.cs_contact_local_enabled > 0.5f && d->isfast_noise_srv.handle) {
+  if (!(shader_injection.cs_contact_enabled > 0.5f
+        && shader_injection.cs_contact_local_enabled > 0.5f)) {
+    return;
+  }
+  if (d->isfast_noise_srv.handle) {
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
@@ -4376,124 +4368,78 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "BendShadowsSampleCount", .binding = &shader_injection.cs_bend_sample_count,
+      // Deliberately a different key from the old raw "ContactShadowsSamples"
+      // slider. That setting stored the step count itself; this one stores a 0-3
+      // quality INDEX, so a saved preset holding 32 would be clamped into the
+      // index range and silently resolve to Ultra. Renaming orphans the stale
+      // value instead, so the tiers start clean at their default. Same reasoning
+      // as DOFQuality.
+      .key = "ContactShadowsQuality", .binding = &shader_injection.cs_contact_sample_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 60.f, .label = "Max Samples", .section = "Contact Shadows",
-      .tooltip = "Bend samples per pixel, rounded to a multiple of 4 (Bend's value: 60). With World-Space Scale on this is the cap in pixels; otherwise it is the shadow length in pixels. Depth reads per thread: 2 x (count / 64 + 2).",
-      .min = 16.f, .max = 252.f, .format = "%d",
+      .default_value = 1.f, .label = "Quality", .section = "Contact Shadows",
+      .tooltip = "March quality: Low 4, Medium 8, High 12, Ultra 16 steps. Higher "
+                 "tiers resolve a cleaner contact term at linearly higher cost.",
+      .labels = {"Low", "Medium", "High", "Ultra"},
+      // .min must be 0: with .labels, GetMax() is labels.size() - 1, and a .min of
+      // 1 would clamp a saved "Low" (0) up to Medium and make Low unreachable
+      // across restarts.
+      .min = 0.f,
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .parse = [](float value) { return std::clamp(std::round(value / 4.f) * 4.f, 16.f, 252.f); },
+      .parse = [](float value) { return ContactShadowQualitySamples(value); },
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "BendShadowsWorldSpace", .binding = &shader_injection.cs_bend_world_space,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "World-Space Scale", .section = "Contact Shadows",
-      .tooltip = "On: thickness and shadow length are in world units and look the same at any distance or FOV. Off: Bend's original screen-relative values (thickness grows with distance, length is in pixels).",
-      .labels = {"Off", "On"},
+      .key = "ContactShadowsRayLength", .binding = &shader_injection.cs_contact_ray_length,
+      .default_value = 2.f, .label = "Ray Length", .section = "Contact Shadows",
+      .tooltip = "World-space distance the ray travels toward the light. Short values keep "
+                 "the term to contact; long values reach genuine occluders.",
+      .min = 1.f, .max = 200.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "BendShadowsWorldThickness", .binding = &shader_injection.cs_bend_world_thickness,
-      .default_value = 0.05f, .label = "Thickness (World)", .section = "Contact Shadows",
-      .tooltip = "Assumed occluder thickness in world units (1 is about 1 m). Exact at the receiver; Bend uses one window per ray.",
-      .min = 0.005f, .max = 1.f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_bend_world_space >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "BendShadowsWorldLength", .binding = &shader_injection.cs_bend_world_length,
-      .default_value = 1.f, .label = "Shadow Length (World)", .section = "Contact Shadows",
-      .tooltip = "World distance the shadow reaches toward the sun. Never shorter than 12 pixels, never longer than Max Samples.",
-      .min = 0.05f, .max = 10.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_bend_world_space >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "BendShadowsSurfaceThickness", .binding = &shader_injection.cs_bend_surface_thickness,
-      .default_value = 0.005f, .label = "Surface Thickness", .section = "Contact Shadows",
-      .tooltip = "Bend SurfaceThickness: assumed thickness of each depth pixel, as a fraction of the depth between the sample and the far plane (non-linear depth). Bend's starting value: 0.005 (0.5%). Used when World-Space Scale is off.",
-      .min = 0.001f, .max = 0.05f, .format = "%.4f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_bend_world_space < 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "BendShadowsBilinearThreshold", .binding = &shader_injection.cs_bend_bilinear_threshold,
-      .default_value = 0.02f, .label = "Bilinear Threshold", .section = "Contact Shadows",
-      .tooltip = "Bend BilinearThreshold: relative depth difference above which two neighbouring depth samples count as an edge and are point-sampled. Tune with Debug View Edge Mask. Bend's starting value: 0.02 (2%).",
-      .min = 0.001f, .max = 1.f, .format = "%.3f",
+      .key = "ContactShadowsThickness", .binding = &shader_injection.cs_contact_thickness,
+      .default_value = 0.29f, .label = "Surface Thickness", .section = "Contact Shadows",
+      .tooltip = "How deep a hit must penetrate before it counts. Raise it to stop thin "
+                 "geometry and depth noise from self-shadowing.",
+      .min = 0.001f, .max = 4.f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "BendShadowsContrast", .binding = &shader_injection.cs_bend_shadow_contrast,
-      .default_value = 4.f, .label = "Shadow Contrast", .section = "Contact Shadows",
-      .tooltip = "Bend ShadowContrast: contrast of the transition into shadow. Values of 1 or more are valid; Bend recommends 2 or 4 and defaults to 4.",
-      .min = 1.f, .max = 8.f, .format = "%.1f",
+      .key = "ContactShadowsBias", .binding = &shader_injection.cs_contact_bias,
+      .default_value = 0.0001f, .label = "Depth Bias", .section = "Contact Shadows",
+      .tooltip = "Minimum penetration before a hit counts, in device depth. Raise only if "
+                 "you see acne.",
+      .min = 0.f, .max = 0.2f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "BendShadowsIgnoreEdgePixels", .binding = &shader_injection.cs_bend_ignore_edge_pixels,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Ignore Edge Pixels", .section = "Contact Shadows",
-      .tooltip = "Bend IgnoreEdgePixels: depth-edge pixels cast no shadow. Reduces grazing-angle aliasing on large flat surfaces but can thin valid shadows such as foliage edges. Bend default: Off.",
-      .labels = {"Off", "On"},
+      .key = "ContactShadowsNormalBias", .binding = &shader_injection.cs_contact_normal_bias,
+      .default_value = 0.1000f, .label = "Normal Bias", .section = "Contact Shadows",
+      .tooltip = "Lifts the ray origin along the surface normal. More stable than depth "
+                 "bias on curved surfaces.",
+      .min = 0.f, .max = 1.f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "BendShadowsPrecisionOffset", .binding = &shader_injection.cs_bend_use_precision_offset,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Precision Offset", .section = "Contact Shadows",
-      .tooltip = "Bend UsePrecisionOffset: moves the start depth by 1/65535 toward the far plane for an imprecise depth buffer. Bend default: Off.",
-      .labels = {"Off", "On"},
+      .key = "ContactShadowResponseScale",
+      .binding = &shader_injection.cs_contact_response_scale,
+      .default_value = 4.f, .label = "Contact Shadow Response Scale",
+      .section = "Contact Shadows",
+      .tooltip = "How strong the contact shadow reads, relative to the ORIGINAL "
+                 "4-sample contact shadow appearance. This is NOT a physically based "
+                 "parameter and 4 is not a physical unit: 4 is simply the sample count "
+                 "whose average appearance is being reproduced, so that the Quality "
+                 "setting can be a pure quality control. At Quality Low (4 steps) and "
+                 "scale 4 the march reproduces the old any-hit test exactly, value for "
+                 "value. Raise this for a darker contact, lower it for a lighter one; "
+                 "Quality then only changes how noisy the result is, not how wide or "
+                 "how dark it is. Defaults to 4.",
+      .min = 0.f, .max = 8.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "BendShadowsBilinearOffsetMode", .binding = &shader_injection.cs_bend_bilinear_offset_mode,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Bilinear Offset Mode", .section = "Contact Shadows",
-      .tooltip = "Bend BilinearSamplingOffsetMode. Off: samples start at pixel centres and the shadow depth is biased by the depth gradient across the bilinear pair. On: samples are offset onto the wave's shared ray, so shadow and start depths match; can project more jagged lines. Bend default: Off.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "BendShadowsReceiveCharacters", .binding = &shader_injection.cs_bend_char_receive,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Receive on Characters", .section = "Contact Shadows",
-      .tooltip = "Like RT Sun: character pixels take the contact shadow, including shadows from their own body. Off: character pixels stay unshadowed (characters still cast onto the world). Only pixels that reach the lighting shader's sun composite are affected.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "BendShadowsCharacterBias", .binding = &shader_injection.cs_bend_char_bias,
-      .default_value = 0.02f, .label = "Character Bias", .section = "Contact Shadows",
-      .tooltip = "Like RT Sun's Character Normal Bias: moves a character pixel's start depth toward the camera by this many world units, against acne from its own surface. Real self-shadowing stays.",
-      .min = 0.f, .max = 0.2f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_bend_char_receive >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-      .is_logarithmic = true,
-    },
-    new renodx::utils::settings::Setting{
-      .key = "BendShadowsISFAST", .binding = &shader_injection.cs_bend_isfast,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "IS-FAST Dither", .section = "Contact Shadows",
-      .tooltip = "Dithers the start depth with the IS-FAST volume so shadow edges and depth steps become fine noise for TAA to average. Bend itself uses no noise; Off gives Bend's exact result. Without TAA this shows as grain.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "BendShadowsISFASTAmount", .binding = &shader_injection.cs_bend_isfast_amount,
-      .default_value = 0.5f, .label = "Dither Amount", .section = "Contact Shadows",
-      .tooltip = "Dither range as a fraction of the shadow window. High values can flicker on grazing lit surfaces.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_bend_isfast >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4513,8 +4459,17 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "ContactShadowsSkyDepth", .binding = &shader_injection.cs_contact_sky_depth,
+      .default_value = 100000.f, .label = "Sky Depth", .section = "Contact Shadows",
+      .tooltip = "A device depth linearizing beyond this counts as no geometry, so the "
+                 "march is skipped early. Higher is safer, lower is cheaper on open sky.",
+      .min = 100.f, .max = 1000000.f, .format = "%.0f",
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "ContactShadowsMaxDarkening", .binding = &shader_injection.cs_contact_max_darkening,
-      .default_value = 1.f, .label = "Max Darkening", .section = "Contact Shadows",
+      .default_value = 0.5f, .label = "Max Darkening", .section = "Contact Shadows",
       .tooltip = "Caps how dark a contact-shadowed pixel may get. 1 allows full "
                  "black, 0 disables the darkening entirely. Lower it to keep "
                  "contact shadows from crushing in dark scenes.",
@@ -4523,11 +4478,25 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "BendShadowsDebug", .binding = &shader_injection.cs_contact_debug,
+      .key = "ContactShadowsISFAST", .binding = &shader_injection.cs_contact_isfast_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "IS-FAST Jitter", .section = "Contact Shadows",
+      .tooltip = "Jitters the march with the IS-FAST blue-noise volume and lets TAA resolve "
+                 "it. There is no IGN fallback: without the volume the march runs unjittered "
+                 "and bands visibly, which the log reports once.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsDebug", .binding = &shader_injection.cs_contact_debug,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Debug View", .section = "Contact Shadows",
-      .tooltip = "Shadow Term: the Bend term (white = lit). Edge Mask, Thread Index and Wave Index are Bend's own debug outputs; Wave Index should show waves radiating from the sun's screen position. Coverage: magenta where no Bend wave wrote the pixel (should be none). Character Mask: the lighting shader's character mask. Bend Character Mask: black where the Bend pass sees a character.",
-      .labels = {"Off", "Shadow Term", "Edge Mask", "Thread Index", "Wave Index", "Coverage", "Character Mask", "Bend Character Mask"},
+      .tooltip = "1 shows the raw contact term (white = lit). 2 shows diagnostics: R = term, "
+                 "G = stage code (0 marched, 1 no normal, 2 bad projection, 3 sky, 4 bad "
+                 "depth), B = linear depth. G of 0 with R of 1 means the march runs and finds "
+                 "nothing; G of 1, 2 or 4 means it bails out before marching.",
+      .labels = {"Off", "Raw Term", "Diagnostics"},
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -4592,53 +4561,6 @@ renodx::utils::settings::Settings settings = {
       .key = "ContactShadowsLocalStrength", .binding = &shader_injection.cs_contact_local_strength,
       .default_value = 1.f, .label = "Local Strength", .section = "Contact Shadows",
       .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "ContactShadowsThickness", .binding = &shader_injection.cs_contact_thickness,
-      .default_value = 0.29f, .label = "Local Surface Thickness", .section = "Contact Shadows",
-      .tooltip = "Local lights only. How deep a hit must penetrate before it counts. Raise it to stop thin "
-                 "geometry and depth noise from self-shadowing.",
-      .min = 0.001f, .max = 4.f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "ContactShadowsBias", .binding = &shader_injection.cs_contact_bias,
-      .default_value = 0.0001f, .label = "Local Depth Bias", .section = "Contact Shadows",
-      .tooltip = "Local lights only. Minimum penetration before a hit counts, in device depth. Raise only if "
-                 "you see acne.",
-      .min = 0.f, .max = 0.2f, .format = "%.4f",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "ContactShadowResponseScale",
-      .binding = &shader_injection.cs_contact_response_scale,
-      .default_value = 4.f, .label = "Local Response Scale",
-      .section = "Contact Shadows",
-      .tooltip = "Local lights only. How strong the contact shadow reads, relative to the ORIGINAL "
-                 "4-sample contact shadow appearance. This is NOT a physically based "
-                 "parameter and 4 is not a physical unit: 4 is simply the sample count "
-                 "whose average appearance is being reproduced, so that the Quality "
-                 "setting can be a pure quality control. At Quality Low (4 steps) and "
-                 "scale 4 the march reproduces the old any-hit test exactly, value for "
-                 "value. Raise this for a darker contact, lower it for a lighter one; "
-                 "Quality then only changes how noisy the result is, not how wide or "
-                 "how dark it is. Defaults to 4.",
-      .min = 0.f, .max = 8.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "ContactShadowsISFAST", .binding = &shader_injection.cs_contact_isfast_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Local IS-FAST Jitter", .section = "Contact Shadows",
-      .tooltip = "Local lights only. Jitters the march with the IS-FAST blue-noise volume and lets TAA resolve "
-                 "it. There is no IGN fallback: without the volume the march runs unjittered "
-                 "and bands visibly, which the log reports once.",
-      .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -9984,7 +9906,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     dd->deferred_depth_srv = dd->captured_depth_srv;
     dd->deferred_depth_res = dd->captured_depth_res;
     dd->defDepthLive = dd->captured_depth_live.load();
-    // The SSAO view travels with the snapshot so a deferred restore never hands out a handle from an earlier frame. No pass reads it since micro shadows were removed; the capture is kept by owner decision.
+    // The shadow passes read the same SSAO view and run from the same hook, so
+    // the snapshot has to carry it too -- otherwise the deferred restore would
+    // hand them a handle from an arbitrary earlier frame.
     dd->deferred_ssao_srv = dd->captured_ssao_srv;
     dd->deferred_mrt_normal_srv = dd->captured_mrt_normal_srv;
     dd->deferred_mrt_res = dd->captured_mrt_res;
@@ -10617,24 +10541,6 @@ static void CreateShadowsResources(reshade::api::device* dev, DeviceData* d,
     DestroyShadowsResources(dev, d);
     return;
   }
-  reshade::api::resource_desc dispatch_desc = {};
-  dispatch_desc.type = reshade::api::resource_type::buffer;
-  dispatch_desc.buffer.size = kBendDispatchBufferUints * sizeof(uint32_t);
-  dispatch_desc.heap = reshade::api::memory_heap::gpu_only;
-  dispatch_desc.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access
-                      | reshade::api::resource_usage::indirect_argument;
-  const reshade::api::resource_view_desc dispatch_view(reshade::api::format::r32_uint, 0u, kBendDispatchBufferUints);
-  if (!dev->create_resource(dispatch_desc, nullptr,
-                            reshade::api::resource_usage::indirect_argument | reshade::api::resource_usage::shader_resource,
-                            &d->bend_dispatch_buffer)
-      || !dev->create_resource_view(d->bend_dispatch_buffer, reshade::api::resource_usage::shader_resource,
-                                    dispatch_view, &d->bend_dispatch_srv)
-      || !dev->create_resource_view(d->bend_dispatch_buffer, reshade::api::resource_usage::unordered_access,
-                                    dispatch_view, &d->bend_dispatch_uav)) {
-    CSLog("shadows", "Bend dispatch buffer creation failed", true);
-    DestroyShadowsResources(dev, d);
-    return;
-  }
   d->shadows_resources_ready = true;
   // Recorded only on success, and never by the destroy path inside this function,
   // so the size that describes the live targets is the size they were made at.
@@ -10650,14 +10556,9 @@ static void DestroyShadowsResources(reshade::api::device* dev, DeviceData* d) {
   auto dl = [&](reshade::api::pipeline_layout& l) { if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; } };
 
   dv(d->contact_shadow_srv); dv(d->contact_shadow_uav); dr(d->contact_shadow_texture);
-  dv(d->bend_dispatch_srv); dv(d->bend_dispatch_uav); dr(d->bend_dispatch_buffer);
   if (d->shadows_point_clamp_sampler.handle) {
     dev->destroy_sampler(d->shadows_point_clamp_sampler);
     d->shadows_point_clamp_sampler = {};
-  }
-  if (d->shadows_point_border_sampler.handle) {
-    dev->destroy_sampler(d->shadows_point_border_sampler);
-    d->shadows_point_border_sampler = {};
   }
   for (uint32_t pass = 0; pass < kShadowsPassCount; ++pass) {
     dp(d->shadows_pipelines[pass]);
@@ -10676,7 +10577,7 @@ static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData
   using P = reshade::api::pipeline_layout_param;
   if (!dev || !d) return false;
   static const std::span<const uint8_t> kBytecode[kShadowsPassCount] = {
-      __bend_shadows_setup, __bend_shadows_sun};
+      __contact_shadows};
 
   if (!d->shadows_point_clamp_sampler.handle) {
     reshade::api::sampler_desc sd = {};
@@ -10687,20 +10588,10 @@ static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData
       return false;
     }
   }
-  if (!d->shadows_point_border_sampler.handle) {
-    reshade::api::sampler_desc sd = {};
-    sd.filter = reshade::api::filter_mode::min_mag_mip_point;
-    sd.address_u = sd.address_v = sd.address_w = reshade::api::texture_address_mode::border;
-    sd.border_color[0] = sd.border_color[1] = sd.border_color[2] = sd.border_color[3] = 0.f;
-    if (!dev->create_sampler(sd, &d->shadows_point_border_sampler)) {
-      CSLog("shadows", "create_sampler (border) failed", true);
-      return false;
-    }
-  }
 
   for (uint32_t pass = 0; pass < kShadowsPassCount; ++pass) {
     if (d->shadows_layouts[pass].handle == 0u) {
-      DR sampler_r = {0,0,0,2,DS::all_compute,1,DT::sampler};
+      DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
       DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer};
       DR srv_r     = {0,0,0,kShadowsSrvPerPass[pass],DS::all_compute,1,DT::texture_shader_resource_view};
       DR uav_r     = {0,0,0,kShadowsUavPerPass[pass],DS::all_compute,1,DT::texture_unordered_access_view};
@@ -10748,7 +10639,7 @@ static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData
   return true;
 }
 
-// Bend Studio screen-space shadows for the sun (reference/bend_sss_gpu.h). The setup pass builds the light coordinate and up to 8 wave dispatches on the GPU from cb_scene (no CPU copy of it outside DevKit builds); the shadow pass then runs once per dispatch through DispatchIndirect, each push naming its dispatch.
+// Runs the contact pass when it is enabled.
 static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHook) {
   if (!cl || !d) return false;
   if (d->shadows_ran_frame == d->frame_index) return true;  // already done this frame
@@ -10787,22 +10678,19 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
     blocked("a captured target was destroyed");
     return false;
   }
-  if (!dev->check_capability(reshade::api::device_caps::draw_or_dispatch_indirect)) {
-    blocked("indirect dispatch unsupported");
-    return false;
-  }
 
-  // IS-FAST feeds the Bend start-depth dither and, until M3, the local inline march. Without the volume the dither
-  // adds nothing (FalcomSampleISFAST returns 0.5), which the log reports once.
-  const bool isfast_wanted = shader_injection.cs_bend_isfast > 0.5f
-      || (shader_injection.cs_contact_local_enabled > 0.5f && shader_injection.cs_contact_isfast_enabled > 0.5f);
+  // The IS-FAST volume is an input to the contact march.
+  // There is deliberately no IGN fallback: if the volume is missing the march
+  // runs unjittered, which bands visibly, and that is the honest result.
+  const bool isfast_wanted = shader_injection.cs_contact_isfast_enabled > 0.5f;
   if (isfast_wanted) LoadISFASTNoiseTexture(dev, d);
   const bool isfast_ready = d->isfast_texture_loaded && d->isfast_noise_srv.handle != 0u;
   if (isfast_wanted && !isfast_ready && !d->shadows_logged_isfast_missing) {
     d->shadows_logged_isfast_missing = true;
     reshade::log::message(reshade::log::level::warning,
-        "[Shadows] IS-FAST requested but the volume is unavailable: the Bend dither and the local march run "
-        "unjittered. Enable the IS-FAST master in the IS-FAST section.");
+        "[Shadows] IS-FAST requested but the volume is unavailable: contact "
+        "shadows will run unjittered. Enable the IS-FAST master in the IS-FAST "
+        "section to fix the banding.");
   }
 
   const uint32_t w = std::max(d->shadows_w, 1u);
@@ -10822,23 +10710,21 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
   shader_injection.cs_working_h = static_cast<float>(h);
   shader_injection.cs_noise_frame = isfast_ready
       ? static_cast<float>(d->frame_index % 32u) : -1.f;
-  shader_injection.cs_bend_char_mask_mode = (IsKai() || IsKyoto()) ? 1.f : 0.f;
 
   const auto CS = reshade::api::shader_stage::all_compute;
   const auto AC = reshade::api::pipeline_stage::all_compute;
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
-  const auto IA = reshade::api::resource_usage::indirect_argument;
 
-  auto bind_pass = [&](uint32_t pass, reshade::api::resource_view* srvs, uint32_t srv_count,
-                       reshade::api::resource_view* uavs, uint32_t uav_count) {
+  auto run_pass = [&](uint32_t pass, reshade::api::resource_view* srvs,
+                      uint32_t srv_count, reshade::api::resource_view uav,
+                      reshade::api::resource out_tex) {
     cl->bind_pipeline(AC, d->shadows_pipelines[pass]);
-    reshade::api::sampler samplers[2] = {d->shadows_point_border_sampler, d->shadows_point_clamp_sampler};
     reshade::api::descriptor_table_update u[kGtvbaoDescriptorTableParamCount] = {
-      {{},0,0,2,reshade::api::descriptor_type::sampler,samplers},
+      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->shadows_point_clamp_sampler},
       {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
       {{},0,0,srv_count,reshade::api::descriptor_type::texture_shader_resource_view,srvs},
-      {{},0,0,uav_count,reshade::api::descriptor_type::texture_unordered_access_view,uavs},
+      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&uav},
     };
     for (uint32_t i = 0; i < kGtvbaoDescriptorTableParamCount; ++i)
       u[i].table = d->shadows_tables[pass][i];
@@ -10846,52 +10732,37 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
     std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount> tables = {
         d->shadows_tables[pass][0], d->shadows_tables[pass][1],
         d->shadows_tables[pass][2], d->shadows_tables[pass][3]};
-    cl->bind_descriptor_tables(CS, d->shadows_layouts[pass], 0, kGtvbaoDescriptorTableParamCount, tables.data());
-  };
-  auto push_injection = [&](uint32_t pass) {
+    cl->bind_descriptor_tables(CS, d->shadows_layouts[pass], 0,
+                               kGtvbaoDescriptorTableParamCount, tables.data());
     cl->push_constants(CS, d->shadows_layouts[pass], kGtvbaoPushConstantsLayoutParam, 0,
                        static_cast<uint32_t>(sizeof(ShaderInjectData) / sizeof(uint32_t)),
                        static_cast<const void*>(&shader_injection));
+    cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+    // Barrier the resource, not the view: the views themselves are unchanged, so
+    // a view-level transition would be a no-op and the sampling SRV would keep
+    // seeing the pre-dispatch state.
+    if (out_tex.handle) cl->barrier(out_tex, UA, SR);
   };
 
-  // Cleared to lit with .w = 0: a pixel no Bend wave writes stays lit and Debug View "Coverage" shows it. The
-  // SR -> UA barrier also unbinds the lighting pass's t34 SRV.
-  cl->barrier(d->contact_shadow_texture, SR, UA);
-  static constexpr float kClearLitUncovered[4] = {1.f, 1.f, 1.f, 0.f};
-  cl->clear_unordered_access_view_float(d->contact_shadow_uav, kClearLitUncovered);
-
-  cl->barrier(d->bend_dispatch_buffer, IA | SR, UA);
-  reshade::api::resource_view setup_srvs[1] = {d->captured_depth_srv};
-  bind_pass(kShadowsPassBendSetup, setup_srvs, 1u, &d->bend_dispatch_uav, 1u);
-  shader_injection.cs_bend_dispatch_index = 0.f;
-  push_injection(kShadowsPassBendSetup);
-  cl->dispatch(1u, 1u, 1u);
-  // UA -> read: ReShade's D3D11 barrier unbinds the u0 view, so t1 below can bind the buffer.
-  cl->barrier(d->bend_dispatch_buffer, UA, IA | SR);
-
-  // The IS-FAST slot takes a 1x1 2D stand-in when the volume is not loaded: a null descriptor is not a legal binding,
-  // and the shader never samples it then (shadow_isfast_texture_loaded gates FalcomSampleISFAST).
-  reshade::api::resource_view sun_srvs[4] = {
-      d->captured_depth_srv, d->bend_dispatch_srv, d->captured_mrt_normal_srv,
-      isfast_ready ? d->isfast_noise_srv : d->fallback_srv};
-  bind_pass(kShadowsPassBendSun, sun_srvs, 4u, &d->contact_shadow_uav, 1u);
-  for (uint32_t i = 0; i < kBendMaxDispatches; ++i) {
-    shader_injection.cs_bend_dispatch_index = static_cast<float>(i);
-    push_injection(kShadowsPassBendSun);
-    cl->draw_or_dispatch_indirect(reshade::api::indirect_command::dispatch, d->bend_dispatch_buffer,
-                                  static_cast<uint64_t>(i) * kBendIndirectArgsStride, 1u, kBendIndirectArgsStride);
+  if (contact_on) {
+    // The noise slot is filled with the real 3D volume when it is usable. When it
+    // is not, the fallback is a 1x1 2D stand-in: the shader declares t2 as a
+    // Texture3D and is gated on shadow_isfast_texture_loaded, so it never samples
+    // it. A null descriptor is not a legal binding, which is the only reason the
+    // stand-in exists.
+    reshade::api::resource_view contact_srvs[3] = {
+        d->captured_depth_srv,
+        d->captured_mrt_normal_srv,
+        isfast_ready ? d->isfast_noise_srv : d->fallback_srv};
+    run_pass(kShadowsPassContact, contact_srvs, 3, d->contact_shadow_uav,
+             d->contact_shadow_texture);
   }
-  shader_injection.cs_bend_dispatch_index = 0.f;
-  cl->barrier(d->contact_shadow_texture, UA, SR);
 
   d->shadows_ran_frame = d->frame_index;
   if (!d->shadows_logged_first_dispatch) {
     d->shadows_logged_first_dispatch = true;
-    CSLog("shadows", "first Bend sun dispatch ok at " + std::to_string(w) + "x" + std::to_string(h)
-        + " (samples=" + std::to_string(static_cast<int>(shader_injection.cs_bend_sample_count))
-        + " world=" + (shader_injection.cs_bend_world_space > 0.5f ? "on" : "off")
-        + " isfast=" + (isfast_ready ? "ready" : (shader_injection.cs_bend_isfast > 0.5f ? "missing" : "off"))
-        + " receive_char=" + (shader_injection.cs_bend_char_receive > 0.5f ? "on" : "off") + ")");
+    CSLog("shadows", "first dispatch ok at " + std::to_string(w) + "x" + std::to_string(h)
+        + " (isfast=" + (isfast_ready ? "ready" : "missing") + ")");
   }
   if (d->shadows_ran_from != fromHook) {
     // Report the first dispatch point once. Kai runs a character lighting pass

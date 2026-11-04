@@ -3,7 +3,7 @@
 
 // ── falcomengine-plus screen-space shadow passes — shared core ──
 //
-// The Bend shadow passes (bend_shadows_*.cs_5_0.hlsl) consume this, and the lighting pixel shaders include it again
+// The contact compute pass (contact_shadows.cs_5_0.hlsl) consumes this, and the lighting pixel shaders include it again
 // to run the same contact march per local light. Everything here is therefore
 // free of stage-specific assumptions: no compute-only intrinsics, no
 // pixel-only intrinsics, and no globals of its own -- every entry point takes
@@ -22,27 +22,6 @@
 
 // Falcom MRT world-normal decode, shared with the GTVBAO passes.
 #include "../include/mrt_normal.hlsli"
-
-// ── Bend screen-space shadows: dispatch block layout (in uints) ──
-// Written by BendWriteDispatchList, read by bend_shadows.hlsli, used as DispatchIndirect
-// arguments. A buffer holds one block per light slot (sun: one). Mirrors kBendDispatchBufferUints,
-// kBendMaxDispatches and kBendIndirectArgsStride in addon.cpp.
-#define BEND_WAVE_SIZE 64
-#define BEND_MAX_DISPATCHES 8
-#define BEND_MAX_SAMPLE_COUNT 252
-#define BEND_ARGS_OFFSET 0          // 8 x uint3 thread-group counts
-#define BEND_LIGHT_OFFSET 24        // float4 LightCoordinate, asuint
-#define BEND_WAVE_OFFSET 28         // 8 x int2 WaveOffset in pixels, asuint
-#define BEND_LIGHT_WORLD_OFFSET 44  // float4: sun = (direction to light, 0), local = (position, 1), asuint
-#define BEND_DISPATCH_UINTS 48
-
-// Character pixel from MRT0, per game (cs_bend_char_mask_mode, set by the host every frame):
-// 0 Sora 1st/2nd: (mrt0.w & 8) == 0, the test world_rtsun / world_rtls use; 1 Kai/Kyoto: (mrt0.z >> 8) & 1.
-bool FalcomIsCharacterMrt0(uint4 mrt0)
-{
-  return shader_injection_data.cs_bend_char_mask_mode > 0.5f ? (((mrt0.z >> 8u) & 1u) != 0u)
-                                                             : ((mrt0.w & 8u) == 0u);
-}
 
 // ── Game's scene constant buffer (b0) ──
 // Must match the register layout of the game's own lighting shader. See the
@@ -364,7 +343,30 @@ bool FalcomCharCamDebugView(float rawTerm, float axisLength, float valid,
   return true;
 }
 
-// Contact term (t34, rgba8_unorm): .x = Bend term (1 lit); .w = 1 where a Bend wave wrote the pixel. RunShadows clears it to (1, 1, 1, 0) every frame.
+// ── Output channel layout ──
+// Both passes write an rgba8_unorm target. RGBA8_UNORM is in the D3D11.0
+// guaranteed UAV type-write set (R8_UNORM is not -- it only joins that set at
+// feature level 11_1, so it cannot be relied on here), and the spare channels
+// buy a self-diagnosis the console cannot give us.
+//
+//   .x  the term itself: 1 = lit, 0 = fully occluded. The only channel read in
+//       the normal path.
+//   .y  WHY the term is what it is. A march that finds nothing and a march that
+//       never ran produce the same .x, and from outside the shader they are
+//       indistinguishable -- which is exactly the trap this layout exists to
+//       remove. See the decode in FalcomApplyShadowTerms.
+//   .z  the linearised scene depth.
+//   .w  1 whenever the pass ran at all. 0 means the target was never written,
+//       which points at resource creation rather than at the algorithm.
+
+// Contact .y codes. kContactDiagMarched must stay 0 so a healthy frame is the
+// default state rather than something the shader has to opt into.
+#define kContactDiagMarched      0u  // the march ran to completion
+#define kContactDiagNoNormal     1u  // MRT0 decoded to a zero vector
+#define kContactDiagBadProjection 2u // viewProj_g produced a degenerate clip w
+#define kContactDiagSky          3u  // linear depth beyond the sky cutoff
+#define kContactDiagBadDepth     4u  // device depth or the unpack consts are not finite
+#define kContactDiagNoLightDir  5u  // lightDirection_g was zero-length (no sun this frame)
 
 // ── Per-pixel strength selection ──
 // The two techniques share this because the environment/character split is a
@@ -505,7 +507,18 @@ float3 FalcomApplyContactToSun(float3 sunDiffuse, bool isCharacter, float4 conta
       shader_injection_data.cs_contact_max_darkening);
 }
 
-// ── Debug views, at the final output site ── 1 term, 2 edge mask, 3 thread index, 4 wave index, 7 Bend character mask (2-4 and 7 are written by the Bend pass itself), 5 coverage (magenta = never written), 6 the lighting shader's character mask.
+// ── Diagnostic views, for the final output site ──
+//
+// Runs at the end of the lighting shader, after every contribution is summed.
+// The views override the colour outright so a broken pass can never hide behind a
+// strength of 0, and each mode maps a diagnostic code to a colour that cannot be
+// confused with any other, so one screenshot identifies the failing stage.
+//
+// The term textures are float4 rather than float for the same reason the passes
+// write four channels: a pass that bails early, a pass whose inputs never bound
+// and a pass that legitimately finds nothing all produce .x = 1.0, and only .y
+// tells them apart. Without that, "the effect does nothing" and "the effect is
+// correctly reporting no occlusion" are the same observation.
 //
 // SamplerState is a parameter because no new pixel-stage sampler may be bound:
 // pushing one to the pixel stage is documented as causing heap corruption (see
@@ -514,14 +527,34 @@ float3 FalcomApplyContactToSun(float3 sunDiffuse, bool isCharacter, float4 conta
 float3 FalcomApplyShadowTerms(float3 lit, float2 screenUV, bool isCharacter,
                               SamplerState pointSampler, Texture2D<float4> contactTex)
 {
-  const int view = (int)shader_injection_data.cs_contact_debug;
+  const bool contact_on = shader_injection_data.cs_contact_dedicated_bound > 0.5f;
+  const float4 contact = contact_on ? contactTex.SampleLevel(pointSampler, screenUV, 0) : float4(1, 0, 1, 1);
+
+  // ---- diagnostic views ----
+  const int contactDbg = (int)shader_injection_data.cs_contact_debug;
   float3 result = lit;
-  if (view == 6) {
-    result = isCharacter ? float3(1.0, 0.0, 1.0) : float3(0.0, 0.0, 0.0);
-  } else if (view > 0 && shader_injection_data.cs_contact_dedicated_bound > 0.5f) {
-    const float4 contact = contactTex.SampleLevel(pointSampler, screenUV, 0);
-    if (view == 5) result = contact.w < 0.5 ? float3(1.0, 0.0, 1.0) : float3(1.0, 1.0, 1.0);
+  if (contactDbg == 1 && contact_on) {
+    // Stage ladder. See the kContactDiag* block above.
+    const uint code = (uint)(contact.y * 255.0 + 0.5);
+    if (contact.w < 0.5) result = float3(0.15, 0.15, 0.15);
+    else if (code == kContactDiagNoNormal) result = float3(1.0, 0.0, 1.0);
+    else if (code == kContactDiagBadProjection) result = float3(1.0, 1.0, 0.0);
+    else if (code == kContactDiagSky) result = float3(0.0, 1.0, 1.0);
+    else if (code == kContactDiagBadDepth) result = float3(1.0, 0.5, 0.0);
+    else if (code == kContactDiagNoLightDir) result = float3(0.0, 0.0, 1.0);
+    else if (contact.x < 0.5) result = float3(1.0, 0.0, 0.0);
     else result = contact.xxx;
+  } else if (contactDbg == 2 && contact_on) {
+    // Linearised scene depth, 0..1 over 1000 world units. A uniformly white
+    // frame means the linearisation is wrong; a uniformly black frame means it
+    // is returning 0 for everything.
+    result = contact.zzz;
+  } else if (contactDbg >= 3) {
+    // Character mask, independent of either pass: the per-game flag-bit
+    // convention is the one input here that no other shader in the repo can
+    // corroborate for every game, and an all-one-colour frame is the unambiguous
+    // symptom of getting it wrong.
+    result = isCharacter ? float3(1.0, 0.0, 1.0) : float3(0.0, 0.0, 0.0);
   }
   return result;
 }

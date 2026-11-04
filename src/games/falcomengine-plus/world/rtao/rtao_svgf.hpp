@@ -2,7 +2,7 @@
 
 // RTAO SVGF glue: the trace-size raw AO (rtao.hpp pass A) goes through the input pass (world_rtao_svgf_input), the shared
 // SVGF chain (rtgi::EnsureRtgiDenoise, rtgi::DispatchRtgiDenoise) and the byte upsample (gtvbao_svgf_upsample), which writes
-// the full-size AO the lighting and the deferred list read. Kept out of rtao.hpp: rtgi.hpp includes rtao.hpp.
+// the full-size AO the lighting, micro shadows and the deferred list read. Kept out of rtao.hpp: rtgi.hpp includes rtao.hpp.
 // No module mutex is held around any graphics call here.
 
 #include <cstdint>
