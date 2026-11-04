@@ -63,8 +63,8 @@ ShaderInjectData shader_injection = {
   // the CharShadowMode setting: the contact term owns character shadowing
   // unless the user deliberately turns the engine's own back on.
   .char_shadow_mode = 0.f,
-  .char_shadow_sample_count = 32.f,
-  .char_shadow_hard_shadow_samples = 4.f,
+  .cs_contact_local_char_lamp = 0.5f,
+  .cs_contact_local_char_strength = 1.f,
   .char_shadow_fade_out_samples = 16.f,
   .rtao_debug_show = 0.f,
   .char_shadow_contrast = 9.f,
@@ -4658,6 +4658,22 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsLocalCharLamp", .binding = &shader_injection.cs_contact_local_char_lamp,
+      .default_value = 0.5f, .label = "Local Character Lamp Light", .section = "Contact Shadows",
+      .tooltip = "Strength of the game's lamp light added to characters where the local contact shadows find the lamp unblocked (the game gives characters no lamp shadows). 0 = none, characters unchanged.",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+      .is_visible = []() { return IsSora2nd(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsLocalCharStrength", .binding = &shader_injection.cs_contact_local_char_strength,
+      .default_value = 1.f, .label = "Local Character Strength", .section = "Contact Shadows",
+      .tooltip = "Strength of the local contact shadows on character pixels, applied on top of Local Strength. Only the character lamp light (Local Character Lamp Light) is affected. Independent of the sun Character Strength.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+      .is_visible = []() { return IsSora2nd(); },
     },
     new renodx::utils::settings::Setting{
       // Key renamed with the slider-to-tier change, same reasoning as

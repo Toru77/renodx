@@ -168,6 +168,7 @@ static void TestSharedLamps() {
   CHECK(lamps.find("struct LightIndexData") != std::string::npos, "lamp header: LightIndexData");
   CHECK(lamps.find("float LampDistanceAttenuation(LightParam lamp, float3 to_lamp)") != std::string::npos, "lamp header: attenuation");
   CHECK(lamps.find("float LampSpotCone(LightParam lamp, float3 lamp_dir)") != std::string::npos, "lamp header: spot cone");
+  CHECK(lamps.find("float3 CharacterLampLight(StructuredBuffer<LightParam> lights, StructuredBuffer<LightIndexData> indices,") != std::string::npos, "lamp header: character lamp light");
   const std::string rtgi = ReadText("src/games/falcomengine-plus/world/shaders/world_rtgi.cs_5_0.hlsl");
   const std::string rtgi_lights = ReadText("src/games/falcomengine-plus/world/shaders/world_rtgi_lights.cs_5_0.hlsl");
   const std::string rtls_text = ReadText("src/games/falcomengine-plus/world/shaders/world_rtls.cs_5_0.hlsl");
@@ -381,7 +382,11 @@ static void TestCharacters() {
   CHECK(Count(lighting, "#include \"../../world/shaders/world_rt_lamps.hlsli\"") == 1, "lighting includes the lamp header once");
   CHECK(Count(lighting, "struct LightParam") == 0 && Count(lighting, "struct LightIndexData") == 0, "no own lamp structs");
   CHECK(Count(lighting, "#define RTLS_FLAG_CHARACTER 64u") == 1, "character flag define");
-  CHECK(Count(lighting, "charColor += r0.xyz * rtlsLamp * shader_injection_data.rtls_char_lamp;") == 1, "one character lamp term");
+  CHECK(Count(lighting, "charColor += r0.xyz * CharacterLampLight(") == 2, "two character lamp terms: RTLS and local contact");
+  CHECK(Count(lighting, "* shader_injection_data.rtls_char_lamp;") == 1, "RTLS character lamp scale");
+  CHECK(Count(lighting, "* shader_injection_data.cs_contact_local_char_lamp;") == 1, "local character lamp scale");
+  CHECK(Count(lighting, "saturate(shader_injection_data.cs_contact_local_char_strength)") == 1, "local character strength knob");
+  CHECK(Count(lighting, "cs_contact_char_strength") == 0, "sun Character Strength not used on the lamp term");
   const std::string header = ReadText("../../src/games/falcomengine-plus/shared.h");
   CHECK(Count(header, "float rtls_char_lamp;") == 1 && Count(header, "local_sss_sample_count") == 0, "shared.h slot renamed");
   CHECK(sizeof(ShaderInjectData) == 1760u, "ShaderInjectData stays 1756 bytes (%zu)", sizeof(ShaderInjectData));
