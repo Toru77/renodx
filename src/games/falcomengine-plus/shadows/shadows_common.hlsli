@@ -140,7 +140,7 @@ float FalcomSampleISFAST(Texture3D<float2> volume, SamplerState noiseSampler,
 // ── Screen-Space Contact Shadows, clip space ──
 // Marches from a surface point toward the light, testing the reconstructed
 // scene depth at each step. The whole march stays in the space the depth buffer
-// is already in, so the per-step work is one texture fetch plus a compare --
+// is already in, so the per-step work is one texture fetch, two divides and a compare --
 // no world-to-screen projection and no position reconstruction inside the loop,
 // which is what makes this affordable at full resolution.
 //
@@ -226,17 +226,24 @@ float FalcomContactShadowMarch(float4 clipStart, float4 clipEnd, float2 unpack,
   if (sampleCount < 1.0) return 1.0;
   const float invSamples = rcp(sampleCount);
 
+  // Clip space is linear in world space, so a ray whose end crosses the camera plane is cut with a lerp
+  // where w reaches kMinClipW; dividing by w <= 0 would mirror the end point through the camera.
+  const float kMinClipW = 1e-3;
+  if (clipStart.w <= kMinClipW) return 1.0;
+  if (clipEnd.w < kMinClipW) {
+    clipEnd = lerp(clipStart, clipEnd, (clipStart.w - kMinClipW) / (clipStart.w - clipEnd.w));
+  }
+
   const float3 ndcStart = clipStart.xyz / clipStart.w;
   const float3 ndcEnd = clipEnd.xyz / clipEnd.w;
   if (!isfinite(ndcStart.z) || !isfinite(ndcEnd.z)) return 1.0;
 
-  const float rayLinearStart = FalcomLinearDepth(ndcStart.z, unpack);
-  const float rayLinearEnd = FalcomLinearDepth(ndcEnd.z, unpack);
-
-  // Jitter advances the first step by a fraction of the step size, so the whole
-  // ray is offset rather than only its tail.
-  float rayLinearDepth = rayLinearStart + (rayLinearEnd - rayLinearStart) * jitter * invSamples;
-  const float rayLinearStep = (rayLinearEnd - rayLinearStart) * invSamples;
+  // Device Z is affine in screen space (a linear function of 1/w); linear depth is not. Stepping linear
+  // depth alongside the screen-space uv puts every interior sample deeper than the ray really is, which
+  // reads as occlusion on any surface the ray grazes. Step device Z and linearise per sample.
+  // Jitter advances the first step by a fraction of the step size, so the whole ray is offset.
+  float rayDeviceZ = ndcStart.z + (ndcEnd.z - ndcStart.z) * jitter * invSamples;
+  const float rayDeviceStep = (ndcEnd.z - ndcStart.z) * invSamples;
 
   // The engine's clip Y is inverted relative to the D3D UV convention, so the
   // y scale is negative. Every Falcom shader in this repo uses this exact form.
@@ -254,10 +261,10 @@ float FalcomContactShadowMarch(float4 clipStart, float4 clipEnd, float2 unpack,
 
     const float sceneDepth = FalcomLinearDepth(
         depthTex.SampleLevel(depthSampler, uv * depthUvScale, 0).x, unpack);
-    const float penetration = rayLinearDepth - sceneDepth;
+    const float penetration = FalcomLinearDepth(rayDeviceZ, unpack) - sceneDepth;
     hits += (penetration > bias && penetration < thickness) ? 1.0 : 0.0;
 
-    rayLinearDepth += rayLinearStep;
+    rayDeviceZ += rayDeviceStep;
     uv += uvStep;
   }
 
