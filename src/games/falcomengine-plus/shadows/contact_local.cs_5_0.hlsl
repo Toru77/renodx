@@ -8,6 +8,7 @@
 // Only the kinds the pixel's material path uses are marched. The path is the lighting shaders' own test, bit 2 of the
 // pixel's DeferredParam.flag: set is the specular path (Point / Spot), clear the diffuse-only path (Env Point / Env
 // Spot). A pixel with neither kind on writes kContactDiagNoLocalKind and marches nothing.
+// On Sora 2nd a character pixel (mrt0.w bit 3 clear) skips the material path: see the character test below.
 //
 // The origin is lifted along the MRT normal by Local Normal Bias, and along the negated normal for a lamp behind the
 // surface (lit through translucency), as RT Local Shadows does.
@@ -76,7 +77,8 @@ void main(uint2 p : SV_DispatchThreadID)
     g_outLocal[p] = float4(0.0, kContactDiagSky / 255.0, 0.0, 1.0);
     return;
   }
-  const float3 N = DecodeFalcomMrtNormal(g_srcMrtNormal.Load(int3(p, 0)).xy);
+  const uint4 mrt0 = g_srcMrtNormal.Load(int3(p, 0));
+  const float3 N = DecodeFalcomMrtNormal(mrt0.xy);
   if (!FalcomNormalValid(N)) {
     g_outLocal[p] = float4(0.0, kContactDiagNoNormal / 255.0, 0.0, 1.0);
     return;
@@ -84,17 +86,29 @@ void main(uint2 p : SV_DispatchThreadID)
   const float2 pixelCentre = float2(p) + 0.5;
   const float2 uv = pixelCentre / max(float2(shader_injection_data.cs_working_w, shader_injection_data.cs_working_h), 1.0.xx);
 
-  // Material path: the lighting shaders' own test (sora2nd lighting_0xCA3D8596 lines 262, 771, 804 and 849): the texel
-  // is uv x the material texture size, truncated, and the index is clamped to 0x4E1F, both as they do it.
-  uint materialW, materialH;
-  g_srcMaterialIndex.GetDimensions(materialW, materialH);
-  const uint2 materialTexel = min(uint2(uv * float2(materialW, materialH)), uint2(materialW, materialH) - 1u);
-  const uint materialIndex = min(0x4E1Fu, g_srcMaterialIndex.Load(int3(materialTexel, 0)).x);
-  const bool specPath = (asuint(g_materials[materialIndex].tail[3].z) & 2u) != 0u;
-  const bool pointsOn = (specPath ? shader_injection_data.cs_contact_local_point
-                                  : shader_injection_data.cs_contact_local_env_point) > 0.5f;
-  const bool spotsOn = (specPath ? shader_injection_data.cs_contact_local_spot
-                                 : shader_injection_data.cs_contact_local_env_spot) > 0.5f;
+  // Character pixel: mrt0.w bit 3 clear, the Sora lighting shaders' test (sora2nd lighting_0xCA3D8596 lines 380-382,
+  // world_rtls.cs_5_0.hlsl line 161). Tested only while Local Character Lamp Light is on; the addon sets it to 0 for this
+  // pass outside Sora 2nd. A character's mrtTexture2.x is a packed colour, not a material index, so its kinds are the
+  // ones the lighting shader's character lamp term counts (either material path on) and lamps are weighted by charaColor.
+  const bool character = shader_injection_data.cs_contact_local_char_lamp > 0.0f && (mrt0.w & 8u) == 0u;
+  bool pointsOn;
+  bool spotsOn;
+  if (character) {
+    pointsOn = shader_injection_data.cs_contact_local_point > 0.5f || shader_injection_data.cs_contact_local_env_point > 0.5f;
+    spotsOn = shader_injection_data.cs_contact_local_spot > 0.5f || shader_injection_data.cs_contact_local_env_spot > 0.5f;
+  } else {
+    // Material path: the lighting shaders' own test (sora2nd lighting_0xCA3D8596 lines 262, 771, 804 and 849): the texel
+    // is uv x the material texture size, truncated, and the index is clamped to 0x4E1F, both as they do it.
+    uint materialW, materialH;
+    g_srcMaterialIndex.GetDimensions(materialW, materialH);
+    const uint2 materialTexel = min(uint2(uv * float2(materialW, materialH)), uint2(materialW, materialH) - 1u);
+    const uint materialIndex = min(0x4E1Fu, g_srcMaterialIndex.Load(int3(materialTexel, 0)).x);
+    const bool specPath = (asuint(g_materials[materialIndex].tail[3].z) & 2u) != 0u;
+    pointsOn = (specPath ? shader_injection_data.cs_contact_local_point
+                         : shader_injection_data.cs_contact_local_env_point) > 0.5f;
+    spotsOn = (specPath ? shader_injection_data.cs_contact_local_spot
+                        : shader_injection_data.cs_contact_local_env_spot) > 0.5f;
+  }
   if (!pointsOn && !spotsOn) {
     g_outLocal[p] = float4(0.0, kContactDiagNoLocalKind / 255.0, 0.0, 1.0);
     return;
@@ -145,7 +159,7 @@ void main(uint2 p : SV_DispatchThreadID)
       att *= LampSpotCone(lamp, dir);
     }
     if (att <= 0.0) continue;
-    float w = dot(lamp.color, float3(0.2126, 0.7152, 0.0722)) * att * max(dot(N, dir), lamp.translucency);
+    float w = dot(character ? lamp.charaColor : lamp.color, float3(0.2126, 0.7152, 0.0722)) * att * max(dot(N, dir), lamp.translucency);
     if (w <= 0.0) continue;
     if (spot) {
       spotSum += w;
