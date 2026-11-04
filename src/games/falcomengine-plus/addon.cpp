@@ -4541,11 +4541,11 @@ renodx::utils::settings::Settings settings = {
       .key = "ContactShadowsDebug", .binding = &shader_injection.cs_contact_debug,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Debug View", .section = "Contact Shadows",
-      .tooltip = "1 shows the raw contact term (white = lit). 2 shows diagnostics: R = term, "
-                 "G = stage code (0 marched, 1 no normal, 2 bad projection, 3 sky, 4 bad "
-                 "depth), B = linear depth. G of 0 with R of 1 means the march runs and finds "
-                 "nothing; G of 1, 2 or 4 means it bails out before marching.",
-      .labels = {"Off", "Raw Term", "Diagnostics"},
+      .tooltip = "Stage Ladder colours each pixel by where the contact pass stopped: white = "
+                 "lit, grey = the pass never wrote this pixel, red = the march ran and is occluded, magenta = no normal, "
+                 "yellow = bad projection, cyan = beyond the sky cutoff, orange = bad depth, blue = "
+                 "no light direction. Linear Depth shows the scene depth, 0 to 1 over 1000 world units.",
+      .labels = {"Off", "Stage Ladder", "Linear Depth"},
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
