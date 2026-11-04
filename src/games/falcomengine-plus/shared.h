@@ -249,7 +249,7 @@ struct ShaderInjectData {
   float gtvbao_normal_input_mode;      // Kai: 0=off, 1=on (mirrors global g_gtvbao_normal_input_mode)
   // Kai char shadow / misc
   // RETIRED and unread: no .hlsl file has ever read this. The per-technique
-  // character control the mod needs is cs_contact_char_strength (cs_micro_char_strength is RETIRED).
+  // character control the mod needs is cs_contact_char_strength.
   // Kept so the packoffsets after it do not move.
   float char_shadow_strength;
   // Foliage/character mask debug views. View 2 now shows the Contact Shadow term
@@ -580,13 +580,15 @@ struct ShaderInjectData {
   // ---- Contact Shadows compute pass (appended last: do not insert above) ----
   // The contact term is computed in shadows/*.cs_5_0.hlsl and consumed by the lighting shaders; it supersedes the inline raymarches (char_shadow_* / env_sss_* / local_sss_* above, now retired).
 
+  // Sun contact denoise (shadows/contact_denoise.cs_5_0.hlsl): a separable joint bilateral over
+  // the sun contact term. These take six retired micro shadow slots, so the layout does not move.
+  float cs_contact_denoise_enabled;       // 0=Off, 1=On, default On
+  float cs_contact_denoise_radius;        // [1..8] pixels per axis, default 4
+  float cs_contact_denoise_depth_sigma;   // [0.001..0.2] tangent-plane distance edge stop, relative to linear depth, default 0.02
+  float cs_contact_denoise_normal_sigma;  // [0.01..1] edge stop on 1 - dot(Nc, Nt), default 0.1
+  float cs_contact_denoise_passes;        // [1..4] horizontal + vertical iterations, default 1
+  float cs_denoise_axis;                  // runtime: 0 = horizontal, 1 = vertical; set by RunShadows before each denoise dispatch
   // RETIRED micro shadow slots (kept for the layout)
-  float cs_micro_enabled;           // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_strength;          // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_env_strength;      // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_char_strength;     // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_opacity;           // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_aperture_scale;    // RETIRED: micro shadows removed, unread, kept for the layout
   float cs_micro_debug;             // RETIRED: micro shadows removed, unread, kept for the layout
   float cs_micro_ao_source;  // RETIRED: micro shadows removed, unread, kept for the layout
 

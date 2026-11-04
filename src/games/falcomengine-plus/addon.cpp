@@ -404,13 +404,13 @@ ShaderInjectData shader_injection = {
         .mb_camera_jitter = 1.f,
         .mb_camera_cut = 1.f,
         .mb_camera_cut_px = 120.f,
-  // -- Contact Shadows -- (the cs_micro_* slots are RETIRED and unread)
-  .cs_micro_enabled = 0.f,
-  .cs_micro_strength = 1.f,
-  .cs_micro_env_strength = 1.f,
-  .cs_micro_char_strength = 1.f,
-  .cs_micro_opacity = 1.f,
-  .cs_micro_aperture_scale = 1.f,
+  // -- Contact Shadows -- (the remaining cs_micro_* slots are RETIRED and unread)
+  .cs_contact_denoise_enabled = 1.f,
+  .cs_contact_denoise_radius = 4.f,
+  .cs_contact_denoise_depth_sigma = 0.02f,
+  .cs_contact_denoise_normal_sigma = 0.1f,
+  .cs_contact_denoise_passes = 1.f,
+  .cs_denoise_axis = 0.f,
   .cs_micro_debug = 0.f,
   .cs_micro_ao_source = 1.f,
   .cs_contact_enabled = 0.f,
@@ -528,7 +528,8 @@ constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
 // the two resource sets cannot drift apart.
 enum ShadowsPass : uint32_t {
   kShadowsPassContact = 0u,  // contact_shadows.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 noise -> u0)
-  kShadowsPassCount = 1u,
+  kShadowsPassDenoise = 1u,  // contact_denoise.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 contact -> u0), one axis per dispatch
+  kShadowsPassCount = 2u,
 };
 // The lighting pixel shaders read the result from this slot. t34 is declared by no
 // game's lighting shader and claimed by no existing push, so it is free in Sora 1st,
@@ -548,8 +549,8 @@ constexpr uint32_t kLightingShadowDepthRegister = 36u;
 // shaders, which is where it was first needed.
 constexpr uint32_t kCharShadowNoiseRegister = kLightingShadowNoiseRegister;
 // SRV counts per pass, matching the register() declarations in each shader.
-constexpr uint32_t kShadowsSrvPerPass[kShadowsPassCount] = {3u};
-constexpr uint32_t kShadowsUavPerPass[kShadowsPassCount] = {1u};
+constexpr uint32_t kShadowsSrvPerPass[kShadowsPassCount] = {3u, 3u};
+constexpr uint32_t kShadowsUavPerPass[kShadowsPassCount] = {1u, 1u};
 
 // -- Motion Blur (Guertin et al. 2013) --
 // Fixed pass order; the indices address the layout/pipeline/table arrays in
@@ -1456,6 +1457,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource contact_shadow_texture = {};
   reshade::api::resource_view contact_shadow_srv = {};
   reshade::api::resource_view contact_shadow_uav = {};
+  // Ping-pong target of the sun contact denoise: the horizontal pass writes here and the
+  // vertical pass writes back into contact_shadow_texture, so t34 is unchanged.
+  reshade::api::resource contact_denoise_texture = {};
+  reshade::api::resource_view contact_denoise_srv = {};
+  reshade::api::resource_view contact_denoise_uav = {};
   // Owned by this chain. GTVBAO creates and destroys point_clamp_sampler inside
   // its own resource lifecycle, so borrowing it meant the shadow passes could not
   // dispatch at all with GTVBAO off -- a failure that looks exactly like "the
@@ -4511,6 +4517,51 @@ renodx::utils::settings::Settings settings = {
                  "nothing; G of 1, 2 or 4 means it bails out before marching.",
       .labels = {"Off", "Raw Term", "Diagnostics"},
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsSunDenoise", .binding = &shader_injection.cs_contact_denoise_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Sun Denoise", .section = "Contact Shadows",
+      .tooltip = "Smooths the IS-FAST grain of the sun contact term with an edge-aware blur that stops at depth and normal edges. Off leaves the term exactly as marched.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsSunDenoiseRadius", .binding = &shader_injection.cs_contact_denoise_radius,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 4.f, .label = "Sun Denoise Radius", .section = "Contact Shadows",
+      .tooltip = "Blur radius in pixels along each axis. Larger is smoother and costs more.",
+      .min = 1.f, .max = 8.f, .format = "%d",
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_contact_denoise_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsSunDenoiseDepthSigma", .binding = &shader_injection.cs_contact_denoise_depth_sigma,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.02f, .label = "Sun Denoise Depth Sigma", .section = "Contact Shadows",
+      .tooltip = "How far a neighbour may sit off this pixel's surface plane, relative to its distance, before it stops contributing. Lower keeps depth edges sharper.",
+      .min = 0.001f, .max = 0.2f, .format = "%.3f",
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_contact_denoise_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsSunDenoiseNormalSigma", .binding = &shader_injection.cs_contact_denoise_normal_sigma,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.1f, .label = "Sun Denoise Normal Sigma", .section = "Contact Shadows",
+      .tooltip = "How different a neighbour's surface normal may be before it stops contributing. Lower keeps creases and corners sharper.",
+      .min = 0.01f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_contact_denoise_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsSunDenoisePasses", .binding = &shader_injection.cs_contact_denoise_passes,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Sun Denoise Passes", .section = "Contact Shadows",
+      .tooltip = "Horizontal + vertical iterations. Each extra pass widens the blur and adds the same cost again.",
+      .min = 1.f, .max = 4.f, .format = "%d",
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_contact_denoise_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -10550,7 +10601,8 @@ static void CreateShadowsResources(reshade::api::device* dev, DeviceData* d,
     return true;
   };
 
-  if (!mk(&d->contact_shadow_texture, &d->contact_shadow_srv, &d->contact_shadow_uav)) {
+  if (!mk(&d->contact_shadow_texture, &d->contact_shadow_srv, &d->contact_shadow_uav)
+      || !mk(&d->contact_denoise_texture, &d->contact_denoise_srv, &d->contact_denoise_uav)) {
     DestroyShadowsResources(dev, d);
     return;
   }
@@ -10569,6 +10621,7 @@ static void DestroyShadowsResources(reshade::api::device* dev, DeviceData* d) {
   auto dl = [&](reshade::api::pipeline_layout& l) { if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; } };
 
   dv(d->contact_shadow_srv); dv(d->contact_shadow_uav); dr(d->contact_shadow_texture);
+  dv(d->contact_denoise_srv); dv(d->contact_denoise_uav); dr(d->contact_denoise_texture);
   if (d->shadows_point_clamp_sampler.handle) {
     dev->destroy_sampler(d->shadows_point_clamp_sampler);
     d->shadows_point_clamp_sampler = {};
@@ -10590,7 +10643,7 @@ static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData
   using P = reshade::api::pipeline_layout_param;
   if (!dev || !d) return false;
   static const std::span<const uint8_t> kBytecode[kShadowsPassCount] = {
-      __contact_shadows};
+      __contact_shadows, __contact_denoise};
 
   if (!d->shadows_point_clamp_sampler.handle) {
     reshade::api::sampler_desc sd = {};
@@ -10652,7 +10705,7 @@ static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData
   return true;
 }
 
-// Runs the contact pass when it is enabled.
+// Runs the contact pass when it is enabled, then the sun denoise when that is on.
 static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHook) {
   if (!cl || !d) return false;
   if (d->shadows_ran_frame == d->frame_index) return true;  // already done this frame
@@ -10769,6 +10822,21 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
         isfast_ready ? d->isfast_noise_srv : d->fallback_srv};
     run_pass(kShadowsPassContact, contact_srvs, 3, d->contact_shadow_uav,
              d->contact_shadow_texture);
+    if (shader_injection.cs_contact_denoise_enabled > 0.5f) {
+      reshade::api::resource_view horizontal_srvs[3] = {
+          d->captured_depth_srv, d->captured_mrt_normal_srv, d->contact_shadow_srv};
+      reshade::api::resource_view vertical_srvs[3] = {
+          d->captured_depth_srv, d->captured_mrt_normal_srv, d->contact_denoise_srv};
+      const int denoise_passes = std::clamp(static_cast<int>(shader_injection.cs_contact_denoise_passes + 0.5f), 1, 4);
+      for (int denoise_pass = 0; denoise_pass < denoise_passes; ++denoise_pass) {
+        shader_injection.cs_denoise_axis = 0.f;
+        run_pass(kShadowsPassDenoise, horizontal_srvs, 3, d->contact_denoise_uav,
+                 d->contact_denoise_texture);
+        shader_injection.cs_denoise_axis = 1.f;
+        run_pass(kShadowsPassDenoise, vertical_srvs, 3, d->contact_shadow_uav,
+                 d->contact_shadow_texture);
+      }
+    }
   }
 
   d->shadows_ran_frame = d->frame_index;
