@@ -102,8 +102,8 @@ ShaderInjectData shader_injection = {
   .rtsun_max_darkening = 1.f,
   .rtsun_spare = 0.f,
   .rtsun_char_max_darkening = 1.f,
-  .local_sss_light_fade_end = 1.f,
-  .local_sss_occluder_depth_scale = 0.f,
+  .cs_contact_local_bound = 0.f,
+  .cs_contact_local_normal_bias = 0.05f,
   .gtvbao_mode = 1.f,
   .gtvbao_quality_level = 2.f,
   .gtvbao_denoise_passes = 1.f,
@@ -523,13 +523,14 @@ constexpr uint64_t kDynCubeLoadingStaleFrames = 5u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
 
 // -- Contact Shadows (shadows/*.cs_5_0.hlsl) --
-// Two independent compute passes, so two layout/pipeline/table slots. The index
+// One compute pass per entry, so one layout/pipeline/table slot each. The index
 // is fixed and used to size the DeviceData arrays, so the shader, the host and
 // the two resource sets cannot drift apart.
 enum ShadowsPass : uint32_t {
   kShadowsPassContact = 0u,  // contact_shadows.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 noise -> u0)
   kShadowsPassDenoise = 1u,  // contact_denoise.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 contact -> u0), one axis per dispatch
-  kShadowsPassCount = 2u,
+  kShadowsPassLocal = 2u,  // contact_local.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 noise, t3 lamps, t4 light cells, t5 material index, t6 materials -> u0), one dispatch writes all four channels
+  kShadowsPassCount = 3u,
 };
 // The lighting pixel shaders read the result from this slot. t34 is declared by no
 // game's lighting shader and claimed by no existing push, so it is free in Sora 1st,
@@ -542,6 +543,8 @@ constexpr uint32_t kLightingContactShadowRegister = 34u;
 // noise registers on their behalf.
 constexpr uint32_t kLightingShadowNoiseRegister = 35u;
 constexpr uint32_t kLightingShadowDepthRegister = 36u;
+// The lighting shaders read the local contact term from this slot. Only Sora 2nd's lighting shader declares t40 (csLocalContactTex), for this term alone, and no other push claims it.
+constexpr uint32_t kLightingLocalContactRegister = 40u;
 // The character and SSAO passes bind the same noise volume at the same register as
 // the lighting shaders. One number, not two, so the two families of shaders cannot
 // drift onto different registers and leave one of them sampling a stale descriptor.
@@ -549,8 +552,8 @@ constexpr uint32_t kLightingShadowDepthRegister = 36u;
 // shaders, which is where it was first needed.
 constexpr uint32_t kCharShadowNoiseRegister = kLightingShadowNoiseRegister;
 // SRV counts per pass, matching the register() declarations in each shader.
-constexpr uint32_t kShadowsSrvPerPass[kShadowsPassCount] = {3u, 3u};
-constexpr uint32_t kShadowsUavPerPass[kShadowsPassCount] = {1u, 1u};
+constexpr uint32_t kShadowsSrvPerPass[kShadowsPassCount] = {3u, 3u, 7u};
+constexpr uint32_t kShadowsUavPerPass[kShadowsPassCount] = {1u, 1u, 1u};
 
 // -- Motion Blur (Guertin et al. 2013) --
 // Fixed pass order; the indices address the layout/pipeline/table arrays in
@@ -888,6 +891,11 @@ static bool VbgiGameSupported() { return !IsKyoto() && !IsDaybreak2(); }
 static bool VbgiRowVisible() { return IsAdvancedSettingsMode() && VbgiGameSupported(); }
 static bool VbgiRunning() { return g_vbgi_enabled > 0.5f && VbgiGameSupported() && !falcom_world::rtao::RtaoRequested(); }
 static bool VbgiFarRunning() { return VbgiRunning() && g_vbgi_far_enabled > 0.5f; }
+// Local contact shadows run as a compute pass (shadows/contact_local.cs_5_0.hlsl) on the titles whose lighting shaders
+// read the term at t40. Off while RT Local Shadows is requested, as the Local Lights row is.
+static bool LocalContactComputeRunning() {
+  return shader_injection.cs_contact_local_enabled > 0.5f && IsSora2nd() && !falcom_world::rtls::RtlsRequested();
+}
 
 // -- Lighting shader identification (Sora + Kai) --
 static bool IsLightingShader(uint32_t hash) {
@@ -1462,6 +1470,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource contact_denoise_texture = {};
   reshade::api::resource_view contact_denoise_srv = {};
   reshade::api::resource_view contact_denoise_uav = {};
+  // Local contact target (shadows/contact_local.cs_5_0.hlsl): .x point share, .y diagnostic, .z spot share, .w written.
+  // Bound at t40 for the main lighting draws.
+  reshade::api::resource contact_local_texture = {};
+  reshade::api::resource_view contact_local_srv = {};
+  reshade::api::resource_view contact_local_uav = {};
   // Owned by this chain. GTVBAO creates and destroys point_clamp_sampler inside
   // its own resource lifecycle, so borrowing it meant the shadow passes could not
   // dispatch at all with GTVBAO off -- a failure that looks exactly like "the
@@ -1477,6 +1490,9 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // the passes. Whichever draw comes first does the work; the later one only
   // consumes the result.
   uint64_t shadows_ran_frame = UINT64_MAX;
+  // Frame the local pass dispatched. Only the main lighting hook runs it: it is the term's only consumer, and on Kai the
+  // character hook runs before the frame's lamp lists are certain to be captured.
+  uint64_t shadows_local_ran_frame = UINT64_MAX;
   // Frame of the last "blocked: <why>" line. The lighting draw fires several
   // times per frame, so without this the reason is reported once per draw.
   uint64_t shadows_log_frame = UINT64_MAX;
@@ -1486,6 +1502,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // the char pass is reading a same-frame result or last frame's.
   int shadows_ran_from = -1;  // 0 = char lighting, 1 = main lighting
   bool shadows_logged_isfast_missing = false;
+  bool shadows_logged_first_local_dispatch = false;
+  bool shadows_logged_local_inputs_missing = false;  // cleared by the next successful local dispatch
   // -- Custom TAA cross-addon slot ownership (compat with the falcomengine addon,
   // which replaces the same TAA hashes unconditionally) --
   // Replacement bytecode lives in one cross-addon shared slot per hash
@@ -1924,6 +1942,7 @@ static void pushInlineShadowInputs(reshade::api::command_list* cmd_list, DeviceD
 // longer matches the current resolution.
 static void DeployShadows(reshade::api::command_list* cmd_list, int fromHook) {
   shader_injection.cs_contact_dedicated_bound = 0.f;
+  shader_injection.cs_contact_local_bound = 0.f;
   if (!cmd_list) return;
   auto* dev = cmd_list->get_device();
   auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
@@ -1932,7 +1951,8 @@ static void DeployShadows(reshade::api::command_list* cmd_list, int fromHook) {
   const bool contact_on = shader_injection.cs_contact_enabled > 0.5f;
   if (!contact_on && shader_injection.cs_contact_local_enabled < 0.5f) return;
   pushInlineShadowInputs(cmd_list, d);
-  if (!contact_on) return;
+  const bool local_compute = fromHook == 1 && LocalContactComputeRunning();
+  if (!contact_on && !local_compute) return;
 
   // The shadow grid is the DEPTH buffer's grid: both passes read depth, and both
   // sample the G-buffer on the same texels. Sizing the output to anything else
@@ -1974,6 +1994,16 @@ static void DeployShadows(reshade::api::command_list* cmd_list, int fromHook) {
             reshade::api::descriptor_type::texture_shader_resource_view,
             &d->contact_shadow_srv});
     shader_injection.cs_contact_dedicated_bound = 1.f;
+  }
+  if (local_compute && d->shadows_local_ran_frame == d->frame_index && d->contact_local_srv.handle
+      && d->captured_depth_live.load()) {
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{
+            {}, kLightingLocalContactRegister, 0, 1,
+            reshade::api::descriptor_type::texture_shader_resource_view,
+            &d->contact_local_srv});
+    shader_injection.cs_contact_local_bound = 1.f;
   }
 }
 
@@ -4483,7 +4513,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "A device depth linearizing beyond this counts as no geometry, so the "
                  "march is skipped early. Higher is safer, lower is cheaper on open sky.",
       .min = 100.f, .max = 1000000.f, .format = "%.0f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4652,6 +4682,16 @@ renodx::utils::settings::Settings settings = {
       .min = 0.1f, .max = 20.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsLocalNormalBias", .binding = &shader_injection.cs_contact_local_normal_bias,
+      .default_value = 0.05f, .label = "Local Normal Bias", .section = "Contact Shadows",
+      .tooltip = "Lifts the local light march's ray origin along the surface normal (against it for a light behind "
+                 "the surface), so a lit face does not shadow itself. Separate from the sun's Normal Bias because "
+                 "local rays are much shorter. 0 marches from the surface itself.",
+      .min = 0.f, .max = 0.5f, .format = "%.3f",
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+      .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalMaxLights", .binding = &shader_injection.cs_contact_local_max_lights,
@@ -5687,6 +5727,7 @@ static void OnPushDescriptorsCapture(
   // the player walks out of a cutscene would drop the view the deploy still needs.
   const bool wantMotionBlurPush = shader_injection.mb_mode > 0.5f;
   // Sun contact shadows read the depth, MRT normal and scene CBV captured below.
+  // Local contact shadows need the lighting captures and VBGI's slots 0-2, 4 and 5 (material index, materials, lamp lists).
   if (shader_injection.gtvbao_mode < 0.5f
       && !falcom_world::rtao::RtaoRequested()
       && !falcom_world::rr::RrRequested()
@@ -5694,7 +5735,8 @@ static void OnPushDescriptorsCapture(
       && shader_injection.dynCube_enabled < 0.5f
       && !wantTAAMotionPush
       && !wantMotionBlurPush
-      && shader_injection.cs_contact_enabled < 0.5f) {
+      && shader_injection.cs_contact_enabled < 0.5f
+      && !LocalContactComputeRunning()) {
     return;
   }
   if (capture_timer.armed) {
@@ -5707,7 +5749,7 @@ static void OnPushDescriptorsCapture(
   const bool cbv = update.type == reshade::api::descriptor_type::constant_buffer;
   if (update.count == 0u || (!srv && !cbv)) return;
   if (cbv && update.binding != kLightingSceneCbRegister) return;
-  if (srv && update.binding != kDynCubeRegister && update.binding > (VbgiRunning() ? 16u : 5u)) return;
+  if (srv && update.binding != kDynCubeRegister && update.binding > ((VbgiRunning() || LocalContactComputeRunning()) ? 16u : 5u)) return;
   renodx::utils::state::CommandListStateCache state_cache;
   std::optional<uint32_t> ps_hash;
   auto pixel_hash = [&]() {
@@ -5840,8 +5882,8 @@ static void OnPushDescriptorsCapture(
     }
     // VBGI radiance inputs: from the Sora and Kai lighting shaders while VBGI runs. The binding is the array base, so each
     // slot of the update is matched by its own number (shadow t9 on Sora 1st, t7 on Sora 2nd; slot 3 is the depth on Kai, so
-    // it is not captured there). Kai slots 16, 11 and 12 come from any pixel-shader push (shape-filtered), see below.
-    if (VbgiRunning() && update.count >= 1) {
+    // it is not captured there). Kai slots 16, 11 and 12 come from any pixel-shader push (shape-filtered), see below. Slots 1 (0 on Kai), 2, 4 and 5 are also the local contact pass's material index, materials and lamp lists.
+    if ((VbgiRunning() || LocalContactComputeRunning()) && update.count >= 1) {
       // Kai: t16 (cascade array), t11 and t12 (lamp lists) are bound by earlier passes and stay bound into the lighting
       // draw, so they are taken from any pixel-shader push, filtered by resource shape. The last accepted view is what the
       // lighting draw sees.
@@ -10604,7 +10646,8 @@ static void CreateShadowsResources(reshade::api::device* dev, DeviceData* d,
   };
 
   if (!mk(&d->contact_shadow_texture, &d->contact_shadow_srv, &d->contact_shadow_uav)
-      || !mk(&d->contact_denoise_texture, &d->contact_denoise_srv, &d->contact_denoise_uav)) {
+      || !mk(&d->contact_denoise_texture, &d->contact_denoise_srv, &d->contact_denoise_uav)
+      || !mk(&d->contact_local_texture, &d->contact_local_srv, &d->contact_local_uav)) {
     DestroyShadowsResources(dev, d);
     return;
   }
@@ -10624,6 +10667,7 @@ static void DestroyShadowsResources(reshade::api::device* dev, DeviceData* d) {
 
   dv(d->contact_shadow_srv); dv(d->contact_shadow_uav); dr(d->contact_shadow_texture);
   dv(d->contact_denoise_srv); dv(d->contact_denoise_uav); dr(d->contact_denoise_texture);
+  dv(d->contact_local_srv); dv(d->contact_local_uav); dr(d->contact_local_texture);
   if (d->shadows_point_clamp_sampler.handle) {
     dev->destroy_sampler(d->shadows_point_clamp_sampler);
     d->shadows_point_clamp_sampler = {};
@@ -10645,7 +10689,7 @@ static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData
   using P = reshade::api::pipeline_layout_param;
   if (!dev || !d) return false;
   static const std::span<const uint8_t> kBytecode[kShadowsPassCount] = {
-      __contact_shadows, __contact_denoise};
+      __contact_shadows, __contact_denoise, __contact_local};
 
   if (!d->shadows_point_clamp_sampler.handle) {
     reshade::api::sampler_desc sd = {};
@@ -10707,15 +10751,14 @@ static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData
   return true;
 }
 
-// Runs the contact pass when it is enabled, then the sun denoise when that is on.
+// Runs the sun contact pass and its denoise once a frame, and the local contact pass once a frame from the main lighting hook.
 static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHook) {
   if (!cl || !d) return false;
-  if (d->shadows_ran_frame == d->frame_index) return true;  // already done this frame
+  const bool sun_due = shader_injection.cs_contact_enabled > 0.5f && d->shadows_ran_frame != d->frame_index;
+  const bool local_due = fromHook == 1 && LocalContactComputeRunning() && d->shadows_local_ran_frame != d->frame_index;
+  if (!sun_due && !local_due) return true;  // nothing left to dispatch this frame
   auto* dev = cl->get_device();
   if (!dev) return false;
-
-  const bool contact_on = shader_injection.cs_contact_enabled > 0.5f;
-  if (!contact_on) return true;
 
   // Name whichever condition is currently blocking, at most once a frame. Every
   // early return here used to be silent, which made "the pass never ran" and "the
@@ -10812,7 +10855,7 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
     if (out_tex.handle) cl->barrier(out_tex, UA, SR);
   };
 
-  if (contact_on) {
+  if (sun_due) {
     // The noise slot is filled with the real 3D volume when it is usable. When it
     // is not, the fallback is a 1x1 2D stand-in: the shader declares t2 as a
     // Texture3D and is gated on shadow_isfast_texture_loaded, so it never samples
@@ -10839,24 +10882,65 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
                  d->contact_shadow_texture);
       }
     }
+    d->shadows_ran_frame = d->frame_index;
+    if (!d->shadows_logged_first_dispatch) {
+      d->shadows_logged_first_dispatch = true;
+      CSLog("shadows", "first dispatch ok at " + std::to_string(w) + "x" + std::to_string(h)
+          + " (isfast=" + (isfast_ready ? "ready" : "missing") + ")");
+    }
+    if (d->shadows_ran_from != fromHook) {
+      // Report the first dispatch point once. Kai runs a character lighting pass
+      // before the main lighting pass, so which one reaches this first is what
+      // decides whether the character pass reads this frame's result or the
+      // previous frame's -- and that is not something to have to guess at from a
+      // symptom.
+      d->shadows_ran_from = fromHook;
+      CSLog("shadows", fromHook == 0
+          ? "dispatched from the character lighting pass"
+          : "dispatched from the main lighting pass");
+    }
   }
-
-  d->shadows_ran_frame = d->frame_index;
-  if (!d->shadows_logged_first_dispatch) {
-    d->shadows_logged_first_dispatch = true;
-    CSLog("shadows", "first dispatch ok at " + std::to_string(w) + "x" + std::to_string(h)
-        + " (isfast=" + (isfast_ready ? "ready" : "missing") + ")");
-  }
-  if (d->shadows_ran_from != fromHook) {
-    // Report the first dispatch point once. Kai runs a character lighting pass
-    // before the main lighting pass, so which one reaches this first is what
-    // decides whether the character pass reads this frame's result or the
-    // previous frame's -- and that is not something to have to guess at from a
-    // symptom.
-    d->shadows_ran_from = fromHook;
-    CSLog("shadows", fromHook == 0
-        ? "dispatched from the character lighting pass"
-        : "dispatched from the main lighting pass");
+  if (local_due) {
+    // The pass's game inputs come from the VBGI capture slots: the material index (1 = mrtTexture2 on Sora,
+    // 0 = mrtTexture1 on Kai), 2 deferredParams, 4 lamps, 5 light cells. Each must be live and from this frame.
+    const uint32_t material_k = IsKai() ? 0u : 1u;
+    const std::array<uint32_t, 4> local_inputs = {material_k, 2u, 4u, 5u};
+    bool inputs_ready = true;
+    for (const uint32_t k : local_inputs) {
+      inputs_ready = inputs_ready && d->vbgi_in_srv[k].handle != 0u && d->vbgi_in_live[k].load()
+                     && d->vbgi_in_frame[k] == d->frame_index;
+    }
+    if (inputs_ready) {
+      reshade::api::resource_view local_srvs[7] = {
+          d->captured_depth_srv, d->captured_mrt_normal_srv,
+          isfast_ready ? d->isfast_noise_srv : d->fallback_srv,
+          d->vbgi_in_srv[4], d->vbgi_in_srv[5], d->vbgi_in_srv[material_k], d->vbgi_in_srv[2]};
+      run_pass(kShadowsPassLocal, local_srvs, 7, d->contact_local_uav, d->contact_local_texture);
+      d->shadows_local_ran_frame = d->frame_index;
+      d->shadows_logged_local_inputs_missing = false;
+      if (!d->shadows_logged_first_local_dispatch) {
+        d->shadows_logged_first_local_dispatch = true;
+        const uint64_t light_bytes = dev->get_resource_desc(dev->get_resource_from_view(d->vbgi_in_srv[4])).buffer.size;
+        const uint64_t cell_bytes = dev->get_resource_desc(dev->get_resource_from_view(d->vbgi_in_srv[5])).buffer.size;
+        CSLog("shadows", "local first dispatch ok at " + std::to_string(w) + "x" + std::to_string(h)
+            + " (lamps=" + std::to_string(light_bytes / falcom_world::rtgi::kLightParamBytes)
+            + " cells=" + std::to_string(cell_bytes / falcom_world::rtgi::kLightIndexDataBytes)
+            + " material_slot=" + std::to_string(material_k)
+            + " isfast=" + (isfast_ready ? "ready" : "missing") + ")");
+      }
+    } else if (!d->shadows_logged_local_inputs_missing) {
+      d->shadows_logged_local_inputs_missing = true;
+      std::string why = "[Shadows] local blocked: lighting inputs not captured this frame (";
+      for (const uint32_t k : local_inputs) {
+        why += " slot" + std::to_string(k) + "="
+               + (d->vbgi_in_srv[k].handle == 0u ? "null"
+                  : !d->vbgi_in_live[k].load() ? "dead"
+                  : d->vbgi_in_frame[k] != d->frame_index ? "stale" : "ok");
+      }
+      why += " )";
+      reshade::log::message(reshade::log::level::warning, why.c_str());
+      CSLog("shadows", "local blocked: lighting inputs not captured this frame");
+    }
   }
   return true;
 }

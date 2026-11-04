@@ -374,6 +374,7 @@ bool FalcomCharCamDebugView(float rawTerm, float axisLength, float valid,
 #define kContactDiagSky          3u  // linear depth beyond the sky cutoff
 #define kContactDiagBadDepth     4u  // device depth or the unpack consts are not finite
 #define kContactDiagNoLightDir  5u  // lightDirection_g was zero-length (no sun this frame)
+#define kContactDiagNoLocalKind  6u  // local pass: the pixel's material path has no local lamp kind on (nothing marched)
 
 // ── Per-pixel strength selection ──
 // The two techniques share this because the environment/character split is a
