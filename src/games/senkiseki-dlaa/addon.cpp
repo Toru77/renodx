@@ -12,6 +12,7 @@
 
 #include <array>
 #include <atomic>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -223,7 +224,7 @@ static std::atomic<uint64_t> g_character_report_generation = 0;
 
 static void MotionReportLog(reshade::log::level level, const char* message) {
   reshade::log::message(level, message);
-  const bool weapon_line = strncmp(message, "[DLAA] rigid ", 13) == 0 || strncmp(message, "[DLAA] phaseW", 13) == 0;
+  const bool weapon_line = strncmp(message, "[DLAA] rigid ", 13) == 0 || strncmp(message, "[DLAA] phaseW", 13) == 0 || strncmp(message, "[DLAA] motionBufFull:", 21) == 0 || strncmp(message, "[DLAA] motionBuf:", 17) == 0 || strncmp(message, "[DLAA] motionBufTiles:", 22) == 0;
   const bool character_line = strncmp(message, "[DLAA] charmv ", 14) == 0 || strncmp(message, "[DLAA] alternate ", 17) == 0 || strncmp(message, "[DLAA] snapshot-missing ", 24) == 0 || (strncmp(message, "[DLAA] bone-slot ", 17) == 0 && strstr(message, " reason=0") == nullptr) || (strncmp(message, "[DLAA] decision ", 16) == 0 && (strstr(message, "result=snapshot-rejected") != nullptr || strstr(message, "result=pixel-shader-patch-failed") != nullptr || strstr(message, "result=render-target-incompatible") != nullptr)) || strncmp(message, "[DLAA] burst ", 13) == 0;
   if ((!weapon_line || g_weapon_motion_debug <= 0.5f) && (!character_line || g_char_motion_debug <= 0.5f)) return;
   auto& report = (weapon_line ? g_weapon_motion_report : g_character_motion_report);
@@ -2019,6 +2020,235 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
                    "[DLAA] rigid decision f=%u vs=0x%08X ps=0x%08X rtvs=%u emits=%d psCandidate=%d result=%s",
                    d->frame_index, vh, ph, d->last_rtv_count, (int)is_po_vs, (int)is_phasee_candidate, reason);
     }
+    if (g_weapon_motion_debug > 0.5f && d->last_rtv_count == 3u && is_phasee_candidate) {
+      auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+      ID3D11Buffer* vb = nullptr;
+      UINT stride = 0u, offset = 0u;
+      if (ctx) {
+        ctx->IAGetVertexBuffers(0u, 1u, &vb, &stride, &offset);
+      }
+      if (!is_po_vs) {
+        LogThrottled(ThrottleKey("weapon-unpatched", vh, ph).c_str(),
+                     reshade::log::level::info, 1u, 0u,
+                     "[DLAA] rigid candidate f=%u vs=0x%08X ps=0x%08X vb=0x%llX stride=%u offset=%u patched=%d emits=%d result=%s",
+                     d->frame_index, vh, ph, (unsigned long long)(uintptr_t)vb, stride, offset,
+                     (int)(vit != d->patched_vs_by_hash.end()), (int)is_po_vs, reason);
+      }
+      // Sample different candidate meshes on different frames so the debug
+      // readbacks remain bounded even in scenes with hundreds of draws.
+      const uint64_t sample_key = ((uint64_t)(uintptr_t)vb >> 4u) ^ ((uint64_t)vh << 32u) ^ ph;
+      if (ctx && vb && (sample_key % 128u) == (d->frame_index % 128u)) {
+        struct CandidateSample {
+          uint64_t frame = 0u;
+          uint64_t b0 = 0u;
+          float world[12] = {};
+          float root[12] = {};
+          uint64_t pose_hash = 0u;
+          uint32_t pose_count = 0u;
+          uint32_t view_count = 0u;
+          bool has_root = false;
+        };
+        static std::mutex sample_mutex;
+        static std::unordered_map<uint64_t, CandidateSample> samples;
+        static uint64_t sample_generation = 0u;
+        static uint64_t budget_frame = UINT64_MAX;
+        static uint32_t frame_samples = 0u;
+        bool sample_this_draw = true;
+        {
+          std::lock_guard lock(sample_mutex);
+          const uint64_t generation = g_character_report_generation.load();
+          if (generation != sample_generation) {
+            samples.clear();
+            sample_generation = generation;
+          }
+          if (budget_frame != d->frame_index) {
+            budget_frame = d->frame_index;
+            frame_samples = 0u;
+          }
+          const auto previous = samples.find(sample_key);
+          if (previous != samples.end() && previous->second.frame == d->frame_index) {
+            sample_this_draw = false;
+          }
+          if (frame_samples >= 8u) {
+            sample_this_draw = false;
+          }
+          if (sample_this_draw) {
+            ++frame_samples;
+          }
+        }
+        ID3D11Buffer* b0 = nullptr;
+        if (sample_this_draw) {
+          ctx->VSGetConstantBuffers(0u, 1u, &b0);
+        }
+        if (b0) {
+          D3D11_BUFFER_DESC desc = {};
+          b0->GetDesc(&desc);
+          if (desc.ByteWidth >= 47u * 16u) {
+            D3D11_BUFFER_DESC staging_desc = {};
+            staging_desc.ByteWidth = desc.ByteWidth;
+            staging_desc.Usage = D3D11_USAGE_STAGING;
+            staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ID3D11Buffer* staging = nullptr;
+            auto* native_device = reinterpret_cast<ID3D11Device*>(cmd_list->get_device()->get_native());
+            if (native_device && SUCCEEDED(native_device->CreateBuffer(&staging_desc, nullptr, &staging))) {
+              ctx->CopyResource(staging, b0);
+              D3D11_MAPPED_SUBRESOURCE mapped = {};
+              if (SUCCEEDED(ctx->Map(staging, 0u, D3D11_MAP_READ, 0u, &mapped))) {
+                LogThrottled(ThrottleKey("weapon-scan-readback", vh, ph).c_str(),
+                             reshade::log::level::info, 1u, 0u,
+                             "[DLAA] rigid scan vs=0x%08X ps=0x%08X result=readback-ok; World c44 and VP c10 are hypotheses",
+                             vh, ph);
+                const auto* constants = static_cast<const float*>(mapped.pData);
+                CandidateSample current;
+                current.frame = d->frame_index;
+                current.b0 = (uint64_t)(uintptr_t)b0;
+                memcpy(current.world, constants + 44u * 4u, sizeof(current.world));
+                float clip[4] = {};
+                for (uint32_t row = 0u; row < 4u; ++row) {
+                  const float* vp = constants + (10u + row) * 4u;
+                  clip[row] = vp[0] * current.world[3] + vp[1] * current.world[7] + vp[2] * current.world[11] + vp[3];
+                }
+                ctx->Unmap(staging, 0u);
+                ID3D11ShaderResourceView* bone_view = nullptr;
+                const uint32_t bone_slot = (vit != d->patched_vs_by_hash.end() && !vit->second.is_rigid)
+                                               ? vit->second.bone_game_slot
+                                               : 0u;
+                if (bone_slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+                  ctx->VSGetShaderResources(bone_slot, 1u, &bone_view);
+                }
+                if (bone_view) {
+                  ID3D11Resource* resource = nullptr;
+                  bone_view->GetResource(&resource);
+                  ID3D11Buffer* bone_buffer = nullptr;
+                  if (resource && SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Buffer), (void**)&bone_buffer))) {
+                    D3D11_BUFFER_DESC bone_desc = {};
+                    bone_buffer->GetDesc(&bone_desc);
+                    D3D11_SHADER_RESOURCE_VIEW_DESC view_desc = {};
+                    bone_view->GetDesc(&view_desc);
+                    const bool buffer_view = view_desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFER || view_desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX;
+                    const uint64_t first_element = (view_desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX)
+                                                       ? view_desc.BufferEx.FirstElement
+                                                       : view_desc.Buffer.FirstElement;
+                    const uint64_t root_offset = first_element * 64u;
+                    if (buffer_view && (bone_desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) && bone_desc.StructureByteStride == 64u && root_offset + 64u <= bone_desc.ByteWidth) {
+                      current.view_count = (view_desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX)
+                                               ? view_desc.BufferEx.NumElements
+                                               : view_desc.Buffer.NumElements;
+                      const uint32_t available = (uint32_t)((bone_desc.ByteWidth - root_offset) / 64u);
+                      const uint32_t pose_count = std::min(256u, std::min(current.view_count, available));
+                      D3D11_BUFFER_DESC root_desc = {};
+                      root_desc.ByteWidth = pose_count * 64u;
+                      root_desc.Usage = D3D11_USAGE_STAGING;
+                      root_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                      ID3D11Buffer* root_staging = nullptr;
+                      if (pose_count > 0u && SUCCEEDED(native_device->CreateBuffer(&root_desc, nullptr, &root_staging))) {
+                        const D3D11_BOX box = {(UINT)root_offset, 0u, 0u, (UINT)root_offset + root_desc.ByteWidth, 1u, 1u};
+                        ctx->CopySubresourceRegion(root_staging, 0u, 0u, 0u, 0u, bone_buffer, 0u, &box);
+                        D3D11_MAPPED_SUBRESOURCE root_mapping = {};
+                        if (SUCCEEDED(ctx->Map(root_staging, 0u, D3D11_MAP_READ, 0u, &root_mapping))) {
+                          memcpy(current.root, root_mapping.pData, sizeof(current.root));
+                          const auto* bytes = static_cast<const uint8_t*>(root_mapping.pData);
+                          current.pose_hash = 14695981039346656037ull;
+                          for (uint32_t i = 0u; i < root_desc.ByteWidth; ++i) {
+                            current.pose_hash = (current.pose_hash ^ bytes[i]) * 1099511628211ull;
+                          }
+                          current.pose_count = pose_count;
+                          ctx->Unmap(root_staging, 0u);
+                          current.has_root = true;
+                          for (float value : current.root) {
+                            current.has_root = current.has_root && std::isfinite(value);
+                          }
+                        }
+                        root_staging->Release();
+                      }
+                    }
+                    bone_buffer->Release();
+                  }
+                  if (resource) {
+                    resource->Release();
+                  }
+                  bone_view->Release();
+                }
+                LogThrottled(ThrottleKey("weapon-scan-root", vh, ph, (uint32_t)current.has_root, bone_slot).c_str(),
+                             reshade::log::level::info, 1u, 0u,
+                             "[DLAA] rigid scan vs=0x%08X ps=0x%08X boneSlot=%u rootRead=%d",
+                             vh, ph, bone_slot, (int)current.has_root);
+                bool finite = true;
+                for (float value : current.world) {
+                  finite = finite && std::isfinite(value);
+                }
+                for (float value : clip) {
+                  finite = finite && std::isfinite(value);
+                }
+                CandidateSample previous;
+                bool have_previous = false;
+                if (finite) {
+                  std::lock_guard lock(sample_mutex);
+                  const auto it = samples.find(sample_key);
+                  if (it != samples.end()) {
+                    previous = it->second;
+                    have_previous = previous.frame < current.frame && previous.b0 == current.b0;
+                  } else if (samples.size() >= 8192u) {
+                    samples.clear();
+                  }
+                  samples[sample_key] = current;
+                }
+                if (have_previous) {
+                  float transform_delta = 0.f;
+                  float root_delta = 0.f;
+                  for (uint32_t i = 0u; i < 12u; ++i) {
+                    const float delta = current.world[i] - previous.world[i];
+                    transform_delta += delta * delta;
+                    if (current.has_root && previous.has_root) {
+                      const float root_difference = current.root[i] - previous.root[i];
+                      root_delta += root_difference * root_difference;
+                    }
+                  }
+                  const bool pose_changed = current.pose_count > 0u && current.pose_count == previous.pose_count && current.pose_hash != previous.pose_hash;
+                  if (transform_delta > 0.000001f || root_delta > 0.000001f || pose_changed) {
+                    char line[900];
+                    const bool projected = std::fabs(clip[3]) > 0.00001f;
+                    snprintf(line, sizeof(line),
+                             "[DLAA] rigid moving-candidate f=%u prevFrame=%llu vs=0x%08X ps=0x%08X vb=0x%llX b0=0x%llX stride=%u offset=%u patched=%d emits=%d result=%s assumedWorldC44=1 assumedVPc10=1 transformDelta=%.6f rootValid=%d rootSlot=%u rootDelta=%.6f poseChanged=%d poseRead=%u poseView=%u root=(%+.4f,%+.4f,%+.4f) origin=(%+.4f,%+.4f,%+.4f) prevOrigin=(%+.4f,%+.4f,%+.4f) projected=%d ndc=(%+.4f,%+.4f) clipW=%+.4f",
+                             d->frame_index, (unsigned long long)previous.frame, vh, ph,
+                             (unsigned long long)(uintptr_t)vb, (unsigned long long)(uintptr_t)b0, stride, offset,
+                             (int)(vit != d->patched_vs_by_hash.end()), (int)is_po_vs, reason,
+                             std::sqrt(transform_delta), (int)(current.has_root && previous.has_root), bone_slot,
+                             std::sqrt(root_delta), (int)pose_changed, current.pose_count, current.view_count,
+                             current.root[3], current.root[7], current.root[11],
+                             current.world[3], current.world[7], current.world[11],
+                             previous.world[3], previous.world[7], previous.world[11], (int)projected,
+                             projected ? clip[0] / clip[3] : 0.f, projected ? clip[1] / clip[3] : 0.f, clip[3]);
+                    MotionReportLog(reshade::log::level::info, line);
+                  }
+                }
+              } else {
+                LogThrottled(ThrottleKey("weapon-scan-map-failed", vh, ph).c_str(),
+                             reshade::log::level::warning, 1u, 0u,
+                             "[DLAA] rigid scan vs=0x%08X ps=0x%08X result=map-failed", vh, ph);
+              }
+              staging->Release();
+            } else {
+              LogThrottled(ThrottleKey("weapon-scan-staging-failed", vh, ph).c_str(),
+                           reshade::log::level::warning, 1u, 0u,
+                           "[DLAA] rigid scan vs=0x%08X ps=0x%08X result=staging-allocation-failed", vh, ph);
+            }
+          } else {
+            LogThrottled(ThrottleKey("weapon-scan-small-cb", vh, ph).c_str(),
+                         reshade::log::level::info, 1u, 0u,
+                         "[DLAA] rigid scan vs=0x%08X ps=0x%08X result=cb0-too-small bytes=%u", vh, ph, desc.ByteWidth);
+          }
+          b0->Release();
+        } else if (sample_this_draw) {
+          LogThrottled(ThrottleKey("weapon-scan-no-cb", vh, ph).c_str(),
+                       reshade::log::level::info, 1u, 0u,
+                       "[DLAA] rigid scan vs=0x%08X ps=0x%08X result=no-cb0", vh, ph);
+        }
+      }
+      if (vb) {
+        vb->Release();
+      }
+    }
     if (g_char_motion_debug <= 0.5f || (!is_po_vs && !is_phasee_candidate && d->last_rtv_count != 3u)) return;
     LogThrottled(ThrottleKeyStr("report-motion-decision", (std::string(reason) + ":" + std::to_string(vh) + ":" + std::to_string(ph) + ":" + std::to_string(d->last_rtv_count)).c_str()).c_str(),
                  reshade::log::level::info, 1u, 200u,
@@ -2049,9 +2279,7 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
     }
   }
 
-  const bool eligible = g_phasee_enabled >= 0.5f &&
-                        shader_injection.dlaa_per_object_motion >= 0.5f &&
-                        d->motion_rtv.handle && is_po_vs && is_phasee_candidate;
+  const bool eligible = g_phasee_enabled >= 0.5f && shader_injection.dlaa_per_object_motion >= 0.5f && d->motion_rtv.handle && is_po_vs && is_phasee_candidate;
   if (!eligible) {
     log_decision("ineligible");
     RestoreAppendedMotionRtv(cmd_list, d);
@@ -2448,51 +2676,87 @@ static void LogRigidWorldSnap(reshade::api::command_list* cmd_list, DeviceData* 
                               ID3D11Buffer* const* prev_bufs, uint32_t prev_count,
                               uint64_t base, uint64_t key, uint32_t world_elem) {
   if (!PhasebDbgActive() && g_weapon_motion_debug <= 0.5f) return;
-  static uint32_t last_dump_frame = UINT32_MAX;
-  if (d->frame_index - last_dump_frame < 60u) return;
-  last_dump_frame = d->frame_index;
+  static std::mutex sample_mutex;
+  static std::unordered_map<uint64_t, uint64_t> last_dump_frame;
+  static uint64_t generation = 0u;
+  {
+    std::lock_guard lock(sample_mutex);
+    const uint64_t current_generation = g_character_report_generation.load();
+    if (generation != current_generation) {
+      last_dump_frame.clear();
+      generation = current_generation;
+    }
+    const auto it = last_dump_frame.find(key);
+    if (it != last_dump_frame.end() && d->frame_index - it->second < 120u) return;
+    last_dump_frame[key] = d->frame_index;
+  }
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
   auto* ndev = reinterpret_cast<ID3D11Device*>(cmd_list->get_device()->get_native());
   if (!ctx || !ndev) return;
-  // Read the World translation (column-major col0.w/col1.w/col2.w = floats 3/7/11)
-  // from a cbuffer at the World element offset.
+  // Copy the entire constant buffer; partial copies from this source have not
+  // been reliable on this path. Read the first three World rows after mapping.
   const uint32_t byte_off = world_elem * 16u;
-  auto read_world = [&](ID3D11Buffer* src, float out[4]) {
-    out[0] = out[1] = out[2] = out[3] = 0.f;
-    if (!src) return;
+  auto read_world = [&](ID3D11Buffer* src, float out[12]) {
+    if (!src) return false;
     D3D11_BUFFER_DESC sbd = {};
     src->GetDesc(&sbd);
-    if (byte_off + 64u > sbd.ByteWidth) return;
+    if (byte_off + 48u > sbd.ByteWidth) return false;
     D3D11_BUFFER_DESC sd = {};
-    sd.ByteWidth = 64u;
+    sd.ByteWidth = sbd.ByteWidth;
     sd.Usage = D3D11_USAGE_STAGING;
     sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     ID3D11Buffer* st = nullptr;
-    if (FAILED(ndev->CreateBuffer(&sd, nullptr, &st))) return;
-    D3D11_BOX box = {byte_off, 0, 0, byte_off + 64u, 1, 1};
-    ctx->CopySubresourceRegion(st, 0, 0, 0, 0, src, 0, &box);
+    if (FAILED(ndev->CreateBuffer(&sd, nullptr, &st))) return false;
+    ctx->CopyResource(st, src);
     D3D11_MAPPED_SUBRESOURCE m = {};
-    if (SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
-      const float* f = static_cast<const float*>(m.pData);
-      out[0] = f[3]; out[1] = f[7]; out[2] = f[11]; out[3] = f[15];
+    bool ok = SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m));
+    if (ok) {
+      memcpy(out, static_cast<const uint8_t*>(m.pData) + byte_off, 48u);
       ctx->Unmap(st, 0);
+      for (uint32_t i = 0u; i < 12u; ++i) ok = ok && std::isfinite(out[i]);
     }
     st->Release();
+    return ok;
   };
-  float gw[4] = {};
-  float pw[4][4] = {};
-  read_world(b0, gw);  // game's CURRENT World (this frame's b0)
-  for (uint32_t s = 0u; s < prev_count && s < 4u; ++s)
-    read_world(prev_bufs[s], pw[s]);
+  float gw[12] = {};
+  float pw[4][12] = {};
+  uint32_t mask = read_world(b0, gw) ? 1u : 0u;
+  for (uint32_t s = 0u; s < prev_count && s < 4u; ++s) {
+    if (read_world(prev_bufs[s], pw[s])) mask |= 2u << s;
+  }
+  int selected = -1;
+  float best = FLT_MAX;
+  float rotation = 0.f;
+  if (prev_count >= 4u && (mask & 0x1fu) == 0x1fu) {
+    for (uint32_t s = 0u; s < prev_count && s < 4u; ++s) {
+      if ((mask & (2u << s)) == 0u) continue;
+      float distance = 0.f;
+      float rotation_difference = 0.f;
+      for (uint32_t row = 0u; row < 3u; ++row) {
+        const float delta = pw[s][row * 4u + 3u] - gw[row * 4u + 3u];
+        distance += delta * delta;
+        for (uint32_t col = 0u; col < 3u; ++col) {
+          const float r = pw[s][row * 4u + col] - gw[row * 4u + col];
+          rotation_difference += r * r;
+        }
+      }
+      if (distance < best) {
+        selected = (int)s;
+        best = distance;
+        rotation = rotation_difference;
+      }
+    }
+  }
   char line[1024];
   // game=(..) then prev0=(..) prev1=(..) prev2=(..) prev3=(..)
   snprintf(line, sizeof(line),
-           "[DLAA] phaseW world b0=0x%llX vb=0x%llX key=0x%llX game=(%+.4f,%+.4f,%+.4f) prev0=(%+.4f,%+.4f,%+.4f) prev1=(%+.4f,%+.4f,%+.4f) prev2=(%+.4f,%+.4f,%+.4f) prev3=(%+.4f,%+.4f,%+.4f)",
+           "[DLAA] phaseW world f=%u vs=0x%08X ps=0x%08X b0=0x%llX vb=0x%llX key=0x%llX readbackMask=0x%X predictedSlot=%d distance=%.5f rotationDelta=%.5f game=(%+.4f,%+.4f,%+.4f) prev0=(%+.4f,%+.4f,%+.4f) prev1=(%+.4f,%+.4f,%+.4f) prev2=(%+.4f,%+.4f,%+.4f) prev3=(%+.4f,%+.4f,%+.4f)",
+           d->frame_index, CurrentVsHash(cmd_list, d), CurrentPsHash(cmd_list, d),
            (unsigned long long)(uintptr_t)b0, (unsigned long long)(uintptr_t)vb0,
-           (unsigned long long)key,
-           gw[0], gw[1], gw[2],
-           pw[0][0], pw[0][1], pw[0][2], pw[1][0], pw[1][1], pw[1][2],
-           pw[2][0], pw[2][1], pw[2][2], pw[3][0], pw[3][1], pw[3][2]);
+           (unsigned long long)key, mask, selected, selected >= 0 ? std::sqrt(best) : -1.f, std::sqrt(rotation),
+           gw[3], gw[7], gw[11],
+           pw[0][3], pw[0][7], pw[0][11], pw[1][3], pw[1][7], pw[1][11],
+           pw[2][3], pw[2][7], pw[2][11], pw[3][3], pw[3][7], pw[3][11]);
   MotionReportLog(reshade::log::level::info, line);
 }
 
@@ -2524,12 +2788,13 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
   auto* src = ResolveMotionSourceTexture(d);
   if (!src) return;
   if (shader_injection.dlaa_per_object_motion < 0.5f) return;
-  if (shader_injection.dlaa_phaseb_debug_logging <= 0.5f) return;
+  if (shader_injection.dlaa_phaseb_debug_logging <= 0.5f && g_weapon_motion_debug <= 0.5f) return;
   auto* dev = cmd_list->get_device();
   auto* cl = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
   auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
   if (!dev || !cl || !nd) return;
   if (d->frame_index - d->motion_dump_last_issue < 60u) return;  // ~1x/sec
+  const uint32_t sampled_frame = d->motion_dump_last_issue;
   d->motion_dump_last_issue = d->frame_index;
 
   D3D11_TEXTURE2D_DESC sd = {};
@@ -2585,34 +2850,45 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
       // mode 6: prev-skin NDC.x displacement), <0 for noData/clampMax. ──
       auto decode_px = [&](const float* q, double* dx, double* dy) -> double {
         if (g_phasee_enabled >= 0.5f) {
-          if (q[3] < 0.5f) { *dx = 0.0; *dy = 0.0; return -1.0; }
+          if (q[3] < 0.5f) {
+            *dx = 0.0;
+            *dy = 0.0;
+            return -1.0;
+          }
           *dx = (double)q[0] * wp;
           *dy = -(double)q[1] * hp;
           return std::sqrt(*dx * *dx + *dy * *dy);
         }
-        const double code = std::round((double)q[0] * 256.0) * 65536.0 +
-                            std::round((double)q[1] * 256.0) * 256.0 +
-                            std::round((double)q[2] * 256.0);
-        if (code <= 0.5) { *dx = 0.0; *dy = 0.0; return -1.0; }   // noData
+        const double code = std::round((double)q[0] * 256.0) * 65536.0 + std::round((double)q[1] * 256.0) * 256.0 + std::round((double)q[2] * 256.0);
+        if (code <= 0.5) {
+          *dx = 0.0;
+          *dy = 0.0;
+          return -1.0;
+        }  // noData
         const double e = code / 16777216.0;
         const bool mode6 = (g_phaseb_vel_debug > 5.5f && g_phaseb_vel_debug < 6.5f);
         // clampMax only applies to the DELTA encode (S range clamp); in mode 6
         // the full +-1 NDC range is a legitimate position, not a clamp.
-        if (!mode6 && e >= 0.99) { *dx = 0.0; *dy = 0.0; return -2.0; }
+        if (!mode6 && e >= 0.99) {
+          *dx = 0.0;
+          *dy = 0.0;
+          return -2.0;
+        }
         const double ix = std::floor(code / 4096.0);
         const double iy = code - ix * 4096.0;
         if (mode6) {
           // VelDebug 6: Ix = curNDC.x, Iy = prevNDC.x (4095-scale). The useful
           // signal is the PREV-skin displacement from the current skin.
           const double prev_ndc_x = (iy / 4095.0) * 2.0 - 1.0;
-          *dx = prev_ndc_x * wp;   // prevNDC.x -> px from screen center
+          *dx = prev_ndc_x * wp;  // prevNDC.x -> px from screen center
           *dy = 0.0;
           return std::fabs(*dx);
         }
         // FIX 1c (encode re-center): delta = E - 0.75 (S=1 both modes).
         const double vx = (ix / 4096.0) - 0.75;
         const double vy = (iy / 4096.0) - 0.75;
-        *dx = vx * wp; *dy = -vy * hp;
+        *dx = vx * wp;
+        *dy = -vy * hp;
         return std::sqrt(*dx * *dx + *dy * *dy);
       };
       // ── Full-texture sampled scan (every 4th pixel): does ANY pixel hold
@@ -2621,17 +2897,34 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
       // if it shows data outside the crop, the center-box assumption is wrong. ──
       uint64_t n_no = 0, n_zero = 0, n_pos = 0, n_neg = 0, n_max = 0;
       uint64_t n_a1 = 0, n_a0 = 0, n_a_other = 0;
-      double best_speed = 0.0; UINT best_x = 0, best_y = 0;
+      double best_speed = 0.0;
+      UINT best_x = 0, best_y = 0;
       float max_r = 0.f, max_g = 0.f, max_b = 0.f, max_a = 0.f;
       // Bounding box + centroid of the alpha=1 pixels (packer writes) so we can
       // tell WHERE on screen the swap actually landed — the center crop can miss
       // the character if it isn't at screen center.
       UINT a_min_x = sd.Width, a_min_y = sd.Height, a_max_x = 0u, a_max_y = 0u;
       uint64_t a_cx = 0, a_cy = 0;
+      uint32_t tile_written[8][8] = {};
+      uint32_t tile_rejected[8][8] = {};
+      uint32_t tile_moving[8][8] = {};
       constexpr UINT sx = 4u, sy = 4u;
       for (UINT y = 0; y < sd.Height; y += sy) {
         for (UINT x = 0; x < sd.Width; x += sx) {
-          float q[4]; read_texel(x, y, q);
+          float q[4];
+          read_texel(x, y, q);
+          if (g_weapon_motion_debug > 0.5f && g_phasee_enabled >= 0.5f && q[3] > 0.5f) {
+            const UINT tx = std::min(7u, (UINT)((uint64_t)x * 8u / sd.Width));
+            const UINT ty = std::min(7u, (UINT)((uint64_t)y * 8u / sd.Height));
+            ++tile_written[ty][tx];
+            const float dx = q[0] * (float)wp;
+            const float dy = -q[1] * (float)hp;
+            if (!std::isfinite(dx) || !std::isfinite(dy) || std::max(std::fabs(q[0]), std::fabs(q[1])) >= 4.f || std::max(std::fabs(dx), std::fabs(dy)) >= 1000.f) {
+              ++tile_rejected[ty][tx];
+            } else if (std::sqrt(dx * dx + dy * dy) >= g_phase_mv_threshold_object) {
+              ++tile_moving[ty][tx];
+            }
+          }
           if (q[0] > max_r) max_r = q[0];
           if (q[1] > max_g) max_g = q[1];
           if (q[2] > max_b) max_b = q[2];
@@ -2642,19 +2935,48 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
             if (x > a_max_x) a_max_x = x;
             if (y < a_min_y) a_min_y = y;
             if (y > a_max_y) a_max_y = y;
-            a_cx += x; a_cy += y;
-          } else if (q[3] <= 0.01f) n_a0++; else n_a_other++;
+            a_cx += x;
+            a_cy += y;
+          } else if (q[3] <= 0.01f)
+            n_a0++;
+          else
+            n_a_other++;
           // FIX 1b: match the compute's alpha validity gate — the motion RTV is
           // full-screen (background depth has alpha=0); only the packer's
           // o2.w=1 pixels (the character) are per-object candidates.
-          if (q[3] < 0.5f) { n_no++; continue; }
+          if (q[3] < 0.5f) {
+            n_no++;
+            continue;
+          }
           double dx = 0.0, dy = 0.0;
           const double sp = decode_px(q, &dx, &dy);
-          if (sp < -0.5) { if (sp < -1.5) n_max++; else n_no++; continue; }
-          if (sp < 1.0) { n_zero++; continue; }   // truly sub-pixel (<1px)
-          if (std::fabs(dx) >= std::fabs(dy)) { if (dx >= 0.0) n_pos++; else n_neg++; }
-          else { if (dy >= 0.0) n_pos++; else n_neg++; }
-          if (sp > best_speed) { best_speed = sp; best_x = x; best_y = y; }
+          if (sp < -0.5) {
+            if (sp < -1.5)
+              n_max++;
+            else
+              n_no++;
+            continue;
+          }
+          if (sp < 1.0) {
+            n_zero++;
+            continue;
+          }  // truly sub-pixel (<1px)
+          if (std::fabs(dx) >= std::fabs(dy)) {
+            if (dx >= 0.0)
+              n_pos++;
+            else
+              n_neg++;
+          } else {
+            if (dy >= 0.0)
+              n_pos++;
+            else
+              n_neg++;
+          }
+          if (sp > best_speed) {
+            best_speed = sp;
+            best_x = x;
+            best_y = y;
+          }
         }
       }
       const uint64_t ftotal = ((uint64_t)(sd.Height / sy)) * (uint64_t)(sd.Width / sx);
@@ -2674,37 +2996,75 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
                n_a1 ? a_max_x : 0u, n_a1 ? a_max_y : 0u,
                n_a1 ? (unsigned)(a_cx / n_a1) : 0u, n_a1 ? (unsigned)(a_cy / n_a1) : 0u);
       MotionReportLog(reshade::log::level::info, fbuf);
+      if (g_weapon_motion_debug > 0.5f && g_phasee_enabled >= 0.5f) {
+        for (uint32_t row = 0u; row < 8u; ++row) {
+          char tile_line[512];
+          int pos = snprintf(tile_line, sizeof(tile_line), "[DLAA] motionBufTiles: sampledFrame=%u row=%u cells=written/rejected/moving", sampled_frame, row);
+          for (uint32_t col = 0u; col < 8u && pos > 0 && (size_t)pos < sizeof(tile_line); ++col) {
+            pos += snprintf(tile_line + pos, sizeof(tile_line) - (size_t)pos, " %u/%u/%u",
+                            tile_written[row][col], tile_rejected[row][col], tile_moving[row][col]);
+          }
+          MotionReportLog(reshade::log::level::info, tile_line);
+        }
+      }
 
       // ── Center crop detail (the per-character summary) ──
       uint64_t c_no = 0, c_zero = 0, c_pos = 0, c_neg = 0, c_max = 0;
       uint64_t c_a1 = 0, c_a0 = 0;
-      double c_speed_sum = 0.0; uint64_t c_speed_n = 0; double c_best = 0.0;
+      double c_speed_sum = 0.0;
+      uint64_t c_speed_n = 0;
+      double c_best = 0.0;
       float c_min_e = 2.f, c_max_e = -1.f;
       float center_rgba[4] = {0.f, 0.f, 0.f, 0.f};
       const UINT c_left = (sd.Width - kDw) / 2u, c_top = (sd.Height - kDh) / 2u;
       for (UINT y = 0; y < kDh; ++y) {
         for (UINT x = 0; x < kDw; ++x) {
-          float q[4]; read_texel(c_left + x, c_top + y, q);
+          float q[4];
+          read_texel(c_left + x, c_top + y, q);
           if (x == kDw / 2u && y == kDh / 2u) {
-            center_rgba[0] = q[0]; center_rgba[1] = q[1];
-            center_rgba[2] = q[2]; center_rgba[3] = q[3];
+            center_rgba[0] = q[0];
+            center_rgba[1] = q[1];
+            center_rgba[2] = q[2];
+            center_rgba[3] = q[3];
           }
-          if (q[3] >= 0.99f) c_a1++; else if (q[3] <= 0.01f) c_a0++;
+          if (q[3] >= 0.99f)
+            c_a1++;
+          else if (q[3] <= 0.01f)
+            c_a0++;
           // FIX 1b: alpha validity gate (see compute) — only packer-written
           // (o2.w=1) pixels are per-object candidates.
-          if (q[3] < 0.5f) { c_no++; continue; }
-          const double code = std::round((double)q[0] * 256.0) * 65536.0 +
-                              std::round((double)q[1] * 256.0) * 256.0 +
-                              std::round((double)q[2] * 256.0);
+          if (q[3] < 0.5f) {
+            c_no++;
+            continue;
+          }
+          const double code = std::round((double)q[0] * 256.0) * 65536.0 + std::round((double)q[1] * 256.0) * 256.0 + std::round((double)q[2] * 256.0);
           const double e = g_phasee_enabled >= 0.5f ? 0.0 : code / 16777216.0;
           if (e < c_min_e) c_min_e = (float)e;
           if (e > c_max_e) c_max_e = (float)e;
           double cdx = 0.0, cdy = 0.0;
           const double csp = decode_px(q, &cdx, &cdy);
-          if (csp < -0.5) { if (csp < -1.5) c_max++; else c_no++; continue; }
-          if (csp < 1.0) { c_zero++; continue; }   // truly sub-pixel (<1px)
-          if (std::fabs(cdx) >= std::fabs(cdy)) { if (cdx >= 0.0) c_pos++; else c_neg++; }
-          else { if (cdy >= 0.0) c_pos++; else c_neg++; }
+          if (csp < -0.5) {
+            if (csp < -1.5)
+              c_max++;
+            else
+              c_no++;
+            continue;
+          }
+          if (csp < 1.0) {
+            c_zero++;
+            continue;
+          }  // truly sub-pixel (<1px)
+          if (std::fabs(cdx) >= std::fabs(cdy)) {
+            if (cdx >= 0.0)
+              c_pos++;
+            else
+              c_neg++;
+          } else {
+            if (cdy >= 0.0)
+              c_pos++;
+            else
+              c_neg++;
+          }
           c_speed_sum += csp;
           c_speed_n++;
           if (csp > c_best) c_best = csp;
@@ -6120,302 +6480,426 @@ static bool RunDLAA(reshade::api::command_list* cmd_list, uint32_t color_slot) {
 // ── Settings ──
 renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
-        .key = "DLAAFGPage", .binding = &g_fg_page,
+        .key = "DLAAFGPage",
+        .binding = &g_fg_page,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f, .label = "Page", .section = "",
+        .default_value = 0.f,
+        .label = "Page",
+        .section = "",
         .tooltip = "Switch the settings page. DLAA: all existing DLAA settings. Frame Generation: FG controls and live status.",
-        .labels = {"DLAA","Frame Generation"},
+        .labels = {"DLAA", "Frame Generation"},
     },
     new renodx::utils::settings::Setting{
-        .key = "FGEnabled", .binding = &g_fg_enabled,
+        .key = "FGEnabled",
+        .binding = &g_fg_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Frame Generation", .section = "Frame Generation",
+        .default_value = 0.f,
+        .label = "Frame Generation",
+        .section = "Frame Generation",
         .tooltip = "DLSS Frame Generation master switch (Stage 0: proxy bring-up only, no generated frames yet). Requires DLAA enabled and Composite inject mode because FG consumes the post-DLAA HUD-less composite. Unavailable otherwise.",
-        .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f &&
-                                 (int)shader_injection.dlaa_hdr_inject != 1; },
-        .is_visible = []{ return g_fg_page > 0.5f; },
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f && (int)shader_injection.dlaa_hdr_inject != 1; },
+        .is_visible = [] { return g_fg_page > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "FGProxySpike", .binding = &g_fg_proxy_spike,
+        .key = "FGProxySpike",
+        .binding = &g_fg_proxy_spike,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Proxy spike (dev)", .section = "Frame Generation",
+        .default_value = 0.f,
+        .label = "Proxy spike (dev)",
+        .section = "Frame Generation",
         .tooltip = "Stage 0 diagnostic: exercise the DX12 proxy device and DX11->DX12 shared-frame sync without Streamline. Game presentation is unchanged. Default off.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page > 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "FGLogStatus", .binding = &g_fg_log_status,
+        .key = "FGLogStatus",
+        .binding = &g_fg_log_status,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Status logging", .section = "Frame Generation",
+        .default_value = 0.f,
+        .label = "Status logging",
+        .section = "Frame Generation",
         .tooltip = "Log FG proxy/Streamline state transitions and the 1 Hz spike summary. Default off.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page > 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "FGStatus", .binding = nullptr,
+        .key = "FGStatus",
+        .binding = nullptr,
         .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
-        .default_value = 0.f, .label = "Status", .section = "Frame Generation",
+        .default_value = 0.f,
+        .label = "Status",
+        .section = "Frame Generation",
         .tooltip = "Live FG pipeline status.",
         .on_draw = [] { return FgStatusDraw(); },
-        .is_visible = []{ return g_fg_page > 0.5f; },
+        .is_visible = [] { return g_fg_page > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAEnabled", .binding = &shader_injection.dlaa_enabled,
+        .key = "DLAAEnabled",
+        .binding = &shader_injection.dlaa_enabled,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 2.f, .label = "Anti-Aliasing", .section = "Antialiasing",
-        .tooltip = "Off: no anti-aliasing (FXAA pass skipped, native copy). FXAA: the game's original FXAA (no replacement). DLAA: NVIDIA DLAA (requires nvngx_dlss.dll).", .labels = {"Off", "FXAA", "DLAA"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .default_value = 2.f,
+        .label = "Anti-Aliasing",
+        .section = "Antialiasing",
+        .tooltip = "Off: no anti-aliasing (FXAA pass skipped, native copy). FXAA: the game's original FXAA (no replacement). DLAA: NVIDIA DLAA (requires nvngx_dlss.dll).",
+        .labels = {"Off", "FXAA", "DLAA"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPreset", .binding = &shader_injection.dlaa_preset,
+        .key = "DLAAPreset",
+        .binding = &shader_injection.dlaa_preset,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 3.f, .label = "DLSS Preset", .section = "Antialiasing",
-        .labels = {"Default","F-CNN","J-T1","K-T1","L-T2","M-T2"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .default_value = 3.f,
+        .label = "DLSS Preset",
+        .section = "Antialiasing",
+        .labels = {"Default", "F-CNN", "J-T1", "K-T1", "L-T2", "M-T2"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAJitter", .binding = &shader_injection.dlaa_jitter_enabled,
+        .key = "DLAAJitter",
+        .binding = &shader_injection.dlaa_jitter_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Camera Jitter", .section = "Antialiasing",
-        .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .default_value = 1.f,
+        .label = "Camera Jitter",
+        .section = "Antialiasing",
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAZeroMV", .binding = &shader_injection.dlaa_zero_mv,
+        .key = "DLAAZeroMV",
+        .binding = &shader_injection.dlaa_zero_mv,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Zero Motion Vectors", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Zero Motion Vectors",
+        .section = "Antialiasing",
         .tooltip = "Forces all motion vectors to 0. A/B: if image looks similar, MVs aren't helping; if worse, MVs contribute useful info.",
-        .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAMVThreshold", .binding = &shader_injection.dlaa_mv_threshold,
+        .key = "DLAAMVThreshold",
+        .binding = &shader_injection.dlaa_mv_threshold,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-        .default_value = 0.f, .label = "MV Threshold (px)", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "MV Threshold (px)",
+        .section = "Antialiasing",
         .tooltip = "Zeros CAMERA motion vectors below this magnitude. Kills static sub-pixel MV noise that poisons history. Per-object / Prev-Bone MVs have their own threshold: DLAAPerObjectMVThreshold.",
-        .min = 0.f, .max = 5.f, .format = "%.2f",
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .min = 0.f,
+        .max = 5.f,
+        .format = "%.2f",
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPerObjectMVThreshold", .binding = &g_phase_mv_threshold_object,
+        .key = "DLAAPerObjectMVThreshold",
+        .binding = &g_phase_mv_threshold_object,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-        .default_value = 0.f, .label = "Per-Object Motion Deadband (px)", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Per-Object Motion Deadband (px)",
+        .section = "Antialiasing",
         .tooltip = "Minimum per-object displacement accepted by the direct motion path. This replaces the former hidden 0.20px cutoff and also zeros the final per-object MV below the same value. Lower values retain subtle animation but can preserve subpixel noise; 0.00 disables the deadband. The camera path has its own DLAAMVThreshold.",
-        .min = 0.f, .max = 5.f, .format = "%.2f",
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .min = 0.f,
+        .max = 5.f,
+        .format = "%.2f",
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAVelocityFormat", .binding = &shader_injection.dlaa_velocity_format,
+        .key = "DLAAVelocityFormat",
+        .binding = &shader_injection.dlaa_velocity_format,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "32-bit Motion Vectors", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "32-bit Motion Vectors",
+        .section = "Antialiasing",
         .tooltip = "MV texture precision A/B: r16g16_float (16-bit, default) vs r32g32_float (32-bit). 32-bit costs a little bandwidth; 16-bit is already exact for pixel-space MVs up to 2048px.",
-        .labels = {"16-bit (r16g16)","32-bit (r32g32)"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"16-bit (r16g16)", "32-bit (r32g32)"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAExcludeEffects", .binding = &shader_injection.dlaa_exclude_effects,
+        .key = "DLAAExcludeEffects",
+        .binding = &shader_injection.dlaa_exclude_effects,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Exclude Effects from DLAA", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Exclude Effects from DLAA",
+        .section = "Antialiasing",
         .tooltip = "Masks particles/effects out of DLAA: they get an off-screen motion vector so DLSS falls back to the current frame (no temporal shimmer/ghosting).",
-        .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAADepthSource", .binding = &shader_injection.dlaa_depth_source,
+        .key = "DLAADepthSource",
+        .binding = &shader_injection.dlaa_depth_source,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f, .label = "Depth Source", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Depth Source",
+        .section = "Antialiasing",
         .tooltip = "Which pass's depth DLAA uses. Auto = last full-res depth push (may be wrong). Pick the one that shows a real depth map in MV Debug=Depth. See scan log.",
-        .labels = {"Auto","0x0E83E74E","0x55D61207","0x322E20D4"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Auto", "0x0E83E74E", "0x55D61207", "0x322E20D4"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAForceReset", .binding = &shader_injection.dlaa_force_reset,
+        .key = "DLAAForceReset",
+        .binding = &shader_injection.dlaa_force_reset,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Force Reset (No History)", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Force Reset (No History)",
+        .section = "Antialiasing",
         .tooltip = "Forces NGX InReset=1 every frame (no temporal accumulation). A/B test: if identical to Off, history is already disabled.",
-        .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPerObjectMotion", .binding = &shader_injection.dlaa_per_object_motion,
+        .key = "DLAAPerObjectMotion",
+        .binding = &shader_injection.dlaa_per_object_motion,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f, .label = "Per-Object Motion", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Per-Object Motion",
+        .section = "Antialiasing",
         .tooltip = "Camera Only: camera reprojection MVs only. Per-Object: patched character VSs re-skin with the PREVIOUS frame's per-character bone matrices and provide the object delta to the selected motion transport. Prev-Bone: same mechanism reserved for the deeper prev-bone debug view. Requires Phase B bind mode (NoBind/Minimal off) and a restart.",
-        .labels = {"Camera Only","Per-Object","Prev-Bone"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Camera Only", "Per-Object", "Prev-Bone"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAVelocityScale", .binding = &shader_injection.dlaa_velocity_scale,
+        .key = "DLAAVelocityScale",
+        .binding = &shader_injection.dlaa_velocity_scale,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-        .default_value = 1.f, .label = "Velocity Scale", .section = "Antialiasing",
-        .min = 0.1f, .max = 5.f, .format = "%.2f",
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .default_value = 1.f,
+        .label = "Velocity Scale",
+        .section = "Antialiasing",
+        .min = 0.1f,
+        .max = 5.f,
+        .format = "%.2f",
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAADebugView", .binding = &shader_injection.dlaa_debug_view,
+        .key = "DLAADebugView",
+        .binding = &shader_injection.dlaa_debug_view,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f, .label = "MV Debug", .section = "Antialiasing",
-        .labels = {"Off","HSV","Arrows","Magnitude","Reproj","Depth"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .default_value = 0.f,
+        .label = "MV Debug",
+        .section = "Antialiasing",
+        .labels = {"Off", "HSV", "Arrows", "Magnitude", "Reproj", "Depth"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAADebugScale", .binding = &shader_injection.dlaa_debug_scale,
+        .key = "DLAADebugScale",
+        .binding = &shader_injection.dlaa_debug_scale,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-        .default_value = 50.f, .label = "MV Debug Scale", .section = "Antialiasing",
-        .min = 1.f, .max = 200.f, .format = "%.0f",
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f && shader_injection.dlaa_debug_view >= 1.f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .default_value = 50.f,
+        .label = "MV Debug Scale",
+        .section = "Antialiasing",
+        .min = 1.f,
+        .max = 200.f,
+        .format = "%.0f",
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f && shader_injection.dlaa_debug_view >= 1.f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAFlagIsHDR", .binding = &shader_injection.dlaa_flag_is_hdr,
+        .key = "DLAAFlagIsHDR",
+        .binding = &shader_injection.dlaa_flag_is_hdr,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Flag: HDR Input", .section = "Antialiasing",
-        .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .default_value = 1.f,
+        .label = "Flag: HDR Input",
+        .section = "Antialiasing",
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAFlagDepthInverted", .binding = &shader_injection.dlaa_flag_depth_inverted,
+        .key = "DLAAFlagDepthInverted",
+        .binding = &shader_injection.dlaa_flag_depth_inverted,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Flag: Depth Inverted", .section = "Antialiasing",
-        .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .default_value = 0.f,
+        .label = "Flag: Depth Inverted",
+        .section = "Antialiasing",
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAFlagAutoExposure", .binding = &shader_injection.dlaa_flag_auto_exposure,
+        .key = "DLAAFlagAutoExposure",
+        .binding = &shader_injection.dlaa_flag_auto_exposure,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Flag: Auto Exposure", .section = "Antialiasing",
-        .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .default_value = 1.f,
+        .label = "Flag: Auto Exposure",
+        .section = "Antialiasing",
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAHdrInject", .binding = &shader_injection.dlaa_hdr_inject,
+        .key = "DLAAHdrInject",
+        .binding = &shader_injection.dlaa_hdr_inject,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 2.f, .label = "HDR Pre-ToneMap Inject", .section = "Antialiasing",
+        .default_value = 2.f,
+        .label = "HDR Pre-ToneMap Inject",
+        .section = "Antialiasing",
         .tooltip = "Where DLAA runs the DLSS pass. Auto: runs at the final_blending draw (raw untonemapped scene) when the HDR mod (renodx-senkiseki.addon64) is loaded, so the HDR mod tone maps the DLAA'd image itself. Pre-ToneMap: force that path. Composite: run DLSS on the finished composite at FXAA (post-DOF/post-tonemap); with the HDR mod the FXAA draw runs on the DLAA output so the HDR swapchain stays fed.",
-        .labels = {"Auto","Pre-ToneMap","Composite"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Auto", "Pre-ToneMap", "Composite"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAHdrFloatOut", .binding = &shader_injection.dlaa_hdr_float_out,
+        .key = "DLAAHdrFloatOut",
+        .binding = &shader_injection.dlaa_hdr_float_out,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "HDR: Float DLSS Output", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "HDR: Float DLSS Output",
+        .section = "Antialiasing",
         .tooltip = "Makes the DLSS output texture r16g16b16a16_float instead of r8g8b8a8. The 8-bit UNORM output clamps highlight values before the HDR mod's tone map / swapchain proxy can recover them (clipping/banding). Float preserves the range and applies on BOTH Pre-ToneMap and Composite when the HDR mod is loaded; without the HDR mod, Composite stays 8-bit. Recreates the DLSS feature once on toggle.",
-        .labels = {"Off (8-bit)","On (r16 float)"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off (8-bit)", "On (r16 float)"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAADebugLogging", .binding = &shader_injection.dlaa_debug_logging,
+        .key = "DLAADebugLogging",
+        .binding = &shader_injection.dlaa_debug_logging,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Debug Logging", .section = "Antialiasing",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .default_value = 0.f,
+        .label = "Debug Logging",
+        .section = "Antialiasing",
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhase0Logging", .binding = &shader_injection.dlaa_phase0_logging,
+        .key = "DLAAPhase0Logging",
+        .binding = &shader_injection.dlaa_phase0_logging,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Phase 0 Probe Logging", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Phase 0 Probe Logging",
+        .section = "Antialiasing",
         .tooltip = "Prev-pose feasibility probe (bone-buffer SRV pushes at vertex t0, per-object VS skinned/world detection, buffer handle reuse, and vertex-buffer BindFlags to detect GPU-skinned UAV buffers for the Luma-style prev-vertex capture). Kept SEPARATE from Debug Logging so bone logs aren't buried in general spam.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseBDebugLogging", .binding = &shader_injection.dlaa_phaseb_debug_logging,
+        .key = "DLAAPhaseBDebugLogging",
+        .binding = &shader_injection.dlaa_phaseb_debug_logging,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Phase B / Motion Debug Logging", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Phase B / Motion Debug Logging",
+        .section = "Antialiasing",
         .tooltip = "Isolates the Phase B generic VS patch + per-object motion logs (patched-VS bind, prevVP/prev-bone/prev-World slots, motion RTV append/skip, and the patched-draw output-merger state) from the general Debug Logging spam. Turn this ON with Debug Logging OFF to see ONLY the Phase B / motion machinery.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseBVelDebug", .binding = &g_phaseb_vel_debug,
+        .key = "DLAAPhaseBVelDebug",
+        .binding = &g_phaseb_vel_debug,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f, .label = "Phase B Velocity Encode Debug", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Phase B Velocity Encode Debug",
+        .section = "Antialiasing",
         .tooltip = "Diagnostic: make the patched VS encode a RAW NDC component instead of the prevNDC-curNDC delta, so the motionBuf readback reveals whether the injected cur/prev skin NDC is sane (character at screen center -> zeroVel) or NaN (all-zeros -> the injected skin is broken). 0=normal delta, 1=curNDC.x, 2=prevNDC.x, 3=curNDC.y, 4=prevNDC.y, 5=RAW DELTA with a wide +-4 NDC range (zeroVel => delta~0, pos/neg => real finite delta, noData => delta NaN), 6=BOTH skins in one code (Ix=curNDC.x, Iy=prevNDC.x) so a single motionBuf center readback shows which skin is displaced, 7=FULL-RESOLUTION (1px) scan of the motion buffer: counts EVERY non-zeroVel pixel and lists the largest decoded deltas with locations (the 4px readback hides scattered large-delta pixels -> random HSV spots at still). Restart-gated (read at shader patch time).",
-        .labels = {"Off","Cur NDC X","Prev NDC X","Cur NDC Y","Prev NDC Y","Raw Delta (wide)","CurX + PrevX","Full-Resolution Scan"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "Cur NDC X", "Prev NDC X", "Cur NDC Y", "Prev NDC Y", "Raw Delta (wide)", "CurX + PrevX", "Full-Resolution Scan"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseBVelFullMV", .binding = &g_phaseb_vel_full_mv,
+        .key = "DLAAPhaseBVelFullMV",
+        .binding = &g_phaseb_vel_full_mv,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Phase B Full Motion Vector (A/B)", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Phase B Full Motion Vector (A/B)",
+        .section = "Antialiasing",
         .tooltip = "Full-MV A/B: On (DEFAULT) = the patched VS encodes the COMPLETE screen-space motion (prevBone x previous VP - curBone x current VP) directly — the exact MV DLAA expects, no decomposition. Off = object-only delta (curVP for both skins; the compute adds the object delta onto the depth-reprojected camera path), which has a camera x object cross-term error that makes the per-object MVs wrong and the character shake/jitter when both the camera and the character move (chase cam + walking). Requires a restart (read at shader patch time).",
-        .labels = {"Object-only","Full-MV"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Object-only", "Full-MV"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseBVelFrameDump", .binding = &g_phaseb_vel_frame_dump,
+        .key = "DLAAPhaseBVelFrameDump",
+        .binding = &g_phaseb_vel_frame_dump,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-        .default_value = 0.f, .label = "Phase B Velocity Frame Burst (diagnostic)", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Phase B Velocity Frame Burst (diagnostic)",
+        .section = "Antialiasing",
         .tooltip = "Diagnostic: set to N (e.g. 90) to decode the per-object delta (px) at the alpha-box center EVERY frame for N frames and log it. The 1/sec motionBuf readback classifies the delta into bands and its zeroVel band hides deltas up to several px, so an oscillating per-object delta reads as 'clean' while the HSV debug view shows the character covered in changing colors. The burst reveals the exact temporal pattern: smooth small sine at still = real idle motion; alternating 0/large or random garbage = stale/wrong prev snapshot. Stand still ~2s then walk ~2s, then paste the [DLAA] burst lines. Auto-resets to 0 when done.",
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseBBurstFrames", .binding = &g_phaseb_burst_frames,
+        .key = "DLAAPhaseBBurstFrames",
+        .binding = &g_phaseb_burst_frames,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-        .default_value = 90.f, .label = "Phase B Auto-Burst Length (frames)", .section = "Antialiasing",
+        .default_value = 90.f,
+        .label = "Phase B Auto-Burst Length (frames)",
+        .section = "Antialiasing",
         .tooltip = "Diagnostic: length in frames of the automatic velocity burst that DLAAPhaseBCharMotionDebug arms once when switched on (also re-arms on each Off->On edge). Default 90; raise up to 600 so the burst spans a reported flicker window. Only used when DLAAPhaseBVelFrameDump is 0.",
-        .min = 1.f, .max = 600.f, .format = "%.0f",
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .min = 1.f,
+        .max = 600.f,
+        .format = "%.0f",
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     // ROOT-CAUSE fixes (A/B, live — test each separately):
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseStaticCameraSC", .binding = &g_phase_static_camera_shortcircuit,
+        .key = "DLAAPhaseStaticCameraSC",
+        .binding = &g_phase_static_camera_shortcircuit,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Phase B Static Camera Short-Circuit (A/B)", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Phase B Static Camera Short-Circuit (A/B)",
+        .section = "Antialiasing",
         .tooltip = "Root-cause fix 1: when the ViewProjection is unchanged (max |prevVP-curVP| < 1e-4), SKIP the depth reprojection (prevPx = current pixel). At a still camera the reprojection is a mathematical identity that only injects float round-trip noise (~0.01-0.02px on the near character) — the yellow/purple HSV spots. With this ON, static velocity is exactly 0 at the source (no threshold involved). Test SEPARATELY from DLAAPhaseObjectDeltaDirect.",
-        .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseObjectDeltaDirect", .binding = &g_phase_object_delta_direct,
+        .key = "DLAAPhaseObjectDeltaDirect",
+        .binding = &g_phase_object_delta_direct,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Phase B Object Delta Direct", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Phase B Object Delta Direct",
+        .section = "Antialiasing",
         .tooltip = "Character pixels use the exact jitter-corrected per-object delta directly (sub-0.2px values are snapped to zero), rather than the old 12..20px confidence blend that discarded normal low-speed character motion. Full-MV: the delta is the complete screen-space motion. Object-only: it is added to the camera path.",
-        .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseBStrictPrev", .binding = &g_phaseb_strict_prev,
+        .key = "DLAAPhaseBStrictPrev",
+        .binding = &g_phaseb_strict_prev,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Phase B Strict Prev-Bone (A/B)", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Phase B Strict Prev-Bone (A/B)",
+        .section = "Antialiasing",
         .tooltip = "Root-cause fix 3: only use a prev-bone snapshot when it is EXACTLY 1 frame old. Default (Off) allows a 2-frame-old prev, whose 2-frame accumulated delta intermittently crosses the 12px confidence gate -> the flashing yellow/purple HSV regions on intermittently-drawn parts (and wrong-magnitude MVs that poison DLSS when they move). On = anything stale is forced to prev=cur (delta 0, camera path): every-frame parts keep their constant real MV, intermittent parts go stable. Live (no restart).",
-        .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseObjectDepthTest", .binding = &g_phase_object_depth_test,
+        .key = "DLAAPhaseObjectDepthTest",
+        .binding = &g_phase_object_depth_test,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Phase Object Depth Test", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Phase Object Depth Test",
+        .section = "Antialiasing",
         .tooltip = "Reject stale per-object MVs where the character is occluded. The patched Phase E PS stores the character's clip z/w in the motion target; the velocity compute only uses the object MV when that matches the captured scene depth (within DLAAPhaseObjectDepthEps). A mismatch means a later-drawn surface (e.g. a wall) covers the character, so the compute falls back to the correct camera MV of the visible surface. Fixes occluded characters smearing their motion onto foreground geometry. Live.",
-        .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseObjectDepthEps", .binding = &g_phase_object_depth_eps,
+        .key = "DLAAPhaseObjectDepthEps",
+        .binding = &g_phase_object_depth_eps,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-        .default_value = 0.001f, .label = "Phase Object Depth Epsilon", .section = "Antialiasing",
+        .default_value = 0.001f,
+        .label = "Phase Object Depth Epsilon",
+        .section = "Antialiasing",
         .tooltip = "Clip-z tolerance for the object-depth visibility test. The scene depth is R24G8 (24-bit unorm, ~6e-8 quantization in clip-z), so 0.001 comfortably absorbs quantization while still rejecting any meaningful occlusion gap. Smaller = stricter; larger = more forgiving. Live.",
-        .min = 0.00001f, .max = 0.1f, .format = "%.5f",
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .min = 0.00001f,
+        .max = 0.1f,
+        .format = "%.5f",
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     // Character motion diagnostics and copyable report.
     new renodx::utils::settings::Setting{
@@ -6453,8 +6937,7 @@ renodx::utils::settings::Settings settings = {
             g_weapon_motion_report.bytes = 0;
             g_weapon_motion_report.dropped = 0;
             ++g_character_report_generation;
-          }
-        },
+          } },
         .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
@@ -6475,6 +6958,16 @@ renodx::utils::settings::Settings settings = {
                      g_phaseb_enabled, g_phasee_enabled, g_phase_rigid_weapons,
                      g_phaseb_strict_prev, g_char_motion_debug, g_weapon_motion_debug);
             report = header;
+            if (g_weapon_motion_debug > 0.5f) {
+              char weapon_settings[256];
+              snprintf(weapon_settings, sizeof(weapon_settings),
+                       "Weapon motion settings: objectDepthTest=%.0f objectDepthEpsilon=%.6f objectDeadbandPx=%.4f cameraDeadbandPx=%.4f directObjectDelta=%.0f fullMotion=%.0f\n",
+                       g_phase_object_depth_test, g_phase_object_depth_eps, g_phase_mv_threshold_object,
+                       shader_injection.dlaa_mv_threshold, g_phase_object_delta_direct, g_phaseb_vel_full_mv);
+              report += weapon_settings;
+              report += "Moving-candidate scan: samples G-buffer draws over 128 frames, with at most eight samples per frame. World c44 and VP c10 are hypotheses; shared buffers, sampling gaps and the budget can hide or misidentify movement. Root and pose samples use up to 256 structured-buffer elements from the bound SRV; byte changes do not prove visible movement. No entry does not prove a draw was stationary.\n";
+              report += "Motion tiles: 8x8 screen regions, sampled every fourth pixel in each axis; cells are carrier writes / range rejections / raw carrier vectors at least the object deadband. These raw counts precede jitter correction and depth rejection; pixel-to-draw identity is not measured.\n";
+            }
             report += "Snapshot missing reasons: 1=capture gated, 2=missing b0 or VB, 3=missing bone SRV, 4=missing or non-buffer resource, 5=not structured stride-64, 6=snapshot allocation failed, 7=ownership rejected.\n";
             report += "Ownership reasons describe the original key: 0=selected, 1=no previous-frame slot, 2=no matching owner/serial, 3=multiple previous slots or bone handles, 4=not evaluated. Alternate lines identify a different selected key. charmv roots and age describe the original key; sel may refer to the alternate. readbackMask bits 0..4 indicate successful reads of game and prev0..3.\n";
             {
@@ -6504,204 +6997,280 @@ renodx::utils::settings::Settings settings = {
     },
     // Phase B generic-patch isolation (crash bisection).
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseB", .binding = &g_phaseb_enabled,
+        .key = "DLAAPhaseB",
+        .binding = &g_phaseb_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Phase B Generic VS Patch", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Phase B Generic VS Patch",
+        .section = "Antialiasing",
         .tooltip = "Generic DXBC patcher: adds prev-bone re-skin + prevVP to every skinned VS at pipeline creation (per-object motion MVs without per-shader HLSL).",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseE", .binding = &g_phasee_enabled,
+        .key = "DLAAPhaseE",
+        .binding = &g_phasee_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Phase E Dedicated Motion RTV", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Phase E Dedicated Motion RTV",
+        .section = "Antialiasing",
         .tooltip = "Generic dedicated motion target: Phase B writes the raw object delta into existing TEXCOORD10.xy. Phase E classifies PSs structurally, but keeps their original bytecode at creation; it lazily creates/binds a patched twin only for a live patched-VS + exact three-RT G-buffer draw, then restores the original PS before every other draw. Requires restart.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseWRigidWeapon", .binding = &g_phase_rigid_weapons,
+        .key = "DLAAPhaseWRigidWeapon",
+        .binding = &g_phase_rigid_weapons,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Phase W: Weapons/Accessories", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Phase W: Weapons/Accessories",
+        .section = "Antialiasing",
         .tooltip = "Patch weapon/accessory rigid objects (LightDirForChar) with per-object motion. Off = these objects are NOT patched and fall back to camera (depth-reprojected) MVs only. Requires restart (read at shader patch time).",
-        .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseWRigidItem", .binding = &g_phase_rigid_items,
+        .key = "DLAAPhaseWRigidItem",
+        .binding = &g_phase_rigid_items,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Phase W: Held Items (books)", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Phase W: Held Items (books)",
+        .section = "Antialiasing",
         .tooltip = "Patch rim-lit held-item rigid objects like books/torches (RimLitColor + WorldViewProjection) with per-object motion. Off = these objects are NOT patched and fall back to camera (depth-reprojected) MVs only. Requires restart (read at shader patch time).",
-        .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseWItemDump", .binding = &g_phase_item_dump,
+        .key = "DLAAPhaseWItemDump",
+        .binding = &g_phase_item_dump,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Phase W: Item Dump Logs", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Phase W: Item Dump Logs",
+        .section = "Antialiasing",
         .tooltip = "Diagnostic: dump ORIGINAL + PATCHED VS bytecode for rigid ITEMS only (books/torches, RimLitColor + WorldViewProjection) to renodx-dev/dump/phasew/ and append each rigid-item draw to phasew/item.log. Use to isolate a hang caused by patching held items. Requires restart.",
-        .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseDepthConsistency", .binding = &g_phase_depth_consistency,
+        .key = "DLAAPhaseDepthConsistency",
+        .binding = &g_phase_depth_consistency,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Depth Reprojection Consistency", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Depth Reprojection Consistency",
+        .section = "Antialiasing",
         .tooltip = "Previous-depth validation: compare the reprojected previous pixel's predicted depth against the previous frame's captured depth. A mismatch (disocclusion, or a moving surface like a held item) marks the pixel invalid so DLSS falls back to the current frame instead of smearing. Live.",
-        .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseDepthConsistencyEps", .binding = &g_phase_depth_consistency_eps,
+        .key = "DLAAPhaseDepthConsistencyEps",
+        .binding = &g_phase_depth_consistency_eps,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-        .default_value = 0.15f, .label = "Depth Consistency Epsilon", .section = "Antialiasing",
+        .default_value = 0.15f,
+        .label = "Depth Consistency Epsilon",
+        .section = "Antialiasing",
         .tooltip = "Tolerance (clip-z, 0..1) for the depth-consistency check. Depth is R24G8 (~6e-8 quantization); a few px of parallax is ~1e-3..1e-2. Smaller = stricter, larger = more forgiving. Live.",
-        .min = 0.0001f, .max = 0.2f, .format = "%.4f",
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .min = 0.0001f,
+        .max = 0.2f,
+        .format = "%.4f",
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseDepthConsistencySoft", .binding = &g_phase_depth_consistency_soft,
+        .key = "DLAAPhaseDepthConsistencySoft",
+        .binding = &g_phase_depth_consistency_soft,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-        .default_value = 0.1f, .label = "Depth Consistency Soft Band", .section = "Antialiasing",
+        .default_value = 0.1f,
+        .label = "Depth Consistency Soft Band",
+        .section = "Antialiasing",
         .tooltip = "Soft falloff width (clip-z) past the epsilon, over which the confidence ramps down to invalid. Larger = smoother valid/invalid transition (less flicker at the boundary). Live.",
-        .min = 0.0001f, .max = 0.2f, .format = "%.4f",
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .min = 0.0001f,
+        .max = 0.2f,
+        .format = "%.4f",
+        .is_enabled = [] { return shader_injection.dlaa_enabled > 1.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     // ── Shake-isolation diagnostics ──
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseMVComp", .binding = &g_phase_mv_comp,
+        .key = "DLAAPhaseMVComp",
+        .binding = &g_phase_mv_comp,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Phase: MV Jitter Comp", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Phase: MV Jitter Comp",
+        .section = "Antialiasing",
         .tooltip = "DIAGNOSTIC: per-object jitter subtraction in the velocity shader A/B (Test A/B with MVJittered off). Off: if the character STOPS shaking, the character was never jittered (we were over-subtracting); if it still shakes, the character IS jittered and compensation isn't the cause.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseBDump", .binding = &g_phaseb_dump,
+        .key = "DLAAPhaseBDump",
+        .binding = &g_phaseb_dump,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Phase B Evidence Dump", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Phase B Evidence Dump",
+        .section = "Antialiasing",
         .tooltip = "Write every patched VS's original + patched bytecode (0x<hash>.cso / 0x<new>.patched.cso) and a per-draw crash trace (drawtrace.log) to renodx-dev/dump/phaseb/. The LAST drawtrace line before a GPU TDR identifies the crashing draw.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     // ── CPU optimizations (A/B, live — enable ONE at a time against baseline) ──
     new renodx::utils::settings::Setting{
-        .key = "DLAAOptPromoteDrawnOnly", .binding = &g_opt_promote_drawn_only,
+        .key = "DLAAOptPromoteDrawnOnly",
+        .binding = &g_opt_promote_drawn_only,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Opt 1: Promote Only Drawn Snaps", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Opt 1: Promote Only Drawn Snaps",
+        .section = "Antialiasing",
         .tooltip = "CPU opt 1: at present, only CopyResource(cur->prev) for prev-bone snapshots whose instance was drawn this frame. An undrawn snap's cur is byte-identical to its last capture, so the copy is a no-op — this removes hundreds of D3D11 copy commands per present with no content change. Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAOptBindCaptureOnly", .binding = &g_opt_bind_capture_only,
+        .key = "DLAAOptBindCaptureOnly",
+        .binding = &g_opt_bind_capture_only,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Opt 2: Capture Bones Only on G-Buffer", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Opt 2: Capture Bones Only on G-Buffer",
+        .section = "Antialiasing",
         .tooltip = "CPU opt 2: only run the per-instance prev-bone capture in MaybeBindPatchedVs on draws whose PS actually consumes the velocity encode (velocity-compatible packer PS). Depth/outline/low-res patched draws bind the identity placeholder instead (the encode is dropped there), saving the key COM queries + a full-bone-buffer CopyResource on every patched draw. Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAOptWatchdogGate", .binding = &g_opt_watchdog_gate,
+        .key = "DLAAOptWatchdogGate",
+        .binding = &g_opt_watchdog_gate,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Opt 3: Gate Watchdog Stamps", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Opt 3: Gate Watchdog Stamps",
+        .section = "Antialiasing",
         .tooltip = "CPU opt 3: skip the per-draw watchdog stamp (mutex + vsnprintf, x2 per draw) unless DLAAPhaseBDump is on. The heartbeat file is only written when dump is on, so the stamp is dead weight otherwise. Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAOptDepthCache", .binding = &g_opt_depth_cache,
+        .key = "DLAAOptDepthCache",
+        .binding = &g_opt_depth_cache,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Opt 4: Cache Depth-Writer Check", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Opt 4: Cache Depth-Writer Check",
+        .section = "Antialiasing",
         .tooltip = "CPU opt 4: cache the _Globals buffer size at upload time (skips get_resource_desc per draw for tracked buffers) and skip the OMGetRenderTargets depth-writer query when no depth-stencil is bound (event-tracked last OM bind, current at draw time). Draws WITH a DSV still query, so the world-depth prepass vs color-pass distinction is never skipped. Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAOptSharedState", .binding = &g_opt_shared_state,
+        .key = "DLAAOptSharedState",
+        .binding = &g_opt_shared_state,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Opt 5: Shared Per-Draw State", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Opt 5: Shared Per-Draw State",
+        .section = "Antialiasing",
         .tooltip = "CPU opt 5: query GetCurrentState ONCE per draw in the draw hook and share the VS/PS hashes across all per-draw helpers, instead of ~6 redundant state lookups per draw. Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAOptDescCache", .binding = &g_opt_desc_cache,
+        .key = "DLAAOptDescCache",
+        .binding = &g_opt_desc_cache,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Opt 6: Cache Non-Depth Views", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Opt 6: Cache Non-Depth Views",
+        .section = "Antialiasing",
         .tooltip = "CPU opt 6: OnPushDescriptorsCapture caches view handles already classified as NOT depth-format, so repeated t0/t1 pushes of the same material/color texture skip get_resource_from_view + get_resource_desc. Persistent (resource formats don't change). Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAOptRecMap", .binding = &g_opt_rec_map,
+        .key = "DLAAOptRecMap",
+        .binding = &g_opt_rec_map,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Opt 7: _Globals Rec Index Map", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Opt 7: _Globals Rec Index Map",
+        .section = "Antialiasing",
         .tooltip = "CPU opt 7: FindGlobalsRec uses a handle->index map instead of a linear scan over up to 128 _Globals buffer records on every upload/draw lookup. Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAOptJitterWriteSkip", .binding = &g_opt_jitter_write_skip,
+        .key = "DLAAOptJitterWriteSkip",
+        .binding = &g_opt_jitter_write_skip,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Opt 8: Skip Redundant VP Writes", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Opt 8: Skip Redundant VP Writes",
+        .section = "Antialiasing",
         .tooltip = "CPU opt 8: skip the draw-time 64-byte _Globals jitter write when this buffer has not been re-uploaded since our last write this frame (upload_seq tracking; Map/Unmap invalidates). Behavior-preserving: the same bytes are already in place. Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAOptColorCache", .binding = &g_opt_color_cache,
+        .key = "DLAAOptColorCache",
+        .binding = &g_opt_color_cache,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Opt 10: Cache t0 Color Views", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Opt 10: Cache t0 Color Views",
+        .section = "Antialiasing",
         .tooltip = "CPU opt 10: cache view -> resource for the t0 color capture (views map to one immutable resource; entries are dropped on destroy_resource_view). Removes get_resource_from_view from every repeated t0 SRV push. Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAOptRtCache", .binding = &g_opt_rt_cache,
+        .key = "DLAAOptRtCache",
+        .binding = &g_opt_rt_cache,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Opt 12: Cache RTV0 Resource", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Opt 12: Cache RTV0 Resource",
+        .section = "Antialiasing",
         .tooltip = "CPU opt 12: OnBindRenderTargets resolves RTV0's resource only when the view handle changes (cached, invalidated on destroy_resource_view). Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAOptPsTwinTrack", .binding = &g_opt_ps_twin_track,
+        .key = "DLAAOptPsTwinTrack",
+        .binding = &g_opt_ps_twin_track,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Opt 13: PS Twin Bind Tracking (A/B)", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Opt 13: PS Twin Bind Tracking (A/B)",
+        .section = "Antialiasing",
         .tooltip = "CPU opt 13 (A/B, default OFF): track whether the game rebound its PS since our Phase E twin swap (bind_pipeline event) so Ensure/RestorePhaseEPixelShader skip PSGetShader in steady state. Falls back to the proven query path on any doubt. If per-object MVs break with this ON, turn it OFF. Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAOptMotionRtvCache", .binding = &g_opt_motion_rtv_cache,
+        .key = "DLAAOptMotionRtvCache",
+        .binding = &g_opt_motion_rtv_cache,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Opt 14: Cache Motion RTV Compat", .section = "Antialiasing",
+        .default_value = 1.f,
+        .label = "Opt 14: Cache Motion RTV Compat",
+        .section = "Antialiasing",
         .tooltip = "CPU opt 14: MaybeAppendMotionRtvStrict caches the live three-RTV G-buffer compatibility verdict (RTV descriptors are immutable; invalidated when one of the cached views is destroyed) instead of re-querying descs/resources on every character draw. Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAACpuProfile", .binding = &g_cpu_profile,
+        .key = "DLAACpuProfile",
+        .binding = &g_cpu_profile,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "CPU Profile (DLAA)", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "CPU Profile (DLAA)",
+        .section = "Antialiasing",
         .tooltip = "Diagnostic: while DLAA mode is active, accumulate QueryPerformanceCounter time per hook site (draw, restore, vp-write, bind-vs, bind-rigid, motion-rtv, push-desc, bind-rt, buf-update, run-dlaa, present) and log a per-frame ms breakdown to ReShade.log every 120 frames. Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .labels = {"Off", "On"},
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLAAStatus", .binding = nullptr,
+        .key = "DLAAStatus",
+        .binding = nullptr,
         .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
-        .default_value = 0.f, .label = "Status", .section = "Antialiasing",
+        .default_value = 0.f,
+        .label = "Status",
+        .section = "Antialiasing",
         .tooltip = "Live DLAA deployment status: which gate is blocking and which inputs were captured.",
         .on_draw = [] { return DlaaStatusDraw(); },
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
 };
 
