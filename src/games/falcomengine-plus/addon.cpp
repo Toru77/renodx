@@ -40,6 +40,7 @@
 #include "./fast_noise_ea.h"  // baked-in fast_noise_ea.dds (embed_file.exe output)
 #include "./world/world.hpp"  // Phase 0 world-space research module (DevKit-only)
 #include "./world/rtao/rtao.hpp"  // RTAO round 1 (inline lighting-hook dispatch)
+#include "./world/rtao/rtao_svgf.hpp"  // RTAO SVGF glue (inline lighting-hook dispatch)
 #include "./world/rr/rr_state.hpp"
 
 namespace {
@@ -9062,7 +9063,10 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   frame.producing = false;
   frame.reason = rtao::Reason::Off;
   frame.note = rtao::Reason::Off;
-  if (!rtao::RtaoRequested()) return;
+  if (!rtao::RtaoRequested()) {
+    rtao::ReleaseRtaoTextures(cmd_list->get_device());
+    return;
+  }
 
   auto* dev = cmd_list->get_device();
   auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
@@ -9071,6 +9075,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
     return;
   }
   auto& rd = rtao::GetRtaoDeviceData(dev);
+  auto& sd = rtao::GetRtaoSvgfData(dev);
   const auto* bvh_data = falcom_world::bvh::GetBvhDeviceData(dev);
   // G5: with the CPU pool reduced, DXR traces the GPU scene and the CPU TLAS may be stale or empty: the region follows the camera.
   const bool pool_reduced = falcom_world::bvh::g_gpu_capture.pool_reduced.load(std::memory_order_relaxed);
@@ -9091,18 +9096,19 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
     frame.reason = rtao::Reason::RangeTooSmall;
     return;
   }
-  // Deferred lists may run after their slots are reused: keep the last AO only if it matches the size.
+  // Deferred lists may run after their slots are reused: keep the last AO only if it was written and matches the size.
   if (cmd_list != dd->immediate_cmd_list) {
     frame.reason = rtao::Reason::DeferredList;
-    if (rtao::OutputSrv(rd).handle != 0u && rd.ao_width == dd->captured_depth_w && rd.ao_height == dd->captured_depth_h) {
+    if (frame.dispatched_frame != UINT64_MAX && rtao::OutputSrv(dev).handle != 0u
+        && sd.denoise.output.width == dd->captured_depth_w && sd.denoise.output.height == dd->captured_depth_h) {
       frame.producing = true;
-      PushRtaoAo(cmd_list, rtao::OutputSrv(rd));
+      PushRtaoAo(cmd_list, rtao::OutputSrv(dev));
     }
     return;
   }
   if (frame.dispatched_frame == dd->frame_index) {
     frame.producing = true;
-    PushRtaoAo(cmd_list, rtao::OutputSrv(rd));
+    PushRtaoAo(cmd_list, rtao::OutputSrv(dev));
     return;
   }
   if (!RtFrameInputsReady(dd, &frame.reason)) return;
@@ -9139,27 +9145,6 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   auto& rf = rtao::g_rtao_frame;
   const bool temporal_on = rtao::g_rtao_temporal_enabled > 0.5f;
   if (temporal_on) rf.temporal_on_frames += 1u;
-  // CPU matrix self-check (D1b): one copy of the camera matrices under the world state mutex, no graphics call.
-  // Indicative only: g_state.camera may be one frame old at this point.
-  if (temporal_on && !rf.matrix_valid) {
-    float vp[16] = {}, vp_inv[16] = {}, prev_vp[16] = {};
-    bool has_prev = false;
-    {
-      std::lock_guard<std::mutex> lock(falcom_world::g_state.mutex);
-      std::memcpy(vp, falcom_world::g_state.camera.view_proj, sizeof(vp));
-      std::memcpy(vp_inv, falcom_world::g_state.camera.view_proj_inv, sizeof(vp_inv));
-      std::memcpy(prev_vp, falcom_world::g_state.camera.prev_view_proj, sizeof(prev_vp));
-      has_prev = falcom_world::g_state.camera.has_prev;
-    }
-    if (has_prev) {
-      const rtao::MatrixSelfCheck check = rtao::CheckSceneMatrices(vp, vp_inv, prev_vp);
-      rf.matrix_valid = true;
-      rf.matrix_identity_err = check.identity_err;
-      rf.matrix_prev_diff = check.prev_diff;
-      renodx::utils::log::i("[world-rtao] scene matrices: |VP*VPinv-I|=", check.identity_err,
-                            " |VP-prevVP|=", check.prev_diff);
-    }
-  }
   static bool taa_never_logged = false;
   if (!taa_never_logged && rf.temporal_on_frames >= 600u && dd->rcas_motion_res == 0u) {
     taa_never_logged = true;
@@ -9170,14 +9155,15 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
       rtao::g_rtao_radius, rtao::g_rtao_ray_max, rtao::g_rtao_strength, rtao::g_rtao_samples,
       rtao::g_rtao_normal_bias, rtao::g_rtao_two_sided, rtao::g_rtao_isfast, rtao::g_rtao_fade_start_pct,
       rtao::g_rtao_fade_end_pct, rtao::g_rtao_temporal_enabled, rtao::g_rtao_history_weight,
-      rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection, rtao::g_rtao_history_clamp,
-      rtao::g_rtao_debug, rtao::g_test_zero_motion, rtao::g_test_freeze_noise, rtao::g_test_camera_matrix,
+      rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection, rtao::g_rtao_debug, rtao::g_test_freeze_noise,
       rtao::g_rtao_foliage_skip, rtao::g_rtao_trace_characters, rtao::g_rtao_trace_resolution};
   const bool params_changed = rf.prev_params_valid && !(params == rf.prev_params);
   if (params_changed) rf.last_parameter_change = rtao::ParameterFieldName(params, rf.prev_params);
   rf.prev_params = params;
   rf.prev_params_valid = true;
-  const bool resized = rd.ao_texture.handle != 0u && (rd.ao_width != in.width || rd.ao_height != in.height);
+  // The denoised output is not the size of this frame (Resize): the next frame restarts the history.
+  const bool resized = rtao::OutputSrv(dev).handle != 0u && (sd.denoise.output.width != in.width || sd.denoise.output.height != in.height);
+  if (resized) rf.dispatched_frame = UINT64_MAX;
   const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
       temporal_on, rf.temporal_last, resized, dd->frame_index, rf.dispatched_frame,
       dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
@@ -9189,22 +9175,33 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
     rf.last_reset = reset;
     rf.reset_counts[static_cast<size_t>(reset)] += 1u;
   }
-  in.temporal = temporal_on;
-  in.spatial = rtao::g_rtao_spatial_enabled > 0.5f;
-  in.filter_type = static_cast<int>(rtao::g_rtao_filter_type);
-  in.filter_radius = static_cast<int>(rtao::g_rtao_filter_radius);
-  in.filter_passes = static_cast<int>(rtao::g_rtao_filter_passes);
-  in.filter_taps = static_cast<int>(in.filter_type == 1 ? rtao::g_rtao_filter_taps_atrous : rtao::g_rtao_filter_taps_separable);
-  in.debug_mode = static_cast<int>(rtao::g_rtao_debug);
-  in.motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u};
-  in.temporal_push = {
-      {rtao::g_rtao_history_weight, rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection,
-       rtao::g_rtao_history_clamp},
-      {0.f, 0.f, 0.f, 0.f},
-      {0.f, 0.f, rtao::g_rtao_debug, reset == rtao::ResetReason::None ? 1.f : 0.f},
-      {rtao::g_test_zero_motion > 0.5f ? 1.f : 0.f, rtao::g_test_camera_matrix > 0.5f ? 1.f : 0.f, 0.f, 0.f},
-      {rf.temporal_last ? 1.f : 0.f, 0.f, 0.f, 0.f},
-  };
+
+  // SVGF glue (rtao_svgf.hpp): the chain is ensured before pass A; a failure produces no AO this frame.
+  // Debug Raw AO (1) runs neither the temporal nor the spatial pass.
+  const bool debug_raw = rtao::g_rtao_debug > 0.5f && rtao::g_rtao_debug < 1.5f;
+  const bool spatial_on = rtao::g_rtao_spatial_enabled > 0.5f;
+  rtao::RtaoSvgfInputs svgf_in = {};
+  svgf_in.depth_view = dd->captured_depth_srv;
+  svgf_in.mrt_normal_view = dd->captured_mrt_normal_srv;
+  svgf_in.scene_cbv_view = dd->captured_scene_cbv_view;
+  svgf_in.motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u};
+  svgf_in.full_width = dd->captured_depth_w;
+  svgf_in.full_height = dd->captured_depth_h;
+  svgf_in.trace_width = rtao::RtgiTraceExtent(in.width, in.trace_divisor);
+  svgf_in.trace_height = rtao::RtgiTraceExtent(in.height, in.trace_divisor);
+  svgf_in.divisor = in.trace_divisor;
+  svgf_in.temporal = temporal_on && motion_ok && !debug_raw;
+  svgf_in.spatial = spatial_on && !debug_raw;
+  svgf_in.stats = rtao::g_rtao_discovery < 0.5f;
+  svgf_in.svgf = {rtao::g_rtao_history_weight, rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection,
+                  reset == rtao::ResetReason::None, rtao::g_rtao_svgf_iterations, rtao::g_rtao_svgf_luminance_edge_stop};
+  const falcom_world::rtgi::RtgiDenoiseReady ready = rtao::EnsureRtaoSvgf(dev, svgf_in);
+  if (!ready.ok) {
+    rf.temporal_ran = false;
+    rf.temporal_last = false;
+    frame.reason = rtao::Reason::PipelineFailed;
+    return;
+  }
 
   const bool rtgi_characters = falcom_world::rtgi::g_rtgi_enabled > 0.5f && falcom_world::rtgi::g_rtgi_trace_characters > 0.5f;
   if (rtao::g_rtao_trace_characters > 0.5f || rtgi_characters) {
@@ -9213,36 +9210,31 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
     if (rtao::g_rtao_trace_characters > 0.5f) in.dynamic = characters;
   }
   const rtao::RtaoDispatchResult result = rtao::Dispatch(dev, cmd_list, in);
-  rf.temporal_ran = result.temporal_ran;
-  rf.temporal_last = temporal_on && result.temporal_ran;
   if (!result.ok) {
+    rf.temporal_ran = false;
+    rf.temporal_last = false;
     frame.reason = result.pool_reduced ? rtao::Reason::PoolReduced : rtao::Reason::PipelineFailed;
     return;
   }
-  // Temporal requested but pass B did not run: round-1 AO this frame, history invalid next frame.
-  if (temporal_on && !result.temporal_ran) frame.note = motion_ok ? rtao::Reason::PipelineFailed : rtao::Reason::NoMotion;
+  rtao::DispatchRtaoSvgf(dev, cmd_list, svgf_in, ready);
+  rf.temporal_ran = ready.temporal;
+  rf.temporal_last = temporal_on && ready.temporal;
+  // Temporal requested but the reprojection did not run: the output is the spatial-only or raw AO this frame.
+  if (temporal_on && !debug_raw && !ready.temporal) frame.note = motion_ok ? rtao::Reason::PipelineFailed : rtao::Reason::NoMotion;
+  if (spatial_on && !debug_raw && !ready.spatial && frame.note == rtao::Reason::Off) frame.note = rtao::Reason::FilterFailed;
   frame.dispatched_frame = dd->frame_index;
   frame.producing = true;
   frame.gpu_ms = rd.timer.last_ms;
-  frame.filter_gpu_ms = rd.filter_timer.last_ms;
-  frame.filter_requested = in.spatial;
-  frame.filter_ran = rd.filter_ran;
-  frame.filter_failed = rd.filter_failed;
-  frame.filter_type = in.filter_type;
-  frame.filter_radius = in.filter_radius;
-  frame.filter_taps_requested = in.filter_taps;
-  const rtao::FilterPlan filter_plan = rtao::MakeFilterPlan(in.filter_type, in.filter_radius, in.filter_passes, in.filter_taps);
-  frame.filter_iterations = filter_plan.iterations;
-  frame.filter_passes = filter_plan.pass_count;
-  frame.filter_taps = filter_plan.passes[0].taps;
-  frame.filter_tap_count = filter_plan.taps_side;
-  if (rd.filter_failed && frame.note == rtao::Reason::Off) frame.note = rtao::Reason::FilterFailed;
+  frame.denoise_gpu_ms = sd.denoise.timer.last_ms;
+  frame.filter_ran = ready.spatial;
+  frame.svgf_iterations = sd.denoise.atrous_iterations;
+  frame.svgf_stats = svgf_in.stats;
   frame.captured = params;
   frame.captured_isfast_used = isfast_used;
-  const uint64_t pixels = static_cast<uint64_t>(rd.ao_width) * rd.ao_height;
-  rf.temporal_bytes = rd.raw_texture[0].handle != 0u ? pixels * (2u * 2u + 2u * 8u) : 0u;
-  frame.texture_bytes = pixels * 4u + sizeof(uint32_t) * rtao::kRtaoStatsCount + rf.temporal_bytes;
-  PushRtaoAo(cmd_list, rtao::OutputSrv(rd));
+  const uint64_t trace_pixels = static_cast<uint64_t>(rf.trace_width) * rf.trace_height;
+  frame.texture_bytes = sizeof(uint32_t) * rtao::kRtaoStatsCount + trace_pixels * 2u + trace_pixels * 8u
+                        + falcom_world::rtgi::RtgiDenoiseTextureBytes(sd.denoise);
+  PushRtaoAo(cmd_list, rtao::OutputSrv(dev));
 }
 
 // RT Local Shadows (world/rtls): independent of RTAO and RTGI. Binds this frame's term at t38 for the Sora 2nd lighting draw.
@@ -10846,7 +10838,7 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
   // the same buffer, in Full and in low-res modes alike.
   reshade::api::resource_view ao_gtvbao = {};
   if (falcom_world::rtao::g_rtao_frame.producing) {
-    ao_gtvbao = falcom_world::rtao::OutputSrv(falcom_world::rtao::GetRtaoDeviceData(dev));
+    ao_gtvbao = falcom_world::rtao::OutputSrv(dev);
   } else if (shader_injection.gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested()) {
     ao_gtvbao = d->gtvbao_denoise.output.srv[d->gtvbao_denoise.output_index];
   }

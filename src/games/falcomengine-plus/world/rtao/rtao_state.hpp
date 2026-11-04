@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cmath>
 #include <cstdint>
 
 namespace falcom_world::rtao {
@@ -24,25 +23,19 @@ inline float g_rtao_trace_resolution = 0.f;  // Trace Resolution: RTAO traces at
 inline float g_rtao_char_intensity = 1.f;  // Character Intensity: RTAO kept on character pixels (lighting shader)
 inline float g_rtao_max_darkening = 1.f;  // Max Darkening: AO is never below 1 - this (lighting shader)
 inline float g_rtao_temporal_enabled = 1.f;
-inline float g_rtao_history_weight = 0.9f;
-inline float g_rtao_depth_rejection = 0.05f;
-inline float g_rtao_normal_rejection = 0.9f;
-inline float g_rtao_history_clamp = 1.f;
+inline float g_rtao_history_weight = 0.8f;
+inline float g_rtao_depth_rejection = 0.2f;
+inline float g_rtao_normal_rejection = 0.f;
 inline float g_rtao_isfast = 1.f;
-inline float g_rtao_spatial_enabled = 0.f;
-inline float g_rtao_filter_radius = 2.f;
-inline float g_rtao_filter_type = 0.f;  // Filter Type: 0 separable bilateral, 1 a-trous
-inline float g_rtao_filter_passes = 1.f;          // Filter Passes: 1..4
-inline float g_rtao_filter_taps_separable = 5.f;  // Filter Taps (separable): 3..17
-inline float g_rtao_filter_taps_atrous = 5.f;     // Filter Taps (a-trous): 3..9
+inline float g_rtao_spatial_enabled = 1.f;
+inline float g_rtao_svgf_iterations = 5.f;
+inline float g_rtao_svgf_luminance_edge_stop = 4.f;
 inline float g_rtao_fade_start_pct = 15.625f;  // Fade Start: percent of the BVH range (Region)
 inline float g_rtao_fade_end_pct = 31.25f;    // Fade End: percent of the BVH range (Region)
-inline float g_rtao_debug = 0.f;       // RTAO Debug (advanced): 0 off, 1 raw AO, 2 accumulated AO, 3 history confidence
+inline float g_rtao_debug = 0.f;       // RTAO Debug (advanced): 0 off, 1 raw AO, 2 denoised AO
 inline float g_rtao_discovery = 0.f;   // Two-Sided discovery (advanced, diagnostic): GPU facing test when 1
 // Test rows (advanced, session only: their key is empty, so settings.hpp never saves them).
-inline float g_test_zero_motion = 0.f;  // pass B looks up the history at the same pixel
 inline float g_test_freeze_noise = 0.f; // pass A uses a fixed slice and seed
-inline float g_test_camera_matrix = 0.f; // pass B looks up the history with the camera matrix (force zero motion wins)
 
 enum class Reason : uint8_t {
   Off = 0,
@@ -98,8 +91,8 @@ struct Fade {
 // Settings that shape the AO. A change resets the temporal history for one frame (R2-S4).
 struct ParameterSnapshot {
   float radius, ray_max, strength, samples, normal_bias, two_sided, isfast, fade_start, fade_end;  // fade: percent of the range
-  float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug;
-  float zero_motion, freeze_noise, camera_matrix;
+  float temporal_enabled, history_weight, depth_rejection, normal_rejection, debug;
+  float freeze_noise;
   float foliage_skip;
   float trace_characters;
   float trace_resolution;
@@ -150,136 +143,6 @@ inline MotionCheck CheckMotionResources(uint64_t rcas_res, uint64_t rtv4_res) {
 // Number of Reason codes (frames without AO are counted per code).
 inline constexpr size_t kReasonCount = 17u;
 
-// Names of the pass B diagnostics, in index order (stats index = kRtaoStatTemporalFBase + i).
-inline constexpr const char* kTemporalDiagnosticNames[16] = {
-    "moving_pixels", "motion_max", "motion_sum", "clamp_active",
-    "clamp_shift_sum", "alpha_sum", "abs_raw_ao_sum", "no_history", "texel_differs",
-    "matrix_lt_0.1", "matrix_lt_0.25", "matrix_lt_0.5", "matrix_lt_1", "matrix_ge_1", "matrix_diff_sum", "matrix_diff_max"};
-
-// Names of the output quality statistics, in index order (stats index = kRtaoStatQualityBase + i).
-inline constexpr const char* kQualityStatNames[7] = {
-    "ao_sum", "raw_sum", "rough_pairs", "rough_raw_sum", "rough_prev_out_sum", "change_pairs", "change_sum"};
-
-// Mean of a per-pixel sum kept x1000 over count pixels; 0 when count is 0.
-inline double MeanFromSum(uint32_t sum_x1000, uint32_t count) {
-  return count > 0u ? sum_x1000 / 1000.0 / count : 0.0;
-}
-
-// Width of the soft normal weight ramp (HLSL kNormalRampWidth in world_rt_denoise.hlsli): full at T, zero at T - width.
-inline constexpr float kNormalRampWidth = 0.4f;
-
-// Spatial filter (denoises the final AO only). Edge stops are shared by both kernels; see the filter shader.
-inline constexpr float kFilterPlaneSigma = 0.02f;  // plane distance, relative to the view distance
-inline constexpr float kFilterNormalPower = 16.f;  // normal weight = saturate(dot)^power
-inline constexpr float kFilterMinSigma = 0.5f;     // separable Gaussian sigma floor (pixels)
-inline constexpr float kFilterChangeScale = 8.f;   // debug mode 8: saturate(|filtered - AO| * scale)
-inline constexpr uint32_t kFilterMaxPasses = 4u;      // Filter Passes upper bound
-inline constexpr int kFilterTapsMin = 3;              // Filter Taps lower bound (odd side)
-inline constexpr int kFilterSeparableTapsMax = 17;    // separable taps per pass (odd side)
-inline constexpr int kFilterAtrousTapsMax = 9;        // a-trous taps per axis (odd side)
-
-enum class FilterKind : uint8_t { Separable, ATrous };
-enum class FilterSlot : uint8_t { A, F0, F1, B };  // A: AO (uint), F0/F1: intermediates (float), B: filtered AO (uint)
-enum class FilterDirection : uint8_t { Horizontal, Vertical, Both };  // Both: 2D a-trous pass
-
-struct FilterPass {
-  FilterSlot input;
-  FilterSlot output;
-  FilterDirection direction;
-  uint32_t step;       // tap spacing in pixels (separable: always 1; a-trous: this pass's step)
-  uint32_t taps;       // samples per dispatch (separable: N_eff; a-trous: N_eff^2)
-  uint32_t footprint;  // reach in pixels per side (separable: h; a-trous: h * step), h = (N_eff - 1) / 2
-};
-
-struct FilterPlan {
-  FilterKind kind;
-  uint32_t iterations;  // the Filter Passes setting
-  uint32_t pass_count;  // dispatches
-  uint32_t taps_side;   // effective odd taps per axis, N_eff
-  float sigma;          // separable spatial Gaussian sigma (pixels); 0 for a-trous
-  FilterPass passes[2 * kFilterMaxPasses];
-};
-
-// Pass schedule for a Filter Type (0 separable bilateral, 1 a-trous), Radius 1..8, Filter Passes 1..4 and Filter
-// Taps (N_eff odd; an even value rounds up, clamped to 3..17 separable, 3..9 a-trous). Separable: each pass is one
-// horizontal or vertical 1D pass with N_eff taps at spacing 1; the passes alternate H, V (two dispatches per pass).
-// A-trous: one 2D pass per Filter Pass with N_eff^2 taps; the step doubles per pass up to max(1, R / 2) (the first
-// pass is dense). Intermediates alternate F0 and F1; the last dispatch writes B.
-inline FilterPlan MakeFilterPlan(int type, int radius, int passes, int taps) {
-  FilterPlan plan{};
-  const bool separable = type != 1;
-  const int r = radius < 1 ? 1 : (radius > 8 ? 8 : radius);
-  const uint32_t n = static_cast<uint32_t>(passes < 1 ? 1 : (passes > static_cast<int>(kFilterMaxPasses) ? static_cast<int>(kFilterMaxPasses) : passes));
-  const int taps_max = separable ? kFilterSeparableTapsMax : kFilterAtrousTapsMax;
-  const uint32_t side = static_cast<uint32_t>((taps < kFilterTapsMin ? kFilterTapsMin : (taps > taps_max ? taps_max : taps)) | 1);
-  const uint32_t h = (side - 1u) / 2u;
-  const uint32_t s_max = static_cast<uint32_t>(r) / 2u > 1u ? static_cast<uint32_t>(r) / 2u : 1u;
-  plan.kind = separable ? FilterKind::Separable : FilterKind::ATrous;
-  plan.iterations = n;
-  plan.pass_count = separable ? 2u * n : n;
-  plan.taps_side = side;
-  plan.sigma = separable ? (r * 0.5f > kFilterMinSigma ? r * 0.5f : kFilterMinSigma) : 0.f;
-  for (uint32_t i = 0; i < plan.pass_count; ++i) {
-    FilterPass& pass = plan.passes[i];
-    pass.output = i + 1u == plan.pass_count ? FilterSlot::B : (i % 2u == 0u ? FilterSlot::F0 : FilterSlot::F1);
-    pass.input = i == 0u ? FilterSlot::A : plan.passes[i - 1u].output;
-    pass.direction = !separable ? FilterDirection::Both : (i % 2u == 0u ? FilterDirection::Horizontal : FilterDirection::Vertical);
-    pass.step = separable ? 1u : (1u << i < s_max ? 1u << i : s_max);
-    pass.taps = separable ? side : side * side;
-    pass.footprint = separable ? h : h * pass.step;
-  }
-  return plan;
-}
-
-// Histogram bin of a motion vs camera-matrix difference in pixels: 0 below 0.1, 1 below 0.25, 2 below 0.5,
-// 3 below 1, 4 otherwise. Negative values count as 0; NaN counts as 4 (never in the first bin). The HLSL does the same.
-inline uint32_t DiffBin(float diff_px) {
-  if (diff_px != diff_px) return 4u;
-  if (diff_px < 0.1f) return 0u;
-  if (diff_px < 0.25f) return 1u;
-  if (diff_px < 0.5f) return 2u;
-  if (diff_px < 1.0f) return 3u;
-  return 4u;
-}
-
-// CPU matrix self-check (no graphics call). identity_err = max |VP * VPinv - I| (a true inverse pair gives ~0; the
-// product is the same in either order). prev_diff = max |VP - prevVP| over the 16 elements. Matrices are row-major
-// float[16], the layout CameraSnapshot stores.
-struct MatrixSelfCheck {
-  float identity_err;
-  float prev_diff;
-};
-
-inline MatrixSelfCheck CheckSceneMatrices(const float vp[16], const float vp_inv[16], const float prev_vp[16]) {
-  MatrixSelfCheck result = {0.f, 0.f};
-  for (int r = 0; r < 4; ++r) {
-    for (int c = 0; c < 4; ++c) {
-      float sum = 0.f;
-      for (int k = 0; k < 4; ++k) sum += vp[r * 4 + k] * vp_inv[k * 4 + c];
-      const float err = std::fabs(sum - (r == c ? 1.f : 0.f));
-      if (err > result.identity_err) result.identity_err = err;
-    }
-  }
-  for (int i = 0; i < 16; ++i) {
-    const float d = std::fabs(vp[i] - prev_vp[i]);
-    if (d > result.prev_diff) result.prev_diff = d;
-  }
-  return result;
-}
-
-// Depth-ratio bin of the highest-weight history tap (P0-B), the same edges as the pass B shader. 0 invalid history
-// (distance <= 0 or NaN); 1 below 0.1%; 2 below 0.5%; 3 below 1%; 4 below 2%; 5 below 5%; 6 otherwise (and NaN).
-inline uint32_t DepthRatioBin(float history_dist, float ratio) {
-  if (!(history_dist > 0.f)) return 0u;
-  if (ratio != ratio) return 6u;
-  if (ratio < 0.001f) return 1u;
-  if (ratio < 0.005f) return 2u;
-  if (ratio < 0.01f) return 3u;
-  if (ratio < 0.02f) return 4u;
-  if (ratio < 0.05f) return 5u;
-  return 6u;
-}
-
 // Pass A sampling slice and seed (b12 c1.z and c1.w). Freeze noise gives 0 and 0 for every frame; otherwise the
 // values are the ones the round-1 dispatch always used.
 struct NoiseSample {
@@ -291,23 +154,6 @@ inline NoiseSample RtaoNoiseSample(uint64_t frame_index, uint32_t spp, bool free
   if (freeze) return {0.f, 0.f};
   return {static_cast<float>((frame_index * static_cast<uint64_t>(spp)) % 32u),
           static_cast<float>(frame_index % 1024u)};
-}
-
-// Denominators of the pass B shares (D0). Pass A and pass B both count every pixel of the dispatch. The four
-// neutral classes (sky, normal, region, scaled) are exactly the pixels that pass A marks raw = -1 and pass B
-// skips: the traced count is the rest. reset_traced removes the neutral pixels from pass B reset_pixels.
-struct TracedDenominators {
-  uint32_t traced;
-  uint32_t taps;         // 4 bilinear taps per traced pixel
-  uint32_t reset_traced;
-};
-
-inline TracedDenominators ComputeTracedDenominators(uint32_t pixels, uint32_t sky, uint32_t normal, uint32_t region,
-                                                    uint32_t scaled, uint32_t reset_pixels) {
-  const uint32_t neutral = sky + normal + region + scaled;
-  const uint32_t traced = pixels > neutral ? pixels - neutral : 0u;
-  const uint32_t reset_traced = reset_pixels > neutral ? reset_pixels - neutral : 0u;
-  return {traced, 4u * traced, reset_traced};
 }
 
 // Share in percent; 0 when the denominator is 0 (no division).
@@ -330,11 +176,8 @@ inline const char* ParameterFieldName(const ParameterSnapshot& a, const Paramete
   if (a.history_weight != b.history_weight) return "history_weight";
   if (a.depth_rejection != b.depth_rejection) return "depth_rejection";
   if (a.normal_rejection != b.normal_rejection) return "normal_rejection";
-  if (a.history_clamp != b.history_clamp) return "history_clamp";
   if (a.debug != b.debug) return "debug";
-  if (a.zero_motion != b.zero_motion) return "test_zero_motion";
   if (a.freeze_noise != b.freeze_noise) return "test_freeze_noise";
-  if (a.camera_matrix != b.camera_matrix) return "test_camera_matrix";
   if (a.foliage_skip != b.foliage_skip) return "foliage_skip";
   if (a.trace_characters != b.trace_characters) return "trace_characters";
   if (a.trace_resolution != b.trace_resolution) return "trace_resolution";

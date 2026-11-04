@@ -18,6 +18,7 @@
 #include "../../../../utils/data.hpp"
 #include "../../../../utils/render.hpp"
 #include "../rtao/rtao.hpp"
+#include "../rtao/rtao_svgf.hpp"
 #include "../rtgi/rtgi.hpp"
 #include "../rtls/rtls.hpp"
 #include "../rtsun/rtsun.hpp"
@@ -336,6 +337,7 @@ inline void OnWorldPresentBvh(
   if (g_perf_gate.clear_pending.exchange(false)) {
     ClearPerfGathered(GetBvhDeviceData(device));
     rtao::ClearRtaoPerfGathered(device);
+    ClearGpuTimerStats(&rtao::GetRtaoSvgfData(device).denoise.timer);
     rtgi::ClearRtgiPerfGathered(device);
     rtls::RtlsDeviceData& rtls_data = rtls::GetRtlsDeviceData(device);
     ClearGpuTimerStats(&rtls_data.timer);
@@ -357,7 +359,8 @@ inline void OnWorldPresentBvh(
     {
       const rtao::RtaoDeviceData& rtao_data = rtao::GetRtaoDeviceData(device);
       extra.rtao = {rtao_data.timer.ms_sum, rtao_data.timer.samples};
-      extra.rtao_filter = {rtao_data.filter_timer.ms_sum, rtao_data.filter_timer.samples};
+      const rtao::RtaoSvgfData& rtao_svgf = rtao::GetRtaoSvgfData(device);
+      extra.rtao_filter = {rtao_svgf.denoise.timer.ms_sum, rtao_svgf.denoise.timer.samples};
     }
     {
       const rtgi::RtgiDeviceData& rtgi_data = rtgi::GetRtgiDeviceData(device);

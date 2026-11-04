@@ -1,8 +1,7 @@
 #pragma once
 
-// world_rt_denoise.hlsli - denoiser math shared by the RTAO passes (world_rtao_temporal, world_rtao_filter) and the RTGI
-// passes (world_rtgi_temporal, world_rtgi_filter, world_rtgi_upsample): one implementation of the temporal accept
-// rules, the history clamp and the spatial edge stops. Pure functions; no resources or constant buffers.
+// world_rt_denoise.hlsli - denoiser math shared by the SVGF passes (world_svgf.hlsli) and the upsample (world_rtgi_upsample).
+// Pure functions; no resources or constant buffers.
 
 // Soft normal weight: a history tap counts fully at dot >= the Normal Rejection value and falls linearly to 0 over this width.
 static const float kNormalRampWidth = 0.4;
@@ -35,14 +34,6 @@ bool TemporalDepthAccept(float history_dist, float dist_cur, float depth_rejecti
 float TemporalNormalWeight(float tap_dot, float normal_rejection)
 {
     return saturate((tap_dot - (normal_rejection - kNormalRampWidth)) / kNormalRampWidth);
-}
-
-// History clamp: value clamped to the neighbourhood mean +/- k * sigma from the sum s1, the sum of squares s2 and the count n.
-float ClampToNeighbourhood(float value, float s1, float s2, float n, float k)
-{
-    const float mean = s1 / n;
-    const float sigma = sqrt(max(s2 / n - mean * mean, 0.0));
-    return clamp(value, mean - k * sigma, mean + k * sigma);
 }
 
 // Spatial edge stop of a tap (Pt, Nt) against the centre (Pc, Nc, dist_c): depth-plane distance and normal dot.

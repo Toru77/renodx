@@ -72,7 +72,7 @@ enum PerfBlock : size_t {
   kPerfBlockGcPresent,     // rt12::OnGcPresent, whole (OnWorldPresentBvh)
   kPerfBlockRt12Present,   // rt12::OnPresent, whole (OnWorldPresentBvh)
   kPerfBlockDrawHookPre,   // WorldDrawCallback direct: hook start to record start
-  kPerfBlockRtaoPost,      // rtao::Dispatch after pass A: upsample, pass B, filter, table nulls
+  kPerfBlockRtaoPost,      // rtao_svgf.hpp DispatchRtaoSvgf: input pass, SVGF chain, upsample, table nulls
   kPerfBlockRt12PassA,     // rt12::RunRtaoPassA, whole
   kPerfBlockRt12D3d11Passes,  // RunRtaoPassA steps 10-11: D3D11 noise copy and passes
   kPerfBlockRt12Record,    // RunRtaoPassA step 13: D3D12 recording to Close
