@@ -38,6 +38,7 @@ cbuffer cb_scene : register(b0)
   float4x4 proj_g          : packoffset(c8);
   float4x4 projInv_g       : packoffset(c12);
   float4x4 viewProjInv_g   : packoffset(c20);
+  float2 resolutionScaling_g : packoffset(c49);
 };
 
 // ── User settings via push_constants (b13) ──
@@ -78,11 +79,11 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_foliage_ao_value;         // c[28] - [0..1] - AO value for excluded foliage
   float GTVBAO_foliage_channel_mode;     // c[29] - 0=o1.w (Sora), 1=o1.z (Kai)
   float GTVBAO_foliage_mask_valid;       // c[30] - 1 = mask pre-pass ran this frame (mask is fresh)
-  // - spatial filter -
-  float GTVBAO_filter_kind;              // c[31] - 0=Separable bilateral, 1=A-trous
-  float GTVBAO_filter_radius;            // c[32] - pixel radius
-  float GTVBAO_filter_taps;              // c[33] - taps per axis (separable) or square kernel side (a-trous)
-  float GTVBAO_filter_step;              // c[34] - a-trous stride for this dispatch (1, 2, 4)
+  // - AO upsample skip (gtvbao_main.cs_5_0.hlsl; 0 in every other pass) -
+  float GTVBAO_skip_unread;              // c[31] - 0 = off, 1 = no-depth texels (SVGF reprojects), 2 = upsample tap test
+  float GTVBAO_skip_full_width;          // c[32] - the upsample's full width
+  float GTVBAO_skip_full_height;         // c[33] - the upsample's full height
+  float GTVBAO_skip_divisor;             // c[34] - the upsample's divisor d
   // - Low-resolution spatial pipeline (appended; Full path ignores these) -
   float GTVBAO_resolution;               // c[35] - 0=Full, 1=Half
   float GTVBAO_hemisphere_weighting;     // c[36] - 0=Cosine, 1=Uniform

@@ -6,6 +6,9 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "gtvbao_common.hlsl"
+#ifndef GTVBAO_GI
+#include "../world/shaders/world_rt_denoise.hlsli"
+#endif
 
 Texture2D<lpfloat>     g_srcWorkingDepth   : register(t0);
 Texture2D<uint4>       g_srcMrtNormal      : register(t1);
@@ -14,12 +17,11 @@ SamplerState           g_samplerPointClamp : register(s0);
 // ── IS-FAST noise (t2 = 3D noise texture / unused when off) ──
 Texture3D<float2>      g_isfastNoiseTexture : register(t2);
 Texture2D<uint>        g_srcFoliageMask    : register(t3);
-
-#ifdef GTVBAO_GI
-RWTexture2D<float4>        g_outWorkingAOTerm : register(u0);  // raw GI in the GI flavour
-#else
-RWTexture2D<uint>          g_outWorkingAOTerm : register(u0);
+#ifndef GTVBAO_GI
+Texture2D<float4> g_srcGameDepth : register(t4); // game depth, the AO upsample's t0 (upsample skip)
 #endif
+
+RWTexture2D<float4> g_outWorkingAOTerm : register(u0); // AO: SVGF raw (GTVBAO_WriteSvgfRaw); GI: raw GI
 RWTexture2D<float4>        g_outDebug         : register(u1);
 
 // ── Interleaved Gradient Noise (IGN) — IS-FAST fallback ──
@@ -202,8 +204,12 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
   // something only once its setting leaves neutral.
   float sharpness = max(0.01, GTVBAO_normal_sharpness);
   float base_blend = pow(saturate(GTVBAO_normal_depth_blend), 1.0 / sharpness);
-  float edge_metric = ComputeDepthEdgeMetric(pix, consts);
-  float edge_att = 1.0 - saturate(edge_metric * max(0.0, GTVBAO_normal_edge_rejection));
+  // Rejection <= 0 or NaN (max(0, r) maps both to 0) gives edge_att = 1 exactly, because the metric is saturated; its five
+  // depth loads are skipped then.
+  float edge_att = 1.0;
+  if (GTVBAO_normal_edge_rejection > 0.0) {
+    edge_att = 1.0 - saturate(ComputeDepthEdgeMetric(pix, consts) * GTVBAO_normal_edge_rejection);
+  }
   float normal_delta = 1.0 - saturate(dot(depth_fallback, tuned));
   // Reweight by MRT-vs-depth disagreement. 0 = neutral, i.e. gain exactly 1.0.
   // 1 = the full 0.35..1.25 swing, which leans on the depth normal where the
@@ -225,6 +231,22 @@ void main(uint2 p : SV_DispatchThreadID)
   uint width, height;
   g_outWorkingAOTerm.GetDimensions(width, height);
   if (p.x >= width || p.y >= height) return;
+#ifndef GTVBAO_GI
+  // Texels the AO upsample (world_rtgi_upsample.cs_5_0.hlsl) does not read skip the pass. Mode 2 is the upsample's own
+  // test: its tap test at the texel's representative pixel, or no surface anywhere while resolution scaling is active.
+  // Mode 1 (the SVGF chain reprojects) skips only texels without depth: their guide z is 0, so no SVGF pass reads them
+  // as a neighbour or as history, while a texel with depth can still be read. Off while a debug view (22 and up) is shown.
+  if (GTVBAO_skip_unread > 0.5f && GTVBAO_debug_mode <= 21.5f) {
+    const uint2 rep = RtTraceRepresentativePixel(p, max((uint)GTVBAO_skip_divisor, 1u), uint2(GTVBAO_skip_full_width, GTVBAO_skip_full_height));
+    const float rep_depth = g_srcGameDepth.Load(int3(rep, 0)).x;
+    bool unread = rep_depth <= 0.0;
+    if (GTVBAO_skip_unread > 1.5f) {
+      const float3 rep_normal = DecodeFalcomMrtNormalAsGame(g_srcMrtNormal.Load(int3(rep, 0)).xy);
+      unread = RtUpsampleTapRejected(rep_depth, rep_normal) || !all(resolutionScaling_g == float2(1.0, 1.0));
+    }
+    if (unread) { GTVBAO_WriteSvgfRaw(g_outWorkingAOTerm, p, 255u); return; }
+  }
+#endif
 
   GTAOConstants consts = BuildGTAOConstants(uint2(width, height));
 

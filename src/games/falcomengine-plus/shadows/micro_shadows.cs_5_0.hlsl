@@ -96,7 +96,7 @@ void main(uint2 p : SV_DispatchThreadID)
 
   const bool use_gtvbao = shader_injection_data.cs_micro_ao_source > 0.5f;
   // GTVBAO quantises the visibility term into byte 0 of an r32_uint
-  // (GTVBAO_OutputWorkingTerm), so the decode is a straight /255 on that byte --
+  // (the AO upsample, world_rtgi_upsample.cs_5_0.hlsl with RTGI_UPSAMPLE_AO_BYTE), so the decode is a straight /255 on that byte --
   // reading the same resource as a float would give the integer bit pattern.
   const float ao = use_gtvbao
       ? saturate(float(g_srcAoGtvbao.Load(int3(aoTexel, 0)).x) / 255.0)

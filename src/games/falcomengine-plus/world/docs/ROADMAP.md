@@ -42,7 +42,7 @@ SVGF M1 (the shared denoise chain of RTGI, GTVBGI, RT Local Shadows and RT Sun),
 9. Perf tab: gpu_*_denoise from a 30-second performance test.
 Non-paper choices (each marked in the code): history length cap 32, alpha floor 1/h, eps_z = 1e-3 z, eps_l = 1e-6. Falcor differences recorded in code comments (reference\svgf\.referencecode), not implemented: depth gradient form, spatial luminance term and 4/h boost, moments alpha, tap renormalisation, fwidth consistency tests.
 
-SVGF M2a (GTVBAO), implemented, not validated in game: GTVBAO AO runs the main pass (byte), then the input pass (float, x 1.5 applied once), then the shared SVGF chain (`EnsureRtgiDenoise` and `DispatchRtgiDenoise`, r32_uint output), then the byte upsample. It runs at Full and Half on every game that runs GTVBAO. The main pass is never final; the x 1.5 scale is applied only in `gtvbao_svgf_input`. Removed: the GTVBAO temporal, filter, upscale and normal-prep shaders with their pipelines, textures and settings rows (GtvbaoHistoryClamp, GtvbaoFilterType, GtvbaoFilterRadius, GTVBAOAtrous*, GtvbaoFilterTaps*). New rows: GtvbaoSpatialEnabled, GtvbaoSvgfIterations, GtvbaoSvgfLuminanceEdgeStop. GTVBAO Half Res Iterations (`GtvbaoSvgfHalfResIterations`, 1 to 4, default 4) sets the a-trous count at Half; Iterations (label Full Res Iterations) applies at Full only. Owner test list (Sora 1st, Sora 2nd and Kai):
+SVGF M2a (GTVBAO), implemented, not validated in game: GTVBAO AO runs the main pass, which writes the SVGF raw layout directly (the AO byte x 1.5, applied once; perf P4), then the shared SVGF chain (`EnsureRtgiDenoise` and `DispatchRtgiDenoise`, r32_uint output), then the byte upsample. It runs at Full and Half on every game that runs GTVBAO. The main pass is never final; the x 1.5 scale is applied only in `GTVBAO_WriteSvgfRaw`. Removed: the GTVBAO temporal, filter, upscale and normal-prep shaders with their pipelines, textures and settings rows (GtvbaoHistoryClamp, GtvbaoFilterType, GtvbaoFilterRadius, GTVBAOAtrous*, GtvbaoFilterTaps*). New rows: GtvbaoSpatialEnabled, GtvbaoSvgfIterations, GtvbaoSvgfLuminanceEdgeStop. GTVBAO Half Res Iterations (`GtvbaoSvgfHalfResIterations`, 1 to 4, default 4) sets the a-trous count at Half; Iterations (label Full Res Iterations) applies at Full only. Owner test list (Sora 1st, Sora 2nd and Kai):
 1. Defaults at Full, then at Half: screenshots of the final image and of Debug AO Only against HEAD; no seams and no white or black blocks at silhouettes.
 2. Temporal off, spatial off, both off.
 3. Iterations 1 to 5 at Full and at Half.
@@ -53,6 +53,37 @@ SVGF M2a (GTVBAO), implemented, not validated in game: GTVBAO AO runs the main p
 8. Deferred Dispatch on: AO renders and the game does not crash.
 9. Sora 2nd with the DevKit: RTAO on, then off. GTVBAO comes back.
 Send back: screenshots, the `[gtvbao]` and `[world-rtgi]` log lines (no "svgf chain not ready" line), FPS against HEAD, and GPU memory.
+
+GTVBAO perf P1 (skip texels the upsample does not read), implemented, not validated in game: the GTVBAO main pass skips the texels the AO upsample does not read, writing byte 255 without tracing. Mode 2 (the SVGF chain does not reproject, or resolution scaling is active) uses the upsample's tap test at the texel's representative pixel; mode 1 (the chain reprojects) skips only texels without depth. The main pass reads the game depth at t4 (AO only), and the mode, full size and divisor come from `GtvbaoPassPush` (c[31..34]). The tap test's normal term never rejects today (`DecodeFalcomMrtNormalAsGame` returns a unit vector); it is kept so the skip uses the upsample's own rule (`RtUpsampleTapRejected`), and test_gpu_gtvbao models mode 2 by depth only. Off while a debug view (22 and up) is shown. Owner test list (Sora 1st, Sora 2nd and Kai):
+1. Full with Temporal off and Spatial off: identical to HEAD (final image and Debug Raw AO).
+2. Defaults identical to HEAD at Full and at Half.
+3. Half with the denoiser on and off: identical to HEAD.
+4. Debug Raw AO (22) matches HEAD.
+5. Deferred Dispatch on: AO renders and the game does not crash.
+Send back: screenshots, the `[gtvbao]` log lines, FPS against HEAD.
+
+GTVBAO perf P2 (foliage early exit), implemented, not validated in game: with Foliage AO Value 0, a foliage pixel is written as byte 255 and the main pass returns before the AO work (the blend would give 255 anyway). Debug views (22 and up) keep the full pass. Owner test list (Sora 1st, Sora 2nd and Kai):
+1. Foliage AO Value 0 in a foliage scene: identical to HEAD (final image and Debug Raw AO).
+2. Foliage AO Value 0.5 and Exclude Foliage off: identical to HEAD.
+3. FPS in a foliage scene against HEAD.
+Send back: screenshots and FPS against HEAD.
+
+GTVBAO perf P3 (AO upsample at Full), implemented, not validated in game: at d = 1 the AO byte upsample skips the taps after the first used one (their weight is exactly 0). It applies to GTVBAO and RTAO (one shader) and is bit-identical (test_gpu_gtvbao on WARP, 0 mismatches) while the skipped taps have finite weights and values; a NaN or infinite depth, normal or AO value at a skipped tap made the HEAD sums NaN, so only then can the result differ from HEAD. Owner test list (Sora 1st, Sora 2nd and Kai):
+1. GTVBAO at Full: identical to HEAD (final image and Debug Raw AO).
+2. GTVBAO at Half: identical to HEAD.
+3. RTAO at Full: identical to HEAD.
+4. FPS at Full against HEAD.
+Send back: screenshots and FPS against HEAD.
+
+GTVBAO perf P4 (AO written in the SVGF raw layout), implemented, not validated in game: the GTVBAO main pass writes the SVGF raw layout (`GTVBAO_WriteSvgfRaw`) directly, and the separate input pass is gone. `ao_term_a` is still allocated but no longer written; removing it is deferred cleanup. Owner test: the SVGF M2a list items 1, 2, 4, 6 and 8 against HEAD.
+
+GTVBAO perf P5 (CDF hoist, edge metric skip, full-mask stop), implemented, not validated in game: the per-slice cosine CDF terms are computed once per slice; the normal edge metric is skipped at Normal Edge Rejection 0 (its term is exactly 1); the horizon search stops once the bitmask is full (AO only). The GI output is bit-identical (test_gpu_gtvbao on WARP, 0 mismatches); its code generation changes. Item 6 (fast acos) dropped: the FXC /O3 listings of gtvbao_main, gtvbao_vbgi_main and gtvbao_vbgi_far_main already expand acos to the 4-coefficient Abramowitz-Stegun polynomial (its constants 0.018729, 0.074261, 0.212114 and 1.570729 appear in each listing; published error bound about 6.7e-5 rad, not measured here); a cheaper form would trade accuracy for an estimated 2 ALU per call. R16_FLOAT depth mips deferred: the GTVBGI far-field Thin hit window (bitmask thickness, default 0.3) is below the fp16 depth spacing beyond z = 512, and the depth-fallback normal precision changes AO at Normal Detail Response 1.0. Owner test list (Sora 1st, Sora 2nd and Kai):
+1. Defaults identical to HEAD (final image and Debug Raw AO).
+2. Cosine Sampling modes and Hemisphere Uniform identical to HEAD.
+3. Normal Edge Rejection 0 and 0.5 identical to HEAD.
+4. GTVBGI far field GI identical to HEAD.
+5. FPS against HEAD.
+Send back: screenshots and FPS against HEAD.
 
 SVGF M2b (RTAO), implemented, not validated in game: RTAO pass A writes the trace-size raw AO (r16_float, -1 = not traced) at every Trace Resolution, then the input pass (`world_rtao_svgf_input`), the shared SVGF chain (`EnsureRtgiDenoise` and `DispatchRtgiDenoise`, r32_uint output) and the byte upsample (`gtvbao_svgf_upsample`), in `rtao/rtao_svgf.hpp`. The RTAO rows follow the GTVBAO layout (Temporal Accumulation: History Weight, Depth Rejection, Normal Rejection; Denoising: Spatial Filter, Iterations, Luminance Edge Stop, advanced). Removed: the RTAO temporal, filter and upsample shaders with their pipelines and textures, the History Clamp, Filter Type, Filter Radius, Filter Passes and Filter Taps rows, and the test rows Force Zero Motion and Camera-Matrix Reprojection. RTAO Debug is Off, Raw AO, Denoised AO. Owner test list (Sora 1st, Sora 2nd and Kai where RTAO runs):
 1. RTAO at Full, Half and Quarter, DXR on and off: screenshots of the final image and of Debug Raw AO and Denoised AO against HEAD; no seams and no black or white blocks at silhouettes.
@@ -178,6 +209,8 @@ Game facts: all world VS read `StructuredBuffer<InstanceParam> instances_g : t15
 - New shaders in `world/shaders/` are embedded automatically (`__<name>_EMBED_FILE`, `__<name>` span; code guards with `#if defined(...)`).
 - Never put `.cso` files under `src/games/falcomengine-plus/` (CMake globs and embeds them).
 - FXC was never available in the cloud; shaders were checked with DXC cs_6_0 there. On this PC the addon build runs FXC (`fxc.exe` in the repo `bin/`); a clean addon build is the compile check.
+- clang-tidy cannot run on addon.cpp on this PC: the VS-bundled clang-tidy 19.1.5 fails on the MSVC 18 STL (STL1000 requires Clang 20+). Until a clang-tidy 20+ is installed, the addon build is the only C++ check; clang-format 19.1.5 still applies to changed statements.
+- Build the addon from an MSVC x64 environment: run the build command inside vcvars64 (cmd /c "call C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat && cmake --build E:\RenoDX\renodx\build --config Release --target falcomengine-plus"); a plain shell fails.
 
 ### Native test harness (`<repo>/.falcom-dev/harness`)
 

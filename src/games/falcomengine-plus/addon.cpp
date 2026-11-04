@@ -1020,7 +1020,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   falcom_world::rtgi::RtgiDenoiseSet vbgi_denoise = {};
   falcom_world::rtgi::RtgiDenoiseSet gtvbao_denoise = {};
   falcom_world::rtgi::RtgiTextureSet<1> gtvbao_svgf_raw = {};  // rgba16f, AO size: rgb = visibility, a = 1
-  falcom_world::rtgi::RtgiPipeline gtvbao_svgf_input_pipeline = {};
   reshade::api::resource vbgi_stats_buffer = {};
   reshade::api::resource_view vbgi_stats_uav = {};
   uint64_t vbgi_gi_frame = UINT64_MAX;
@@ -10562,8 +10561,6 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   falcom_world::rtgi::DestroyRtgiDenoiseSet(dev, &d->gtvbao_denoise);
   d->gtvbao_denoise = falcom_world::rtgi::RtgiDenoiseSet{};
   falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->gtvbao_svgf_raw);
-  falcom_world::rtgi::DestroyRtgiPipeline(dev, d->gtvbao_svgf_input_pipeline);
-  d->gtvbao_svgf_input_pipeline = {};
   dp(d->vbgi_far_main_pipeline); dp(d->vbgi_far_resolve_pipeline);
   dl(d->vbgi_far_main_layout); dl(d->vbgi_far_layout);
   DestroyGTVBAODescriptorTables(dev, &d->vbgi_far_main_tables);
@@ -12486,6 +12483,10 @@ struct GtvbaoPassPush {
   int filter_taps = 1;
   bool history_valid = false;
   bool vbgi = false;
+  int skip_unread = 0;
+  uint32_t full_width = 0u;
+  uint32_t full_height = 0u;
+  uint32_t divisor = 1u;
 };
 
 // Push indices that make up the temporal reset snapshot (settings that shape the AO; not debug, filter or per-frame values).
@@ -12530,11 +12531,11 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   c[29] = IsKai() ? 1.f : 0.f;
   // c[30] - foliage mask is only fresh when the pre-pass dispatched this frame.
   c[30] = pass.foliage_mask_valid ? 1.f : 0.f;
-  // -- Denoiser upgrades (R1-R4) --
-  c[31] = 0.f;  // unused: GTVBAO filter removed (SVGF M2a)
-  c[32] = 0.f;  // unused: GTVBAO filter removed (SVGF M2a)
-  c[33] = 0.f;  // unused: GTVBAO filter removed (SVGF M2a)
-  c[34] = 0.f;  // unused: GTVBAO filter removed (SVGF M2a)
+  // c[31..34]: the main pass skips the texels the AO upsample does not read (gtvbao_main.cs_5_0.hlsl).
+  c[31] = static_cast<float>(pass.skip_unread);
+  c[32] = static_cast<float>(pass.full_width);
+  c[33] = static_cast<float>(pass.full_height);
+  c[34] = static_cast<float>(pass.divisor);
   // �� Low-resolution spatial pipeline (appended; Full path ignores these) ��
   c[35] = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 1.f);
   c[36] = g_gtvbao_hemisphere_weighting;       // hemisphere weighting 0=Cosine, 1=Uniform
@@ -12682,8 +12683,8 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   EnsureGTVBAODescriptorTables(dev, d->foliage_mask_layout, &d->foliage_mask_tables);
   if (!d->foliage_mask_pipeline.handle)
     mkcs(__gtvbao_foliage_mask, "main", d->foliage_mask_layout, &d->foliage_mask_pipeline);
-  // Main: 4 SRVs (t0 depth MIPs, t1 MRT normal, t2 IS-FAST noise, t3 foliage mask) + 2 UAVs (u0 AO, u1 debug)
-  if (!make_layout(4u, 2u, &d->main_layout)) return false;
+  // Main: 5 SRVs (t0 depth MIPs, t1 MRT normal, t2 IS-FAST noise, t3 foliage mask, t4 game depth) + 2 UAVs (u0 AO, u1 debug)
+  if (!make_layout(5u, 2u, &d->main_layout)) return false;
   // VBGI gather: the main pass's 4 SRVs plus t4 radiance (5 SRVs) and 2 UAVs.
   if (!make_layout(5u, 2u, &d->vbgi_main_layout)) return false;
   // VBGI radiance prepass: 9 SRVs + 1 UAV. Radiance mip chain: 1 SRV + 1 UAV.
@@ -12960,7 +12961,6 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   const auto CS = reshade::api::shader_stage::all_compute;
   namespace rtgi = falcom_world::rtgi;
   static constexpr rtgi::RtgiPipelineDesc kGtvbaoUpsampleDesc = {.srv_count = rtgi::kRtgiUpsampleSrvCount, .uav_count = rtgi::kRtgiUpsampleUavCount, .sampler_count = 0u, .push_count = rtgi::kRtgiUpsamplePushCount, .code = __gtvbao_svgf_upsample, .name = "gtvbao upsample"};
-  static constexpr rtgi::RtgiPipelineDesc kGtvbaoInputDesc = {.srv_count = 1u, .uav_count = 1u, .sampler_count = 0u, .push_count = 4u, .code = __gtvbao_svgf_input, .name = "gtvbao svgf input"};
   const bool motion_ok = temporal_wanted && UpdateRtMotion(dev, d, true);
   const uint32_t divisor = low_res ? 2u : 1u;
   const uint32_t full_w = d->captured_depth_w, full_h = d->captured_depth_h;
@@ -12968,7 +12968,6 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   if (d->captured_mrt_normal_srv.handle != 0u && d->captured_scene_cbv_view.handle != 0u && full_w != 0u && full_h != 0u
       && aw == rtao::RtgiTraceExtent(full_w, divisor) && ah == rtao::RtgiTraceExtent(full_h, divisor)
       && rtgi::EnsureRtgiPipeline(dev, &d->gtvbao_denoise.upsample_pipeline, kGtvbaoUpsampleDesc)
-      && rtgi::EnsureRtgiPipeline(dev, &d->gtvbao_svgf_input_pipeline, kGtvbaoInputDesc)
       && rtgi::EnsureRtgiTextureSet(dev, &d->gtvbao_svgf_raw, reshade::api::format::r16g16b16a16_float, 8u, aw, ah)) {
     ready = rtgi::EnsureRtgiDenoise(dev, &d->gtvbao_denoise, {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = aw, .trace_height = ah, .full_width = full_w, .full_height = full_h, .temporal = motion_ok, .spatial = g_gtvbao_svgf_spatial_enabled > 0.5f, .log_prefix = "[gtvbao]"});
   }
@@ -13026,32 +13025,32 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   if (!mp.handle) return false;
   GtvbaoBindPipeline(cl, mp);
   {
-    reshade::api::resource_view main_srvs[4] = {
+    reshade::api::resource_view main_srvs[5] = {
         d->depth_mips_srv,
         d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
         d->isfast_noise_srv.handle ? d->isfast_noise_srv : d->fallback_srv,  // t2 IS-FAST noise
-        d->foliage_mask_srv.handle ? d->foliage_mask_srv : d->fallback_srv   // t3 foliage mask
+        d->foliage_mask_srv.handle ? d->foliage_mask_srv : d->fallback_srv,  // t3 foliage mask
+        d->captured_depth_srv                                                // t4 game depth (upsample skip)
     };
     // The debug UAV is only read while a debug view is active; bind the
     // fallback otherwise so nothing can sample stale debug output.
     const bool gtvbao_debug_active = IsGtvbaoComputeDebug(GtvbaoDebugMode());
     // Shader register order: u0=AO, u1=debug
     reshade::api::resource_view main_uavs[2] = {
-        d->ao_term_a_uav,
-        (gtvbao_debug_active && d->debug_uav.handle) ? d->debug_uav : d->fallback_uav
-    };
+        d->gtvbao_svgf_raw.uav[0],
+        (gtvbao_debug_active && d->debug_uav.handle) ? d->debug_uav : d->fallback_uav};
     reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,4,reshade::api::descriptor_type::texture_shader_resource_view,main_srvs},
-      {{},0,0,2,reshade::api::descriptor_type::texture_unordered_access_view,main_uavs},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_clamp_sampler},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, 5, reshade::api::descriptor_type::texture_shader_resource_view, main_srvs},
+        {{}, 0, 0, 2, reshade::api::descriptor_type::texture_unordered_access_view, main_uavs},
     };
     GtvbaoApplyDescriptors(dev, cl, d->main_layout, &d->main_tables, 4, u);
-    auto pc = BuildGTVBAOPushConstants(d, {.final_pass = false, .foliage_mask_valid = foliage_mask_valid});
+    auto pc = BuildGTVBAOPushConstants(d, {.final_pass = false, .foliage_mask_valid = foliage_mask_valid, .skip_unread = (ready.reproject ? 1 : 2), .full_width = full_w, .full_height = full_h, .divisor = divisor});
     cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
   }
   cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
-  GtvbaoBarrier(cl, d->ao_term_a_texture, UA, SR);
+  GtvbaoBarrier(cl, d->gtvbao_svgf_raw.texture[0], UA, SR);
   if (IsGtvbaoComputeDebug(GtvbaoDebugMode())) {
     d->gtvbao_debug_frame = d->frame_index;
     d->gtvbao_debug_mode_written = (float)GtvbaoDebugMode();
@@ -13067,27 +13066,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 2 (main) done.");
 
   {
-    static const reshade::api::resource_view kNull[1] = {};
     std::vector<reshade::api::descriptor_table_update> table_nulls;
-    // Input pass: the main pass AO byte (t0) to the SVGF raw layout (u0, rgba16f); x 1.5 applied once here.
-    {
-      const rtgi::RtgiPipeline& ip = d->gtvbao_svgf_input_pipeline;
-      reshade::api::descriptor_table_update iu[2] = {
-          {ip.srv_table, 0, 0, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &d->ao_term_a_srv},
-          {ip.uav_table, 0, 0, 1u, reshade::api::descriptor_type::texture_unordered_access_view, &d->gtvbao_svgf_raw.uav[0]},
-      };
-      dev->update_descriptor_tables(2, iu);
-      GtvbaoBindPipeline(cl, ip.pipeline);
-      const reshade::api::descriptor_table ip_tables[2] = {ip.srv_table, ip.uav_table};
-      cl->bind_descriptor_tables(CS, ip.layout, 1, 2, ip_tables);
-      const float ipush[4] = {(float)aw, (float)ah, 0.f, 0.f};
-      cl->push_constants(CS, ip.layout, 3, 0, 4, ipush);
-      cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
-      rtao::NullComputeSlots(cl, 1, 1, 0);
-      GtvbaoBarrier(cl, d->gtvbao_svgf_raw.texture[0], UA, SR);
-      table_nulls.push_back({ip.srv_table, 0, 0, 1u, reshade::api::descriptor_type::texture_shader_resource_view, kNull});
-      table_nulls.push_back({ip.uav_table, 0, 0, 1u, reshade::api::descriptor_type::texture_unordered_access_view, kNull});
-    }
     const bool gt_conf = GtvbaoDebugMode() == 23 && d->debug_uav.handle != 0u;
     // Half: DispatchRtgiDenoise subtracts log2(divisor) = 1, so + 1 makes Half Res Iterations the effective count.
     const float svgf_iterations = low_res ? g_gtvbao_svgf_half_res_iterations + 1.f : g_gtvbao_svgf_iterations;

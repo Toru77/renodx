@@ -77,15 +77,20 @@ void main(uint3 id : SV_DispatchThreadID)
         [unroll]
         for (int t = 0; t < 4; ++t)
         {
+#if defined(RTGI_UPSAMPLE_AO_BYTE) && defined(RTGI_UPSAMPLE_NEAREST_FALLBACK)
+            // d = 1: f = 0, so only tap 0 has a weight (1). Once a tap is used (best_w >= 0) a later tap adds exactly 0 to
+            // both sums and cannot replace it as the nearest tap (strict >), so it is skipped.
+            if (d == 1u && best_w >= 0.0) continue;
+#endif
             const int2 offset = int2(t & 1, t >> 1);
             const float w = (offset.x == 1 ? f.x : 1.0 - f.x) * (offset.y == 1 ? f.y : 1.0 - f.y);
             const int2 tq = clamp(base + offset, int2(0, 0), trace_size - 1);
             const float4 v = g_in[tq];
             if (v.a < 0.0) continue;
-            const uint2 rep = min(uint2(tq) * d + d / 2u, full_size - 1u);
+            const uint2 rep = RtTraceRepresentativePixel(uint2(tq), d, full_size);
             const float rep_depth = g_game_depth.Load(int3(rep, 0)).x;
             const float3 Nt = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(rep, 0)).xy);
-            if (rep_depth <= 0.0 || dot(Nt, Nt) < 0.5) continue;
+            if (RtUpsampleTapRejected(rep_depth, Nt)) continue;
 #if defined(RTGI_UPSAMPLE_NEAREST_FALLBACK)
             if (w > best_w)
             {

@@ -21,11 +21,7 @@
 #define GT_VBAO_RCP_PI              (0.31830988618379067153776752674503)
 #define GT_VBAO_RCP_PI_HALF         (0.63661977236758134307553505349006)
 
-#ifdef GTVBAO_GI
-#define GTVBAO_AO_OUT_TYPE RWTexture2D<float4>
-#else
-#define GTVBAO_AO_OUT_TYPE RWTexture2D<uint>
-#endif
+#define GTVBAO_AO_OUT_TYPE RWTexture2D<float4>   // AO: the SVGF raw layout (GTVBAO_WriteSvgfRaw); GI: raw GI
 
 #ifndef GT_VBAO_USE_HALF_FLOAT_PRECISION
 #define GT_VBAO_USE_HALF_FLOAT_PRECISION 1
@@ -140,8 +136,8 @@ float GTVBAO_SliceRelCDF_Uniform(float x, float angN, bool isPhiLargerThanAngN)
     return d0;
 }
 
-// bufferc.txt:506-522
-float GTVBAO_SliceRelCDF_Cos(float x, float angN, float cosN, bool isPhiLargerThanAngN)
+// bufferc.txt:506-522. sinN = sin(angN) and denom = the guarded 4 (cosN + angN sinN) are per-slice, computed once by the caller.
+float GTVBAO_SliceRelCDF_Cos(float x, float angN, float cosN, float sinN, float denom, bool isPhiLargerThanAngN)
 {
     if (x <= 0.0f || x >= 1.0f) return x;
 
@@ -153,10 +149,9 @@ float GTVBAO_SliceRelCDF_Cos(float x, float angN, float cosN, bool isPhiLargerTh
     float n1 = c ? -1.0f : 1.0f;
     float n2 = c ? 4.0f : 0.0f;
 
-    float t0 = n0 * cosN + n1 * cos(angN - 2.0f * phi) + (n2 * angN + (n1 * 2.0f) * phi + GT_VBAO_PI) * sin(angN);
-    float t1 = 4.0f * (cosN + angN * sin(angN));
+    float t0 = n0 * cosN + n1 * cos(angN - 2.0f * phi) + (n2 * angN + (n1 * 2.0f) * phi + GT_VBAO_PI) * sinN;
 
-    return t0 / (abs(t1) > 1e-6f ? t1 : 1e-6f);
+    return t0 / denom;
 }
 
 // bufferc.txt:339-359
@@ -239,13 +234,14 @@ float2 GTVBAO_ScreenDirFromViewDir(float3 P, float3 D, GTAOConstants consts)
     return dPx * rsqrt(max(dot(dPx, dPx), 1e-12f));
 }
 
-void GTVBAO_OutputWorkingTerm( const uint2 pixCoord, lpfloat visibility, GTVBAO_AO_OUT_TYPE outWorkingAOTerm )
+#ifndef GTVBAO_GI
+// Writes an AO byte in the SVGF raw layout: rgb = byte x GT_VBAO_OCCLUSION_TERM_SCALE / 255 (the scale applied once), a = 1.
+void GTVBAO_WriteSvgfRaw( GTVBAO_AO_OUT_TYPE outWorkingAOTerm, const uint2 pixCoord, uint aoByte )
 {
-    if (GTVBAO_final_pass < 0.5f)
-        visibility = visibility / lpfloat(GT_VBAO_OCCLUSION_TERM_SCALE);
-    visibility = saturate( visibility );
-    outWorkingAOTerm[pixCoord] = uint(visibility * 255.0 + 0.5);
+    const float ao = (float)aoByte * (GT_VBAO_OCCLUSION_TERM_SCALE / 255.0);
+    outWorkingAOTerm[pixCoord] = float4(ao, ao, ao, 1.0);
 }
+#endif
 #ifdef GTVBAO_GI_FAR
 #include "vbgi_far.hlsli"
 #endif
@@ -317,7 +313,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     // ── Foliage detection (toggle on) ──
     // Foliage PS sets bit 15 (0x8000) of the marker channel to mark the pixel: o1.w on Sora, o1.z on Kai.
     // When detected: normal AO is fully computed, then blended toward
-    // fully bright (255) by (1 - foliage_ao_value) after GTVBAO_OutputWorkingTerm.
+    // fully bright (255) by (1 - foliage_ao_value) after the AO byte is computed. Foliage AO Value 0 is written as 255 directly.
     //   foliage_ao_value = 1.0 → keep normal AO (blend factor 0)
     //   foliage_ao_value = 0.0 → fully bright (blend factor 1)
     bool gtvbao_foliage_pixel = false;
@@ -329,6 +325,14 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
           mrtNormalTexture, pixCoord, (uint2)g_workDims, uint2(g_fullDepthW, g_fullDepthH),
           uint2(g_mrtW, g_mrtH), GTVBAO_foliage_channel_mode >= 0.5f, (uint)GTVBAO_Divisor());
     }
+#ifndef GTVBAO_GI
+    // Foliage AO Value 0 blends every foliage pixel to 255 below (lerp(cur, 255, 1) is exactly 255), so the full pass
+    // is skipped. Debug views (22 and up) keep the full pass.
+    if (gtvbao_foliage_pixel && GTVBAO_foliage_ao_value <= 0.0f && !g_trackDebug) {
+        GTVBAO_WriteSvgfRaw( outWorkingAOTerm, pixCoord, 255u );
+        return;
+    }
+#endif
 
     // Move center pixel slightly towards camera to avoid imprecision artifacts due to depth buffer imprecision; offset depends on depth texture format used
 #ifdef GT_VBAO_FP32_DEPTHS
@@ -391,7 +395,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         [branch]
         if( screenspaceRadius < pixelTooCloseThreshold )
         {
-            GTVBAO_OutputWorkingTerm( pixCoord, 1, outWorkingAOTerm );
+            GTVBAO_WriteSvgfRaw( outWorkingAOTerm, pixCoord, 170u );   // visibility 1: (1 / GT_VBAO_OCCLUSION_TERM_SCALE) x 255, rounded
             return;
         }
 #endif
@@ -454,6 +458,11 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             const float  angN        = sgn * acos(clamp(cosN, -1.0f, 1.0f));
             const float  angOff      = angN * GT_VBAO_RCP_PI + 0.5f;
 
+            // Per-slice terms of the cosine CDF (GTVBAO_SliceRelCDF_Cos).
+            const float sinN = sin(angN);
+            const float cdfT1 = 4.0f * (cosN + angN * sinN);
+            const float cdfDenom = abs(cdfT1) > 1e-6f ? cdfT1 : 1e-6f;
+
             // ── Horizons (bufferc.txt:705-795) ──
 #ifdef GTVBAO_GI
             float3 gi0 = 0.0f;
@@ -513,8 +522,8 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                         hor01.x = GTVBAO_SliceRelCDF_Uniform(hor01.x, angN, isPhiLargerThanAngN);
                         hor01.y = GTVBAO_SliceRelCDF_Uniform(hor01.y, angN, isPhiLargerThanAngN);
                     } else {
-                        hor01.x = GTVBAO_SliceRelCDF_Cos(hor01.x, angN, cosN, isPhiLargerThanAngN);
-                        hor01.y = GTVBAO_SliceRelCDF_Cos(hor01.y, angN, cosN, isPhiLargerThanAngN);
+                        hor01.x = GTVBAO_SliceRelCDF_Cos(hor01.x, angN, cosN, sinN, cdfDenom, isPhiLargerThanAngN);
+                        hor01.y = GTVBAO_SliceRelCDF_Cos(hor01.y, angN, cosN, sinN, cdfDenom, isPhiLargerThanAngN);
                     }
                     hor01 = saturate(hor01 + rnd.w * (1.0f / 32.0f));
 
@@ -546,7 +555,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                                         if (flipT) hor = 1.0f - hor;
                                         const bool isPhiLargerThanAngN = hor * GT_VBAO_PI - GT_VBAO_PI_HALF > angN;
                                         if (useUniform) hor = GTVBAO_SliceRelCDF_Uniform(hor, angN, isPhiLargerThanAngN);
-                                        else            hor = GTVBAO_SliceRelCDF_Cos(hor, angN, cosN, isPhiLargerThanAngN);
+                                        else            hor = GTVBAO_SliceRelCDF_Cos(hor, angN, cosN, sinN, cdfDenom, isPhiLargerThanAngN);
                                         hor = saturate(hor + rnd.w * (1.0f / 32.0f));
                                         uint horInt = (uint)floor(hor * 32.0f);
                                         uint visBitsN = horInt < 32u ? (0xFFFFFFFFu << horInt) : 0u;
@@ -561,8 +570,14 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     occBits |= sampleMask;
 #else
                     occBits |= sampleMask;
+                    // AO only: a full mask cannot change (OR only) and nothing else accumulates per sample, so the
+                    // remaining steps and the other side are skipped.
+                    if (occBits == 0xFFFFFFFFu) break;
 #endif
                 }
+#ifndef GTVBAO_GI
+                if (occBits == 0xFFFFFFFFu) break;
+#endif
             }
 
             // ── Debug: save first slice's final bitmask ──
@@ -597,13 +612,13 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     {
                         const float x = 0.5f * (lo + hi);
                         const float c = useUniform ? GTVBAO_SliceRelCDF_Uniform(x, angN, x > angOff)
-                                                   : GTVBAO_SliceRelCDF_Cos(x, angN, cosN, x > angOff);
+                                                   : GTVBAO_SliceRelCDF_Cos(x, angN, cosN, sinN, cdfDenom, x > angOff);
                         if (c < target) lo = x; else hi = x;
                     }
                     const float a = (0.5f * (lo + hi) - angOff) * GT_VBAO_PI;
                     const float3 dir = cos(a) * V + sin(a) * normalize(smplDirVS);
                     float hc = saturate(a * GT_VBAO_RCP_PI + angOff);
-                    hc = useUniform ? GTVBAO_SliceRelCDF_Uniform(hc, angN, a > 0.0f) : GTVBAO_SliceRelCDF_Cos(hc, angN, cosN, a > 0.0f);
+                    hc = useUniform ? GTVBAO_SliceRelCDF_Uniform(hc, angN, a > 0.0f) : GTVBAO_SliceRelCDF_Cos(hc, angN, cosN, sinN, cdfDenom, a > 0.0f);
                     mismatch = min((uint)floor(saturate(hc + rnd.w * (1.0f / 32.0f)) * 32.0f), 31u) != sector;
                     const float2 rt = VbgiFarViewToUv(VbgiFarWorldToView(VbgiFarViewToWorld(positionVS)), consts);
                     mismatch = mismatch || any(abs(rt - normalizedScreenPos) > 0.5f * consts.ViewportPixelSize);
@@ -689,18 +704,20 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         GTVBAO_WriteDebug(outDebug, pixCoord, dbgValue);
     }
 #else
-    GTVBAO_OutputWorkingTerm( pixCoord, visibility, outWorkingAOTerm );
+    // The 8-bit AO byte of visibility / GT_VBAO_OCCLUSION_TERM_SCALE (final_pass 0), the quantisation the SVGF input has always had.
+    if (GTVBAO_final_pass < 0.5f) visibility = visibility / lpfloat(GT_VBAO_OCCLUSION_TERM_SCALE);
+    visibility = saturate( visibility );
+    uint aoByte = uint(visibility * 255.0 + 0.5);
 
-    // ── Foliage post-blend (no early-out, normal AO computed first) ──
+    // ── Foliage post-blend (normal AO computed first; Foliage AO Value 0 returned early above) ──
     // Blend written AO toward 255 (fully visible) based on foliage_ao_value.
     //   value=1 → blend=0 → keep AO unchanged
     //   value=0 → blend=1 → fully bright (AO=1.0)
     if (gtvbao_foliage_pixel && GTVBAO_exclude_foliage > 0.5f) {
       float aoBlend = 1.0f - saturate(GTVBAO_foliage_ao_value);
-      uint cur = outWorkingAOTerm[pixCoord];
-      uint blended = (uint)(lerp((float)cur, 255.0f, aoBlend) + 0.5f);
-      outWorkingAOTerm[pixCoord] = blended;
+      aoByte = (uint)(lerp((float)aoByte, 255.0f, aoBlend) + 0.5f);
     }
+    GTVBAO_WriteSvgfRaw( outWorkingAOTerm, pixCoord, aoByte );
 
     // ── Debug views 22-26 (written last, after the AO and the foliage blend) ──
     // Each view fills the full-res d x d block that this AO pixel covers, so
@@ -710,7 +727,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         float4 dbgValue = float4(0.0f, 0.0f, 0.0f, 1.0f);
         if (dbgMode == GTVBAO_DEBUG_RAW_AO) {
             // Stored AO byte of this frame, before temporal and filter.
-            float rawAO = (float)outWorkingAOTerm[pixCoord] / 255.0f;
+            float rawAO = (float)aoByte / 255.0f;
             if (GTVBAO_final_pass < 0.5f) rawAO *= 1.5f;
             dbgValue = float4(rawAO, rawAO, rawAO, 1.0f);
         } else if (dbgMode == GTVBAO_DEBUG_TEMPORAL) {

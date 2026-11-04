@@ -1,6 +1,6 @@
 #pragma once
 
-// world_rt_denoise.hlsli - denoiser math shared by the SVGF passes (world_svgf.hlsli) and the upsample (world_rtgi_upsample).
+// world_rt_denoise.hlsli - denoiser math shared by the SVGF passes (world_svgf.hlsli), the upsample (world_rtgi_upsample) and the GTVBAO main pass (gtvbao_main, upsample skip).
 // Pure functions; no resources or constant buffers.
 
 // Soft normal weight: a history tap counts fully at dot >= the Normal Rejection value and falls linearly to 0 over this width.
@@ -55,3 +55,9 @@ float FilterGaussianWeight(int k, float sigma)
     const float d = (float)k / sigma;
     return exp(-0.5 * d * d);
 }
+
+// Representative full-res pixel of trace pixel tq at divisor d: the centre of its d x d block, clamped to the image.
+uint2 RtTraceRepresentativePixel(uint2 tq, uint d, uint2 full_size) { return min(tq * d + d / 2u, full_size - 1u); }
+
+// The upsample's tap rejection at the tap's representative pixel. A NaN normal is not rejected (both compares are false).
+bool RtUpsampleTapRejected(float rep_depth, float3 rep_normal) { return rep_depth <= 0.0 || dot(rep_normal, rep_normal) < 0.5; }
