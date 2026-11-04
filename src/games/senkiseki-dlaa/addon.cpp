@@ -20,6 +20,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -207,7 +208,35 @@ static float g_phase_object_delta_direct = 1.f;
 // anything stale is forced to prev=cur (delta 0, camera path). Every-frame
 // parts keep their constant real MV; intermittent parts go stable.
 static float g_phaseb_strict_prev = 0.f;
-static float g_char_motion_debug = 0.f;  // non-throttled per-draw logs for specific character VS/PS pairs
+static float g_char_motion_debug = 0.f;
+static float g_weapon_motion_debug = 0.f;
+
+struct CharacterMotionReport {
+  std::shared_mutex mutex;
+  std::deque<std::string> lines;
+  size_t bytes = 0;
+  uint64_t dropped = 0;
+};
+static CharacterMotionReport g_character_motion_report;
+static CharacterMotionReport g_weapon_motion_report;
+static std::atomic<uint64_t> g_character_report_generation = 0;
+
+static void MotionReportLog(reshade::log::level level, const char* message) {
+  reshade::log::message(level, message);
+  const bool weapon_line = strncmp(message, "[DLAA] rigid ", 13) == 0 || strncmp(message, "[DLAA] phaseW", 13) == 0;
+  const bool character_line = strncmp(message, "[DLAA] charmv ", 14) == 0 || strncmp(message, "[DLAA] alternate ", 17) == 0 || strncmp(message, "[DLAA] snapshot-missing ", 24) == 0 || (strncmp(message, "[DLAA] bone-slot ", 17) == 0 && strstr(message, " reason=0") == nullptr) || (strncmp(message, "[DLAA] decision ", 16) == 0 && (strstr(message, "result=snapshot-rejected") != nullptr || strstr(message, "result=pixel-shader-patch-failed") != nullptr || strstr(message, "result=render-target-incompatible") != nullptr)) || strncmp(message, "[DLAA] burst ", 13) == 0;
+  if ((!weapon_line || g_weapon_motion_debug <= 0.5f) && (!character_line || g_char_motion_debug <= 0.5f)) return;
+  auto& report = (weapon_line ? g_weapon_motion_report : g_character_motion_report);
+  std::unique_lock lock(report.mutex);
+  report.lines.emplace_back(message);
+  report.bytes += report.lines.back().size() + 1;
+  while (report.bytes > 512u * 1024u && report.lines.size() > 1u) {
+    report.bytes -= report.lines.front().size() + 1;
+    report.lines.pop_front();
+    ++report.dropped;
+  }
+}
+
 // DLAAPhaseBCharMotionDebug is the MASTER diagnostic toggle: it also enables
 // the Phase B prevVP/snapshot diagnostics (which normally need
 // DLAAPhaseBDebugLogging) and one automatic velocity burst. This helper is
@@ -373,7 +402,7 @@ static void CpuProfileLogFrame() {
     pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, " %s=%.3fms/%uc", kCpuProfileNames[i], ms,
                     (unsigned)(calls / (uint32_t)frames));
   }
-  reshade::log::message(reshade::log::level::info, buf);
+  MotionReportLog(reshade::log::level::info, buf);
   for (uint32_t i = 0u; i < kCpuSiteCount; ++i) {
     g_cpu_profile_state.ticks[i].store(0u, std::memory_order_relaxed);
     g_cpu_profile_state.calls[i].store(0u, std::memory_order_relaxed);
@@ -497,10 +526,16 @@ static void LogThrottled(const char* key, reshade::log::level level,
                          uint32_t first, uint32_t interval, const char* fmt, ...) {
   static std::mutex mtx;
   static std::unordered_map<std::string, LogThrottleState> state;
+  static uint64_t generation = 0;
   bool emit;
   uint32_t suppressed = 0u;
   {
     std::lock_guard<std::mutex> lock(mtx);
+    const uint64_t current_generation = g_character_report_generation.load();
+    if (generation != current_generation) {
+      state.clear();
+      generation = current_generation;
+    }
     auto& t = state[key];
     ++t.count;
     emit = (t.count <= first) || (interval > 0u && (t.count - t.last_emit) >= interval);
@@ -521,7 +556,7 @@ static void LogThrottled(const char* key, reshade::log::level level,
     size_t n = strlen(buf);
     snprintf(buf + n, sizeof(buf) - n, " (+%u suppressed)", suppressed);
   }
-  reshade::log::message(level, buf);
+  MotionReportLog(level, buf);
 }
 
 // Content-aware throttle key: `site` + the DISTINCT draw/state content, so the
@@ -677,19 +712,23 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
     uint64_t serial = 0u;
   };
   struct PrevBoneSnap {
-    ID3D11Buffer* cur_buffer[kBoneSlots] = {};    // addon-owned structured buffers (this frame's bones)
+    ID3D11Buffer* cur_buffer[kBoneSlots] = {};  // addon-owned structured buffers (this frame's bones)
     ID3D11ShaderResourceView* cur_srv[kBoneSlots] = {};
-    ID3D11Buffer* prev_buffer[kBoneSlots] = {};   // addon-owned structured buffers (prev frame's bones)
+    ID3D11Buffer* prev_buffer[kBoneSlots] = {};  // addon-owned structured buffers (prev frame's bones)
     ID3D11ShaderResourceView* prev_srv[kBoneSlots] = {};
     BoneSlotMeta slot_meta[kBoneSlots] = {};
     BoneSlotMeta prev_meta[kBoneSlots] = {};
     uint64_t serial = 0u;
     uint64_t cap_seq = 0u;
-    uint32_t size = 0u;                    // byte size (== game bone buffer)
-    uint32_t rr = 0u;                      // round-robin capture cursor (reset at present)
-    uint64_t last_draw_frame = 0u;         // frame of the last draw-time capture
-    uint64_t prev_capture_frame = 0u;      // frame the CURRENT prev_buffer content was captured (freshness)
-    uint64_t charmv_last_log_frame = 0u;   // frame of the last charmv log line (charmv steady-state throttle)
+    uint32_t size = 0u;                   // byte size (== game bone buffer)
+    uint32_t rr = 0u;                     // round-robin capture cursor (reset at present)
+    uint64_t last_draw_frame = 0u;        // frame of the last draw-time capture
+    uint64_t prev_capture_frame = 0u;     // frame the CURRENT prev_buffer content was captured (freshness)
+    uint64_t charmv_last_log_frame = 0u;  // frame of the last charmv log line (charmv steady-state throttle)
+    uint64_t mesh_b0 = 0u;
+    uint64_t mesh_vb = 0u;
+    uint32_t mesh_stride = 0u;
+    uint32_t mesh_offset = 0u;
     // OPT 1: set at the draw-time cur capture, cleared at present after the
     // promote. Lets CapturePrevBones promote exactly the snaps drawn this
     // present cycle WITHOUT comparing frame counters (d->frame_index advances
@@ -701,7 +740,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool skinned_po_motion_valid = true;
   senkiseki3::fg::FgRuntime fg;
   ID3D11ShaderResourceView* last_bound_bone_srv[kBoneSlots] = {};  // our bound SRVs (is-ours check)
-  bool bound_real_prev_bones = false;  // this draw bound a real per-instance snapshot (vs identity)
+  bool bound_real_prev_bones = false;                              // this draw bound a real per-instance snapshot (vs identity)
 
   // ── Phase W: per-instance prev-World snapshots (rigid weapon/object path) ──
   // The weapon's per-object motion is its World matrix (b0 c44..c47). At draw time
@@ -1031,7 +1070,7 @@ static void DlaaDeployStatusLog(reshade::api::device* dev, DeviceData* d) {
            (int)(d->velocity_pipeline.handle != 0u), (int)(d->prev_depth_srv.handle != 0u),
            (senkiseki3::dlss::dlss_output_format == DXGI_FORMAT_R16G16B16A16_FLOAT) ? "float" : "8bit",
            diag.capture_invalidations);
-  reshade::log::message(reshade::log::level::info, buf);
+  MotionReportLog(reshade::log::level::info, buf);
 }
 
 // Live ImGui row (same content as the status line) for the settings panel.
@@ -1526,7 +1565,7 @@ static void LogNgxOutputLuma(ID3D11DeviceContext* cl, DeviceData* d) {
   char buf[128];
   snprintf(buf, sizeof(buf), "[DLAA] NGX output luma: min=%.3f avg=%.3f max=%.3f (min=0 => DLSS wrote pure black)",
            mn, avg, mx);
-  reshade::log::message(reshade::log::level::info, buf);
+  MotionReportLog(reshade::log::level::info, buf);
 }
 
 // Ensure the CPU readback staging for the DLSS color-source diagnostic.
@@ -1595,7 +1634,7 @@ static void LogColorSource(reshade::api::command_list* cmd_list, DeviceData* d,
       using_live ? "LIVE" : "CAPTURE", (unsigned long long)color_res,
       (int)td.Format, (unsigned)td.Width, (unsigned)td.Height, stale, hash);
   }
-  reshade::log::message(reshade::log::level::info, buf);
+  MotionReportLog(reshade::log::level::info, buf);
 }
 
 // ── Effect/particle exclusion mask ──
@@ -1921,8 +1960,8 @@ static bool EnsureLazyPhaseEPixelShader(reshade::api::command_list* cmd_list,
                                              &info.native_patched))) {
       info.patched_bytecode.clear();
       info.patch_failed = true;
-      reshade::log::message(reshade::log::level::warning,
-          "[DLAA] phaseE: lazy PS patch/create rejected; keeping the original PS.");
+      MotionReportLog(reshade::log::level::warning,
+                      "[DLAA] phaseE: lazy PS patch/create rejected; keeping the original PS.");
       return false;
     }
     WritePhasebDump(original_hash, info.original_bytecode.data(), info.original_bytecode.size(), ".ps");
@@ -1933,7 +1972,7 @@ static bool EnsureLazyPhaseEPixelShader(reshade::api::command_list* cmd_list,
              original_hash, info.patched_hash, (uint32_t)info.patched_bytecode.size(),
              (int)options.constant_output, (int)options.no_read, (int)options.no_math,
              (int)options.no_new_output);
-    reshade::log::message(reshade::log::level::info, buf);
+    MotionReportLog(reshade::log::level::info, buf);
   }
   if (!info.native_patched) return false;
 
@@ -1973,7 +2012,23 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
   const auto vit = d->patched_vs_by_hash.find(vh);
   const bool is_po_vs = vit != d->patched_vs_by_hash.end() && vit->second.emits_velocity;
   const bool is_phasee_candidate = d->phasee_ps_candidates.contains(ph);
+  auto log_decision = [&](const char* reason) {
+    if (g_weapon_motion_debug > 0.5f && vit != d->patched_vs_by_hash.end() && vit->second.is_rigid) {
+      LogThrottled(ThrottleKeyStr("report-weapon-decision", (std::string(reason) + ":" + std::to_string(vh) + ":" + std::to_string(ph)).c_str()).c_str(),
+                   reshade::log::level::info, 1u, 200u,
+                   "[DLAA] rigid decision f=%u vs=0x%08X ps=0x%08X rtvs=%u emits=%d psCandidate=%d result=%s",
+                   d->frame_index, vh, ph, d->last_rtv_count, (int)is_po_vs, (int)is_phasee_candidate, reason);
+    }
+    if (g_char_motion_debug <= 0.5f || (!is_po_vs && !is_phasee_candidate && d->last_rtv_count != 3u)) return;
+    LogThrottled(ThrottleKeyStr("report-motion-decision", (std::string(reason) + ":" + std::to_string(vh) + ":" + std::to_string(ph) + ":" + std::to_string(d->last_rtv_count)).c_str()).c_str(),
+                 reshade::log::level::info, 1u, 200u,
+                 "[DLAA] decision f=%u vs=0x%08X ps=0x%08X rtvs=%u patched=%d rigid=%d emits=%d psCandidate=%d result=%s",
+                 d->frame_index, vh, ph, d->last_rtv_count, (int)(vit != d->patched_vs_by_hash.end()),
+                 (int)(vit != d->patched_vs_by_hash.end() && vit->second.is_rigid),
+                 (int)is_po_vs, (int)is_phasee_candidate, reason);
+  };
   if (is_po_vs && !vit->second.is_rigid && !d->skinned_po_motion_valid) {
+    log_decision("snapshot-rejected");
     RestoreAppendedMotionRtv(cmd_list, d);
     RestorePhaseEPixelShader(cmd_list, d);
     return;
@@ -1985,7 +2040,7 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
       snprintf(mline, sizeof(mline),
                "[DLAA] motion: draw vs=0x%08X ps=0x%08X rtvs=%u poVS=%d phaseECandidate=%d",
                vh, ph, d->last_rtv_count, (int)is_po_vs, (int)is_phasee_candidate);
-      reshade::log::message(reshade::log::level::info, mline);
+      MotionReportLog(reshade::log::level::info, mline);
     } else {
       LogThrottled(ThrottleKey("motion-draw", vh, ph, d->last_rtv_count).c_str(),
                    reshade::log::level::info, 1u, 200u,
@@ -1998,6 +2053,7 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
                         shader_injection.dlaa_per_object_motion >= 0.5f &&
                         d->motion_rtv.handle && is_po_vs && is_phasee_candidate;
   if (!eligible) {
+    log_decision("ineligible");
     RestoreAppendedMotionRtv(cmd_list, d);
     RestorePhaseEPixelShader(cmd_list, d);
     return;
@@ -2006,7 +2062,10 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
   auto* motion_tex = reinterpret_cast<ID3D11Texture2D*>(d->motion_texture.handle);
   auto* motion_rtv = reinterpret_cast<ID3D11RenderTargetView*>(d->motion_rtv.handle);
-  if (!ctx || !motion_tex || !motion_rtv) return;
+  if (!ctx || !motion_tex || !motion_rtv) {
+    log_decision("missing-native-target");
+    return;
+  }
   ID3D11RenderTargetView* rtvs[8] = {};
   ID3D11DepthStencilView* dsv_native = nullptr;
   ctx->OMGetRenderTargets(8, rtvs, &dsv_native);
@@ -2018,6 +2077,7 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
   for (UINT i = 0u; i < 8u; ++i) if (rtvs[i]) count = i + 1u;
   const bool already_appended = count == 4u && rtvs[0] && rtvs[1] && rtvs[2] && rtvs[3] == motion_rtv;
   if (!already_appended && (count != 3u || !rtvs[0] || !rtvs[1] || !rtvs[2])) {
+    log_decision("render-target-count");
     release_om();
     RestoreAppendedMotionRtv(cmd_list, d);
     RestorePhaseEPixelShader(cmd_list, d);
@@ -2069,6 +2129,7 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
     }
   }
   if (!compatible) {
+    log_decision("render-target-incompatible");
     release_om();
     RestoreAppendedMotionRtv(cmd_list, d);
     RestorePhaseEPixelShader(cmd_list, d);
@@ -2079,6 +2140,7 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
   // velocity-emitting VS and the exact live three-target G-buffer. Only now
   // create/bind its patched twin; non-character uses always run the original.
   if (!EnsureLazyPhaseEPixelShader(cmd_list, d, ph)) {
+    log_decision("pixel-shader-patch-failed");
     release_om();
     RestoreAppendedMotionRtv(cmd_list, d);
     RestorePhaseEPixelShader(cmd_list, d);
@@ -2091,11 +2153,13 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
     d->motion_cleared_this_frame = true;
   }
   if (already_appended) {
+    log_decision("appended");
     d->motion_rtv_appended = true;
     release_om();
     return;
   }
 
+  log_decision("appended");
   if (PhasebDbgActive())
     LogThrottled(ThrottleKey("motion-append", vh, ph, 3u).c_str(),
                  reshade::log::level::info, 1u, 200u,
@@ -2383,7 +2447,7 @@ static void LogRigidWorldSnap(reshade::api::command_list* cmd_list, DeviceData* 
                               ID3D11Buffer* b0, ID3D11Buffer* vb0,
                               ID3D11Buffer* const* prev_bufs, uint32_t prev_count,
                               uint64_t base, uint64_t key, uint32_t world_elem) {
-  if (shader_injection.dlaa_phaseb_debug_logging <= 0.5f) return;
+  if (!PhasebDbgActive() && g_weapon_motion_debug <= 0.5f) return;
   static uint32_t last_dump_frame = UINT32_MAX;
   if (d->frame_index - last_dump_frame < 60u) return;
   last_dump_frame = d->frame_index;
@@ -2429,7 +2493,7 @@ static void LogRigidWorldSnap(reshade::api::command_list* cmd_list, DeviceData* 
            gw[0], gw[1], gw[2],
            pw[0][0], pw[0][1], pw[0][2], pw[1][0], pw[1][1], pw[1][2],
            pw[2][0], pw[2][1], pw[2][2], pw[3][0], pw[3][1], pw[3][2]);
-  reshade::log::message(reshade::log::level::info, line);
+  MotionReportLog(reshade::log::level::info, line);
 }
 
 // ── Phase B diagnostic: motion-buffer content readback ──
@@ -2609,7 +2673,7 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
                n_a1 ? a_min_x : 0u, n_a1 ? a_min_y : 0u,
                n_a1 ? a_max_x : 0u, n_a1 ? a_max_y : 0u,
                n_a1 ? (unsigned)(a_cx / n_a1) : 0u, n_a1 ? (unsigned)(a_cy / n_a1) : 0u);
-      reshade::log::message(reshade::log::level::info, fbuf);
+      MotionReportLog(reshade::log::level::info, fbuf);
 
       // ── Center crop detail (the per-character summary) ──
       uint64_t c_no = 0, c_zero = 0, c_pos = 0, c_neg = 0, c_max = 0;
@@ -2695,7 +2759,7 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
                         top[t].x, top[t].y, (float)top[t].dx, (float)top[t].dy,
                         (float)top[t].sp);
         }
-        reshade::log::message(reshade::log::level::info, fsbuf);
+        MotionReportLog(reshade::log::level::info, fsbuf);
       }
       // ── Mode 7 velocity-buffer readback: the HSV view displays the VELOCITY
       // buffer (r16g16/r32g32), NOT the motion buffer. The motion buffer is
@@ -2766,7 +2830,7 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
                              (float)vtop[t].sp);
             }
             cl->Unmap(d->vel_dump_staging, 0);
-            reshade::log::message(reshade::log::level::info, vbuf);
+            MotionReportLog(reshade::log::level::info, vbuf);
           }
         }
       }
@@ -2784,7 +2848,7 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
                c_speed_n ? (float)(c_speed_sum / (double)c_speed_n) : 0.f, (float)c_best, c_min_e, c_max_e,
                center_rgba[0], center_rgba[1], center_rgba[2], center_rgba[3],
                (unsigned)(c_a1 * 100u / ctotal), (unsigned)(c_a0 * 100u / ctotal));
-      reshade::log::message(reshade::log::level::info, cbuf);
+      MotionReportLog(reshade::log::level::info, cbuf);
       // ── Mode 6 self-decode: the center pixel's 24-bit code holds
       // Ix = curNDC.x, Iy = prevNDC.x (4095-scale). Log the decoded NDC values
       // directly so the cur-vs-prev diagnosis is unambiguous:
@@ -2803,7 +2867,7 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
         snprintf(cb6, sizeof(cb6),
                  "[DLAA] mode6 center: curNDC.x=%+.4f prevNDC.x=%+.4f (Ix=%.0f Iy=%.0f)",
                  (float)c_cur, (float)c_prev, c_ix, c_iy);
-        reshade::log::message(reshade::log::level::info, cb6);
+        MotionReportLog(reshade::log::level::info, cb6);
       }
     }
     d->motion_dump_pending = false;
@@ -2909,7 +2973,7 @@ static void MaybeLogMotionFrameBurst(reshade::api::command_list* cmd_list, Devic
     char armbuf[96];
     snprintf(armbuf, sizeof(armbuf), "[DLAA] burst auto-armed: %u frames",
              (unsigned)d->motion_burst_remaining);
-    reshade::log::message(reshade::log::level::info, armbuf);
+    MotionReportLog(reshade::log::level::info, armbuf);
   }
   if (g_phaseb_vel_frame_dump > 0.5f && d->motion_burst_remaining == 0u) {
     d->motion_burst_remaining = (uint32_t)std::clamp(g_phaseb_vel_frame_dump, 1.0f, 300.0f);
@@ -3054,7 +3118,7 @@ static void MaybeLogMotionFrameBurst(reshade::api::command_list* cmd_list, Devic
              (unsigned long long)d->frame_index);
   }
   cl->Unmap(d->motion_burst_staging, 0);
-  reshade::log::message(reshade::log::level::info, buf);
+  MotionReportLog(reshade::log::level::info, buf);
   // ── Frame-burst context capture: a maxD spike (wrong MV region) arms
   // unthrottled per-draw Phase B diag for the next frames so the log names
   // WHICH draw/key wrote the wrong pixels. The event repeats on consecutive
@@ -3066,7 +3130,7 @@ static void MaybeLogMotionFrameBurst(reshade::api::command_list* cmd_list, Devic
       snprintf(ctxbuf, sizeof(ctxbuf),
                "[DLAA] burst-ctx: armed full draw context through f=%llu (maxD=%.2fpx)",
                (unsigned long long)d->diag_ctx_until, (float)max_speed);
-      reshade::log::message(reshade::log::level::info, ctxbuf);
+      MotionReportLog(reshade::log::level::info, ctxbuf);
     }
     if (n_a1 && top[0].sp > 0.0) {
       char topbuf[400];
@@ -3076,7 +3140,7 @@ static void MaybeLogMotionFrameBurst(reshade::api::command_list* cmd_list, Devic
                top[0].x, top[0].y, (float)top[0].vx, (float)top[0].vy, (float)top[0].sp,
                top[1].x, top[1].y, (float)top[1].vx, (float)top[1].vy, (float)top[1].sp,
                top[2].x, top[2].y, (float)top[2].vx, (float)top[2].vy, (float)top[2].sp);
-      reshade::log::message(reshade::log::level::info, topbuf);
+      MotionReportLog(reshade::log::level::info, topbuf);
     }
   }
   d->motion_burst_remaining--;
@@ -3135,7 +3199,7 @@ static void LogBoneTopology(DeviceData* d) {
                     " prevAge=" + (min_age == UINT64_MAX ? std::string("n/a") : std::to_string(min_age)) +
                     ".." + (max_age == 0u ? std::string("n/a") : std::to_string(max_age)) +
                     " bindReal/identity={" + bindsum + "}";
-  reshade::log::message(reshade::log::level::info, msg.c_str());
+  MotionReportLog(reshade::log::level::info, msg.c_str());
 }
 
 // ── Diag: dump the first 4x4 matrix of a structured bone buffer via a staging
@@ -3167,7 +3231,7 @@ static void DumpBoneFirstMat(ID3D11Device* nd, ID3D11DeviceContext* ctx,
              "%+.4f %+.4f %+.4f %+.4f | %+.4f %+.4f %+.4f %+.4f",
              tag, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
              f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
-    reshade::log::message(reshade::log::level::info, line);
+    MotionReportLog(reshade::log::level::info, line);
     ctx->Unmap(staging, 0);
   }
   staging->Release();
@@ -3471,7 +3535,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                            "[DLAA] ring b0=0x%llX vb=0x%llX bone=0x%llX key=0x%llX size=%u",
                            (unsigned long long)b0k, (unsigned long long)vbk,
                            (unsigned long long)gbk, (unsigned long long)key, gd.ByteWidth);
-                  reshade::log::message(reshade::log::level::info, rline2);
+                  MotionReportLog(reshade::log::level::info, rline2);
                 } else {
                   LogThrottled("ring-components", reshade::log::level::info, 1u, 30u,
                                "[DLAA] ring b0=0x%llX vb=0x%llX bone=0x%llX key=0x%llX size=%u",
@@ -3528,6 +3592,10 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 d->diag_key_bones[key].insert(gbk);
               }
               if (snap) {
+                snap->mesh_b0 = b0k;
+                snap->mesh_vb = vbk;
+                snap->mesh_stride = vb_stride;
+                snap->mesh_offset = vb_offset;
                 // Refresh cur with the game's CURRENT bones at EVERY draw.
                 // The game can update the bone buffer in place DURING the frame
                 // (an early pass may draw the character before the final pose
@@ -3565,7 +3633,8 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 // rejected; the draw then binds no real prev and the motion
                 // target is not appended, so the pixel keeps camera/depth MV.
                 const uint64_t snap_age = snap->prev_capture_frame
-                    ? (d->frame_index - snap->prev_capture_frame) : UINT64_MAX;
+                                              ? (d->frame_index - snap->prev_capture_frame)
+                                              : UINT64_MAX;
                 int own_sel = -1;
                 int own_reason = 4;
                 {
@@ -3574,6 +3643,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                   uint64_t newest_seq = 0u;
                   uint64_t bones[DeviceData::kBoneSlots] = {};
                   uint32_t nb = 0u;
+                  uint32_t valid_slots = 0u;
                   bool saw_owner = false;
                   bool saw_frame = false;
                   for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
@@ -3583,17 +3653,66 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                     saw_owner = true;
                     if (f < 1u || f - pm.frame != 1u) continue;
                     saw_frame = true;
+                    ++valid_slots;
                     bool known = false;
                     for (uint32_t i = 0u; i < nb; ++i)
-                      if (bones[i] == pm.bone) { known = true; break; }
+                      if (bones[i] == pm.bone) {
+                        known = true;
+                        break;
+                      }
                     if (!known && nb < DeviceData::kBoneSlots) bones[nb++] = pm.bone;
-                    if (newest < 0 || pm.seq > newest_seq) { newest = (int)s; newest_seq = pm.seq; }
+                    if (newest < 0 || pm.seq > newest_seq) {
+                      newest = (int)s;
+                      newest_seq = pm.seq;
+                    }
                   }
-                  if (!saw_owner) own_reason = 2;
-                  else if (!saw_frame) own_reason = 1;
-                  else if (nb > 1u) own_reason = 3;
-                  else { own_sel = newest; own_reason = 0; }
+                  if (!saw_owner)
+                    own_reason = 2;
+                  else if (!saw_frame)
+                    own_reason = 1;
+                  else if (nb > 1u || valid_slots > 1u)
+                    own_reason = 3;
+                  else {
+                    own_sel = newest;
+                    own_reason = 0;
+                  }
                 }
+                // A unique slot within this address group is not necessarily
+                // unique for the mesh: another address group may contain a
+                // different instance from the same previous frame.
+                if (own_sel >= 0 && d->frame_index > 0u) {
+                  for (const auto& [candidate_key, candidate] : d->prev_bone_snaps) {
+                    if (candidate_key == key || candidate.mesh_b0 != b0k || candidate.mesh_vb != vbk || candidate.mesh_stride != vb_stride || candidate.mesh_offset != vb_offset || candidate.size != gd.ByteWidth) continue;
+                    bool other_candidate = false;
+                    for (const auto& meta : candidate.prev_meta) {
+                      if (meta.owner == candidate_key && meta.serial == candidate.serial && meta.bone != 0u && meta.frame == d->frame_index - 1u) {
+                        other_candidate = true;
+                        break;
+                      }
+                    }
+                    if (other_candidate) {
+                      own_sel = -1;
+                      own_reason = 3;
+                      break;
+                    }
+                  }
+                }
+                if (g_char_motion_debug > 0.5f) {
+                  for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+                    const auto& meta = snap->prev_meta[s];
+                    LogThrottled(ThrottleKey("report-bone-slot", (uint32_t)key,
+                                             (uint32_t)(key >> 32u), s, (uint32_t)own_reason)
+                                     .c_str(),
+                                 reshade::log::level::info, 1u, 200u,
+                                 "[DLAA] bone-slot f=%u vs=0x%08X ps=0x%08X key=0x%llX currentBone=0x%llX serial=%llu slot=%u owner=0x%llX bone=0x%llX frame=%llu seq=%llu serial=%llu selected=%d reason=%d",
+                                 d->frame_index, vh, CurrentPsHash(cmd_list, d), (unsigned long long)key,
+                                 (unsigned long long)gbk, (unsigned long long)snap->serial, s,
+                                 (unsigned long long)meta.owner, (unsigned long long)meta.bone,
+                                 (unsigned long long)meta.frame, (unsigned long long)meta.seq,
+                                 (unsigned long long)meta.serial, own_sel, own_reason);
+                  }
+                }
+                own_sel_slot = own_sel;
                 if (own_sel >= 0) {
                   bound_snap = snap;
                   d->skinned_po_motion_valid = true;
@@ -3601,8 +3720,102 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                   bound_snap = nullptr;
                   snap_miss_reason = 7;
                   d->skinned_po_motion_valid = false;
+                  // Other address groups for the same mesh can hold the
+                  // previous frame when the game's bone-buffer ring crosses
+                  // the address mask boundary. Only accept a unique, close
+                  // root transform from an exactly previous-frame snapshot.
+                  auto* native_device = reinterpret_cast<ID3D11Device*>(cmd_list->get_device()->get_native());
+                  D3D11_BUFFER_DESC read_desc = {};
+                  read_desc.ByteWidth = 64u;
+                  read_desc.Usage = D3D11_USAGE_STAGING;
+                  read_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                  ID3D11Buffer* readback = nullptr;
+                  bool has_candidate = false;
+                  if (d->frame_index > 0u) {
+                    for (const auto& [candidate_key, candidate] : d->prev_bone_snaps) {
+                      if (candidate.mesh_b0 != b0k || candidate.mesh_vb != vbk || candidate.mesh_stride != vb_stride || candidate.mesh_offset != vb_offset || candidate.size != gd.ByteWidth) continue;
+                      for (const auto& meta : candidate.prev_meta) {
+                        if (meta.owner == candidate_key && meta.serial == candidate.serial && meta.bone != 0u && meta.frame == d->frame_index - 1u) {
+                          has_candidate = true;
+                          break;
+                        }
+                      }
+                      if (has_candidate) break;
+                    }
+                  }
+                  if (has_candidate && native_device && SUCCEEDED(native_device->CreateBuffer(&read_desc, nullptr, &readback))) {
+                    auto read_root = [&](ID3D11Buffer* source, float* matrix) {
+                      if (!source) return false;
+                      D3D11_BOX box = {0u, 0u, 0u, 64u, 1u, 1u};
+                      ctx->CopySubresourceRegion(readback, 0u, 0u, 0u, 0u, source, 0u, &box);
+                      D3D11_MAPPED_SUBRESOURCE mapped = {};
+                      if (FAILED(ctx->Map(readback, 0u, D3D11_MAP_READ, 0u, &mapped))) return false;
+                      memcpy(matrix, mapped.pData, 64u);
+                      ctx->Unmap(readback, 0u);
+                      for (uint32_t i = 0; i < 16u; ++i) {
+                        if (!std::isfinite(matrix[i])) return false;
+                      }
+                      return true;
+                    };
+                    float current_root[16] = {};
+                    float best_distance = 0.0025f;
+                    float second_distance = 1e30f;
+                    DeviceData::PrevBoneSnap* best_snap = nullptr;
+                    int best_slot = -1;
+                    bool candidates_read = true;
+                    if (read_root(gb, current_root) && d->frame_index > 0u) {
+                      for (auto& [candidate_key, candidate] : d->prev_bone_snaps) {
+                        if (candidate.mesh_b0 != b0k || candidate.mesh_vb != vbk || candidate.mesh_stride != vb_stride || candidate.mesh_offset != vb_offset || candidate.size != gd.ByteWidth) continue;
+                        for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+                          const auto& meta = candidate.prev_meta[s];
+                          if (meta.owner != candidate_key || meta.serial != candidate.serial || meta.bone == 0u || meta.frame != d->frame_index - 1u) continue;
+                          float previous_root[16] = {};
+                          if (!read_root(candidate.prev_buffer[s], previous_root)) {
+                            candidates_read = false;
+                            break;
+                          }
+                          float distance = 0.f;
+                          float rotation_difference = 0.f;
+                          for (uint32_t row = 0u; row < 3u; ++row) {
+                            const float delta = current_root[row * 4u + 3u] - previous_root[row * 4u + 3u];
+                            distance += delta * delta;
+                            for (uint32_t col = 0u; col < 3u; ++col) {
+                              const float rotation_delta = current_root[row * 4u + col] - previous_root[row * 4u + col];
+                              rotation_difference += rotation_delta * rotation_delta;
+                            }
+                          }
+                          if (rotation_difference > 0.04f) continue;
+                          if (distance < best_distance) {
+                            if (best_snap) {
+                              second_distance = best_distance;
+                            }
+                            best_distance = distance;
+                            best_snap = &candidate;
+                            best_slot = (int)s;
+                          } else if (distance < second_distance) {
+                            second_distance = distance;
+                          }
+                        }
+                        if (!candidates_read) break;
+                      }
+                    }
+                    readback->Release();
+                    if (candidates_read && best_snap && second_distance - best_distance > 0.0001f) {
+                      bound_snap = best_snap;
+                      own_sel_slot = best_slot;
+                      snap_miss_reason = 0;
+                      d->skinned_po_motion_valid = true;
+                      if (g_char_motion_debug > 0.5f) {
+                        LogThrottled(ThrottleKey("report-alternate", vh, (uint32_t)key, (uint32_t)(key >> 32u)).c_str(),
+                                     reshade::log::level::info, 1u, 200u,
+                                     "[DLAA] alternate f=%u vs=0x%08X ps=0x%08X key=0x%llX candidate=0x%llX slot=%d rootDistance=%.5f secondDistance=%.5f",
+                                     d->frame_index, vh, CurrentPsHash(cmd_list, d), (unsigned long long)key,
+                                     (unsigned long long)best_snap->prev_meta[best_slot].owner, best_slot,
+                                     std::sqrt(best_distance), std::sqrt(second_distance));
+                      }
+                    }
+                  }
                 }
-                own_sel_slot = own_sel;
                 own_reason_code = own_reason;
                 // ── Diag (throttled per key): the snapshot's prev-bone
                 // freshness/state at THIS draw. age = frames since the prev
@@ -3610,8 +3823,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 // of the frame for this key (cur refreshed from the game's t0);
                 // refreshed = strict ownership rejected this draw so the object
                 // path is suppressed and the pixel falls back to camera/depth MV.
-                if (DiagCtxActive(d) ||
-                    shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
+                if (DiagCtxActive(d) || shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
                   const bool captured_this = (prev_last_draw != d->frame_index);
                   const bool refreshed_this = (own_sel_slot < 0);
                   if (DiagCtxActive(d)) {
@@ -3623,7 +3835,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                              (int)captured_this, (int)refreshed_this,
                              (unsigned long long)snap->prev_capture_frame,
                              (unsigned long long)snap->last_draw_frame, snap->size);
-                    reshade::log::message(reshade::log::level::info, sline);
+                    MotionReportLog(reshade::log::level::info, sline);
                   } else {
                     LogThrottled(ThrottleKey("snap-state", vh, (uint32_t)key,
                                              (uint32_t)(key >> 32)).c_str(),
@@ -3650,7 +3862,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                              own_sel_slot, (unsigned long long)so, (unsigned long long)sb,
                              (unsigned long long)sf, (unsigned long long)ss, (unsigned long long)sl,
                              (int)(own_sel_slot >= 0), own_reason_code);
-                    reshade::log::message(reshade::log::level::info, oline);
+                    MotionReportLog(reshade::log::level::info, oline);
                   } else {
                     LogThrottled(ThrottleKey("snap-own", vh, (uint32_t)key,
                                              (uint32_t)(key >> 32u)).c_str(),
@@ -3725,65 +3937,50 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                         pt[0][0], pt[0][1], pt[0][2], pt[1][0], pt[1][1], pt[1][2],
                         pt[2][0], pt[2][1], pt[2][2], pt[3][0], pt[3][1], pt[3][2],
                         best_t[0]-gt[0], best_t[1]-gt[1], best_t[2]-gt[2]);
-                      reshade::log::message(reshade::log::level::info, rline);
+                      MotionReportLog(reshade::log::level::info, rline);
                     }
                   }
                 }
-                // ── Character Motion Debug Logs (DLAAPhaseBCharMotionDebug) ──
-                // Per-draw diagnostic for SPECIFIC character VS/PS pairs. The
-                // flickering-MV ghosting is intermittent (one frame wrong, next
-                // frame right), so the 1/sec throttled logs hide the offending
-                // frame. Logs the game's CURRENT root bone, every prev slot's
-                // root bone, and the slot the patched VS's nearest-root-bone
-                // match would select (mirrors the GPU logic). On a STATIONARY
-                // (breathing-only) character a large dBone means the
-                // nearest-match picked a stale/identity slot - the smoking gun.
-                // DLAAPhaseBCharMotionDebug is the MASTER diagnostic toggle
-                // (it also enables the Phase B prevVP/snapshot logs and one
-                // velocity burst), so this block is THROTTLED to stay
-                // processable: anomalies (age != 1, refr=1, best != 0, root
-                // delta > 5mm) ALWAYS log, steady state logs at most one line
-                // per key per 60 frames, and the 5 GPU readbacks are skipped
-                // entirely on throttled steady-state draws (the expensive part).
+                // Sample each snapshot at most once per 60 frames outside a burst
+                // context; each sample performs five synchronous GPU readbacks.
                 {
                   const uint32_t ph_char = CurrentPsHash(cmd_list, d);
-                  const bool cm_vs = (vh == 0x0B8C262Du || vh == 0x1D90829Au ||
-                                      it->second.new_hash == 0x0B8C262Du ||
-                                      it->second.new_hash == 0x1D90829Au);
-                  const bool cm_ps = (ph_char == 0x159A34A3u || ph_char == 0x1DE48D94u);
-                  if (g_char_motion_debug > 0.5f && (cm_vs || cm_ps)) {
+                  if (g_char_motion_debug > 0.5f) {
                     const bool cd_anomaly = (own_sel_slot < 0) || snap_age != 1u;
                     const uint64_t cd_last = snap->charmv_last_log_frame;
                     const bool cd_recent = cd_last != 0u &&
                                            (d->frame_index - cd_last) < 60u;
-                    if (cd_anomaly || !cd_recent || DiagCtxActive(d)) {
+                    if (!cd_recent || DiagCtxActive(d)) {
                       auto* ndev3 = reinterpret_cast<ID3D11Device*>(
                           cmd_list->get_device()->get_native());
                       auto read_bone_t = [&](ID3D11Buffer* src, float out[3]) {
                         out[0] = out[1] = out[2] = 0.f;
-                        if (!ndev3 || !src) return;
+                        if (!ndev3 || !src) return false;
                         D3D11_BUFFER_DESC sd3 = {};
                         sd3.ByteWidth = 64u;
                         sd3.Usage = D3D11_USAGE_STAGING;
                         sd3.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
                         ID3D11Buffer* st3 = nullptr;
-                        if (FAILED(ndev3->CreateBuffer(&sd3, nullptr, &st3))) return;
+                        if (FAILED(ndev3->CreateBuffer(&sd3, nullptr, &st3))) return false;
                         D3D11_BOX box3 = {0, 0, 0, 64u, 1, 1};
                         ctx->CopySubresourceRegion(st3, 0, 0, 0, 0, src, 0, &box3);
                         D3D11_MAPPED_SUBRESOURCE mm3 = {};
-                        if (SUCCEEDED(ctx->Map(st3, 0, D3D11_MAP_READ, 0, &mm3))) {
+                        const bool mapped = SUCCEEDED(ctx->Map(st3, 0, D3D11_MAP_READ, 0, &mm3));
+                        if (mapped) {
                           const float* f3 = static_cast<const float*>(mm3.pData);
                           out[0] = f3[3]; out[1] = f3[7]; out[2] = f3[11];
                           ctx->Unmap(st3, 0);
                         }
                         st3->Release();
+                        return mapped;
                       };
                       float gt[3] = {};
                       float pt[DeviceData::kBoneSlots][3] = {};
-                      read_bone_t(gb, gt);
-                      for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s)
-                        read_bone_t(snap->prev_buffer[s], pt[s]);
-                      // Mirror the GPU nearest-root-bone selection (min |delta|^2).
+                      uint32_t readback_mask = read_bone_t(gb, gt) ? 1u : 0u;
+                      for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+                        if (read_bone_t(snap->prev_buffer[s], pt[s])) readback_mask |= 2u << s;
+                      }
+                      // Compare all previous roots; the actual bound slot is own_sel_slot.
                       uint32_t best_slot = 0u; float best_d = 1e30f;
                       for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
                         float dx = pt[s][0]-gt[0], dy = pt[s][1]-gt[1], dz = pt[s][2]-gt[2];
@@ -3800,16 +3997,17 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                           best_slot != 0u || cd_last == 0u || !cd_recent) {
                         char cline[1100];
                         snprintf(cline, sizeof(cline),
-                          "[DLAA] charmv vs=0x%08X ps=0x%08X f=%llu key=0x%llX rr=%u cap=%u age=%llu refr=%d real=%d game=(%+.4f,%+.4f,%+.4f) p0=(%+.4f,%+.4f,%+.4f) p1=(%+.4f,%+.4f,%+.4f) p2=(%+.4f,%+.4f,%+.4f) p3=(%+.4f,%+.4f,%+.4f) best=%u d=%.4f dBone=(%+.4f,%+.4f,%+.4f)",
-                          vh, ph_char, (unsigned long long)d->frame_index,
-                          (unsigned long long)key, snap->rr, cap_slot,
-                          (unsigned long long)snap_age, (int)(own_sel_slot < 0),
-                          (int)(bound_snap != nullptr),
-                          gt[0], gt[1], gt[2],
-                          pt[0][0], pt[0][1], pt[0][2], pt[1][0], pt[1][1], pt[1][2],
-                          pt[2][0], pt[2][1], pt[2][2], pt[3][0], pt[3][1], pt[3][2],
-                          best_slot, best_d, dbx, dby, dbz);
-                        reshade::log::message(reshade::log::level::info, cline);
+                                 "[DLAA] charmv vs=0x%08X ps=0x%08X f=%llu key=0x%llX b0=0x%llX vb=0x%llX bone=0x%llX stride=%u offset=%u reason=%d sel=%d rr=%u cap=%u age=%llu refr=%d real=%d readbackMask=0x%X game=(%+.4f,%+.4f,%+.4f) p0=(%+.4f,%+.4f,%+.4f) p1=(%+.4f,%+.4f,%+.4f) p2=(%+.4f,%+.4f,%+.4f) p3=(%+.4f,%+.4f,%+.4f) best=%u d=%.4f dBone=(%+.4f,%+.4f,%+.4f)",
+                                 vh, ph_char, (unsigned long long)d->frame_index,
+                                 (unsigned long long)key, (unsigned long long)b0k, (unsigned long long)vbk,
+                                 (unsigned long long)gbk, vb_stride, vb_offset, own_reason_code, own_sel_slot, snap->rr, cap_slot,
+                                 (unsigned long long)snap_age, (int)(own_sel_slot < 0),
+                                 (int)(bound_snap != nullptr), readback_mask,
+                                 gt[0], gt[1], gt[2],
+                                 pt[0][0], pt[0][1], pt[0][2], pt[1][0], pt[1][1], pt[1][2],
+                                 pt[2][0], pt[2][1], pt[2][2], pt[3][0], pt[3][1], pt[3][2],
+                                 best_slot, best_d, dbx, dby, dbz);
+                        MotionReportLog(reshade::log::level::info, cline);
                         snap->charmv_last_log_frame = d->frame_index;
                       }
                     }
@@ -3873,14 +4071,14 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                            "[DLAA] draw cb1(prevVP)=[%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f]",
                            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
                            f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
-                  reshade::log::message(reshade::log::level::info, cb1line);
+                  MotionReportLog(reshade::log::level::info, cb1line);
                   const float* g = b0m;
                   char b0line[340];
                   snprintf(b0line, sizeof(b0line),
                            "[DLAA] draw b0 c10..13=[%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f]",
                            g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
                            g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
-                  reshade::log::message(reshade::log::level::info, b0line);
+                  MotionReportLog(reshade::log::level::info, b0line);
                   // Simulate the VS for a vertex at the root-bone translation:
                   // curClip = c10..13 x gameRoot, prevClip = cb1 x prevRoot.
                   auto project = [](const float* m, const float* p, float* ndc) {
@@ -3898,7 +4096,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                            "[DLAA] draw sim: curNDC=(%+.4f,%+.4f) prevNDC=(%+.4f,%+.4f) delta=(%+.4f,%+.4f)  (root-bone vertex; observed motionBuf delta ~(-0.92,-0.35))",
                            curN[0], curN[1], prevN[0], prevN[1],
                            prevN[0]-curN[0], prevN[1]-curN[1]);
-                  reshade::log::message(reshade::log::level::info, simline);
+                  MotionReportLog(reshade::log::level::info, simline);
                 }
               } else {
                 snap_miss_reason = 6;
@@ -3910,6 +4108,8 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
             snap_miss_reason = 4;
           }
           res->Release();
+        } else {
+          snap_miss_reason = 4;
         }
         game_srv->Release();
       } else {
@@ -3923,6 +4123,14 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
     if (PhasebDbgActive()) LogBoneTopology(d);
   } else {
     snap_miss_reason = 1;
+  }
+  if (g_char_motion_debug > 0.5f && !bound_snap) {
+    LogThrottled(ThrottleKey("report-snapshot-missing", vh, CurrentPsHash(cmd_list, d),
+                             (uint32_t)snap_miss_reason)
+                     .c_str(),
+                 reshade::log::level::info, 1u, 200u,
+                 "[DLAA] snapshot-missing f=%u vs=0x%08X ps=0x%08X reason=%d ownershipReason=%d",
+                 d->frame_index, vh, CurrentPsHash(cmd_list, d), snap_miss_reason, own_reason_code);
   }
   // Per-VS bind accounting: bound_snap is non-null iff a REAL prev-bone
   // snapshot was captured/bound this draw (vs the identity placeholder).
@@ -3977,13 +4185,13 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                it->second.prev_bone_t_slot,
                d->bound_real_prev_bones ? "prevBones" : "prevBones(identity)",
                it->second.texcoord_index, it->second.output_reg);
-      reshade::log::message(reshade::log::level::info, bline);
+      MotionReportLog(reshade::log::level::info, bline);
       if (!bound_snap) {
         char mline[192];
         snprintf(mline, sizeof(mline),
                  "[DLAA] snap MISSING vs=0x%08X ps=0x%08X reason=%d",
                  vh, CurrentPsHash(cmd_list, d), snap_miss_reason);
-        reshade::log::message(reshade::log::level::info, mline);
+        MotionReportLog(reshade::log::level::info, mline);
       }
     } else {
       LogThrottled(ThrottleKey("phaseB-bind", vh, it->second.prev_vp_cb_slot,
@@ -4080,8 +4288,17 @@ static void MaybeBindPatchedRigidVs(reshade::api::command_list* cmd_list, Device
         // Staleness guard (mirrors the bone path): stale prev -> force prev = cur
         // (delta 0, camera path) instead of a multi-frame accumulated garbage delta.
         const uint64_t snap_age = world_snap->prev_capture_frame
-            ? (d->frame_index - world_snap->prev_capture_frame) : UINT64_MAX;
+                                      ? (d->frame_index - world_snap->prev_capture_frame)
+                                      : UINT64_MAX;
         const uint64_t max_stale_age = (g_phaseb_strict_prev > 0.5f) ? 1u : 2u;
+        if (g_weapon_motion_debug > 0.5f) {
+          LogThrottled(ThrottleKey("report-rigid", vh, (uint32_t)key, (uint32_t)(key >> 32u)).c_str(),
+                       reshade::log::level::info, 1u, 60u,
+                       "[DLAA] rigid f=%u vs=0x%08X ps=0x%08X b0=0x%llX vb=0x%llX stride=%u offset=%u key=0x%llX slot=%u age=%llu staleRefresh=%d",
+                       d->frame_index, vh, CurrentPsHash(cmd_list, d), (unsigned long long)b0k,
+                       (unsigned long long)vbk, vb_stride, vb_offset, (unsigned long long)key,
+                       slot, (unsigned long long)snap_age, (int)(snap_age > max_stale_age));
+        }
         if (snap_age > max_stale_age)
           for (uint32_t s = 0u; s < DeviceData::kRigidPrevWorldSlots; ++s)
             ctx->CopyResource(world_snap->prev_buffer[s], world_snap->cur_buffer[s]);
@@ -4092,6 +4309,15 @@ static void MaybeBindPatchedRigidVs(reshade::api::command_list* cmd_list, Device
     }
     if (b0) b0->Release();
     if (vb0) vb0->Release();
+  }
+
+  if (g_weapon_motion_debug > 0.5f && !world_snap) {
+    const uint32_t ph = CurrentPsHash(cmd_list, d);
+    LogThrottled(ThrottleKey("report-rigid-missing", vh, ph).c_str(),
+                 reshade::log::level::info, 1u, 200u,
+                 "[DLAA] rigid missing f=%u vs=0x%08X ps=0x%08X perObject=%d psCandidate=%d",
+                 d->frame_index, vh, ph, (int)(shader_injection.dlaa_per_object_motion >= 0.5f),
+                 (int)d->phasee_ps_candidates.contains(ph));
   }
 
   // Save the game's current bindings at these slots BEFORE overwriting them so the
@@ -4128,7 +4354,7 @@ static void MaybeBindPatchedRigidVs(reshade::api::command_list* cmd_list, Device
     ctx->VSSetConstantBuffers(vp_slot, 1u, cbs);
   }
 
-  if (PhasebDbgActive())
+  if (PhasebDbgActive() || g_weapon_motion_debug > 0.5f)
     LogThrottled(ThrottleKey("phaseW-bind", vh, world_slot, vp_slot).c_str(),
                  reshade::log::level::info, 1u, 120u,
                  "[DLAA] phaseW: bind rigid vs=0x%08X cbWorld%u..%u=%s cbVP%u=prevVP",
@@ -4762,7 +4988,7 @@ static void Phase0ProbeVertexSrv(reshade::api::device* dev, reshade::api::comman
       snprintf(buf, sizeof(buf),
                "[P0] VS t%u SRV push (patched=%d) vs=0x%08X — would conflict with prev-bone t1",
                update.binding, (int)d->patched_vs_by_hash.contains(vhash), vhash);
-      reshade::log::message(reshade::log::level::info, buf);
+      MotionReportLog(reshade::log::level::info, buf);
     }
     return;
   }
@@ -4877,7 +5103,7 @@ static void Phase0ProbeFrameSummary(DeviceData* d) {
            "[P0] summary: per-object VSs=%zu skinned=%u world=%u distinctBoneBuffers=%zu vbUAV(gpu-skin)=%u vbNonUAV=%zu",
            d->p0_vs_bone_handle.size(), skinned, world_only, handles.size(),
            gpu_skinned, d->p0_vs_vb_bind_flags.size() - gpu_skinned);
-  reshade::log::message(reshade::log::level::info, buf);
+  MotionReportLog(reshade::log::level::info, buf);
 }
 
 // ── Event: capture all needed descriptors (falcomengine-plus pattern: type → binding → hash) ──
@@ -4909,7 +5135,7 @@ static void OnPushDescriptorsCapture(
         char buf[128];
         snprintf(buf, sizeof(buf), "[DLAA] Diag: t%u pushed, hash=0x%08X",
                  update.binding, hash);
-        reshade::log::message(reshade::log::level::info, buf);
+        MotionReportLog(reshade::log::level::info, buf);
       }
     }
 
@@ -5386,7 +5612,7 @@ static bool RunDLAA(reshade::api::command_list* cmd_list, uint32_t color_slot) {
                            : reshade::api::format::r16g16_float;
   if (d->velocity_texture.handle && d->velocity_format != vel_fmt) {
     if (shader_injection.dlaa_debug_logging > 0.5f)
-      reshade::log::message(reshade::log::level::info, "[DLAA] Velocity format change: recreating MV texture");
+      MotionReportLog(reshade::log::level::info, "[DLAA] Velocity format change: recreating MV texture");
     if (d->velocity_srv.handle) dev->destroy_resource_view(d->velocity_srv);
     if (d->velocity_uav.handle) dev->destroy_resource_view(d->velocity_uav);
     dev->destroy_resource(d->velocity_texture);
@@ -5669,8 +5895,8 @@ static bool RunDLAA(reshade::api::command_list* cmd_list, uint32_t color_slot) {
           }
           if (!EnsureDebugNative(dev, d)) {
             DlaaDiagSet(d, kDlaaReasonEvalFalse, "MV debug native setup failed");
-            reshade::log::message(reshade::log::level::error,
-              "[DLAA] MV debug native setup failed");
+            MotionReportLog(reshade::log::level::error,
+                            "[DLAA] MV debug native setup failed");
             return false;
           }
 
@@ -5680,7 +5906,7 @@ static bool RunDLAA(reshade::api::command_list* cmd_list, uint32_t color_slot) {
             char buf[96];
             snprintf(buf, sizeof(buf), "[DLAA] MV debug mode=%d scale=%.0f",
                      (int)shader_injection.dlaa_debug_view, shader_injection.dlaa_debug_scale);
-            reshade::log::message(reshade::log::level::info, buf);
+            MotionReportLog(reshade::log::level::info, buf);
           }
 
           D3D11_MAPPED_SUBRESOURCE map = {};
@@ -5780,7 +6006,7 @@ static bool RunDLAA(reshade::api::command_list* cmd_list, uint32_t color_slot) {
               d->depth_capture_frame, d->vp_read_frame, d->prev_vp_frame,
               (unsigned long long)d->depth_capture_res_handle,
               (unsigned long long)d->vp_cbv_handle);
-            reshade::log::message(reshade::log::level::info, buf);
+            MotionReportLog(reshade::log::level::info, buf);
           }
           // Motion vectors are already in pixel space.
           float mv_scale_x = 1.f, mv_scale_y = 1.f;
@@ -5799,8 +6025,8 @@ static bool RunDLAA(reshade::api::command_list* cmd_list, uint32_t color_slot) {
               (d->dlaa_diag.eval_fail_color_res != color_identity ||
                d->dlaa_diag.eval_fail_w != w || d->dlaa_diag.eval_fail_h != h)) {
             senkiseki3::dlss::ngx.eval_failed = false;
-            reshade::log::message(reshade::log::level::info,
-                "[DLAA] NGX eval-failure latch cleared (color identity changed)");
+            MotionReportLog(reshade::log::level::info,
+                            "[DLAA] NGX eval-failure latch cleared (color identity changed)");
           }
           dlaa_ok = senkiseki3::dlss::EvaluateDLSS(cl, src, ngx_out, mv, dep,
                        jitter_px_x, jitter_px_y, mv_scale_x, mv_scale_y);
@@ -5846,7 +6072,7 @@ static bool RunDLAA(reshade::api::command_list* cmd_list, uint32_t color_slot) {
           char buf[96];
           snprintf(buf, sizeof(buf), "[DLAA] NGX output: %ux%u fmt=%d",
                    ngx_desc.Width, ngx_desc.Height, (int)ngx_desc.Format);
-          reshade::log::message(reshade::log::level::info, buf);
+          MotionReportLog(reshade::log::level::info, buf);
         }
         if (!BindDlaaOutputSrv(cl, color_slot))
           LogThrottled("ngx-srv-fail", reshade::log::level::warning, 1u, 120u,
@@ -6191,14 +6417,90 @@ renodx::utils::settings::Settings settings = {
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
         .is_visible = []{ return g_fg_page < 0.5f; },
     },
-    // Non-throttled per-draw motion logs for the two flickering-MV characters.
+    // Character motion diagnostics and copyable report.
     new renodx::utils::settings::Setting{
-        .key = "DLAAPhaseBCharMotionDebug", .binding = &g_char_motion_debug,
+        .key = "DLAAPhaseBCharMotionDebug",
+        .binding = &g_char_motion_debug,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Character Motion Debug Logs", .section = "Antialiasing",
-        .tooltip = "MASTER DIAGNOSTIC TOGGLE for the two ghosting characters (VS 0x0B8C262D / 0x1D90829A, PS 0x159A34A3 / 0x1DE48D94): logs the game's current root bone, all 4 prev-bone slots' root bones, and the nearest-root-bone slot the patched VS selects, PLUS the Phase B prevVP/snapshot diagnostics and ONE automatic velocity burst (DLAAPhaseBBurstFrames frames, re-armed on each Off->On edge). Charmv lines are throttled (anomalies - stale snapshot, wrong slot, root delta >5mm - always log; steady state 1/key/60 frames; readbacks skipped when throttled). Set ONLY this toggle; toggle Off then On to re-arm the burst (or restart). Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
+        .default_value = 0.f,
+        .label = "Character Motion Debug Logs",
+        .section = "Antialiasing",
+        .tooltip = "Capture character motion diagnostics, including snapshot ownership, motion output decisions, rigid weapons, root-bone samples, and one automatic velocity burst. Root readbacks are sampled once per snapshot per 60 frames outside a diagnostic burst. Toggle Off then On to start a new report and re-arm the burst.",
+        .labels = {"Off", "On"},
+        .on_change_value = [](float, float current) {
+          if (current > 0.5f) {
+            std::unique_lock lock(g_character_motion_report.mutex);
+            g_character_motion_report.lines.clear();
+            g_character_motion_report.bytes = 0;
+            g_character_motion_report.dropped = 0;
+            ++g_character_report_generation;
+          } },
+        .is_visible = [] { return g_fg_page < 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAWeaponMotionDebug",
+        .binding = &g_weapon_motion_debug,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Weapon Logs",
+        .section = "Antialiasing",
+        .tooltip = "Capture rigid weapon motion diagnostics for Copy Report. Toggle off and on to start a fresh weapon report.",
+        .labels = {"Off", "On"},
+        .on_change_value = [](float, float current) {
+          if (current > 0.5f) {
+            std::unique_lock lock(g_weapon_motion_report.mutex);
+            g_weapon_motion_report.lines.clear();
+            g_weapon_motion_report.bytes = 0;
+            g_weapon_motion_report.dropped = 0;
+            ++g_character_report_generation;
+          }
+        },
+        .is_visible = [] { return g_fg_page < 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAACopyCharacterMotionReport",
+        .binding = nullptr,
+        .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
+        .default_value = 0.f,
+        .label = "Motion Report",
+        .section = "Antialiasing",
+        .tooltip = "Copy the recent character motion diagnostics. Turn on Character Motion Debug Logs, reproduce the problem, then copy the report.",
+        .on_draw = [] {
+          if (ImGui::Button("Copy Report")) {
+            std::string report;
+            char header[512];
+            snprintf(header, sizeof(header),
+                     "Senkiseki DLAA motion report v2\nAA=%.0f per_object=%.0f phaseB=%.0f phaseE=%.0f rigid_weapons=%.0f strict_prev=%.0f character_logs=%.0f weapon_logs=%.0f\n",
+                     shader_injection.dlaa_enabled, shader_injection.dlaa_per_object_motion,
+                     g_phaseb_enabled, g_phasee_enabled, g_phase_rigid_weapons,
+                     g_phaseb_strict_prev, g_char_motion_debug, g_weapon_motion_debug);
+            report = header;
+            report += "Snapshot missing reasons: 1=capture gated, 2=missing b0 or VB, 3=missing bone SRV, 4=missing or non-buffer resource, 5=not structured stride-64, 6=snapshot allocation failed, 7=ownership rejected.\n";
+            report += "Ownership reasons describe the original key: 0=selected, 1=no previous-frame slot, 2=no matching owner/serial, 3=multiple previous slots or bone handles, 4=not evaluated. Alternate lines identify a different selected key. charmv roots and age describe the original key; sel may refer to the alternate. readbackMask bits 0..4 indicate successful reads of game and prev0..3.\n";
+            {
+              std::shared_lock lock(g_character_motion_report.mutex);
+              if (g_char_motion_debug > 0.5f) {
+                report += "Character lines dropped: " + std::to_string(g_character_motion_report.dropped) + "\n";
+                for (const auto& line : g_character_motion_report.lines) {
+                  report += line;
+                  report += '\n';
+                }
+              }
+            }
+            {
+              std::shared_lock lock(g_weapon_motion_report.mutex);
+              if (g_weapon_motion_debug > 0.5f) {
+                report += "Weapon lines dropped: " + std::to_string(g_weapon_motion_report.dropped) + "\n";
+                for (const auto& line : g_weapon_motion_report.lines) {
+                  report += line;
+                  report += '\n';
+                }
+              }
+            }
+            ImGui::SetClipboardText(report.c_str());
+          }
+          return false; },
+        .is_visible = [] { return g_fg_page < 0.5f; },
     },
     // Phase B generic-patch isolation (crash bisection).
     new renodx::utils::settings::Setting{
@@ -6501,18 +6803,18 @@ static void FgPresentTick(reshade::api::device* dev, reshade::api::command_queue
           snprintf(sline, sizeof(sline),
                    "[DLAA] FG proxy: swapchain ready %ux%u factory=%d variant=%d", cw, ch,
                    fg->swap_req_factory, fg->swap_req_variant);
-          reshade::log::message(reshade::log::level::info, sline);
+          MotionReportLog(reshade::log::level::info, sline);
         } else if (chr != 1) {
           char eline[192];
           snprintf(eline, sizeof(eline),
                    "[DLAA] FG proxy: swapchain attempt factory=%d variant=%d hr=0x%08X",
                    fg->swap_req_factory, fg->swap_req_variant, (unsigned int)chr);
-          reshade::log::message(reshade::log::level::warning, eline);
+          MotionReportLog(reshade::log::level::warning, eline);
           fg->swap_step++;
           if (fg->swap_step > 5) {
             fg->swap_latched = true;
-            reshade::log::message(reshade::log::level::error,
-                                  "[DLAA] FG proxy: swap creation latched off until retoggled");
+            MotionReportLog(reshade::log::level::error,
+                            "[DLAA] FG proxy: swap creation latched off until retoggled");
           }
         }
       }
@@ -6555,12 +6857,12 @@ static void FgPresentTick(reshade::api::device* dev, reshade::api::command_queue
                      (unsigned long long)fg->fence_value, (unsigned long long)fg->suppressed,
                      (unsigned long long)fg->proxy_presents, (unsigned long long)fg->dropped,
                      (unsigned long long)fg->occluded, fg->proxy_pattern ? "pattern" : "real");
-            reshade::log::message(reshade::log::level::info, sline);
+            MotionReportLog(reshade::log::level::info, sline);
           }
         } else if (rc != fg->last_test_code) {
           char eline[192];
           snprintf(eline, sizeof(eline), "[DLAA] FG proxy: spike test failed code=%d", rc);
-          reshade::log::message(reshade::log::level::warning, eline);
+          MotionReportLog(reshade::log::level::warning, eline);
         }
         fg->last_test_code = rc;
       }
@@ -6616,17 +6918,17 @@ static void OnInitSwapchainFg(reshade::api::swapchain* swapchain, bool resize) {
   if (!hwnd) return;
   char line[192];
   snprintf(line, sizeof(line), "[DLAA] FG proxy: init_swapchain attempt %ux%u", w, h);
-  reshade::log::message(reshade::log::level::info, line);
+  MotionReportLog(reshade::log::level::info, line);
   in_init_swap = true;
   HRESULT hr = senkiseki3::fg::FgSwapCreateSync(fg, hwnd, w, h, 2, 0);
   in_init_swap = false;
   if (SUCCEEDED(hr) && fg->proxy_swap) {
     snprintf(line, sizeof(line), "[DLAA] FG proxy: swapchain ready %ux%u init-event", w, h);
-    reshade::log::message(reshade::log::level::info, line);
+    MotionReportLog(reshade::log::level::info, line);
   } else {
     snprintf(line, sizeof(line), "[DLAA] FG proxy: init_swapchain attempt hr=0x%08X",
              (unsigned int)hr);
-    reshade::log::message(reshade::log::level::warning, line);
+    MotionReportLog(reshade::log::level::warning, line);
   }
 }
 
@@ -6763,9 +7065,9 @@ static bool HdrFinalPathActive(reshade::api::command_list* cmd_list) {
     const bool detected = GetModuleHandleA("renodx-senkiseki.addon64") != nullptr;
     if (detected != d->hdr_detected) {
       d->hdr_detected = detected;
-      reshade::log::message(reshade::log::level::info,
-          detected ? "[DLAA] HDR mod detected (late): renodx-senkiseki.addon64"
-                   : "[DLAA] HDR mod unloaded");
+      MotionReportLog(reshade::log::level::info,
+                      detected ? "[DLAA] HDR mod detected (late): renodx-senkiseki.addon64"
+                               : "[DLAA] HDR mod unloaded");
     }
   }
   const int mode = (int)shader_injection.dlaa_hdr_inject;
@@ -7173,7 +7475,7 @@ static bool OnCreatePipeline(
                info.prev_bone_t_slot, info.texcoord_index, info.output_reg,
                (int)info.outline_applied);
     }
-    reshade::log::message(reshade::log::level::info, buf);
+    MotionReportLog(reshade::log::level::info, buf);
     WatchdogSet(d, "create_pipeline patch VS 0x%08X -> 0x%08X", hash, new_hash);
   }
 
@@ -7211,7 +7513,7 @@ static bool OnCreatePipeline(
       char buf[128];
       snprintf(buf, sizeof(buf), "[DLAA] phaseE: staged generic PS 0x%08X (%u B)",
                hash, (uint32_t)it->second.original_bytecode.size());
-      reshade::log::message(reshade::log::level::info, buf);
+      MotionReportLog(reshade::log::level::info, buf);
     }
     WatchdogSet(d, "create_pipeline phaseE staged PS 0x%08X", hash);
   }
@@ -7219,8 +7521,8 @@ static bool OnCreatePipeline(
     static bool phasee_off_logged = false;
     if (!phasee_off_logged) {
       phasee_off_logged = true;
-      reshade::log::message(reshade::log::level::info,
-          "[DLAA] Phase E PS patcher DISABLED (default) — no per-object MVs.");
+      MotionReportLog(reshade::log::level::info,
+                      "[DLAA] Phase E PS patcher DISABLED (default) — no per-object MVs.");
     }
   }
   WatchdogSet(d, "create_pipeline done");
@@ -7387,9 +7689,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
                           "no RunDLAA call (final=%u fxaa=%u) — the FXAA/final_blending on_draw hook is not firing",
                           diag.final_entry, diag.fxaa_entry);
               if (diag.presents_without_entry == 60u) {
-                reshade::log::message(reshade::log::level::warning,
-                    "[DLAA] deploy blocked: no entry point for 60 frames — check for "
-                    "utils::shader 'Pipeline not found' warnings / an unlisted final pass");
+                MotionReportLog(reshade::log::level::warning,
+                                "[DLAA] deploy blocked: no entry point for 60 frames — check for "
+                                "utils::shader 'Pipeline not found' warnings / an unlisted final pass");
               }
             } else {
               diag.presents_without_entry = 0u;
@@ -7406,12 +7708,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
                   snprintf(edge, sizeof(edge), "[DLAA] deploy ON (entry=%s)",
                            diag.last_deploy_entry == 1u ? "final" :
                            diag.last_deploy_entry == 2u ? "fxaa" : "?");
-                  reshade::log::message(reshade::log::level::info, edge);
+                  MotionReportLog(reshade::log::level::info, edge);
                 } else {
                   char edge[256];
                   snprintf(edge, sizeof(edge), "[DLAA] deploy OFF reason=%s detail=%s",
                            DlaaReasonName(diag.reason), diag.detail);
-                  reshade::log::message(reshade::log::level::warning, edge);
+                  MotionReportLog(reshade::log::level::warning, edge);
                 }
               }
             } else if (diag.reason != diag.last_logged_reason && diag.reason != kDlaaReasonOk &&
@@ -7420,7 +7722,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
               char edge[256];
               snprintf(edge, sizeof(edge), "[DLAA] deploy blocked: reason=%s detail=%s",
                        DlaaReasonName(diag.reason), diag.detail);
-              reshade::log::message(reshade::log::level::warning, edge);
+              MotionReportLog(reshade::log::level::warning, edge);
             }
             diag.last_logged_reason = diag.reason;
             if (shader_injection.dlaa_debug_logging > 0.5f &&
@@ -7444,18 +7746,18 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
         CpuProfileLogFrame();  // CPU profile: per-site ms breakdown every 120 DLAA frames
         if (!senkiseki3::dlss::ngx.initialized && !senkiseki3::dlss::ngx.init_failed) {
           if (shader_injection.dlaa_debug_logging > 0.5f)
-            reshade::log::message(reshade::log::level::info, "[DLAA] Attempting NGX init...");
+            MotionReportLog(reshade::log::level::info, "[DLAA] Attempting NGX init...");
           auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
           bool ok = senkiseki3::dlss::InitDLSS(nd, (uint32_t)d->swapchain_w, (uint32_t)d->swapchain_h);
           if (!ok)
-            reshade::log::message(reshade::log::level::error, "[DLAA] NGX init failed");
+            MotionReportLog(reshade::log::level::error, "[DLAA] NGX init failed");
           else if (shader_injection.dlaa_debug_logging > 0.5f)
-            reshade::log::message(reshade::log::level::info, "[DLAA] NGX init succeeded");
+            MotionReportLog(reshade::log::level::info, "[DLAA] NGX init succeeded");
         }
         static int fc = 0;
         if (shader_injection.dlaa_debug_logging > 0.5f && (++fc <= 3 || (fc % 300 == 0)))
-          reshade::log::message(reshade::log::level::info,
-            (std::string("[DLAA] Present frame ") + std::to_string(fc)).c_str());
+          MotionReportLog(reshade::log::level::info,
+                          (std::string("[DLAA] Present frame ") + std::to_string(fc)).c_str());
         // Per-frame global-jitter summary: _Globals uploads patched vs large
         // buffers mapped this frame — tells us mid-game whether the scene
         // _Globals is uploaded via UpdateSubresource or Map/Unmap.
@@ -7463,7 +7765,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
           char gbuf[128];
           snprintf(gbuf, sizeof(gbuf), "[DLAA] global: frame %d patched=%u mapped=%u",
                    fc, d->globals_patch_count, d->globals_map_count);
-          reshade::log::message(reshade::log::level::info, gbuf);
+          MotionReportLog(reshade::log::level::info, gbuf);
         }
         if (d) { d->globals_patch_count = 0; d->globals_map_count = 0; }
         // DIAGNOSTIC: how many EvaluateDLSS calls happened in the frame that just
@@ -7473,13 +7775,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
           char fbuf[128];
           snprintf(fbuf, sizeof(fbuf), "[DLAA] freq f=%u evals=%u",
                    d->frame_index, d->evals_this_frame);
-          reshade::log::message(reshade::log::level::info, fbuf);
+          MotionReportLog(reshade::log::level::info, fbuf);
         }
         if (d) d->evals_this_frame = 0;
         if (d) FgPresentTick(dev, queue, swapchain, d);
       });
 
-      reshade::log::message(reshade::log::level::info, "[Senkiseki3 DLAA] Addon loaded");
+      MotionReportLog(reshade::log::level::info, "[Senkiseki3 DLAA] Addon loaded");
 
       reshade::register_event<reshade::addon_event::init_device>([](reshade::api::device* dev) {
         if (!dev || dev->get_api() != reshade::api::device_api::d3d11) return;
@@ -7487,9 +7789,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
         g_dlaa_diag_device = d;
         // HDR-mod detection selects the pre-tone-map injection path in Auto mode.
         d->hdr_detected = GetModuleHandleA("renodx-senkiseki.addon64") != nullptr;
-        reshade::log::message(reshade::log::level::info,
-          d->hdr_detected ? "[DLAA] HDR mod detected: renodx-senkiseki.addon64"
-                          : "[DLAA] HDR mod not detected");
+        MotionReportLog(reshade::log::level::info,
+                        d->hdr_detected ? "[DLAA] HDR mod detected: renodx-senkiseki.addon64"
+                                        : "[DLAA] HDR mod not detected");
         WatchdogStart(d);
         if (g_fg_enabled > 0.5f || g_fg_proxy_spike > 0.5f) {
           auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
@@ -7539,7 +7841,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
              g_phaseb_enabled >= 0.5f ? "ON" : "OFF",
              "OFF",
              GetPhasebDir().c_str());
-    reshade::log::message(reshade::log::level::info, ibuf);
+    MotionReportLog(reshade::log::level::info, ibuf);
   }
   return TRUE;
 }
