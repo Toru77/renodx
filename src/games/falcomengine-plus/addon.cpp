@@ -5686,13 +5686,15 @@ static void OnPushDescriptorsCapture(
   // still makes the real per-frame decision, and a capture that flickers off when
   // the player walks out of a cutscene would drop the view the deploy still needs.
   const bool wantMotionBlurPush = shader_injection.mb_mode > 0.5f;
+  // Sun contact shadows read the depth, MRT normal and scene CBV captured below.
   if (shader_injection.gtvbao_mode < 0.5f
       && !falcom_world::rtao::RtaoRequested()
       && !falcom_world::rr::RrRequested()
       && !VbgiRunning()
       && shader_injection.dynCube_enabled < 0.5f
       && !wantTAAMotionPush
-      && !wantMotionBlurPush) {
+      && !wantMotionBlurPush
+      && shader_injection.cs_contact_enabled < 0.5f) {
     return;
   }
   if (capture_timer.armed) {
