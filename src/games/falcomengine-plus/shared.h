@@ -588,9 +588,10 @@ struct ShaderInjectData {
   float cs_contact_denoise_normal_sigma;  // [0.01..1] edge stop on 1 - dot(Nc, Nt), default 0.1
   float cs_contact_denoise_passes;        // [1..4] horizontal + vertical iterations, default 1
   float cs_denoise_axis;                  // runtime: 0 = horizontal, 1 = vertical; set by RunShadows before each denoise dispatch
-  // RETIRED micro shadow slots (kept for the layout)
-  float cs_micro_debug;             // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_ao_source;  // RETIRED: micro shadows removed, unread, kept for the layout
+  // Local contact denoise (shadows/contact_local_denoise.cs_5_0.hlsl): the same filter over the point (.x) and spot (.z)
+  // shares of the local term. These take the five remaining retired micro shadow slots, so the layout does not move.
+  float cs_contact_local_denoise_enabled;       // 0=Off, 1=On, default On
+  float cs_contact_local_denoise_radius;        // [1..8] pixels per axis, default 4
 
   // Contact Shadows
   float cs_contact_enabled;         // 0=Off, 1=On
@@ -625,10 +626,10 @@ struct ShaderInjectData {
   float cs_noise_frame;            // IS-FAST volume slice (frame_index % 32), or -1 when
                                    // the volume is unusable and the caller must not sample
   float cs_working_w, cs_working_h; // shadow output / depth texture dims
-  float cs_ao_bound;               // RETIRED: micro shadows removed, unread, kept for the layout
-  float cs_micro_dedicated_bound;  // RETIRED: micro shadows removed, unread, kept for the layout
+  float cs_contact_local_denoise_depth_sigma;   // [0.001..0.2] local denoise depth sigma, default 0.02
+  float cs_contact_local_denoise_normal_sigma;  // [0.01..1] local denoise normal sigma, default 0.1
   float cs_contact_dedicated_bound;// 0/1 — t34 holds a valid contact term this frame
-  float cs_micro_isfast_enabled;  // RETIRED: micro shadows removed, unread, kept for the layout
+  float cs_contact_local_denoise_passes;        // [1..4] local denoise iterations, default 1
   // Manual override for the sun-contact range gate, in world units. 0 = derive the
   // cutoff from the engine's own last-cascade split. The override exists because
   // that split is only read in-shader by Kai and Kai soft; the Sora shaders

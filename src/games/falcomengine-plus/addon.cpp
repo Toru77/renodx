@@ -404,15 +404,15 @@ ShaderInjectData shader_injection = {
         .mb_camera_jitter = 1.f,
         .mb_camera_cut = 1.f,
         .mb_camera_cut_px = 120.f,
-  // -- Contact Shadows -- (the remaining cs_micro_* slots are RETIRED and unread)
+  // -- Contact Shadows --
   .cs_contact_denoise_enabled = 1.f,
   .cs_contact_denoise_radius = 4.f,
   .cs_contact_denoise_depth_sigma = 0.02f,
   .cs_contact_denoise_normal_sigma = 0.1f,
   .cs_contact_denoise_passes = 1.f,
   .cs_denoise_axis = 0.f,
-  .cs_micro_debug = 0.f,
-  .cs_micro_ao_source = 1.f,
+  .cs_contact_local_denoise_enabled = 1.f,
+  .cs_contact_local_denoise_radius = 4.f,
   .cs_contact_enabled = 0.f,
   .cs_contact_strength = 1.f,
   .cs_contact_env_strength = 1.f,
@@ -438,10 +438,10 @@ ShaderInjectData shader_injection = {
   .cs_noise_frame = -1.f,
   .cs_working_w = 0.f,
   .cs_working_h = 0.f,
-  .cs_ao_bound = 0.f,
-  .cs_micro_dedicated_bound = 0.f,
+  .cs_contact_local_denoise_depth_sigma = 0.02f,
+  .cs_contact_local_denoise_normal_sigma = 0.1f,
   .cs_contact_dedicated_bound = 0.f,
-  .cs_micro_isfast_enabled = 0.f,
+  .cs_contact_local_denoise_passes = 1.f,
   // 0 = derive the sun-contact range gate from the engine's last cascade split.
   .cs_contact_sun_range = 0.f,
   // 4 reproduces the original 4-sample appearance exactly, so the estimator change is
@@ -530,7 +530,8 @@ enum ShadowsPass : uint32_t {
   kShadowsPassContact = 0u,  // contact_shadows.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 noise -> u0)
   kShadowsPassDenoise = 1u,  // contact_denoise.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 contact -> u0), one axis per dispatch
   kShadowsPassLocal = 2u,  // contact_local.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 noise, t3 lamps, t4 light cells, t5 material index, t6 materials -> u0), one dispatch writes all four channels
-  kShadowsPassCount = 3u,
+  kShadowsPassLocalDenoise = 3u,  // contact_local_denoise.cs_5_0.hlsl (t0 depth, t1 mrt, t2 local -> u0), one axis per dispatch
+  kShadowsPassCount = 4u,
 };
 // The lighting pixel shaders read the result from this slot. t34 is declared by no
 // game's lighting shader and claimed by no existing push, so it is free in Sora 1st,
@@ -552,8 +553,8 @@ constexpr uint32_t kLightingLocalContactRegister = 40u;
 // shaders, which is where it was first needed.
 constexpr uint32_t kCharShadowNoiseRegister = kLightingShadowNoiseRegister;
 // SRV counts per pass, matching the register() declarations in each shader.
-constexpr uint32_t kShadowsSrvPerPass[kShadowsPassCount] = {3u, 3u, 7u};
-constexpr uint32_t kShadowsUavPerPass[kShadowsPassCount] = {1u, 1u, 1u};
+constexpr uint32_t kShadowsSrvPerPass[kShadowsPassCount] = {3u, 3u, 7u, 3u};
+constexpr uint32_t kShadowsUavPerPass[kShadowsPassCount] = {1u, 1u, 1u, 1u};
 
 // -- Motion Blur (Guertin et al. 2013) --
 // Fixed pass order; the indices address the layout/pipeline/table arrays in
@@ -4701,6 +4702,51 @@ renodx::utils::settings::Settings settings = {
                  "cannot multiply the cost without limit. Sora and Kai march the strongest lights first.",
       .min = 1.f, .max = 16.f, .format = "%d",
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsLocalDenoise", .binding = &shader_injection.cs_contact_local_denoise_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Local Denoise", .section = "Contact Shadows",
+      .tooltip = "Smooths the IS-FAST grain of the local light contact term with an edge-aware blur that stops at depth and normal edges. Off leaves the term exactly as marched.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsLocalDenoiseRadius", .binding = &shader_injection.cs_contact_local_denoise_radius,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 4.f, .label = "Local Denoise Radius", .section = "Contact Shadows",
+      .tooltip = "Blur radius in pixels along each axis. Larger is smoother and costs more.",
+      .min = 1.f, .max = 8.f, .format = "%d",
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsLocalDenoiseDepthSigma", .binding = &shader_injection.cs_contact_local_denoise_depth_sigma,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.02f, .label = "Local Denoise Depth Sigma", .section = "Contact Shadows",
+      .tooltip = "How far a neighbour may sit off this pixel's surface plane, relative to its distance, before it stops contributing. Lower keeps depth edges sharper.",
+      .min = 0.001f, .max = 0.2f, .format = "%.3f",
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsLocalDenoiseNormalSigma", .binding = &shader_injection.cs_contact_local_denoise_normal_sigma,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.1f, .label = "Local Denoise Normal Sigma", .section = "Contact Shadows",
+      .tooltip = "How different a neighbour's surface normal may be before it stops contributing. Lower keeps creases and corners sharper.",
+      .min = 0.01f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsLocalDenoisePasses", .binding = &shader_injection.cs_contact_local_denoise_passes,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Local Denoise Passes", .section = "Contact Shadows",
+      .tooltip = "Horizontal + vertical iterations. Each extra pass widens the blur and adds the same cost again.",
+      .min = 1.f, .max = 4.f, .format = "%d",
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
 
@@ -10689,7 +10735,7 @@ static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData
   using P = reshade::api::pipeline_layout_param;
   if (!dev || !d) return false;
   static const std::span<const uint8_t> kBytecode[kShadowsPassCount] = {
-      __contact_shadows, __contact_denoise, __contact_local};
+      __contact_shadows, __contact_denoise, __contact_local, __contact_local_denoise};
 
   if (!d->shadows_point_clamp_sampler.handle) {
     reshade::api::sampler_desc sd = {};
@@ -10855,6 +10901,20 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
     if (out_tex.handle) cl->barrier(out_tex, UA, SR);
   };
 
+  // Separable denoise of one target: horizontal into contact_denoise_texture, vertical back into the target.
+  auto run_denoise = [&](uint32_t pass, float passes_setting, reshade::api::resource_view target_srv,
+                         reshade::api::resource_view target_uav, reshade::api::resource target_texture) {
+    reshade::api::resource_view horizontal_srvs[3] = {d->captured_depth_srv, d->captured_mrt_normal_srv, target_srv};
+    reshade::api::resource_view vertical_srvs[3] = {d->captured_depth_srv, d->captured_mrt_normal_srv, d->contact_denoise_srv};
+    const int passes = std::clamp(static_cast<int>(passes_setting + 0.5f), 1, 4);
+    for (int denoise_pass = 0; denoise_pass < passes; ++denoise_pass) {
+      shader_injection.cs_denoise_axis = 0.f;
+      run_pass(pass, horizontal_srvs, 3, d->contact_denoise_uav, d->contact_denoise_texture);
+      shader_injection.cs_denoise_axis = 1.f;
+      run_pass(pass, vertical_srvs, 3, target_uav, target_texture);
+    }
+  };
+
   if (sun_due) {
     // The noise slot is filled with the real 3D volume when it is usable. When it
     // is not, the fallback is a 1x1 2D stand-in: the shader declares t2 as a
@@ -10868,19 +10928,8 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
     run_pass(kShadowsPassContact, contact_srvs, 3, d->contact_shadow_uav,
              d->contact_shadow_texture);
     if (shader_injection.cs_contact_denoise_enabled > 0.5f) {
-      reshade::api::resource_view horizontal_srvs[3] = {
-          d->captured_depth_srv, d->captured_mrt_normal_srv, d->contact_shadow_srv};
-      reshade::api::resource_view vertical_srvs[3] = {
-          d->captured_depth_srv, d->captured_mrt_normal_srv, d->contact_denoise_srv};
-      const int denoise_passes = std::clamp(static_cast<int>(shader_injection.cs_contact_denoise_passes + 0.5f), 1, 4);
-      for (int denoise_pass = 0; denoise_pass < denoise_passes; ++denoise_pass) {
-        shader_injection.cs_denoise_axis = 0.f;
-        run_pass(kShadowsPassDenoise, horizontal_srvs, 3, d->contact_denoise_uav,
-                 d->contact_denoise_texture);
-        shader_injection.cs_denoise_axis = 1.f;
-        run_pass(kShadowsPassDenoise, vertical_srvs, 3, d->contact_shadow_uav,
-                 d->contact_shadow_texture);
-      }
+      run_denoise(kShadowsPassDenoise, shader_injection.cs_contact_denoise_passes, d->contact_shadow_srv,
+                  d->contact_shadow_uav, d->contact_shadow_texture);
     }
     d->shadows_ran_frame = d->frame_index;
     if (!d->shadows_logged_first_dispatch) {
@@ -10916,6 +10965,10 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
           isfast_ready ? d->isfast_noise_srv : d->fallback_srv,
           d->vbgi_in_srv[4], d->vbgi_in_srv[5], d->vbgi_in_srv[material_k], d->vbgi_in_srv[2]};
       run_pass(kShadowsPassLocal, local_srvs, 7, d->contact_local_uav, d->contact_local_texture);
+      if (shader_injection.cs_contact_local_denoise_enabled > 0.5f) {
+        run_denoise(kShadowsPassLocalDenoise, shader_injection.cs_contact_local_denoise_passes, d->contact_local_srv,
+                    d->contact_local_uav, d->contact_local_texture);
+      }
       d->shadows_local_ran_frame = d->frame_index;
       d->shadows_logged_local_inputs_missing = false;
       if (!d->shadows_logged_first_local_dispatch) {
