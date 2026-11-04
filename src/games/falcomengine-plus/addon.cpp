@@ -1862,29 +1862,43 @@ static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list) {
 // noise volume. They go to slots the lighting shaders declare for the shadow path
 // alone (t35/t36), never to the game's own registers.
 //
-// Split out of DeployShadows purely for readability -- it is one gate and two pushes.
-// It is called from the same place the inline block used to live, after the contact
-// and the contact enables are known.
+// DeployShadows calls this when either Sun or Local contact shadows is on. t36 feeds
+// both the sun range gate (FalcomApplyContactToSun) and the local march, so it is
+// pushed for both; t35 and the noise frame are needed only by the local march and sit
+// behind a second gate on the Local toggle.
+//
+// t36 gets a null view when the depth capture is missing or dead. KillTrackedInput
+// only clears the live flag and keeps the handle, so pushing that handle would bind
+// a freed view, and skipping the push would leave an earlier frame's depth under the
+// march. The sun gate never reads the null view: DeployShadows sets
+// cs_contact_dedicated_bound only while captured_depth_live is set, because
+// RunShadows' once-a-frame early return does not recheck the capture.
+//
+// t35 needs no fallback: FalcomSampleISFAST does not sample while
+// shadow_isfast_texture_loaded is 0, and the jitter is unused while Local is off.
 static void pushInlineShadowInputs(reshade::api::command_list* cmd_list, DeviceData* d) {
-  if (!(shader_injection.cs_contact_enabled > 0.5f
-        && shader_injection.cs_contact_local_enabled > 0.5f)) {
-    return;
+  const reshade::api::resource_view depth_srv = (d->captured_depth_live.load()
+                                                     ? d->captured_depth_srv
+                                                     : reshade::api::resource_view{});
+  cmd_list->push_descriptors(
+      reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+      reshade::api::descriptor_table_update{
+          {}, kLightingShadowDepthRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &depth_srv});
+  if (shader_injection.cs_contact_local_enabled < 0.5f) return;
+  if (shader_injection.cs_contact_isfast_enabled > 0.5f) {
+    LoadISFASTNoiseTexture(cmd_list->get_device(), d);
   }
-  if (d->isfast_noise_srv.handle) {
+  const bool isfast_ready = d->isfast_texture_loaded && d->isfast_noise_srv.handle != 0u;
+  shader_injection.cs_noise_frame = (isfast_ready
+                                         ? static_cast<float>(d->frame_index % 32u)
+                                         : -1.f);
+  if (isfast_ready) {
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
             {}, kLightingShadowNoiseRegister, 0, 1,
             reshade::api::descriptor_type::texture_shader_resource_view,
             &d->isfast_noise_srv});
-  }
-  if (d->captured_depth_srv.handle) {
-    cmd_list->push_descriptors(
-        reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
-        reshade::api::descriptor_table_update{
-            {}, kLightingShadowDepthRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &d->captured_depth_srv});
   }
 }
 
@@ -1910,12 +1924,9 @@ static void DeployShadows(reshade::api::command_list* cmd_list, int fromHook) {
   if (!d) return;
 
   const bool contact_on = shader_injection.cs_contact_enabled > 0.5f;
-  if (!contact_on) return;
-
-  // The local-light march runs inside the dynamic light loop rather than in a pass,
-  // so it needs the two resources a pass would have supplied: the depth buffer and
-  // the noise volume.
+  if (!contact_on && shader_injection.cs_contact_local_enabled < 0.5f) return;
   pushInlineShadowInputs(cmd_list, d);
+  if (!contact_on) return;
 
   // The shadow grid is the DEPTH buffer's grid: both passes read depth, and both
   // sample the G-buffer on the same texels. Sizing the output to anything else
@@ -1949,7 +1960,7 @@ static void DeployShadows(reshade::api::command_list* cmd_list, int fromHook) {
   ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
   if (!ok) return;
 
-  if (contact_on && d->contact_shadow_srv.handle) {
+  if (contact_on && d->contact_shadow_srv.handle && d->captured_depth_live.load()) {
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
@@ -1966,7 +1977,7 @@ static void DeployShadows(reshade::api::command_list* cmd_list, int fromHook) {
 // the custom camera-facing contact march and all three dither it with the same
 // volume, so they share one body and one register.
 //
-// cs_noise_frame is written here as well as in RunShadows, and that is the point:
+// cs_noise_frame is written here as well as in RunShadows and pushInlineShadowInputs, and that is the point:
 // these passes do not call RunShadows and can be the first consumer of the frame, so
 // without this the jitter frame would stay at whatever the last pass left -- which
 // is -1 whenever Contact Shadows is off, and -1 means slice 0 forever. That is not
@@ -4345,8 +4356,10 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsEnabled", .binding = &shader_injection.cs_contact_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Contact Shadows", .section = "Contact Shadows",
-      .tooltip = "Contact Shadows add subtle shadows where objects and characters meet the ground, making them feel more naturally connected to their surroundings.",
+      .default_value = 1.f,
+      .label = "Sun Contact Shadows",
+      .section = "Contact Shadows",
+      .tooltip = "Sun Contact Shadows add subtle shadows where objects and characters meet the ground, making them feel more naturally connected to their surroundings.",
       .labels = {"Off", "On"},
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
@@ -4403,7 +4416,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "How deep a hit must penetrate before it counts. Raise it to stop thin "
                  "geometry and depth noise from self-shadowing.",
       .min = 0.001f, .max = 4.f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4412,7 +4425,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Minimum penetration before a hit counts, in device depth. Raise only if "
                  "you see acne.",
       .min = 0.f, .max = 0.2f, .format = "%.4f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4439,7 +4452,7 @@ renodx::utils::settings::Settings settings = {
                  "Quality then only changes how noisy the result is, not how wide or "
                  "how dark it is. Defaults to 4.",
       .min = 0.f, .max = 8.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4485,7 +4498,7 @@ renodx::utils::settings::Settings settings = {
                  "it. There is no IGN fallback: without the volume the march runs unjittered "
                  "and bands visibly, which the log reports once.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4506,7 +4519,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Local Lights", .section = "Contact Shadows",
       .tooltip = "Local Light Contact Shadows add subtle shadows around objects and characters where nearby lights would naturally create them, making them feel more grounded in the scene. Greyed out and off while RT Local Shadows is on.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+      .is_enabled = []() { return !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
