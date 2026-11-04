@@ -17,12 +17,43 @@ Texture2D<float2> g_history_normal : register(t3);
 RWTexture2D<float4> g_atrous_write : register(u0);
 RWTexture2D<float4> g_rtgi_debug : register(u1);
 
+#define SVGF_VAR_TILE_SIDE 14
+
+groupshared float gs_a[196];
+groupshared float gs_z[196];
+groupshared float2 gs_normal[196];
+groupshared float2 gs_m[196];
+groupshared uint gs_active;
+
 [numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID)
+void main(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
-    if (!SvgfInside(int2(id.xy))) return;
+    const uint lin = gtid.y * 8u + gtid.x;
     const int2 p = int2(id.xy);
-    const float4 c = g_integrated[p];
+    const int2 origin = int2(gid.xy) * 8 - 3;
+    const bool inside = SvgfInside(p);
+    const float4 c = inside ? g_integrated[p] : float4(0.0, 0.0, 0.0, -1.0);
+    const float4 mp = inside ? g_history_moments[p] : float4(0.0, 0.0, 0.0, 0.0);
+    if (lin == 0u) gs_active = 0u;
+    GroupMemoryBarrierWithGroupSync();
+    if (inside && c.a >= 0.0 && mp.z < kSvgfVarianceHistory) InterlockedOr(gs_active, 1u);
+    GroupMemoryBarrierWithGroupSync();
+    if (gs_active != 0u)
+    {
+        for (uint t = lin; t < 196u; t += 64u)
+        {
+            const int2 q = origin + int2(t % SVGF_VAR_TILE_SIDE, t / SVGF_VAR_TILE_SIDE);
+            if (SvgfInside(q))
+            {
+                gs_a[t] = g_integrated[q].a;
+                gs_z[t] = g_history_guide[q].x;
+                gs_normal[t] = g_history_normal[q];
+                gs_m[t] = g_history_moments[q].xy;
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (!inside) return;
     const int debug_mode = (int)s_params.y;
     if (c.a < 0.0)
     {
@@ -32,7 +63,6 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
     const float4 gp = g_history_guide[p];
-    const float4 mp = g_history_moments[p];
     const float3 np = OctDecode(g_history_normal[p]);
     float sigma2 = c.a;  // h >= 4: the temporal variance
     if (mp.z < kSvgfVarianceHistory)
@@ -48,8 +78,9 @@ void main(uint3 id : SV_DispatchThreadID)
             {
                 const int2 q = p + int2(i, j);
                 if (!SvgfInside(q)) continue;
-                const float4 cq = g_integrated[q];
-                const float4 gq = g_history_guide[q];
+                const uint ti = uint(q.y - origin.y) * SVGF_VAR_TILE_SIDE + uint(q.x - origin.x);
+                const float4 cq = float4(0.0, 0.0, 0.0, gs_a[ti]);
+                const float4 gq = float4(gs_z[ti], 0.0, 0.0, 0.0);
                 // The centre is never skipped by the guide gate (it is traced: a >= 0); other taps keep the skip rules.
                 const bool centre = i == 0 && j == 0;
                 if (!centre && (cq.a < 0.0 || gq.x <= 0.0)) continue;
@@ -57,8 +88,8 @@ void main(uint3 id : SV_DispatchThreadID)
                 // The plan default follows the paper's depth and normal weights only.
                 const float w = (i == 0 && j == 0)
                     ? 1.0
-                    : SvgfDepthWeight(gp, gq, float2(i, j)) * SvgfNormalWeight(np, OctDecode(g_history_normal[q]));
-                const float4 mq = g_history_moments[q];
+                    : SvgfDepthWeight(gp, gq, float2(i, j)) * SvgfNormalWeight(np, OctDecode(gs_normal[ti]));
+                const float4 mq = float4(gs_m[ti], 0.0, 0.0);
                 sum_w += w;
                 sum_m1 += w * mq.x;
                 sum_m2 += w * mq.y;

@@ -176,7 +176,7 @@ inline RtgiDenoiseReady EnsureRtgiDenoise(reshade::api::device* device, RtgiDeno
     sd.address_u = sd.address_v = sd.address_w = reshade::api::texture_address_mode::clamp;
     reproject_run = device->create_sampler(sd, &set->linear_sampler);
   }
-  const bool spatial_run = reproject_run && request.spatial
+  bool spatial_run = reproject_run && request.spatial
       && EnsureRtgiPipeline(device, &set->variance_pipeline, {.srv_count = kSvgfVarianceSrvCount, .uav_count = kSvgfVarianceUavCount,
                                                              .sampler_count = 0u, .push_count = kSvgfPushCount,
                                                              .code = kSvgfVarianceShader, .name = "variance"})
@@ -185,6 +185,11 @@ inline RtgiDenoiseReady EnsureRtgiDenoise(reshade::api::device* device, RtgiDeno
                                                             .code = kSvgfAtrousShader, .name = "atrous"})
       && EnsureRtgiTextureSet(device, &set->integrated, reshade::api::format::r16g16b16a16_float, 8u, request.trace_width, request.trace_height)
       && EnsureRtgiTextureSet(device, &set->atrous, reshade::api::format::r16g16b16a16_float, 8u, request.trace_width, request.trace_height);
+  const std::span<const std::uint8_t> kTileCode[kSvgfAtrousTileSteps] = {kSvgfAtrousS1Shader, kSvgfAtrousS2Shader, kSvgfAtrousS4Shader};
+  const char* kTileName[kSvgfAtrousTileSteps] = {"atrous s1", "atrous s2", "atrous s4"};
+  for (uint32_t k = 0u; k < kSvgfAtrousTileSteps; ++k) {
+    spatial_run = spatial_run && EnsureRtgiPipeline(device, &set->atrous_tile_pipeline[k], {.srv_count = kSvgfAtrousSrvCount, .uav_count = kSvgfAtrousUavCount, .sampler_count = 0u, .push_count = kSvgfPushCount, .code = kTileCode[k], .name = kTileName[k]});
+  }
   return {.ok = true, .reproject = reproject_run, .temporal = reproject_run && request.temporal, .spatial = spatial_run};
 }
 
@@ -325,12 +330,13 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
 
   // A-trous: N = max(1, clamp(iterations, 1, 5) - log2(d)) iterations of step 2^i. Iteration 0 reads atrous[0] and writes
   // history[write] (the feedback colour); iteration 1 reads history[write] and writes atrous[1]; from 2 on it reads
-  // atrous[(i - 1) & 1] and writes atrous[i & 1]. The last one written is the input of the upsample.
+  // atrous[(i - 1) & 1] and writes atrous[i & 1]. The last one written is the input of the upsample. Iterations 0 to 2
+  // (steps 1, 2, 4) use the group-shared tile kernels (atrous_tile_pipeline); the rest use atrous_pipeline.
   set->atrous_iterations = ready.spatial ? SvgfEffectiveIterations(in.svgf.iterations, static_cast<uint32_t>(in.divisor + 0.5f)) : 0u;
   if (ready.spatial) {
-    const RtgiPipeline& atrous = set->atrous_pipeline;
-    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, atrous.pipeline);
     for (uint32_t i = 0u; i < set->atrous_iterations; ++i) {
+      const RtgiPipeline& atrous = i < kSvgfAtrousTileSteps ? set->atrous_tile_pipeline[i] : set->atrous_pipeline;
+      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, atrous.pipeline);
       const bool to_history = i == 0u;
       const uint32_t slot = i & 1u;
       const reshade::api::resource_view atrous_in = i == 0u ? set->atrous.srv[0]
@@ -404,6 +410,10 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
     table_nulls->push_back({set->variance_pipeline.uav_table, 0, 0, kSvgfVarianceUavCount, kUav, null_views});
     table_nulls->push_back({set->atrous_pipeline.srv_table, 0, 0, kSvgfAtrousSrvCount, kSrv, null_views});
     table_nulls->push_back({set->atrous_pipeline.uav_table, 0, 0, kSvgfAtrousUavCount, kUav, null_views});
+    for (const RtgiPipeline& tile : set->atrous_tile_pipeline) {
+      table_nulls->push_back({tile.srv_table, 0, 0, kSvgfAtrousSrvCount, kSrv, null_views});
+      table_nulls->push_back({tile.uav_table, 0, 0, kSvgfAtrousUavCount, kUav, null_views});
+    }
   }
   return {.temporal_debug = reproject_debug, .variance_debug = variance_debug, .upsample_debug = upsample_debug};
 }

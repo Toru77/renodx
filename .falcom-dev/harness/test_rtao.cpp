@@ -59,6 +59,15 @@ inline constexpr std::span<const std::uint8_t> __world_svgf_variance{__world_svg
 #define __world_svgf_atrous_EMBED_FILE
 inline constexpr std::uint8_t __world_svgf_atrous_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_svgf_atrous{__world_svgf_atrous_base};
+#define __world_svgf_atrous_s1_EMBED_FILE
+inline constexpr std::uint8_t __world_svgf_atrous_s1_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_svgf_atrous_s1{__world_svgf_atrous_s1_base};
+#define __world_svgf_atrous_s2_EMBED_FILE
+inline constexpr std::uint8_t __world_svgf_atrous_s2_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_svgf_atrous_s2{__world_svgf_atrous_s2_base};
+#define __world_svgf_atrous_s4_EMBED_FILE
+inline constexpr std::uint8_t __world_svgf_atrous_s4_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_svgf_atrous_s4{__world_svgf_atrous_s4_base};
 #define __world_rtgi_lights_EMBED_FILE
 inline constexpr std::uint8_t __world_rtgi_lights_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_rtgi_lights{__world_rtgi_lights_base};

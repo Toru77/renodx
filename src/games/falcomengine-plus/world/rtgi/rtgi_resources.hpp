@@ -81,6 +81,8 @@ inline constexpr uint32_t kSvgfVarianceUavCount = 2u;
 // A-trous: t0 input, t1 guide, t2 normal; u0 output.
 inline constexpr uint32_t kSvgfAtrousSrvCount = 3u;
 inline constexpr uint32_t kSvgfAtrousUavCount = 1u;
+// A-trous iterations 0 to 2 (steps 1, 2, 4) use the group-shared tile kernels world_svgf_atrous_s1, _s2 and _s4.
+inline constexpr uint32_t kSvgfAtrousTileSteps = 3u;
 inline constexpr uint32_t kSvgfPushCount = 16u;
 inline constexpr uint32_t kSvgfMaxIterations = 5u;
 inline constexpr float kSvgfLuminanceRgb[3] = {0.2126f, 0.7152f, 0.0722f};  // RTGI and GTVBGI luminance weights
@@ -132,6 +134,21 @@ inline constexpr std::span<const std::uint8_t> kSvgfVarianceShader = {};
 inline constexpr std::span<const std::uint8_t> kSvgfAtrousShader = __world_svgf_atrous;
 #else
 inline constexpr std::span<const std::uint8_t> kSvgfAtrousShader = {};
+#endif
+#if defined(__world_svgf_atrous_s1_EMBED_FILE)
+inline constexpr std::span<const std::uint8_t> kSvgfAtrousS1Shader = __world_svgf_atrous_s1;
+#else
+inline constexpr std::span<const std::uint8_t> kSvgfAtrousS1Shader = {};
+#endif
+#if defined(__world_svgf_atrous_s2_EMBED_FILE)
+inline constexpr std::span<const std::uint8_t> kSvgfAtrousS2Shader = __world_svgf_atrous_s2;
+#else
+inline constexpr std::span<const std::uint8_t> kSvgfAtrousS2Shader = {};
+#endif
+#if defined(__world_svgf_atrous_s4_EMBED_FILE)
+inline constexpr std::span<const std::uint8_t> kSvgfAtrousS4Shader = __world_svgf_atrous_s4;
+#else
+inline constexpr std::span<const std::uint8_t> kSvgfAtrousS4Shader = {};
 #endif
 #if defined(__world_rtgi_upsample_EMBED_FILE)
 inline constexpr std::span<const std::uint8_t> kRtgiUpsampleShader = __world_rtgi_upsample;
@@ -347,6 +364,7 @@ struct RtgiDenoiseSet {
   RtgiPipeline reproject_pipeline;
   RtgiPipeline variance_pipeline;
   RtgiPipeline atrous_pipeline;
+  RtgiPipeline atrous_tile_pipeline[kSvgfAtrousTileSteps];
   RtgiPipeline upsample_pipeline;
   reshade::api::sampler point_sampler = {0u};
   reshade::api::sampler linear_sampler = {0u};
@@ -452,6 +470,7 @@ inline void DestroyRtgiDenoiseSet(reshade::api::device* device, RtgiDenoiseSet* 
   DestroyRtgiPipeline(device, set->reproject_pipeline);
   DestroyRtgiPipeline(device, set->variance_pipeline);
   DestroyRtgiPipeline(device, set->atrous_pipeline);
+  for (RtgiPipeline& tile : set->atrous_tile_pipeline) DestroyRtgiPipeline(device, tile);
   DestroyRtgiPipeline(device, set->upsample_pipeline);
 }
 

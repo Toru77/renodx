@@ -39,6 +39,15 @@ inline constexpr std::span<const std::uint8_t> __world_svgf_variance{__world_svg
 #define __world_svgf_atrous_EMBED_FILE
 inline constexpr std::uint8_t __world_svgf_atrous_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_svgf_atrous{__world_svgf_atrous_base};
+#define __world_svgf_atrous_s1_EMBED_FILE
+inline constexpr std::uint8_t __world_svgf_atrous_s1_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_svgf_atrous_s1{__world_svgf_atrous_s1_base};
+#define __world_svgf_atrous_s2_EMBED_FILE
+inline constexpr std::uint8_t __world_svgf_atrous_s2_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_svgf_atrous_s2{__world_svgf_atrous_s2_base};
+#define __world_svgf_atrous_s4_EMBED_FILE
+inline constexpr std::uint8_t __world_svgf_atrous_s4_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_svgf_atrous_s4{__world_svgf_atrous_s4_base};
 #define __world_rtgi_lights_EMBED_FILE
 inline constexpr std::uint8_t __world_rtgi_lights_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_rtgi_lights{__world_rtgi_lights_base};
@@ -500,7 +509,7 @@ struct GoldenCmdList : mock::CommandListBase {
 // The command log and dispatch count of five fixed rtgi::Dispatch calls (trace and upsample; plus the SVGF chain with
 // spatial; plus temporal; lamps with debug 4 and no spatial; trace debug 9) on the recording mock. SVGF M1 counts:
 // 2 + 8 + 8 + 4 + 2 = 24 (trace, reproject, variance, 4 a-trous, upsample at Iterations 5 and divisor 2).
-static constexpr uint64_t kDispatchGoldenHash = 0xce5510e6fa6e3b30ull;
+static constexpr uint64_t kDispatchGoldenHash = 0x0e450c3d93d0ec36ull;
 static constexpr int kDispatchGoldenCount = 24;
 
 static void TestDispatchGolden() {
