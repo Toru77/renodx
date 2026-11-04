@@ -10980,12 +10980,7 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
           d->captured_depth_srv, d->captured_mrt_normal_srv,
           isfast_ready ? d->isfast_noise_srv : d->fallback_srv,
           d->vbgi_in_srv[4], d->vbgi_in_srv[5], d->vbgi_in_srv[material_k], d->vbgi_in_srv[2]};
-      // contact_local tests the Sora character flag (mrt0.w bit 3) only while this is above 0, and only Sora 2nd's
-      // lighting shader reads the character share, so the pass sees 0 everywhere else.
-      const float local_char_lamp = shader_injection.cs_contact_local_char_lamp;
-      if (!IsSora2nd()) shader_injection.cs_contact_local_char_lamp = 0.f;
       run_pass(kShadowsPassLocal, local_srvs, 7, d->contact_local_uav, d->contact_local_texture);
-      shader_injection.cs_contact_local_char_lamp = local_char_lamp;
       if (shader_injection.cs_contact_local_denoise_enabled > 0.5f) {
         run_denoise(kShadowsPassLocalDenoise, shader_injection.cs_contact_local_denoise_passes, d->contact_local_srv,
                     d->contact_local_uav, d->contact_local_texture);
