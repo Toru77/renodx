@@ -64,6 +64,12 @@ bool SvgfInside(int2 q)
     return all(q >= 0) && all(q < int2(s_size.xy));
 }
 
+// Non-paper: a history tap with a NaN or infinite colour or moment is inconsistent (bit test; FXC may drop isnan).
+bool SvgfFinite(float4 v)
+{
+    return all((asuint(v) & 0x7F800000u) != 0x7F800000u);
+}
+
 // Writes a traced pixel's colour to its d x d block of the full-size debug view.
 void SvgfWriteDebugBlock(RWTexture2D<float4> debug, uint2 tp, float3 colour)
 {

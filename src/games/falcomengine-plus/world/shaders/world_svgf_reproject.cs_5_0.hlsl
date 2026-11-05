@@ -144,9 +144,10 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                         const float4 hg = g_history_guide.Load(int3(q, 0));
                         const float4 hm = g_history_moments.Load(int3(q, 0));
                         const float3 hn = OctDecode(g_history_normal.Load(int3(q, 0)));
-                        ok[t] = hg.x > 0.0 && hm.z > 0.0 && TemporalDepthAccept(hg.w, dist_cur, s_temporal.y)
+                        const float4 hc = g_history_color.Load(int3(q, 0));
+                        ok[t] = hg.x > 0.0 && hm.z > 0.0 && SvgfFinite(hc) && SvgfFinite(hm) && TemporalDepthAccept(hg.w, dist_cur, s_temporal.y)
                             && dot(hn, N) >= s_temporal.z;
-                        tc[t] = g_history_color.Load(int3(q, 0)).rgb;
+                        tc[t] = hc.rgb;
                         tm[t] = hm.xyz;
                     }
                     if (ok[t]) nc += 1u;
@@ -182,11 +183,12 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             const float4 hg = g_history_guide.Load(int3(q, 0));
                             const float4 hm = g_history_moments.Load(int3(q, 0));
                             const float3 hn = OctDecode(g_history_normal.Load(int3(q, 0)));
-                            if (hg.x > 0.0 && hm.z > 0.0 && TemporalDepthAccept(hg.w, dist_cur, s_temporal.y)
+                            const float4 hc = g_history_color.Load(int3(q, 0));
+                            if (hg.x > 0.0 && hm.z > 0.0 && SvgfFinite(hc) && SvgfFinite(hm) && TemporalDepthAccept(hg.w, dist_cur, s_temporal.y)
                                 && dot(hn, N) >= s_temporal.z)
                             {
                                 n3 += 1u;
-                                hist_col += g_history_color.Load(int3(q, 0)).rgb;
+                                hist_col += hc.rgb;
                                 hist_mom += hm.xyz;
                             }
                         }
