@@ -3428,7 +3428,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharGTVBAOMaskStr", .binding = &shader_injection.char_gtvbao_mask_strength,
-      .default_value = 50.f, .label = "GTVBAO Char Mask", .section = "GTVBAO",
+      .default_value = 75.f, .label = "GTVBAO Char Mask", .section = "GTVBAO",
       .min = 0.f, .max = 100.f,
       .is_enabled = []() { return shader_injection.char_gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested(); },
       .parse = [](float v) { return v * 0.01f; },
