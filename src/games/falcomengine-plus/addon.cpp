@@ -10468,6 +10468,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         float vStrength = std::clamp(shader_injection.dynCube_global_strength, 0.f, 1.f);
         bool wantVariant = (vSoften > 1e-4f || vStrength < 1.f - 1e-4f);
         if (dd->dyncube_ggx_valid && wantVariant
+            && dd->dyncube_phase != DeviceData::DynCubePhase::Variant
             && (vSoften != dd->dyncube_lastVariantSoften || vStrength != dd->dyncube_lastVariantStrength)) {
           // Self-healing: the variant cube is derived and never part of a full
           // Create, so it may be absent (first use, or a resize destroyed it) �

@@ -32,8 +32,9 @@ static const float kWorldBoxSafetyHalfExtentX = 4.0;
 static const float kWorldBoxSafetyHalfExtentY = 3.0;
 static const float kWorldBoxSafetyHalfExtentZ = 4.0;
 
-// Partials per pass-2 chunk. Must match kDynCubeWorldBoxChunkPartials (addon.cpp). The partials
-// per face ((size/8)^2) are a multiple of 256 for every cube size, so a chunk never spans two faces.
+// Partials per pass-2 chunk. Must match kDynCubeWorldBoxChunkPartials (addon.cpp). The partial count
+// per face ((size/8)^2) is a multiple of 256 for every size the addon can create (multiples of 128:
+// 128, 256, 512, 768, 1024, 1536, 2048), so a chunk never spans two faces.
 static const uint kChunkPartials = 256u;
 
 Texture2DArray<float4> g_posTex      : register(t0);
