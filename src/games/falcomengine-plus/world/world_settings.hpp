@@ -67,6 +67,14 @@ struct SvgfRows {
   float* iterations;
   float* luminance_edge_stop;
   float* half_res_iterations = nullptr;  // GTVBAO only: Half Res Iterations row; Iterations then applies at Full only
+  float default_temporal_enabled = 1.f;
+  float default_history_weight = 0.8f;
+  float default_depth_rejection = 0.2f;
+  float default_normal_rejection = 0.f;
+  float default_spatial_enabled = 1.f;
+  float default_iterations = 5.f;
+  float default_half_res_iterations = 4.f;
+  float default_luminance_edge_stop = 4.f;
 };
 inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::function<bool()>& visible,
                         const std::function<bool()>& advanced, const SvgfRows& rows) {
@@ -77,7 +85,7 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
       .key = prefix + "TemporalEnabled",
       .binding = rows.temporal_enabled,
       .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
+      .default_value = rows.default_temporal_enabled,
       .label = "Temporal Accumulation",
       .section = rows.temporal_section,
       .tooltip = rows.temporal_enabled_tooltip,
@@ -88,7 +96,7 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
       .key = prefix + "HistoryWeight",
       .binding = rows.history_weight,
       .value_type = SettingValueType::FLOAT,
-      .default_value = 0.8f,
+      .default_value = rows.default_history_weight,
       .label = "History Weight",
       .section = rows.temporal_section,
       .tooltip = "Weight of the reprojected history: alpha = 1 - History Weight (0 to 0.99). Higher = smoother, slower to follow changes.",
@@ -101,7 +109,7 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
       .key = prefix + "DepthRejection",
       .binding = rows.depth_rejection,
       .value_type = SettingValueType::FLOAT,
-      .default_value = 0.2f,
+      .default_value = rows.default_depth_rejection,
       .label = "Depth Rejection",
       .section = rows.temporal_section,
       .tooltip = "Relative distance difference allowed between history and current (0.001 to 0.2).",
@@ -115,7 +123,7 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
       .key = prefix + "NormalRejection",
       .binding = rows.normal_rejection,
       .value_type = SettingValueType::FLOAT,
-      .default_value = 0.f,
+      .default_value = rows.default_normal_rejection,
       .label = "Normal Rejection",
       .section = rows.temporal_section,
       .tooltip = "Binary normal test: a history tap counts only when the dot product of its normal with the current normal is at or above this value (0 accepts any normal facing the same way).",
@@ -128,7 +136,7 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
       .key = prefix + "SpatialEnabled",
       .binding = rows.spatial_enabled,
       .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
+      .default_value = rows.default_spatial_enabled,
       .label = "Spatial Filter",
       .section = rows.spatial_section,
       .tooltip = rows.spatial_enabled_tooltip,
@@ -139,7 +147,7 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
       .key = prefix + "SvgfIterations",
       .binding = rows.iterations,
       .value_type = SettingValueType::INTEGER,
-      .default_value = 5.f,
+      .default_value = rows.default_iterations,
       .label = rows.half_res_iterations != nullptr ? "Full Res Iterations" : "Iterations",
       .section = rows.spatial_section,
       .tooltip = rows.half_res_iterations != nullptr ? "A-trous iterations of the SVGF filter at Full resolution (1 to 5). Half resolution uses Half Res Iterations." : "A-trous iterations of the SVGF filter (1 to 5). The effective count is this minus log2 of the trace divisor (Half: minus 1, Quarter: minus 2), at least 1; the panel shows the effective count.",
@@ -153,7 +161,7 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
         .key = prefix + "SvgfHalfResIterations",
         .binding = rows.half_res_iterations,
         .value_type = SettingValueType::INTEGER,
-        .default_value = 4.f,
+        .default_value = rows.default_half_res_iterations,
         .label = "Half Res Iterations",
         .section = rows.spatial_section,
         .tooltip = "A-trous iterations of the SVGF filter at Half resolution (1 to 4). Each iteration doubles the step, so 4 at Half covers the same screen area as 5 at Full.",
@@ -167,7 +175,7 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
       .key = prefix + "SvgfLuminanceEdgeStop",
       .binding = rows.luminance_edge_stop,
       .value_type = SettingValueType::FLOAT,
-      .default_value = 4.f,
+      .default_value = rows.default_luminance_edge_stop,
       .label = "Luminance Edge Stop",
       .section = rows.spatial_section,
       .tooltip = "Sigma of the luminance edge stop, in units of the local luminance standard deviation (0.5 to 16). Lower = sharper edges, more noise; higher = smoother, more blur across edges.",
@@ -774,7 +782,10 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .spatial_enabled_tooltip = "Denoises the RTAO AO with the SVGF a-trous filter (depth, normal and AO edge stops). Off = no filter.",
                                             .spatial_enabled = &rtao::g_rtao_spatial_enabled,
                                             .iterations = &rtao::g_rtao_svgf_iterations,
-                                            .luminance_edge_stop = &rtao::g_rtao_svgf_luminance_edge_stop});
+                                            .luminance_edge_stop = &rtao::g_rtao_svgf_luminance_edge_stop,
+                                            .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.2f,
+                                            .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f,
+                                            .default_luminance_edge_stop = 4.f});
   settings->push_back(new Setting{
       .key = "RtaoIsfast",
       .binding = &rtao::g_rtao_isfast,
@@ -1157,7 +1168,10 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .spatial_enabled_tooltip = "Denoises the RTGI output at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered GI. Off = no filter.",
                                             .spatial_enabled = &rtgi::g_rtgi_spatial_enabled,
                                             .iterations = &rtgi::g_rtgi_svgf_iterations,
-                                            .luminance_edge_stop = &rtgi::g_rtgi_svgf_luminance_edge_stop});
+                                            .luminance_edge_stop = &rtgi::g_rtgi_svgf_luminance_edge_stop,
+                                            .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.2f,
+                                            .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f,
+                                            .default_luminance_edge_stop = 4.f});
   settings->push_back(new Setting{
       .key = "RtgiFadeStartPct",
       .binding = &rtgi::g_rtgi_fade_start_pct,
@@ -1441,7 +1455,10 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .spatial_enabled_tooltip = "Denoises the RT local shadow term at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered term. Off = no filter.",
                                             .spatial_enabled = &rtls::g_rtls_spatial_enabled,
                                             .iterations = &rtls::g_rtls_svgf_iterations,
-                                            .luminance_edge_stop = &rtls::g_rtls_svgf_luminance_edge_stop});
+                                            .luminance_edge_stop = &rtls::g_rtls_svgf_luminance_edge_stop,
+                                            .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.2f,
+                                            .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f,
+                                            .default_luminance_edge_stop = 4.f});
   settings->push_back(new Setting{
       .key = "RtlsFadeStartPct",
       .binding = &rtls::g_rtls_fade_start_pct,
@@ -1701,7 +1718,10 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .spatial_enabled_tooltip = "Denoises the RT sun term at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered term. Off = no filter.",
                                             .spatial_enabled = &rtsun::g_rtsun_spatial_enabled,
                                             .iterations = &rtsun::g_rtsun_svgf_iterations,
-                                            .luminance_edge_stop = &rtsun::g_rtsun_svgf_luminance_edge_stop});
+                                            .luminance_edge_stop = &rtsun::g_rtsun_svgf_luminance_edge_stop,
+                                            .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.2f,
+                                            .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f,
+                                            .default_luminance_edge_stop = 4.f});
 }
 
 }  // namespace falcom_world

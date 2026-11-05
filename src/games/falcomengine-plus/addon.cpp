@@ -919,19 +919,19 @@ static float g_cpuopt_ensure_pipelines    = 0.f;  // kai-style: don't destroy/re
 
 static float g_gtvbao_temporal_enabled = 1.f;
 static float g_gtvbao_history_weight = 0.8f;
-static float g_gtvbao_depth_rejection = 0.2f;
-static float g_gtvbao_normal_rejection = 0.f;
+static float g_gtvbao_depth_rejection = 0.010f;
+static float g_gtvbao_normal_rejection = 0.8f;
 static float g_gtvbao_svgf_spatial_enabled = 1.f;
-static float g_gtvbao_svgf_iterations = 5.f;
+static float g_gtvbao_svgf_iterations = 1.f;
 static float g_gtvbao_svgf_half_res_iterations = 4.f;
-static float g_gtvbao_svgf_luminance_edge_stop = 4.f;
+static float g_gtvbao_svgf_luminance_edge_stop = 16.f;
 static float g_vbgi_temporal_enabled = 1.f;
-static float g_vbgi_history_weight = 0.8f;
+static float g_vbgi_history_weight = 0.99f;
 static float g_vbgi_depth_rejection = 0.05f;
 static float g_vbgi_normal_rejection = 0.9f;
 static float g_vbgi_spatial_enabled = 1.f;
 static float g_vbgi_svgf_iterations = 5.f;
-static float g_vbgi_svgf_luminance_edge_stop = 4.f;
+static float g_vbgi_svgf_luminance_edge_stop = 16.f;
 static float g_gtvbao_debug_ui = 0.f;  // GTVBAODebugMode index into kGtvbaoDebugModes
 constexpr int kGtvbaoDebugModes[7] = {0, 1, 22, 23, 24, 25, 26};
 // VBGI Debug View row (0=Off, 1..6) maps to GTVBAO debug modes 30..35 while g_vbgi_enabled.
@@ -3792,7 +3792,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIQuality", .binding = &g_vbgi_quality_level,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Quality Level", .section = "GTVBGI",
+      .default_value = 2.f, .label = "Quality Level", .section = "GTVBGI",
       .tooltip = "Slices x steps per side. Low 2x4, Medium 3x4, High 3x6, Ultra 4x10.",
       .labels = {"Low", "Medium", "High", "Ultra"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
@@ -3827,7 +3827,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharGTVBGIMaskStr", .binding = &shader_injection.char_gtvbgi_mask_strength,
-      .default_value = 0.f, .label = "Character Mask Strength", .section = "GTVBGI",
+      .default_value = 50.f, .label = "Character Mask Strength", .section = "GTVBGI",
       .min = 0.f, .max = 100.f,
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .parse = [](float v) { return v * 0.01f; },
@@ -3854,7 +3854,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIBackfaceMode", .binding = &g_vbgi_backface_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Backface Rejection", .section = "GTVBGI",
+      .default_value = 1.f, .label = "Backface Rejection", .section = "GTVBGI",
       .labels = {"Off", "Simple", "Exact"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
@@ -13768,8 +13768,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
   }
   if (fdw_reason == DLL_PROCESS_ATTACH) {
-    falcom_world::AddSvgfRows(&settings, IsAdvancedSettingsMode, IsAdvancedSettingsMode, {.prefix = "Gtvbao", .temporal_section = "GTVBAO Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Runs on Sora 1st, Sora 2nd and Kai only; off while Deferred Dispatch is On. Resets on camera cuts, frame gaps and parameter changes.", .temporal_enabled = &g_gtvbao_temporal_enabled, .history_weight = &g_gtvbao_history_weight, .depth_rejection = &g_gtvbao_depth_rejection, .normal_rejection = &g_gtvbao_normal_rejection, .spatial_section = "GTVBAO Spatial Filter", .spatial_enabled_tooltip = "Denoises the GTVBAO AO with the SVGF a-trous filter (depth, normal and AO edge stops). Off = no filter.", .spatial_enabled = &g_gtvbao_svgf_spatial_enabled, .iterations = &g_gtvbao_svgf_iterations, .luminance_edge_stop = &g_gtvbao_svgf_luminance_edge_stop, .half_res_iterations = &g_gtvbao_svgf_half_res_iterations});
-    falcom_world::AddSvgfRows(&settings, []() { return VbgiRowVisible(); }, IsAdvancedSettingsMode, {.prefix = "Vbgi", .temporal_section = "GTVBGI Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.", .temporal_enabled = &g_vbgi_temporal_enabled, .history_weight = &g_vbgi_history_weight, .depth_rejection = &g_vbgi_depth_rejection, .normal_rejection = &g_vbgi_normal_rejection, .spatial_section = "GTVBGI Spatial Filter", .spatial_enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.", .spatial_enabled = &g_vbgi_spatial_enabled, .iterations = &g_vbgi_svgf_iterations, .luminance_edge_stop = &g_vbgi_svgf_luminance_edge_stop});
+    falcom_world::AddSvgfRows(&settings, IsAdvancedSettingsMode, IsAdvancedSettingsMode, {.prefix = "Gtvbao", .temporal_section = "GTVBAO Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Runs on Sora 1st, Sora 2nd and Kai only; off while Deferred Dispatch is On. Resets on camera cuts, frame gaps and parameter changes.", .temporal_enabled = &g_gtvbao_temporal_enabled, .history_weight = &g_gtvbao_history_weight, .depth_rejection = &g_gtvbao_depth_rejection, .normal_rejection = &g_gtvbao_normal_rejection, .spatial_section = "GTVBAO Spatial Filter", .spatial_enabled_tooltip = "Denoises the GTVBAO AO with the SVGF a-trous filter (depth, normal and AO edge stops). Off = no filter.", .spatial_enabled = &g_gtvbao_svgf_spatial_enabled, .iterations = &g_gtvbao_svgf_iterations, .luminance_edge_stop = &g_gtvbao_svgf_luminance_edge_stop, .half_res_iterations = &g_gtvbao_svgf_half_res_iterations, .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.010f, .default_normal_rejection = 0.8f, .default_spatial_enabled = 1.f, .default_iterations = 1.f, .default_half_res_iterations = 4.f, .default_luminance_edge_stop = 16.f});
+    falcom_world::AddSvgfRows(&settings, []() { return VbgiRowVisible(); }, IsAdvancedSettingsMode, {.prefix = "Vbgi", .temporal_section = "GTVBGI Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.", .temporal_enabled = &g_vbgi_temporal_enabled, .history_weight = &g_vbgi_history_weight, .depth_rejection = &g_vbgi_depth_rejection, .normal_rejection = &g_vbgi_normal_rejection, .spatial_section = "GTVBGI Spatial Filter", .spatial_enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.", .spatial_enabled = &g_vbgi_spatial_enabled, .iterations = &g_vbgi_svgf_iterations, .luminance_edge_stop = &g_vbgi_svgf_luminance_edge_stop, .default_temporal_enabled = 1.f, .default_history_weight = 0.99f, .default_depth_rejection = 0.05f, .default_normal_rejection = 0.9f, .default_spatial_enabled = 1.f, .default_iterations = 5.f, .default_luminance_edge_stop = 16.f});
     falcom_world::AddSettings(&settings, IsSora2nd(), IsAdvancedSettingsMode);
   }
   falcom_world::Use(fdw_reason, IsSora2nd());
