@@ -7099,7 +7099,7 @@ renodx::utils::settings::Settings settings = {
         .key = "DLAAPhaseWRigidItem",
         .binding = &g_phase_rigid_items,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f,
+        .default_value = 1.f,
         .label = "Phase W: Held Items (books)",
         .section = "Antialiasing",
         .tooltip = "Patch rim-lit held-item rigid objects like books/torches (RimLitColor + WorldViewProjection) with per-object motion. Off = these objects are NOT patched and fall back to camera (depth-reprojected) MVs only. Requires restart (read at shader patch time).",
