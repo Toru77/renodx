@@ -119,6 +119,9 @@ static void TestParameterSnapshot() {
   CHECK(a == b, "equal snapshots compare equal");
   b.history_weight = 0.5f;
   CHECK(!(a == b), "a history weight change is a parameter change");
+  b = a;
+  b.restir = 1.f;
+  CHECK(!(a == b), "a ReSTIR toggle change is a parameter change");
 }
 
 static void TestShaderDefines() {
@@ -172,6 +175,11 @@ static void TestShaderDefines() {
   CHECK(text.find("#define RTGI_FLAG_GAME_SUN " + std::to_string(rtgi::kRtgiFlagGameSun) + "u") != std::string::npos,
         "game sun flag define matches kRtgiFlagGameSun");
   CHECK(text.find("g_rtgi_sun : packoffset(c6)") != std::string::npos, "trace cb_rtgi has c6 (Sun Shadow Distance)");
+  CHECK(text.find("#define RTGI_FLAG_RESTIR " + std::to_string(rtgi::kRtgiFlagRestir) + "u") != std::string::npos,
+        "ReSTIR flag define matches kRtgiFlagRestir");
+  CHECK(text.find("g_rtgi_restir_pos : register(u3)") != std::string::npos
+            && text.find("g_rtgi_restir_data : register(u4)") != std::string::npos,
+        "ReSTIR sample UAVs at u3 and u4 (kRtgiUavCount 5)");
   CHECK(text.find("RTGI_SUN_RAY_MAX") == std::string::npos, "the fixed sun ray length is gone");
   const std::string temporal = ReadText("src/games/falcomengine-plus/world/shaders/world_svgf_reproject.cs_5_0.hlsl");
   CHECK(!temporal.empty(), "reproject shader copy readable");
@@ -315,7 +323,7 @@ static void TestRt12RtgiReadRules() {
 }
 
 static void TestRt12RtgiConstants() {
-  CHECK(rt12::kRt12RtgiDescriptors == 25u, "descriptors 25 (%u)", rt12::kRt12RtgiDescriptors);
+  CHECK(rt12::kRt12RtgiDescriptors == 27u, "descriptors 27 (%u)", rt12::kRt12RtgiDescriptors);
   CHECK(rt12::kRt12RtgiTimestamps == 3u, "timestamps 3 (%u)", rt12::kRt12RtgiTimestamps);
   CHECK(rt12::kRt12RtgiSceneRows == 96u, "scene rows 96 (%u)", rt12::kRt12RtgiSceneRows);
   CHECK(rt12::kRt12RtgiLampTexels == 7u, "lamp texels 7 (%u)", rt12::kRt12RtgiLampTexels);
@@ -506,11 +514,12 @@ struct GoldenCmdList : mock::CommandListBase {
   }
 };
 
-// The command log and dispatch count of five fixed rtgi::Dispatch calls (trace and upsample; plus the SVGF chain with
-// spatial; plus temporal; lamps with debug 4 and no spatial; trace debug 9) on the recording mock. SVGF M1 counts:
-// 2 + 8 + 8 + 4 + 2 = 24 (trace, reproject, variance, 4 a-trous, upsample at Iterations 5 and divisor 2).
-static constexpr uint64_t kDispatchGoldenHash = 0x0e450c3d93d0ec36ull;
-static constexpr int kDispatchGoldenCount = 24;
+// The command log and dispatch count of six fixed rtgi::Dispatch calls (trace and upsample; plus the SVGF chain with
+// spatial; plus temporal; lamps with debug 4 and no spatial; trace debug 9; ReSTIR GI on with debug 12) on the recording
+// mock. SVGF M1 counts: 2 + 8 + 8 + 4 + 2 = 24 (trace, reproject, variance, 4 a-trous, upsample at Iterations 5 and
+// divisor 2); the ReSTIR call adds 2 (trace and upsample): 26.
+static constexpr uint64_t kDispatchGoldenHash = 0x45bd015985e22c97ull;
+static constexpr int kDispatchGoldenCount = 26;
 
 static void TestDispatchGolden() {
   GoldenDevice dev;
@@ -564,6 +573,10 @@ static void TestDispatchGolden() {
   in.lights_view = {0u};
   in.light_indices_view = {0u};
   CHECK(rtgi::Dispatch(&dev, &cl, in).ok, "case 5: trace debug view");
+  // 6. ReSTIR GI on (u3, u4 targets created) with Debug 12.
+  in.debug_mode = 12;
+  in.push.fade[2] = static_cast<float>(rtgi::kRtgiFlagRestir);
+  CHECK(rtgi::Dispatch(&dev, &cl, in).ok, "case 6: ReSTIR initial samples");
   const uint64_t hash = Fnv1a64(g_golden_log);
   CHECK(cl.dispatches == kDispatchGoldenCount, "dispatch count %d (golden %d)", cl.dispatches, kDispatchGoldenCount);
   CHECK(hash == kDispatchGoldenHash, "command log hash %016llx over %zu words (golden %016llx)",

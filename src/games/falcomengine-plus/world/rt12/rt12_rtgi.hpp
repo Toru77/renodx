@@ -27,6 +27,8 @@ enum Rt12RtgiShared : uint32_t {
   kRt12RtgiStats,
   kRt12RtgiRaw,
   kRt12RtgiDebug,
+  kRt12RtgiSamplePos,
+  kRt12RtgiSampleData,
 };
 
 #if defined(__world_rt12_rtgi_pack_EMBED_FILE)
@@ -63,6 +65,8 @@ struct Rt12RtgiInputs {
   reshade::api::resource_view deferred = {0u};
   reshade::api::resource raw_texture = {0u};
   reshade::api::resource debug_texture = {0u};
+  reshade::api::resource sample_pos_texture = {0u};
+  reshade::api::resource sample_data_texture = {0u};
   reshade::api::resource_view stats_uav = {0u};
   uint32_t trace_width = 0u;
   uint32_t trace_height = 0u;
@@ -126,7 +130,7 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
     hr = r.list->Close();
     if (FAILED(hr)) return fail("rtgi close", hr);
 
-    // Root signature (C4): root CBV b0 (scene rows), 32 constants at b12, one table of 25 descriptors in register order.
+    // Root signature (C4): root CBV b0 (scene rows), 32 constants at b12, one table of 27 descriptors in register order.
     D3D12_DESCRIPTOR_RANGE ranges[4] = {};
     const auto set_range = [](D3D12_DESCRIPTOR_RANGE& range, D3D12_DESCRIPTOR_RANGE_TYPE type, UINT count, UINT base) {
       range.RangeType = type;
@@ -138,7 +142,7 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
     set_range(ranges[0], D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4u, 0u);
     set_range(ranges[1], D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 9u);
     set_range(ranges[2], D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 17u, 14u);
-    set_range(ranges[3], D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3u, 0u);
+    set_range(ranges[3], D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 5u, 0u);
     D3D12_ROOT_PARAMETER parameters[3] = {};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     parameters[0].Descriptor.ShaderRegister = 0u;
@@ -260,10 +264,13 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
   const uint32_t th = in.trace_height;
   const uint32_t fw = in.full_width;
   const uint32_t fh = in.full_height;
+  const bool restir_on = in.sample_pos_texture.handle != 0u && in.sample_data_texture.handle != 0u;
   if (!EnsureRtgiShared(s, device, r.shared[kRt12RtgiDepth], DXGI_FORMAT_R32_FLOAT, fw, fh)
       || !EnsureRtgiShared(s, device, r.shared[kRt12RtgiNormal], DXGI_FORMAT_R32G32B32A32_UINT, tw, th)
       || !EnsureRtgiShared(s, device, r.shared[kRt12RtgiRaw], DXGI_FORMAT_R16G16B16A16_FLOAT, tw, th)
-      || !EnsureRtgiShared(s, device, r.shared[kRt12RtgiDebug], DXGI_FORMAT_R8G8B8A8_UNORM, fw, fh)) {
+      || !EnsureRtgiShared(s, device, r.shared[kRt12RtgiDebug], DXGI_FORMAT_R8G8B8A8_UNORM, fw, fh)
+      || (restir_on && (!EnsureRtgiShared(s, device, r.shared[kRt12RtgiSamplePos], DXGI_FORMAT_R32G32B32A32_FLOAT, tw, th)
+                        || !EnsureRtgiShared(s, device, r.shared[kRt12RtgiSampleData], DXGI_FORMAT_R32G32B32A32_UINT, tw, th)))) {
     return RtgiFallback(Rt12RtgiReason::TargetFailed);
   }
 
@@ -433,7 +440,7 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
   }
   list->EndQuery(r.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base_q + 1u);
 
-  // The C4 descriptors of this slot: t0..t3, t9, t14..t30, u0..u2. Unbound inputs get a null descriptor.
+  // The C4 descriptors of this slot: t0..t3, t9, t14..t30, u0..u4. Unbound inputs get a null descriptor.
   ID3D12Device5* device12 = s.device12.Get();
   const auto cpu_at = [&r, &s](uint32_t index) {
     D3D12_CPU_DESCRIPTOR_HANDLE handle = r.heap->GetCPUDescriptorHandleForHeapStart();
@@ -495,6 +502,8 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
   set_uav(22u, debug_on ? r.shared[kRt12RtgiDebug].texture12.Get() : nullptr, Rt12TextureUav(DXGI_FORMAT_R8G8B8A8_UNORM));
   set_uav(23u, r.shared[kRt12RtgiStats].texture12.Get(), Rt12TextureUav(DXGI_FORMAT_R32_UINT));
   set_uav(24u, r.shared[kRt12RtgiRaw].texture12.Get(), Rt12TextureUav(DXGI_FORMAT_R16G16B16A16_FLOAT));
+  set_uav(25u, restir_on ? r.shared[kRt12RtgiSamplePos].texture12.Get() : nullptr, Rt12TextureUav(DXGI_FORMAT_R32G32B32A32_FLOAT));
+  set_uav(26u, restir_on ? r.shared[kRt12RtgiSampleData].texture12.Get() : nullptr, Rt12TextureUav(DXGI_FORMAT_R32G32B32A32_UINT));
   const D3D12_UNORDERED_ACCESS_VIEW_DESC stats_clear_uav = Rt12TextureUav(DXGI_FORMAT_R32_UINT);
   device12->CreateUnorderedAccessView(r.shared[kRt12RtgiStats].texture12.Get(), nullptr, &stats_clear_uav,
                                       r.cpu_heap->GetCPUDescriptorHandleForHeapStart());
@@ -510,6 +519,7 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
   };
   const std::vector<ID3D12Resource*> writes = {
       r.shared[kRt12RtgiStats].texture12.Get(), r.shared[kRt12RtgiRaw].texture12.Get(), shared_resource(debug_on, kRt12RtgiDebug),
+      shared_resource(restir_on, kRt12RtgiSamplePos), shared_resource(restir_on, kRt12RtgiSampleData),
   };
   barriers.clear();
   for (ID3D12Resource* resource : reads) {
@@ -621,12 +631,18 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
     return RtgiFallback(Rt12RtgiReason::SubmitFailed);
   }
 
-  // 10. D3D11 copy back (raw, and the debug texture when set), then the stats resolve into the RTGI stats buffer.
+  // 10. D3D11 copy back (raw, the debug texture when set, the ReSTIR sample textures when on), then the stats resolve into the RTGI stats buffer.
   s.ctx11->CopyResource(reinterpret_cast<ID3D11Resource*>(in.raw_texture.handle),  // NOLINT(performance-no-int-to-ptr)
                         r.shared[kRt12RtgiRaw].texture11.Get());
   if (debug_on) {
     s.ctx11->CopyResource(reinterpret_cast<ID3D11Resource*>(in.debug_texture.handle),  // NOLINT(performance-no-int-to-ptr)
                           r.shared[kRt12RtgiDebug].texture11.Get());
+  }
+  if (restir_on) {
+    s.ctx11->CopyResource(reinterpret_cast<ID3D11Resource*>(in.sample_pos_texture.handle),  // NOLINT(performance-no-int-to-ptr)
+                          r.shared[kRt12RtgiSamplePos].texture11.Get());
+    s.ctx11->CopyResource(reinterpret_cast<ID3D11Resource*>(in.sample_data_texture.handle),  // NOLINT(performance-no-int-to-ptr)
+                          r.shared[kRt12RtgiSampleData].texture11.Get());
   }
   {
     const reshade::api::resource_view srvs[1] = {r.shared[kRt12RtgiStats].srv11};

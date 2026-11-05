@@ -29,6 +29,7 @@
 #include "world_bvh_trace.hlsli"
 #include "../../include/mrt_normal.hlsli"
 #include "world_rt_lamps.hlsli"
+#include "world_rt_denoise.hlsli"
 
 Texture2D<float4> g_game_depth : register(t9);
 #ifndef RTGI_DXR
@@ -52,6 +53,8 @@ RWTexture2D<float4> g_rtgi_debug : register(u0);
 RWStructuredBuffer<uint> g_rtgi_stats : register(u1);
 #endif
 RWTexture2D<float4> g_rtgi_raw : register(u2);
+RWTexture2D<float4> g_rtgi_restir_pos : register(u3);   // ReSTIR GI initial sample: x_s (xyz), W (w); RTGI_FLAG_RESTIR only
+RWTexture2D<uint4> g_rtgi_restir_data : register(u4);   // n_s (2 x f16 oct), L_o (3 x f16), M (high 16 of z), flags (w)
 
 cbuffer cb_scene : register(b0)
 {
@@ -112,6 +115,9 @@ cbuffer cb_rtgi : register(b12)
 #define RTGI_FLAG_FEEDBACK 64u
 #define RTGI_FLAG_REAL_RAYS 128u
 #define RTGI_FLAG_LAMP_SHADOWS 256u
+#define RTGI_FLAG_RESTIR 512u
+#define RTGI_RESTIR_VALID 1u
+#define RTGI_RESTIR_SURFACE 2u
 #define RTGI_LAMP_COUNT 1024u
 #define RTGI_FALLBACK_ALBEDO 0.5
 // world_rt12_rtgi.cs_6_5.hlsl includes this file with RTGI_DXR and its own trace, stats target and prologue.
@@ -236,6 +242,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
         float3 debug_color = float3(0.25, 0.0, 0.25);
         bool traced = false;
         float3 gi = float3(0.0, 0.0, 0.0);
+        float4 restir_sample_pos = float4(0.0, 0.0, 0.0, 0.0);
+        uint4 restir_sample_data = uint4(0u, 0u, 0u, 0u);
         const float depth = g_game_depth.Load(int3(px, 0)).x;
         const float3 N = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(px, 0)).xy);
         if (any(resolutionScaling_g != float2(1.0, 1.0)))
@@ -311,6 +319,13 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 uint stack_overflow = 0u;
                 float t_sum = 0.0;
                 float min_t = ray_max;
+                const bool restir = (flags & RTGI_FLAG_RESTIR) != 0u;
+                float restir_w_sum = 0.0;
+                bool restir_selected = false;
+                float3 restir_pos = float3(0.0, 0.0, 0.0);
+                float3 restir_n = float3(0.0, 0.0, 0.0);
+                float3 restir_radiance = float3(0.0, 0.0, 0.0);
+                float restir_cos = 0.0;
                 for (uint i = 0u; i < spp; ++i)
                 {
                     float3 ray_origin = origin;
@@ -319,6 +334,10 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     float3 extra = float3(0.0, 0.0, 0.0);
                     float3 fed_back_view = float3(0.0, 0.0, 0.0);
                     float3 radiance_0 = float3(0.0, 0.0, 0.0);
+                    bool first_hit = false;
+                    float3 first_pos = float3(0.0, 0.0, 0.0);
+                    float3 first_n = float3(0.0, 0.0, 0.0);
+                    float first_cos = 0.0;
                     for (uint b = 0u; b <= bounce_rays; ++b)
                     {
                         const float3 up = abs(ray_N.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
@@ -385,6 +404,13 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             }
                         }
                         const float3 n = dot(hit.normal, dir) > 0.0 ? -hit.normal : hit.normal;
+                        if (b == 0u)
+                        {
+                            first_hit = true;
+                            first_pos = hit.position;
+                            first_n = n;
+                            first_cos = dot(N, dir);
+                        }
                         float3 radiance = float3(0.0, 0.0, 0.0);
                         bool looked_up = false;
                         const float fallback_albedo = (flags & RTGI_FLAG_FALLBACK_NO_ALBEDO) != 0u ? 1.0 : RTGI_FALLBACK_ALBEDO;
@@ -533,6 +559,21 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                         clamped += 1u;
                     }
                     gi_sum += radiance;
+                    if (restir && first_hit && first_cos > 1e-6)
+                    {
+                        const float p_hat = dot(radiance, float3(0.2126, 0.7152, 0.0722));
+                        const float w = p_hat / (first_cos * 0.31830989);
+                        restir_w_sum += w;
+                        const float u_select = TraceIgnNoise2(float2(tp) + g_rtgi_sampling.z + 101.0 + float(i) * 7.0).x;
+                        if (w > 0.0 && u_select * restir_w_sum < w)
+                        {
+                            restir_selected = true;
+                            restir_pos = first_pos;
+                            restir_n = first_n;
+                            restir_radiance = radiance;
+                            restir_cos = first_cos;
+                        }
+                    }
                 }
                 InterlockedAdd(gs_stats[RTGI_STAT_RAYS], spp);
                 InterlockedAdd(gs_stats[RTGI_STAT_HITS], hits);
@@ -550,6 +591,22 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 InterlockedAdd(gs_stats[RTGI_STAT_CLAMPED], clamped);
                 const float fade = saturate((g_rtgi_fade.y - distance_to_camera) / max(g_rtgi_fade.y - g_rtgi_fade.x, 1e-4));
                 gi = gi_sum / (float)spp * fade;
+                if (restir)
+                {
+                    restir_sample_data.z = min(spp, 0xFFFFu) << 16u;
+                    gi = float3(0.0, 0.0, 0.0);
+                    if (restir_selected)
+                    {
+                        const float p_hat_z = dot(restir_radiance, float3(0.2126, 0.7152, 0.0722));
+                        const float restir_W = restir_w_sum / ((float)spp * p_hat_z);
+                        gi = restir_radiance * (restir_cos * 0.31830989) * restir_W * fade;
+                        const float2 oct = OctEncode(restir_n);
+                        const float3 l16 = min(restir_radiance, 65504.0);
+                        restir_sample_pos = float4(restir_pos, restir_W);
+                        restir_sample_data = uint4(f32tof16(oct.x) | (f32tof16(oct.y) << 16u), f32tof16(l16.r) | (f32tof16(l16.g) << 16u),
+                            f32tof16(l16.b) | (min(spp, 0xFFFFu) << 16u), RTGI_RESTIR_VALID);
+                    }
+                }
                 const float mean_t = hits > 0u ? t_sum / (float)hits / ray_max : 0.0;
                 if (debug_mode == 1)
                 {
@@ -592,10 +649,17 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     const float3 extra_mean = extra_light_sum / (float)spp * fade;
                     debug_color = extra_mean / (1.0 + extra_mean);
                 }
+                else if (debug_mode == 12)
+                {
+                    // ReSTIR GI: the radiance of the kept sample, shown as rgb / (1 + rgb); black when none was kept.
+                    const float3 l = float3(f16tof32(restir_sample_data.y & 0xFFFFu), f16tof32(restir_sample_data.y >> 16u),
+                        f16tof32(restir_sample_data.z & 0xFFFFu));
+                    debug_color = (restir_sample_data.w & RTGI_RESTIR_VALID) != 0u ? l / (1.0 + l) : float3(0.0, 0.0, 0.0);
+                }
             }
         }
         InterlockedAdd(gs_stats[RTGI_STAT_PIXELS], 1u);
-        if ((debug_mode >= 1 && debug_mode <= 3) || debug_mode == 8 || debug_mode == 9 || debug_mode == 10)
+        if ((debug_mode >= 1 && debug_mode <= 3) || debug_mode == 8 || debug_mode == 9 || debug_mode == 10 || debug_mode == 12)
         {
             for (uint dy = 0u; dy < d; ++dy)
             {
@@ -611,6 +675,11 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
         }
         // a: 1 = GI value valid (traced or beyond Fade End), -1 = no surface or outside the region.
         g_rtgi_raw[tp] = traced ? float4(gi, 1.0) : float4(0.0, 0.0, 0.0, -1.0);
+        if (((uint)g_rtgi_fade.z & RTGI_FLAG_RESTIR) != 0u)
+        {
+            g_rtgi_restir_pos[tp] = restir_sample_pos;
+            g_rtgi_restir_data[tp] = uint4(restir_sample_data.xyz, restir_sample_data.w | (traced ? RTGI_RESTIR_SURFACE : 0u));
+        }
     }
     GroupMemoryBarrierWithGroupSync();
     if (group_index < RTGI_STAT_TRACE_COUNT)

@@ -166,7 +166,7 @@ struct Rt12RtgiState {
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> queries;        // kRt12Slots * kRt12RtgiTimestamps
   Microsoft::WRL::ComPtr<ID3D12Resource> query_readback;  // kRt12Slots * kRt12RtgiTimestamps * 8 bytes
   Microsoft::WRL::ComPtr<ID3D12Resource> scene_cb, lamps, lamp_types, deferred;  // DEFAULT, COMMON
-  Rt12Shared shared[15];  // the RTGI D3D11 textures (fixed and per frame, by format and size)
+  Rt12Shared shared[17];  // the RTGI D3D11 textures (fixed and per frame, by format and size)
   rtgi::RtgiPipeline pack, pack_lights, resolve;
 };
 

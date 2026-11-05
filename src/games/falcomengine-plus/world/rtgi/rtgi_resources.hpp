@@ -2,7 +2,7 @@
 
 // RTGI GPU resources: the trace pipeline (world_rtgi), the SVGF denoise chain (world_svgf_reproject, world_svgf_variance,
 // world_svgf_atrous) and the upsample (world_rtgi_upsample), the stats buffer, the debug texture (r8g8b8a8_unorm at the depth
-// size, created while RTGI Debug is 1 to 11), the raw GI, the history, the SVGF targets, the final GI and the radiance
+// size, created while RTGI Debug is 1 to 12), the raw GI, the history, the SVGF targets, the final GI and the radiance
 // copy. Created lazily from the lighting hook (rtgi.hpp); no module mutex is held around any graphics call here.
 
 #include <algorithm>
@@ -28,8 +28,9 @@ namespace falcom_world::rtgi {
 // (sun diffuse factor), t26 the screen shadow map (shadowTexture), t27 G-buffer mrtTexture2 (material index) and
 // t28 deferredParams_g (dynamicLightIntensity).
 inline constexpr uint32_t kRtgiSrvCount = 29u;
-// u0 debug texture (null unless RTGI Debug is 1 to 3, 8 or 9), u1 stats, u2 raw GI
-inline constexpr uint32_t kRtgiUavCount = 3u;
+// u0 debug texture (null unless RTGI Debug is 1 to 3, 8, 9, 10 or 12), u1 stats, u2 raw GI, u3 ReSTIR sample position and W,
+// u4 ReSTIR sample data (null unless kRtgiFlagRestir)
+inline constexpr uint32_t kRtgiUavCount = 5u;
 inline constexpr uint32_t kRtgiPushConstantCount = 32u;
 inline constexpr uint32_t kRtgiStatsCount = 24u;
 
@@ -65,6 +66,7 @@ inline constexpr uint32_t kRtgiFlagGameSun = 32u;  // b12 c2.z bit: fallback sun
 inline constexpr uint32_t kRtgiFlagFeedback = 64u;  // b12 c2.z bit: add back the feedback share (c7.y) of last frame's bounce
 inline constexpr uint32_t kRtgiFlagRealRays = 128u;  // b12 c2.z bit: Extra Bounces on, extra bounce rays from c7.z
 inline constexpr uint32_t kRtgiFlagLampShadows = 256u;  // b12 c2.z bit: fallback lamp light gets a shadow ray per lamp
+inline constexpr uint32_t kRtgiFlagRestir = 512u;  // b12 c2.z bit: ReSTIR GI initial sample (u3, u4) and the RIS estimate in raw
 // Reprojection pass counters, matching RTGI_STAT_* in world_svgf_reproject.cs_5_0.hlsl.
 inline constexpr uint32_t kRtgiStatTemporalPixels = 20u;
 inline constexpr uint32_t kRtgiStatNoHistory = 21u;
@@ -416,6 +418,8 @@ struct RtgiDeviceData {
   reshade::api::resource_view lamp_types_srv = {0u};
   RtgiTextureSet<1> debug;  // r8g8b8a8_unorm, depth size; created while RTGI Debug is 1 to 10
   RtgiTextureSet<1> raw;    // rgba16f, trace size: rgb GI, a = 1 traced, -1 not traced
+  RtgiTextureSet<1> restir_sample_pos;   // r32g32b32a32_float, trace size: x_s, W (only while kRtgiFlagRestir)
+  RtgiTextureSet<1> restir_sample_data;  // r32g32b32a32_uint, trace size: n_s, L_o, M, flags (only while kRtgiFlagRestir)
   RtgiDenoiseSet denoise;   // output: r11g11b10_float, the upsampled GI
   reshade::api::resource radiance_texture = {0u};
   reshade::api::resource_view radiance_srv = {0u};
@@ -480,6 +484,8 @@ inline void DestroyRtgiDeviceData(reshade::api::device* device) {
   RtgiDeviceData& data = found->second;
   DestroyRtgiTextureSet(device, &data.debug);
   DestroyRtgiTextureSet(device, &data.raw);
+  DestroyRtgiTextureSet(device, &data.restir_sample_pos);
+  DestroyRtgiTextureSet(device, &data.restir_sample_data);
   DestroyRtgiDenoiseSet(device, &data.denoise);
   bvh::DestroyBuffer(device, &data.radiance_srv, &data.radiance_texture);
   bvh::DestroyBuffer(device, &data.stats_uav, &data.stats_buffer);
@@ -500,6 +506,8 @@ inline void ReleaseRtgiTextures(reshade::api::device* device) {
   RtgiDeviceData& data = found->second;
   DestroyRtgiTextureSet(device, &data.debug);
   DestroyRtgiTextureSet(device, &data.raw);
+  DestroyRtgiTextureSet(device, &data.restir_sample_pos);
+  DestroyRtgiTextureSet(device, &data.restir_sample_data);
   ReleaseRtgiDenoiseTextures(device, &data.denoise);
   bvh::DestroyBuffer(device, &data.radiance_srv, &data.radiance_texture);
   data.radiance_width = 0u;

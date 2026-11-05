@@ -9741,7 +9741,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       rtgi::g_rtgi_sun_casters_only, rtgi::g_rtgi_sun_contribution, rtgi::g_rtgi_fallback_no_albedo,
       rtgi::g_rtgi_dynamic_lights, rtgi::g_rtgi_dynamic_light_contribution, rtgi::g_rtgi_game_sun, rtgi::g_rtgi_lamp_shadows,
       rtgi::g_rtgi_extra_bounces, rtgi::g_rtgi_feedback_strength,
-      rtgi::g_rtgi_extra_bounce_rays, rtgi::g_rtgi_bounce_saturation};
+      rtgi::g_rtgi_extra_bounce_rays, rtgi::g_rtgi_bounce_saturation, rtgi::g_rtgi_restir};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;
@@ -9784,6 +9784,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   const bool sora2nd_bindings = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr;
   const float feedback_strength = rtgi::RtgiFeedbackStrengthEffective();
   const uint32_t extra_rays = rtgi::RtgiExtraBounceRaysEffective();
+  const bool restir_on = rtgi::g_rtgi_restir > 0.5f;
   static_assert((falcom_world::kPsSrvResourceSlots & (1u << rtgi::kLightingLightsRegister)) != 0u
                     && (falcom_world::kPsSrvResourceSlots & (1u << rtgi::kLightingLightIndicesRegister)) != 0u,
                 "the bind hook resolves the RTGI light buffers");
@@ -9811,7 +9812,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
                        | (rtgi::g_rtgi_game_sun > 0.5f ? rtgi::kRtgiFlagGameSun : 0u)
                        | (feedback_strength > 0.f ? rtgi::kRtgiFlagFeedback : 0u)
                        | (extra_rays > 0u ? rtgi::kRtgiFlagRealRays : 0u)
-                       | (lamp_shadows ? rtgi::kRtgiFlagLampShadows : 0u)),
+                       | (lamp_shadows ? rtgi::kRtgiFlagLampShadows : 0u)
+                       | (restir_on ? rtgi::kRtgiFlagRestir : 0u)),
                    0.f},
           .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
                      bvh_data->tlas_region_size},
@@ -9873,12 +9875,15 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.prev_view_proj_register = prev_view_proj_register;
   frame.radiance_valid = radiance_valid;
   frame.subtracted = subtract && radiance_valid;
+  frame.restir = restir_on;
   frame.radiance_width = rd.radiance_width;
   frame.radiance_height = rd.radiance_height;
   frame.radiance_format = static_cast<uint32_t>(rd.radiance_format);
   frame.texture_bytes = sizeof(uint32_t) * rtgi::kRtgiStatsCount
       + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
       + static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
+      + static_cast<uint64_t>(rd.restir_sample_pos.width) * rd.restir_sample_pos.height * 16u
+      + static_cast<uint64_t>(rd.restir_sample_data.width) * rd.restir_sample_data.height * 16u
       + rtgi::RtgiDenoiseTextureBytes(rd.denoise)
       + (rd.radiance_texture.handle != 0u
              ? static_cast<uint64_t>(reshade::api::format_row_pitch(rd.radiance_format, rd.radiance_width)) * rd.radiance_height

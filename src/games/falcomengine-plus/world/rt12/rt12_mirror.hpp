@@ -275,7 +275,7 @@ inline bool Rt12RtgiReadsMaterialInputs(float dynamic_light_contribution) {
   return dynamic_light_contribution != 1.f;
 }
 
-inline constexpr uint32_t kRt12RtgiDescriptors = 25u;
+inline constexpr uint32_t kRt12RtgiDescriptors = 27u;
 inline constexpr uint32_t kRt12RtgiTimestamps = 3u;
 inline constexpr uint32_t kRt12RtgiSceneRows = 96u;
 inline constexpr uint32_t kRt12RtgiLampTexels = 7u;

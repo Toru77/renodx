@@ -62,6 +62,7 @@ struct RtgiFrameState {
   uint64_t applied_frame = UINT64_MAX;  // last frame whose lighting draw got the bounce (RunRtgiInline push_gi)
   float applied_intensity = 0.f;        // GI Intensity applied in applied_frame
   bool subtracted = false;              // this frame's trace subtracted last frame's applied bounce (one bounce)
+  bool restir = false;  // the newest trace wrote the ReSTIR GI initial samples (kRtgiFlagRestir)
 };
 
 inline RtgiFrameState g_rtgi_frame;
@@ -458,19 +459,30 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     }
   }
   bool debug_ready = false;
-  if (in.debug_mode >= 1 && in.debug_mode <= 11) {
+  if (in.debug_mode >= 1 && in.debug_mode <= 12) {
     debug_ready = EnsureRtgiTextureSet(device, &data.debug, reshade::api::format::r8g8b8a8_unorm, 4u, in.full_width, in.full_height);
     if (!debug_ready) {
       renodx::utils::log::w("[world-rtgi] debug texture creation failed");
     }
   }
-  // Views the trace pass writes (modes 1 to 3, 8 to 10); a failed debug texture leaves u0 null and does not fail the
+  // Views the trace pass writes (modes 1 to 3, 8 to 10 and 12); a failed debug texture leaves u0 null and does not fail the
   // dispatch.
   const bool trace_debug =
-      debug_ready && (in.debug_mode <= 3 || in.debug_mode == 8 || in.debug_mode == 9 || in.debug_mode == 10);
+      debug_ready && (in.debug_mode <= 3 || in.debug_mode == 8 || in.debug_mode == 9 || in.debug_mode == 10 || in.debug_mode == 12);
   if (!EnsureRtgiTextureSet(device, &data.raw, reshade::api::format::r16g16b16a16_float, 8u, in.trace_width, in.trace_height)) {
     renodx::utils::log::w("[world-rtgi] raw GI texture creation failed");
     return {};
+  }
+  const bool restir = (static_cast<uint32_t>(in.push.fade[2]) & kRtgiFlagRestir) != 0u;
+  if (restir) {
+    if (!EnsureRtgiTextureSet(device, &data.restir_sample_pos, reshade::api::format::r32g32b32a32_float, 16u, in.trace_width, in.trace_height)
+        || !EnsureRtgiTextureSet(device, &data.restir_sample_data, reshade::api::format::r32g32b32a32_uint, 16u, in.trace_width, in.trace_height)) {
+      renodx::utils::log::w("[world-rtgi] ReSTIR sample texture creation failed (", in.trace_width, "x", in.trace_height, ")");
+      return {};
+    }
+  } else {
+    DestroyRtgiTextureSet(device, &data.restir_sample_pos);
+    DestroyRtgiTextureSet(device, &data.restir_sample_data);
   }
   const RtgiDenoiseReady denoise = EnsureRtgiDenoise(device, &data.denoise,
                                                      {.output_format = reshade::api::format::r11g11b10_float,
@@ -550,7 +562,9 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   srvs[27] = in.mrt2_view;
   srvs[28] = in.deferred_view;
   const reshade::api::resource_view uavs[kRtgiUavCount] = {
-      trace_debug ? data.debug.uav[0] : reshade::api::resource_view{0u}, data.stats_uav, data.raw.uav[0]};
+      trace_debug ? data.debug.uav[0] : reshade::api::resource_view{0u}, data.stats_uav, data.raw.uav[0],
+      restir ? data.restir_sample_pos.uav[0] : reshade::api::resource_view{0u},
+      restir ? data.restir_sample_data.uav[0] : reshade::api::resource_view{0u}};
   const reshade::api::buffer_range scene_cbv = rtao::SceneCbvRange(in.scene_cbv_view);
   reshade::api::descriptor_table_update updates[3] = {
       {trace.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
@@ -568,6 +582,10 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     cmd_list->barrier(data.debug.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   }
   cmd_list->barrier(data.raw.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  if (restir) {
+    cmd_list->barrier(data.restir_sample_pos.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    cmd_list->barrier(data.restir_sample_data.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  }
   bvh::EndGpuTimer(cmd_list, &data.timer);
 #else
   bvh::BeginGpuTimer(device, cmd_list, &data.timer);
@@ -594,6 +612,8 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
       .deferred = in.deferred_view,
       .raw_texture = data.raw.texture[0],
       .debug_texture = trace_debug ? data.debug.texture[0] : reshade::api::resource{0u},
+      .sample_pos_texture = restir ? data.restir_sample_pos.texture[0] : reshade::api::resource{0u},
+      .sample_data_texture = restir ? data.restir_sample_data.texture[0] : reshade::api::resource{0u},
       .stats_uav = data.stats_uav,
       .trace_width = in.trace_width,
       .trace_height = in.trace_height,
@@ -796,6 +816,7 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   } else {
     out << "  \"game_sun\": {\"captured\": false},\n";
   }
+  out << "  \"restir\": {\"on\": " << (f.restir ? "true" : "false") << ", \"candidates\": " << f.samples << ", \"sample_texels\": " << (f.restir ? static_cast<uint64_t>(f.trace_width) * f.trace_height : 0u) << "},\n";
   out << "  \"composite\": {\"intensity\": " << g_rtgi_intensity << ", \"character_intensity\": " << g_rtgi_char_intensity
       << ", \"saturation\": " << g_rtgi_saturation
       << ", \"dispatched_frame\": " << f.dispatched_frame << ", \"applied_frame\": " << f.applied_frame
