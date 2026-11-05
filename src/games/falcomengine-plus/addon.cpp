@@ -240,7 +240,7 @@ ShaderInjectData shader_injection = {
   // -- Bitmask fix toggles: all default OFF = previously shipped behaviour --
   .char_gtvbao_mode = 0.f,
   .char_gtvbao_mask_strength = 0.f,
-  .char_gtvbgi_mask_strength = 0.f,
+  .char_gtvbgi_mask_strength = 0.5f,
   .gtvbao_prefilter_enabled = 1.f,
   .brdf_hammon_diffuse_enabled = 0.f,
   .brdf_multiscatter_specular_enabled = 0.f,
@@ -731,7 +731,7 @@ static uint32_t DynCubeResolveSize(float v);
 
 // -- VBGI settings and state (inert until the VBGI pass lands) --
 static float g_vbgi_enabled = 0.f;
-static float g_vbgi_quality_level = 1.f;
+static float g_vbgi_quality_level = 2.f;
 static float g_vbgi_resolution = 1.f;
 constexpr int kVbgiMaxResolutionIndex = 3;  // VBGIResolution label count - 1 (1/8)
 static float g_vbgi_noise_type = 2.f;
@@ -745,7 +745,7 @@ static float g_vbgi_sun = 1.f;
 static float g_vbgi_emissive = 1.f;
 static float g_vbgi_multibounce_strength = 0.5f;
 static float g_vbgi_debug_mode = 0.f;
-static float g_vbgi_backface_mode = 0.f;
+static float g_vbgi_backface_mode = 1.f;
 static float g_vbgi_far_enabled = 1.f;
 static float g_vbgi_far_distance = 3.f;
 static float g_vbgi_far_intensity = 2.f;
