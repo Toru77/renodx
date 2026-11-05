@@ -48,7 +48,7 @@ cbuffer cb_restir_spatial : register(b12)
 #define RTGI_SSTAT_COUNT 4u
 static const float kRestirJacobianMax = 10.0;  // non-paper, as world_restir_temporal
 static const float kRestirInvPi = 0.31830989;
-static const float3 kRestirLuminance = float3(0.2126, 0.7152, 0.0722);  // p_hat = luminance of L_o (Eq. 10)
+static const float3 kRestirLuminance = float3(0.2126, 0.7152, 0.0722);  // luminance weights of p_hat = luminance(L_o) x receiver cosine (GI Eq. 9, Lambertian), as the trace
 
 // Integer hash (the mixer of world_restir_temporal's selection number).
 uint RestirHash(uint h)
@@ -106,7 +106,9 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
 
             // Canonical candidate: this pixel's own reservoir; MERGE weight p_hat x W x M (Alg. 1 line 13).
             const float3 l_c = float3(f16tof32(c_data.y & 0xFFFFu), f16tof32(c_data.y >> 16u), f16tof32(c_data.z & 0xFFFFu));
-            const float p_c = dot(l_c, kRestirLuminance);
+            // GI Eq. 9 target at this pixel: luminance(L_o) x the receiver cosine toward the sample point.
+            const float3 to_cc = c_sample.xyz - xv;
+            const float p_c = dot(l_c, kRestirLuminance) * max(0.0, dot(nv, to_cc) * rsqrt(max(dot(to_cc, to_cc), 1e-12)));
             float w_sum = c_sample.w > 0.0 ? p_c * c_sample.w * float(c_m) : 0.0;
             uint m_sum = c_m;
             float3 sel_xs = c_sample.xyz;
@@ -159,7 +161,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                         {
                             accepted += 1u;
                             const float3 hl = float3(f16tof32(n_data.y & 0xFFFFu), f16tof32(n_data.y >> 16u), f16tof32(n_data.z & 0xFFFFu));
-                            const float hp_hat = dot(hl, kRestirLuminance);
+                            const float hp_hat = dot(hl, kRestirLuminance) * cos_recv;
                             const float hw = hp_hat * n_sample.w * float(n_m) * J;
                             w_sum += hw;
                             m_sum += n_m;
@@ -179,7 +181,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
             if (accepted > 0u)
             {
                 // Biased normalisation: Z = the M of the canonical and every merged neighbour (Alg. 4 lines 16-20 without
-                // visibility; with p_hat of Eq. 10 the line 18 test is always true). W = w_sum / (Z p_hat(z)).
+                // visibility and without the line 18 test; with the Eq. 9 target that test can fail for a neighbour that
+                // cannot see z, a small darkening bias left to M5). W = w_sum / (Z p_hat(z)).
                 const float W = sel_p > 0.0 ? w_sum / (float(m_sum) * sel_p) : 0.0;
                 const float3 to_s = sel_xs - xv;
                 const float cos_s = max(0.0, dot(nv, to_s) * rsqrt(max(dot(to_s, to_s), 1e-12)));

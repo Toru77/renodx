@@ -54,7 +54,7 @@ cbuffer cb_restir_temporal : register(b12)
 #define RTGI_RESTIR_SURFACE 2u
 static const float kRestirJacobianMax = 10.0;  // non-paper: history dropped when J > 10 or J < 1 / 10 (singular reconnections)
 static const float kRestirInvPi = 0.31830989;
-static const float3 kRestirLuminance = float3(0.2126, 0.7152, 0.0722);  // p_hat = luminance of L_o (Eq. 10), as the trace
+static const float3 kRestirLuminance = float3(0.2126, 0.7152, 0.0722);  // luminance weights of p_hat = luminance(L_o) x receiver cosine (GI Eq. 9, Lambertian), as the trace
 
 groupshared uint gs_rstats[RTGI_RSTAT_COUNT];
 
@@ -96,7 +96,9 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
             // Canonical candidate: the initial reservoir (z0, W0, M0); MERGE weight p_hat x W x M (Alg. 1 line 13).
             const bool s0_valid = (s0_data.w & RTGI_RESTIR_VALID) != 0u && s0_pos.w > 0.0;
             const float3 l0 = float3(f16tof32(s0_data.y & 0xFFFFu), f16tof32(s0_data.y >> 16u), f16tof32(s0_data.z & 0xFFFFu));
-            const float p0 = dot(l0, kRestirLuminance);
+            // GI Eq. 9 target at this pixel: luminance(L_o) x the receiver cosine toward the sample point.
+            const float3 to_c0 = s0_pos.xyz - xv;
+            const float p0 = dot(l0, kRestirLuminance) * max(0.0, dot(nv, to_c0) * rsqrt(max(dot(to_c0, to_c0), 1e-12)));
             float w_sum = s0_valid ? p0 * s0_pos.w * float(m0) : 0.0;
             uint m_sum = m0;
             bool accepted = false;
@@ -143,7 +145,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             accepted = true;
                             InterlockedAdd(gs_rstats[1], 1u);
                             const float3 hl = float3(f16tof32(h_data.y & 0xFFFFu), f16tof32(h_data.y >> 16u), f16tof32(h_data.z & 0xFFFFu));
-                            const float hp_hat = dot(hl, kRestirLuminance);
+                            const float hp_hat = dot(hl, kRestirLuminance) * cos_recv;
                             const float hw = hp_hat * h_sample.w * float(h_m) * J;
                             w_sum += hw;
                             m_sum += h_m;
@@ -175,7 +177,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
             const uint nv_pack = f32tof16(nv_oct.x) | (f32tof16(nv_oct.y) << 16u);
             if (accepted)
             {
-                // W = w_sum / (M p_hat(z)) (Alg. 3 line 6, Eq. 7); f(z) = L_o x cos / pi at this pixel (albedo: the composite).
+                // W = w_sum / (M p_hat(z)) with the Eq. 9 target at this pixel (Alg. 3 line 6, Eq. 7); f(z) = L_o x cos / pi (albedo: the composite).
                 const float W = sel_p > 0.0 ? w_sum / (float(m_sum) * sel_p) : 0.0;
                 const float3 to_s = sel_xs - xv;
                 const float cos_s = max(0.0, dot(nv, to_s) * rsqrt(max(dot(to_s, to_s), 1e-12)));

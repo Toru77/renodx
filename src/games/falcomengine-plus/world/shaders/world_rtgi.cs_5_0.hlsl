@@ -561,7 +561,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     gi_sum += radiance;
                     if (restir && first_hit && first_cos > 1e-6)
                     {
-                        const float p_hat = dot(radiance, float3(0.2126, 0.7152, 0.0722));
+                        const float p_hat = dot(radiance, float3(0.2126, 0.7152, 0.0722)) * first_cos;  // GI Eq. 9 (Lambertian): luminance x receiver cosine
                         const float w = p_hat / (first_cos * 0.31830989);
                         restir_w_sum += w;
                         const float u_select = TraceIgnNoise2(float2(tp) + g_rtgi_sampling.z + 101.0 + float(i) * 7.0).x;
@@ -597,7 +597,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     gi = float3(0.0, 0.0, 0.0);
                     if (restir_selected)
                     {
-                        const float p_hat_z = dot(restir_radiance, float3(0.2126, 0.7152, 0.0722));
+                        const float p_hat_z = dot(restir_radiance, float3(0.2126, 0.7152, 0.0722)) * restir_cos;
                         const float restir_W = restir_w_sum / ((float)spp * p_hat_z);
                         gi = restir_radiance * (restir_cos * 0.31830989) * restir_W * fade;
                         const float2 oct = OctEncode(restir_n);
