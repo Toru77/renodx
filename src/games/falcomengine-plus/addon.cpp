@@ -42,6 +42,7 @@
 #include "./world/rtao/rtao.hpp"  // RTAO round 1 (inline lighting-hook dispatch)
 #include "./world/rtao/rtao_svgf.hpp"  // RTAO SVGF glue (inline lighting-hook dispatch)
 #include "./world/rr/rr_state.hpp"
+#include "./world/bvh/deform_probe.hpp"  // native D3D11 event query (DynCube validity readback poll)
 
 namespace {
 
@@ -520,6 +521,9 @@ constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
 // DynCube loading wipe: color captures older than this mean no lighting draws
 // (loading screen) � arm history hard-replace so the next scene rebuilds clean.
 constexpr uint64_t kDynCubeLoadingStaleFrames = 5u;
+// DynCube validity readback: consecutive immediate-context ticks an armed staging copy may
+// stay incomplete before the blocking map runs anyway (more than twice the DXGI default queue of 3).
+constexpr uint32_t DYNCUBE_VALIDITY_MAX_WAIT_TICKS = 8u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
 
 // -- Contact Shadows (shadows/*.cs_5_0.hlsl) --
@@ -1205,6 +1209,12 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t dyncube_readSet = 0;            // validated consumer set (t29/previews/aliases/filter input)
   uint32_t dyncube_filteredReadSet = 99u;  // readSet last fed into GGX filter (99 = none yet)
   bool dyncube_boxCopyPending = false;     // staged validity copy enqueued, not yet consumed
+  uint64_t dyncube_valid_event = 0u;       // native D3D11 event query ended after the staging copies (0 = unavailable)
+  bool dyncube_valid_event_armed = false;  // the latest staging copies were followed by an End on the immediate context
+  uint32_t dyncube_valid_wait_ticks = 0u;  // consecutive immediate ticks the armed copy was not complete yet
+  uint64_t dyncube_valid_poll_misses = 0u; // scheduler ticks where the staged copy was not complete yet
+  uint64_t dyncube_valid_timeouts = 0u;    // armed copies that hit DYNCUBE_VALIDITY_MAX_WAIT_TICKS (blocking map fallback)
+  float dyncube_map_wait_ms_max = 0.f;     // longest validity-staging map wait since the last scheduler log line (CPU ms)
   bool dyncube_wasRejected = false;        // edge latch for reject/resume logging
   bool dyncube_rejectedGap = false;        // a capture was rejected since the last dispatched capture (one-shot: first accepted capture hard-replaces history)
   bool dyncube_loadingWipeDone = false;   // loading wipe already applied for the current stale episode (edge latch)
@@ -1570,7 +1580,7 @@ static bool RunDynCubeSolid(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, uint32_t set);
 static void PromoteDynCubeReadSet(DeviceData* d);
-static void ConsumeDynCubeStagedValidity(reshade::api::device* dev, DeviceData* d);
+static void ConsumeDynCubeStagedValidity(reshade::api::device* dev, DeviceData* d, bool on_immediate);
 static bool RunDynCubeInference(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool ggxOn);
 static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d);
@@ -10267,7 +10277,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
       // Delayed-validate commit: consume the staged hasGeom bit BEFORE any new
       // capture/filter work, so promotion always pairs with the latest capture.
-      ConsumeDynCubeStagedValidity(dev, dd);
+      ConsumeDynCubeStagedValidity(dev, dd, dd->immediate_cmd_list != nullptr && dd->immediate_cmd_list == cmd_list);
 
       // Capture-content settings dirtiness: character_capture bakes into history
       // texels, but the served cube only rebuilds on readSet change. A toggle in a
@@ -10298,7 +10308,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       // Seed: on first activation (no completed cube yet) capture immediately; the
       // filter is deferred to the gated Filter phase so an unvalidated first capture
       // can never bake the GGX cubes (costs ~1 frame of first-image latency).
-      if (!dd->dyncube_ggx_valid && RunDynCubeCapture(cmd_list, dd)) {
+      if (!dd->dyncube_ggx_valid && dd->dyncube_phase != DeviceData::DynCubePhase::Filter
+          && RunDynCubeCapture(cmd_list, dd)) {
         dd->dyncube_phase = DeviceData::DynCubePhase::Filter;
         dd->dyncube_next_update_frame = dd->frame_index + interval;
       }
@@ -10316,6 +10327,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           }
           break;
         case DeviceData::DynCubePhase::Filter:
+          // Armed staged validity not consumed yet: promotion and filter must land in the same
+          // tick. Unarmed or failed copies do not hold the phase (blocking-map behavior).
+          if (dd->dyncube_boxCopyPending && dd->dyncube_valid_event_armed) break;
           if (!dd->dyncube_hasValidRead) {
             // No validated read set yet (e.g. loading at boot): wait, retry on cadence.
             dd->dyncube_phase = DeviceData::DynCubePhase::Done;
@@ -10399,7 +10413,11 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           msg += " fltTot=" + std::to_string(dd->dyncube_filter_updates);
           msg += " ggxMips=" + std::to_string(dd->dyncube_ggx_mip_dispatches);
           msg += " faceCpy=" + std::to_string(dd->dyncube_face_copies);
+          msg += " pollMiss=" + std::to_string(dd->dyncube_valid_poll_misses);
+          msg += " timeouts=" + std::to_string(dd->dyncube_valid_timeouts);
+          msg += " mapWaitMaxMs=" + std::to_string(dd->dyncube_map_wait_ms_max);
           reshade::log::message(reshade::log::level::info, msg.c_str());
+          dd->dyncube_map_wait_ms_max = 0.f;
         }
       }
     }
@@ -11102,6 +11120,10 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   d->dyncube_loadingWipeDone = false;
   d->dyncube_loadingWipePending = false;
   dr(d->dyncube_validStaging);
+  falcom_world::bvh::DestroyDeformQueryD3D11(d->dyncube_valid_event);
+  d->dyncube_valid_event = 0u;
+  d->dyncube_valid_event_armed = false;
+  d->dyncube_valid_wait_ticks = 0u;
   dr(d->dyncube_faceExtStaging);
   d->dyncube_readSet = 0;
   d->dyncube_filteredReadSet = 99u;
@@ -11511,6 +11533,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       DestroyDynCubeResources(dev, d);
       return false;
     }
+    d->dyncube_valid_event = falcom_world::bvh::CreateDeformEventD3D11(dev);
   }
 
   // -- Phase 3 filtered cubes --
@@ -11928,13 +11951,35 @@ static void PromoteDynCubeReadSet(DeviceData* d) {
 
 // Delayed-validate commit: consume the staged hasGeom bit (bounds[1].w, float index 7)
 // from the previous capture. Runs at scheduler entry before any new capture/filter work,
-// so the staged copy always describes the latest capture (no epochs needed). Blocking map
-// is safe: staged data is >=1 present old by construction. On map failure the pending flag
-// is kept and the system stays frozen (safe direction); a later copy overwrites the slot.
-static void ConsumeDynCubeStagedValidity(reshade::api::device* dev, DeviceData* dd) {
+// so the staged copy always describes the latest capture (no epochs needed). With a deep
+// driver frame queue the copy can still be frames behind the CPU, so on the immediate
+// context an armed copy is mapped only once its event reports done (polled without
+// flush), for at most DYNCUBE_VALIDITY_MAX_WAIT_TICKS ticks; meanwhile the Filter phase
+// waits. Deferred-list ticks, unarmed copies, poll errors and the wait bound use the
+// blocking map. On map failure the pending flag is kept (frozen, safe direction) and the
+// copy is disarmed so the Filter phase keeps running; a later copy overwrites the slot.
+static void ConsumeDynCubeStagedValidity(reshade::api::device* dev, DeviceData* dd, bool on_immediate) {
   if (!dev || !dd || !dd->dyncube_boxCopyPending || !dd->dyncube_validStaging.handle) return;
+  if (on_immediate && dd->dyncube_valid_event_armed) {
+    if (dd->dyncube_valid_wait_ticks < DYNCUBE_VALIDITY_MAX_WAIT_TICKS
+        && falcom_world::bvh::PollDeformEventD3D11(dd->immediate_cmd_list, dd->dyncube_valid_event) == 0) {
+      ++dd->dyncube_valid_wait_ticks;
+      ++dd->dyncube_valid_poll_misses;
+      return;
+    }
+    if (dd->dyncube_valid_wait_ticks >= DYNCUBE_VALIDITY_MAX_WAIT_TICKS) {
+      ++dd->dyncube_valid_timeouts;
+      CSLog("dyncube", "validity poll timeout: blocking map fallback", true);
+    }
+  }
   void* staged = nullptr;
-  if (!dev->map_buffer_region(dd->dyncube_validStaging, 0, 32, reshade::api::map_access::read_only, &staged) || staged == nullptr) {
+  const auto map_start = std::chrono::steady_clock::now();
+  const bool mapped = dev->map_buffer_region(dd->dyncube_validStaging, 0, 32, reshade::api::map_access::read_only, &staged);
+  const float map_wait_ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - map_start).count();
+  dd->dyncube_map_wait_ms_max = std::max(dd->dyncube_map_wait_ms_max, map_wait_ms);
+  if (!mapped || staged == nullptr) {
+    dd->dyncube_valid_event_armed = false;
+    CSLog("dyncube", "validity map FAILED: pending kept, Filter gate released", true);
     return;
   }
   dd->dyncube_boxCopyPending = false;
@@ -12212,8 +12257,8 @@ static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, ui
     cl->dispatch(1, 1, 1);
     cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   }
-  // Stage bounds for delayed-validate commit (consumed next scheduler entry; the
-  // per-frame hasGeom bit lives in staged bounds[1].w, float index 7).
+  // Stage bounds for delayed-validate commit (consumed at the first scheduler entry after
+  // the copy completed; the per-frame hasGeom bit lives in staged bounds[1].w, float index 7).
   cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_source);
   cl->copy_resource(d->dyncube_worldbox_bounds, d->dyncube_validStaging);
   cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::shader_resource);
@@ -12221,6 +12266,14 @@ static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, ui
   cl->barrier(d->dyncube_faceextents, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::copy_source);
   cl->copy_resource(d->dyncube_faceextents, d->dyncube_faceExtStaging);
   cl->barrier(d->dyncube_faceextents, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::unordered_access);
+  // The event lets the scheduler consume the copies without waiting on the GPU. It is
+  // ended only on the immediate context: a deferred list may never execute, which would
+  // leave the copy pending forever, so that path keeps the blocking map.
+  d->dyncube_valid_event_armed = d->dyncube_valid_event != 0u && cl == d->immediate_cmd_list;
+  if (d->dyncube_valid_event_armed) {
+    d->dyncube_valid_wait_ticks = 0u;
+    falcom_world::bvh::EndDeformQueryD3D11(cl, d->dyncube_valid_event);
+  }
   d->dyncube_boxCopyPending = true;
   d->dyncube_worldbox_reset_pending = false;
 
