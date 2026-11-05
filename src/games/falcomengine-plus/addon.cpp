@@ -1224,6 +1224,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   falcom_world::bvh::GpuTimer dyncube_gpu_variant_timer = {};
   falcom_world::bvh::GpuTimer dyncube_gpu_ssr_timer = {};
   std::chrono::steady_clock::time_point present_last_time = {};   // previous present, for the frame-interval log
+  std::chrono::steady_clock::time_point present_window_t0 = {};   // first interval of the current log window
   bool present_last_valid = false;                                  // false until the first interval after the toggle is turned on
   double present_sum_ms = 0.0;                                      // frame intervals in the current log window
   float present_max_ms = 0.f;                                       // longest frame interval in the current log window
@@ -1604,6 +1605,13 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d);
 // queries there, and GetData is not valid on a deferred context (photo mode).
 static bool DynCubeGpuTimingOn(reshade::api::command_list* cl, const DeviceData* d) {
   return g_dyncube_gpu_timing > 0.5f && cl != nullptr && cl == d->immediate_cmd_list;
+}
+// GPU Timing Log: start a new frame-interval window (the previous average is kept by the caller's choice).
+static void ResetPresentWindow(DeviceData* d) {
+  d->present_sum_ms = 0.0;
+  d->present_max_ms = 0.f;
+  d->present_count = 0u;
+  d->present_slow_count = 0u;
 }
 
 // VBGI gather: see RunVBGI
@@ -6580,8 +6588,17 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   d->frame_index++;
   if (g_dyncube_gpu_timing > 0.5f) {
     const auto now = std::chrono::steady_clock::now();
+    // The scheduler's 1/sec line resets the window; when it does not run (DynCube off, menus,
+    // loading, deferred list) drop a window older than 1.5 s and its stale slow threshold.
+    if (d->present_count > 0u && now - d->present_window_t0 > std::chrono::milliseconds(1500)) {
+      ResetPresentWindow(d);
+      d->present_prev_avg_ms = 0.0;
+    }
     if (d->present_last_valid) {
       const double ms = std::chrono::duration<double, std::milli>(now - d->present_last_time).count();
+      if (d->present_count == 0u) {
+        d->present_window_t0 = now;
+      }
       d->present_sum_ms += ms;
       d->present_count += 1u;
       if (ms > d->present_max_ms) d->present_max_ms = static_cast<float>(ms);
@@ -6591,6 +6608,8 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     d->present_last_valid = true;
   } else {
     d->present_last_valid = false;
+    ResetPresentWindow(d);
+    d->present_prev_avg_ms = 0.0;
   }
   {
     static uint64_t s_cap_frames = 0u;
@@ -10507,10 +10526,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               present_text << " (n=" << dd->present_count << " slow=" << dd->present_slow_count << ")";
               msg += " presentMs=" + present_text.str();
               if (avg > 0.0) dd->present_prev_avg_ms = avg;
-              dd->present_sum_ms = 0.0;
-              dd->present_max_ms = 0.f;
-              dd->present_count = 0u;
-              dd->present_slow_count = 0u;
+              ResetPresentWindow(dd);
             }
           }
           reshade::log::message(reshade::log::level::info, msg.c_str());
