@@ -1223,6 +1223,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   falcom_world::bvh::GpuTimer dyncube_gpu_filter_timer = {};
   falcom_world::bvh::GpuTimer dyncube_gpu_variant_timer = {};
   falcom_world::bvh::GpuTimer dyncube_gpu_ssr_timer = {};
+  falcom_world::bvh::GpuTimer dyncube_gpu_box_timer = {};   // world-box merge (split out of the capture timer)
   std::chrono::steady_clock::time_point present_last_time = {};   // previous present, for the frame-interval log
   std::chrono::steady_clock::time_point present_window_t0 = {};   // first interval of the current log window
   bool present_last_valid = false;                                  // false until the first interval after the toggle is turned on
@@ -10515,6 +10516,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
             msg += " flt=" + timer_text(&dd->dyncube_gpu_filter_timer);
             msg += " var=" + timer_text(&dd->dyncube_gpu_variant_timer);
             msg += " ssr=" + timer_text(&dd->dyncube_gpu_ssr_timer);
+            msg += " box=" + timer_text(&dd->dyncube_gpu_box_timer);
             {
               const double avg = dd->present_count > 0u ? dd->present_sum_ms / dd->present_count : 0.0;
               std::ostringstream present_text;
@@ -11241,6 +11243,7 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   falcom_world::bvh::DestroyGpuTimer(&d->dyncube_gpu_filter_timer);
   falcom_world::bvh::DestroyGpuTimer(&d->dyncube_gpu_variant_timer);
   falcom_world::bvh::DestroyGpuTimer(&d->dyncube_gpu_ssr_timer);
+  falcom_world::bvh::DestroyGpuTimer(&d->dyncube_gpu_box_timer);
   dr(d->dyncube_faceExtStaging);
   d->dyncube_readSet = 0;
   d->dyncube_filteredReadSet = 99u;
@@ -12304,17 +12307,24 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   // become t29/t17/filter input. The write cursor advances on promotion only,
   // which keeps rejected scratch sets disposable (overwritten by the next capture).
   cl->barrier(d->dyncube_charmask, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  if (time_capture) {
+    falcom_world::bvh::EndGpuTimer(cl, &d->dyncube_gpu_capture_timer);
+  }
+  const bool time_box = DynCubeGpuTimingOn(cl, d);
+  if (time_box) {
+    falcom_world::bvh::BeginGpuTimer(dev, cl, &d->dyncube_gpu_box_timer, true);
+  }
   if (!RunDynCubeWorldBox(cl, d, cur)) {
     // Reduction unavailable: fall back to immediate promotion (pre-protection behavior).
     CSLog("dyncube", "worldbox UNAVAILABLE: immediate-promote fallback", true);
     PromoteDynCubeReadSet(d);
   }
+  if (time_box) {
+    falcom_world::bvh::EndGpuTimer(cl, &d->dyncube_gpu_box_timer);
+  }
   cl->barrier(d->dyncube_charmask, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
 
   d->dyncube_solid_written = false; // capture ran (aliases still track the validated readSet)
-  if (time_capture) {
-    falcom_world::bvh::EndGpuTimer(cl, &d->dyncube_gpu_capture_timer);
-  }
   UnbindDynCubeComputeState(cl);
   return true;
 }
