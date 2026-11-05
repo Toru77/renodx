@@ -13768,8 +13768,46 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
   }
   if (fdw_reason == DLL_PROCESS_ATTACH) {
-    falcom_world::AddSvgfRows(&settings, IsAdvancedSettingsMode, IsAdvancedSettingsMode, {.prefix = "Gtvbao", .temporal_section = "GTVBAO Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Runs on Sora 1st, Sora 2nd and Kai only; off while Deferred Dispatch is On. Resets on camera cuts, frame gaps and parameter changes.", .temporal_enabled = &g_gtvbao_temporal_enabled, .history_weight = &g_gtvbao_history_weight, .depth_rejection = &g_gtvbao_depth_rejection, .normal_rejection = &g_gtvbao_normal_rejection, .spatial_section = "GTVBAO Spatial Filter", .spatial_enabled_tooltip = "Denoises the GTVBAO AO with the SVGF a-trous filter (depth, normal and AO edge stops). Off = no filter.", .spatial_enabled = &g_gtvbao_svgf_spatial_enabled, .iterations = &g_gtvbao_svgf_iterations, .luminance_edge_stop = &g_gtvbao_svgf_luminance_edge_stop, .half_res_iterations = &g_gtvbao_svgf_half_res_iterations, .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.010f, .default_normal_rejection = 0.8f, .default_spatial_enabled = 1.f, .default_iterations = 1.f, .default_half_res_iterations = 4.f, .default_luminance_edge_stop = 16.f});
-    falcom_world::AddSvgfRows(&settings, []() { return VbgiRowVisible(); }, IsAdvancedSettingsMode, {.prefix = "Vbgi", .temporal_section = "GTVBGI Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.", .temporal_enabled = &g_vbgi_temporal_enabled, .history_weight = &g_vbgi_history_weight, .depth_rejection = &g_vbgi_depth_rejection, .normal_rejection = &g_vbgi_normal_rejection, .spatial_section = "GTVBGI Spatial Filter", .spatial_enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.", .spatial_enabled = &g_vbgi_spatial_enabled, .iterations = &g_vbgi_svgf_iterations, .luminance_edge_stop = &g_vbgi_svgf_luminance_edge_stop, .default_temporal_enabled = 1.f, .default_history_weight = 0.99f, .default_depth_rejection = 0.05f, .default_normal_rejection = 0.9f, .default_spatial_enabled = 1.f, .default_iterations = 5.f, .default_luminance_edge_stop = 16.f});
+    falcom_world::AddSvgfRows(&settings, IsAdvancedSettingsMode, IsAdvancedSettingsMode, {.prefix = "Gtvbao",
+                                                                                          .temporal_section = "GTVBAO Temporal Accumulation",
+                                                                                          .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Runs on Sora 1st, Sora 2nd and Kai only; off while Deferred Dispatch is On. Resets on camera cuts, frame gaps and parameter changes.",
+                                                                                          .temporal_enabled = &g_gtvbao_temporal_enabled,
+                                                                                          .history_weight = &g_gtvbao_history_weight,
+                                                                                          .depth_rejection = &g_gtvbao_depth_rejection,
+                                                                                          .normal_rejection = &g_gtvbao_normal_rejection,
+                                                                                          .spatial_section = "GTVBAO Spatial Filter",
+                                                                                          .spatial_enabled_tooltip = "Denoises the GTVBAO AO with the SVGF a-trous filter (depth, normal and AO edge stops). Off = no filter.",
+                                                                                          .spatial_enabled = &g_gtvbao_svgf_spatial_enabled,
+                                                                                          .iterations = &g_gtvbao_svgf_iterations,
+                                                                                          .luminance_edge_stop = &g_gtvbao_svgf_luminance_edge_stop,
+                                                                                          .half_res_iterations = &g_gtvbao_svgf_half_res_iterations,
+                                                                                          .default_temporal_enabled = 1.f,
+                                                                                          .default_history_weight = 0.8f,
+                                                                                          .default_depth_rejection = 0.010f,
+                                                                                          .default_normal_rejection = 0.8f,
+                                                                                          .default_spatial_enabled = 1.f,
+                                                                                          .default_iterations = 1.f,
+                                                                                          .default_half_res_iterations = 4.f,
+                                                                                          .default_luminance_edge_stop = 16.f});
+    falcom_world::AddSvgfRows(&settings, []() { return VbgiRowVisible(); }, IsAdvancedSettingsMode, {.prefix = "Vbgi",
+                                                                                                     .temporal_section = "GTVBGI Temporal Accumulation",
+                                                                                                     .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.",
+                                                                                                     .temporal_enabled = &g_vbgi_temporal_enabled,
+                                                                                                     .history_weight = &g_vbgi_history_weight,
+                                                                                                     .depth_rejection = &g_vbgi_depth_rejection,
+                                                                                                     .normal_rejection = &g_vbgi_normal_rejection,
+                                                                                                     .spatial_section = "GTVBGI Spatial Filter",
+                                                                                                     .spatial_enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.",
+                                                                                                     .spatial_enabled = &g_vbgi_spatial_enabled,
+                                                                                                     .iterations = &g_vbgi_svgf_iterations,
+                                                                                                     .luminance_edge_stop = &g_vbgi_svgf_luminance_edge_stop,
+                                                                                                     .default_temporal_enabled = 1.f,
+                                                                                                     .default_history_weight = 0.99f,
+                                                                                                     .default_depth_rejection = 0.05f,
+                                                                                                     .default_normal_rejection = 0.9f,
+                                                                                                     .default_spatial_enabled = 1.f,
+                                                                                                     .default_iterations = 5.f,
+                                                                                                     .default_luminance_edge_stop = 16.f});
     falcom_world::AddSettings(&settings, IsSora2nd(), IsAdvancedSettingsMode);
   }
   falcom_world::Use(fdw_reason, IsSora2nd());

@@ -783,8 +783,12 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .spatial_enabled = &rtao::g_rtao_spatial_enabled,
                                             .iterations = &rtao::g_rtao_svgf_iterations,
                                             .luminance_edge_stop = &rtao::g_rtao_svgf_luminance_edge_stop,
-                                            .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.2f,
-                                            .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f,
+                                            .default_temporal_enabled = 1.f,
+                                            .default_history_weight = 0.8f,
+                                            .default_depth_rejection = 0.2f,
+                                            .default_normal_rejection = 0.f,
+                                            .default_spatial_enabled = 1.f,
+                                            .default_iterations = 5.f,
                                             .default_luminance_edge_stop = 4.f});
   settings->push_back(new Setting{
       .key = "RtaoIsfast",
@@ -1169,8 +1173,12 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .spatial_enabled = &rtgi::g_rtgi_spatial_enabled,
                                             .iterations = &rtgi::g_rtgi_svgf_iterations,
                                             .luminance_edge_stop = &rtgi::g_rtgi_svgf_luminance_edge_stop,
-                                            .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.2f,
-                                            .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f,
+                                            .default_temporal_enabled = 1.f,
+                                            .default_history_weight = 0.8f,
+                                            .default_depth_rejection = 0.2f,
+                                            .default_normal_rejection = 0.f,
+                                            .default_spatial_enabled = 1.f,
+                                            .default_iterations = 5.f,
                                             .default_luminance_edge_stop = 4.f});
   settings->push_back(new Setting{
       .key = "RtgiFadeStartPct",
@@ -1456,8 +1464,12 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .spatial_enabled = &rtls::g_rtls_spatial_enabled,
                                             .iterations = &rtls::g_rtls_svgf_iterations,
                                             .luminance_edge_stop = &rtls::g_rtls_svgf_luminance_edge_stop,
-                                            .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.2f,
-                                            .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f,
+                                            .default_temporal_enabled = 1.f,
+                                            .default_history_weight = 0.8f,
+                                            .default_depth_rejection = 0.2f,
+                                            .default_normal_rejection = 0.f,
+                                            .default_spatial_enabled = 1.f,
+                                            .default_iterations = 5.f,
                                             .default_luminance_edge_stop = 4.f});
   settings->push_back(new Setting{
       .key = "RtlsFadeStartPct",
@@ -1719,8 +1731,12 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .spatial_enabled = &rtsun::g_rtsun_spatial_enabled,
                                             .iterations = &rtsun::g_rtsun_svgf_iterations,
                                             .luminance_edge_stop = &rtsun::g_rtsun_svgf_luminance_edge_stop,
-                                            .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.2f,
-                                            .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f,
+                                            .default_temporal_enabled = 1.f,
+                                            .default_history_weight = 0.8f,
+                                            .default_depth_rejection = 0.2f,
+                                            .default_normal_rejection = 0.f,
+                                            .default_spatial_enabled = 1.f,
+                                            .default_iterations = 5.f,
                                             .default_luminance_edge_stop = 4.f});
 }
 
