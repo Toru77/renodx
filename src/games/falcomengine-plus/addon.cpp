@@ -10454,8 +10454,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           msg += " pollMiss=" + std::to_string(dd->dyncube_valid_poll_misses);
           msg += " timeouts=" + std::to_string(dd->dyncube_valid_timeouts);
           msg += " mapWaitMaxMs=" + std::to_string(dd->dyncube_map_wait_ms_max);
-          if (g_dyncube_gpu_timing > 0.5f) {
-            const bool read_timers = DynCubeGpuTimingOn(cmd_list, dd);
+          const bool read_timers = DynCubeGpuTimingOn(cmd_list, dd);
+          // Timer stats are written on the immediate context only; off it, leave them alone (no gpuMs part).
+          if (g_dyncube_gpu_timing > 0.5f && read_timers) {
             auto timer_text = [&](falcom_world::bvh::GpuTimer* timer) {
               if (read_timers) {
                 falcom_world::bvh::PollGpuTimer(falcom_world::bvh::GpuTimerContext(cmd_list), timer);
