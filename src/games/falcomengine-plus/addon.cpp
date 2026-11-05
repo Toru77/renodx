@@ -43,6 +43,7 @@
 #include "./world/rtao/rtao_svgf.hpp"  // RTAO SVGF glue (inline lighting-hook dispatch)
 #include "./world/rr/rr_state.hpp"
 #include "./world/bvh/deform_probe.hpp"  // native D3D11 event query (DynCube validity readback poll)
+#include "./world/bvh/gpu_timer.hpp"  // GpuTimer (Dynamic Cubemaps GPU Timing Log)
 
 namespace {
 
@@ -632,6 +633,7 @@ static bool MotionBlurActive(bool cutscene) {
 static float g_mb_logging = 1.f;
 static bool MotionBlurLogEnabled() { return g_mb_logging > 0.5f; }
 static float g_capture_perf_log = 0.f;
+static float g_dyncube_gpu_timing = 0.f;  // Dynamic Cubemaps > GPU Timing Log (1/sec): per-step GPU ms in the [DynCube] line
 
 // -- Motion blur quality preset ------------------------------------------------
 // Replaces the raw Max Samples slider. The slider's useful range was narrow, the
@@ -1216,6 +1218,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint64_t dyncube_valid_poll_misses = 0u; // scheduler ticks where the staged copy was not complete yet
   uint64_t dyncube_valid_timeouts = 0u;    // armed copies that hit DYNCUBE_VALIDITY_MAX_WAIT_TICKS (blocking map fallback)
   float dyncube_map_wait_ms_max = 0.f;     // longest validity-staging map wait since the last scheduler log line (CPU ms)
+  // Dynamic Cubemaps > GPU Timing Log: one timer per step, read without waiting.
+  falcom_world::bvh::GpuTimer dyncube_gpu_capture_timer = {};
+  falcom_world::bvh::GpuTimer dyncube_gpu_filter_timer = {};
+  falcom_world::bvh::GpuTimer dyncube_gpu_variant_timer = {};
+  falcom_world::bvh::GpuTimer dyncube_gpu_ssr_timer = {};
   bool dyncube_wasRejected = false;        // edge latch for reject/resume logging
   bool dyncube_rejectedGap = false;        // a capture was rejected since the last dispatched capture (one-shot: first accepted capture hard-replaces history)
   bool dyncube_loadingWipeDone = false;   // loading wipe already applied for the current stale episode (edge latch)
@@ -1586,6 +1593,11 @@ static bool RunDynCubeInference(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool ggxOn);
 static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d);
+// GPU Timing Log: time a step only on the immediate context. The timer reads its
+// queries there, and GetData is not valid on a deferred context (photo mode).
+static bool DynCubeGpuTimingOn(reshade::api::command_list* cl, const DeviceData* d) {
+  return g_dyncube_gpu_timing > 0.5f && cl != nullptr && cl == d->immediate_cmd_list;
+}
 
 // VBGI gather: see RunVBGI
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
@@ -4872,6 +4884,15 @@ renodx::utils::settings::Settings settings = {
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Debug Logging (1/sec)", .section = "Dynamic Cubemaps",
       .tooltip = "Emits one log per second to help diagnose which part is broken: resource creation, capture inputs (depth/color/cbv), dispatch success, t17 override, and debug mode.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeGpuTimingLog", .binding = &g_dyncube_gpu_timing,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "GPU Timing Log (1/sec)", .section = "Dynamic Cubemaps",
+      .tooltip = "Adds the GPU time of each cubemap step (capture, filter, variant, SSR) to the once-per-second [DynCube] log line: max and average in ms over the last second, with sample and skipped counts. Results are read without waiting for the GPU. Works without Debug Logging and without Gather performance metrics. Off = nothing is timed.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -10357,7 +10378,15 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
             // flow otherwise untouched.
             if (dd->dyncube_captureDirty && dd->dyncube_readSet == dd->dyncube_filteredReadSet)
               PromoteDynCubeReadSet(dd);
-            if (RunDynCubeFilter(cmd_list, dd, (shader_injection.dynCube_ggx > 0.5f))) {
+            const bool time_filter = DynCubeGpuTimingOn(cmd_list, dd);
+            if (time_filter) {
+              falcom_world::bvh::BeginGpuTimer(dev, cmd_list, &dd->dyncube_gpu_filter_timer, true);
+            }
+            const bool filtered = RunDynCubeFilter(cmd_list, dd, (shader_injection.dynCube_ggx > 0.5f));
+            if (time_filter) {
+              falcom_world::bvh::EndGpuTimer(cmd_list, &dd->dyncube_gpu_filter_timer);
+            }
+            if (filtered) {
               dd->dyncube_ggx_active = 1u - dd->dyncube_ggx_active;
               dd->dyncube_ggx_valid = true;
               dd->dyncube_filteredReadSet = dd->dyncube_readSet;
@@ -10400,7 +10429,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       }
 
       // -- Throttled scheduler log (1/sec) � verify the state machine behavior --
-      if (shader_injection.dynCube_debug_logging > 0.5f) {
+      if (shader_injection.dynCube_debug_logging > 0.5f || g_dyncube_gpu_timing > 0.5f) {
         static auto last_log = std::chrono::steady_clock::now() - std::chrono::seconds(2);
         auto now = std::chrono::steady_clock::now();
         if (now - last_log >= std::chrono::seconds(1)) {
@@ -10425,6 +10454,27 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           msg += " pollMiss=" + std::to_string(dd->dyncube_valid_poll_misses);
           msg += " timeouts=" + std::to_string(dd->dyncube_valid_timeouts);
           msg += " mapWaitMaxMs=" + std::to_string(dd->dyncube_map_wait_ms_max);
+          if (g_dyncube_gpu_timing > 0.5f) {
+            const bool read_timers = DynCubeGpuTimingOn(cmd_list, dd);
+            auto timer_text = [&](falcom_world::bvh::GpuTimer* timer) {
+              if (read_timers) {
+                falcom_world::bvh::PollGpuTimer(falcom_world::bvh::GpuTimerContext(cmd_list), timer);
+              }
+              std::ostringstream text;
+              if (timer->samples == 0u) {
+                text << "-";
+              } else {
+                text << std::fixed << std::setprecision(2) << timer->ms_max << "/" << (timer->ms_sum / timer->samples);
+              }
+              text << " (n=" << timer->samples << " skip=" << timer->skipped << ")";
+              falcom_world::bvh::ClearGpuTimerStats(timer);
+              return text.str();
+            };
+            msg += " gpuMs cap=" + timer_text(&dd->dyncube_gpu_capture_timer);
+            msg += " flt=" + timer_text(&dd->dyncube_gpu_filter_timer);
+            msg += " var=" + timer_text(&dd->dyncube_gpu_variant_timer);
+            msg += " ssr=" + timer_text(&dd->dyncube_gpu_ssr_timer);
+          }
           reshade::log::message(reshade::log::level::info, msg.c_str());
           dd->dyncube_map_wait_ms_max = 0.f;
         }
@@ -11133,6 +11183,10 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   d->dyncube_valid_event = 0u;
   d->dyncube_valid_event_armed = false;
   d->dyncube_valid_wait_ticks = 0u;
+  falcom_world::bvh::DestroyGpuTimer(&d->dyncube_gpu_capture_timer);
+  falcom_world::bvh::DestroyGpuTimer(&d->dyncube_gpu_filter_timer);
+  falcom_world::bvh::DestroyGpuTimer(&d->dyncube_gpu_variant_timer);
+  falcom_world::bvh::DestroyGpuTimer(&d->dyncube_gpu_ssr_timer);
   dr(d->dyncube_faceExtStaging);
   d->dyncube_readSet = 0;
   d->dyncube_filteredReadSet = 99u;
@@ -12090,6 +12144,10 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   auto* dev = cl->get_device();
   if (!CreateDynCubePipelinesIfNeeded(dev, d)) return false;
   if (!d->dyncube_capture_pipeline.handle) return false;
+  const bool time_capture = DynCubeGpuTimingOn(cl, d);
+  if (time_capture) {
+    falcom_world::bvh::BeginGpuTimer(dev, cl, &d->dyncube_gpu_capture_timer, true);
+  }
 
   const uint32_t cur = d->dyncube_hist_cur;
   const uint32_t prev = 1u - cur;
@@ -12200,6 +12258,9 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   cl->barrier(d->dyncube_charmask, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
 
   d->dyncube_solid_written = false; // capture ran (aliases still track the validated readSet)
+  if (time_capture) {
+    falcom_world::bvh::EndGpuTimer(cl, &d->dyncube_gpu_capture_timer);
+  }
   UnbindDynCubeComputeState(cl);
   return true;
 }
@@ -12385,6 +12446,10 @@ static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d) {
   if (!CreateDynCubePipelinesIfNeeded(cl->get_device(), d)) return false;
   if (!d->dyncube_variant_pipeline.handle) return false;
   auto* dev = cl->get_device();
+  const bool time_variant = DynCubeGpuTimingOn(cl, d);
+  if (time_variant) {
+    falcom_world::bvh::BeginGpuTimer(dev, cl, &d->dyncube_gpu_variant_timer, true);
+  }
   const uint32_t mips = d->dyncube_mip_count;
   const uint32_t sz = d->dyncube_size;
   const float soften = std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f);
@@ -12406,6 +12471,9 @@ static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d) {
   cl->dispatch((sz + 7u) / 8u, (sz + 7u) / 8u, 6);
   cl->barrier(d->dyncube_variant, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   cl->generate_mipmaps(d->dyncube_variant_cube_srv);
+  if (time_variant) {
+    falcom_world::bvh::EndGpuTimer(cl, &d->dyncube_gpu_variant_timer);
+  }
   UnbindDynCubeComputeState(cl);
   d->dyncube_variant_valid = true;
   d->dyncube_lastVariantSoften = soften;
@@ -12498,6 +12566,10 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
         " raw=" + std::to_string(rawDesc.texture.width) + "x" + std::to_string(rawDesc.texture.height), true);
   }
 
+  const bool time_ssr = DynCubeGpuTimingOn(cl, d);
+  if (time_ssr) {
+    falcom_world::bvh::BeginGpuTimer(dev, cl, &d->dyncube_gpu_ssr_timer, true);
+  }
   // -- March pass ? ssr_raw --
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_ssr_pipeline);
   auto* st = &d->dyncube_ssr_tables;
@@ -12553,7 +12625,12 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
 
   // -- Separable bilateral blur: H (raw ? blur_h), V (blur_h ? blur) --
   // Both passes reference ORIGINAL captured scene depth (not blurred intermediates).
-  if (!d->dyncube_ssr_blur_pipeline.handle) return false;
+  if (!d->dyncube_ssr_blur_pipeline.handle) {
+    if (time_ssr) {
+      falcom_world::bvh::EndGpuTimer(cl, &d->dyncube_gpu_ssr_timer);
+    }
+    return false;
+  }
   const float sigma = std::clamp(shader_injection.dynCube_ssr_blur, 0.f, 8.f);
   auto* bt = &d->dyncube_ssr_blur_tables;
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_ssr_blur_pipeline);
@@ -12586,6 +12663,9 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 4, 0, 3, pcV);
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
   cl->barrier(d->dyncube_ssr_blur, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  if (time_ssr) {
+    falcom_world::bvh::EndGpuTimer(cl, &d->dyncube_gpu_ssr_timer);
+  }
   UnbindDynCubeComputeState(cl);
   return true;
 }

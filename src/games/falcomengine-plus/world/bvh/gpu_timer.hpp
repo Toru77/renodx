@@ -127,8 +127,9 @@ inline void PollGpuTimer(ID3D11DeviceContext* context, GpuTimer* timer) {
   }
 }
 
-inline void BeginGpuTimer(reshade::api::device* device, reshade::api::command_list* cmd_list, GpuTimer* timer) {
-  if (!g_perf_gate.gather.load(std::memory_order_relaxed)) return;
+// ignore_perf_gate: for a caller with its own switch (Dynamic Cubemaps > GPU Timing Log), timing without the Performance gather.
+inline void BeginGpuTimer(reshade::api::device* device, reshade::api::command_list* cmd_list, GpuTimer* timer, bool ignore_perf_gate = false) {
+  if (!ignore_perf_gate && !g_perf_gate.gather.load(std::memory_order_relaxed)) return;
   if (timer == nullptr || timer->open >= 0 || !CreateGpuTimer(device, timer)) return;
   ID3D11DeviceContext* context = GpuTimerContext(cmd_list);
   if (context == nullptr) return;
@@ -161,7 +162,7 @@ inline void EndGpuTimer(reshade::api::command_list* cmd_list, GpuTimer* timer) {
 inline void DestroyGpuTimer(GpuTimer* timer) {
   if (timer != nullptr) timer->last_ms = -1.f;
 }
-inline void BeginGpuTimer(reshade::api::device*, reshade::api::command_list*, GpuTimer*) {}
+inline void BeginGpuTimer(reshade::api::device*, reshade::api::command_list*, GpuTimer*, bool = false) {}
 inline void EndGpuTimer(reshade::api::command_list*, GpuTimer*) {}
 
 #endif
