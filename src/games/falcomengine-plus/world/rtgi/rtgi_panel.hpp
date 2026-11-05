@@ -69,10 +69,15 @@ inline void DrawRtgiPanel() {
               g_rtgi_extra_bounces > 0.5f ? "on" : "off", RtgiExtraBounceRaysEffective(),
               g_rtgi_feedback_strength, RtgiFeedbackStrengthEffective());
   if (frame.restir_temporal) {
-    ImGui::Text("ReSTIR GI: on (initial sample: RIS over %.0f candidates; temporal reuse ran, M cap %.0f, %.3f ms; spatial reuse not implemented)",
-                frame.samples, kRestirTemporalMCap, frame.restir_gpu_ms);
+    ImGui::Text("ReSTIR GI: on (initial sample: RIS over %.0f candidates; temporal reuse ran, M cap %.0f, %.3f ms; spatial reuse %s)",
+                frame.samples, kRestirTemporalMCap, frame.restir_gpu_ms, frame.restir_spatial ? "ran" : "off");
+    if (frame.restir_spatial) {
+      ImGui::Text("ReSTIR spatial: 3 neighbours, 9 below temporal M %.0f; radius %.0f%% of the trace width down to %.0f px; normal 25 deg, depth 5%%; spatial-from-spatial below M %.0f; M cap %.0f; %.3f ms",
+                  kRestirSpatialLowM, kRestirSpatialRadiusFraction * 100.f, kRestirSpatialRadiusMin, kRestirSpatialLowM,
+                  kRestirSpatialMCap, frame.restir_spatial_gpu_ms);
+    }
   } else {
-    ImGui::Text("ReSTIR GI: %s (initial sample: RIS over %.0f candidates; temporal reuse %s; spatial reuse not implemented)",
+    ImGui::Text("ReSTIR GI: %s (initial sample: RIS over %.0f candidates; temporal reuse %s; spatial reuse off)",
                 frame.restir ? "on" : "off", frame.samples,
                 frame.restir ? "off (needs RTGI Temporal and motion vectors)" : "off");
   }

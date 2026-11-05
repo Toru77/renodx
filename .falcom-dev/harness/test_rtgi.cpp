@@ -57,6 +57,9 @@ inline constexpr std::span<const std::uint8_t> __world_rtgi_upsample{__world_rtg
 #define __world_restir_temporal_EMBED_FILE
 inline constexpr std::uint8_t __world_restir_temporal_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_restir_temporal{__world_restir_temporal_base};
+#define __world_restir_spatial_EMBED_FILE
+inline constexpr std::uint8_t __world_restir_spatial_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_restir_spatial{__world_restir_spatial_base};
 
 #include "gen/mock_base.hpp"
 #include "harness_timer.hpp"
@@ -115,6 +118,7 @@ static void TestPushLayout() {
   CHECK(offsetof(rtgi::SvgfPushConstants, temporal) == 8u * sizeof(float), "svgf b12 c2 offset");
   CHECK(sizeof(rtgi::RtgiUpsamplePushConstants) == 12u * sizeof(float), "upsample b12 is 12 floats");
   CHECK(sizeof(rtgi::RestirTemporalPushConstants) == 16u * sizeof(float), "restir temporal b12 is 16 floats");
+  CHECK(sizeof(rtgi::RestirSpatialPushConstants) == 16u * sizeof(float), "restir spatial b12 is 16 floats");
 }
 
 static void TestParameterSnapshot() {
@@ -126,6 +130,9 @@ static void TestParameterSnapshot() {
   b = a;
   b.restir = 1.f;
   CHECK(!(a == b), "a ReSTIR toggle change is a parameter change");
+  b = a;
+  b.restir_spatial = 1.f;
+  CHECK(!(a == b), "a ReSTIR spatial toggle change is a parameter change");
 }
 
 static void TestShaderDefines() {
@@ -194,6 +201,13 @@ static void TestShaderDefines() {
   CHECK(restir.find("#define RTGI_RESTIR_VALID 1u") != std::string::npos && restir.find("#define RTGI_RESTIR_SURFACE 2u") != std::string::npos
             && text.find("#define RTGI_RESTIR_VALID 1u") != std::string::npos && text.find("#define RTGI_RESTIR_SURFACE 2u") != std::string::npos,
         "sample flag defines match between the trace and the temporal pass");
+  const std::string spatial = ReadText("src/games/falcomengine-plus/world/shaders/world_restir_spatial.cs_5_0.hlsl");
+  CHECK(!spatial.empty(), "restir spatial shader copy readable");
+  CHECK(spatial.find("#define RTGI_STAT_RESTIR_SPATIAL_PIXELS " + std::to_string(rtgi::kRtgiStatRestirSpatialPixels) + "u") != std::string::npos
+            && spatial.find("#define RTGI_STAT_RESTIR_SPATIAL_TRIED " + std::to_string(rtgi::kRtgiStatRestirSpatialTried) + "u") != std::string::npos
+            && spatial.find("#define RTGI_STAT_RESTIR_SPATIAL_ACCEPTED " + std::to_string(rtgi::kRtgiStatRestirSpatialAccepted) + "u") != std::string::npos
+            && spatial.find("#define RTGI_STAT_RESTIR_SPATIAL_LOW_M " + std::to_string(rtgi::kRtgiStatRestirSpatialLowM) + "u") != std::string::npos,
+        "restir spatial stat defines match kRtgiStatRestirSpatial*");
   CHECK(text.find("RTGI_SUN_RAY_MAX") == std::string::npos, "the fixed sun ray length is gone");
   const std::string temporal = ReadText("src/games/falcomengine-plus/world/shaders/world_svgf_reproject.cs_5_0.hlsl");
   CHECK(!temporal.empty(), "reproject shader copy readable");
@@ -528,12 +542,13 @@ struct GoldenCmdList : mock::CommandListBase {
   }
 };
 
-// The command log and dispatch count of seven fixed rtgi::Dispatch calls (trace and upsample; plus the SVGF chain with
+// The command log and dispatch count of eight fixed rtgi::Dispatch calls (trace and upsample; plus the SVGF chain with
 // spatial; plus temporal; lamps with debug 4 and no spatial; trace debug 9; ReSTIR GI on with debug 12) on the recording
 // mock. SVGF M1 counts: 2 + 8 + 8 + 4 + 2 = 24 (trace, reproject, variance, 4 a-trous, upsample at Iterations 5 and
-// divisor 2); the ReSTIR call adds 2 (trace and upsample): 26; the ReSTIR temporal call (case 7) adds 4: 30.
-static constexpr uint64_t kDispatchGoldenHash = 0xa3b7de2ee25fc60full;
-static constexpr int kDispatchGoldenCount = 30;
+// divisor 2); the ReSTIR call adds 2 (trace and upsample): 26; the ReSTIR temporal call (case 7) adds 4: 30;
+// the ReSTIR spatial call (case 8, two spatial dispatches plus the chain) adds 6: 36.
+static constexpr uint64_t kDispatchGoldenHash = 0xa350fbf2d7784372ull;
+static constexpr int kDispatchGoldenCount = 36;
 
 static void TestDispatchGolden() {
   GoldenDevice dev;
@@ -596,6 +611,10 @@ static void TestDispatchGolden() {
   in.motion_view = {0x9700u};
   in.svgf.history_valid = true;
   CHECK(rtgi::Dispatch(&dev, &cl, in).ok, "case 7: ReSTIR temporal reuse");
+  // 8. ReSTIR GI spatial reuse (two spatial dispatches after the temporal pass), debug 14.
+  in.restir_spatial = true;
+  in.debug_mode = 14;
+  CHECK(rtgi::Dispatch(&dev, &cl, in).ok, "case 8: ReSTIR spatial reuse");
   const uint64_t hash = Fnv1a64(g_golden_log);
   CHECK(cl.dispatches == kDispatchGoldenCount, "dispatch count %d (golden %d)", cl.dispatches, kDispatchGoldenCount);
   CHECK(hash == kDispatchGoldenHash, "command log hash %016llx over %zu words (golden %016llx)",

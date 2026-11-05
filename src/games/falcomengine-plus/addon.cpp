@@ -9741,7 +9741,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       rtgi::g_rtgi_sun_casters_only, rtgi::g_rtgi_sun_contribution, rtgi::g_rtgi_fallback_no_albedo,
       rtgi::g_rtgi_dynamic_lights, rtgi::g_rtgi_dynamic_light_contribution, rtgi::g_rtgi_game_sun, rtgi::g_rtgi_lamp_shadows,
       rtgi::g_rtgi_extra_bounces, rtgi::g_rtgi_feedback_strength,
-      rtgi::g_rtgi_extra_bounce_rays, rtgi::g_rtgi_bounce_saturation, rtgi::g_rtgi_restir};
+      rtgi::g_rtgi_extra_bounce_rays, rtgi::g_rtgi_bounce_saturation, rtgi::g_rtgi_restir, rtgi::g_rtgi_restir_spatial};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;
@@ -9829,6 +9829,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       .svgf = {rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
                reset == rtao::ResetReason::None, rtgi::g_rtgi_svgf_iterations, rtgi::g_rtgi_svgf_luminance_edge_stop},
       .spatial = rtgi::g_rtgi_spatial_enabled > 0.5f,
+      .restir_spatial = restir_on && rtgi::g_rtgi_restir_spatial > 0.5f,
       .lights = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightsRegister] : reshade::api::resource{0u},
       .light_indices = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightIndicesRegister] : reshade::api::resource{0u},
       .lights_view = dynamic_lights ? world_cl->ps_srv_view[rtgi::kLightingLightsRegister]
@@ -9878,6 +9879,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.restir = restir_on;
   frame.restir_temporal = result.restir_temporal_ran;
   frame.restir_gpu_ms = result.restir_temporal_ran ? rd.restir_timer.last_ms : -1.f;
+  frame.restir_spatial = result.restir_spatial_ran;
+  frame.restir_spatial_gpu_ms = result.restir_spatial_ran ? rd.restir_spatial_timer.last_ms : -1.f;
   frame.radiance_width = rd.radiance_width;
   frame.radiance_height = rd.radiance_height;
   frame.radiance_format = static_cast<uint32_t>(rd.radiance_format);
@@ -9890,6 +9893,10 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       + static_cast<uint64_t>(rd.restir_res_sample.width) * rd.restir_res_sample.height * 16u * 2u
       + static_cast<uint64_t>(rd.restir_res_visible.width) * rd.restir_res_visible.height * 16u * 2u
       + static_cast<uint64_t>(rd.restir_res_data.width) * rd.restir_res_data.height * 16u * 2u
+      + static_cast<uint64_t>(rd.restir_sp_raw.width) * rd.restir_sp_raw.height * 8u
+      + static_cast<uint64_t>(rd.restir_sp_sample.width) * rd.restir_sp_sample.height * 16u
+      + static_cast<uint64_t>(rd.restir_sp_visible.width) * rd.restir_sp_visible.height * 16u
+      + static_cast<uint64_t>(rd.restir_sp_data.width) * rd.restir_sp_data.height * 16u
       + rtgi::RtgiDenoiseTextureBytes(rd.denoise)
       + (rd.radiance_texture.handle != 0u
              ? static_cast<uint64_t>(reshade::api::format_row_pitch(rd.radiance_format, rd.radiance_width)) * rd.radiance_height

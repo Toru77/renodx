@@ -44,6 +44,7 @@ inline float g_rtgi_extra_bounce_rays = 1.f;      // Extra Bounce Rays: extra ra
 inline float g_rtgi_bounce_saturation = 1.f;      // Bounce Saturation: saturation of the extra bounce light only (Feedback add-back, Real Extra Rays)
 inline float g_rtgi_trace_characters = 0.f;  // Trace characters: RTGI rays hit this frame's skinned characters
 inline float g_rtgi_restir = 0.f;  // ReSTIR GI: RIS initial sample per trace pixel (M1; reuse comes later)
+inline float g_rtgi_restir_spatial = 1.f;  // ReSTIR Spatial Reuse (M3): spatial reuse after the temporal pass, with ReSTIR GI on
 inline float g_rtgi_rtao_restore = 0.f;           // RTAO value to put back when RTGI is turned off (hidden row RtgiRtaoRestore)
 
 enum class Reason : uint8_t {
@@ -122,7 +123,7 @@ struct ParameterSnapshot {
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, debug, sun_distance;
   float trace_characters;
   float sun_casters_only, sun_contribution, fallback_no_albedo, dynamic_lights, dynamic_light_contribution, game_sun, lamp_shadows;
-  float extra_bounces, feedback_strength, extra_bounce_rays, bounce_saturation, restir;
+  float extra_bounces, feedback_strength, extra_bounce_rays, bounce_saturation, restir, restir_spatial;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 

@@ -65,6 +65,8 @@ struct RtgiFrameState {
   bool restir = false;  // the newest trace wrote the ReSTIR GI initial samples (kRtgiFlagRestir)
   bool restir_temporal = false;   // the newest dispatch ran the ReSTIR GI temporal pass
   float restir_gpu_ms = -1.f;     // ReSTIR temporal pass GPU time (negative: none yet)
+  bool restir_spatial = false;          // the newest dispatch ran the ReSTIR GI spatial passes
+  float restir_spatial_gpu_ms = -1.f;   // spatial passes GPU time (negative: not run)
 };
 
 inline RtgiFrameState g_rtgi_frame;
@@ -98,6 +100,7 @@ struct RtgiDispatchInputs {
   bool temporal = false;
   SvgfSettings svgf = {};  // SVGF settings (history valid set by the owner)
   bool spatial = false;
+  bool restir_spatial = false;  // ReSTIR Spatial Reuse (runs only with the ReSTIR flag and this dispatch's temporal pass)
   reshade::api::resource lights = {0u};         // Sora 2nd dynamicLights_g (t11); copied for the stats request, null otherwise
   reshade::api::resource light_indices = {0u};  // Sora 2nd lightIndices_g (t12); copied for the stats request, null otherwise
   reshade::api::resource_view lights_view = {0u};         // t23 lamps (Sora 2nd dynamicLights_g); null: no lamps
@@ -118,6 +121,7 @@ struct RtgiDispatchResult {
   bool filter_ran = false;
   bool dxr_unavailable = false;
   bool restir_temporal_ran = false;
+  bool restir_spatial_ran = false;
 };
 
 // What a trace owner asks the denoise chain to prepare for this frame.
@@ -466,7 +470,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     }
   }
   bool debug_ready = false;
-  if (in.debug_mode >= 1 && in.debug_mode <= 13) {
+  if (in.debug_mode >= 1 && in.debug_mode <= 14) {
     debug_ready = EnsureRtgiTextureSet(device, &data.debug, reshade::api::format::r8g8b8a8_unorm, 4u, in.full_width, in.full_height);
     if (!debug_ready) {
       renodx::utils::log::w("[world-rtgi] debug texture creation failed");
@@ -532,6 +536,26 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
       DestroyRtgiTextureSet(device, &data.restir_res_data);
       data.restir_res_index = 0u;
     }
+  }
+  // ReSTIR GI spatial reuse (M3): needs this dispatch's temporal reservoirs. Its reservoirs live for this dispatch only
+  // (no cross-frame state, so nothing is latched); its textures exist only while it runs.
+  const bool restir_spatial = restir_temporal && in.restir_spatial;
+  if (restir_spatial) {
+    if (!EnsureRtgiPipeline(device, &data.restir_spatial_pipeline,
+                            {.srv_count = kRestirSpatialSrvCount, .uav_count = kRestirSpatialUavCount, .sampler_count = 0u,
+                             .push_count = kRestirSpatialPushCount, .code = kRestirSpatialShader, .name = "restir spatial"})
+        || !EnsureRtgiTextureSet(device, &data.restir_sp_raw, reshade::api::format::r16g16b16a16_float, 8u, in.trace_width, in.trace_height)
+        || !EnsureRtgiTextureSet(device, &data.restir_sp_sample, reshade::api::format::r32g32b32a32_float, 16u, in.trace_width, in.trace_height)
+        || !EnsureRtgiTextureSet(device, &data.restir_sp_visible, reshade::api::format::r32g32b32a32_float, 16u, in.trace_width, in.trace_height)
+        || !EnsureRtgiTextureSet(device, &data.restir_sp_data, reshade::api::format::r32g32b32a32_uint, 16u, in.trace_width, in.trace_height)) {
+      renodx::utils::log::w("[world-rtgi] ReSTIR spatial resources failed (", in.trace_width, "x", in.trace_height, ")");
+      return {};
+    }
+  } else {
+    DestroyRtgiTextureSet(device, &data.restir_sp_raw);
+    DestroyRtgiTextureSet(device, &data.restir_sp_sample);
+    DestroyRtgiTextureSet(device, &data.restir_sp_visible);
+    DestroyRtgiTextureSet(device, &data.restir_sp_data);
   }
 
   RtgiPushConstants push = in.push;
@@ -724,6 +748,64 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     data.restir_res_valid = true;
     chain_raw = data.restir_raw.srv[0];
   }
+  // ReSTIR GI spatial passes (M3): mode 0 temporal reservoirs -> spatial reservoirs and restir_sp_raw; mode 1 (low temporal
+  // M only, others copied) spatial -> restir_raw, which stays the chain's input (chain_raw).
+  if (restir_spatial) {
+    bvh::BeginGpuTimer(device, cmd_list, &data.restir_spatial_timer);
+    const bool spatial_debug = debug_ready && in.debug_mode == 14;
+    const RtgiPipeline& sp = data.restir_spatial_pipeline;
+    const reshade::api::buffer_range sscene = rtao::SceneCbvRange(in.scene_cbv_view);
+    const uint32_t tnew = data.restir_res_index;  // the temporal pass's output of this dispatch
+    RestirSpatialPushConstants spush = {
+        .size = {static_cast<float>(in.trace_width), static_cast<float>(in.trace_height), static_cast<float>(in.full_width),
+                 static_cast<float>(in.full_height)},
+        .params = {in.push.params[3], static_cast<float>(in.debug_mode), 0.f, kRestirSpatialLowM},
+        .spatial = {kRestirSpatialRadiusFraction * static_cast<float>(in.trace_width), kRestirSpatialRadiusMin,
+                    kRestirSpatialNormalCos, kRestirSpatialDepth},
+        .extra = {in.push.sampling[2], kRestirSpatialMCap, in.push.fade[0], in.push.fade[1]}};
+    const auto run_spatial = [&](float mode, const reshade::api::resource_view* srvs, const reshade::api::resource_view* uavs) {
+      reshade::api::descriptor_table_update supdates[3] = {
+          {sp.cbv_table, 0, 0, 1, kCbv, &sscene},
+          {sp.srv_table, 0, 0, kRestirSpatialSrvCount, kSrv, srvs},
+          {sp.uav_table, 0, 0, kRestirSpatialUavCount, kUav, uavs},
+      };
+      device->update_descriptor_tables(3, supdates);
+      spush.params[2] = mode;
+      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, sp.pipeline);
+      const reshade::api::descriptor_table stables[3] = {sp.cbv_table, sp.srv_table, sp.uav_table};
+      cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, sp.layout, 0, 3, stables);
+      cmd_list->push_constants(reshade::api::shader_stage::all_compute, sp.layout, 3, 0, kRestirSpatialPushCount, &spush);
+      cmd_list->dispatch(trace_groups_x, trace_groups_y, 1u);
+      rtao::NullComputeSlots(cmd_list, kRestirSpatialSrvCount, kRestirSpatialUavCount, 0u);
+    };
+    const reshade::api::resource_view sdebug = spatial_debug ? data.debug.uav[0] : reshade::api::resource_view{0u};
+    const reshade::api::resource_view s0_srvs[kRestirSpatialSrvCount] = {
+        data.restir_raw.srv[0], in.depth_view, in.mrt_normal_view, data.restir_res_sample.srv[tnew],
+        data.restir_res_visible.srv[tnew], data.restir_res_data.srv[tnew], data.restir_res_data.srv[tnew]};
+    const reshade::api::resource_view s0_uavs[kRestirSpatialUavCount] = {
+        data.restir_sp_raw.uav[0], data.stats_uav, data.restir_sp_sample.uav[0], data.restir_sp_visible.uav[0],
+        data.restir_sp_data.uav[0], sdebug};
+    run_spatial(0.f, s0_srvs, s0_uavs);
+    cmd_list->barrier(data.restir_sp_raw.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    cmd_list->barrier(data.restir_sp_sample.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    cmd_list->barrier(data.restir_sp_visible.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    cmd_list->barrier(data.restir_sp_data.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    cmd_list->barrier(data.restir_raw.texture[0], reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+    const reshade::api::resource_view s1_srvs[kRestirSpatialSrvCount] = {
+        data.restir_sp_raw.srv[0], in.depth_view, in.mrt_normal_view, data.restir_sp_sample.srv[0],
+        data.restir_sp_visible.srv[0], data.restir_sp_data.srv[0], data.restir_res_data.srv[tnew]};
+    const reshade::api::resource_view s1_uavs[kRestirSpatialUavCount] = {
+        data.restir_raw.uav[0], data.stats_uav, reshade::api::resource_view{0u}, reshade::api::resource_view{0u},
+        reshade::api::resource_view{0u}, sdebug};
+    run_spatial(1.f, s1_srvs, s1_uavs);
+    cmd_list->barrier(data.restir_raw.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    if (spatial_debug) {
+      cmd_list->barrier(data.debug.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    }
+    bvh::EndGpuTimer(cmd_list, &data.restir_spatial_timer);
+    table_nulls.push_back({sp.srv_table, 0, 0, kRestirSpatialSrvCount, kSrv, table_null_views});
+    table_nulls.push_back({sp.uav_table, 0, 0, kRestirSpatialUavCount, kUav, table_null_views});
+  }
   const RtgiDenoiseResult denoised = DispatchRtgiDenoise(
       device, cmd_list, &data.denoise,
       {.raw_view = chain_raw,
@@ -783,10 +865,12 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   device->update_descriptor_tables(static_cast<uint32_t>(table_nulls.size()), table_nulls.data());
   return {.ok = true,
           .debug_written = trace_debug || denoised.temporal_debug || denoised.variance_debug || denoised.upsample_debug
-              || (restir_temporal && debug_ready && in.debug_mode == 13),
+              || (restir_temporal && debug_ready && in.debug_mode == 13)
+              || (restir_spatial && debug_ready && in.debug_mode == 14),
           .temporal_ran = denoise.temporal,
           .filter_ran = denoise.spatial,
-          .restir_temporal_ran = restir_temporal};
+          .restir_temporal_ran = restir_temporal,
+          .restir_spatial_ran = restir_spatial};
 }
 
 // Copies the lighting output (render target 0 of the lighting draw) for the next frame's RTGI trace: the radiance of
@@ -907,7 +991,7 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   } else {
     out << "  \"game_sun\": {\"captured\": false},\n";
   }
-  out << "  \"restir\": {\"on\": " << (f.restir ? "true" : "false") << ", \"candidates\": " << f.samples << ", \"sample_texels\": " << (f.restir ? static_cast<uint64_t>(f.trace_width) * f.trace_height : 0u) << ", \"temporal_ran\": " << (f.restir_temporal ? "true" : "false") << ", \"m_cap\": " << kRestirTemporalMCap << ", \"temporal_gpu_ms\": " << f.restir_gpu_ms << "},\n";
+  out << "  \"restir\": {\"on\": " << (f.restir ? "true" : "false") << ", \"candidates\": " << f.samples << ", \"sample_texels\": " << (f.restir ? static_cast<uint64_t>(f.trace_width) * f.trace_height : 0u) << ", \"temporal_ran\": " << (f.restir_temporal ? "true" : "false") << ", \"m_cap\": " << kRestirTemporalMCap << ", \"temporal_gpu_ms\": " << f.restir_gpu_ms << ", \"spatial_ran\": " << (f.restir_spatial ? "true" : "false") << ", \"spatial_gpu_ms\": " << f.restir_spatial_gpu_ms << "},\n";
   out << "  \"composite\": {\"intensity\": " << g_rtgi_intensity << ", \"character_intensity\": " << g_rtgi_char_intensity
       << ", \"saturation\": " << g_rtgi_saturation
       << ", \"dispatched_frame\": " << f.dispatched_frame << ", \"applied_frame\": " << f.applied_frame
@@ -964,7 +1048,11 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "    \"restir_pixels\": " << v[kRtgiStatRestirPixels] << ",\n";
   out << "    \"restir_accepted\": " << v[kRtgiStatRestirAccepted] << ",\n";
   out << "    \"restir_from_history\": " << v[kRtgiStatRestirFromHistory] << ",\n";
-  out << "    \"restir_jacobian_rejected\": " << v[kRtgiStatRestirJacobianRejected] << "\n";
+  out << "    \"restir_jacobian_rejected\": " << v[kRtgiStatRestirJacobianRejected] << ",\n";
+  out << "    \"restir_spatial_pixels\": " << v[kRtgiStatRestirSpatialPixels] << ",\n";
+  out << "    \"restir_spatial_tried\": " << v[kRtgiStatRestirSpatialTried] << ",\n";
+  out << "    \"restir_spatial_accepted\": " << v[kRtgiStatRestirSpatialAccepted] << ",\n";
+  out << "    \"restir_spatial_low_m\": " << v[kRtgiStatRestirSpatialLowM] << "\n";
   out << "  },\n";
   out << "  \"note\": \"M4: the final GI is added to the image (Sora 2nd lighting shader) while GI Intensity > 0\"\n";
   out << "}\n";

@@ -32,7 +32,7 @@ inline constexpr uint32_t kRtgiSrvCount = 29u;
 // u4 ReSTIR sample data (null unless kRtgiFlagRestir)
 inline constexpr uint32_t kRtgiUavCount = 5u;
 inline constexpr uint32_t kRtgiPushConstantCount = 32u;
-inline constexpr uint32_t kRtgiStatsCount = 28u;
+inline constexpr uint32_t kRtgiStatsCount = 32u;
 
 // Matching RTGI_STAT_* in world_rtgi.cs_5_0.hlsl.
 inline constexpr uint32_t kRtgiStatRays = 0u;
@@ -76,6 +76,11 @@ inline constexpr uint32_t kRtgiStatRestirPixels = 24u;       // pixels with an i
 inline constexpr uint32_t kRtgiStatRestirAccepted = 25u;     // of those, last frame's reservoir merged
 inline constexpr uint32_t kRtgiStatRestirFromHistory = 26u;  // of those, the history sample was selected
 inline constexpr uint32_t kRtgiStatRestirJacobianRejected = 27u;  // reprojection passed, dropped by the Jacobian or cosine guard
+// ReSTIR GI spatial pass counters, matching RTGI_STAT_RESTIR_SPATIAL_* in world_restir_spatial.cs_5_0.hlsl.
+inline constexpr uint32_t kRtgiStatRestirSpatialPixels = 28u;    // mode 0: pixels with a temporal reservoir
+inline constexpr uint32_t kRtgiStatRestirSpatialTried = 29u;     // neighbours tried (both modes)
+inline constexpr uint32_t kRtgiStatRestirSpatialAccepted = 30u;  // neighbours merged (both modes)
+inline constexpr uint32_t kRtgiStatRestirSpatialLowM = 31u;      // mode 1: low-count pixels that reused spatial reservoirs
 // SVGF (world_svgf.hlsli). Reproject: t0 raw GI, t1 depth, t2 MRT normal, t3 motion, t4 history colour, t5 history
 // moments, t6 history guide, t7 history normal; u0 colour write (or integrated), u1 stats, u2 moments write, u3 guide
 // write, u4 normal write, u5 debug; s0 point, s1 linear.
@@ -129,6 +134,18 @@ inline constexpr uint32_t kRestirTemporalUavCount = 6u;
 inline constexpr uint32_t kRestirTemporalSamplerCount = 2u;
 inline constexpr uint32_t kRestirTemporalPushCount = 16u;
 inline constexpr float kRestirTemporalMCap = 30.f;  // ReSTIR GI Sec. 5: temporal M clamped to 30
+// ReSTIR GI spatial pass (world_restir_spatial.cs_5_0.hlsl): t0 raw GI in, t1 depth, t2 MRT normal, t3..t5 reservoirs
+// (mode 0: this dispatch's temporal output; mode 1: the mode-0 output), t6 this dispatch's temporal reservoir data (its M);
+// u0 raw GI out, u1 stats (28..31), u2..u4 spatial reservoir out (null in mode 1), u5 debug.
+inline constexpr uint32_t kRestirSpatialSrvCount = 7u;
+inline constexpr uint32_t kRestirSpatialUavCount = 6u;
+inline constexpr uint32_t kRestirSpatialPushCount = 16u;
+inline constexpr float kRestirSpatialLowM = 15.f;             // half the temporal M cap: 9 neighbours and mode 1 below it (Sec. 5, Fig. 10)
+inline constexpr float kRestirSpatialRadiusFraction = 0.1f;   // Sec. 5: initial radius 10% of the (trace) image width
+inline constexpr float kRestirSpatialRadiusMin = 3.f;         // Sec. 5: minimum radius 3 pixels
+inline constexpr float kRestirSpatialNormalCos = 0.906307787f;  // Sec. 4.2: normals within 25 degrees
+inline constexpr float kRestirSpatialDepth = 0.05f;           // Sec. 4.2: depths within 0.05 (relative)
+inline constexpr float kRestirSpatialMCap = 500.f;            // Sec. 5: spatial M clamped to 500
 
 #if defined(__world_rtgi_EMBED_FILE)
 inline constexpr std::span<const std::uint8_t> kRtgiTraceShader = __world_rtgi;
@@ -180,6 +197,11 @@ inline constexpr std::span<const std::uint8_t> kRestirTemporalShader = __world_r
 #else
 inline constexpr std::span<const std::uint8_t> kRestirTemporalShader = {};
 #endif
+#if defined(__world_restir_spatial_EMBED_FILE)
+inline constexpr std::span<const std::uint8_t> kRestirSpatialShader = __world_restir_spatial;
+#else
+inline constexpr std::span<const std::uint8_t> kRestirSpatialShader = {};
+#endif
 
 // b12 for the RTGI trace, matching cbuffer cb_rtgi in world_rtgi.cs_5_0.hlsl (eight float4 registers).
 struct RtgiPushConstants {
@@ -228,6 +250,15 @@ struct RestirTemporalPushConstants {
   float seed[4];    // c3: noise seed, unused, unused, unused
 };
 static_assert(sizeof(RestirTemporalPushConstants) == kRestirTemporalPushCount * sizeof(float), "restir temporal b12 must be 16 floats");
+
+// b12 for the ReSTIR GI spatial pass, matching cbuffer cb_restir_spatial in world_restir_spatial.cs_5_0.hlsl.
+struct RestirSpatialPushConstants {
+  float size[4];     // c0: trace width, trace height, full width, full height
+  float params[4];   // c1: trace divisor, debug mode, mode (0 temporal -> spatial, 1 spatial -> spatial), low M
+  float spatial[4];  // c2: initial radius (trace px), minimum radius, normal cosine, relative depth tolerance
+  float extra[4];    // c3: noise seed, spatial M cap, fade start_eff, fade end_eff
+};
+static_assert(sizeof(RestirSpatialPushConstants) == kRestirSpatialPushCount * sizeof(float), "restir spatial b12 must be 16 floats");
 
 // Mirrors LightParam in lighting_0xCA3D8596.ps_5_0.hlsl (offsets 0 to 108).
 struct LightParamCpu {
@@ -455,6 +486,12 @@ struct RtgiDeviceData {
   bool restir_res_valid = false;         // reservoir[restir_res_index] holds the previous frame's temporal reservoirs
   RtgiPipeline restir_temporal_pipeline;
   bvh::GpuTimer restir_timer = {};
+  RtgiTextureSet<1> restir_sp_raw;      // rgba16f, trace size: raw GI after spatial mode 0 (mode 1's input)
+  RtgiTextureSet<1> restir_sp_sample;   // r32g32b32a32_float, trace size: spatial reservoir x_s, W (this dispatch only)
+  RtgiTextureSet<1> restir_sp_visible;  // r32g32b32a32_float, trace size: spatial reservoir x_v, 0
+  RtgiTextureSet<1> restir_sp_data;     // r32g32b32a32_uint, trace size: n_s, L_o rg, L_o b | M << 16, n_v
+  RtgiPipeline restir_spatial_pipeline;
+  bvh::GpuTimer restir_spatial_timer = {};
   RtgiDenoiseSet denoise;   // output: r11g11b10_float, the upsampled GI
   reshade::api::resource radiance_texture = {0u};
   reshade::api::resource_view radiance_srv = {0u};
@@ -525,6 +562,10 @@ inline void DestroyRtgiDeviceData(reshade::api::device* device) {
   DestroyRtgiTextureSet(device, &data.restir_res_sample);
   DestroyRtgiTextureSet(device, &data.restir_res_visible);
   DestroyRtgiTextureSet(device, &data.restir_res_data);
+  DestroyRtgiTextureSet(device, &data.restir_sp_raw);
+  DestroyRtgiTextureSet(device, &data.restir_sp_sample);
+  DestroyRtgiTextureSet(device, &data.restir_sp_visible);
+  DestroyRtgiTextureSet(device, &data.restir_sp_data);
   DestroyRtgiDenoiseSet(device, &data.denoise);
   bvh::DestroyBuffer(device, &data.radiance_srv, &data.radiance_texture);
   bvh::DestroyBuffer(device, &data.stats_uav, &data.stats_buffer);
@@ -534,9 +575,11 @@ inline void DestroyRtgiDeviceData(reshade::api::device* device) {
   bvh::DestroyBuffer(device, nullptr, &data.light_indices_copy);
   bvh::DestroyGpuTimer(&data.timer);
   bvh::DestroyGpuTimer(&data.restir_timer);
+  bvh::DestroyGpuTimer(&data.restir_spatial_timer);
   DestroyRtgiPipeline(device, data.trace_pipeline);
   DestroyRtgiPipeline(device, data.lamp_type_pipeline);
   DestroyRtgiPipeline(device, data.restir_temporal_pipeline);
+  DestroyRtgiPipeline(device, data.restir_spatial_pipeline);
   g_rtgi_devices.erase(found);
 }
 
@@ -553,6 +596,10 @@ inline void ReleaseRtgiTextures(reshade::api::device* device) {
   DestroyRtgiTextureSet(device, &data.restir_res_sample);
   DestroyRtgiTextureSet(device, &data.restir_res_visible);
   DestroyRtgiTextureSet(device, &data.restir_res_data);
+  DestroyRtgiTextureSet(device, &data.restir_sp_raw);
+  DestroyRtgiTextureSet(device, &data.restir_sp_sample);
+  DestroyRtgiTextureSet(device, &data.restir_sp_visible);
+  DestroyRtgiTextureSet(device, &data.restir_sp_data);
   data.restir_res_index = 0u;
   data.restir_res_valid = false;
   ReleaseRtgiDenoiseTextures(device, &data.denoise);
