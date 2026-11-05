@@ -1256,7 +1256,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t dyncube_ggx_active = 0;                       // index of the completed cube bound to t17
   bool dyncube_ggx_valid = false;                        // a completed filter has been produced
   // Multi-frame update scheduler (Capture -> Filter -> Done -> wait -> Capture).
-  enum class DynCubePhase : uint32_t { Done = 0, Capture = 1, Filter = 2 };
+  enum class DynCubePhase : uint32_t { Done = 0, Capture = 1, Filter = 2, Variant = 3 };
   DynCubePhase dyncube_phase = DynCubePhase::Done;
   uint64_t dyncube_next_update_frame = 0;                // next frame a capture may begin
   uint64_t dyncube_sched_frame = UINT64_MAX;             // last present frame the scheduler ran
@@ -10441,14 +10441,22 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               {
                 float vSoften = std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f);
                 float vStrength = std::clamp(shader_injection.dynCube_global_strength, 0.f, 1.f);
-                if (vSoften > 1e-4f || vStrength < 1.f - 1e-4f)
-                  (void)RunDynCubeVariant(cmd_list, dd);
-                else
+                if (vSoften > 1e-4f || vStrength < 1.f - 1e-4f) {
+                  // Built on the next scheduler tick so this frame carries only the filter.
+                  dd->dyncube_phase = DeviceData::DynCubePhase::Variant;
+                } else {
                   dd->dyncube_variant_valid = false;
+                  dd->dyncube_phase = DeviceData::DynCubePhase::Done;
+                }
               }
-              dd->dyncube_phase = DeviceData::DynCubePhase::Done;
             }
           }
+          break;
+        case DeviceData::DynCubePhase::Variant:
+          // Variant cube on its own frame. Done either way: after a loading wipe or resize
+          // in between the build returns false, and the settings-drift refresh rebuilds it when wanted again.
+          (void)RunDynCubeVariant(cmd_list, dd);
+          dd->dyncube_phase = DeviceData::DynCubePhase::Done;
           break;
       }
 
@@ -10478,6 +10486,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           last_log = now;
           const char* phaseName = (dd->dyncube_phase == DeviceData::DynCubePhase::Capture) ? "Capture"
                                 : (dd->dyncube_phase == DeviceData::DynCubePhase::Filter) ? "Filter"
+                                : (dd->dyncube_phase == DeviceData::DynCubePhase::Variant) ? "Variant"
                                 : "Done";
           std::string msg = "[DynCube] ";
           msg += "interval=" + std::to_string(interval);
