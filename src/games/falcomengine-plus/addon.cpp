@@ -714,6 +714,7 @@ constexpr uint32_t kDynCubeSSRRawRegister = 32u;  // t32 dynCubeSSRRawTex (raw S
 constexpr uint32_t kDynCubeSSRLayoutVersion = 6u;
 constexpr uint32_t kDynCubeSSRBlurLayoutVersion = 6u;
 constexpr uint32_t kDynCubeWorldBoxLayoutVersion = 2u;
+constexpr uint32_t kDynCubeWorldBoxChunkPartials = 256u;  // must match kChunkPartials in DynCubeBoundsReduceCS
 constexpr uint32_t kDynCubeCaptureLayoutVersion = 2u;  // bump when the capture pipeline layout shape changes (forces recreate)
 constexpr uint32_t kRCASLayoutVersion = 5u;  // bump when the RCAS pipeline layout shape changes (forces recreate)
 constexpr uint32_t kFXAALayoutVersion = 1u;  // bump when the FXAA pipeline layout shape changes (forces recreate)
@@ -11289,7 +11290,7 @@ static uint64_t DynCubeEstimatedBytes(const DeviceData* d) {
   if (d->dyncube_ggx_in.handle != 0u) bytes += chain * 8u;
   if (d->dyncube_variant.handle != 0u) bytes += chain * 8u;
   if (d->dyncube_solid_cube.handle != 0u) bytes += base * 8u;
-  bytes += d->dyncube_worldbox_scratch_groups * 2u * 16u;
+  bytes += (d->dyncube_worldbox_scratch_groups + d->dyncube_worldbox_scratch_groups / kDynCubeWorldBoxChunkPartials) * 2u * 16u;
   return bytes;
 }
 
@@ -11569,9 +11570,10 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
     }
     // scratch: per-group min/max pairs, sized for the active cube size (not a fixed max).
     const uint64_t scratchGroups = (uint64_t)((size + 7u) / 8u) * ((size + 7u) / 8u) * 6u;
+    const uint64_t scratchEntries = scratchGroups + scratchGroups / kDynCubeWorldBoxChunkPartials;  // partials + chunk results
     reshade::api::resource_desc rs = {};
     rs.type = reshade::api::resource_type::buffer;
-    rs.buffer.size = scratchGroups * 2u * 16u;
+    rs.buffer.size = scratchEntries * 2u * 16u;
     rs.buffer.stride = 16;
     rs.heap = reshade::api::memory_heap::gpu_only;
     rs.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
@@ -11580,7 +11582,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       DestroyDynCubeResources(dev, d);
       return false;
     }
-    const uint64_t scratchElements = scratchGroups * 2u;
+    const uint64_t scratchElements = scratchEntries * 2u;
     if (!dev->create_resource_view(d->dyncube_worldbox_scratch, reshade::api::resource_usage::shader_resource,
         reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, scratchElements),
         &d->dyncube_worldbox_scratch_srv)
@@ -12381,13 +12383,20 @@ static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, ui
   // (folded pass 0); scratch is UAV-written there, so transition it before the
   // merge reads. Bounds/faceExt are SRV-tracked and need their UAV transition.
   {
-    float pc[5] = {1.0f, 0.001f, reset, (float)groups,
+    const uint32_t chunks = groups / kDynCubeWorldBoxChunkPartials;
+    float pc[5] = {2.0f, 0.001f, reset, (float)groups,
         std::clamp(shader_injection.dynCube_worldbox_contrib, 0.f, 1.f)};
     cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_worldbox_layout, 2, 0, 5, pc);
     cl->barrier(d->dyncube_worldbox_scratch, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
     cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
     cl->barrier(d->dyncube_faceextents, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
-    CSLog("dyncube", "worldbox merge dispatch");
+    CSLog("dyncube", "worldbox chunk + merge dispatch");
+    // Chunk pass, then the single-group merge over the chunk results. D3D11 orders
+    // UAV writes between dispatches, so no barrier is needed in between.
+    cl->dispatch(chunks, 1, 1);
+    pc[0] = 3.0f;
+    pc[3] = (float)chunks;
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_worldbox_layout, 2, 0, 5, pc);
     cl->dispatch(1, 1, 1);
     cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   }

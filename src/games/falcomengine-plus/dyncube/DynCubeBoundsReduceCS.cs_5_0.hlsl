@@ -13,7 +13,7 @@
 
 cbuffer DynCubeBoundsCB : register(b13)
 {
-    float g_pass;          // 0 = per-group partials, 1 = single-group merge
+    float g_pass;          // 0 = per-group partials, 1 = merge partials, 2 = reduce 256 partials per group into chunks, 3 = merge chunks
     float g_posScale;      // position storage scale (capture push constant, 0.001)
     float g_reset;         // 1 = ignore stored bounds this run (recreate / manual reset / toggle rising edge)
     float g_scratchCount;  // pass-0 group count this run (pass 1 loop bound)
@@ -31,6 +31,10 @@ static const float kWorldBoxMaxDist = 100.0;
 static const float kWorldBoxSafetyHalfExtentX = 4.0;
 static const float kWorldBoxSafetyHalfExtentY = 3.0;
 static const float kWorldBoxSafetyHalfExtentZ = 4.0;
+
+// Partials per pass-2 chunk. Must match kDynCubeWorldBoxChunkPartials (addon.cpp). The partials
+// per face ((size/8)^2) are a multiple of 256 for every cube size, so a chunk never spans two faces.
+static const uint kChunkPartials = 256u;
 
 Texture2DArray<float4> g_posTex      : register(t0);
 Texture2DArray<float>  g_contribTex  : register(t1);
@@ -81,6 +85,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
     g_posTex.GetDimensions(w, h, el);
     uint gx = (w + 7) / 8;  // groups per face axis; matches the (sz+7)/8 dispatch
     float3 camCur = g_camCurTex.Load(int3(0, 0, 0)).xyz;
+    uint partialCount = gx * ((h + 7) / 8) * 6u;  // pass-0 partials; chunk results are stored after them
 
     if (g_pass < 0.5)
     {
@@ -115,12 +120,48 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
             g_scratch[2 * groupIdx + 1] = s_max[0];
         }
     }
+    else if (g_pass < 2.5 && g_pass > 1.5)
+    {
+        // Pass 2: one group per chunk -> one min/max pair after the partials.
+        uint li = gtid.y * 8 + gtid.x;
+        uint first = gid.x * kChunkPartials;
+        float4 cmin = float4(3.402823466e+38, 3.402823466e+38, 3.402823466e+38, 0.0);
+        float4 cmax = float4(-3.402823466e+38, -3.402823466e+38, -3.402823466e+38, 0.0);
+        for (uint k = li; k < kChunkPartials; k += 64)
+        {
+            uint i = first + k;
+            if (i < partialCount)
+            {
+                cmin.xyz = min(cmin.xyz, g_scratch[2 * i + 0].xyz);
+                cmax.xyz = max(cmax.xyz, g_scratch[2 * i + 1].xyz);
+            }
+        }
+        s_min[li] = cmin;
+        s_max[li] = cmax;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint s = 32; s > 0; s >>= 1)
+        {
+            if (li < s)
+            {
+                s_min[li] = min(s_min[li], s_min[li + s]);
+                s_max[li] = max(s_max[li], s_max[li + s]);
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (li == 0)
+        {
+            uint o = partialCount + gid.x;
+            g_scratch[2 * o + 0] = s_min[0];
+            g_scratch[2 * o + 1] = s_max[0];
+        }
+    }
     else
     {
         // ── Pass 1: single group merges all partials + stored bounds + camera.
         uint li = gtid.y * 8 + gtid.x;
         uint count = (uint)max(g_scratchCount, 1.0);
-        uint gpf = max(gx * ((h + 7) / 8), 1u);  // groups per face; pass-0 groups are face-major
+        uint base = (g_pass > 2.5) ? partialCount : 0u;  // pass 3 reads the chunk results
+        uint gpf = max(count / 6u, 1u);  // entries per face; entries are face-major (partials or chunks)
         bool camOk = all(isfinite(camCur));
         float3 gmin = float3(3.402823466e+38, 3.402823466e+38, 3.402823466e+38);
         float3 gmax = float3(-3.402823466e+38, -3.402823466e+38, -3.402823466e+38);
@@ -134,8 +175,8 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
         float eNZ = -3.402823466e+38;
         for (uint i = li; i < count; i += 64)
         {
-            float3 gmn = g_scratch[2 * i + 0].xyz;
-            float3 gmx = g_scratch[2 * i + 1].xyz;
+            float3 gmn = g_scratch[2 * (base + i) + 0].xyz;
+            float3 gmx = g_scratch[2 * (base + i) + 1].xyz;
             gmin = min(gmin, gmn);
             gmax = max(gmax, gmx);
             // Per-group validity mirrors hasGeom: empty groups hold inverted sentinels.
