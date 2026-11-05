@@ -9876,6 +9876,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.radiance_valid = radiance_valid;
   frame.subtracted = subtract && radiance_valid;
   frame.restir = restir_on;
+  frame.restir_temporal = result.restir_temporal_ran;
+  frame.restir_gpu_ms = result.restir_temporal_ran ? rd.restir_timer.last_ms : -1.f;
   frame.radiance_width = rd.radiance_width;
   frame.radiance_height = rd.radiance_height;
   frame.radiance_format = static_cast<uint32_t>(rd.radiance_format);
@@ -9884,6 +9886,10 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       + static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
       + static_cast<uint64_t>(rd.restir_sample_pos.width) * rd.restir_sample_pos.height * 16u
       + static_cast<uint64_t>(rd.restir_sample_data.width) * rd.restir_sample_data.height * 16u
+      + static_cast<uint64_t>(rd.restir_raw.width) * rd.restir_raw.height * 8u
+      + static_cast<uint64_t>(rd.restir_res_sample.width) * rd.restir_res_sample.height * 16u * 2u
+      + static_cast<uint64_t>(rd.restir_res_visible.width) * rd.restir_res_visible.height * 16u * 2u
+      + static_cast<uint64_t>(rd.restir_res_data.width) * rd.restir_res_data.height * 16u * 2u
       + rtgi::RtgiDenoiseTextureBytes(rd.denoise)
       + (rd.radiance_texture.handle != 0u
              ? static_cast<uint64_t>(reshade::api::format_row_pitch(rd.radiance_format, rd.radiance_width)) * rd.radiance_height

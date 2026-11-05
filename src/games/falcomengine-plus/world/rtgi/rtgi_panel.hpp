@@ -68,8 +68,14 @@ inline void DrawRtgiPanel() {
   ImGui::Text("Extra bounces: %s, rays %u, feedback %.2f (effective %.2f)",
               g_rtgi_extra_bounces > 0.5f ? "on" : "off", RtgiExtraBounceRaysEffective(),
               g_rtgi_feedback_strength, RtgiFeedbackStrengthEffective());
-  ImGui::Text("ReSTIR GI: %s (initial sample: RIS over %.0f candidates; temporal and spatial reuse not implemented)",
-              frame.restir ? "on" : "off", frame.samples);
+  if (frame.restir_temporal) {
+    ImGui::Text("ReSTIR GI: on (initial sample: RIS over %.0f candidates; temporal reuse ran, M cap %.0f, %.3f ms; spatial reuse not implemented)",
+                frame.samples, kRestirTemporalMCap, frame.restir_gpu_ms);
+  } else {
+    ImGui::Text("ReSTIR GI: %s (initial sample: RIS over %.0f candidates; temporal reuse %s; spatial reuse not implemented)",
+                frame.restir ? "on" : "off", frame.samples,
+                frame.restir ? "off (needs RTGI Temporal and motion vectors)" : "off");
+  }
   ImGui::Text("Characters: %s (%u objects traced)", g_rtgi_trace_characters > 0.5f ? "on" : "off",
               frame.character_objects);
   ImGui::Text("Off-screen lamp shadows: %s", (g_rtgi_lamp_shadows > 0.5f && g_rtgi_dynamic_lights > 0.5f) ? "on" : "off");
