@@ -7,7 +7,7 @@
 //
 // Input : t0 source cube (ggx_out[active]), s0 trilinear clamp,
 //         b13 { srcMip, strength }
-// Output: u0 variant mip0 (2D-array UAV); remaining mips via GenerateMips.
+// Output: u0 one variant mip per dispatch (2D-array UAV of that mip); the host sets srcMip per mip.
 cbuffer DynCubeVariantCB : register(b13)
 {
     float g_srcMip;    // fractional source LOD = soften * maxBlur (0 = sharp copy)

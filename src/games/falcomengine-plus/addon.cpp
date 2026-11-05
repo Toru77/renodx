@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -1272,7 +1273,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // Derived from ggx_out[active]; rebuilt on demand, never part of per-size cache.
   reshade::api::resource dyncube_variant = {};                // RGBA16F cube, N mips
   reshade::api::resource_view dyncube_variant_cube_srv = {};  // full-chain SRV (global serve)
-  reshade::api::resource_view dyncube_variant_mip0_uav = {};  // mip0 array UAV (variant write)
+  reshade::api::resource_view dyncube_variant_mip_uav[8] = {};  // per-mip array UAVs (variant write, mip0..N-1)
   reshade::api::pipeline_layout dyncube_variant_layout = {};
   reshade::api::pipeline dyncube_variant_pipeline = {};
   GTVBAODescriptorTableSet dyncube_variant_tables = {};
@@ -11217,7 +11218,7 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   d->dyncube_ggx_valid = false;
   // Global-push variant cube (derived): destroy with the rest, rebuild on demand.
   dv(d->dyncube_variant_cube_srv); dr(d->dyncube_variant);
-  if (d->dyncube_variant_mip0_uav.handle) { dev->destroy_resource_view(d->dyncube_variant_mip0_uav); d->dyncube_variant_mip0_uav = {}; }
+  for (auto& u : d->dyncube_variant_mip_uav) { if (u.handle) { dev->destroy_resource_view(u); u = {}; } }
   dp(d->dyncube_variant_pipeline); dl(d->dyncube_variant_layout);
   for (auto& t : d->dyncube_variant_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
   d->dyncube_variant_valid = false;
@@ -11325,10 +11326,13 @@ static bool CreateDynCubeVariantResources(reshade::api::device* dev, DeviceData*
     reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
                                      reshade::api::format::r16g16b16a16_float, 0, mips, 0, 6),
     &d->dyncube_variant_cube_srv);
-  dev->create_resource_view(d->dyncube_variant, reshade::api::resource_usage::unordered_access,
-    reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                     reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-    &d->dyncube_variant_mip0_uav);
+  // One array UAV per mip: the variant writes every mip directly (no GenerateMips).
+  for (uint32_t m = 0; m < mips && m < 8u; ++m) {
+    dev->create_resource_view(d->dyncube_variant, reshade::api::resource_usage::unordered_access,
+      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                       reshade::api::format::r16g16b16a16_float, m, 1, 0, 6),
+      &d->dyncube_variant_mip_uav[m]);
+  }
   return true;
 }
 
@@ -12524,10 +12528,13 @@ static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d) {
   static const float kVariantMaxBlurMip = 3.0f;  // soften=1 resamples this source LOD
   if (!cl || !d) return false;
   if (!d->dyncube_ggx_valid) return false;
-  if (!d->dyncube_variant.handle || !d->dyncube_variant_cube_srv.handle
-      || !d->dyncube_variant_mip0_uav.handle) return false;
+  if (!d->dyncube_variant.handle || !d->dyncube_variant_cube_srv.handle) return false;
   if (!CreateDynCubePipelinesIfNeeded(cl->get_device(), d)) return false;
   if (!d->dyncube_variant_pipeline.handle) return false;
+  // Every mip must have its UAV, so the chain is never left partly rebuilt.
+  for (uint32_t m = 0; m < d->dyncube_mip_count && m < 8u; ++m) {
+    if (!d->dyncube_variant_mip_uav[m].handle) return false;
+  }
   auto* dev = cl->get_device();
   const bool time_variant = DynCubeGpuTimingOn(cl, d);
   if (time_variant) {
@@ -12543,17 +12550,26 @@ static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d) {
   reshade::api::descriptor_table_update vu[3] = {
       {vt->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_linear_sampler},
       {vt->at(1), 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->dyncube_ggx_out_cube_srv[d->dyncube_ggx_active]},
-      {vt->at(2), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_variant_mip0_uav},
+      {vt->at(2), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_variant_mip_uav[0]},
   };
   dev->update_descriptor_tables(3, vu);
   std::array<reshade::api::descriptor_table, 3> vtables = {vt->at(0), vt->at(1), vt->at(2)};
   cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_variant_layout, 0, 3, vtables.data());
-  float pc[2] = {srcMip, strength};
-  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_variant_layout, 3, 0, 2, pc);
   cl->barrier(d->dyncube_variant, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
-  cl->dispatch((sz + 7u) / 8u, (sz + 7u) / 8u, 6);
+  // One dispatch per mip, each sampling the source at the blur its mip would have had after
+  // a box reduction of mip 0: lod = 0.5*log2(4^srcMip + 4^m - 1), exactly srcMip at mip 0.
+  // Mips write different subresources and read only the source cube, so no barrier between them.
+  for (uint32_t m = 0; m < mips; ++m) {
+    vu[2] = {vt->at(2), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_variant_mip_uav[m]};
+    dev->update_descriptor_tables(1, &vu[2]);
+    cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_variant_layout, 0, 3, vtables.data());
+    const float lod = (m == 0u) ? srcMip : 0.5f * std::log2(std::exp2(2.f * srcMip) + std::exp2(2.f * (float)m) - 1.f);
+    float pc[2] = {lod, strength};
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_variant_layout, 3, 0, 2, pc);
+    const uint32_t mw = std::max(1u, sz >> m);
+    cl->dispatch((mw + 7u) / 8u, (mw + 7u) / 8u, 6);
+  }
   cl->barrier(d->dyncube_variant, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
-  cl->generate_mipmaps(d->dyncube_variant_cube_srv);
   if (time_variant) {
     falcom_world::bvh::EndGpuTimer(cl, &d->dyncube_gpu_variant_timer);
   }
