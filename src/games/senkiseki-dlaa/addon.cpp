@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cfloat>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -28,18 +29,23 @@
 #include <unordered_set>
 #include <vector>
 
+#include <dxgi.h>
+#include <windows.h>
+#include <winerror.h>
+#include <winnt.h>
+
 #include <deps/imgui/imgui.h>
-#include <include/reshade.hpp>
 #include <embed/shaders.h>
+#include <include/reshade.hpp>
 
 #include "../../mods/shader.hpp"
+#include "../../utils/path.hpp"
 #include "../../utils/settings.hpp"
 #include "../../utils/shader.hpp"
-#include "../../utils/path.hpp"
-#include "./shared.h"
 #include "./dlss/dlss.hpp"
 #include "./dxbc_patch.hpp"
 #include "./fg/fg_proxy.hpp"
+#include "./shared.h"
 
 namespace {
 
@@ -1884,7 +1890,7 @@ static void RestoreAppendedMotionRtv(reshade::api::command_list* cmd_list, Devic
 }
 
 // Forward declaration: the evidence dumper is defined with the dump helpers.
-static void WritePhasebDump(uint32_t hash, const void* code, size_t size, const char* suffix);
+static void WritePhasebDump(uint32_t hash, const void* code, size_t size, const char* suffix, bool force = false);
 
 // Restore the original PS when the current native stage is the local lazy
 // replacement. If the game has already bound a different PS, leave it alone.
@@ -1935,9 +1941,7 @@ static bool EnsureLazyPhaseEPixelShader(reshade::api::command_list* cmd_list,
       ID3D11PixelShader* current = nullptr;
       UINT class_count = 0u;
       ctx->PSGetShader(&current, nullptr, &class_count);
-      already_active = current == d->phasee_active_patched_ps &&
-                       class_count == 0u &&
-                       d->phasee_active_ps_hash == original_hash;
+      already_active = current == d->phasee_active_patched_ps && class_count == 0u && d->phasee_active_ps_hash == original_hash;
       if (current) current->Release();
     }
     if (already_active) return true;
@@ -1953,20 +1957,33 @@ static bool EnsureLazyPhaseEPixelShader(reshade::api::command_list* cmd_list,
     options.no_math = false;
     options.no_new_output = false;
     options.existing_velocity_carrier = true;
-    if (!senkiseki3::dxbc::PatchPerObjectPixelShader(
-            info.patched_bytecode, &info.patched_hash, 0u, options) ||
-        info.patched_hash == 0u || info.patched_hash == original_hash ||
-        FAILED(native_dev->CreatePixelShader(info.patched_bytecode.data(),
-                                             info.patched_bytecode.size(), nullptr,
-                                             &info.native_patched))) {
+    const bool focus_ps = g_weapon_motion_debug > 0.5f && original_hash == 0xB493EE8Du;
+    const bool patch_valid = senkiseki3::dxbc::PatchPerObjectPixelShader(
+                                 info.patched_bytecode, &info.patched_hash, 0u, options)
+                             && info.patched_hash != 0u && info.patched_hash != original_hash;
+    WritePhasebDump(original_hash, info.original_bytecode.data(), info.original_bytecode.size(), ".ps", focus_ps);
+    HRESULT create_result = E_FAIL;
+    if (patch_valid) {
+      WritePhasebDump(info.patched_hash, info.patched_bytecode.data(), info.patched_bytecode.size(), ".ps.patched", focus_ps);
+      create_result = native_dev->CreatePixelShader(info.patched_bytecode.data(), info.patched_bytecode.size(),
+                                                    nullptr, &info.native_patched);
+    }
+    if (!patch_valid || FAILED(create_result)) {
+      const HRESULT removed_reason = native_dev->GetDeviceRemovedReason();
+      if (g_weapon_motion_debug > 0.5f) {
+        LogThrottled(ThrottleKey("weapon-ps-create-failed", original_hash).c_str(), reshade::log::level::warning, 1u, 0u,
+                     "[DLAA] rigid ps-create f=%u ps=0x%08X patchValid=%d hr=0x%08X deviceReason=0x%08X",
+                     d->frame_index, original_hash, static_cast<int>(patch_valid), static_cast<unsigned int>(create_result), static_cast<unsigned int>(removed_reason));
+        if (FAILED(removed_reason) || create_result == DXGI_ERROR_DEVICE_REMOVED || create_result == DXGI_ERROR_DEVICE_RESET || create_result == DXGI_ERROR_DEVICE_HUNG) {
+          FlushCrashRing(d);
+        }
+      }
       info.patched_bytecode.clear();
       info.patch_failed = true;
       MotionReportLog(reshade::log::level::warning,
                       "[DLAA] phaseE: lazy PS patch/create rejected; keeping the original PS.");
       return false;
     }
-    WritePhasebDump(original_hash, info.original_bytecode.data(), info.original_bytecode.size(), ".ps");
-    WritePhasebDump(info.patched_hash, info.patched_bytecode.data(), info.patched_bytecode.size(), ".ps.patched");
     char buf[192];
     snprintf(buf, sizeof(buf),
              "[DLAA] phaseE: lazy-created PS 0x%08X -> 0x%08X (%u B) const=%d noRead=%d noMath=%d noNewOut=%d",
@@ -2090,10 +2107,12 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
             staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             ID3D11Buffer* staging = nullptr;
             auto* native_device = reinterpret_cast<ID3D11Device*>(cmd_list->get_device()->get_native());
-            if (native_device && SUCCEEDED(native_device->CreateBuffer(&staging_desc, nullptr, &staging))) {
+            const HRESULT staging_result = (native_device ? native_device->CreateBuffer(&staging_desc, nullptr, &staging) : E_POINTER);
+            if (SUCCEEDED(staging_result)) {
               ctx->CopyResource(staging, b0);
               D3D11_MAPPED_SUBRESOURCE mapped = {};
-              if (SUCCEEDED(ctx->Map(staging, 0u, D3D11_MAP_READ, 0u, &mapped))) {
+              const HRESULT map_result = ctx->Map(staging, 0u, D3D11_MAP_READ, 0u, &mapped);
+              if (SUCCEEDED(map_result)) {
                 LogThrottled(ThrottleKey("weapon-scan-readback", vh, ph).c_str(),
                              reshade::log::level::info, 1u, 0u,
                              "[DLAA] rigid scan vs=0x%08X ps=0x%08X result=readback-ok; World c44 and VP c10 are hypotheses",
@@ -2223,15 +2242,36 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
                   }
                 }
               } else {
+                const HRESULT removed_reason = native_device->GetDeviceRemovedReason();
                 LogThrottled(ThrottleKey("weapon-scan-map-failed", vh, ph).c_str(),
                              reshade::log::level::warning, 1u, 0u,
-                             "[DLAA] rigid scan vs=0x%08X ps=0x%08X result=map-failed", vh, ph);
+                             "[DLAA] rigid scan f=%u vs=0x%08X ps=0x%08X result=map-failed hr=0x%08X deviceReason=0x%08X",
+                             d->frame_index, vh, ph, static_cast<unsigned int>(map_result), static_cast<unsigned int>(removed_reason));
+                if (FAILED(removed_reason) || map_result == DXGI_ERROR_DEVICE_REMOVED || map_result == DXGI_ERROR_DEVICE_RESET || map_result == DXGI_ERROR_DEVICE_HUNG) {
+                  FlushCrashRing(d);
+                }
               }
               staging->Release();
             } else {
+              const HRESULT removed_reason = (native_device ? native_device->GetDeviceRemovedReason() : E_POINTER);
+              uint64_t world_bytes = 0u;
+              for (const auto& [snap_key, snap] : d->prev_world_snaps) {
+                (void)snap_key;
+                world_bytes += static_cast<uint64_t>(snap.size) * 2u * DeviceData::kRigidPrevWorldSlots;
+              }
+              uint64_t bone_bytes = 0u;
+              for (const auto& [snap_key, snap] : d->prev_bone_snaps) {
+                (void)snap_key;
+                bone_bytes += static_cast<uint64_t>(snap.size) * 2u * DeviceData::kBoneSlots;
+              }
               LogThrottled(ThrottleKey("weapon-scan-staging-failed", vh, ph).c_str(),
                            reshade::log::level::warning, 1u, 0u,
-                           "[DLAA] rigid scan vs=0x%08X ps=0x%08X result=staging-allocation-failed", vh, ph);
+                           "[DLAA] rigid scan f=%u vs=0x%08X ps=0x%08X result=staging-allocation-failed bytes=%u hr=0x%08X deviceReason=0x%08X worldSnaps=%zu worldEstimatedBytes=%" PRIu64 " boneSnaps=%zu boneEstimatedBytes=%" PRIu64,
+                           d->frame_index, vh, ph, staging_desc.ByteWidth, static_cast<unsigned int>(staging_result), static_cast<unsigned int>(removed_reason),
+                           d->prev_world_snaps.size(), world_bytes, d->prev_bone_snaps.size(), bone_bytes);
+              if (native_device && (FAILED(removed_reason) || staging_result == DXGI_ERROR_DEVICE_REMOVED || staging_result == DXGI_ERROR_DEVICE_RESET || staging_result == DXGI_ERROR_DEVICE_HUNG)) {
+                FlushCrashRing(d);
+              }
             }
           } else {
             LogThrottled(ThrottleKey("weapon-scan-small-cb", vh, ph).c_str(),
@@ -2679,15 +2719,21 @@ static void LogRigidWorldSnap(reshade::api::command_list* cmd_list, DeviceData* 
   static std::mutex sample_mutex;
   static std::unordered_map<uint64_t, uint64_t> last_dump_frame;
   static uint64_t generation = 0u;
+  static uint64_t last_weapon_sample_frame = UINT64_MAX;
   {
     std::lock_guard lock(sample_mutex);
     const uint64_t current_generation = g_character_report_generation.load();
     if (generation != current_generation) {
       last_dump_frame.clear();
       generation = current_generation;
+      last_weapon_sample_frame = UINT64_MAX;
     }
     const auto it = last_dump_frame.find(key);
     if (it != last_dump_frame.end() && d->frame_index - it->second < 120u) return;
+    if (g_weapon_motion_debug > 0.5f && last_weapon_sample_frame == d->frame_index) return;
+    if (g_weapon_motion_debug > 0.5f) {
+      last_weapon_sample_frame = d->frame_index;
+    }
     last_dump_frame[key] = d->frame_index;
   }
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
@@ -3613,26 +3659,27 @@ static const std::string& GetPhasewDir();
 // every draw whose current VS is a patched one, when evidence capture is on.
 // Crash capture: record every draw into an in-memory ring buffer (bounded so
 // memory stays flat). The ring is dumped to drawtrace.log exactly when the GPU
-// device dies, so the LAST lines name the faulting draw. Runs for every draw
-// when DLAAPhaseBDump is on, INDEPENDENT of the per-object-motion toggle (the
-// crash reproduces with it off too, so the trace must not be gated by it).
+// device dies. GPU execution is asynchronous, so these draws are leads rather
+// than proof of which command failed. Weapon Logs also enables the bounded ring.
 static void MaybeTraceCrashWindow(reshade::api::command_list* cmd_list, DeviceData* d) {
-  if (g_phaseb_dump < 0.5f || !cmd_list || !d) return;
-  uint32_t vh = CurrentVsHash(cmd_list, d);
-  uint32_t ph = CurrentPsHash(cmd_list, d);
-  bool patched = d->patched_vs_by_hash.contains(vh);
-  char line[160];
-  snprintf(line, sizeof(line), "f=%u vs=0x%08X ps=0x%08X rtvs=%u%s%s",
-           d->frame_index, vh, ph, d->last_rtv_count,
-           patched ? " PATCHED" : "",
-           d->motion_rtv.handle ? " motionRTV=1" : "");
-  d->crash_ring.push_back(line);
-  if (d->crash_ring.size() > 2048u) d->crash_ring.pop_front();
-  // Unbounded patched-draw log: the fault (minimal mode is stateless) is at a
-  // PATCHED draw, so the LAST line here before the crash names it, even if the
-  // ring overflows with thousands of post-fault draws before device-removal is
-  // detected. Appended every patched draw, never capped.
-  if (patched) {
+  if ((g_phaseb_dump < 0.5f && g_weapon_motion_debug < 0.5f) || cmd_list == nullptr || d == nullptr) return;
+  const uint32_t vh = CurrentVsHash(cmd_list, d);
+  const uint32_t ph = CurrentPsHash(cmd_list, d);
+  const auto it = d->patched_vs_by_hash.find(vh);
+  const bool patched = it != d->patched_vs_by_hash.end();
+  std::array<char, 256> line = {};
+  snprintf(line.data(), line.size(), "f=%u vs=0x%08X ps=0x%08X rtvs=%u patched=%d rigid=%d item=%d emits=%d psCandidate=%d motionAvailable=%d",
+           d->frame_index, vh, ph, d->last_rtv_count, static_cast<int>(patched),
+           static_cast<int>(patched && it->second.is_rigid), static_cast<int>(patched && it->second.is_rigid_item),
+           static_cast<int>(patched && it->second.emits_velocity), static_cast<int>(d->phasee_ps_candidates.contains(ph)),
+           static_cast<int>(d->motion_rtv.handle != 0u));
+  d->crash_ring.emplace_back(line.data());
+  const size_t trace_limit = (g_weapon_motion_debug > 0.5f ? 32768u : 2048u);
+  while (d->crash_ring.size() > trace_limit) {
+    d->crash_ring.pop_front();
+  }
+  // The explicit Phase B dump also writes an uncapped list of patched draws.
+  if (patched && g_phaseb_dump >= 0.5f) {
     char ppath[1024];
     snprintf(ppath, sizeof(ppath), "%s/patched.log", GetPhasebDir().c_str());
     FILE* pf = nullptr;
@@ -3685,17 +3732,35 @@ static void MaybeLogItemDraw(reshade::api::command_list* cmd_list, DeviceData* d
 // failure. Overwrites the file so each run's capture is clean.
 static void FlushCrashRing(DeviceData* d) {
   if (!d || d->crash_ring_dumped || d->crash_ring.empty()) return;
-  d->crash_ring_dumped = true;
   char path[1024];
   snprintf(path, sizeof(path), "%s/drawtrace.log", GetPhasebDir().c_str());
   FILE* f = nullptr;
   fopen_s(&f, path, "w");
-  if (f) {
-    for (const auto& line : d->crash_ring)
-      if (fputs(line.c_str(), f) >= 0 && fputc('\n', f) == EOF) break;
-    fclose(f);
+  if (f != nullptr) {
+    bool written = true;
+    for (const auto& line : d->crash_ring) {
+      if (fputs(line.c_str(), f) == EOF || fputc('\n', f) == EOF) {
+        written = false;
+        break;
+      }
+    }
+    if (fclose(f) != 0) {
+      written = false;
+    }
+    if (written) {
+      d->crash_ring_dumped = true;
+      std::array<char, 1200> message = {};
+      snprintf(message.data(), message.size(), "[DLAA] rigid crash-trace path=%s entries=%zu", path, d->crash_ring.size());
+      MotionReportLog(reshade::log::level::warning, message.data());
+      d->crash_ring.clear();
+    } else {
+      LogThrottled("crash-trace-write-failed", reshade::log::level::warning, 1u, 0u,
+                   "[DLAA] rigid crash-trace result=write-failed path=%s", path);
+    }
+  } else {
+    LogThrottled("crash-trace-open-failed", reshade::log::level::warning, 1u, 0u,
+                 "[DLAA] rigid crash-trace result=open-failed path=%s", path);
   }
-  d->crash_ring.clear();
 }
 
 // Restore the game's original VS t#/b# bindings that MaybeBindPatchedVs
@@ -6928,7 +6993,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Weapon Logs",
         .section = "Antialiasing",
-        .tooltip = "Capture rigid weapon motion diagnostics for Copy Report. Toggle off and on to start a fresh weapon report.",
+        .tooltip = "Capture weapon motion diagnostics for Copy Report. Device loss detected during diagnostic readback or pixel-shader creation saves recent draws to renodx-dev/dump/phaseb/drawtrace.log. Start with Weapon Logs enabled to capture the suspect shader bytecode. Toggle off and on to start a fresh report.",
         .labels = {"Off", "On"},
         .on_change_value = [](float, float current) {
           if (current > 0.5f) {
@@ -7815,15 +7880,37 @@ static const std::string& GetPhasebDir() {
 
 // Write a raw shader blob to <ReShadeBase>/renodx-dev/dump/phaseb/ (for
 // offline inspection when the GPU TDRs during load before the DevKit flushes).
-// Gated behind the DLAAPhaseBDump setting.
-static void WritePhasebDump(uint32_t hash, const void* code, size_t size, const char* suffix) {
-  if (g_phaseb_dump < 0.5f) return;
+// Normally gated by DLAAPhaseBDump; focused crash diagnostics can force a dump.
+static void WritePhasebDump(uint32_t hash, const void* code, size_t size, const char* suffix, bool force) {
+  if (g_phaseb_dump < 0.5f && !force) return;
   if (!code || size == 0u) return;
   char path[1024];
   snprintf(path, sizeof(path), "%s/0x%08X%s.cso", GetPhasebDir().c_str(), hash, suffix);
+  static std::mutex focus_mutex;
+  static std::unordered_set<std::string> focus_written;
+  std::unique_lock focus_lock(focus_mutex, std::defer_lock);
+  if (force) {
+    focus_lock.lock();
+    if (focus_written.contains(path)) return;
+  }
   FILE* f = nullptr;
   fopen_s(&f, path, "wb");
-  if (f) { fwrite(code, 1, size, f); fclose(f); }
+  if (f != nullptr) {
+    const size_t written = fwrite(code, 1, size, f);
+    const bool complete = fclose(f) == 0 && written == size;
+    if (force) {
+      if (complete) {
+        focus_written.emplace(path);
+      }
+      focus_lock.unlock();
+      LogThrottled(ThrottleKey("weapon-shader-dump", hash).c_str(), reshade::log::level::info, 1u, 0u,
+                   "[DLAA] rigid shader-dump hash=0x%08X bytes=%zu written=%zu complete=%d path=%s", hash, size, written, static_cast<int>(complete), path);
+    }
+  } else if (force) {
+    focus_lock.unlock();
+    LogThrottled(ThrottleKey("weapon-shader-dump-failed", hash).c_str(), reshade::log::level::warning, 1u, 0u,
+                 "[DLAA] rigid shader-dump hash=0x%08X result=open-failed path=%s", hash, path);
+  }
 }
 
 static const std::string& GetPhasewDir() {
@@ -7843,7 +7930,10 @@ static void WriteItemDump(uint32_t hash, const void* code, size_t size, const ch
   snprintf(path, sizeof(path), "%s/0x%08X%s.cso", GetPhasewDir().c_str(), hash, suffix);
   FILE* f = nullptr;
   fopen_s(&f, path, "wb");
-  if (f) { fwrite(code, 1, size, f); fclose(f); }
+  if (f) {
+    fwrite(code, 1, size, f);
+    fclose(f);
+  }
 }
 
 // ── Hang watchdog: heartbeat thread ──
@@ -7954,6 +8044,10 @@ static bool OnCreatePipeline(
     if (!desc || desc->code_size == 0u) continue;
     const uint32_t hash = renodx::utils::hash::ComputeCRC32(
         static_cast<const uint8_t*>(desc->code), desc->code_size);
+    bool focus_vs = g_weapon_motion_debug > 0.5f && (hash == 0x0027063Au || hash == 0x34AA271Fu);
+    if (focus_vs) {
+      WritePhasebDump(hash, desc->code, desc->code_size, ".focus-vs", true);
+    }
     // Skip only when the incoming blob is ALREADY our patched blob (the
     // CreateInputLayout re-fire carries our patched bytecode, whose hash is in
     // patched_vs_new_hashes). A re-creation of the GAME'S ORIGINAL bytecode is
@@ -7996,11 +8090,18 @@ static bool OnCreatePipeline(
       if (!senkiseki3::dxbc::PatchRigidVertexShader(blob, &new_hash, &info, options)) continue;
     }
     if (new_hash == 0u || new_hash == hash) continue;
+    if (!focus_vs && g_weapon_motion_debug > 0.5f && (new_hash == 0x0027063Au || new_hash == 0x34AA271Fu)) {
+      focus_vs = true;
+      WritePhasebDump(hash, desc->code, desc->code_size, ".focus-vs", true);
+    }
 
     // Evidence capture (DLAAPhaseBDump on): original + patched blobs, written
     // BEFORE the driver sees them so a TDR can't lose the evidence.
     WritePhasebDump(hash, desc->code, desc->code_size, "");
     WritePhasebDump(new_hash, blob.data(), blob.size(), ".patched");
+    if (focus_vs) {
+      WritePhasebDump(new_hash, blob.data(), blob.size(), ".focus-vs.patched", true);
+    }
     if (info.rigid_is_item) {
       WriteItemDump(hash, desc->code, desc->code_size, "");
       WriteItemDump(new_hash, blob.data(), blob.size(), ".patched");

@@ -2882,10 +2882,13 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
   if (!ScanShex(shex_data, shex->size, scan)) return false;
   if (!scan.has_ret) return false;
 
-  // Allocate temps: base = declared count or max used + 1.
-  const uint32_t temp_base = std::max(scan.has_temps ? scan.dcl_temps : 0u, scan.max_temp + 1u);
-  const uint32_t rT = temp_base;        // prevClip scratch
-  const uint32_t rHalf = temp_base + 1u; // 0.5 constant
+  // The declaration is the register allocation boundary. The generic operand
+  // scan can mistake instruction payloads for operands, so its max_temp is
+  // not a safe allocation size for a valid shader.
+  const uint32_t temp_base = scan.has_temps ? scan.dcl_temps : 0u;
+  if (temp_base > 4094u) return false;
+  const uint32_t rT = temp_base;          // prevClip scratch
+  const uint32_t rHalf = temp_base + 1u;  // 0.5 constant
   const uint32_t new_dcl_temps = temp_base + 2u;
 
   // Build injected declaration tokens: dcl_input_ps vN.xyzw + dcl_output oM.
@@ -2920,10 +2923,10 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
     // captured scene depth to reject stale object MVs where the character is
     // occluded by a later-drawn surface.
     EmitMovImm4(body, rT, 0xFu, 0u, 0u, 0u, 0x3F800000u);
-    EmitMovInput(body, rT, 0x3u, carrier_reg, kSwizzleXYXY);        // rT.xy = object delta
-    EmitMovInput(body, rHalf, 0xCu, carrier_reg, kSwizzleZZZW);     // rHalf.zw = clip z/w
-    EmitMaxImm1(body, rHalf, 0x8u, rHalf, kSwizzleWWWW, 0x3A83126Fu);  // rHalf.w = max(w, 0.001)
-    EmitDiv(body, rT, 0x4u, rHalf, kSwizzleZZZZ, rHalf, kSwizzleWWWW); // rT.z = clip.z / clip.w
+    EmitMovInput(body, rT, 0x3u, carrier_reg, 0x3u);                    // rT.xy = object delta
+    EmitMovInput(body, rHalf, 0xCu, carrier_reg, 0xCu);                 // rHalf.zw = clip z/w
+    EmitMaxImm1(body, rHalf, 0x8u, rHalf, kSwizzleWWWW, 0x3A83126Fu);   // rHalf.w = max(w, 0.001)
+    EmitDiv(body, rT, 0x4u, rHalf, kSwizzleZZZZ, rHalf, kSwizzleWWWW);  // rT.z = clip.z / clip.w
     if (options.no_new_output)
       EmitMovOutputMasked(body, max_out, 0x3u, rT, kSwizzleXYXY);
     else
@@ -2962,6 +2965,22 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
   uint32_t ret_dw = scan.ret_offset / 4u - 2u;
 
   std::vector<uint32_t> new_tokens(tokens, tokens + old_token_dwords);
+  if (options.existing_velocity_carrier) {
+    bool expanded_carrier = false;
+    for (uint32_t i = 0u; i < first_non_decl_dw;) {
+      const uint32_t len = InstructionLength(new_tokens.data(), old_token_dwords, i);
+      if (len == 0u) return false;
+      if ((new_tokens[i] & 0x7FFu) == OP_DCL_INPUT_PS && len >= 3u && new_tokens[i + 2u] == carrier_reg) {
+        const uint32_t operand = new_tokens[i + 1u];
+        if (len != 3u || (operand & 0xFu) != 2u || ((operand >> kOperandTypeShift) & 0xFFu) != OPERAND_INPUT || ((operand >> kOperandIndexDimShift) & 0x3u) != 1u || ((operand >> kOperandIndexRepShift) & 0x7u) != 0u || (operand & 0x80000000u) != 0u) return false;
+        new_tokens[i + 1u] |= 0xF0u;
+        expanded_carrier = true;
+        break;
+      }
+      i += len;
+    }
+    if (!expanded_carrier) return false;
+  }
   // Relocate SV_SampleIndex references (dcl_input_ps_sgv + iadd operands) to a
   // higher register so TEXCOORD5 can take the register the VS writes prevClip
   // to. Must happen on the ORIGINAL stream before the new decls/body are
@@ -3036,39 +3055,56 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
 
   // ── Append the ISGN input entry (legacy Phase E path) ──
   // Carrier mode already has TEXCOORD10 in the original PS signature.
-  if (!options.existing_velocity_carrier) {
-  {
+  if (options.existing_velocity_carrier) {
     DXBCHeader h2;
     std::vector<ChunkInfo> chunks2;
     if (!ParseDXBC(out, h2, chunks2)) return false;
     const ChunkInfo* isgn2 = FindChunk(chunks2, "ISGN");
     if (!isgn2) return false;
-    uint32_t insert_at = UINT32_MAX;  // default: append at the end
-    if (sv_old_reg != UINT32_MAX) {
-      // Relocate the SV_SampleIndex ISGN entry (register_index) to sv_new_reg
-      // and insert TEXCOORD5 at its old slot so the signature stays sorted by
-      // register (TEXCOORD5@new_in_reg < SV_SampleIndex@sv_new_reg).
-      std::vector<SignatureEntry> is2;
-      if (!ParseSignature(out, *isgn2, is2)) return false;
-      int32_t sv_idx = -1;
-      for (uint32_t i = 0u; i < (uint32_t)is2.size(); ++i) {
-        if (IsRasterizerGeneratedSysval(is2[i].system_value_type) &&
-            is2[i].register_index == sv_old_reg) {
-          sv_idx = (int32_t)i;
-          break;
-        }
+    std::vector<SignatureEntry> is2;
+    if (!ParseSignature(out, *isgn2, is2)) return false;
+    bool expanded_carrier = false;
+    for (uint32_t i = 0u; i < is2.size(); ++i) {
+      if (is2[i].name == "TEXCOORD" && is2[i].semantic_index == 10u && is2[i].register_index == carrier_reg) {
+        const size_t offset = isgn2->offset + kChunkHeaderSize + 8u + i * kSignatureEntrySize + 21u;
+        out[offset] = std::byte{0x0F};
+        expanded_carrier = true;
+        break;
       }
-      if (sv_idx < 0) return false;
-      if (!RewriteSignatureEntryRegister(out, *isgn2, is2[(uint32_t)sv_idx].name,
-                                         is2[(uint32_t)sv_idx].semantic_index, sv_new_reg))
-        return false;
-      insert_at = (uint32_t)sv_idx;
     }
-    // rw_mask 0x0B mirrors the hand-patched PS ISGN entry (reads .xyw).
-    if (!AppendSignatureEntry(out, *isgn2, "TEXCOORD", tex_idx, new_in_reg, 0xFu, 0x0Bu,
-                              3u /* FLOAT32 */, insert_at))
-      return false;
-  }
+    if (!expanded_carrier) return false;
+  } else {
+    {
+      DXBCHeader h2;
+      std::vector<ChunkInfo> chunks2;
+      if (!ParseDXBC(out, h2, chunks2)) return false;
+      const ChunkInfo* isgn2 = FindChunk(chunks2, "ISGN");
+      if (!isgn2) return false;
+      uint32_t insert_at = UINT32_MAX;  // default: append at the end
+      if (sv_old_reg != UINT32_MAX) {
+        // Relocate the SV_SampleIndex ISGN entry (register_index) to sv_new_reg
+        // and insert TEXCOORD5 at its old slot so the signature stays sorted by
+        // register (TEXCOORD5@new_in_reg < SV_SampleIndex@sv_new_reg).
+        std::vector<SignatureEntry> is2;
+        if (!ParseSignature(out, *isgn2, is2)) return false;
+        int32_t sv_idx = -1;
+        for (uint32_t i = 0u; i < (uint32_t)is2.size(); ++i) {
+          if (IsRasterizerGeneratedSysval(is2[i].system_value_type) && is2[i].register_index == sv_old_reg) {
+            sv_idx = (int32_t)i;
+            break;
+          }
+        }
+        if (sv_idx < 0) return false;
+        if (!RewriteSignatureEntryRegister(out, *isgn2, is2[(uint32_t)sv_idx].name,
+                                           is2[(uint32_t)sv_idx].semantic_index, sv_new_reg))
+          return false;
+        insert_at = (uint32_t)sv_idx;
+      }
+      // rw_mask 0x0B mirrors the hand-patched PS ISGN entry (reads .xyw).
+      if (!AppendSignatureEntry(out, *isgn2, "TEXCOORD", tex_idx, new_in_reg, 0xFu, 0x0Bu,
+                                3u /* FLOAT32 */, insert_at))
+        return false;
+    }
   }
   // ── Append the OSGN output entry (SV_TARGET at max_out+1: 3 for 3-RT, 4 for
   // 4-RT G-buffer PSs). SKIPPED in no_new_output mode: prevNDC goes into the
