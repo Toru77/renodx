@@ -3784,7 +3784,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIEnable", .binding = &g_vbgi_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "GTVBGI Enabled", .section = "GTVBGI",
+      .default_value = 1.f, .label = "GTVBGI Enabled", .section = "GTVBGI",
       .tooltip = "GTVBGI: ground-truth visibility bitmask indirect diffuse GI (Sora 1st and Sora 2nd). Added to the lit image after the shadow terms. Off by default.",
       .labels = {"Off", "On"},
       .is_visible = []() { return VbgiRowVisible(); },
@@ -13803,8 +13803,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                                                                                      .luminance_edge_stop = &g_vbgi_svgf_luminance_edge_stop,
                                                                                                      .default_temporal_enabled = 1.f,
                                                                                                      .default_history_weight = 0.99f,
-                                                                                                     .default_depth_rejection = 0.05f,
-                                                                                                     .default_normal_rejection = 0.9f,
+                                                                                                     .default_depth_rejection = 0.2f,
+                                                                                                     .default_normal_rejection = 0.f,
                                                                                                      .default_spatial_enabled = 1.f,
                                                                                                      .default_iterations = 5.f,
                                                                                                      .default_luminance_edge_stop = 16.f});
