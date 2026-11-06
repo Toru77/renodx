@@ -2,13 +2,12 @@
  * Copyright (C) 2026 Carlos Lopez, speedlemur
  * SPDX-License-Identifier: MIT
  *
- * forzahorizon6-rr: RT resolve/denoise bypass.
+ * forzahorizon6-rr: RTGI and SSR denoiser replacements.
  *
- * On Medium and High RTGI, replaces the resolve shaders with minimal per-frame
- * variants (see the 0x*.cs_6_6.hlsl files in this folder) so DLSS-RR receives
- * the raw ray signal instead of the game's neighbourhood-filtered one. Low
- * keeps the game's own resolve; the add-on detects the tier and gates the whole
- * feature (addon.cpp).
+ * On Medium and High RTGI, replaces the denoising stages so DLSS-RR receives
+ * the current-frame ray signal. The High RTGI pointwise resolve is also
+ * replaced with an equivalent implementation. Optional SSR switches disable
+ * the checkerboard cleanup and the separable roughness-mip filters.
  *
  * The swap is a live, per-device runtime replacement on the bind-time
  * replacement path (renodx utility shader framework), so a toggle applies
@@ -30,13 +29,19 @@
 
 namespace denoise {
 
-// Live resolve shader hashes (CRC32 of the original DXIL). The stochastic
-// gather is shared by the Medium and High tiers; the spatial filter and the
-// resolve reconstruct are compiled once per tier.
-inline constexpr uint32_t kGatherHash = 0x209AB6A4;         // 4-tap stochastic reprojected gather
-inline constexpr uint32_t kSpatialHighHash = 0x4DAF8A48;    // spatial filter, high RT tier
-inline constexpr uint32_t kSpatialMediumHash = 0x596D3E8F;  // spatial filter, medium RT tier
-inline constexpr uint32_t kReconMediumHash = 0x0B33C6D8;    // resolve reconstruct + bilateral denoise, medium RT tier
+// Live RTGI shader hashes (CRC32 of the original DXIL). DevKit names the High
+// Known shader tags from the DevKit PDB names:
+//   temporalfilter_0xAF4E3D44 (High), temporalfilter_0x95FA8898 (Medium),
+//   spatialfilter_0x480011D5 (shared), resolve_0x019CE131 (High), and
+//   upscale2x_0x4067B14C (Medium).
+inline constexpr uint32_t kSpatialFilterDiskHash = 0x480011D5;  // confirmed in High and Medium
+inline constexpr uint32_t kTemporalFilterHighHash = 0xAF4E3D44;
+inline constexpr uint32_t kResolveHighHash = 0x019CE131;       // RTGI_Resolve, draw 5441
+inline constexpr uint32_t kTemporalFilterMediumHash = 0x95FA8898;
+inline constexpr uint32_t kUpscale2xMediumHash = 0x4067B14C;
+inline constexpr uint32_t kSsrCheckerboardTidyHash = 0x313E9A06;
+inline constexpr uint32_t kSsrFilterMipHorizontalHash = 0xF0DE4E22;
+inline constexpr uint32_t kSsrFilterMipVerticalHash = 0x24848E0B;
 
 struct Replacement {
   uint32_t hash;
@@ -50,33 +55,54 @@ struct BypassEntry {
   std::atomic<bool> applied{false};
 };
 
-inline const Replacement kGatherReplacements[] = {
-    {kGatherHash, __0x209AB6A4},
+inline const Replacement kSpatialFilterDiskReplacements[] = {
+    {kSpatialFilterDiskHash, __0x480011D5},
 };
 
-// Centre-sample spatial payloads: no spatial neighbourhood and no cross-frame
-// state. The game compiles the pass once per tier; the medium tier runs it at
-// half resolution.
-inline const Replacement kSpatialHighReplacements[] = {
-    {kSpatialHighHash, __0x4DAF8A48_both},
+// These temporal-filter replacements remove the cross-frame/history weighting
+// and keep only the current-frame sample reconstruction.
+inline const Replacement kTemporalFilterHighReplacements[] = {
+    {kTemporalFilterHighHash, __0xAF4E3D44},
 };
 
-inline const Replacement kSpatialMediumReplacements[] = {
-    {kSpatialMediumHash, __0x596D3E8F_both},
+// High RTGI resolve is pointwise; preserve its depth/normal/radiance transform
+// while replacing the game hash with a source-controlled shader.
+inline const Replacement kResolveHighReplacements[] = {
+    {kResolveHighHash, __0x019CE131},
 };
 
-// Medium's reconstruct both denoises (nine-tap bilateral weighting) and
+inline const Replacement kTemporalFilterMediumReplacements[] = {
+    {kTemporalFilterMediumHash, __0x95FA8898},
+};
+
+// Medium's Upscale2x pass both denoises (nine-tap bilateral weighting) and
 // upsamples the half-res pair to the full-res feed; the replacement keeps the
 // bilinear 2x upscale but drops the weighting.
-inline const Replacement kReconMediumReplacements[] = {
-    {kReconMediumHash, __0x0B33C6D8},
+inline const Replacement kUpscale2xMediumReplacements[] = {
+    {kUpscale2xMediumHash, __0x4067B14C},
 };
 
-inline BypassEntry bypasses[4] = {
-    {kGatherReplacements},
-    {kSpatialHighReplacements},
-    {kSpatialMediumReplacements},
-    {kReconMediumReplacements},
+// This pass clamps checkerboard samples in place. A no-op leaves the earlier
+// current-frame reflection values untouched.
+inline const Replacement kSsrCheckerboardTidyReplacements[] = {
+    {kSsrCheckerboardTidyHash, __0x313E9A06},
+};
+
+// These hashes are the repeated separable roughness-mip blur passes. Their
+// replacements copy each source mip texel directly to its destination.
+inline const Replacement kSsrFilterMipReplacements[] = {
+    {kSsrFilterMipHorizontalHash, __0xF0DE4E22},
+    {kSsrFilterMipVerticalHash, __0x24848E0B},
+};
+
+inline BypassEntry bypasses[7] = {
+    {kSpatialFilterDiskReplacements},
+    {kTemporalFilterHighReplacements},
+    {kTemporalFilterMediumReplacements},
+    {kUpscale2xMediumReplacements},
+    {kResolveHighReplacements},
+    {kSsrCheckerboardTidyReplacements},
+    {kSsrFilterMipReplacements},
 };
 
 inline std::atomic<reshade::api::device*> current_device = nullptr;

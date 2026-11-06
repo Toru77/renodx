@@ -1,4 +1,4 @@
-// forzahorizon6-rr: resolve reconstruct bypass (0x0B33C6D8) - medium RT tier.
+// upscale2x_0x4067B14C: Medium RTGI_Upscale2x guided resolve bypass.
 //
 // Original: 16x8 pass over a 6x10 shared-memory tile that upsamples the
 // half-res radiance pair (t22/t23) to the full-res resolve feed by blending

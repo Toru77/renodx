@@ -1,4 +1,5 @@
-// forzahorizon6-rr: spatial resolve, raw current-frame port (0x596D3E8F / 0x4DAF8A48).
+// forzahorizon6-rr: current-frame spatial reconstruction used by the RTGI
+// temporal-filter replacements (High 0xAF4E3D44; Medium 0x95FA8898).
 //
 // Faithful port of the original pass's per-pixel paths with all cross-frame
 // state removed: the material single-sample path and the 3x3 normal/depth-
@@ -11,8 +12,8 @@
 // Two compile variants share this body:
 //   - raw (FH6_SPATIAL_BOTH = 0): the current-frame 3x3 reconstruction. No
 //     wrapper uses it at present.
-//   - centre-only (FH6_SPATIAL_BOTH = 1, used by 0x596D3E8F_both and
-//     0x4DAF8A48_both): each pixel resolves from its own sample alone, with no
+//   - centre-only (FH6_SPATIAL_BOTH = 1, used by both tier replacements): each
+//     pixel resolves from its own sample alone, with no
 //     spatial neighbourhood and no cross-frame state.
 
 #ifndef FH6_SPATIAL_BOTH

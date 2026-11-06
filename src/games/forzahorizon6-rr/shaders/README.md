@@ -4,6 +4,10 @@ Decompiled from the game (DXIL). Identification below is by behavior; shader
 names are mostly stripped, but some semantic/interpolant names survive in the
 decompiled HLSL (e.g. `MOTIONBLUR_POS`, `WORLDPOS`, `DAMAGEIMPACT`).
 
+This inventory describes the historical offline dump corpus. Its hashes are
+not the current live DevKit IDs; see `../README.md` and `../ssr/README.md` for
+the current pass names and hashes.
+
 ## Sources
 
 - `F:\SteamLibrary\steamapps\common\ForzaHorizon6\renodx-dev\dump\decompiled_all\`
@@ -140,8 +144,9 @@ candidate (T0). The rest of the 615 variants stay in the scan corpus.
 
 ## ssr/ — screen-space reflections
 
-No confirmed SSR shader yet. There is no `reflect()`-based march anywhere in
-the corpus. See `../ssr/README.md` for the hunt plan (deprioritized for now).
+The offline corpus has no confirmed SSR shader or `reflect()`-based march.
+Live DevKit capture has since confirmed the current SSR passes; see
+`../ssr/README.md` for those live IDs.
 
 ## infra/ — plumbing
 

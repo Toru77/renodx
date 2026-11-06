@@ -1,11 +1,7 @@
-// forzahorizon6-rr: reflection resolve gather bypass (0x209AB6A4).
+// spatialfilter_0x480011D5: RTGI_SpatialFilter_Disk bypass.
 //
-// Original: 4-tap stochastic gather over the radiance history pair (t22/t23)
-// with per-tap reprojection, normal/depth rejection and weight normalization.
-// This replacement writes the pixel's own samples straight through, using the
-// original's own "all four taps rejected" fallback outputs and its exact
-// depth-guard (including the original hash-jittered sampling coordinate).
-// Bindings, the thread -> pixel swizzle and the guard math are kept as-is.
+// This replacement forwards the current radiance pair while preserving the
+// target's depth guard, hash-jittered sampling coordinate, and thread swizzle.
 
 cbuffer cb : register(b0, space36)
 {

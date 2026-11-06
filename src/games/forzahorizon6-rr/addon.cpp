@@ -7,8 +7,9 @@
  * Requests DLSS Ray Reconstruction at slInit (restart required for the plugin
  * to load), loads it at runtime if needed, and replaces the game's DLSS SR with
  * DLSS-RR. RR receives the game's real G-buffer guides. On Medium and High
- * RTGI the game's resolve denoisers are bypassed so RR gets the raw ray signal;
- * on Low the game's own resolve feeds RR. One switch drives the whole feature.
+ * RTGI the game's denoising stages are bypassed so RR gets the current-frame
+ * ray signal; on Low the game's own resolve feeds RR. Separate optional
+ * switches control the identified SSR cleanup passes.
  */
 
 #define ImTextureID ImU64
@@ -35,6 +36,11 @@ namespace {
 // redirect and the resolve bypasses. RR runs at any RTGI tier; only the
 // raw-signal bypasses require Medium or High RTGI (see below).
 float rr_enable_setting = 1.f;
+
+// These controls skip only the identified SSR cleanup/filter passes. They are
+// independent of the DLSS-RR switch and default to the game's original output.
+float disable_ssr_checkerboard_tidy_setting = 0.f;
+float disable_ssr_mip_filtering_setting = 0.f;
 
 // DLSSD preset values for the D/E/F slider. Streamline marks A-C deprecated
 // and documents F onwards as "reverts to default", so only D (default
@@ -63,7 +69,7 @@ float rr_responsivity_setting = 0.f;
 float rr_responsivity_auto_setting = 0.f;
 
 // RTGI tier detection. The bind hook arms the tier's bound flag whenever the
-// game binds that tier's spatial filter; each present consumes it. Frame
+// game binds that tier's denoiser filter; each present consumes it. Frame
 // generation presents frames the game never rendered, so a single miss must
 // not drop the tier: detection only falls back after kGiMissLimit consecutive
 // missed presents, which still reacts quickly when the player leaves the tier.
@@ -87,9 +93,9 @@ bool RrActive() {
 }
 
 // Applies the whole "RR on/off" bundle. On Medium and High RTGI the game's
-// resolve denoisers are bypassed so RR receives the raw ray signal; on Low the
-// game's own resolve feeds RR and the bypasses stay off. The stochastic gather
-// is shared by both raw tiers.
+// denoising stages are bypassed so RR receives the current-frame signal; on Low
+// the game's own resolve feeds RR and those bypasses stay off. The High
+// pointwise resolve is replaced with equivalent math whenever High is active.
 void ApplyRrState() {
   const bool active = RrActive();
   const bool bypass_high = active && high_gi.active;
@@ -114,10 +120,11 @@ void ApplyRrState() {
     responsivity::value.store(rr_responsivity_setting);
   }
   guides::enabled.store(active);
-  denoise::SetEnabled(denoise::kSpatialHighHash, bypass_high);
-  denoise::SetEnabled(denoise::kSpatialMediumHash, bypass_medium);
-  denoise::SetEnabled(denoise::kReconMediumHash, bypass_medium);
-  denoise::SetEnabled(denoise::kGatherHash, bypass_high || bypass_medium);
+  denoise::SetEnabled(denoise::kTemporalFilterHighHash, bypass_high);
+  denoise::SetEnabled(denoise::kResolveHighHash, bypass_high);
+  denoise::SetEnabled(denoise::kTemporalFilterMediumHash, bypass_medium);
+  denoise::SetEnabled(denoise::kUpscale2xMediumHash, bypass_medium);
+  denoise::SetEnabled(denoise::kSpatialFilterDiskHash, bypass_high || bypass_medium);
 }
 
 renodx::utils::settings::Settings settings = {
@@ -130,6 +137,36 @@ renodx::utils::settings::Settings settings = {
         .section = "Ray Reconstruction",
         .tooltip = "Intercepts the game's DLSS SR then replaces with RR.",
         .on_change_value = [](float, float) { ApplyRrState(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DisableSsrCheckerboardTidy",
+        .binding = &disable_ssr_checkerboard_tidy_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Disable SSR checkerboard cleanup",
+        .section = "SSR Denoising",
+        .tooltip =
+            "Skips the in-place neighbor clamp in "
+            "SSR_FullScreen_TidyCheckerboard_Rough_MipFiltered (0x313E9A06).",
+        .on_change_value = [](float, float value) {
+          denoise::SetEnabled(denoise::kSsrCheckerboardTidyHash, value != 0.f);
+        },
+        .is_visible = [] { return false; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DisableSsrMipFiltering",
+        .binding = &disable_ssr_mip_filtering_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Disable SSR roughness-mip filtering",
+        .section = "SSR Denoising",
+        .tooltip =
+            "Replaces the horizontal and vertical 9-tap SSR roughness-mip blur "
+            "passes (0xF0DE4E22 and 0x24848E0B) with direct copies.",
+        .on_change_value = [](float, float value) {
+          denoise::SetEnabled(denoise::kSsrFilterMipHorizontalHash, value != 0.f);
+        },
+        .is_visible = [] { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "RrHighGiNotice",
@@ -270,9 +307,9 @@ renodx::utils::settings::Settings settings = {
     },
 };
 
-// Arms tier detection when the game binds a tier's spatial filter. Only the
-// flags are set here; RR state changes on the next present, outside the
-// command-recording thread.
+// Arms tier detection from the current High temporal filter or Resolve, and
+// the current Medium temporal filter. Only flags are set here; RR state
+// changes on the next present, outside the command-recording thread.
 void OnBindPipeline(
     reshade::api::command_list* cmd_list,
     reshade::api::pipeline_stage stage,
@@ -281,10 +318,11 @@ void OnBindPipeline(
   if (!renodx::utils::bitwise::HasFlag(stage, reshade::api::pipeline_stage::compute_shader)) return;
   renodx::utils::pipeline::GetPipelineInfo(pipeline, [](const renodx::utils::pipeline::PipelineInfo& info) {
     for (const auto& shader : info.shader_details) {
-      if (shader.shader_hash == denoise::kSpatialHighHash) {
+      if (shader.shader_hash == denoise::kTemporalFilterHighHash
+          || shader.shader_hash == denoise::kResolveHighHash) {
         high_gi.bound.store(true);
       }
-      if (shader.shader_hash == denoise::kSpatialMediumHash) {
+      if (shader.shader_hash == denoise::kTemporalFilterMediumHash) {
         medium_gi.bound.store(true);
       }
     }
@@ -300,7 +338,7 @@ void PollTier(TierDetection& tier, const char* name, const char* hash) {
     if (!tier.active) {
       tier.active = true;
       if (guides::DiagGuidesEnabled()) {
-        guides::LogEvent(std::string(name) + " spatial filter " + hash + " detected");
+        guides::LogEvent(std::string(name) + " RTGI pipeline " + hash + " detected");
       }
       ApplyRrState();
     }
@@ -332,12 +370,12 @@ void OnPresent(
   // The bind hook arms the flags during this frame's dispatches. A miss is only
   // a frame-generation gap or a transition, so require a run of them before
   // letting go of a tier.
-  PollTier(high_gi, "High-RTGI", "0x4DAF8A48");
-  PollTier(medium_gi, "Medium-RTGI", "0x596D3E8F");
+  PollTier(high_gi, "High-RTGI", "temporalfilter_0xAF4E3D44 / resolve_0x019CE131");
+  PollTier(medium_gi, "Medium-RTGI", "temporalfilter_0x95FA8898");
   if (!high_gi.active && !medium_gi.active
       && high_gi.presents_without >= kGiMissLimit && !warned_no_gi) {
     warned_no_gi = true;
-    sl_rr::LogWarn("no Medium/High-RTGI spatial pipeline bound; resolve"
+    sl_rr::LogWarn("no Medium/High-RTGI filter or resolve pipeline bound; resolve"
                    " bypasses stay off");
   }
 }
@@ -393,6 +431,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     sl_rr::SetInitInjection(true);
     // RR loads immediately; the resolve bypasses wait for High RTGI detection.
     ApplyRrState();
+    // on_change_value only fires on edits, so apply saved SSR switches here.
+    denoise::SetEnabled(
+        denoise::kSsrCheckerboardTidyHash,
+        disable_ssr_checkerboard_tidy_setting != 0.f);
+    denoise::SetEnabled(
+        denoise::kSsrFilterMipHorizontalHash,
+        disable_ssr_mip_filtering_setting != 0.f);
     // Apply the saved debug-logging state; on_change_value only fires on edits.
     guides::SetDiagnostics(rr_debug_log_setting != 0.f);
     int preset_index = static_cast<int>(rr_preset_setting);
