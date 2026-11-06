@@ -67,6 +67,7 @@ static const std::unordered_map<std::string_view, std::string_view> kSectionCate
     {"Character SSGI", "Character"},
     {"Character Shadowing", "Character"},
     {"Character Outline", "Character"},
+    {"Hero Light", "Character"},
     {"Custom TAA", "Anti-Aliasing"},
     {"Depth of Field", "Post Processing"},
     {"Motion Blur", "Post Processing"},

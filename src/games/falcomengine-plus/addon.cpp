@@ -12,6 +12,7 @@
 
 #include <embed/shaders.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -45,6 +46,7 @@
 #include "./world/rr/rr_state.hpp"
 #include "./world/bvh/deform_probe.hpp"  // native D3D11 event query (DynCube validity readback poll)
 #include "./world/bvh/gpu_timer.hpp"  // GpuTimer (Dynamic Cubemaps GPU Timing Log)
+#include "./kai_hero_light.hpp"  // Kai hero light: matches and zeroes the hero light in mapped light records
 
 namespace {
 
@@ -957,6 +959,9 @@ static bool IsGtvbaoComputeDebug(int mode) { return mode >= 22 && mode <= 38; }
 
 using GTVBAODescriptorTableSet =
     std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount>;
+
+// Set by the "Hero Light Toggle" overlay setting: 1 patches the Kai hero light in the mapped light buffer.
+static float g_kai_hero_light_toggle = 0.f;
 
 struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t working_width = 0u;
@@ -5572,6 +5577,19 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+        .key = "KaiHeroLightToggle",
+        .binding = &g_kai_hero_light_toggle,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Hero Light Toggle",
+        .section = "Hero Light",
+        .tooltip = "Zeroes the color of the Kai hero (main character) light while it is matched by the light table.",
+        .labels = {"Off", "On"},
+        .on_change = []() {
+        if (g_kai_hero_light_toggle < 0.5f) falcom_world::kai::ResetKaiHeroLight(); },
+        .is_visible = []() { return IsKai(); },
+    },
+    new renodx::utils::settings::Setting{
       .value_type = renodx::utils::settings::SettingValueType::BUTTON,
       .label = "Reset All Settings to Defaults",
       .section = "Settings",
@@ -6580,6 +6598,60 @@ static inline uint64_t WatchdogNowMs() {
 }
 
 // -- Present hook --
+
+// t11 (dynamicLights_g) of the current Kai lighting draw. The hero light patch works on the records mapped on this buffer.
+static std::atomic_uint64_t g_kai_lights_resource{0u};
+
+static void OnKaiHeroMapBuffer(reshade::api::device*, reshade::api::resource resource, uint64_t, uint64_t size,
+                               reshade::api::map_access, void** data) {
+  if (g_kai_hero_light_toggle > 0.5f && resource.handle == g_kai_lights_resource.load(std::memory_order_relaxed)) {
+    falcom_world::kai::g_kai_hero_light.mapped = *data;
+    falcom_world::kai::g_kai_hero_light.mapped_bytes = std::min<uint64_t>(size, falcom_world::kai::kHeroLightBufferBytes);
+  }
+}
+
+static void OnKaiHeroUnmapBuffer(reshade::api::device* device, reshade::api::resource resource) {
+  auto& hero = falcom_world::kai::g_kai_hero_light;
+  if (hero.mapped != nullptr && resource.handle == g_kai_lights_resource.load(std::memory_order_relaxed)) {
+    auto* lights = static_cast<falcom_world::rtgi::LightParamCpu*>(hero.mapped);
+    const size_t count = (std::min)(hero.mapped_bytes / sizeof(falcom_world::rtgi::LightParamCpu),
+                                    falcom_world::kai::kHeroLightCount);
+    auto* d = device->get_private_data<DeviceData>();
+    if (d != nullptr) {
+      // Matching reads only the copy; the copy is taken before the patch below writes the mapped records.
+      std::memcpy(hero.copy.data(), lights, count * sizeof(falcom_world::rtgi::LightParamCpu));
+      const bool new_frame = d->frame_index != hero.evaluated_frame;
+      if (new_frame) {
+        hero.evaluated_frame = d->frame_index;
+        hero.max_maps_per_frame = (std::max)(hero.max_maps_per_frame, hero.maps_in_frame);
+        hero.maps_in_frame = 0u;
+      }
+      ++hero.maps_in_frame;
+      const auto eval_start = std::chrono::steady_clock::now();
+      falcom_world::kai::EvaluateKaiHeroLights(hero.copy.data(), count, new_frame);
+      hero.eval_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - eval_start).count());
+      hero.patched = falcom_world::kai::PatchKaiHeroLights(lights, count);
+      const auto now = std::chrono::steady_clock::now();
+      if (now - hero.last_log >= std::chrono::seconds(1)) {
+        hero.last_log = now;
+        std::ostringstream latched;
+        uint32_t listed = 0u;
+        for (size_t c = 0; c < falcom_world::kai::kHeroConfigCount && listed < 4u; ++c) {
+          if (hero.latched_index[c] >= 0) {
+            latched << (listed != 0u ? "," : "") << falcom_world::kai::kKaiPlayerLightTable[c].config_id << "@" << hero.latched_index[c];
+            ++listed;
+          }
+        }
+        if (listed == 0u) latched << "none";
+        renodx::utils::log::i("[kai-hero] latched=", latched.str(), " patched=", hero.patched, " eval_us=", hero.eval_us,
+                              " maps_per_frame_max=", hero.max_maps_per_frame);
+        hero.max_maps_per_frame = 0u;
+      }
+    }
+    hero.mapped = nullptr;
+  }
+}
 
 static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchain* sc,
                        const reshade::api::rect*, const reshade::api::rect*,
@@ -10037,6 +10109,18 @@ static void OnDrawnLightingShader(reshade::api::command_list* cmd_list) {
 
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // IMPORTANT: returning false would BYPASS the draw (skip it entirely).
+  if (IsKai() && g_kai_hero_light_toggle > 0.5f) {
+    auto* context11 = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());  // NOLINT(performance-no-int-to-ptr)
+    ID3D11ShaderResourceView* srv = nullptr;
+    if (context11 != nullptr) context11->PSGetShaderResources(falcom_world::rtgi::kLightingLightsRegister, 1, &srv);
+    if (srv != nullptr) {
+      ID3D11Resource* resource = nullptr;
+      srv->GetResource(&resource);
+      g_kai_lights_resource.store(reinterpret_cast<uintptr_t>(resource), std::memory_order_relaxed);
+      if (resource != nullptr) resource->Release();
+      srv->Release();
+    }
+  }
   shader_injection.gtvbao_debug_view = (float)ActiveGtvbaoDebugMode();
   shader_injection.gtvbao_dedicated_bound = 0.f;
   shader_injection.gtvbao_vbgi_bound = 0.f;
@@ -13922,6 +14006,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
+      reshade::register_event<reshade::addon_event::map_buffer_region>(OnKaiHeroMapBuffer);
+      reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnKaiHeroUnmapBuffer);
       reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsRCAS);
@@ -13937,6 +14023,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+      reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnKaiHeroMapBuffer);
+      reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnKaiHeroUnmapBuffer);
       reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsRCAS);
