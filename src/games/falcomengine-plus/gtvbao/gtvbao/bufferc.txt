@@ -1,3 +1,4 @@
+
 /*
     This work is licensed under a dual license, public domain and MIT, unless noted otherwise. Choose the one that best suits your needs:
     
@@ -64,14 +65,16 @@
    #endif
 #endif
 
-// #define USE_ANALYTICAL_RAYCASTING
+#define USE_ANALYTICAL_RAYCASTING
 
 // use this to compare against the orignal VBAO implementation (generally too bright)
 // #define USE_ORIGINAL_VBAO_IF_UNIFORM_HEMISHPHERE_WEIGHTING_IS_ACTIVE
 
 const float Raymarching_SampleCount = 32.0;
 const float Raymarching_Width = 512.0;
-const float Thickness = 0.5;
+const float BaseThickness = 0.2;
+const float OccluderThicknessScale = 1.0;
+const float OccluderCosAngleToScreenLimit = 0.9;
 
 //==================================================================================//
 ////////////////////////////////////////////////////////////////////////////////////// 
@@ -338,17 +341,10 @@ vec4 GetQuaternion(vec3 from, vec3 to)
 
 vec4 GetQuaternion(vec3 to)
 {
-#if 1
-    //vec3 from = vec3(0.0, 0.0,-1.0);
-
-    vec3 xyz = vec3( to.y,-to.x, 0.0);// cross(from, to);
-    float s  =                  -to.z;//   dot(from, to);
-#else
     //vec3 from = vec3(0.0, 0.0, 1.0);
 
     vec3 xyz = vec3(-to.y, to.x, 0.0);// cross(from, to);
     float s  =                   to.z;//   dot(from, to);
-#endif
 
     float u = inversesqrt(max(0.0, s * 0.5 + 0.5));// rcp(cosine half-angle formula)
     
@@ -453,27 +449,8 @@ vec4 Rnd01x4(vec2 uv, uint n)
 
     vec4 rnd01 = vec4(0.0);
     
-  #if GTVBAO_SLICE_SAMPLING_MODE == 1 || GTVBAO_SLICE_SAMPLING_MODE == 3
-    
-   #ifdef GTVBAO_USE_WHITE_NOISE
-    rnd01.xzw = Hash01x3(uvec3(uvu, n), 0x9CF617FAu);
-   #else
-    rnd01.x  = BlueNoise01  (uvu, n);
-  //rnd01.x  = IGN(floor(uv), n);
-  //rnd01.y  = unused
-    rnd01.zw = BlueNoise01x4(uvu, n).zw;
-   #endif
-    
-  #elif GTVBAO_SLICE_SAMPLING_MODE == 2
-        
-   #ifdef GTVBAO_USE_WHITE_NOISE
-    rnd01 = Hash01x4(uvec3(uvu, n), 0x9CF617FAu);
-   #else
     rnd01   = BlueNoise01x4(uvu, n);
     rnd01.x = BlueNoise01  (uvu, n);
-   #endif
-   
-  #endif
     
     return rnd01;
 }
@@ -716,6 +693,9 @@ float GTVBAO(vec2 uv0, vec3 wpos, vec3 N, uint dirCount)
             
             rnd01.z = 1.0 - rnd01.z;
             
+            vec3 occluderStartingPos = positionVS;
+            vec3 previousPos = positionVS;
+
             for (float i = 0.0; i < count; ++i)
             {
                 vec2 samplePos = rayStart + rayDir * t;
@@ -728,19 +708,35 @@ float GTVBAO(vec2 uv0, vec3 wpos, vec3 N, uint dirCount)
                 float sampleDepth = textureLod(iChannel2, samplePos / Resolution.xy, 0.0).w;
                 
                 vec3 samplePosVS = VPos_from_SPos(vec3(samplePos, sampleDepth));
-
-                vec3 deltaPosFront = samplePosVS - positionVS;
-                vec3 deltaPosBack  = deltaPosFront - V * Thickness;
                 
-               #if 1
+                float occluderScale = pow(2.0, 2.f*rnd01.y-1.0);
+                
+                vec3 deltaPrevPos = samplePosVS - previousPos;
+                deltaPrevPos.xy *= occluderScale;
+                
+                bool resetOccluder = abs(dot(normalize(deltaPrevPos), V)) > OccluderCosAngleToScreenLimit;
+                
+                if (resetOccluder)
+                    occluderStartingPos = samplePosVS;
+                
+                previousPos = samplePosVS;
+                
+                float thickness = occluderScale*(BaseThickness + OccluderThicknessScale*length(samplePosVS - occluderStartingPos));
+                
+                             
+                vec3 deltaPosFront = samplePosVS - positionVS;
+                vec3 deltaPosBack  = deltaPosFront - V * thickness;
+                vec3 deltaPosBackOccluder  = occluderStartingPos - positionVS - V * thickness;
+             
+               #if 0
                 // required for correctness, but probably not worth to keep active in a practical application:
                 if(isPerspectiveCam)
                 {
                    #if 1
-                    deltaPosBack = VPos_from_SPos(vec3(samplePos, sampleDepth + Thickness)) - positionVS;
+                    deltaPosBack = VPos_from_SPos(vec3(samplePos, sampleDepth + BaseThickness*length(samplePosVS - occluderStartingPos))) - positionVS;
                    #else
                     // also valid, but not consistent with reference ray marcher
-                    deltaPosBack = deltaPosFront + normalize(samplePosVS) * Thickness;
+                    deltaPosBack = deltaPosFront + normalize(samplePosVS) * BaseThickness*length(samplePosVS - occluderStartingPos);
                    #endif
                 }
                #endif
@@ -748,6 +744,9 @@ float GTVBAO(vec2 uv0, vec3 wpos, vec3 N, uint dirCount)
                 // project samples onto unit circle and compute angles relative to V
                 vec2 horCos = vec2(dot(normalize(deltaPosFront), V), 
                                    dot(normalize(deltaPosBack ), V));
+                                   
+                float occluderBackAngle = dot(normalize(deltaPosBackOccluder), V);
+                horCos.y = min(occluderBackAngle, horCos.y);
 
                 vec2 horAng = ACos(horCos) * d;
 
