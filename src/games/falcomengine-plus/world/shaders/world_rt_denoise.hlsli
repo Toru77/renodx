@@ -37,10 +37,15 @@ float TemporalNormalWeight(float tap_dot, float normal_rejection)
 }
 
 // Spatial edge stop of a tap (Pt, Nt) against the centre (Pc, Nc, dist_c): depth-plane distance and normal dot.
-float FilterPlaneNormalWeight(float3 Pc, float3 Nc, float dist_c, float3 Pt, float3 Nt)
+float FilterPlaneNormalWeight(float3 Pc, float3 Nc, float dist_c, float3 Pt, float3 Nt, float plane_sigma, float normal_power)
 {
-    const float plane = dot(Nc, Pt - Pc) / (kFilterPlaneSigma * dist_c);
-    return exp(-0.5 * plane * plane) * pow(saturate(dot(Nc, Nt)), kFilterNormalPower);
+    if (plane_sigma == kFilterPlaneSigma && normal_power == kFilterNormalPower)
+    {
+        const float plane = dot(Nc, Pt - Pc) / (kFilterPlaneSigma * dist_c);
+        return exp(-0.5 * plane * plane) * pow(saturate(dot(Nc, Nt)), kFilterNormalPower);
+    }
+    const float plane = dot(Nc, Pt - Pc) / (max(plane_sigma, 1e-6) * dist_c);
+    return exp(-0.5 * plane * plane) * pow(saturate(dot(Nc, Nt)), max(normal_power, 0.0));
 }
 
 // Separable Gaussian sigma (pixels) of a Filter Radius: radius / 2, at least kFilterMinSigma.

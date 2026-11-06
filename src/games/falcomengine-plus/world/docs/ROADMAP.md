@@ -84,6 +84,14 @@ GTVBAO perf P5 (CDF hoist, edge metric skip, full-mask stop), implemented, not v
 5. FPS against HEAD.
 Send back: screenshots and FPS against HEAD.
 
+GTVBAO/GTVBGI upsample controls, implemented, not validated in game: the new advanced-only sections select the current 2x2 joint-bilateral filter, bilinear, nearest valid, or a 4x4 Gaussian joint-bilateral filter. Depth Plane Sigma defaults to 0.02, Normal Edge Power to 16, Bilinear Weight Sharpness to 1, and Nearest Valid Fallback to On; the current algorithm and these defaults preserve the existing reconstruction. At d = 1 all algorithms use the existing pass-through path. GTVBAO disables its mode-2 unread-texel optimization for the wider filter because it reads beyond the current 2x2 footprint. Other RT denoise-chain consumers retain the current algorithm and edge-weight defaults. Owner test list (Sora 1st, Sora 2nd and Kai where each effect runs):
+1. GTVBAO at Full and Half and GTVBGI at 1/2, 1/4 and 1/8 with all upsample settings at defaults: compare final output to HEAD; no silhouette blocks or missing AO/GI.
+2. Select Bilinear, Nearest Valid and Wider Joint Bilateral at the lower resolutions; check thin geometry, silhouettes, screen edges and the AO/GI debug views.
+3. Sweep Depth Plane Sigma, Normal Edge Power and Bilinear Weight Sharpness through their ranges; toggle Nearest Valid Fallback off and on.
+4. GTVBAO Wider Joint Bilateral with temporal and spatial denoising separately on and off: no missing AO from skipped raw samples.
+5. RTAO, RTGI, RT Local Shadows and RT Sun at defaults: unchanged output and no pipeline or dispatch failures.
+Send back: screenshots, the `[world-rtgi]` and `[gtvbao]` logs, and GPU timing rows for the upsample variants.
+
 SVGF M2b (RTAO), implemented, not validated in game: RTAO pass A writes the trace-size raw AO (r16_float, -1 = not traced) at every Trace Resolution, then the input pass (`world_rtao_svgf_input`), the shared SVGF chain (`EnsureRtgiDenoise` and `DispatchRtgiDenoise`, r32_uint output) and the byte upsample (`gtvbao_svgf_upsample`), in `rtao/rtao_svgf.hpp`. The RTAO rows follow the GTVBAO layout (Temporal Accumulation: History Weight, Depth Rejection, Normal Rejection; Denoising: Spatial Filter, Iterations, Luminance Edge Stop, advanced). Removed: the RTAO temporal, filter and upsample shaders with their pipelines and textures, the History Clamp, Filter Type, Filter Radius, Filter Passes and Filter Taps rows, and the test rows Force Zero Motion and Camera-Matrix Reprojection. RTAO Debug is Off, Raw AO, Denoised AO. Owner test list (Sora 1st, Sora 2nd and Kai where RTAO runs):
 1. RTAO at Full, Half and Quarter, DXR on and off: screenshots of the final image and of Debug Raw AO and Denoised AO against HEAD; no seams and no black or white blocks at silhouettes.
 2. Temporal off, spatial off, both off; Iterations 1 to 5 (the panel shows the effective count).

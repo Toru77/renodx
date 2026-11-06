@@ -710,6 +710,11 @@ static float g_gtvbao_normal_max_darkening  = 1.f;   // cap: 1 = uncapped
 static float g_gtvbao_hemisphere_weighting = 0.f;
 static float g_gtvbao_auto_thickness = 1.f;
 static float g_gtvbao_base_thickness = 0.20f;
+static float g_gtvbao_upscale_algorithm = 3.f;
+static float g_gtvbao_upscale_plane_sigma = 0.02f;
+static float g_gtvbao_upscale_normal_power = 64.f;
+static float g_gtvbao_upscale_bilinear_sharpness = 1.f;
+static float g_gtvbao_upscale_nearest_fallback = 1.f;
 
 // -- Dynamic Cubemaps (Sora 2nd) � standalone t17 replacement --
 constexpr uint32_t kDynCubeRegister = 17u; // t17 texEnvMap_g
@@ -743,6 +748,11 @@ static float g_vbgi_enabled = 0.f;
 static float g_vbgi_quality_level = 2.f;
 static float g_vbgi_resolution = 1.f;
 constexpr int kVbgiMaxResolutionIndex = 3;  // VBGIResolution label count - 1 (1/8)
+static float g_vbgi_upscale_algorithm = 1.f;
+static float g_vbgi_upscale_plane_sigma = 0.02f;
+static float g_vbgi_upscale_normal_power = 16.f;
+static float g_vbgi_upscale_bilinear_sharpness = 1.f;
+static float g_vbgi_upscale_nearest_fallback = 0.f;
 static float g_vbgi_noise_type = 2.f;
 static float g_vbgi_radius = 1.5f;
 static float g_vbgi_bitmask_thickness = 0.30f;
@@ -3563,6 +3573,48 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
+      .key = "GTVBAOUpscaleAlgorithm", .binding = &g_gtvbao_upscale_algorithm,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 3.f, .label = "Reconstruction", .section = "GTVBAO Upscaling",
+      .tooltip = "Joint Bilateral (Current) preserves the existing 2x2 depth and normal aware filter. Bilinear is smoother but can bleed across edges. Nearest Valid selects one edge-aware tap and can look blocky. Wider Joint Bilateral uses a 4x4 footprint and costs more. All modes pass through at native resolution.",
+      .labels = {"Joint Bilateral (Current)", "Bilinear", "Nearest Valid", "Wider Joint Bilateral"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOUpscalePlaneSigma", .binding = &g_gtvbao_upscale_plane_sigma,
+      .default_value = 0.02f, .label = "Depth Plane Sigma", .section = "GTVBAO Upscaling",
+      .tooltip = "Current value 0.02. Higher values allow more blending across depth-plane differences; lower values preserve depth edges more strongly and may leave gaps.",
+      .min = 0.005f, .max = 0.10f, .format = "%.3f",
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOUpscaleNormalPower", .binding = &g_gtvbao_upscale_normal_power,
+      .default_value = 64.f, .label = "Normal Edge Power", .section = "GTVBAO Upscaling",
+      .tooltip = "Current value 16. Higher values reject taps with different surface normals more strongly; lower values blend across normal edges more.",
+      .min = 1.f, .max = 64.f, .format = "%.0f",
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOUpscaleBilinearSharpness", .binding = &g_gtvbao_upscale_bilinear_sharpness,
+      .default_value = 1.f, .label = "Bilinear Weight Sharpness", .section = "GTVBAO Upscaling",
+      .tooltip = "1.0 keeps the current spatial weights. Higher values favor the strongest tap and look sharper; lower values spread weight more evenly. Used by Joint Bilateral, Bilinear and Nearest Valid.",
+      .min = 0.5f, .max = 4.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_upscale_algorithm < 2.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOUpscaleNearestFallback", .binding = &g_gtvbao_upscale_nearest_fallback,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Nearest Valid Fallback", .section = "GTVBAO Upscaling",
+      .tooltip = "When all joint-bilateral taps are rejected by the edge weights, use the valid tap with the strongest spatial weight. Off leaves neutral AO at that pixel.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "GTVBAONoiseType", .binding = &shader_injection.gtvbao_noise_type,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 2.f, .label = "Noise Type", .section = "GTVBAO",
@@ -3889,6 +3941,48 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Full", "1/2", "1/4", "1/8"},
       .min = 1.f,  // index = log2 divisor; Full (0) is hidden and a saved 0 loads as 1/2
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIUpscaleAlgorithm", .binding = &g_vbgi_upscale_algorithm,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Reconstruction", .section = "GTVBGI Upscaling",
+      .tooltip = "Joint Bilateral (Current) preserves the existing 2x2 depth and normal aware filter. Bilinear is smoother but can bleed across edges. Nearest Valid selects one edge-aware tap and can look blocky. Wider Joint Bilateral uses a 4x4 footprint and costs more. All modes pass through at native resolution.",
+      .labels = {"Joint Bilateral (Current)", "Bilinear", "Nearest Valid", "Wider Joint Bilateral"},
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIUpscalePlaneSigma", .binding = &g_vbgi_upscale_plane_sigma,
+      .default_value = 0.02f, .label = "Depth Plane Sigma", .section = "GTVBGI Upscaling",
+      .tooltip = "Current value 0.02. Higher values allow more blending across depth-plane differences; lower values preserve depth edges more strongly and may leave gaps.",
+      .min = 0.005f, .max = 0.10f, .format = "%.3f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && (g_vbgi_upscale_algorithm < 0.5f || g_vbgi_upscale_algorithm > 1.5f); },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIUpscaleNormalPower", .binding = &g_vbgi_upscale_normal_power,
+      .default_value = 16.f, .label = "Normal Edge Power", .section = "GTVBGI Upscaling",
+      .tooltip = "Current value 16. Higher values reject taps with different surface normals more strongly; lower values blend across normal edges more.",
+      .min = 1.f, .max = 64.f, .format = "%.0f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && (g_vbgi_upscale_algorithm < 0.5f || g_vbgi_upscale_algorithm > 1.5f); },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIUpscaleBilinearSharpness", .binding = &g_vbgi_upscale_bilinear_sharpness,
+      .default_value = 1.f, .label = "Bilinear Weight Sharpness", .section = "GTVBGI Upscaling",
+      .tooltip = "1.0 keeps the current spatial weights. Higher values favor the strongest tap and look sharper; lower values spread weight more evenly. Used by Joint Bilateral, Bilinear and Nearest Valid.",
+      .min = 0.5f, .max = 4.f, .format = "%.2f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_upscale_algorithm < 2.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIUpscaleNearestFallback", .binding = &g_vbgi_upscale_nearest_fallback,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Nearest Valid Fallback", .section = "GTVBGI Upscaling",
+      .tooltip = "When all joint-bilateral taps are rejected by the edge weights, use the valid tap with the strongest spatial weight. Off leaves black at that pixel.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && (g_vbgi_upscale_algorithm < 0.5f || g_vbgi_upscale_algorithm > 1.5f); },
       .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
@@ -13527,7 +13621,8 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         {{}, 0, 0, 2, reshade::api::descriptor_type::texture_unordered_access_view, main_uavs},
     };
     GtvbaoApplyDescriptors(dev, cl, d->main_layout, &d->main_tables, 4, u);
-    auto pc = BuildGTVBAOPushConstants(d, {.final_pass = false, .foliage_mask_valid = foliage_mask_valid, .skip_unread = (ready.reproject ? 1 : 2), .full_width = full_w, .full_height = full_h, .divisor = divisor});
+    // The 4x4 reconstruction reads trace pixels beyond the default 2x2 footprint, so keep those AO samples traced.
+    auto pc = BuildGTVBAOPushConstants(d, {.final_pass = false, .foliage_mask_valid = foliage_mask_valid, .skip_unread = (ready.reproject ? 1 : (low_res && g_gtvbao_upscale_algorithm > 2.5f ? 0 : 2)), .full_width = full_w, .full_height = full_h, .divisor = divisor});
     cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
   }
   cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
@@ -13572,7 +13667,12 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
                                .luminance_weights = rtgi::kSvgfLuminanceAo,
                                .upsample_intensity = 1.f,
                                .upsample_char_intensity = 1.f,
-                               .upsample_saturation = 1.f},
+                               .upsample_saturation = 1.f,
+                               .upsample = {.algorithm = g_gtvbao_upscale_algorithm,
+                                            .depth_plane_sigma = g_gtvbao_upscale_plane_sigma,
+                                            .normal_edge_power = g_gtvbao_upscale_normal_power,
+                                            .bilinear_weight_sharpness = g_gtvbao_upscale_bilinear_sharpness,
+                                            .nearest_valid_fallback = g_gtvbao_upscale_nearest_fallback}},
                               ready, &table_nulls);
     dev->update_descriptor_tables(static_cast<uint32_t>(table_nulls.size()), table_nulls.data());
   }
@@ -13984,7 +14084,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
   {
     namespace rtgi = falcom_world::rtgi;
     namespace rtao = falcom_world::rtao;
-    // GTVBGI's upsample: world_rtgi_upsample built with the nearest valid tap fallback (vbgi_upsample.cs_5_0.hlsl).
+    // GTVBGI's upsample uses the shared reconstruction modes and runtime-controlled nearest-valid fallback.
     static constexpr rtgi::RtgiPipelineDesc kVbgiUpsamplePipelineDesc = {
         .srv_count = rtgi::kRtgiUpsampleSrvCount, .uav_count = rtgi::kRtgiUpsampleUavCount, .sampler_count = 0u, .push_count = rtgi::kRtgiUpsamplePushCount, .code = __vbgi_upsample, .name = "vbgi upsample"};
     const uint32_t divisor = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex);
@@ -14044,28 +14144,33 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
         const bool vbgi_conf = VbgiGtvbaoDebugMode() == 34 && d->debug_uav.handle != 0u;
         if (vbgi_conf) GtvbaoBarrier(cl, d->debug_texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
         rtgi::DispatchRtgiDenoise(dev, cl, &d->vbgi_denoise,
-            {.raw_view = far_on ? d->vbgi_far_joint.srv[0] : d->vbgi_raw_srv,
-             .depth_view = d->captured_depth_srv,
-             .mrt_normal_view = d->captured_mrt_normal_srv,
-             .scene_cbv_view = d->captured_scene_cbv_view,
-             .motion_view = d->mb_rtv4_owned_srv,
-             .albedo_view = reshade::api::resource_view{0u},
-             .stats_uav = d->vbgi_stats_uav,
-             .debug_uav = vbgi_conf ? d->debug_uav : reshade::api::resource_view{0u},
-             .debug_texture = d->debug_texture,
-             .trace_width = d->vbgi_width,
-             .trace_height = d->vbgi_height,
-             .full_width = full_w,
-             .full_height = full_h,
-             .divisor = static_cast<float>(divisor),
-             .debug_mode = vbgi_conf ? 5 : 0,
-             .svgf = {g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
-                      reset == rtao::ResetReason::None, g_vbgi_svgf_iterations, g_vbgi_svgf_luminance_edge_stop},
-             .luminance_weights = rtgi::kSvgfLuminanceRgb,
-             .upsample_intensity = 1.f,
-             .upsample_char_intensity = 1.f,
-             .upsample_saturation = 1.f},
-            ready, &table_nulls);
+                                  {.raw_view = far_on ? d->vbgi_far_joint.srv[0] : d->vbgi_raw_srv,
+                                   .depth_view = d->captured_depth_srv,
+                                   .mrt_normal_view = d->captured_mrt_normal_srv,
+                                   .scene_cbv_view = d->captured_scene_cbv_view,
+                                   .motion_view = d->mb_rtv4_owned_srv,
+                                   .albedo_view = reshade::api::resource_view{0u},
+                                   .stats_uav = d->vbgi_stats_uav,
+                                   .debug_uav = vbgi_conf ? d->debug_uav : reshade::api::resource_view{0u},
+                                   .debug_texture = d->debug_texture,
+                                   .trace_width = d->vbgi_width,
+                                   .trace_height = d->vbgi_height,
+                                   .full_width = full_w,
+                                   .full_height = full_h,
+                                   .divisor = static_cast<float>(divisor),
+                                   .debug_mode = vbgi_conf ? 5 : 0,
+                                   .svgf = {g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
+                                            reset == rtao::ResetReason::None, g_vbgi_svgf_iterations, g_vbgi_svgf_luminance_edge_stop},
+                                   .luminance_weights = rtgi::kSvgfLuminanceRgb,
+                                   .upsample_intensity = 1.f,
+                                   .upsample_char_intensity = 1.f,
+                                   .upsample_saturation = 1.f,
+                                   .upsample = {.algorithm = g_vbgi_upscale_algorithm,
+                                                .depth_plane_sigma = g_vbgi_upscale_plane_sigma,
+                                                .normal_edge_power = g_vbgi_upscale_normal_power,
+                                                .bilinear_weight_sharpness = g_vbgi_upscale_bilinear_sharpness,
+                                                .nearest_valid_fallback = g_vbgi_upscale_nearest_fallback}},
+                                  ready, &table_nulls);
         dev->update_descriptor_tables(static_cast<uint32_t>(table_nulls.size()), table_nulls.data());
         d->vbgi_temporal_last = temporal_on && ready.temporal;
         d->vbgi_last_frame = d->frame_index;

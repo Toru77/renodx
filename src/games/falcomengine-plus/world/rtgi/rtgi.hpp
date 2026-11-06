@@ -201,28 +201,37 @@ inline RtgiDenoiseReady EnsureRtgiDenoise(reshade::api::device* device, RtgiDeno
   return {.ok = true, .reproject = reproject_run, .temporal = reproject_run && request.temporal, .spatial = spatial_run};
 }
 
+struct RtgiUpsampleSettings {
+  float algorithm = 0.f;                  // 0 = current joint bilateral, 1 = bilinear, 2 = nearest valid, 3 = wider joint bilateral
+  float depth_plane_sigma = 0.02f;        // current joint-bilateral default
+  float normal_edge_power = 16.f;         // current joint-bilateral default
+  float bilinear_weight_sharpness = 1.f;  // 1 = unchanged bilinear weights
+  float nearest_valid_fallback = 1.f;     // current GTVBAO/GTVBGI fallback behavior
+};
+
 // The inputs of one run of the chain.
 struct RtgiDenoiseInputs {
-  reshade::api::resource_view raw_view;         // trace size, a < 0 = not traced
+  reshade::api::resource_view raw_view;  // trace size, a < 0 = not traced
   reshade::api::resource_view depth_view;
   reshade::api::resource_view mrt_normal_view;
   reshade::api::resource_view scene_cbv_view;
-  reshade::api::resource_view motion_view;      // RTV4 (read only when ready.temporal)
-  reshade::api::resource_view albedo_view;      // upsample t3 (RTGI Debug 7); null for RTLS
-  reshade::api::resource_view stats_uav;        // temporal u1 (stats 20..22)
-  reshade::api::resource_view debug_uav;        // null: no debug view this frame
+  reshade::api::resource_view motion_view;  // RTV4 (read only when ready.temporal)
+  reshade::api::resource_view albedo_view;  // upsample t3 (RTGI Debug 7); null for RTLS
+  reshade::api::resource_view stats_uav;    // temporal u1 (stats 20..22)
+  reshade::api::resource_view debug_uav;    // null: no debug view this frame
   reshade::api::resource debug_texture;
   uint32_t trace_width;
   uint32_t trace_height;
   uint32_t full_width;
   uint32_t full_height;
-  float divisor;                                // trace divisor d (1, 2 or 4)
-  int debug_mode;                               // RTGI numbering: 4 accumulated, 5 history confidence, 6 and 7 upsample views
-  SvgfSettings svgf;                            // SVGF settings of this run (history valid set by the owner)
-  const float* luminance_weights;               // rgb luminance weights of the edge stop (push c3)
-  float upsample_intensity;                     // upsample c1.z (Debug 7 only)
-  float upsample_char_intensity;                // upsample c1.w (Debug 7 only)
-  float upsample_saturation;                    // upsample c2.x; 1 = unchanged
+  float divisor;                   // trace divisor d (1, 2 or 4)
+  int debug_mode;                  // RTGI numbering: 4 accumulated, 5 history confidence, 6 and 7 upsample views
+  SvgfSettings svgf;               // SVGF settings of this run (history valid set by the owner)
+  const float* luminance_weights;  // rgb luminance weights of the edge stop (push c3)
+  float upsample_intensity;        // upsample c1.z (Debug 7 only)
+  float upsample_char_intensity;   // upsample c1.w (Debug 7 only)
+  float upsample_saturation;       // upsample c2.x; 1 = unchanged
+  RtgiUpsampleSettings upsample;   // reconstruction controls; defaults preserve current behavior
 };
 
 struct RtgiDenoiseResult {
@@ -389,7 +398,8 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
       .size = {static_cast<float>(in.full_width), static_cast<float>(in.full_height), static_cast<float>(in.trace_width),
                static_cast<float>(in.trace_height)},
       .params = {in.divisor, static_cast<float>(in.debug_mode), in.upsample_intensity, in.upsample_char_intensity},
-      .extra = {in.upsample_saturation, 0.f, 0.f, 0.f},
+      .extra = {in.upsample_saturation, in.upsample.algorithm, in.upsample.depth_plane_sigma, in.upsample.normal_edge_power},
+      .upscale = {in.upsample.bilinear_weight_sharpness, in.upsample.nearest_valid_fallback, 0.f, 0.f},
   };
   cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, upsample.pipeline);
   const reshade::api::descriptor_table upsample_tables[3] = {upsample.cbv_table, upsample.srv_table, upsample.uav_table};

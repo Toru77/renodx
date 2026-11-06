@@ -104,7 +104,7 @@ inline constexpr float kSvgfLuminanceAo[3] = {1.f, 0.f, 0.f};
 // Upsample: t0 depth, t1 MRT normal, t2 input, t3 G-buffer colour (Debug 7); u0 final GI, u1 debug.
 inline constexpr uint32_t kRtgiUpsampleSrvCount = 4u;
 inline constexpr uint32_t kRtgiUpsampleUavCount = 2u;
-inline constexpr uint32_t kRtgiUpsamplePushCount = 12u;
+inline constexpr uint32_t kRtgiUpsamplePushCount = 16u;
 // Sora 2nd lighting 0xCA3D8596: t11 dynamicLights_g (LightParam) and t12 lightIndices_g (LightIndexData). Copied for the
 // stats request only (rtgi.hpp Dispatch) and read back into world_rtgi_lights.json.
 inline constexpr uint32_t kLightingLightsRegister = 11u;
@@ -236,11 +236,12 @@ static_assert(offsetof(SvgfPushConstants, luminance) == 12 * sizeof(float), "svg
 
 // b12 for the RTGI upsample, matching cbuffer cb_rtgi_upsample in world_rtgi_upsample.cs_5_0.hlsl.
 struct RtgiUpsamplePushConstants {
-  float size[4];      // c0: full width, full height, trace width, trace height
-  float params[4];    // c1: trace divisor, debug mode, GI Intensity, Character GI Intensity (Debug 7)
-  float extra[4];     // c2: GI Saturation, unused, unused, unused
+  float size[4];     // c0: full width, full height, trace width, trace height
+  float params[4];   // c1: trace divisor, debug mode, GI Intensity, Character GI Intensity (Debug 7)
+  float extra[4];    // c2: GI Saturation, algorithm, depth-plane sigma, normal edge power
+  float upscale[4];  // c3: bilinear weight sharpness, nearest-valid fallback, unused, unused
 };
-static_assert(sizeof(RtgiUpsamplePushConstants) == kRtgiUpsamplePushCount * sizeof(float), "upsample b12 must be 12 floats");
+static_assert(sizeof(RtgiUpsamplePushConstants) == kRtgiUpsamplePushCount * sizeof(float), "upsample b12 must be 16 floats");
 
 // b12 for the ReSTIR GI temporal pass, matching cbuffer cb_restir_temporal in world_restir_temporal.cs_5_0.hlsl.
 struct RestirTemporalPushConstants {

@@ -708,7 +708,7 @@ Verification (2026-10-08):
 
 ## GI Saturation (rtgi-gi-sat): implemented, not validated in game
 
-- Setting RtgiSaturation "GI Saturation" (RTGI section): range 0 to 2, default 1. Push constant `u_extra.x` (c2; `RtgiUpsamplePushConstants.extra`, still 12 floats). Not in ParameterSnapshot, so changing it does not reset history.
+- Setting RtgiSaturation "GI Saturation" (RTGI section): range 0 to 2, default 1. Push constant `u_extra.x` (c2; `RtgiUpsamplePushConstants.extra`, in the then-12-float block). Not in ParameterSnapshot, so changing it does not reset history.
 - Where it applies: the RTGI upsample pass (`world_rtgi_upsample.cs_5_0.hlsl`), after denoise, diffuse GI only. The saturation is applied to the value written to g_final, so Debug 6 and 7 show it too. This pass writes no history; the composite reads g_final and Debug 6 and 7 read `gi`, all after saturation.
 - Formula: luma = dot(gi, (0.2126, 0.7152, 0.0722)); gi = max(0, luma + (gi - luma) x S), S = GI Saturation.
 - Off equals HEAD: the branch is skipped at 1, so the image must match HEAD.
