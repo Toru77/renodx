@@ -638,6 +638,7 @@ static bool MotionBlurLogEnabled() { return g_mb_logging > 0.5f; }
 static float g_mb_cs_dispatch_fix = 0.f;
 static float g_capture_perf_log = 0.f;
 static float g_dyncube_gpu_timing = 0.f;  // Dynamic Cubemaps > GPU Timing Log (1/sec): per-step GPU ms in the [DynCube] line
+static float g_dyncube_cs_dispatch_fix = 2.f;
 
 // -- Motion blur quality preset ------------------------------------------------
 // Replaces the raw Max Samples slider. The slider's useful range was narrow, the
@@ -1617,7 +1618,8 @@ static void ApplyComputeDispatchFix(
     renodx::utils::state::CommandListState& prev,
     ComputeDispatchFixMode fix,
     uint32_t srv_count,
-    uint32_t uav_count);
+    uint32_t uav_count,
+    uint32_t buffer_uav_count = 0u);
 // -- Dynamic Cubemaps � forward decls --
 static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uint32_t size);
 static bool CreateDynCubeVariantResources(reshade::api::device* dev, DeviceData* d, uint32_t size, uint32_t mips);
@@ -5080,6 +5082,19 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "DynCubeCSDispatchFix", .binding = &g_dyncube_cs_dispatch_fix,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 2.f, .label = "CS Dispatch Fix", .section = "Dynamic Cubemaps",
+      .tooltip = "Controls compute state cleanup for Dynamic Cubemap and custom SSR dispatches. "
+                 "Off uses the existing compute-slot unbind. "
+                 "Fix 1 restores the previous compute pipeline and descriptor tables. "
+                 "Fix 2 and Fix 3 clear sampler, SRV, texture UAV and buffer UAV slots, "
+                 "then restore the previous pipeline and descriptor tables.",
+      .labels = {"Off", "Fix 1: Restore State", "Fix 2: Null Compute", "Fix 3: Null + Restore"},
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "CustomShaderLogging", .binding = &shader_injection.custom_shader_logging,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Custom Shader Log", .section = "Dynamic Cubemaps",
@@ -6057,7 +6072,8 @@ static void OnPushDescriptorsCapture(
         && views[0].handle != 0u) {
       uint32_t hash = pixel_hash();
       if (IsLightingShader(hash)) {
-        if (d->captured_depth_srv.handle != views[0].handle) {
+        if (d->captured_depth_srv.handle != views[0].handle
+            || !d->captured_depth_live.load(std::memory_order_acquire)) {
           auto info = CSResolveCapture(device, views[0]);
           d->captured_depth_res = info.res;
           d->captured_depth_dims = info.dims;
@@ -6101,7 +6117,8 @@ static void OnPushDescriptorsCapture(
         && views[0].handle != 0u) {
       uint32_t hash = pixel_hash();
       if (IsLightingShader(hash)) {
-        if (d->captured_mrt_normal_srv.handle != views[0].handle) {
+        if (d->captured_mrt_normal_srv.handle != views[0].handle
+            || !d->captured_mrt_live.load(std::memory_order_acquire)) {
           auto info = CSResolveCapture(device, views[0]);
           d->captured_mrt_res = info.res;
           d->captured_mrt_dims = info.dims;
@@ -6148,7 +6165,8 @@ static void OnPushDescriptorsCapture(
         && views[0].handle != 0u) {
       uint32_t hash = pixel_hash();
       if (IsLightingShader(hash)) {
-        if (d->captured_color_srv.handle != views[0].handle) {
+        if (d->captured_color_srv.handle != views[0].handle
+            || !d->captured_color_live.load(std::memory_order_acquire)) {
           auto info = CSResolveCapture(device, views[0]);
           d->captured_color_res = info.res;
           d->captured_color_dims = info.dims;
@@ -6363,7 +6381,8 @@ static void OnPushDescriptorsCapture(
           }
         }
         if (buffer_size != 0u) {
-          if (d->captured_scene_cbv_view.handle != cbv_views[0].handle) {
+          if (d->captured_scene_cbv_view.handle != cbv_views[0].handle
+              || !d->captured_cbv_live.load(std::memory_order_acquire)) {
             CSLog("capture", std::string("cbv handle -> buf:") + std::to_string(buffer_size));
             d->captured_cbv_res = buf.handle;
             d->captured_cbv_dims = std::string("buf:") + std::to_string(buffer_size);
@@ -6509,7 +6528,8 @@ static void ApplyComputeDispatchFix(
     renodx::utils::state::CommandListState& prev,
     ComputeDispatchFixMode fix,
     uint32_t srv_count,
-    uint32_t uav_count) {
+    uint32_t uav_count,
+    uint32_t buffer_uav_count) {
   if (fix == ComputeDispatchFixMode::OFF) {
     cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
     if (cs) *cs = prev;
@@ -6542,6 +6562,12 @@ static void ApplyComputeDispatchFix(
       cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
                                  reshade::api::pipeline_layout{0}, 0,
                                  reshade::api::descriptor_table_update{{}, i, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &null_uav});
+    for (uint32_t i = 0; i < buffer_uav_count; ++i) {
+      cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
+                                 reshade::api::pipeline_layout{0}, 0,
+                                 reshade::api::descriptor_table_update{{}, i, 0, 1,
+                                     reshade::api::descriptor_type::buffer_unordered_access_view, &null_uav});
+    }
   }
 
   // Restore previous compute descriptor tables (if any were bound)
@@ -6731,7 +6757,8 @@ static std::thread s_watchdogThread;
 static bool s_watchdogStarted = false;
 
 // Render-thread region tracking: the watchdog reports where a stalled present stopped.
-// 1=entry 2=liveness-resolver 3=recreate 4=deferred-dispatch; 0=idle (between presents).
+// 1=entry 2=liveness-resolver 3=recreate 4=deferred-dispatch, 5=DynCube recreate,
+// 6=resource-size resolve, 7=GTVBAO recreate; 0=idle (between presents).
 // RAII scope resets to idle on EVERY return path so a stale region can never mislead.
 static std::atomic<int> s_presentRegion{0};
 static const char* PresentRegionName(int r) {
@@ -6740,6 +6767,9 @@ static const char* PresentRegionName(int r) {
     case 2: return "resolver";
     case 3: return "recreate";
     case 4: return "deferred";
+    case 5: return "DynCube recreate";
+    case 6: return "resource-size resolve";
+    case 7: return "GTVBAO recreate";
     default: return "idle";
   }
 }
@@ -7021,6 +7051,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   // is a single set regardless of how many resolutions were visited this session.
   s_presentRegion.store(3);
   if (d->dyncube_pending_recreate && d->dyncube_pending_size != 0u) {
+    s_presentRegion.store(5);
     const uint32_t wantSize = d->dyncube_pending_size;
     // CreateDynCubeResources destroys the active set before allocating, so the old
     // size is always released (no leak) and never overlaps the new one.
@@ -7038,21 +7069,22 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
 
   // Create / recreate resources using depth texture size (kai pattern).
   {
+    s_presentRegion.store(6);
     uint32_t gw = 0u, gh = 0u;
-    if (d->captured_depth_srv.handle != 0u) {
-      auto depth_res = dev->get_resource_from_view(d->captured_depth_srv);
-      if (depth_res.handle != 0u) {
-        auto dd = dev->get_resource_desc(depth_res);
-        gw = dd.texture.width;
-        gh = dd.texture.height;
-      }
+    const bool depth_view_live = d->captured_depth_live.load(std::memory_order_acquire);
+    const bool depth_view_dead = d->captured_depth_srv.handle != 0u && !depth_view_live;
+    // Destroy events can invalidate a cached view between frames. Use dimensions
+    // captured with the live view instead of resolving that handle during Present.
+    if (depth_view_live) {
+      gw = d->captured_depth_w;
+      gh = d->captured_depth_h;
     }
-    if (gw < 64u || gh < 64u) {
+    if (!depth_view_dead && (gw < 64u || gh < 64u)) {
       auto bb = sc->get_back_buffer(0);
       auto bd = dev->get_resource_desc(bb);
       gw = bd.texture.width;
       gh = bd.texture.height;
-    } else {
+    } else if (!depth_view_dead) {
       // Validate: unconditional capture might pick up small SSAO at t4 (e.g. 160x90).
       auto bb = sc->get_back_buffer(0);
       auto bd = dev->get_resource_desc(bb);
@@ -7061,6 +7093,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
         gh = bd.texture.height;
       }
     }
+    if (depth_view_dead) CSLog("gtvbao", "resource recreate deferred: captured depth view dead");
     const bool too_small = d->working_width < 320u || d->working_height < 320u;
     const float want_res = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 1.f);
     const float want_vbgi_res = std::clamp(std::round(g_vbgi_resolution), 0.f, static_cast<float>(kVbgiMaxResolutionIndex));
@@ -7070,6 +7103,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
             || gh != d->last_created_game_height
             || want_res != d->last_created_gtvbao_resolution
             || want_vbgi_res != d->last_created_vbgi_resolution)) {
+      s_presentRegion.store(7);
       CreateGTVBAOResources(dev, d, gw, gh);
       d->last_created_game_width = gw;
       d->last_created_game_height = gh;
@@ -10552,7 +10586,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // -- Dynamic Cubemaps (Sora2nd): t17 override � Phase 0A/B + Phase 1/2 standalone --
   // D3D11 hazard: capture writes UAV, then lighting reads SRV. RunDynCube* does
   // UAV->SRV barrier. We dispatch inline here before the draw that consumes t17.
-  if (dyncube_active) {
+  // A swapchain resize destroys these resources; wait for the shared resize guard
+  // before the draw hook can recreate or dispatch them.
+  if (dyncube_active && dd->frame_index >= dd->resize_guard_until_frame) {
     int dbg = (int)shader_injection.dynCube_debug;
     bool forceVanilla = (shader_injection.dynCube_force_vanilla > 0.5f);
     // Force Vanilla OFF: allow dynamic cubemap to override t17
@@ -10881,6 +10917,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
             reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
       }
     }
+  } else if (dyncube_active) {
+    CSLog("dyncube", "scheduler skipped during resize guard");
   }
 
   return true;
@@ -12308,32 +12346,62 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   return true;
 }
 
-// Null the compute-stage slots used by the DynCube passes so the D3D11 runtime releases
-// its references (otherwise the bound SRVs/UAVs keep the textures alive and
-// destroy_resource cannot free them on resize).
+// Release the compute bindings between nested capture and world-box work so resource
+// barriers after the reduction do not encounter its SRV/UAV views still bound.
 static void UnbindDynCubeComputeState(reshade::api::command_list* cl) {
   if (!cl) return;
-  reshade::api::resource_view null_srv = {};
-  reshade::api::resource_view null_uav = {};
-  reshade::api::sampler null_sampler = {};
-  cl->push_descriptors(reshade::api::shader_stage::all_compute, reshade::api::pipeline_layout{0}, 0,
-      reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &null_sampler});
-  for (int i = 0; i <= 7; ++i)
-    cl->push_descriptors(reshade::api::shader_stage::all_compute, reshade::api::pipeline_layout{0}, 0,
-        reshade::api::descriptor_table_update{{}, (uint32_t)i, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &null_srv});
-  for (int i = 0; i <= 5; ++i)
-    cl->push_descriptors(reshade::api::shader_stage::all_compute, reshade::api::pipeline_layout{0}, 0,
-        reshade::api::descriptor_table_update{{}, (uint32_t)i, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &null_uav});
+  falcom_world::rtao::NullComputeSlots(cl, 8u, 6u, 1u);
 }
+
+class DynCubeComputeDispatchScope final {
+ public:
+  explicit DynCubeComputeDispatchScope(reshade::api::command_list* cl) : cmd_list_(cl) {
+    if (!cmd_list_) return;
+    if (auto* cs = renodx::utils::state::GetCurrentState(cmd_list_)) prev_ = *cs;
+  }
+
+  ~DynCubeComputeDispatchScope() {
+    if (!cmd_list_) return;
+
+    constexpr uint32_t DYNCUBE_COMPUTE_SRV_COUNT = 8u;
+    constexpr uint32_t DYNCUBE_COMPUTE_TEXTURE_UAV_COUNT = 6u;
+    constexpr uint32_t DYNCUBE_COMPUTE_BUFFER_UAV_COUNT = 6u;
+
+    const int fix = static_cast<int>(g_dyncube_cs_dispatch_fix);
+    if (fix == 0) {
+      UnbindDynCubeComputeState(cmd_list_);
+      return;
+    }
+
+    ComputeDispatchFixMode mode = ComputeDispatchFixMode::OFF;
+    switch (fix) {
+      case 1:  mode = ComputeDispatchFixMode::RESTORE_STATE; break;
+      case 2:
+      case 3:  mode = ComputeDispatchFixMode::NULL_AND_RESTORE; break;
+      default:
+        UnbindDynCubeComputeState(cmd_list_);
+        return;
+    }
+    ApplyComputeDispatchFix(
+        cmd_list_, renodx::utils::state::GetCurrentState(cmd_list_), prev_, mode,
+        DYNCUBE_COMPUTE_SRV_COUNT, DYNCUBE_COMPUTE_TEXTURE_UAV_COUNT, DYNCUBE_COMPUTE_BUFFER_UAV_COUNT);
+  }
+
+ private:
+  reshade::api::command_list* cmd_list_ = nullptr;
+  renodx::utils::state::CommandListState prev_ = {};
+};
 
 static bool RunDynCubeSolid(reshade::api::command_list* cl, DeviceData* d) {
   // Writes a DEDICATED solid-color cube � never the history/ggx resources.
   if (!cl || !d) return false;
+  if (d->frame_index < d->resize_guard_until_frame) return false;
   auto* dev = cl->get_device();
   if (!CreateDynCubeSolidResources(dev, d)) return false;
   if (!CreateDynCubePipelinesIfNeeded(dev, d)) return false;
   if (!d->dyncube_solid_pipeline.handle) return false;
 
+  DynCubeComputeDispatchScope dispatch_state(cl);
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_solid_pipeline);
   auto* tbl = &d->dyncube_solid_tables;
   reshade::api::descriptor_table_update upd = {tbl->at(0), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_solid_cube_uav};
@@ -12513,6 +12581,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
     d->dyncube_needs_reset = false;
   }
 
+  DynCubeComputeDispatchScope dispatch_state(cl);
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_capture_pipeline);
   auto* tbl = &d->dyncube_capture_tables;
 
@@ -12605,6 +12674,8 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   if (time_box) {
     falcom_world::bvh::BeginGpuTimer(dev, cl, &d->dyncube_gpu_box_timer, true);
   }
+  // The capture scope owns cleanup across this nested pass. Restoring capture's UAVs here
+  // would rebind them before the character-mask transition below.
   if (!RunDynCubeWorldBox(cl, d, cur)) {
     // Reduction unavailable: fall back to immediate promotion (pre-protection behavior).
     CSLog("dyncube", "worldbox UNAVAILABLE: immediate-promote fallback", true);
@@ -12616,7 +12687,6 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   cl->barrier(d->dyncube_charmask, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
 
   d->dyncube_solid_written = false; // capture ran (aliases still track the validated readSet)
-  UnbindDynCubeComputeState(cl);
   return true;
 }
 
@@ -12768,6 +12838,7 @@ static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool
   if (!copy_mip0(dst)) return false;
 
   if (!d->dyncube_ggx_pipeline.handle) return false;
+  DynCubeComputeDispatchScope dispatch_state(cl);
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_ggx_pipeline);
   auto* gt = &d->dyncube_ggx_tables;
 
@@ -12791,7 +12862,6 @@ static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool
     ++d->dyncube_ggx_mip_dispatches;
   }
   cl->barrier(dst, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
-  UnbindDynCubeComputeState(cl);
   return true;
 }
 
@@ -12820,6 +12890,7 @@ static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d) {
   const float soften = std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f);
   const float strength = std::clamp(shader_injection.dynCube_global_strength, 0.f, 1.f);
   const float srcMip = std::min(soften * kVariantMaxBlurMip, (float)std::max(mips, 1u) - 1.f);
+  DynCubeComputeDispatchScope dispatch_state(cl);
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_variant_pipeline);
   auto* vt = &d->dyncube_variant_tables;
   reshade::api::descriptor_table_update vu[3] = {
@@ -12848,7 +12919,6 @@ static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d) {
   if (time_variant) {
     falcom_world::bvh::EndGpuTimer(cl, &d->dyncube_gpu_variant_timer);
   }
-  UnbindDynCubeComputeState(cl);
   d->dyncube_variant_valid = true;
   d->dyncube_lastVariantSoften = soften;
   d->dyncube_lastVariantStrength = strength;
@@ -12945,6 +13015,7 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
     falcom_world::bvh::BeginGpuTimer(dev, cl, &d->dyncube_gpu_ssr_timer, true);
   }
   // -- March pass ? ssr_raw --
+  DynCubeComputeDispatchScope dispatch_state(cl);
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_ssr_pipeline);
   auto* st = &d->dyncube_ssr_tables;
   const reshade::api::resource_view isfastSrv =
@@ -13040,7 +13111,6 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   if (time_ssr) {
     falcom_world::bvh::EndGpuTimer(cl, &d->dyncube_gpu_ssr_timer);
   }
-  UnbindDynCubeComputeState(cl);
   return true;
 }
 
