@@ -282,6 +282,8 @@ struct LightParamCpu {
   float user_param;
 };
 static_assert(sizeof(LightParamCpu) == kLightParamBytes, "LightParam must be 112 bytes");
+static_assert(offsetof(LightParamCpu, spot_angle_inv) == 60, "LightParam spotAngleInv must be at offset 60");
+static_assert(offsetof(LightParamCpu, attenuation_angle) == 64, "LightParam attenuationAngle must be at offset 64");
 
 // Mirrors LightIndexData in lighting_0xCA3D8596.ps_5_0.hlsl (offsets 0 to 572).
 struct LightIndexDataCpu {

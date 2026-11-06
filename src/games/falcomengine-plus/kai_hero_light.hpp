@@ -45,12 +45,16 @@ inline bool NearHeroValue(float value, float target) {
   return std::fabs(value - target) <= kHeroMatchTolerance;
 }
 
-// Index of the single active light (radius > 0) matching the config, or -1 when no light or two or more lights match.
+// Index of the single active point light (radius > 0, spot fields zero) matching the config, or -1 when no light or two
+// or more lights match.
 inline int32_t FindUniqueHeroMatch(const rtgi::LightParamCpu* lights, size_t count, const KaiPlayerLightConfig& config) {
   int32_t match = -1;
   uint32_t matches = 0u;
   for (size_t i = 0; i < count; ++i) {
     const rtgi::LightParamCpu& light = lights[i];
+    if (light.spot_angle_inv != 0.f || light.attenuation_angle != 0.f) {
+      continue;
+    }
     const bool same = light.radius > 0.f && NearHeroValue(light.radius, config.radius)
                       && NearHeroValue(light.color[0], config.color_r) && NearHeroValue(light.color[1], config.color_g)
                       && NearHeroValue(light.color[2], config.color_b) && NearHeroValue(light.attenuation, config.attenuation);
