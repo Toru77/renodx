@@ -58,3 +58,6 @@ __pycache__/
 tmp/*
 # Harness test output (rewritten on every run)
 .falcom-dev/harness/motion_dump*.json
+
+# Local Claude Code permission settings (per-user)
+.claude/settings.local.json
