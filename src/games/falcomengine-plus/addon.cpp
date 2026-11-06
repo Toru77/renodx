@@ -748,11 +748,11 @@ static float g_vbgi_enabled = 0.f;
 static float g_vbgi_quality_level = 2.f;
 static float g_vbgi_resolution = 1.f;
 constexpr int kVbgiMaxResolutionIndex = 3;  // VBGIResolution label count - 1 (1/8)
-static float g_vbgi_upscale_algorithm = 1.f;
+static float g_vbgi_upscale_algorithm = 3.f;
 static float g_vbgi_upscale_plane_sigma = 0.02f;
-static float g_vbgi_upscale_normal_power = 16.f;
+static float g_vbgi_upscale_normal_power = 64.f;
 static float g_vbgi_upscale_bilinear_sharpness = 1.f;
-static float g_vbgi_upscale_nearest_fallback = 0.f;
+static float g_vbgi_upscale_nearest_fallback = 1.f;
 static float g_vbgi_noise_type = 2.f;
 static float g_vbgi_radius = 1.5f;
 static float g_vbgi_bitmask_thickness = 0.30f;
@@ -3946,7 +3946,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIUpscaleAlgorithm", .binding = &g_vbgi_upscale_algorithm,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Reconstruction", .section = "GTVBGI Upscaling",
+      .default_value = 3.f, .label = "Reconstruction", .section = "GTVBGI Upscaling",
       .tooltip = "Joint Bilateral (Current) preserves the existing 2x2 depth and normal aware filter. Bilinear is smoother but can bleed across edges. Nearest Valid selects one edge-aware tap and can look blocky. Wider Joint Bilateral uses a 4x4 footprint and costs more. All modes pass through at native resolution.",
       .labels = {"Joint Bilateral (Current)", "Bilinear", "Nearest Valid", "Wider Joint Bilateral"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
@@ -3962,8 +3962,8 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "VBGIUpscaleNormalPower", .binding = &g_vbgi_upscale_normal_power,
-      .default_value = 16.f, .label = "Normal Edge Power", .section = "GTVBGI Upscaling",
-      .tooltip = "Current value 16. Higher values reject taps with different surface normals more strongly; lower values blend across normal edges more.",
+      .default_value = 64.f, .label = "Normal Edge Power", .section = "GTVBGI Upscaling",
+      .tooltip = "Current value 64. Higher values reject taps with different surface normals more strongly; lower values blend across normal edges more.",
       .min = 1.f, .max = 64.f, .format = "%.0f",
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && (g_vbgi_upscale_algorithm < 0.5f || g_vbgi_upscale_algorithm > 1.5f); },
       .is_visible = []() { return VbgiRowVisible(); },
@@ -3979,7 +3979,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VBGIUpscaleNearestFallback", .binding = &g_vbgi_upscale_nearest_fallback,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Nearest Valid Fallback", .section = "GTVBGI Upscaling",
+      .default_value = 1.f, .label = "Nearest Valid Fallback", .section = "GTVBGI Upscaling",
       .tooltip = "When all joint-bilateral taps are rejected by the edge weights, use the valid tap with the strongest spatial weight. Off leaves black at that pixel.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && (g_vbgi_upscale_algorithm < 0.5f || g_vbgi_upscale_algorithm > 1.5f); },
