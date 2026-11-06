@@ -2,12 +2,11 @@
  * Copyright (C) 2026 Carlos Lopez, speedlemur
  * SPDX-License-Identifier: MIT
  *
- * forzahorizon6-rr: RTGI and SSR denoiser replacements.
+ * forzahorizon6-rr: RTGI denoiser replacements.
  *
  * On Medium and High RTGI, replaces the denoising stages so DLSS-RR receives
  * the current-frame ray signal. The High RTGI pointwise resolve is also
- * replaced with an equivalent implementation. Optional SSR switches disable
- * the checkerboard cleanup and the separable roughness-mip filters.
+ * replaced with an equivalent implementation.
  *
  * The swap is a live, per-device runtime replacement on the bind-time
  * replacement path (renodx utility shader framework), so a toggle applies
@@ -39,10 +38,6 @@ inline constexpr uint32_t kTemporalFilterHighHash = 0xAF4E3D44;
 inline constexpr uint32_t kResolveHighHash = 0x019CE131;       // RTGI_Resolve, draw 5441
 inline constexpr uint32_t kTemporalFilterMediumHash = 0x95FA8898;
 inline constexpr uint32_t kUpscale2xMediumHash = 0x4067B14C;
-inline constexpr uint32_t kSsrCheckerboardTidyHash = 0x313E9A06;
-inline constexpr uint32_t kSsrFilterMipHorizontalHash = 0xF0DE4E22;
-inline constexpr uint32_t kSsrFilterMipVerticalHash = 0x24848E0B;
-
 struct Replacement {
   uint32_t hash;
   std::span<const uint8_t> data;
@@ -82,27 +77,12 @@ inline const Replacement kUpscale2xMediumReplacements[] = {
     {kUpscale2xMediumHash, __0x4067B14C},
 };
 
-// This pass clamps checkerboard samples in place. A no-op leaves the earlier
-// current-frame reflection values untouched.
-inline const Replacement kSsrCheckerboardTidyReplacements[] = {
-    {kSsrCheckerboardTidyHash, __0x313E9A06},
-};
-
-// These hashes are the repeated separable roughness-mip blur passes. Their
-// replacements copy each source mip texel directly to its destination.
-inline const Replacement kSsrFilterMipReplacements[] = {
-    {kSsrFilterMipHorizontalHash, __0xF0DE4E22},
-    {kSsrFilterMipVerticalHash, __0x24848E0B},
-};
-
-inline BypassEntry bypasses[7] = {
+inline BypassEntry bypasses[5] = {
     {kSpatialFilterDiskReplacements},
     {kTemporalFilterHighReplacements},
     {kTemporalFilterMediumReplacements},
     {kUpscale2xMediumReplacements},
     {kResolveHighReplacements},
-    {kSsrCheckerboardTidyReplacements},
-    {kSsrFilterMipReplacements},
 };
 
 inline std::atomic<reshade::api::device*> current_device = nullptr;

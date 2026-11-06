@@ -8,8 +8,7 @@
  * to load), loads it at runtime if needed, and replaces the game's DLSS SR with
  * DLSS-RR. RR receives the game's real G-buffer guides. On Medium and High
  * RTGI the game's denoising stages are bypassed so RR gets the current-frame
- * ray signal; on Low the game's own resolve feeds RR. Separate optional
- * switches control the identified SSR cleanup passes.
+ * ray signal; on Low the game's own resolve feeds RR.
  */
 
 #define ImTextureID ImU64
@@ -36,11 +35,6 @@ namespace {
 // redirect and the resolve bypasses. RR runs at any RTGI tier; only the
 // raw-signal bypasses require Medium or High RTGI (see below).
 float rr_enable_setting = 1.f;
-
-// These controls skip only the identified SSR cleanup/filter passes. They are
-// independent of the DLSS-RR switch and default to the game's original output.
-float disable_ssr_checkerboard_tidy_setting = 0.f;
-float disable_ssr_mip_filtering_setting = 0.f;
 
 // DLSSD preset values for the D/E/F slider. Streamline marks A-C deprecated
 // and documents F onwards as "reverts to default", so only D (default
@@ -137,36 +131,6 @@ renodx::utils::settings::Settings settings = {
         .section = "Ray Reconstruction",
         .tooltip = "Intercepts the game's DLSS SR then replaces with RR.",
         .on_change_value = [](float, float) { ApplyRrState(); },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "DisableSsrCheckerboardTidy",
-        .binding = &disable_ssr_checkerboard_tidy_setting,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f,
-        .label = "Disable SSR checkerboard cleanup",
-        .section = "SSR Denoising",
-        .tooltip =
-            "Skips the in-place neighbor clamp in "
-            "SSR_FullScreen_TidyCheckerboard_Rough_MipFiltered (0x313E9A06).",
-        .on_change_value = [](float, float value) {
-          denoise::SetEnabled(denoise::kSsrCheckerboardTidyHash, value != 0.f);
-        },
-        .is_visible = [] { return false; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "DisableSsrMipFiltering",
-        .binding = &disable_ssr_mip_filtering_setting,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f,
-        .label = "Disable SSR roughness-mip filtering",
-        .section = "SSR Denoising",
-        .tooltip =
-            "Replaces the horizontal and vertical 9-tap SSR roughness-mip blur "
-            "passes (0xF0DE4E22 and 0x24848E0B) with direct copies.",
-        .on_change_value = [](float, float value) {
-          denoise::SetEnabled(denoise::kSsrFilterMipHorizontalHash, value != 0.f);
-        },
-        .is_visible = [] { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "RrHighGiNotice",
@@ -431,13 +395,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     sl_rr::SetInitInjection(true);
     // RR loads immediately; the resolve bypasses wait for High RTGI detection.
     ApplyRrState();
-    // on_change_value only fires on edits, so apply saved SSR switches here.
-    denoise::SetEnabled(
-        denoise::kSsrCheckerboardTidyHash,
-        disable_ssr_checkerboard_tidy_setting != 0.f);
-    denoise::SetEnabled(
-        denoise::kSsrFilterMipHorizontalHash,
-        disable_ssr_mip_filtering_setting != 0.f);
     // Apply the saved debug-logging state; on_change_value only fires on edits.
     guides::SetDiagnostics(rr_debug_log_setting != 0.f);
     int preset_index = static_cast<int>(rr_preset_setting);

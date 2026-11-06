@@ -55,8 +55,7 @@ The game loads Streamline's DLSS SR. This add-on:
    That pass has no denoising neighborhood/history, so its math is unchanged.
 
 The RR and RTGI replacement behavior is driven by **Enable DLSS Ray
-Reconstruction**. The SSR cleanup and roughness-mip filtering controls below
-are independent and leave the game's SSR path unchanged when off.
+Reconstruction**.
 
 Known DevKit shader tags:
 
@@ -127,10 +126,8 @@ game only after closing the game or unloading this add-on.
   game's G-buffer.
 - `denoise.hpp` + `0x019CE131.cs_6_6.hlsl` + `0x480011D5.cs_6_6.hlsl` +
   `0xAF4E3D44.cs_6_6.hlsl` + `0x95FA8898.cs_6_6.hlsl` +
-  `0x4067B14C.cs_6_6.hlsl` + `0x313E9A06.cs_6_6.hlsl` +
-  `0xF0DE4E22.cs_6_6.hlsl` + `0x24848E0B.cs_6_6.hlsl` +
-  `resolve_spatial_raw.hlsli` - live per-pipeline replacement of the
-  Medium/High-RTGI denoising stages and optional SSR cleanup/mip filtering.
+  `0x4067B14C.cs_6_6.hlsl` + `resolve_spatial_raw.hlsli` - live per-pipeline
+  replacement of the Medium/High-RTGI denoising stages.
 
 ## Requirements
 
