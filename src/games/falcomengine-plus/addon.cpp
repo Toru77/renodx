@@ -2978,7 +2978,7 @@ renodx::utils::settings::Settings settings = {
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Capture Hook Timing", .section = "Motion Blur",
       .tooltip = "Logs the CPU time of the push-descriptor capture hook once per second (DevKit not loaded only). No rendering change.",
-      .is_visible = []() { return IsMotionBlurGame() && !falcom_world::g_state.supported; },
+      .is_visible = []() { return IsAdvancedSettingsMode() && IsMotionBlurGame() && !falcom_world::g_state.supported; },
     },
     new renodx::utils::settings::Setting{      .key = "MotionBlurCameraCutThreshold", .binding = &shader_injection.mb_camera_cut_px,
       .default_value = 360.f, .label = "Camera Cut Threshold", .section = "Motion Blur",
@@ -3868,9 +3868,9 @@ renodx::utils::settings::Settings settings = {
       .key = "SSGIEnable", .binding = &g_vbgi_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "GTVBGI Enabled", .section = "GTVBGI",
-      .tooltip = "GTVBGI: ground-truth visibility bitmask indirect diffuse GI (Sora 1st and Sora 2nd). Added to the lit image after the shadow terms. Off by default.",
+      .tooltip = "GTVBGI: ground-truth visibility bitmask indirect diffuse GI (Sora 1st and Sora 2nd). Added to the lit image after the shadow terms. On by default.",
       .labels = {"Off", "On"},
-      .is_visible = []() { return VbgiRowVisible(); },
+      .is_visible = []() { return VbgiGameSupported(); },
     },
     new renodx::utils::settings::Setting{
       .key = "VBGIQuality", .binding = &g_vbgi_quality_level,
@@ -3879,7 +3879,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Slices x steps per side. Low 2x4, Medium 3x4, High 3x6, Ultra 4x10.",
       .labels = {"Low", "Medium", "High", "Ultra"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+      .is_visible = []() { return VbgiGameSupported(); },
     },
     new renodx::utils::settings::Setting{
       .key = "VBGIResolution", .binding = &g_vbgi_resolution,
@@ -4505,12 +4505,12 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsEnabled", .binding = &shader_injection.cs_contact_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f,
+      .default_value = 0.f,
       .label = "Sun Contact Shadows",
       .section = "Contact Shadows",
       .tooltip = "Sun Contact Shadows add subtle shadows where objects and characters meet the ground, making them feel more naturally connected to their surroundings.",
       .labels = {"Off", "On"},
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsEnvStrength", .binding = &shader_injection.cs_contact_env_strength,
@@ -4548,7 +4548,7 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f,
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
       .parse = [](float value) { return ContactShadowQualitySamples(value); },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsRayLength", .binding = &shader_injection.cs_contact_ray_length,
@@ -4669,7 +4669,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Smooths the IS-FAST grain of the sun contact term with an edge-aware blur that stops at depth and normal edges. Off leaves the term exactly as marched.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsSunDenoiseRadius", .binding = &shader_injection.cs_contact_denoise_radius,
@@ -4823,7 +4823,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Smooths the IS-FAST grain of the local light contact term with an edge-aware blur that stops at depth and normal edges. Off leaves the term exactly as marched.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalDenoiseRadius", .binding = &shader_injection.cs_contact_local_denoise_radius,
