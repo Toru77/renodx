@@ -635,6 +635,7 @@ static bool MotionBlurActive(bool cutscene) {
 // game's depth and motion textures actually match the tonemap's resolution.
 static float g_mb_logging = 1.f;
 static bool MotionBlurLogEnabled() { return g_mb_logging > 0.5f; }
+static float g_mb_cs_dispatch_fix = 0.f;
 static float g_capture_perf_log = 0.f;
 static float g_dyncube_gpu_timing = 0.f;  // Dynamic Cubemaps > GPU Timing Log (1/sec): per-step GPU ms in the [DynCube] line
 
@@ -1587,10 +1588,23 @@ static void CreateShadowsResources(reshade::api::device* dev, DeviceData* d,
 static void DestroyShadowsResources(reshade::api::device* dev, DeviceData* d);
 static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData* d);
 static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHook);
+enum class ComputeDispatchFixMode : uint32_t {
+  OFF,
+  RESTORE_STATE,
+  NULL_COMPUTE,
+  NULL_AND_RESTORE,
+};
 static void ApplyGTVBAOCSDispatchFix(
     reshade::api::command_list* cmd_list,
     renodx::utils::state::CommandListState* cs,
     renodx::utils::state::CommandListState& prev);
+static void ApplyComputeDispatchFix(
+    reshade::api::command_list* cmd_list,
+    renodx::utils::state::CommandListState* cs,
+    renodx::utils::state::CommandListState& prev,
+    ComputeDispatchFixMode fix,
+    uint32_t srv_count,
+    uint32_t uav_count);
 // -- Dynamic Cubemaps � forward decls --
 static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uint32_t size);
 static bool CreateDynCubeVariantResources(reshade::api::device* dev, DeviceData* d, uint32_t size, uint32_t mips);
@@ -2916,6 +2930,20 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "When the blur runs: never, only inside cutscenes, or always.",
       .labels = {"Off", "Cutscene Only", "Always On"},
       .is_visible = []() { return IsMotionBlurGame(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "MotionBlurCSDispatchFix",
+        .binding = &g_mb_cs_dispatch_fix,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 3.f,
+        .label = "CS Dispatch Fix",
+        .section = "Motion Blur",
+        .tooltip = "Controls compute state cleanup after the motion blur chain. "
+                   "Fix 1 restores the previous compute pipeline and descriptor tables. "
+                   "Fix 2 clears the compute sampler, SRV and UAV slots. "
+                   "Fix 3 clears those slots and restores the previous pipeline and tables.",
+        .labels = {"Off", "Fix 1: Restore State", "Fix 2: Null Compute", "Fix 3: Null + Restore"},
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurCameraDirection", .binding = &shader_injection.mb_camera_sign,
@@ -6343,23 +6371,22 @@ static void OnBindDescriptorTables(
   }
 }
 
-// -- GTVBAO CS Dispatch Fix: clears stale compute bindings that cause double volumetrics --
-static void ApplyGTVBAOCSDispatchFix(
+// -- Compute dispatch cleanup --------------------------------------------------
+static void ApplyComputeDispatchFix(
     reshade::api::command_list* cmd_list,
     renodx::utils::state::CommandListState* cs,
-    renodx::utils::state::CommandListState& prev) {
-  int fix = (int)g_gtvbao_cs_dispatch_fix;
-  if (fix < 1 || fix > 3) {
-    // Fix 0 (Off): just null pipeline + struct copy
+    renodx::utils::state::CommandListState& prev,
+    ComputeDispatchFixMode fix,
+    uint32_t srv_count,
+    uint32_t uav_count) {
+  if (fix == ComputeDispatchFixMode::OFF) {
     cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
     if (cs) *cs = prev;
     return;
   }
 
-  // Fix 1/2/3: properly save and restore compute state
-  // GTVBAO binds descriptors via bind_descriptor_tables with a proper pipeline layout.
-  // We save the previous compute pipeline + descriptor tables, then restore them.
-  // This handles both "there were previous compute bindings" and "clean slate" cases.
+  // GTVBAO and motion blur bind compute descriptors through pipeline layouts.
+  // Save the prior compute pipeline and descriptor tables before either chain runs.
   reshade::api::pipeline prev_compute_pipeline = {0u};
   reshade::api::pipeline_layout prev_layout = {0u};
   std::vector<reshade::api::descriptor_table> prev_tables;
@@ -6370,22 +6397,29 @@ static void ApplyGTVBAOCSDispatchFix(
     prev_tables = cs->compute_descriptor_tables;
   }
 
-  if (fix == 2 || fix == 3) {
+  if (fix == ComputeDispatchFixMode::NULL_COMPUTE
+      || fix == ComputeDispatchFixMode::NULL_AND_RESTORE) {
     // Additionally null the individual compute slots (belt and suspenders)
     reshade::api::resource_view null_srv = {};
     reshade::api::resource_view null_uav = {};
     reshade::api::sampler null_sampler = {};
     cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
-        reshade::api::pipeline_layout{0}, 0,
-        reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &null_sampler});
-    for (int i = 0; i < 5; ++i)
+                               reshade::api::pipeline_layout{0}, 0,
+                               reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &null_sampler});
+    for (uint32_t i = 0; i < srv_count; ++i)
       cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
-          reshade::api::pipeline_layout{0}, 0,
-          reshade::api::descriptor_table_update{{}, (uint32_t)i, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &null_srv});
-    for (int i = 0; i < 4; ++i)
+                                 reshade::api::pipeline_layout{0}, 0,
+                                 reshade::api::descriptor_table_update{{}, i, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &null_srv});
+    for (uint32_t i = 0; i < uav_count; ++i)
       cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
-          reshade::api::pipeline_layout{0}, 0,
-          reshade::api::descriptor_table_update{{}, (uint32_t)i, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &null_uav});
+                                 reshade::api::pipeline_layout{0}, 0,
+                                 reshade::api::descriptor_table_update{{}, i, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &null_uav});
+  }
+
+  if (fix == ComputeDispatchFixMode::NULL_COMPUTE) {
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
+    if (cs) *cs = prev;
+    return;
   }
 
   // Restore previous compute descriptor tables (if any were bound)
@@ -6401,6 +6435,22 @@ static void ApplyGTVBAOCSDispatchFix(
   cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, prev_compute_pipeline);
 
   if (cs) *cs = prev;
+}
+
+// -- GTVBAO CS Dispatch Fix: clears stale compute bindings that cause double volumetrics --
+static void ApplyGTVBAOCSDispatchFix(
+    reshade::api::command_list* cmd_list,
+    renodx::utils::state::CommandListState* cs,
+    renodx::utils::state::CommandListState& prev) {
+  const int fix = static_cast<int>(g_gtvbao_cs_dispatch_fix);
+  ComputeDispatchFixMode mode = ComputeDispatchFixMode::OFF;
+  switch (fix) {
+    case 1:  mode = ComputeDispatchFixMode::RESTORE_STATE; break;
+    case 2:
+    case 3:  mode = ComputeDispatchFixMode::NULL_AND_RESTORE; break;
+    default: break;
+  }
+  ApplyComputeDispatchFix(cmd_list, cs, prev, mode, 5u, 4u);
 }
 
 // -- Custom Shader crash-tracing log --
@@ -9009,7 +9059,18 @@ static bool OnBeforeTonemapDraw(reshade::api::command_list* cmd_list) {
     }
     return true;
   }
+  auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
+  renodx::utils::state::CommandListState prev = {};
+  if (cs) prev = *cs;
   auto blurred = RunMotionBlur(cmd_list, d, d->mb_tonemap_src_srv, motionSrc);
+  ComputeDispatchFixMode fix = ComputeDispatchFixMode::OFF;
+  switch (static_cast<int>(g_mb_cs_dispatch_fix)) {
+    case 1:  fix = ComputeDispatchFixMode::RESTORE_STATE; break;
+    case 2:  fix = ComputeDispatchFixMode::NULL_COMPUTE; break;
+    case 3:  fix = ComputeDispatchFixMode::NULL_AND_RESTORE; break;
+    default: break;
+  }
+  ApplyComputeDispatchFix(cmd_list, cs, prev, fix, 6u, 1u);
   if (!blurred.handle) return true;
 
   cmd_list->push_descriptors(
