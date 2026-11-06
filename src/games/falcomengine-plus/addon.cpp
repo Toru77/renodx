@@ -1360,7 +1360,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // RTV4 is written by the GBuffer pass every frame, whereas t3 only exists once the
   // TAA draw has run.
   reshade::api::resource_view mb_rtv4_srv = {};              // GBuffer RTV4, captured from bind_render_targets
-  uint64_t mb_rtv4_res = 0u;
+  std::atomic<uint64_t> mb_rtv4_res{0u};
   std::atomic<bool> mb_rtv4_live{true};
   bool mb_rtv4_warned_fmt = false;                           // one-shot format sanity warning
   bool mb_logged_rtv4_dims = false;                          // one-shot RTV4 dimensions log
@@ -1384,7 +1384,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // on the RENDER thread by MBMotionRtv4Ensure. It is deliberately not destroyed in
   // the destroy event itself: those run on the loader thread and every other
   // handler there is comment-documented as touching no view objects at all.
-  bool mb_rtv4_owned_dirty = false;
+  std::atomic<bool> mb_rtv4_owned_dirty{false};
   // First-wins-per-frame guard. Several passes bind exactly five render targets,
   // and the GBuffer's is only the FIRST of them, so a last-wins capture gets
   // clobbered by a later pass that happens to have something else in slot 4. This
@@ -1605,7 +1605,6 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
 enum class ComputeDispatchFixMode : uint32_t {
   OFF,
   RESTORE_STATE,
-  NULL_COMPUTE,
   NULL_AND_RESTORE,
 };
 static void ApplyGTVBAOCSDispatchFix(
@@ -2954,8 +2953,8 @@ renodx::utils::settings::Settings settings = {
         .section = "Motion Blur",
         .tooltip = "Controls compute state cleanup after the motion blur chain. "
                    "Fix 1 restores the previous compute pipeline and descriptor tables. "
-                   "Fix 2 clears the compute sampler, SRV and UAV slots. "
-                   "Fix 3 clears those slots and restores the previous pipeline and tables.",
+                   "Fix 2 and Fix 3 clear the compute sampler, SRV and UAV slots, "
+                   "then restore the previous compute pipeline and descriptor tables.",
         .labels = {"Off", "Fix 1: Restore State", "Fix 2: Null Compute", "Fix 3: Null + Restore"},
         .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
@@ -6517,20 +6516,17 @@ static void ApplyComputeDispatchFix(
     return;
   }
 
-  // GTVBAO and motion blur bind compute descriptors through pipeline layouts.
-  // Save the prior compute pipeline and descriptor tables before either chain runs.
+  // Both callers pass the state copied before their dispatch chain; restore from
+  // that copy rather than the live tracker, which now describes our last pass.
   reshade::api::pipeline prev_compute_pipeline = {0u};
   reshade::api::pipeline_layout prev_layout = {0u};
   std::vector<reshade::api::descriptor_table> prev_tables;
-  if (cs) {
-    auto it = cs->pipelines.find(reshade::api::pipeline_stage::all_compute);
-    if (it != cs->pipelines.end()) prev_compute_pipeline = it->second;
-    prev_layout = cs->compute_pipeline_layout;
-    prev_tables = cs->compute_descriptor_tables;
-  }
+  auto it = prev.pipelines.find(reshade::api::pipeline_stage::all_compute);
+  if (it != prev.pipelines.end()) prev_compute_pipeline = it->second;
+  prev_layout = prev.compute_pipeline_layout;
+  prev_tables = prev.compute_descriptor_tables;
 
-  if (fix == ComputeDispatchFixMode::NULL_COMPUTE
-      || fix == ComputeDispatchFixMode::NULL_AND_RESTORE) {
+  if (fix == ComputeDispatchFixMode::NULL_AND_RESTORE) {
     // Additionally null the individual compute slots (belt and suspenders)
     reshade::api::resource_view null_srv = {};
     reshade::api::resource_view null_uav = {};
@@ -6546,12 +6542,6 @@ static void ApplyComputeDispatchFix(
       cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
                                  reshade::api::pipeline_layout{0}, 0,
                                  reshade::api::descriptor_table_update{{}, i, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &null_uav});
-  }
-
-  if (fix == ComputeDispatchFixMode::NULL_COMPUTE) {
-    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
-    if (cs) *cs = prev;
-    return;
   }
 
   // Restore previous compute descriptor tables (if any were bound)
@@ -6700,7 +6690,9 @@ static void KillAllTracked(DeviceData* d, uint64_t deadView, uint64_t deadRes) {
   KillTrackedInput(d, d->captured_ssr1_srv, d->captured_ssr1_res, d->captured_ssr1_live, "ssr1", deadView, deadRes);
   KillTrackedInput(d, d->captured_ssr_mrt_srv, d->captured_ssr_mrt_res, d->captured_ssr_mrt_live, "ssrMrt", deadView, deadRes);
   KillTrackedInput(d, d->rcas_motion_srv, d->rcas_motion_res, d->rcas_motion_live, "rcasMotion", deadView, deadRes);
-  KillTrackedInput(d, d->mb_rtv4_srv, d->mb_rtv4_res, d->mb_rtv4_live, "mbRtv4Motion", deadView, deadRes);
+  KillTrackedInput(d, d->mb_rtv4_srv,
+                   d->mb_rtv4_res.load(std::memory_order_acquire), d->mb_rtv4_live,
+                   "mbRtv4Motion", deadView, deadRes);
   KillTrackedInput(d, d->mb_tonemap_src_srv, d->mb_tonemap_src_res, d->mb_tonemap_src_live, "mbTonemapSrc", deadView, deadRes);
   for (int k = 0; k < 6; ++k) KillTrackedInput(d, d->vbgi_in_srv[k], d->vbgi_in_res[k], d->vbgi_in_live[k], "vbgiInput", deadView, deadRes);
 }
@@ -6721,9 +6713,10 @@ static void OnDestroyResource(reshade::api::device* device, reshade::api::resour
   // thread rebuilds it via MBMotionRtv4Ensure. Leaving a dead view bound for even
   // one frame is the thing that must not happen, and the flag is set before the
   // next chain run, which is the same frame's tonemap.
-  if (d->mb_rtv4_res != 0u && d->mb_rtv4_res == res.handle) {
-    d->mb_rtv4_res = 0u;
-    d->mb_rtv4_owned_dirty = true;
+  if (const uint64_t motion_res = d->mb_rtv4_res.load(std::memory_order_acquire);
+      motion_res != 0u && motion_res == res.handle) {
+    d->mb_rtv4_res.store(0u, std::memory_order_release);
+    d->mb_rtv4_owned_dirty.store(true, std::memory_order_release);
   }
   // RCAS note: no per-resource tracking remains. The dispatch reads only the
   // owned unsharpened copy; a dead game target is detected next TAA drawn via
@@ -8158,25 +8151,25 @@ static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
 // and it is the same call the TAA path already makes successfully every frame.
 static void MBMotionRtv4Ensure(reshade::api::device* dev, DeviceData* d) {
   if (!dev || !d) return;
-  if (d->mb_rtv4_srv.handle == 0u || !d->mb_rtv4_live.load()) return;
   // Rebuild requested by the resource-destroy event: drop the dead view first, on
   // this thread, then fall through and make a new one.
-  if (d->mb_rtv4_owned_dirty) {
-    d->mb_rtv4_owned_dirty = false;
+  if (d->mb_rtv4_owned_dirty.exchange(false, std::memory_order_acq_rel)) {
     if (d->mb_rtv4_owned_srv.handle != 0u) {
       dev->destroy_resource_view(d->mb_rtv4_owned_srv);
       d->mb_rtv4_owned_srv = {};
     }
   }
+  if (d->mb_rtv4_srv.handle == 0u || !d->mb_rtv4_live.load()) return;
   reshade::api::resource mres = dev->get_resource_from_view(d->mb_rtv4_srv);
   if (mres.handle == 0u) return;
-  if (mres.handle == d->mb_rtv4_res && d->mb_rtv4_owned_srv.handle != 0u) return;
+  if (mres.handle == d->mb_rtv4_res.load(std::memory_order_acquire)
+      && d->mb_rtv4_owned_srv.handle != 0u) return;
 
   if (d->mb_rtv4_owned_srv.handle != 0u) {
     dev->destroy_resource_view(d->mb_rtv4_owned_srv);
     d->mb_rtv4_owned_srv = {};
   }
-  d->mb_rtv4_res = mres.handle;
+  d->mb_rtv4_res.store(mres.handle, std::memory_order_release);
 
   // .texture is a union member, so .type has to be tested before it is read.
   // Reading it on a buffer desc is undefined behaviour, and undefined behaviour
@@ -8187,7 +8180,7 @@ static void MBMotionRtv4Ensure(reshade::api::device* dev, DeviceData* d) {
   const bool isPlausibleSize = isTexture && (rdesc.texture.width > 0u && rdesc.texture.height > 0u);
 
   if (!isMotionFormat || !isPlausibleSize) {
-    d->mb_rtv4_res = 0u;
+    d->mb_rtv4_res.store(0u, std::memory_order_release);
     // Re-arm, but only while the per-frame budget allows it, so a frame where no
     // five-target bind is the motion target cannot spin.
     if (d->mb_rtv4_rejects < DeviceData::kMotionBlurRtv4RejectCap) {
@@ -8212,7 +8205,7 @@ static void MBMotionRtv4Ensure(reshade::api::device* dev, DeviceData* d) {
                                        rdesc.texture.format, 0, 1, 0, 1),
       &d->mb_rtv4_owned_srv);
   if (d->mb_rtv4_owned_srv.handle == 0u) {
-    d->mb_rtv4_res = 0u;
+    d->mb_rtv4_res.store(0u, std::memory_order_release);
     reshade::log::message(reshade::log::level::warning,
         "[MotionBlur] could not create a shader resource view on the RTV4 motion "
         "resource. Blur is off this frame; it will retry. This is a declared "
@@ -8233,7 +8226,7 @@ static void MBMotionRtv4Ensure(reshade::api::device* dev, DeviceData* d) {
 static reshade::api::resource_view MBMotionInputView(DeviceData* d) {
   if (!d) return {};
   if (MBMotionUseRtv()) {
-    return (d->mb_rtv4_owned_srv.handle != 0u)
+    return (d->mb_rtv4_live.load() && d->mb_rtv4_owned_srv.handle != 0u)
              ? d->mb_rtv4_owned_srv : reshade::api::resource_view{};
   }
   return (d->rcas_motion_srv.handle != 0u && d->rcas_motion_live.load())
@@ -8369,8 +8362,8 @@ static void DestroyMotionBlurResources(reshade::api::device* dev, DeviceData* d)
   // a view on a game-owned resource, and those are freed on a set rebuild, not on
   // device teardown.
   if (d->mb_rtv4_owned_srv.handle) { dev->destroy_resource_view(d->mb_rtv4_owned_srv); d->mb_rtv4_owned_srv = {}; }
-  d->mb_rtv4_res = 0u;
-  d->mb_rtv4_owned_dirty = false;
+  d->mb_rtv4_res.store(0u, std::memory_order_release);
+  d->mb_rtv4_owned_dirty.store(false, std::memory_order_release);
 }
 
 static bool EnsureMotionBlurPipelines(reshade::api::device* dev, DeviceData* d) {
@@ -8673,6 +8666,7 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
   *motionOut = d->fallback_srv;
   if (workingW == 0u || workingH == 0u) return false;
   if (outputFormat == reshade::api::format::unknown) return false;
+  if (!d->captured_depth_live.load() || !d->captured_cbv_live.load()) return false;
   if (!EnsureMotionBlurPipelines(dev, d)) return false;
   if (!EnsureMotionBlurSampler(dev, d)) return false;
   if (!EnsureMotionBlurNoiseFallback(dev, d)) return false;
@@ -8680,7 +8674,7 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
   // Depth: the game's scene depth, captured from the lighting pass. Queried
   // here rather than cached at capture time so it can never go stale.
   uint32_t depthW = 0u, depthH = 0u;
-  if (d->captured_depth_srv.handle != 0u) {
+  if (d->captured_depth_live.load() && d->captured_depth_srv.handle != 0u) {
     reshade::api::resource dres = dev->get_resource_from_view(d->captured_depth_srv);
     if (dres.handle != 0u) {
       auto ddesc = dev->get_resource_desc(dres);
@@ -8857,7 +8851,8 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
                                                  reshade::api::resource_view motionSrc) {
   if (!cl || !d || !colorSrc.handle) return {};
   auto* dev = cl->get_device();
-  if (!dev || !d->mb_resources_ready) return {};
+  if (!dev || !d->mb_resources_ready
+      || !d->captured_depth_live.load() || !d->captured_cbv_live.load()) return {};
 
   const auto CS = reshade::api::shader_stage::all_compute;
   const auto AC = reshade::api::pipeline_stage::all_compute;
@@ -9191,17 +9186,17 @@ static bool OnBeforeTonemapDraw(reshade::api::command_list* cmd_list) {
     }
     return true;
   }
+  ComputeDispatchFixMode fix = ComputeDispatchFixMode::OFF;
+  switch (static_cast<int>(g_mb_cs_dispatch_fix)) {
+    case 1:  fix = ComputeDispatchFixMode::RESTORE_STATE; break;
+    case 2:
+    case 3:  fix = ComputeDispatchFixMode::NULL_AND_RESTORE; break;
+    default: break;
+  }
   auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
   renodx::utils::state::CommandListState prev = {};
   if (cs) prev = *cs;
   auto blurred = RunMotionBlur(cmd_list, d, d->mb_tonemap_src_srv, motionSrc);
-  ComputeDispatchFixMode fix = ComputeDispatchFixMode::OFF;
-  switch (static_cast<int>(g_mb_cs_dispatch_fix)) {
-    case 1:  fix = ComputeDispatchFixMode::RESTORE_STATE; break;
-    case 2:  fix = ComputeDispatchFixMode::NULL_COMPUTE; break;
-    case 3:  fix = ComputeDispatchFixMode::NULL_AND_RESTORE; break;
-    default: break;
-  }
   ApplyComputeDispatchFix(cmd_list, cs, prev, fix, 6u, 1u);
   if (!blurred.handle) return true;
 
@@ -9383,14 +9378,16 @@ static bool UpdateRtMotion(reshade::api::device* dev, DeviceData* dd, bool tempo
   namespace rtao = falcom_world::rtao;
   auto& rf = rtao::g_rtao_frame;
   if (temporal_on) MBMotionRtv4Ensure(dev, dd);
+  const uint64_t mb_rtv4_res = dd->mb_rtv4_res.load(std::memory_order_acquire);
   // Motion source (round 2). TAA t3 and RTV4 are different resources: t3 is not proven to be written before
   // lighting, so Temporal stops for the session. Unknown on either side: no decision yet.
-  const rtao::MotionCheck motion_check = rtao::CheckMotionResources(dd->rcas_motion_res, dd->mb_rtv4_res);
+  const rtao::MotionCheck motion_check = rtao::CheckMotionResources(dd->rcas_motion_res, mb_rtv4_res);
   rf.rcas_res = dd->rcas_motion_res;
-  rf.rtv4_res = dd->mb_rtv4_res;
+  rf.rtv4_res = mb_rtv4_res;
   rf.depth_w = dd->captured_depth_w;
   rf.depth_h = dd->captured_depth_h;
-  if (temporal_on && dd->mb_rtv4_owned_srv.handle != 0u) {
+  if (temporal_on && dd->mb_rtv4_live.load()
+      && dd->mb_rtv4_owned_srv.handle != 0u) {
     const auto motion_desc = dev->get_resource_desc(dev->get_resource_from_view(dd->mb_rtv4_owned_srv));
     if (motion_desc.type == reshade::api::resource_type::texture_2d) {
       rf.motion_w = motion_desc.texture.width;
@@ -9408,16 +9405,17 @@ static bool UpdateRtMotion(reshade::api::device* dev, DeviceData* dd, bool tempo
   if (motion_check == rtao::MotionCheck::Conflict && !rf.motion_conflict) {
     rf.motion_conflict = true;
     renodx::utils::log::w("[world-rtao] motion CONFLICT: rcas_motion_res=", dd->rcas_motion_res,
-                          " mb_rtv4_res=", dd->mb_rtv4_res,
+                          " mb_rtv4_res=", mb_rtv4_res,
                           " differ. TAA t3 is not proven written before lighting; Temporal is off for this session (no_motion, round-1 AO).");
   }
   static bool motion_logged = false;
-  if (!motion_logged && motion_check == rtao::MotionCheck::Ok && dd->rcas_motion_res != 0u && dd->mb_rtv4_res != 0u) {
+  if (!motion_logged && motion_check == rtao::MotionCheck::Ok && dd->rcas_motion_res != 0u && mb_rtv4_res != 0u) {
     motion_logged = true;
     renodx::utils::log::i("[world-rtao] motion: rcas_motion_res=", dd->rcas_motion_res,
-                          " mb_rtv4_res=", dd->mb_rtv4_res, " same resource: RTV4 owned SRV used");
+                          " mb_rtv4_res=", mb_rtv4_res, " same resource: RTV4 owned SRV used");
   }
-  return dd->mb_rtv4_owned_srv.handle != 0u && !rf.motion_conflict && rf.motion_dims_ok;
+  return dd->mb_rtv4_live.load() && dd->mb_rtv4_owned_srv.handle != 0u
+      && !rf.motion_conflict && rf.motion_dims_ok;
 }
 
 // RTAO round 1 (world/rtao): dispatched inline before DeployShadows so the RTAO
