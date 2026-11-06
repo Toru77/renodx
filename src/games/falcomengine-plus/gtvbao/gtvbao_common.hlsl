@@ -87,12 +87,12 @@ cbuffer cb_gtvbao : register(b13)
   // - Low-resolution spatial pipeline (appended; Full path ignores these) -
   float GTVBAO_resolution;               // c[35] - 0=Full, 1=Half
   float GTVBAO_hemisphere_weighting;     // c[36] - 0=Cosine, 1=Uniform
-  // - Spatial filter direction and temporal accumulation (appended) -
-  float GTVBAO_filter_direction;         // c[37] - separable pass: 0=Horizontal, 1=Vertical, 2=Both (a-trous)
+  // - Auto thickness and temporal accumulation (appended) -
+  float GTVBAO_auto_thickness;           // c[37] - 0=constant thickness, 1=estimate thickness from sample span
   float GTVBAO_temporal_history_weight;  // c[38] - maximum blend toward validated history
   float GTVBAO_temporal_depth_rejection; // c[39] - relative depth difference allowed between history and current
   float GTVBAO_temporal_normal_rejection;// c[40] - normal dot product below which history taps fade out
-  float GTVBAO_temporal_history_clamp;   // c[41] - 3x3 neighbourhood clamp, k sigma (0 = off)
+  float GTVBAO_base_thickness;           // c[41] - base for the auto thickness estimate
   float GTVBAO_temporal_history_valid;   // c[42] - 1 when the history may be used (reset == None)
   // - VBGI (appended; the AO path leaves these at 0) -
   float GTVBAO_vbgi_mode;                // c[43] - 1 = GI
@@ -351,7 +351,7 @@ GTAOConstants BuildGTAOConstants(uint2 viewport_size)
   consts.RadiusMultiplier = max(0.3, GTVBAO_radius_multiplier);
   consts.FinalValuePower = max(0.5, GTVBAO_final_value_power);
   consts.SampleDistributionPower = max(1.0, GTVBAO_sample_distribution_power);
-  consts.BitmaskThickness = max(0.0, GTVBAO_bitmask_thickness);
+  consts.BitmaskThickness = max(0.0, GTVBAO_auto_thickness > 0.5f ? GTVBAO_base_thickness : GTVBAO_bitmask_thickness);
 #ifdef GTVBAO_GI
   // GI offsets are in trace texels but sample the full-res depth mips: shift by 2 - r (r = c[35] = log2 divisor) so every
   // resolution gets the full-res footprint of 1/4 (r = 2, unchanged).

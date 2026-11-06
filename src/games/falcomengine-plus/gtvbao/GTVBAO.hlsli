@@ -350,6 +350,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     const lpfloat effectRadius              = (lpfloat)consts.EffectRadius * (lpfloat)consts.RadiusMultiplier;
     const lpfloat sampleDistributionPower   = (lpfloat)consts.SampleDistributionPower;
     const lpfloat bitmaskThickness          = (lpfloat)consts.BitmaskThickness;
+    const bool useAutoThickness = GTVBAO_auto_thickness > 0.5f;
 
     lpfloat visibility = 0;
     // ── Per-pixel setup (bufferc.txt:628-633) ──
@@ -474,6 +475,13 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                 const float d = side == 0 ? -1.0f : 1.0f;
                 const float z = side == 0 ? rnd.z : 1.0f - rnd.z;
                 const bool  isPhiLargerThanAngN = d > 0.0f;
+                // The adaptive mode estimates each connected occluder's width from its sample-run span.
+                float3 occluderStartingPos = positionVS;
+                float3 previousPos = positionVS;
+                float occluderScale = 1.0f;
+                if (useAutoThickness) {
+                    occluderScale = exp2(2.0f * rnd.y - 1.0f);
+                }
 
                 [loop]
                 for (int i = 0; i < (int)stepsPerSlice; i++)
@@ -507,12 +515,32 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     }
                     float3 samplePos = GTVBAO_ComputeViewspacePosition( sampleScreenPos, SZ, consts );
 
-                    // bufferc.txt:732-740 (constant thickness in view depth, deviation 5)
-                    float3 deltaPosFront = samplePos - positionVS;
-                    float3 deltaPosBack  = GTVBAO_ComputeViewspacePosition( sampleScreenPos, SZ + bitmaskThickness, consts ) - positionVS;
+                    float2 horCos;
+                    if (useAutoThickness) {
+                        float3 deltaPrevPos = samplePos - previousPos;
+                        deltaPrevPos.xy *= occluderScale;
+                        const float deltaPrevLengthSq = dot(deltaPrevPos, deltaPrevPos);
+                        if (deltaPrevLengthSq > 1e-12f
+                            && abs(dot(deltaPrevPos * rsqrt(deltaPrevLengthSq), V)) > 0.9f) {
+                            occluderStartingPos = samplePos;
+                        }
+                        previousPos = samplePos;
+
+                        const float thickness = occluderScale * (bitmaskThickness + length(samplePos - occluderStartingPos));
+                        const float3 deltaPosFront = samplePos - positionVS;
+                        const float3 deltaPosBack = deltaPosFront - V * thickness;
+                        const float3 deltaPosBackOccluder = occluderStartingPos - positionVS - V * thickness;
+                        horCos = float2(dot(normalize(deltaPosFront), V), dot(normalize(deltaPosBack), V));
+                        horCos.y = min(dot(normalize(deltaPosBackOccluder), V), horCos.y);
+                    } else {
+                        // bufferc.txt:732-740 (constant thickness in view depth, deviation 5)
+                        const float3 deltaPosFront = samplePos - positionVS;
+                        const float3 deltaPosBack = GTVBAO_ComputeViewspacePosition(
+                            sampleScreenPos, SZ + bitmaskThickness, consts) - positionVS;
+                        horCos = float2(dot(normalize(deltaPosFront), V), dot(normalize(deltaPosBack), V));
+                    }
 
                     // bufferc.txt:749-758
-                    float2 horCos = float2(dot(normalize(deltaPosFront), V), dot(normalize(deltaPosBack), V));
                     float2 horAng = acos(clamp(horCos, -1.0f, 1.0f)) * d;
                     float2 hor01  = saturate(horAng * GT_VBAO_RCP_PI + angOff);
                     if (d < 0.0f) hor01 = hor01.yx;

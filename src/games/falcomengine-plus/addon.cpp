@@ -519,7 +519,7 @@ constexpr uint32_t kGtvbaoPushConstantsLayoutParam = 4u;   // push_constants at 
 // here silently truncates the tail of the block rather than failing loudly.
 constexpr uint32_t kGtvbaoPushConstantFloats = 48;
 constexpr uint32_t kVbgiFarPushConstantFloats = 56;  // GTVBAO block + far tail c[48..55] (gtvbao_common.hlsl)
-constexpr uint32_t kGtvbaoSnapshotFloats = 32;
+constexpr uint32_t kGtvbaoSnapshotFloats = 33;
 constexpr uint32_t kLightingMrtNormalRegister = 1u;  // t1 = mrtTexture0 (g-buffer normals)
 constexpr uint64_t kGTVBAOStartupGuardFrames = 8u;
 constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
@@ -708,6 +708,8 @@ static float g_gtvbao_normal_edge_rejection = 0.f;   // 0 = no silhouette reject
 static float g_gtvbao_normal_detail_response = 0.f; // 0 = no disagreement reweight
 static float g_gtvbao_normal_max_darkening  = 1.f;   // cap: 1 = uncapped
 static float g_gtvbao_hemisphere_weighting = 0.f;
+static float g_gtvbao_auto_thickness = 1.f;
+static float g_gtvbao_base_thickness = 0.20f;
 
 // -- Dynamic Cubemaps (Sora 2nd) � standalone t17 replacement --
 constexpr uint32_t kDynCubeRegister = 17u; // t17 texEnvMap_g
@@ -744,6 +746,8 @@ constexpr int kVbgiMaxResolutionIndex = 3;  // VBGIResolution label count - 1 (1
 static float g_vbgi_noise_type = 2.f;
 static float g_vbgi_radius = 1.5f;
 static float g_vbgi_bitmask_thickness = 0.30f;
+static float g_vbgi_auto_thickness = 1.f;
+static float g_vbgi_base_thickness = 0.20f;
 static float g_vbgi_depth_mip_offset = 3.5f;
 static float g_vbgi_mrt_normal = 1.f;
 static float g_vbgi_ambient = 0.5f;
@@ -1040,7 +1044,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool vbgi_temporal_last = false;
   uint64_t vbgi_last_frame = UINT64_MAX;
   bool vbgi_prev_params_valid = false;
-  std::array<float, 17> vbgi_prev_params = {};
+  std::array<float, 19> vbgi_prev_params = {};
   // -- VBGI far field (one candidate per texel, resolve into the joint raw GI) --
   reshade::api::pipeline_layout vbgi_far_main_layout = {};  // far main variant: 5 SRVs, 5 UAVs, 56-float push
   reshade::api::pipeline vbgi_far_main_pipeline = {};
@@ -1056,7 +1060,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool vbgi_far_was_on = false;                                  // far state last RunVBGI (near history resets on a change)
   uint64_t vbgi_far_frame = UINT64_MAX;                          // last frame the far resolve ran
   bool vbgi_far_prev_params_valid = false;
-  std::array<float, 9> vbgi_far_prev_params = {};
+  std::array<float, 11> vbgi_far_prev_params = {};
   reshade::api::pipeline vbgi_far_temporal_pipeline = {};
   falcom_world::rtgi::RtgiTextureSet<2> vbgi_far_res_pos = {};  // rgba32f, trace size: temporal reservoir sample point, W
   falcom_world::rtgi::RtgiTextureSet<2> vbgi_far_res_rad = {};  // rgba16f, trace size: sender radiance, M
@@ -3598,14 +3602,30 @@ renodx::utils::settings::Settings settings = {
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "GTVBAOAutoThickness", .binding = &g_gtvbao_auto_thickness,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Auto Thickness", .section = "GTVBAO",
+      .tooltip = "Estimate occluder thickness from connected depth samples. Base Thickness sets the starting thickness.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "GTVBAOBitmaskThickness", .binding = &shader_injection.gtvbao_bitmask_thickness,
       .default_value = 0.30f, .label = "Bitmask Thickness", .section = "GTVBAO",
-      .tooltip = "World-space thickness for visibility bitmask. Higher = more light passes behind surfaces.",
+      .tooltip = "Constant thickness used when Auto Thickness is off.",
       .min = 0.01f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_auto_thickness < 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // �� GTVBAO Upgrade (visibility bitmask accuracy improvements, always On) ��
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOBaseThickness", .binding = &g_gtvbao_base_thickness,
+      .default_value = 0.20f, .label = "Base Thickness", .section = "GTVBAO",
+      .tooltip = "Starting thickness for the Auto Thickness estimate.",
+      .min = 0.01f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_auto_thickness > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOGTVBAOCosineMode", .binding = &shader_injection.gtvbao_cosine_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -3906,12 +3926,30 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "VBGIAutoThickness", .binding = &g_vbgi_auto_thickness,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Auto Thickness", .section = "GTVBGI",
+      .tooltip = "Estimate occluder thickness from connected depth samples. Base Thickness sets the starting thickness.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "VBGIThickness", .binding = &g_vbgi_bitmask_thickness,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
       .default_value = 0.30f, .label = "Bitmask Thickness", .section = "GTVBGI",
-      .tooltip = "World-space thickness for visibility bitmask. Higher = more light passes behind surfaces.",
+      .tooltip = "Constant thickness used when Auto Thickness is off.",
       .min = 0.01f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_auto_thickness < 0.5f; },
+      .is_visible = []() { return VbgiRowVisible(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VBGIBaseThickness", .binding = &g_vbgi_base_thickness,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.20f, .label = "Base Thickness", .section = "GTVBGI",
+      .tooltip = "Starting thickness for the Auto Thickness estimate.",
+      .min = 0.01f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_auto_thickness > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
@@ -4019,7 +4057,7 @@ renodx::utils::settings::Settings settings = {
       .key = "VBGIFarHitWindow", .binding = &g_vbgi_far_hit_window,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Far Hit Window", .section = "GTVBGI",
-      .tooltip = "How a far ray decides it hit a surface. Thin = only within Bitmask Thickness behind the depth buffer (fewer hits). Wide = also counts a surface crossed between two march steps (more hits; may add faint halos behind thin objects).",
+      .tooltip = "Thin = active thickness tolerance. Wide also counts surfaces crossed between march steps (more hits; may add faint halos).",
       .labels = {"Thin", "Wide"},
       .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
       .is_visible = []() { return VbgiRowVisible(); },
@@ -12934,7 +12972,7 @@ struct GtvbaoPassPush {
 // Push indices that make up the temporal reset snapshot (settings that shape the AO; not debug, filter or per-frame values).
 constexpr uint32_t kGtvbaoSnapshotIndex[kGtvbaoSnapshotFloats] = {
     0, 35, 1, 2, 3, 4, 5, 6, 26, 36, 25, 19, 20, 21, 22, 23, 24, 27, 28,
-    10, 11, 12, 13, 14, 15, 16, 17, 18, 38, 39, 40, 41};
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 38, 39, 40, 41, 37};
 
 static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(DeviceData* data, const GtvbaoPassPush& pass = {}) {
   std::array<float, kGtvbaoPushConstantFloats> c = {};
@@ -12981,12 +13019,13 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   // �� Low-resolution spatial pipeline (appended; Full path ignores these) ��
   c[35] = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 1.f);
   c[36] = g_gtvbao_hemisphere_weighting;       // hemisphere weighting 0=Cosine, 1=Uniform
-  // unused: GTVBAO filter removed (SVGF M2a)
-  c[37] = 0.f;
+  c[37] = pass.vbgi ? std::clamp(g_vbgi_auto_thickness, 0.f, 1.f)
+                    : std::clamp(g_gtvbao_auto_thickness, 0.f, 1.f);
   c[38] = g_gtvbao_history_weight;
   c[39] = g_gtvbao_depth_rejection;
   c[40] = g_gtvbao_normal_rejection;
-  c[41] = 0.f;  // unused: GTVBAO temporal removed (SVGF M2a)
+  c[41] = pass.vbgi ? std::clamp(g_vbgi_base_thickness, 0.01f, 2.f)
+                    : std::clamp(g_gtvbao_base_thickness, 0.01f, 2.f);
   c[42] = pass.history_valid ? 1.f : 0.f;
   if (pass.vbgi) {
     c[0] = g_vbgi_quality_level;
@@ -13021,7 +13060,7 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   return c;
 }
 
-// The GTVBAO push block for the VBGI far passes plus the far tail c[48..51] (gtvbao_common.hlsl).
+// The GTVBAO push block for the VBGI far passes plus the far tail c[48..55] (gtvbao_common.hlsl).
 static std::array<float, kVbgiFarPushConstantFloats> BuildVbgiFarPushConstants(DeviceData* data, bool history_valid) {
   std::array<float, kVbgiFarPushConstantFloats> c = {};
   const auto base = BuildGTVBAOPushConstants(data, {.history_valid = history_valid, .vbgi = true});
@@ -13764,9 +13803,10 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     if (!far_on) {
       CSLog("vbgi", "far skipped: psos=" + std::to_string(far_psos) + " tables=" + std::to_string(far_tables) + " textures=" + std::to_string(far_textures), true);
     }
-    const std::array<float, 9> far_params = {g_vbgi_far_distance, g_vbgi_far_history_length, g_vbgi_far_hit_window,
-                                             g_vbgi_quality_level, g_vbgi_resolution, g_vbgi_radius,
-                                             g_vbgi_bitmask_thickness, g_vbgi_noise_type, g_vbgi_mrt_normal};
+    const std::array<float, 11> far_params = {g_vbgi_far_distance, g_vbgi_far_history_length, g_vbgi_far_hit_window,
+                                              g_vbgi_quality_level, g_vbgi_resolution, g_vbgi_radius,
+                                              g_vbgi_bitmask_thickness, g_vbgi_auto_thickness, g_vbgi_base_thickness,
+                                              g_vbgi_noise_type, g_vbgi_mrt_normal};
     far_params_changed = d->vbgi_far_prev_params_valid && far_params != d->vbgi_far_prev_params;
     d->vbgi_far_prev_params = far_params;
     d->vbgi_far_prev_params_valid = true;
@@ -13966,10 +14006,11 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     if (denoise_ok) {
       const bool temporal_on = g_vbgi_temporal_enabled > 0.5f && g_cpuopt_deferred_dispatch < 0.5f;
       const bool motion_ok = temporal_on && UpdateRtMotion(dev, d, true);
-      const std::array<float, 17> params = {g_vbgi_quality_level, g_vbgi_resolution, g_vbgi_radius, g_vbgi_bitmask_thickness,
-          g_vbgi_depth_mip_offset, g_vbgi_noise_type, g_vbgi_mrt_normal, g_vbgi_ambient, g_vbgi_lights, g_vbgi_sun,
-          g_vbgi_emissive, g_vbgi_backface_mode, g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
-          shader_injection.vbgi_multibounce, g_vbgi_multibounce_strength};
+      const std::array<float, 19> params = {g_vbgi_quality_level, g_vbgi_resolution, g_vbgi_radius, g_vbgi_bitmask_thickness,
+                                            g_vbgi_auto_thickness, g_vbgi_base_thickness,
+                                            g_vbgi_depth_mip_offset, g_vbgi_noise_type, g_vbgi_mrt_normal, g_vbgi_ambient, g_vbgi_lights, g_vbgi_sun,
+                                            g_vbgi_emissive, g_vbgi_backface_mode, g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
+                                            shader_injection.vbgi_multibounce, g_vbgi_multibounce_strength};
       const bool params_changed = d->vbgi_prev_params_valid && !(params == d->vbgi_prev_params);
       d->vbgi_prev_params = params;
       d->vbgi_prev_params_valid = true;
