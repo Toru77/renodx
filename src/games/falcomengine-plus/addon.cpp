@@ -4546,7 +4546,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "KaiCharacterLight", .binding = &shader_injection.character_light_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Hero Light Suppression", .section = "Shadows",
+      .default_value = 1.f, .label = "Hero Light Suppression", .section = "Shadows",
       .tooltip = "Suppresses dynamic point/spot lights on character pixels. 0=off (vanilla), 1=fully remove.",
       .min = 0.f, .max = 1.0f, .format = "%.2f",
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
