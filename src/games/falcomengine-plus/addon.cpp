@@ -9405,7 +9405,11 @@ static bool RtBvhReady(const falcom_world::bvh::BvhDeviceData* bvh_data, falcom_
     *reason = falcom_world::rtao::Reason::LiveBvhOff;
     return false;
   }
+#if !defined(FALCOM_WINDOWS_HARNESS)
+  if (!bvh_data->scene_catalog_ready || !bvh_data->tlas_built) {
+#else
   if (!bvh_data->bvh_ready || !bvh_data->tlas_built) {
+#endif
     *reason = falcom_world::rtao::Reason::BvhNotReady;
     return false;
   }
@@ -9664,7 +9668,8 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   if (!result.ok) {
     rf.temporal_ran = false;
     rf.temporal_last = false;
-    frame.reason = result.pool_reduced ? rtao::Reason::PoolReduced : rtao::Reason::PipelineFailed;
+    frame.reason = result.dxr_unavailable ? rtao::Reason::DxrUnavailable
+                                          : (result.pool_reduced ? rtao::Reason::PoolReduced : rtao::Reason::PipelineFailed);
     return;
   }
   rtao::DispatchRtaoSvgf(dev, cmd_list, svgf_in, ready);

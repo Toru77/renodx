@@ -1126,6 +1126,10 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
     return;
   }
 
+#if !defined(FALCOM_WINDOWS_HARNESS)
+  return;
+#endif
+
   // 1. BLAS of identities captured two presents ago.
   stage.Set("present: deform live (topology)");
   uint32_t resolve = 0u;
@@ -1424,6 +1428,34 @@ inline DynamicTraceInputs RefitDeformLiveCharacters(reshade::api::device* device
                                                     reshade::api::command_list* cmd_list) {
   DynamicTraceInputs inputs;
   const uint32_t frame = g_state.frame.load();
+#if !defined(FALCOM_WINDOWS_HARNESS)
+  std::vector<DynamicCharacter> characters;
+  {
+    std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+    if (!g_deform_live.enabled.load(std::memory_order_relaxed) || g_deform_live.device != device) return inputs;
+    inputs.vertices = g_deform_live.arena_srv;
+    if (g_deform_live.lighting_frame == frame) {
+      inputs.count = g_deform_live.lighting_object_count;
+      return inputs;
+    }
+    g_deform_live.lighting_frame = frame;
+    g_deform_live.lighting_object_count = 0u;
+    g_deform_live.lighting_characters.clear();
+    if (g_deform_live.capture_frame != frame) return inputs;
+    for (const DynamicCapture& capture : g_deform_live.captures) {
+      if (!capture.skinned) continue;
+      if (characters.size() >= kDynamicMaxObjects) break;
+      characters.push_back({capture.key, capture.vertex_base, capture.triangles});
+    }
+  }
+  if (characters.empty()) return inputs;
+  std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+  if (g_deform_live.lighting_frame != frame) return inputs;
+  g_deform_live.lighting_object_count = static_cast<uint32_t>(characters.size());
+  g_deform_live.lighting_characters = std::move(characters);
+  inputs.count = g_deform_live.lighting_object_count;
+  return inputs;
+#else
   std::vector<DynamicObjectGPU> character_objects;
   std::vector<DynamicCharacter> characters;
   reshade::api::resource objects_buffer = {0u};
@@ -1471,6 +1503,7 @@ inline DynamicTraceInputs RefitDeformLiveCharacters(reshade::api::device* device
   g_deform_live.lighting_characters = std::move(characters);
   inputs.count = count;
   return inputs;
+#endif
 }
 
 // rt12 (DXR RTAO): the characters RefitDeformLiveCharacters traced for this frame and the arena they live in.

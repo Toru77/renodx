@@ -416,6 +416,7 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   bool tlas_built = false;
   uint32_t active_count = 0u;  // instances in the uploaded TLAS
   bool bvh_ready = false;      // store and TLAS can be traced
+  bool scene_catalog_ready = false;  // DXR CPU instance catalog is current; no software tree is required
 
   reshade::api::resource debug_texture = {0u};
   reshade::api::resource_view debug_srv = {0u};
@@ -496,6 +497,7 @@ inline void DestroyLiveTlas(reshade::api::device* device, BvhDeviceData* data) {
   data->tlas_built = false;
   data->active_count = 0u;
   data->bvh_ready = false;
+  data->scene_catalog_ready = false;
 }
 
 // Drops every mesh of the store (and the TLAS, whose mesh ids it invalidates).

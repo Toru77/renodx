@@ -414,7 +414,9 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
     src.SubresourceIndex = 0u;
     list->CopyTextureRegion(&dst, 0u, 0u, 0u, &src, nullptr);
   };
-  std::vector<D3D12_RESOURCE_BARRIER> barriers;
+  std::vector<D3D12_RESOURCE_BARRIER>& barriers = slot.barrier_scratch;
+  barriers.clear();
+  barriers.reserve(64u);
   Transition(barriers, r.shared[kRt12RtgiScene].texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
   Transition(barriers, r.scene_cb.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
   if (lamps_on) {
@@ -462,14 +464,41 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
     return on ? r.shared[index].texture12.Get() : static_cast<ID3D12Resource*>(nullptr);
   };
   const Rt12Slot& scene = s.lighting_slots[static_cast<uint32_t>(s.scene_slot)];
+  const bool gc = s.scene_gc;
+  ID3D12Resource* vertex_arena = gc ? g_rt12_gc_scene.vertices : s.arenas[kRt12ArenaVertices].buffer.Get();
+  const uint64_t vertex_count = gc ? g_rt12_gc_scene.vertex_count : s.arenas[kRt12ArenaVertices].used;
+  ID3D12Resource* index_arena = gc ? g_rt12_gc_scene.indices : s.arenas[kRt12ArenaIndices].buffer.Get();
+  const uint64_t index_count = gc ? g_rt12_gc_scene.index_count : s.arenas[kRt12ArenaIndices].used;
+  ID3D12Resource* mesh_table = gc ? scene.gc_meshes.Get() : s.mesh_table.Get();
+  const uint32_t mesh_count = gc ? static_cast<uint32_t>(bvh::kGcMaxEntries) : s.mesh_count;
+  ID3D12Resource* uv_arena = gc ? g_rt12_gc_scene.uvs : s.arenas[kRt12ArenaUvs].buffer.Get();
+  const uint64_t uv_count = gc ? g_rt12_gc_scene.uv_count : s.arenas[kRt12ArenaUvs].used;
   const bool dynamic_on = characters_on;
-  set_srv(0u, s.arenas[kRt12ArenaVertices].buffer.Get(),
-          Rt12BufferSrv(kRt12ArenaStride[kRt12ArenaVertices], s.arenas[kRt12ArenaVertices].used));
-  set_srv(1u, s.arenas[kRt12ArenaIndices].buffer.Get(), Rt12BufferSrv(kRt12ArenaStride[kRt12ArenaIndices], s.arenas[kRt12ArenaIndices].used));
-  set_srv(2u, s.mesh_table.Get(), Rt12BufferSrv(sizeof(bvh::WorldMeshGPU), s.mesh_count));
-  set_srv(3u, scene.instance_table.Get(), Rt12BufferSrv(sizeof(bvh::WorldInstanceGPU), s.scene_instance_count));
+  const std::array<ID3D12Resource*, 6> scene_resources = {
+      vertex_arena, index_arena, mesh_table, scene.instance_table.Get(), uv_arena, scene.tlas.Get()};
+  const std::array<uint64_t, 5> scene_counts = {vertex_count, index_count, mesh_count, s.scene_instance_count, uv_count};
+  const std::array<uint64_t, 3> scene_versions = (gc ? std::array<uint64_t, 3>{g_rt12_gc_scene.version, scene.gc_version, 0u}
+                                                    : std::array<uint64_t, 3>{s.scene_key_version, s.scene_key_blas,
+                                                                               s.mesh_store_version});
+  if (!slot.rtgi_scene_descriptors_valid || slot.rtgi_scene_resources != scene_resources || slot.rtgi_scene_counts != scene_counts
+      || slot.rtgi_scene_versions != scene_versions) {
+    set_srv(0u, vertex_arena, Rt12BufferSrv(kRt12ArenaStride[kRt12ArenaVertices], vertex_count));
+    set_srv(1u, index_arena, Rt12BufferSrv(kRt12ArenaStride[kRt12ArenaIndices], index_count));
+    set_srv(2u, mesh_table, Rt12BufferSrv(sizeof(bvh::WorldMeshGPU), mesh_count));
+    set_srv(3u, scene.instance_table.Get(), Rt12BufferSrv(sizeof(bvh::WorldInstanceGPU), s.scene_instance_count));
+    set_srv(5u, uv_arena, Rt12BufferSrv(kRt12ArenaStride[kRt12ArenaUvs], uv_count));
+    D3D12_SHADER_RESOURCE_VIEW_DESC tlas_srv = {};
+    tlas_srv.Format = DXGI_FORMAT_UNKNOWN;
+    tlas_srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+    tlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    tlas_srv.RaytracingAccelerationStructure.Location = scene.tlas ? scene.tlas->GetGPUVirtualAddress() : 0u;
+    set_srv(20u, nullptr, tlas_srv);
+    slot.rtgi_scene_resources = scene_resources;
+    slot.rtgi_scene_counts = scene_counts;
+    slot.rtgi_scene_versions = scene_versions;
+    slot.rtgi_scene_descriptors_valid = true;
+  }
   set_srv(4u, shared_resource(true, kRt12RtgiDepth), Rt12TextureSrv(DXGI_FORMAT_R32_FLOAT));
-  set_srv(5u, s.arenas[kRt12ArenaUvs].buffer.Get(), Rt12BufferSrv(kRt12ArenaStride[kRt12ArenaUvs], s.arenas[kRt12ArenaUvs].used));
   D3D12_SHADER_RESOURCE_VIEW_DESC atlas_srv = {};
   atlas_srv.Format = DXGI_FORMAT_R32_UINT;
   atlas_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -491,12 +520,6 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
   set_srv(17u, shared_resource(shadow_on, kRt12RtgiShadow), Rt12TextureSrv(DXGI_FORMAT_R32_FLOAT));
   set_srv(18u, shared_resource(mrt2_on, kRt12RtgiMrt2), Rt12TextureSrv(DXGI_FORMAT_R32G32_UINT));
   set_srv(19u, deferred_on ? r.deferred.Get() : nullptr, Rt12BufferSrv(kRt12RtgiDeferredTexels * 16u, deferred_elements));
-  D3D12_SHADER_RESOURCE_VIEW_DESC tlas_srv = {};
-  tlas_srv.Format = DXGI_FORMAT_UNKNOWN;
-  tlas_srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
-  tlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  tlas_srv.RaytracingAccelerationStructure.Location = scene.tlas ? scene.tlas->GetGPUVirtualAddress() : 0u;
-  set_srv(20u, nullptr, tlas_srv);
   set_srv(21u, dynamic_on ? s.dynamic_vertices.Get() : nullptr,
           Rt12BufferSrv(16u, uint64_t{kRt12CarrierWidth} * kRt12CarrierHeight));
   set_uav(22u, debug_on ? r.shared[kRt12RtgiDebug].texture12.Get() : nullptr, Rt12TextureUav(DXGI_FORMAT_R8G8B8A8_UNORM));
@@ -510,8 +533,7 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
 
   // Barriers into the read and write states, then the stats clear and the trace.
   const std::vector<ID3D12Resource*> reads = {
-      s.arenas[kRt12ArenaVertices].buffer.Get(), s.arenas[kRt12ArenaIndices].buffer.Get(), s.arenas[kRt12ArenaUvs].buffer.Get(),
-      s.mesh_table.Get(), scene.instance_table.Get(), s.materials.Get(), s.atlas.texture12.Get(), s.noise.texture12.Get(),
+      vertex_arena, index_arena, uv_arena, mesh_table, scene.instance_table.Get(), s.materials.Get(), s.atlas.texture12.Get(), s.noise.texture12.Get(),
       shared_resource(true, kRt12RtgiDepth), shared_resource(true, kRt12RtgiNormal), shared_resource(radiance_on, kRt12RtgiRadiance),
       shared_resource(prev_on, kRt12RtgiPrevFinal), shared_resource(albedo_on, kRt12RtgiAlbedo), shared_resource(mrt1_on, kRt12RtgiMrt1),
       shared_resource(shadow_on, kRt12RtgiShadow), shared_resource(mrt2_on, kRt12RtgiMrt2),

@@ -168,7 +168,7 @@ struct GcPoolReduceInputs {
   bool dxr_on = false;       // rt12::g_rt12_enabled
   bool dxr_running = false;  // rt12::g_rt12 exists, not failed, not stuck
   bool scene_ready = false;  // rt12::g_rt12_gc_scene.ready
-  bool rtao = false, rtgi = false, rtls = false, rt_sun = false;
+  bool rtao = false;
   bool debug_view = false;   // a BVH GPU debug view
   bool pool_scan = false;    // the Pool Scan tick
   bool discovery = false;    // RTAO Two-Sided discovery (always the compute pass)
@@ -318,9 +318,6 @@ inline void UpdateGcPoolReduce(const GcPoolReduceInputs& in, uint32_t frame) {
                         : !in.gc_active   ? "gc_inactive"
                         : !in.scene_ready ? "not_ready"
                         : !in.rtao        ? "rtao_off"
-                        : in.rtgi         ? "rtgi"
-                        : in.rtls         ? "rtls"
-                        : in.rt_sun       ? "rt_sun"
                         : in.debug_view   ? "debug_view"
                         : in.pool_scan    ? "pool_scan"
                         : in.discovery    ? "discovery"

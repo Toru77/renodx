@@ -85,6 +85,7 @@ struct RtaoDispatchInputs {
 struct RtaoDispatchResult {
   bool ok = false;           // pass A dispatched
   bool pool_reduced = false;  // G5: no AO: the DXR pass fell back while the CPU pool is reduced
+  bool dxr_unavailable = false;
 };
 
 // Null-array sizes: upper bounds of the SRV, UAV and sampler counts of every pass that calls NullComputeSlots (RTAO, RTGI and
@@ -133,10 +134,12 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   auto* bvh_data = bvh::GetBvhDeviceData(device);
   if (bvh_data == nullptr || in.width == 0u || in.height == 0u) return {};
   RtaoDeviceData& data = GetRtaoDeviceData(device);
-  if (!EnsureRtaoPipeline(device, &data) || !EnsureRtaoStats(device, &data)
-      || !EnsureRtaoTraceTarget(device, &data, trace_w, trace_h)) {
-    return {};
-  }
+#if defined(FALCOM_WINDOWS_HARNESS)
+  if (!EnsureRtaoPipeline(device, &data)) return {};
+#else
+  if (!EnsureRtaoLayout(device, &data)) return {};
+#endif
+  if (!EnsureRtaoStats(device, &data) || !EnsureRtaoTraceTarget(device, &data, trace_w, trace_h)) return {};
 
   RtaoPushConstants push = in.push;
   push.size[0] = static_cast<float>(in.width);
@@ -162,6 +165,14 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
                                              in.isfast_view, in.scene_cbv_view, uavs, trace_w, trace_h, in.scene_characters);
 #else
   const bool dxr_pass_a = false;
+#endif
+#if !defined(FALCOM_WINDOWS_HARNESS)
+  if (!dxr_pass_a) {
+    const bool pool_reduced = bvh::g_gpu_capture.pool_reduced.load(std::memory_order_relaxed);
+    if (pool_reduced) bvh::g_gpu_capture.reduced_fallback.store(true, std::memory_order_relaxed);
+    bvh::EndGpuTimer(cmd_list, &data.timer);
+    return {.ok = false, .pool_reduced = pool_reduced, .dxr_unavailable = true};
+  }
 #endif
   if (!dxr_pass_a && bvh::g_gpu_capture.pool_reduced.load(std::memory_order_relaxed)) {
     // G5 (decision 8): the CPU pool is reduced, so the compute pass would trace a stale scene. No AO this frame (vanilla

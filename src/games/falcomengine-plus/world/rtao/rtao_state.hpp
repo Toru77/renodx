@@ -60,6 +60,7 @@ enum class Reason : uint8_t {
   HistoryReset,    // Temporal history reset for one frame (note)
   FilterFailed,    // Spatial filter could not run: the unfiltered AO is used (note)
   PoolReduced,     // G5: the DXR pass fell back while the CPU pool is reduced: vanilla SSAO this frame
+  DxrUnavailable,  // production DXR failed; keep the game's vanilla SSAO
 };
 
 inline const char* ReasonName(Reason reason) {
@@ -81,6 +82,7 @@ inline const char* ReasonName(Reason reason) {
     case Reason::HistoryReset: return "history_reset";
     case Reason::FilterFailed: return "filter_failed";
     case Reason::PoolReduced: return "pool_reduced";
+    case Reason::DxrUnavailable: return "dxr_unavailable";
   }
   return "unknown";
 }
@@ -147,7 +149,7 @@ inline MotionCheck CheckMotionResources(uint64_t rcas_res, uint64_t rtv4_res) {
 }
 
 // Number of Reason codes (frames without AO are counted per code).
-inline constexpr size_t kReasonCount = 17u;
+inline constexpr size_t kReasonCount = 18u;
 
 // Pass A sampling slice and seed (b12 c1.z and c1.w). Freeze noise gives 0 and 0 for every frame; otherwise the
 // values are the ones the round-1 dispatch always used.

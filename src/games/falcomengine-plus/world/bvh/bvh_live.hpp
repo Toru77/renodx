@@ -295,13 +295,34 @@ inline LiveUploadResult UploadLiveMeshes(
   for (LiveMeshUpload& upload : *uploads) {
     LiveBuiltMesh mesh;
     mesh.upload = &upload;
+    const char* error = nullptr;
+#if defined(FALCOM_WINDOWS_HARNESS)
     const auto blas_start = PerfNow();
-    const char* error = BuildMeshBlas(upload.positions, upload.indices, &mesh.blas);
+    error = BuildMeshBlas(upload.positions, upload.indices, &mesh.blas);
     const float blas_ms = LiveElapsedMs(blas_start);
     stats.blas_builds += 1u;
     stats.blas_build_ms_sum += blas_ms;
     stats.blas_build_ms_max = (std::max)(stats.blas_build_ms_max, blas_ms);
     if (error == nullptr) stats.blas_built_triangles += upload.indices.size() / 3u;
+#else
+    if (upload.positions.empty() || upload.indices.empty() || upload.indices.size() % 3u != 0u) error = "invalid triangle geometry";
+    if (error == nullptr) {
+      for (const std::array<float, 3>& position : upload.positions) {
+        if (!std::isfinite(position[0]) || !std::isfinite(position[1]) || !std::isfinite(position[2])) {
+          error = "nonfinite vertex position";
+          break;
+        }
+      }
+    }
+    if (error == nullptr) {
+      for (uint32_t index : upload.indices) {
+        if (index >= upload.positions.size()) {
+          error = "index outside vertex range";
+          break;
+        }
+      }
+    }
+#endif
     if (error != nullptr) {
       data->failed_uids.insert(upload.uid);
       result.failed += 1u;
@@ -313,16 +334,23 @@ inline LiveUploadResult UploadLiveMeshes(
     }
     if (data->vertices.used + vertex_total + upload.positions.size() > kLiveFloatExact
         || data->indices.used + index_total + upload.indices.size() > kLiveFloatExact
-        || data->blas_leaves.used + leaf_total + mesh.blas.leaves.size() > kLiveFloatExact
-        || data->blas_nodes.used + node_total + mesh.blas.nodes.size() > kLiveFloatExact
         || data->uvs.used + uv_total + upload.uvs.size() > kLiveFloatExact) {
       data->store_full = true;
       continue;
     }
+#if defined(FALCOM_WINDOWS_HARNESS)
+    if (data->blas_leaves.used + leaf_total + mesh.blas.leaves.size() > kLiveFloatExact
+        || data->blas_nodes.used + node_total + mesh.blas.nodes.size() > kLiveFloatExact) {
+      data->store_full = true;
+      continue;
+    }
+#endif
     vertex_total += upload.positions.size();
     index_total += upload.indices.size();
+#if defined(FALCOM_WINDOWS_HARNESS)
     leaf_total += mesh.blas.leaves.size();
     node_total += mesh.blas.nodes.size();
+#endif
     uv_total += upload.uvs.size();
     built.push_back(std::move(mesh));
   }
@@ -332,8 +360,10 @@ inline LiveUploadResult UploadLiveMeshes(
   std::string error;
   if (!EnsureLiveArena(device, cmd_list, data, &data->vertices, data->vertices.used + vertex_total, &error)
       || !EnsureLiveArena(device, cmd_list, data, &data->indices, data->indices.used + index_total, &error)
+#if defined(FALCOM_WINDOWS_HARNESS)
       || !EnsureLiveArena(device, cmd_list, data, &data->blas_leaves, data->blas_leaves.used + leaf_total, &error)
       || !EnsureLiveArena(device, cmd_list, data, &data->blas_nodes, data->blas_nodes.used + node_total, &error)
+#endif
       || (uv_total != 0u && !EnsureLiveArena(device, cmd_list, data, &data->uvs, data->uvs.used + uv_total, &error))) {
     stats.upload_failures += 1u;
     stats.last_failure = "arena buffer creation failed: " + error;
@@ -381,8 +411,10 @@ inline LiveUploadResult UploadLiveMeshes(
       vertex_batch.push_back(1.f);
     }
     index_batch.insert(index_batch.end(), upload.indices.begin(), upload.indices.end());
+#if defined(FALCOM_WINDOWS_HARNESS)
     leaf_batch.insert(leaf_batch.end(), mesh.blas.leaves.begin(), mesh.blas.leaves.end());
     node_batch.insert(node_batch.end(), mesh.blas.nodes.begin(), mesh.blas.nodes.end());
+#endif
     new_slots.push_back(slot);
   }
 
@@ -394,8 +426,10 @@ inline LiveUploadResult UploadLiveMeshes(
   };
   if (!append(&data->vertices, vertex_batch.data(), vertex_batch.size() / 4u)
       || !append(&data->indices, index_batch.data(), index_batch.size())
+#if defined(FALCOM_WINDOWS_HARNESS)
       || !append(&data->blas_leaves, leaf_batch.data(), leaf_batch.size())
       || !append(&data->blas_nodes, node_batch.data(), node_batch.size())
+#endif
       || (!uv_batch.empty() && !append(&data->uvs, uv_batch.data(), uv_batch.size()))) {
     stats.upload_failures += 1u;
     stats.last_failure = "arena write failed: " + error;
@@ -416,8 +450,10 @@ inline LiveUploadResult UploadLiveMeshes(
   }
   data->vertices.used += vertex_batch.size() / 4u;
   data->indices.used += index_batch.size();
+#if defined(FALCOM_WINDOWS_HARNESS)
   data->blas_leaves.used += leaf_batch.size();
   data->blas_nodes.used += node_batch.size();
+#endif
   data->uvs.used += uv_batch.size();
 
   for (const LiveMeshSlot& slot : new_slots) {
@@ -440,7 +476,7 @@ inline LiveUploadResult UploadLiveMeshes(
     data->slots.push_back(slot);
     data->mesh_descriptors.push_back(descriptor);
     stats.meshes_uploaded += 1u;
-    stats.triangles_uploaded += slot.leaf_count;
+    stats.triangles_uploaded += slot.index_count / 3u;
   }
   result.uploaded = static_cast<uint32_t>(new_slots.size());
   return result;
@@ -1061,7 +1097,9 @@ inline void RebuildLiveTlas(
   instances.clear();
   leaves.clear();
   instances.reserve(info.size());
+#if defined(FALCOM_WINDOWS_HARNESS)
   leaves.reserve(info.size());
+#endif
   uint32_t waiting = 0u;
   uint32_t unusable = 0u;
   uint32_t near_fade = 0u;
@@ -1095,7 +1133,9 @@ inline void RebuildLiveTlas(
     const uint32_t flags = InstanceVisibilityFlags(descriptor);
     if ((flags & kInstanceNearFade) != 0u) near_fade += 1u;
     if ((flags & kInstanceCameraVisible) == 0u) camera_hidden += 1u;
+#if defined(FALCOM_WINDOWS_HARNESS)
     leaves.push_back(MakeLeaf(instance.bounds_min, instance.bounds_max, static_cast<uint32_t>(instances.size())));
+#endif
     instances.push_back(descriptor);
     if (instance.wind) wind_count += 1u;
     if (kept != read) info[kept] = instance;
@@ -1121,14 +1161,23 @@ inline void RebuildLiveTlas(
     stats.tlas_skip_ms_max = (std::max)(stats.tlas_skip_ms_max, skip_ms);
     RecordCacheTlasSkip(skip_ms, diag.cause);
   };
+  bool noop_full_match = false;
   if (g_live_bvh.skip_noop.load(std::memory_order_relaxed) && !instances.empty() && !data->tlas_refit_failed
       && std::strcmp(reason, "first build") != 0 && std::strcmp(reason, "refit quality") != 0 && std::strcmp(reason, "refit failed") != 0
       && data->tlas_slack == g_live_bvh.slack.load(std::memory_order_relaxed)  // a switch change rebuilds (the layout changes)
-      && LiveSnapshotMatchesTlas(*data, instances, info)) {
+      && LiveSnapshotMatchesTlas(*data, instances, info, &noop_full_match)
+#if !defined(FALCOM_WINDOWS_HARNESS)
+      && noop_full_match
+#endif
+  ) {
     // The TLAS already holds these instances: nothing is built, uploaded or destroyed. The static prefix takes the new
     // provenance; the dynamic suffix is left to the refit, and its revision is not taken over (the refit still runs).
     data->tlas_check_frame = frame;
+#if defined(FALCOM_WINDOWS_HARNESS)
     std::copy(info.begin(), info.begin() + data->tlas_dynamic_first, data->tlas_info.begin());
+#else
+    data->tlas_info = info;
+#endif
     commit(true);
     count_skip();
     return;
@@ -1197,6 +1246,30 @@ inline void RebuildLiveTlas(
     finish();
     return;
   }
+
+#if !defined(FALCOM_WINDOWS_HARNESS)
+  previous_info = std::move(data->tlas_info);
+  replaced = true;
+  DestroyLiveTlas(device, data);
+  data->tlas_instances_cpu.swap(instances);
+  data->tlas_cpu_version += 1u;
+  data->tlas_info = std::move(info);
+  data->tlas_dynamic_first = static_cast<uint32_t>(
+      std::count_if(data->tlas_info.begin(), data->tlas_info.end(), [](const LiveTlasInstance& instance) { return !instance.dynamic; }));
+  data->tlas_built = true;
+  data->scene_catalog_ready = true;
+  data->active_count = static_cast<uint32_t>(data->tlas_instances_cpu.size());
+  data->tlas_wind_count = wind_count;
+  commit();
+  stats.tlas_instances = data->active_count;
+  stats.tlas_near_fade = near_fade;
+  stats.tlas_camera_hidden = camera_hidden;
+  stats.tlas_nodes = 0u;
+  lap(&diag.phase_ms[4]);
+  finish();
+  data->tlas_info_spare = std::move(previous_info);
+  return;
+#endif
 
   // Slack (session switch): spare slots (holes) in the static block, each with a parked leaf at an anchor; otherwise HEAD.
   const bool slack_layout = g_live_bvh.slack.load(std::memory_order_relaxed);
@@ -1343,6 +1416,10 @@ inline void RebuildLiveTlas(
 // full rebuild ("refit failed").
 inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_list* cmd_list, BvhDeviceData* data,
                           uint32_t frame) {
+#if !defined(FALCOM_WINDOWS_HARNESS)
+  RebuildLiveTlas(device, cmd_list, data, CurrentPoolRegion(), frame, "dynamic pose", false);
+  return;
+#endif
   const auto start = PerfNow();
   LiveBvhStats& stats = data->live;
   uint64_t dynamic_revision = 0u;
@@ -1601,6 +1678,11 @@ inline std::vector<T> LiveBytesAs(const std::vector<uint8_t>& bytes, uint64_t fi
 // and the TLAS with the CPU copies kept at upload; read-back trees are also
 // validated structurally.
 inline void CheckLiveBvhOnGpu(reshade::api::device* device, reshade::api::command_queue* queue, BvhDeviceData* data) {
+#if !defined(FALCOM_WINDOWS_HARNESS)
+  (void)device;
+  (void)queue;
+  return;
+#endif
   LiveBvhStats& stats = data->live;
   stats.gpu_checked = true;
   stats.gpu_check_frame = g_state.frame.load();

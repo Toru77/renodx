@@ -2096,7 +2096,8 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
     gc.scene_dirty = false;
     gc.scene_slot_version = slot_version;
   }
-  const bool arenas_ready = gc.arenas[kRt12ArenaIndices].buffer != nullptr && gc.arenas[kRt12ArenaUvs].buffer != nullptr;
+  const bool arenas_ready = gc.arenas[kRt12ArenaVertices].buffer != nullptr && gc.arenas[kRt12ArenaIndices].buffer != nullptr
+                            && gc.arenas[kRt12ArenaUvs].buffer != nullptr;
   const char* not_ready = "";
   if (!gc.settled_latch) {
     not_ready = "not_settled";
@@ -2107,6 +2108,8 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
   } else if (g_rt12_gc_scene.version == 0u) {
     not_ready = "no_tables";
   }
+  g_rt12_gc_scene.vertices = gc.arenas[kRt12ArenaVertices].buffer.Get();
+  g_rt12_gc_scene.vertex_count = gc.arenas[kRt12ArenaVertices].used;
   g_rt12_gc_scene.indices = gc.arenas[kRt12ArenaIndices].buffer.Get();
   g_rt12_gc_scene.index_count = gc.arenas[kRt12ArenaIndices].used;
   g_rt12_gc_scene.uvs = gc.arenas[kRt12ArenaUvs].buffer.Get();

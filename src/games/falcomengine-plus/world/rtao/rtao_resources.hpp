@@ -68,6 +68,7 @@ struct RtaoDeviceData {
   reshade::api::descriptor_table uav_table = {0u};
   reshade::api::pipeline pipeline = {0u};
   bool pipeline_failed = false;
+  bool layout_failed = false;
   reshade::api::resource stats_buffer = {0u};
   reshade::api::resource_view stats_uav = {0u};
   bvh::GpuTimer timer = {};
@@ -84,11 +85,11 @@ inline std::unordered_map<reshade::api::device*, RtaoDeviceData> g_rtao_devices;
 
 inline RtaoDeviceData& GetRtaoDeviceData(reshade::api::device* device) { return g_rtao_devices[device]; }
 
-inline bool EnsureRtaoPipeline(reshade::api::device* device, RtaoDeviceData* data) {
-  if (data->pipeline.handle != 0u) return true;
-  if (data->pipeline_failed) return false;
+inline bool EnsureRtaoLayout(reshade::api::device* device, RtaoDeviceData* data) {
+  if (data->layout.handle != 0u && data->cbv_table.handle != 0u && data->srv_table.handle != 0u
+      && data->uav_table.handle != 0u) return true;
+  if (data->layout_failed) return false;
 
-#if defined(__world_rtao_EMBED_FILE)
   using DR = reshade::api::descriptor_range;
   using DS = reshade::api::shader_stage;
   using DT = reshade::api::descriptor_type;
@@ -116,22 +117,33 @@ inline bool EnsureRtaoPipeline(reshade::api::device* device, RtaoDeviceData* dat
   params[3].type = reshade::api::pipeline_layout_param_type::push_constants;
   params[3].push_constants = push_range;
   const auto fail = [&](const char* stage) {
-    renodx::utils::log::w("[world-rtao] pipeline creation failed: ", stage);
-    data->pipeline_failed = true;
+    renodx::utils::log::w("[world-rtao] shared layout creation failed: ", stage);
+    data->layout_failed = true;
     return false;
   };
   if (data->layout.handle == 0u && !device->create_pipeline_layout(4, params, &data->layout)) return fail("pipeline layout");
   if (data->cbv_table.handle == 0u && !device->allocate_descriptor_table(data->layout, 0, &data->cbv_table)) return fail("cbv table");
   if (data->srv_table.handle == 0u && !device->allocate_descriptor_table(data->layout, 1, &data->srv_table)) return fail("srv table");
   if (data->uav_table.handle == 0u && !device->allocate_descriptor_table(data->layout, 2, &data->uav_table)) return fail("uav table");
+  return true;
+}
 
+inline bool EnsureRtaoPipeline(reshade::api::device* device, RtaoDeviceData* data) {
+  if (data->pipeline.handle != 0u) return true;
+  if (data->pipeline_failed || !EnsureRtaoLayout(device, data)) return false;
+
+#if defined(__world_rtao_EMBED_FILE)
   reshade::api::shader_desc shader = {};
   shader.code = __world_rtao.data();
   shader.code_size = __world_rtao.size();
   shader.entry_point = "main";
   reshade::api::pipeline_subobject subobject = {
       reshade::api::pipeline_subobject_type::compute_shader, 1, &shader};
-  if (!device->create_pipeline(data->layout, 1, &subobject, &data->pipeline)) return fail("compute pipeline");
+  if (!device->create_pipeline(data->layout, 1, &subobject, &data->pipeline)) {
+    renodx::utils::log::w("[world-rtao] compute pipeline creation failed");
+    data->pipeline_failed = true;
+    return false;
+  }
   renodx::utils::log::i("[world-rtao] pipeline ready");
   return true;
 #else

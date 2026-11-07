@@ -110,6 +110,11 @@ struct Rt12Arena {
 struct Rt12Slot {
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
   uint64_t fence_value = 0u;  // 0 = never submitted
+  std::vector<D3D12_RESOURCE_BARRIER> barrier_scratch;  // reused after this slot fence completes
+  std::array<ID3D12Resource*, 6> rtgi_scene_resources = {};
+  std::array<uint64_t, 5> rtgi_scene_counts = {};
+  std::array<uint64_t, 3> rtgi_scene_versions = {};
+  bool rtgi_scene_descriptors_valid = false;
   Microsoft::WRL::ComPtr<ID3D12Resource> upload;  // UPLOAD heap, persistently mapped
   uint8_t* upload_data = nullptr;
   uint64_t upload_bytes = 0u;
@@ -220,6 +225,7 @@ struct Rt12State {
   uint32_t scene_record_count = 0u;   // P2b records in the TLAS of scene_slot
   uint32_t scene_frame = UINT32_MAX;   // g_state.frame of scene_slot (RTGI)
   uint32_t scene_instance_count = 0u;  // instances of scene_slot (RTGI)
+  bool scene_gc = false;  // scene_slot uses the GPU geometry cache
   PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = nullptr;
   Rt12RtgiState rtgi;
   uint64_t address_generation = ~0ull;  // blas_generation the per-slot address tables were last written for (see Rt12Slot)
@@ -273,9 +279,10 @@ inline Rt12Panel g_rt12_panel;
 struct Rt12GcScene {
   bool ready = false;
   const char* not_ready = "off";
+  ID3D12Resource* vertices = nullptr;
   ID3D12Resource* indices = nullptr;  // GC arenas, rest state COMMON
   ID3D12Resource* uvs = nullptr;
-  uint64_t index_count = 0u, uv_count = 0u;
+  uint64_t vertex_count = 0u, index_count = 0u, uv_count = 0u;
   std::vector<float> meshes;        // bvh::kGcMaxEntries * 16 (Rt12GcMeshWords per slot)
   std::vector<uint64_t> addresses;  // bvh::kGcMaxEntries BLAS addresses, 0 none
   uint64_t version = 0u;
@@ -286,8 +293,8 @@ inline Rt12GcScene g_rt12_gc_scene;
 inline uint64_t g_rt12_gc_epoch = 0u;  // last Rt12GcScene::version handed out; never reset, so versions never repeat
 
 inline bool GcOwnsRtao() {
-  return bvh::g_gpu_capture.enabled.load(std::memory_order_relaxed) && bvh::g_gpu_capture.trace.load(std::memory_order_relaxed)
-         && rtgi::g_rtgi_enabled < 0.5f;
+  return rtao::RtaoRequested() && bvh::g_gpu_capture.enabled.load(std::memory_order_relaxed)
+      && bvh::g_gpu_capture.trace.load(std::memory_order_relaxed) && g_rt12_gc_scene.ready && g_rt12_gc_scene.version != 0u;
 }
 
 template <typename F>
@@ -983,7 +990,9 @@ inline bool SubmitPresent(Rt12State& s, const bvh::BvhDeviceData* data, const st
   }
 
   // 9.4 Barrier batch 1: COMMON to the copy states (the old arenas are only read).
-  std::vector<D3D12_RESOURCE_BARRIER> barriers;
+  std::vector<D3D12_RESOURCE_BARRIER>& barriers = p.barrier_scratch;
+  barriers.clear();
+  barriers.reserve(64u);
   for (uint32_t a = 0u; a < 3u; ++a) {
     if (grown[a] && old_used[a] > 0u) Transition(barriers, old_arena[a].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     if (written[a]) Transition(barriers, s.arenas[a].buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1662,7 +1671,9 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     FailSession(s, Rt12Reason::SubmitFailed, "lighting reset");
     return RtFallback(Rt12Reason::SubmitFailed);
   }
-  std::vector<D3D12_RESOURCE_BARRIER> barriers;
+  std::vector<D3D12_RESOURCE_BARRIER>& barriers = L.barrier_scratch;
+  barriers.clear();
+  barriers.reserve(64u);
   UavBarrier(barriers, nullptr);
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
   list->EndQuery(s.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, k * kRt12Timestamps + 2u);
@@ -2313,10 +2324,9 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   }
   bvh::AddPerfBlockMs(bvh::kPerfBlockRt12Resolve, bvh::LiveElapsedMs(resolve_start));
 
-  if (!gc) {
-    s.scene_frame = frame;
-    s.scene_instance_count = scene_count;
-  }
+  s.scene_frame = frame;
+  s.scene_instance_count = gc ? records : scene_count;
+  s.scene_gc = gc;
 
   // 16. Panel.
   uint64_t dynamic_blas_bytes = 0u;
