@@ -59,6 +59,7 @@ struct SvgfRows {
   const char* temporal_enabled_tooltip;
   float* temporal_enabled;
   float* full_res_denoise;
+  float* temporal_far_only = nullptr;
   float* history_weight;
   float* depth_rejection;
   float* normal_rejection;
@@ -74,6 +75,7 @@ struct SvgfRows {
   float* radius_scale = nullptr;
   float* half_res_radius_scale = nullptr;
   float default_temporal_enabled = 1.f;
+  float default_temporal_far_only = 0.f;
   float default_full_res_denoise = 0.f;
   float default_history_weight = 0.8f;
   float default_history_length = 32.f;
@@ -85,6 +87,7 @@ struct SvgfRows {
   float default_luminance_edge_stop = 4.f;
   float default_depth_sigma = 1.f;
   float default_normal_power = 128.f;
+  float default_radius_scale = 1.f;
 };
 inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::function<bool()>& visible,
                         const std::function<bool()>& advanced, const SvgfRows& rows) {
@@ -102,6 +105,19 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
       .labels = {"Off", "On"},
       .is_visible = visible,
   });
+  if (rows.temporal_far_only != nullptr) {
+    settings->push_back(new Setting{
+        .key = prefix + "TemporalFarFieldOnly",
+        .binding = rows.temporal_far_only,
+        .value_type = SettingValueType::BOOLEAN,
+        .default_value = rows.default_temporal_far_only,
+        .label = "Temporal Far Field only",
+        .section = rows.temporal_section,
+        .tooltip = "Accumulates resolved far-field color while near GI stays current. Requires the far field and motion; independent of Far Temporal Reuse. Multi-Bounce feedback is disabled while this mode is selected.",
+        .labels = {"Off", "On"},
+        .is_visible = [visible, enabled = rows.temporal_enabled]() { return visible() && *enabled < 0.5f; },
+    });
+  }
   settings->push_back(new Setting{
       .key = prefix + "FullResDenoise",
       .binding = rows.full_res_denoise,
@@ -197,7 +213,7 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
         .key = prefix + "SvgfRadiusScale",
         .binding = rows.radius_scale,
         .value_type = SettingValueType::INTEGER,
-        .default_value = 1.f,
+        .default_value = rows.default_radius_scale,
         .label = "Spatial Radius Scale",
         .section = rows.spatial_section,
         .tooltip = "Scales the spacing between a-trous taps without changing the iteration count or kernel. Higher spacing skips neighbors and can cause shimmer or grid patterns.",

@@ -140,6 +140,7 @@ struct RtgiDenoiseRequest {
   const char* log_prefix;  // "[world-rtgi]" or "[world-rtls]"
   bool full_resolution = false;
   bool nearest_fallback = false;
+  bool history_only = false;
 };
 
 // The passes the chain can run this frame (ok: the output exists).
@@ -171,8 +172,8 @@ inline RtgiDenoiseReady EnsureRtgiDenoise(reshade::api::device* device, RtgiDeno
     set->history_index = 0u;
     set->mode_valid = false;
   }
-  if (!EnsureRtgiTextureSet(device, &set->output, request.output_format, request.output_bytes_per_pixel, request.full_width,
-                            request.full_height)) {
+  if (!request.history_only && !EnsureRtgiTextureSet(device, &set->output, request.output_format, request.output_bytes_per_pixel, request.full_width,
+                                                     request.full_height)) {
     renodx::utils::log::w(request.log_prefix, " final texture creation failed");
     set->mode_valid = false;
     return {};
@@ -270,6 +271,7 @@ struct RtgiDenoiseInputs {
   float upsample_char_intensity;   // upsample c1.w (Debug 7 only)
   float upsample_saturation;       // upsample c2.x; 1 = unchanged
   RtgiUpsampleSettings upsample;   // reconstruction controls; defaults preserve current behavior
+  bool history_only = false;
 };
 
 struct RtgiDenoiseResult {
@@ -296,7 +298,7 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
   const uint32_t trace_groups_y = (height + 7u) / 8u;
   const bool reproject_debug = in.debug_uav.handle != 0u && ready.reproject && (in.debug_mode == 4 || in.debug_mode == 5);
   const bool variance_debug = in.debug_uav.handle != 0u && ready.spatial && in.debug_mode == 11;
-  const bool upsample_debug = in.debug_uav.handle != 0u && (in.debug_mode == 6 || in.debug_mode == 7);
+  const bool upsample_debug = !in.history_only && in.debug_uav.handle != 0u && (in.debug_mode == 6 || in.debug_mode == 7);
   const reshade::api::buffer_range scene_cbv = rtao::SceneCbvRange(in.scene_cbv_view);
   bvh::BeginGpuTimer(device, cmd_list, &set->timer);
   // Push constants shared by the passes; each pass sets params[2] (history valid) and params[3] (a-trous step).
@@ -464,45 +466,47 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
     }
   }
 
-  // Upsample to the depth size: writes final_gi[final_index ^ 1], which becomes the newest.
-  const RtgiPipeline& upsample = in.svgf.full_resolution ? set->finalize_pipeline : set->upsample_pipeline;
-  const uint32_t final_write = set->output_index ^ 1u;
-  const reshade::api::resource_view upsample_srvs[kRtgiUpsampleSrvCount] = {in.depth_view, in.mrt_normal_view, input, in.albedo_view};
-  const reshade::api::resource_view upsample_uavs[kRtgiUpsampleUavCount] = {
-      set->output.uav[final_write], upsample_debug ? in.debug_uav : reshade::api::resource_view{0u}};
-  reshade::api::descriptor_table_update upsample_updates[3] = {
-      {upsample.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
-      {upsample.srv_table, 0, 0, kRtgiUpsampleSrvCount, kSrv, upsample_srvs},
-      {upsample.uav_table, 0, 0, kRtgiUpsampleUavCount, kUav, upsample_uavs},
-  };
-  device->update_descriptor_tables(3, upsample_updates);
-  const RtgiUpsamplePushConstants upush = {
-      .size = {static_cast<float>(in.full_width), static_cast<float>(in.full_height), static_cast<float>(width),
-               static_cast<float>(height)},
-      .params = {divisor, static_cast<float>(in.debug_mode), in.upsample_intensity, in.upsample_char_intensity},
-      .extra = {in.upsample_saturation, in.upsample.algorithm, in.upsample.depth_plane_sigma, in.upsample.normal_edge_power},
-      .upscale = {in.upsample.bilinear_weight_sharpness, in.upsample.nearest_valid_fallback, 0.f, 0.f},
-  };
-  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, upsample.pipeline);
-  const reshade::api::descriptor_table upsample_tables[3] = {upsample.cbv_table, upsample.srv_table, upsample.uav_table};
-  cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, upsample.layout, 0, 3, upsample_tables);
-  cmd_list->push_constants(reshade::api::shader_stage::all_compute, upsample.layout, 3, 0, kRtgiUpsamplePushCount, &upush);
-  cmd_list->dispatch((in.full_width + 7u) / 8u, (in.full_height + 7u) / 8u, 1u);
-  rtao::NullComputeSlots(cmd_list, kRtgiUpsampleSrvCount, kRtgiUpsampleUavCount, 0u);
-  cmd_list->barrier(set->output.texture[final_write], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
-  if (upsample_debug) {
-    cmd_list->barrier(in.debug_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
-  }
-  set->output_index = final_write;
-  bvh::EndGpuTimer(cmd_list, &set->timer);
   static const reshade::api::resource_view null_views[kSvgfReprojectSrvCount] = {};
   static const reshade::api::sampler null_samplers[kSvgfReprojectSamplerCount] = {};
+  if (!in.history_only) {
+    // Upsample to the depth size: writes final_gi[final_index ^ 1], which becomes the newest.
+    const RtgiPipeline& upsample = in.svgf.full_resolution ? set->finalize_pipeline : set->upsample_pipeline;
+    const uint32_t final_write = set->output_index ^ 1u;
+    const reshade::api::resource_view upsample_srvs[kRtgiUpsampleSrvCount] = {in.depth_view, in.mrt_normal_view, input, in.albedo_view};
+    const reshade::api::resource_view upsample_uavs[kRtgiUpsampleUavCount] = {
+        set->output.uav[final_write], upsample_debug ? in.debug_uav : reshade::api::resource_view{0u}};
+    reshade::api::descriptor_table_update upsample_updates[3] = {
+        {upsample.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
+        {upsample.srv_table, 0, 0, kRtgiUpsampleSrvCount, kSrv, upsample_srvs},
+        {upsample.uav_table, 0, 0, kRtgiUpsampleUavCount, kUav, upsample_uavs},
+    };
+    device->update_descriptor_tables(3, upsample_updates);
+    const RtgiUpsamplePushConstants upush = {
+        .size = {static_cast<float>(in.full_width), static_cast<float>(in.full_height), static_cast<float>(width),
+                 static_cast<float>(height)},
+        .params = {divisor, static_cast<float>(in.debug_mode), in.upsample_intensity, in.upsample_char_intensity},
+        .extra = {in.upsample_saturation, in.upsample.algorithm, in.upsample.depth_plane_sigma, in.upsample.normal_edge_power},
+        .upscale = {in.upsample.bilinear_weight_sharpness, in.upsample.nearest_valid_fallback, 0.f, 0.f},
+    };
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, upsample.pipeline);
+    const reshade::api::descriptor_table upsample_tables[3] = {upsample.cbv_table, upsample.srv_table, upsample.uav_table};
+    cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, upsample.layout, 0, 3, upsample_tables);
+    cmd_list->push_constants(reshade::api::shader_stage::all_compute, upsample.layout, 3, 0, kRtgiUpsamplePushCount, &upush);
+    cmd_list->dispatch((in.full_width + 7u) / 8u, (in.full_height + 7u) / 8u, 1u);
+    rtao::NullComputeSlots(cmd_list, kRtgiUpsampleSrvCount, kRtgiUpsampleUavCount, 0u);
+    cmd_list->barrier(set->output.texture[final_write], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    if (upsample_debug) {
+      cmd_list->barrier(in.debug_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    }
+    set->output_index = final_write;
+    table_nulls->push_back({upsample.srv_table, 0, 0, kRtgiUpsampleSrvCount, kSrv, null_views});
+    table_nulls->push_back({upsample.uav_table, 0, 0, kRtgiUpsampleUavCount, kUav, null_views});
+  }
+  bvh::EndGpuTimer(cmd_list, &set->timer);
   if (in.svgf.full_resolution && in.divisor > 1.f) {
     table_nulls->push_back({set->reconstruct_pipeline.srv_table, 0, 0, kRtgiUpsampleSrvCount, kSrv, null_views});
     table_nulls->push_back({set->reconstruct_pipeline.uav_table, 0, 0, kRtgiUpsampleUavCount, kUav, null_views});
   }
-  table_nulls->push_back({upsample.srv_table, 0, 0, kRtgiUpsampleSrvCount, kSrv, null_views});
-  table_nulls->push_back({upsample.uav_table, 0, 0, kRtgiUpsampleUavCount, kUav, null_views});
   if (ready.reproject) {
     table_nulls->push_back({set->reproject_pipeline.srv_table, 0, 0, kSvgfReprojectSrvCount, kSrv, null_views});
     table_nulls->push_back({set->reproject_pipeline.uav_table, 0, 0, kSvgfReprojectUavCount, kUav, null_views});
