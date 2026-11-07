@@ -939,8 +939,8 @@ static float g_gtvbao_cs_dispatch_fix    = 0.f;  // 0=Off, 1=Restore, 2=Null, 3=
 static float g_cpuopt_deferred_dispatch   = 1.f;  // dispatch GTVBAO/VBGI in OnPresent, not inline (default ON for Kai)
 static float g_cpuopt_ensure_pipelines    = 0.f;  // kai-style: don't destroy/recreate pipelines every frame
 
-static float g_gtvbao_full_res_denoise = 1.f;
-static float g_gtvbao_temporal_enabled = 1.f;
+static float g_gtvbao_full_res_denoise = 0.f;
+static float g_gtvbao_temporal_enabled = 0.f;
 static float g_gtvbao_history_weight = 0.8f;
 static float g_gtvbao_depth_rejection = 0.200f;
 static float g_gtvbao_normal_rejection = 0.f;
@@ -14368,8 +14368,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                                                                           .history_length = &g_gtvbao_svgf_history_length,
                                                                                           .radius_scale = &g_gtvbao_svgf_radius_scale,
                                                                                           .half_res_radius_scale = &g_gtvbao_svgf_half_res_radius_scale,
-                                                                                          .default_temporal_enabled = 1.f,
-                                                                                          .default_full_res_denoise = 1.f,
+                                                                                          .default_temporal_enabled = 0.f,
+                                                                                          .default_full_res_denoise = 0.f,
                                                                                           .default_history_weight = 0.8f,
                                                                                           .default_history_length = 128.f,
                                                                                           .default_depth_rejection = 0.200f,
