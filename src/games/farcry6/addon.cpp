@@ -28,8 +28,8 @@
 #include "../../mods/swapchain.hpp"
 #include "../../utils/date.hpp"
 #include "../../utils/settings.hpp"
-#include "./shared.h"
 #include "./dlss/dlss.hpp"
+#include "./shared.h"
 
 namespace {
 
@@ -44,6 +44,11 @@ void SyncFrameGenerationSetting() {
   farcry6_dlss::dlss::fg_debug_log_enabled.store(farcry6_dlss::dlss::fg_debug_log_setting != 0.f, std::memory_order_release);
   farcry6_dlss::dlss::fg_zero_ui_alpha_enabled.store(farcry6_dlss::dlss::fg_zero_ui_alpha_setting != 0.f, std::memory_order_release);
   farcry6_dlss::dlss::fg_ui_alpha_enabled.store(farcry6_dlss::dlss::fg_ui_alpha_setting != 0.f, std::memory_order_release);
+}
+
+void SyncReflexSetting() {
+  const int requested = static_cast<int>((std::clamp)(farcry6_dlss::dlss::reflex_mode_setting, 0.f, 2.f));
+  farcry6_dlss::dlss::reflex_requested_mode.store(requested, std::memory_order_release);
 }
 
 renodx::utils::settings::Settings settings = {
@@ -195,6 +200,19 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Off", "2x", "3x", "4x", "5x", "6x"},
         .on_change_value = [](float, float) { SyncFrameGenerationSetting(); },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "NVIDIAReflex",
+        .binding = &farcry6_dlss::dlss::reflex_mode_setting,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "NVIDIA Reflex",
+        .section = "DLSS",
+        .tooltip = "Use NVIDIA Reflex low latency. Frame Generation requires Reflex On. Marker timings use generic frame callbacks.",
+        .labels = {"Off", "On", "On + Boost"},
+        .max = 2.f,
+        .on_change_value = [](float, float) { SyncReflexSetting(); },
+        .is_visible = []() { return farcry6_dlss::dlss::IsReflexSupported(); },
     },
     new renodx::utils::settings::Setting{
         .key = "FrameGenerationUIAlpha",
@@ -391,6 +409,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   }
   renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff, &SyncFrameGenerationSetting);
   if (fdw_reason == DLL_PROCESS_ATTACH) {
+    SyncReflexSetting();
     farcry6_dlss::dlss::fg_debug_log_enabled.store(farcry6_dlss::dlss::fg_debug_log_setting != 0.f, std::memory_order_release);
     farcry6_dlss::dlss::fg_zero_ui_alpha_enabled.store(farcry6_dlss::dlss::fg_zero_ui_alpha_setting != 0.f, std::memory_order_release);
     farcry6_dlss::dlss::fg_ui_alpha_enabled.store(farcry6_dlss::dlss::fg_ui_alpha_setting != 0.f, std::memory_order_release);

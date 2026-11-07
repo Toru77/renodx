@@ -18,10 +18,10 @@
 
 #include "../../../utils/detour.hpp"
 #include "./fg_native_factory.hpp"
-#include "./streamline_runtime.hpp"
 #include "./streamline/include/sl_dlss_g.h"
 #include "./streamline/include/sl_pcl.h"
 #include "./streamline/include/sl_reflex.h"
+#include "./streamline_runtime.hpp"
 
 namespace farcry6_dlss::streamline {
 
@@ -29,6 +29,8 @@ inline std::mutex sdk_interface_mutex;
 // Serializes frame APIs with shutdown; acquire before bootstrap_mutex so a
 // Streamline call can safely trigger the command-queue hook.
 inline std::mutex frame_api_mutex;
+// Reflex sleep runs without frame_api_mutex so concurrent queue callbacks can progress.
+inline std::shared_mutex reflex_sleep_lifetime_mutex;
 // Called before ReShade forwards swapchain creation to its underlying factory.
 // Repeated swapchain creation may use the same factory, so do not wrap it twice.
 inline bool UpgradeReShadeFactory(IDXGIFactory* factory) {
@@ -55,12 +57,13 @@ inline bool UpgradeReShadeFactory(IDXGIFactory* factory) {
 }
 
 using CreateSwapChainForHwnd = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
-                                                          const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+                                                           const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
 inline CreateSwapChainForHwnd original_create_swapchain_for_hwnd = nullptr;
 inline std::atomic<bool> factory_hook_active = false;
 inline std::atomic<bool> factory_hook_native = false;
 inline std::atomic<int> bootstrap_fg_support = -1;
 inline std::atomic<int> bootstrap_reflex_support = -1;
+inline std::atomic<int> bootstrap_pcl_support = -1;
 inline std::mutex bootstrap_mutex;
 inline bool bootstrap_initialized = false;
 inline std::atomic<void*> bootstrap_device = nullptr;
@@ -78,7 +81,7 @@ inline ID3D12Device* queue_proxy_device = nullptr;
 // queue for their other operations. The proxy device remains alive until the
 // ReShade device is destroyed; Streamline's queue proxy refers back to it.
 inline HRESULT STDMETHODCALLTYPE HookCreateCommandQueue(ID3D12Device* device, const D3D12_COMMAND_QUEUE_DESC* desc,
-                                                         REFIID iid, void** queue) {
+                                                        REFIID iid, void** queue) {
   static thread_local bool inside_queue = false;
   if (inside_queue || !factory_hook_active.load(std::memory_order_acquire)
       || device != bootstrap_device.load(std::memory_order_acquire)) return original_create_queue(device, desc, iid, queue);
@@ -113,8 +116,8 @@ inline HRESULT STDMETHODCALLTYPE HookCreateCommandQueue(ID3D12Device* device, co
 }
 
 inline HRESULT STDMETHODCALLTYPE HookCreateSwapChainForHwnd(IDXGIFactory2* factory, IUnknown* device, HWND window,
-                                                             const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen,
-                                                             IDXGIOutput* output, IDXGISwapChain1** swapchain) {
+                                                            const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen,
+                                                            IDXGIOutput* output, IDXGISwapChain1** swapchain) {
   static thread_local bool inside_native_factory = false;
   if (inside_native_factory) return original_create_swapchain_for_hwnd(factory, device, window, desc, fullscreen, output, swapchain);
   const bool active = factory_hook_active.load(std::memory_order_acquire);
@@ -169,7 +172,7 @@ inline bool InstallFactoryHook(IDXGIFactory2* factory) {
   DXGIFactory* reshade_factory = nullptr;
   UINT size = sizeof(reshade_factory);
   const bool proxy = SUCCEEDED(factory->GetPrivateData(__uuidof(DXGIFactory), &size, &reshade_factory))
-                  && size == sizeof(reshade_factory) && reshade_factory != nullptr;
+                     && size == sizeof(reshade_factory) && reshade_factory != nullptr;
   void* target = proxy ? (*reinterpret_cast<void***>(factory))[15] : FindNativeFactoryMethod(factory, 15u);
   if (target == nullptr) {
     return false;
@@ -215,12 +218,12 @@ inline void StartBootstrap(const std::wstring& directory) {
       return;
     }
   }
-  sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex};
+  sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
   const wchar_t* paths[] = {directory.c_str()};
   sl::Preferences preferences = {};
   preferences.flags = sl::PreferenceFlags::eUseManualHooking | sl::PreferenceFlags::eUseFrameBasedResourceTagging;
   preferences.featuresToLoad = features;
-  preferences.numFeaturesToLoad = 2;
+  preferences.numFeaturesToLoad = 3;
   preferences.pathsToPlugins = paths;
   preferences.numPathsToPlugins = 1;
   preferences.projectId = "a3f4c8e1-7b2d-4f6a-9c1e-5d8b0f2a6c4e";
@@ -248,6 +251,7 @@ inline void RegisterBootstrapDevice(void* device) {
   adapter.deviceLUIDSizeInBytes = sizeof(luid);
   bootstrap_fg_support.store(static_cast<int>(runtime.is_feature_supported(sl::kFeatureDLSS_G, adapter)));
   bootstrap_reflex_support.store(static_cast<int>(runtime.is_feature_supported(sl::kFeatureReflex, adapter)));
+  bootstrap_pcl_support.store(static_cast<int>(runtime.is_feature_supported(sl::kFeaturePCL, adapter)));
   const auto resolve = [](sl::Feature feature, const char* name) {
     void* function = nullptr;
     if (runtime.get_feature_function(feature, name, function) != sl::Result::eOk) return static_cast<void*>(nullptr);
@@ -284,6 +288,7 @@ inline void RegisterBootstrapDevice(void* device) {
 }
 
 inline void StopBootstrap(void* device) {
+  std::unique_lock sleep_lock(reflex_sleep_lifetime_mutex);
   std::lock_guard frame_lock(frame_api_mutex);
   std::lock_guard lock(bootstrap_mutex);
   if (!bootstrap_initialized || bootstrap_device.load() != device) return;
@@ -296,6 +301,7 @@ inline void StopBootstrap(void* device) {
   bootstrap_device.store(nullptr);
   bootstrap_fg_support.store(-1);
   bootstrap_reflex_support.store(-1);
+  bootstrap_pcl_support.store(-1);
   fg_set_options = nullptr;
   fg_get_state = nullptr;
   reflex_set_options = nullptr;
