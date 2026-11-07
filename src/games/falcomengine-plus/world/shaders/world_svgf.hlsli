@@ -19,18 +19,18 @@ cbuffer cb_scene : register(b0)
     float2 resolutionScaling_g : packoffset(c49);
 };
 
-// Push constants (SvgfPushConstants in rtgi_resources.hpp, 16 floats).
+// Push constants (SvgfPushConstants in rtgi_resources.hpp, 20 floats).
 cbuffer cb_svgf : register(b12)
 {
     float4 s_size : packoffset(c0);      // trace width, trace height, full width, full height
     float4 s_params : packoffset(c1);    // trace divisor d, debug mode (RTGI numbering), history valid (1, 0 = reset), a-trous step 2^i (0 otherwise)
     float4 s_temporal : packoffset(c2);  // alpha = 1 - History Weight, depth rejection, normal rejection, sigma_l
     float4 s_luminance : packoffset(c3); // luminance weights rgb, unused
+    float4 s_spatial : packoffset(c4);   // a-trous depth sigma, normal power, history length cap, radius scale
 };
 
 static const float kSvgfSigmaZ = 1.0;                  // Sec. 4.4: sigma_z = 1
 static const float kSvgfSigmaN = 128.0;                // Sec. 4.4: sigma_n = 128
-static const float kSvgfMaxHistory = 32.0;             // non-paper: history length cap
 static const float kSvgfDepthEpsilonScale = 1e-3;      // non-paper: eps_z = this x z_p (plan default; Falcor has no eps)
 static const float kSvgfLuminanceEpsilon = 1e-6;       // non-paper: eps_l (plan default; Falcor uses 1e-10 under the sqrt)
 static const float kSvgfVarianceHistory = 4.0;         // Sec. 4.2: history below 4 frames uses the spatial estimate
@@ -46,16 +46,16 @@ float SvgfLuminance(float3 c)
 // Eq. 4: depth weight of tap q (guide gq) against centre p (guide gp); offset = q - p in trace pixels. Guide: (z, dz/dx,
 // dz/dy, dist). The slope is the dot product of the screen-space gradient with the offset (Sec. 4.4 local linear model).
 // Non-paper: the dot product and the relative eps follow the plan; Falcor uses length(offset) and no eps.
-float SvgfDepthWeight(float4 gp, float4 gq, float2 offset)
+float SvgfDepthWeight(float4 gp, float4 gq, float2 offset, float sigma_z)
 {
     const float slope = abs(dot(gp.yz, offset));
-    return exp(-abs(gp.x - gq.x) / (kSvgfSigmaZ * slope + kSvgfDepthEpsilonScale * gp.x));
+    return exp(-abs(gp.x - gq.x) / (sigma_z * slope + kSvgfDepthEpsilonScale * gp.x));
 }
 
 // Eq. 5: normal weight, cosine term with sigma_n.
-float SvgfNormalWeight(float3 np, float3 nq)
+float SvgfNormalWeight(float3 np, float3 nq, float sigma_n)
 {
-    return pow(max(0.0, dot(np, nq)), kSvgfSigmaN);
+    return pow(max(0.0, dot(np, nq)), sigma_n);
 }
 
 // Trace pixel inside the trace image.

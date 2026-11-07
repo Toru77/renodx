@@ -61,6 +61,14 @@ void main(uint3 id : SV_DispatchThreadID)
 #else
     float3 gi = float3(0.0, 0.0, 0.0);
 #endif
+    bool valid = false;
+#if defined(RTGI_UPSAMPLE_FINAL)
+    if (surface)
+    {
+        const float4 v = g_in[px];
+        if (v.a >= 0.0) gi = v.rgb;
+    }
+#else
     if (surface)
     {
         const float2 uv = (float2(px) + 0.5) / float2(full_size);
@@ -169,18 +177,26 @@ void main(uint3 id : SV_DispatchThreadID)
         if (algorithm == 2 && best_joint_w > 1e-6)
         {
             gi = best_joint_v;
+            valid = true;
         }
         else if (sum_w > 1e-6)
         {
             gi = sum_v / sum_w;
+            valid = true;
         }
 #if defined(RTGI_UPSAMPLE_NEAREST_FALLBACK)
         else if (algorithm != 1 && nearest_fallback && best_w >= 0.0)
         {
             gi = best_v;
+            valid = true;
         }
 #endif
     }
+#endif
+#if defined(RTGI_UPSAMPLE_SVGF_INPUT)
+    g_final[px] = float4(gi, valid ? 1.0 : -1.0);
+    return;
+#endif
     if (u_extra.x != 1.0)
     {
         float luma = dot(gi, float3(0.2126, 0.7152, 0.0722));

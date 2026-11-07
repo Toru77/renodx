@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -99,6 +101,7 @@ struct RtgiDispatchInputs {
   reshade::api::resource_view motion_view = {0u};  // RTV4 motion; null: the temporal pass does not run
   bool temporal = false;
   SvgfSettings svgf = {};  // SVGF settings (history valid set by the owner)
+  bool restir_history_valid = false;
   bool spatial = false;
   bool restir_spatial = false;  // ReSTIR Spatial Reuse (runs only with the ReSTIR flag and this dispatch's temporal pass)
   reshade::api::resource lights = {0u};         // Sora 2nd dynamicLights_g (t11); copied for the stats request, null otherwise
@@ -135,6 +138,8 @@ struct RtgiDenoiseRequest {
   bool temporal;           // Temporal on and a motion view available
   bool spatial;            // Spatial filter on
   const char* log_prefix;  // "[world-rtgi]" or "[world-rtls]"
+  bool full_resolution = false;
+  bool nearest_fallback = false;
 };
 
 // The passes the chain can run this frame (ok: the output exists).
@@ -150,26 +155,55 @@ struct RtgiDenoiseReady {
 // integrated and a-trous targets when the spatial filter is requested. A new or resized history starts at index 0 (all
 // invalid). The owner ensures the upsample pipeline itself (kRtgiUpsamplePipelineDesc).
 inline RtgiDenoiseReady EnsureRtgiDenoise(reshade::api::device* device, RtgiDenoiseSet* set, const RtgiDenoiseRequest& request) {
+  if (!request.full_resolution && set->reconstructed.texture[0].handle != 0u) {
+    DestroyRtgiTextureSet(device, &set->reconstructed);
+  }
+  if (!request.spatial) {
+    DestroyRtgiTextureSet(device, &set->integrated);
+    DestroyRtgiTextureSet(device, &set->atrous);
+    set->atrous_iterations = 0u;
+  }
+  if (!request.temporal && !request.spatial) {
+    DestroyRtgiTextureSet(device, &set->history_color);
+    DestroyRtgiTextureSet(device, &set->history_normal);
+    DestroyRtgiTextureSet(device, &set->history_moments);
+    DestroyRtgiTextureSet(device, &set->history_guide);
+    set->history_index = 0u;
+    set->mode_valid = false;
+  }
   if (!EnsureRtgiTextureSet(device, &set->output, request.output_format, request.output_bytes_per_pixel, request.full_width,
                             request.full_height)) {
     renodx::utils::log::w(request.log_prefix, " final texture creation failed");
+    set->mode_valid = false;
     return {};
+  }
+  const uint32_t denoise_width = request.full_resolution ? request.full_width : request.trace_width;
+  const uint32_t denoise_height = request.full_resolution ? request.full_height : request.trace_height;
+  if (request.full_resolution) {
+    const bool ao = request.output_format == reshade::api::format::r32_uint;
+    if (!EnsureRtgiPipeline(device, &set->reconstruct_pipeline, {.srv_count = kRtgiUpsampleSrvCount, .uav_count = kRtgiUpsampleUavCount, .sampler_count = 0u, .push_count = kRtgiUpsamplePushCount, .code = request.nearest_fallback ? kSvgfReconstructFallbackShader : kSvgfReconstructShader, .name = "svgf reconstruct"})
+        || !EnsureRtgiPipeline(device, &set->finalize_pipeline, {.srv_count = kRtgiUpsampleSrvCount, .uav_count = kRtgiUpsampleUavCount, .sampler_count = 0u, .push_count = kRtgiUpsamplePushCount, .code = ao ? kSvgfFinalizeAoShader : kSvgfFinalizeShader, .name = "svgf finalize"})
+        || !EnsureRtgiTextureSet(device, &set->reconstructed, reshade::api::format::r16g16b16a16_float, 8u, request.full_width, request.full_height)) {
+      set->mode_valid = false;
+      return {};
+    }
   }
   bool reproject_run = (request.temporal || request.spatial)
       && EnsureRtgiPipeline(device, &set->reproject_pipeline, {.srv_count = kSvgfReprojectSrvCount, .uav_count = kSvgfReprojectUavCount,
                                                               .sampler_count = kSvgfReprojectSamplerCount, .push_count = kSvgfPushCount,
                                                               .code = kSvgfReprojectShader, .name = "reproject"});
   if (reproject_run) {
-    const bool history_recreated = set->history_color.texture[0].handle == 0u || set->history_color.width != request.trace_width
-        || set->history_color.height != request.trace_height;
-    reproject_run = EnsureRtgiTextureSet(device, &set->history_color, reshade::api::format::r16g16b16a16_float, 8u, request.trace_width, request.trace_height)
-        && EnsureRtgiTextureSet(device, &set->history_normal, reshade::api::format::r16g16_float, 4u, request.trace_width, request.trace_height)
-        && EnsureRtgiTextureSet(device, &set->history_moments, reshade::api::format::r32g32b32a32_float, 16u, request.trace_width, request.trace_height)
-        && EnsureRtgiTextureSet(device, &set->history_guide, reshade::api::format::r32g32b32a32_float, 16u, request.trace_width, request.trace_height);
+    const bool history_recreated = set->history_color.texture[0].handle == 0u || set->history_color.width != denoise_width
+        || set->history_color.height != denoise_height;
+    reproject_run = EnsureRtgiTextureSet(device, &set->history_color, reshade::api::format::r16g16b16a16_float, 8u, denoise_width, denoise_height)
+        && EnsureRtgiTextureSet(device, &set->history_normal, reshade::api::format::r16g16_float, 4u, denoise_width, denoise_height)
+        && EnsureRtgiTextureSet(device, &set->history_moments, reshade::api::format::r32g32b32a32_float, 16u, denoise_width, denoise_height)
+        && EnsureRtgiTextureSet(device, &set->history_guide, reshade::api::format::r32g32b32a32_float, 16u, denoise_width, denoise_height);
     if (!reproject_run) {
       renodx::utils::log::w(request.log_prefix, " history texture creation failed");
     } else if (history_recreated) {
       set->history_index = 0u;
+      set->mode_valid = false;
     }
   }
   if (reproject_run && set->point_sampler.handle == 0u) {
@@ -191,12 +225,16 @@ inline RtgiDenoiseReady EnsureRtgiDenoise(reshade::api::device* device, RtgiDeno
       && EnsureRtgiPipeline(device, &set->atrous_pipeline, {.srv_count = kSvgfAtrousSrvCount, .uav_count = kSvgfAtrousUavCount,
                                                             .sampler_count = 0u, .push_count = kSvgfPushCount,
                                                             .code = kSvgfAtrousShader, .name = "atrous"})
-      && EnsureRtgiTextureSet(device, &set->integrated, reshade::api::format::r16g16b16a16_float, 8u, request.trace_width, request.trace_height)
-      && EnsureRtgiTextureSet(device, &set->atrous, reshade::api::format::r16g16b16a16_float, 8u, request.trace_width, request.trace_height);
+      && EnsureRtgiTextureSet(device, &set->integrated, reshade::api::format::r16g16b16a16_float, 8u, denoise_width, denoise_height)
+      && EnsureRtgiTextureSet(device, &set->atrous, reshade::api::format::r16g16b16a16_float, 8u, denoise_width, denoise_height);
   const std::span<const std::uint8_t> kTileCode[kSvgfAtrousTileSteps] = {kSvgfAtrousS1Shader, kSvgfAtrousS2Shader, kSvgfAtrousS4Shader};
   const char* kTileName[kSvgfAtrousTileSteps] = {"atrous s1", "atrous s2", "atrous s4"};
   for (uint32_t k = 0u; k < kSvgfAtrousTileSteps; ++k) {
     spatial_run = spatial_run && EnsureRtgiPipeline(device, &set->atrous_tile_pipeline[k], {.srv_count = kSvgfAtrousSrvCount, .uav_count = kSvgfAtrousUavCount, .sampler_count = 0u, .push_count = kSvgfPushCount, .code = kTileCode[k], .name = kTileName[k]});
+  }
+  if (request.full_resolution && ((request.temporal || request.spatial) && !reproject_run || (request.spatial && !spatial_run))) {
+    set->mode_valid = false;
+    return {};
   }
   return {.ok = true, .reproject = reproject_run, .temporal = reproject_run && request.temporal, .spatial = spatial_run};
 }
@@ -251,8 +289,11 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
   const reshade::api::descriptor_type kCbv = reshade::api::descriptor_type::constant_buffer;
   const reshade::api::descriptor_type kSrv = reshade::api::descriptor_type::shader_resource_view;
   const reshade::api::descriptor_type kUav = reshade::api::descriptor_type::unordered_access_view;
-  const uint32_t trace_groups_x = (in.trace_width + 7u) / 8u;
-  const uint32_t trace_groups_y = (in.trace_height + 7u) / 8u;
+  const uint32_t width = in.svgf.full_resolution ? in.full_width : in.trace_width;
+  const uint32_t height = in.svgf.full_resolution ? in.full_height : in.trace_height;
+  const float divisor = in.svgf.full_resolution ? 1.f : in.divisor;
+  const uint32_t trace_groups_x = (width + 7u) / 8u;
+  const uint32_t trace_groups_y = (height + 7u) / 8u;
   const bool reproject_debug = in.debug_uav.handle != 0u && ready.reproject && (in.debug_mode == 4 || in.debug_mode == 5);
   const bool variance_debug = in.debug_uav.handle != 0u && ready.spatial && in.debug_mode == 11;
   const bool upsample_debug = in.debug_uav.handle != 0u && (in.debug_mode == 6 || in.debug_mode == 7);
@@ -260,20 +301,59 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
   bvh::BeginGpuTimer(device, cmd_list, &set->timer);
   // Push constants shared by the passes; each pass sets params[2] (history valid) and params[3] (a-trous step).
   SvgfPushConstants push = {};
-  push.size[0] = static_cast<float>(in.trace_width);
-  push.size[1] = static_cast<float>(in.trace_height);
+  push.size[0] = static_cast<float>(width);
+  push.size[1] = static_cast<float>(height);
   push.size[2] = static_cast<float>(in.full_width);
   push.size[3] = static_cast<float>(in.full_height);
-  push.params[0] = in.divisor;
+  push.params[0] = divisor;
   push.params[1] = static_cast<float>(in.debug_mode);
   push.temporal[0] = 1.f - in.svgf.history_weight;  // alpha
   push.temporal[1] = in.svgf.depth_rejection;
   push.temporal[2] = in.svgf.normal_rejection;
   push.temporal[3] = in.svgf.luminance_edge_stop;  // sigma_l
+  push.spatial[0] = in.svgf.depth_sigma;
+  push.spatial[1] = in.svgf.normal_power;
+  push.spatial[2] = std::isfinite(in.svgf.history_length) ? std::clamp(in.svgf.history_length, 4.f, 128.f) : 32.f;
+  const uint32_t radius_scale = (std::isfinite(in.svgf.radius_scale)
+                                     ? static_cast<uint32_t>(std::round(std::clamp(in.svgf.radius_scale, 1.f, 4.f)))
+                                     : 1u);
+  push.spatial[3] = static_cast<float>(radius_scale);
   push.luminance[0] = in.luminance_weights[0];
   push.luminance[1] = in.luminance_weights[1];
   push.luminance[2] = in.luminance_weights[2];
   reshade::api::resource_view input = in.raw_view;
+  const bool mode_changed = !set->mode_valid || set->full_resolution != in.svgf.full_resolution
+      || (ready.spatial && set->radius_scale != radius_scale);
+  if (in.svgf.full_resolution && in.divisor > 1.f) {
+    const RtgiPipeline& reconstruct = set->reconstruct_pipeline;
+    const reshade::api::resource_view srvs[kRtgiUpsampleSrvCount] = {in.depth_view, in.mrt_normal_view, in.raw_view, in.albedo_view};
+    const reshade::api::resource_view uavs[kRtgiUpsampleUavCount] = {set->reconstructed.uav[0], {0u}};
+    reshade::api::descriptor_table_update updates[3] = {
+        {reconstruct.cbv_table, 0, 0, 1, kCbv, &scene_cbv},
+        {reconstruct.srv_table, 0, 0, kRtgiUpsampleSrvCount, kSrv, srvs},
+        {reconstruct.uav_table, 0, 0, kRtgiUpsampleUavCount, kUav, uavs},
+    };
+    device->update_descriptor_tables(3, updates);
+    const RtgiUpsamplePushConstants constants = {
+        .size = {static_cast<float>(in.full_width), static_cast<float>(in.full_height), static_cast<float>(in.trace_width), static_cast<float>(in.trace_height)},
+        .params = {in.divisor, 0.f, 1.f, 1.f},
+        .extra = {1.f, in.upsample.algorithm, in.upsample.depth_plane_sigma, in.upsample.normal_edge_power},
+        .upscale = {in.upsample.bilinear_weight_sharpness, in.upsample.nearest_valid_fallback, 0.f, 0.f},
+    };
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reconstruct.pipeline);
+    const reshade::api::descriptor_table tables[3] = {reconstruct.cbv_table, reconstruct.srv_table, reconstruct.uav_table};
+    cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, reconstruct.layout, 0, 3, tables);
+    cmd_list->push_constants(reshade::api::shader_stage::all_compute, reconstruct.layout, 3, 0, kRtgiUpsamplePushCount, &constants);
+    cmd_list->dispatch(trace_groups_x, trace_groups_y, 1u);
+    rtao::NullComputeSlots(cmd_list, kRtgiUpsampleSrvCount, kRtgiUpsampleUavCount, 0u);
+    cmd_list->barrier(set->reconstructed.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    input = set->reconstructed.srv[0];
+  }
+  if (ready.spatial) {
+    set->radius_scale = radius_scale;
+  }
+  set->full_resolution = in.svgf.full_resolution;
+  set->mode_valid = true;
   const uint32_t read = set->history_index;
   const uint32_t write = set->history_index ^ 1u;
 
@@ -281,7 +361,7 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
   if (ready.reproject) {
     const RtgiPipeline& reproject = set->reproject_pipeline;
     const reshade::api::resource_view reproject_srvs[kSvgfReprojectSrvCount] = {
-        in.raw_view, in.depth_view, in.mrt_normal_view, in.motion_view, set->history_color.srv[read],
+        input, in.depth_view, in.mrt_normal_view, in.motion_view, set->history_color.srv[read],
         set->history_moments.srv[read], set->history_guide.srv[read], set->history_normal.srv[read]};
     const reshade::api::resource_view reproject_uavs[kSvgfReprojectUavCount] = {
         ready.spatial ? set->integrated.uav[0] : set->history_color.uav[write], in.stats_uav, set->history_moments.uav[write],
@@ -296,7 +376,7 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
     };
     device->update_descriptor_tables(4, reproject_updates);
     SvgfPushConstants rpush = push;
-    rpush.params[2] = in.svgf.history_valid && ready.temporal ? 1.f : 0.f;
+    rpush.params[2] = in.svgf.history_valid && ready.temporal && !mode_changed ? 1.f : 0.f;
     rpush.params[3] = 0.f;
     cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reproject.pipeline);
     const reshade::api::descriptor_table reproject_tables[4] = {
@@ -347,12 +427,14 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
 
   // A-trous: N = max(1, clamp(iterations, 1, 5) - log2(d)) iterations of step 2^i. Iteration 0 reads atrous[0] and writes
   // history[write] (the feedback colour); iteration 1 reads history[write] and writes atrous[1]; from 2 on it reads
-  // atrous[(i - 1) & 1] and writes atrous[i & 1]. The last one written is the input of the upsample. Iterations 0 to 2
-  // (steps 1, 2, 4) use the group-shared tile kernels (atrous_tile_pipeline); the rest use atrous_pipeline.
-  set->atrous_iterations = ready.spatial ? SvgfEffectiveIterations(in.svgf.iterations, static_cast<uint32_t>(in.divisor + 0.5f)) : 0u;
+  // atrous[(i - 1) & 1] and writes atrous[i & 1]. The last one written is the input of the upsample. Iterations
+  // whose actual step is 1, 2 or 4 use group-shared tile kernels; other steps use atrous_pipeline.
+  set->atrous_iterations = ready.spatial ? SvgfEffectiveIterations(in.svgf.iterations, static_cast<uint32_t>(divisor + 0.5f)) : 0u;
   if (ready.spatial) {
     for (uint32_t i = 0u; i < set->atrous_iterations; ++i) {
-      const RtgiPipeline& atrous = i < kSvgfAtrousTileSteps ? set->atrous_tile_pipeline[i] : set->atrous_pipeline;
+      const uint32_t step = radius_scale * (1u << i);
+      const bool tiled = step == 1u || step == 2u || step == 4u;
+      const RtgiPipeline& atrous = (tiled ? set->atrous_tile_pipeline[std::countr_zero(step)] : set->atrous_pipeline);
       cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, atrous.pipeline);
       const bool to_history = i == 0u;
       const uint32_t slot = i & 1u;
@@ -383,7 +465,7 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
   }
 
   // Upsample to the depth size: writes final_gi[final_index ^ 1], which becomes the newest.
-  const RtgiPipeline& upsample = set->upsample_pipeline;
+  const RtgiPipeline& upsample = in.svgf.full_resolution ? set->finalize_pipeline : set->upsample_pipeline;
   const uint32_t final_write = set->output_index ^ 1u;
   const reshade::api::resource_view upsample_srvs[kRtgiUpsampleSrvCount] = {in.depth_view, in.mrt_normal_view, input, in.albedo_view};
   const reshade::api::resource_view upsample_uavs[kRtgiUpsampleUavCount] = {
@@ -395,9 +477,9 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
   };
   device->update_descriptor_tables(3, upsample_updates);
   const RtgiUpsamplePushConstants upush = {
-      .size = {static_cast<float>(in.full_width), static_cast<float>(in.full_height), static_cast<float>(in.trace_width),
-               static_cast<float>(in.trace_height)},
-      .params = {in.divisor, static_cast<float>(in.debug_mode), in.upsample_intensity, in.upsample_char_intensity},
+      .size = {static_cast<float>(in.full_width), static_cast<float>(in.full_height), static_cast<float>(width),
+               static_cast<float>(height)},
+      .params = {divisor, static_cast<float>(in.debug_mode), in.upsample_intensity, in.upsample_char_intensity},
       .extra = {in.upsample_saturation, in.upsample.algorithm, in.upsample.depth_plane_sigma, in.upsample.normal_edge_power},
       .upscale = {in.upsample.bilinear_weight_sharpness, in.upsample.nearest_valid_fallback, 0.f, 0.f},
   };
@@ -415,6 +497,10 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
   bvh::EndGpuTimer(cmd_list, &set->timer);
   static const reshade::api::resource_view null_views[kSvgfReprojectSrvCount] = {};
   static const reshade::api::sampler null_samplers[kSvgfReprojectSamplerCount] = {};
+  if (in.svgf.full_resolution && in.divisor > 1.f) {
+    table_nulls->push_back({set->reconstruct_pipeline.srv_table, 0, 0, kRtgiUpsampleSrvCount, kSrv, null_views});
+    table_nulls->push_back({set->reconstruct_pipeline.uav_table, 0, 0, kRtgiUpsampleUavCount, kUav, null_views});
+  }
   table_nulls->push_back({upsample.srv_table, 0, 0, kRtgiUpsampleSrvCount, kSrv, null_views});
   table_nulls->push_back({upsample.uav_table, 0, 0, kRtgiUpsampleUavCount, kUav, null_views});
   if (ready.reproject) {
@@ -514,7 +600,8 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
                                                       .full_height = in.full_height,
                                                       .temporal = in.temporal && in.motion_view.handle != 0u,
                                                       .spatial = in.spatial,
-                                                      .log_prefix = "[world-rtgi]"});
+                                                      .log_prefix = "[world-rtgi]",
+                                                                  .full_resolution = in.svgf.full_resolution});
   if (!denoise.ok) return {};
   // ReSTIR GI temporal reuse (M2): runs on ReSTIR frames whose chain reprojects with motion (RTGI Temporal on); it uses
   // the chain's samplers. Its reservoirs are kept while ReSTIR is on and marked stale on frames without the pass.
@@ -735,7 +822,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
         .size = {static_cast<float>(in.trace_width), static_cast<float>(in.trace_height), static_cast<float>(in.full_width),
                  static_cast<float>(in.full_height)},
         .params = {in.push.params[3], static_cast<float>(in.debug_mode),
-                   in.svgf.history_valid && restir_history_ok ? 1.f : 0.f, kRestirTemporalMCap},
+                   in.restir_history_valid && restir_history_ok ? 1.f : 0.f, kRestirTemporalMCap},
         .reject = {in.svgf.depth_rejection, in.svgf.normal_rejection, in.push.fade[0], in.push.fade[1]},
         .seed = {in.push.sampling[2], 0.f, 0.f, 0.f}};
     cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, rt.pipeline);
@@ -1028,7 +1115,7 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "]},\n";
   out << "  \"spatial_filter\": {\"on\": " << (g_rtgi_spatial_enabled > 0.5f ? "true" : "false")
       << ", \"ran\": " << (f.filter_ran ? "true" : "false") << ", \"iterations\": " << g_rtgi_svgf_iterations
-      << ", \"iterations_effective\": " << SvgfEffectiveIterations(g_rtgi_svgf_iterations, f.divisor)
+      << ", \"iterations_effective\": " << SvgfEffectiveIterations(g_rtgi_svgf_iterations, g_rtgi_full_res_denoise > 0.5f ? 1u : f.divisor)
       << ", \"luminance_edge_stop\": " << g_rtgi_svgf_luminance_edge_stop << "},\n";
   out << "  \"stats\": {\n";
   out << "    \"rays\": " << v[kRtgiStatRays] << ",\n";

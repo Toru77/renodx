@@ -95,7 +95,7 @@ inline constexpr uint32_t kSvgfAtrousSrvCount = 3u;
 inline constexpr uint32_t kSvgfAtrousUavCount = 1u;
 // A-trous iterations 0 to 2 (steps 1, 2, 4) use the group-shared tile kernels world_svgf_atrous_s1, _s2 and _s4.
 inline constexpr uint32_t kSvgfAtrousTileSteps = 3u;
-inline constexpr uint32_t kSvgfPushCount = 16u;
+inline constexpr uint32_t kSvgfPushCount = 20u;
 inline constexpr uint32_t kSvgfMaxIterations = 5u;
 inline constexpr float kSvgfLuminanceRgb[3] = {0.2126f, 0.7152f, 0.0722f};  // RTGI and GTVBGI luminance weights
 inline constexpr float kSvgfLuminanceShadow[3] = {1.f, 1.f, 0.f};          // RT Local Shadows and RT Sun
@@ -182,6 +182,26 @@ inline constexpr std::span<const std::uint8_t> kSvgfAtrousS4Shader = __world_svg
 #else
 inline constexpr std::span<const std::uint8_t> kSvgfAtrousS4Shader = {};
 #endif
+#if defined(__world_svgf_reconstruct_EMBED_FILE)
+inline constexpr std::span<const std::uint8_t> kSvgfReconstructShader = __world_svgf_reconstruct;
+#else
+inline constexpr std::span<const std::uint8_t> kSvgfReconstructShader = {};
+#endif
+#if defined(__world_svgf_reconstruct_fallback_EMBED_FILE)
+inline constexpr std::span<const std::uint8_t> kSvgfReconstructFallbackShader = __world_svgf_reconstruct_fallback;
+#else
+inline constexpr std::span<const std::uint8_t> kSvgfReconstructFallbackShader = {};
+#endif
+#if defined(__world_svgf_finalize_EMBED_FILE)
+inline constexpr std::span<const std::uint8_t> kSvgfFinalizeShader = __world_svgf_finalize;
+#else
+inline constexpr std::span<const std::uint8_t> kSvgfFinalizeShader = {};
+#endif
+#if defined(__world_svgf_finalize_ao_EMBED_FILE)
+inline constexpr std::span<const std::uint8_t> kSvgfFinalizeAoShader = __world_svgf_finalize_ao;
+#else
+inline constexpr std::span<const std::uint8_t> kSvgfFinalizeAoShader = {};
+#endif
 #if defined(__world_rtgi_upsample_EMBED_FILE)
 inline constexpr std::span<const std::uint8_t> kRtgiUpsampleShader = __world_rtgi_upsample;
 #else
@@ -228,11 +248,13 @@ struct SvgfPushConstants {
   float params[4];    // c1: trace divisor, debug mode (RTGI numbering), history valid (0 = reset), a-trous step (2^i, 0 otherwise)
   float temporal[4];  // c2: alpha = 1 - History Weight, depth rejection, normal rejection, luminance edge stop sigma_l
   float luminance[4]; // c3: luminance weights rgb, unused
+  float spatial[4];    // c4: depth sigma, normal power, history length cap, radius scale
 };
-static_assert(sizeof(SvgfPushConstants) == kSvgfPushCount * sizeof(float), "svgf b12 must be 16 floats");
+static_assert(sizeof(SvgfPushConstants) == kSvgfPushCount * sizeof(float), "svgf b12 must be 20 floats");
 static_assert(offsetof(SvgfPushConstants, params) == 4 * sizeof(float), "svgf b12 c1 offset");
 static_assert(offsetof(SvgfPushConstants, temporal) == 8 * sizeof(float), "svgf b12 c2 offset");
 static_assert(offsetof(SvgfPushConstants, luminance) == 12 * sizeof(float), "svgf b12 c3 offset");
+static_assert(offsetof(SvgfPushConstants, spatial) == 16 * sizeof(float), "svgf b12 c4 offset");
 
 // b12 for the RTGI upsample, matching cbuffer cb_rtgi_upsample in world_rtgi_upsample.cs_5_0.hlsl.
 struct RtgiUpsamplePushConstants {
@@ -429,6 +451,12 @@ struct RtgiDenoiseSet {
   RtgiPipeline atrous_pipeline;
   RtgiPipeline atrous_tile_pipeline[kSvgfAtrousTileSteps];
   RtgiPipeline upsample_pipeline;
+  RtgiPipeline reconstruct_pipeline;
+  RtgiPipeline finalize_pipeline;
+  RtgiTextureSet<1> reconstructed;
+  bool full_resolution = false;
+  bool mode_valid = false;
+  uint32_t radius_scale = 1u;
   reshade::api::sampler point_sampler = {0u};
   reshade::api::sampler linear_sampler = {0u};
   RtgiTextureSet<2> history_color;   // rgba16f, trace size: rgb colour, a = variance
@@ -452,6 +480,11 @@ struct SvgfSettings {
   bool history_valid = false;       // false: reset (ResetReason != None)
   float iterations = 5.f;           // requested a-trous iterations (1 to 5)
   float luminance_edge_stop = 4.f;  // sigma_l
+  float depth_sigma = 1.f;
+  float normal_power = 128.f;
+  bool full_resolution = false;
+  float history_length = 32.f;
+  float radius_scale = 1.f;
 };
 
 // Effective a-trous iterations: clamp(iterations, 1, 5) - log2(divisor), at least 1.
@@ -466,6 +499,7 @@ inline uint64_t RtgiDenoiseTextureBytes(const RtgiDenoiseSet& set) {
   const auto bytes = [](const auto& s, uint32_t bpp) { return static_cast<uint64_t>(s.width) * s.height * bpp; };
   return bytes(set.history_color, 8u * 2u) + bytes(set.history_normal, 4u * 2u) + bytes(set.history_moments, 16u * 2u)
       + bytes(set.history_guide, 16u * 2u) + bytes(set.integrated, 8u) + bytes(set.atrous, 8u * 2u)
+      + bytes(set.reconstructed, 8u)
       + bytes(set.output, 4u * 2u);
 }
 
@@ -528,6 +562,8 @@ inline void DestroyRtgiPipeline(reshade::api::device* device, const RtgiPipeline
 
 // Destroys the denoise textures and the history; the pipelines, samplers and timer stay. The next run recreates them.
 inline void ReleaseRtgiDenoiseTextures(reshade::api::device* device, RtgiDenoiseSet* set) {
+  DestroyRtgiTextureSet(device, &set->reconstructed);
+  set->mode_valid = false;
   DestroyRtgiTextureSet(device, &set->history_color);
   DestroyRtgiTextureSet(device, &set->history_normal);
   DestroyRtgiTextureSet(device, &set->history_moments);
@@ -551,6 +587,8 @@ inline void DestroyRtgiDenoiseSet(reshade::api::device* device, RtgiDenoiseSet* 
   DestroyRtgiPipeline(device, set->atrous_pipeline);
   for (RtgiPipeline& tile : set->atrous_tile_pipeline) DestroyRtgiPipeline(device, tile);
   DestroyRtgiPipeline(device, set->upsample_pipeline);
+  DestroyRtgiPipeline(device, set->reconstruct_pipeline);
+  DestroyRtgiPipeline(device, set->finalize_pipeline);
 }
 
 inline void DestroyRtgiDeviceData(reshade::api::device* device) {

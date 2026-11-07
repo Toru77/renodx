@@ -28,12 +28,17 @@ inline float g_rtgi_dynamic_lights = 0.f;   // Off-screen Dynamic Lights: lamps 
 inline float g_rtgi_dynamic_light_contribution = 1.f;  // Dynamic Light Contribution: scales only RTGI's lamp bounce
 inline float g_rtgi_lamp_shadows = 0.f;  // Off-screen Lamp Shadows: fallback lamp light gets shadow rays
 inline float g_rtgi_game_sun = 0.f;  // Game-Style Fallback Sun: fallback sun gets the game's shadow floor
+inline float g_rtgi_full_res_denoise = 0.f;
 inline float g_rtgi_temporal_enabled = 1.f;
 inline float g_rtgi_history_weight = 0.8f;
 inline float g_rtgi_depth_rejection = 0.05f;
 inline float g_rtgi_normal_rejection = 0.9f;
 inline float g_rtgi_spatial_enabled = 1.f;
-inline float g_rtgi_svgf_iterations = 5.f;        // Iterations: a-trous iterations of the SVGF filter, 1..5 (divisor reduces them)
+inline float g_rtgi_svgf_history_length = 32.f;
+inline float g_rtgi_svgf_radius_scale = 1.f;
+inline float g_rtgi_svgf_iterations = 5.f;  // Iterations: a-trous iterations of the SVGF filter, 1..5 (divisor reduces them)
+inline float g_rtgi_svgf_depth_sigma = 1.f;
+inline float g_rtgi_svgf_normal_power = 128.f;
 inline float g_rtgi_svgf_luminance_edge_stop = 4.f;  // Luminance Edge Stop: sigma_l of the SVGF luminance weight
 inline float g_rtgi_intensity = 1.f;              // GI Intensity: scale of the bounce added to the image (0 = none)
 inline float g_rtgi_char_intensity = 1.f;         // Character GI Intensity: on the character shading path
@@ -124,6 +129,7 @@ struct ParameterSnapshot {
   float trace_characters;
   float sun_casters_only, sun_contribution, fallback_no_albedo, dynamic_lights, dynamic_light_contribution, game_sun, lamp_shadows;
   float extra_bounces, feedback_strength, extra_bounce_rays, bounce_saturation, restir, restir_spatial;
+  float svgf_history_length;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 

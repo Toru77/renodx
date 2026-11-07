@@ -88,7 +88,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 g
                 // The plan default follows the paper's depth and normal weights only.
                 const float w = (i == 0 && j == 0)
                     ? 1.0
-                    : SvgfDepthWeight(gp, gq, float2(i, j)) * SvgfNormalWeight(np, OctDecode(gs_normal[ti]));
+                    : SvgfDepthWeight(gp, gq, float2(i, j), kSvgfSigmaZ) * SvgfNormalWeight(np, OctDecode(gs_normal[ti]), kSvgfSigmaN);
                 const float4 mq = float4(gs_m[ti], 0.0, 0.0);
                 sum_w += w;
                 sum_m1 += w * mq.x;

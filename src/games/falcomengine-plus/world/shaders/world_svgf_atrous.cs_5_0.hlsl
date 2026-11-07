@@ -1,7 +1,7 @@
 // world_svgf_atrous.cs_5_0.hlsl - SVGF a-trous wavelet iteration (world/docs/ROADMAP.md, SVGF M1). Paper Sec. 4.3 Eq. 1 to 3
 // and the Sec. 4.4 edge stops Eq. 4 to 6 (reference/svgf/svgf_preprint.md).
 //
-// One iteration i with step s = 2^i (params.w). Input t0 (rgb colour, a = variance; a < 0 = not traced), guide t1, normal
+// One iteration i with step s = 2^i (params.w) times the radius scale. Input t0 (rgb colour, a = variance; a < 0 = not traced), guide t1, normal
 // t2 of the history (current frame). Output u0. The centre is copied through when not traced or when the resolution
 // scaling is not 1 (as the RTAO and RTGI filters).
 //   Eq. 1: C'(p) = sum(h w C(q)) / sum(h w)
@@ -56,8 +56,8 @@ void main(uint3 id : SV_DispatchThreadID)
     const float gv_mean = gv_w > 0.0 ? gv_sum / gv_w : c.a;
     const float sigma_l = s_temporal.w * sqrt(max(0.0, gv_mean));
 
-    // Sec. 4.3 kernel footprint: 5x5 taps at spacing s = 2^i (params.w).
-    const int step = (int)s_params.w;
+    // Sec. 4.3 kernel footprint: 5x5 taps at the scaled iteration spacing.
+    const int step = (int)s_params.w * (int)clamp(round(s_spatial.w), 1.0, 4.0);
     float sum_hw = 0.0;
     float sum_hw_sq_var = 0.0;
     float3 sum_c = float3(0.0, 0.0, 0.0);
@@ -75,8 +75,8 @@ void main(uint3 id : SV_DispatchThreadID)
             const float2 offset = float2(i, j) * float(step);
             const float h = kSvgfKernel[abs(i)] * kSvgfKernel[abs(j)];
             // Eq. 2: the centre has weight 1 (w_z = w_n = w_l = 1), so only h(0,0) enters Eq. 1 and Eq. 3 for it.
-            const float w_z = centre ? 1.0 : SvgfDepthWeight(gp, gq, offset);
-            const float w_n = centre ? 1.0 : SvgfNormalWeight(np, OctDecode(g_history_normal[q]));
+            const float w_z = centre ? 1.0 : SvgfDepthWeight(gp, gq, offset, s_spatial.x);
+            const float w_n = centre ? 1.0 : SvgfNormalWeight(np, OctDecode(g_history_normal[q]), s_spatial.y);
             const float w_l = centre ? 1.0 : exp(-abs(lp - SvgfLuminance(cq.rgb)) / (sigma_l + kSvgfLuminanceEpsilon));
             const float hw = h * w_z * w_n * w_l;
             sum_c += hw * cq.rgb;

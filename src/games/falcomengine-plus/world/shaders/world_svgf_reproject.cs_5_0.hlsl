@@ -202,10 +202,10 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 }
                 if (blended)
                 {
-                    // Sec. 4.1: h = min(h_prev + 1, 32) (non-paper cap), alpha = max(1 - History Weight, 1 / h) (non-paper
+                    // Sec. 4.1: h = min(h_prev + 1, history cap) (non-paper), alpha = max(1 - History Weight, 1 / h) (non-paper
                     // floor; the paper gives alpha = 0.2), C' = alpha C + (1 - alpha) C_prev. The moments use the same alpha
                     // (plan default; Falcor uses a separate moments alpha, SVGFReproject.ps.slang.txt:222).
-                    h = min(hist_mom.z + 1.0, kSvgfMaxHistory);
+                    h = min(hist_mom.z + 1.0, clamp(s_spatial.z, 4.0, 128.0));
                     const float alpha = max(s_temporal.x, 1.0 / h);
                     col = alpha * raw.rgb + (1.0 - alpha) * hist_col;
                     mu1 = alpha * l + (1.0 - alpha) * hist_mom.x;
@@ -233,7 +233,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
             }
             else if (debug_mode == 5)
             {
-                debug_color = float3(h, h, h) / kSvgfMaxHistory;
+                debug_color = float3(h, h, h) / clamp(s_spatial.z, 4.0, 128.0);
             }
         }
         if (debug_mode == 4 || debug_mode == 5)

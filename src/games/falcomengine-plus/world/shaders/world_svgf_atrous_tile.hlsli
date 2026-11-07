@@ -1,5 +1,5 @@
 // world_svgf_atrous_tile.hlsli - SVGF a-trous with the taps staged in group-shared memory (reference/svgf/optimizing_svgf.md
-// Sec. 3.3). Output bit-identical to world_svgf_atrous at params.w = SVGF_TILE_STEP.
+// Sec. 3.3). Output bit-identical to world_svgf_atrous when the scaled step equals SVGF_TILE_STEP.
 
 #include "world_svgf.hlsli"
 
@@ -82,8 +82,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 g
     const float gv_mean = gv_w > 0.0 ? gv_sum / gv_w : c.a;
     const float sigma_l = s_temporal.w * sqrt(max(0.0, gv_mean));
 
-    // Sec. 4.3 kernel footprint: 5x5 taps at spacing s = 2^i (params.w).
-    const int step = (int)s_params.w;
+    // Sec. 4.3 kernel footprint: 5x5 taps at the scaled iteration spacing.
+    const int step = (int)s_params.w * (int)clamp(round(s_spatial.w), 1.0, 4.0);
     float sum_hw = 0.0;
     float sum_hw_sq_var = 0.0;
     float3 sum_c = float3(0.0, 0.0, 0.0);
@@ -102,8 +102,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 g
             const float2 offset = float2(i, j) * float(step);
             const float h = kSvgfKernel[abs(i)] * kSvgfKernel[abs(j)];
             // Eq. 2: the centre has weight 1 (w_z = w_n = w_l = 1), so only h(0,0) enters Eq. 1 and Eq. 3 for it.
-            const float w_z = centre ? 1.0 : SvgfDepthWeight(gp, gq, offset);
-            const float w_n = centre ? 1.0 : SvgfNormalWeight(np, OctDecode(gs_normal[ti]));
+            const float w_z = centre ? 1.0 : SvgfDepthWeight(gp, gq, offset, s_spatial.x);
+            const float w_n = centre ? 1.0 : SvgfNormalWeight(np, OctDecode(gs_normal[ti]), s_spatial.y);
             const float w_l = centre ? 1.0 : exp(-abs(lp - SvgfLuminance(cq.rgb)) / (sigma_l + kSvgfLuminanceEpsilon));
             const float hw = h * w_z * w_n * w_l;
             sum_c += hw * cq.rgb;

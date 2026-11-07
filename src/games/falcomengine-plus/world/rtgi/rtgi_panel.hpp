@@ -110,7 +110,7 @@ inline void DrawRtgiPanel() {
   if (g_rtgi_spatial_enabled < 0.5f) {
     ImGui::TextDisabled("Spatial filter: off");
   } else if (frame.filter_ran) {
-    ImGui::Text("Spatial filter: on (SVGF, %u a-trous iterations)", SvgfEffectiveIterations(g_rtgi_svgf_iterations, frame.divisor));
+    ImGui::Text("Spatial filter: on (SVGF, %u a-trous iterations)", SvgfEffectiveIterations(g_rtgi_svgf_iterations, g_rtgi_full_res_denoise > 0.5f ? 1u : frame.divisor));
   } else {
     ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "Spatial filter: on, not run (pipeline or target failed)");
   }

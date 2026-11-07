@@ -29,11 +29,14 @@ inline float g_rtsun_light_size = 0.53f;      // Light Size (degrees)
 inline float g_rtsun_normal_bias = 0.02f;     // Normal Bias (m)
 inline float g_rtsun_isfast = 1.f;            // IS-FAST Noise
 inline float g_rtsun_trace_resolution = 1.f;  // Trace Resolution: 0 Full, 1 Half, 2 Quarter
+inline float g_rtsun_full_res_denoise = 0.f;
 inline float g_rtsun_temporal_enabled = 1.f;  // RT Sun Temporal Accumulation rows
 inline float g_rtsun_history_weight = 0.8f;
 inline float g_rtsun_depth_rejection = 0.05f;
 inline float g_rtsun_normal_rejection = 0.9f;
 inline float g_rtsun_spatial_enabled = 1.f;   // RT Sun Denoising rows
+inline float g_rtsun_svgf_history_length = 32.f;
+inline float g_rtsun_svgf_radius_scale = 1.f;
 inline float g_rtsun_svgf_iterations = 5.f;   // Iterations: a-trous iterations of the SVGF filter, 1..5 (not in the snapshot)
 inline float g_rtsun_svgf_luminance_edge_stop = 4.f;  // Luminance Edge Stop: sigma_l of the SVGF luminance weight (not in the snapshot)
 
@@ -64,6 +67,7 @@ struct ParameterSnapshot {
   float cascade_range, samples, ray_max, light_size, normal_bias, trace_characters, isfast, trace_resolution;
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, debug;
   float receive_characters, character_normal_bias, foliage_intensity;
+  float svgf_history_length;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 

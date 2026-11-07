@@ -114,7 +114,8 @@ inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
                                                                   .full_height = in.full_height,
                                                                   .temporal = in.temporal && in.motion_view.handle != 0u,
                                                                   .spatial = in.spatial,
-                                                                  .log_prefix = "[world-rtls]"});
+                                                                  .log_prefix = "[world-rtls]",
+                                                                  .full_resolution = in.svgf.full_resolution});
   if (!denoise.ok) return {};
 
   RtlsPushConstants push = in.push;
@@ -238,7 +239,7 @@ inline std::string BuildRtlsJson(const RtlsJsonInput& in) {
   out << "]},\n";
   out << "  \"spatial_filter\": {\"on\": " << (g_rtls_spatial_enabled > 0.5f ? "true" : "false")
       << ", \"ran\": " << (f.filter_ran ? "true" : "false") << ", \"iterations\": " << g_rtls_svgf_iterations
-      << ", \"iterations_effective\": " << rtgi::SvgfEffectiveIterations(g_rtls_svgf_iterations, f.divisor)
+      << ", \"iterations_effective\": " << rtgi::SvgfEffectiveIterations(g_rtls_svgf_iterations, g_rtls_full_res_denoise > 0.5f ? 1u : f.divisor)
       << ", \"luminance_edge_stop\": " << g_rtls_svgf_luminance_edge_stop << "},\n";
   out << "  \"ray_max\": {\"requested\": " << f.ray_max_requested << ", \"effective\": " << f.ray_max_effective << "},\n";
   out << "  \"fade\": {\"start_eff\": " << f.fade.start << ", \"end_eff\": " << f.fade.end

@@ -939,21 +939,32 @@ static float g_gtvbao_cs_dispatch_fix    = 0.f;  // 0=Off, 1=Restore, 2=Null, 3=
 static float g_cpuopt_deferred_dispatch   = 1.f;  // dispatch GTVBAO/VBGI in OnPresent, not inline (default ON for Kai)
 static float g_cpuopt_ensure_pipelines    = 0.f;  // kai-style: don't destroy/recreate pipelines every frame
 
+static float g_gtvbao_full_res_denoise = 1.f;
 static float g_gtvbao_temporal_enabled = 1.f;
 static float g_gtvbao_history_weight = 0.8f;
-static float g_gtvbao_depth_rejection = 0.010f;
-static float g_gtvbao_normal_rejection = 0.8f;
+static float g_gtvbao_depth_rejection = 0.200f;
+static float g_gtvbao_normal_rejection = 0.f;
 static float g_gtvbao_svgf_spatial_enabled = 1.f;
+static float g_gtvbao_svgf_history_length = 128.f;
+static float g_gtvbao_svgf_radius_scale = 1.f;
+static float g_gtvbao_svgf_half_res_radius_scale = 1.f;
 static float g_gtvbao_svgf_iterations = 1.f;
-static float g_gtvbao_svgf_half_res_iterations = 4.f;
+static float g_gtvbao_svgf_half_res_iterations = 1.f;
 static float g_gtvbao_svgf_luminance_edge_stop = 16.f;
+static float g_gtvbao_svgf_depth_sigma = 0.10f;
+static float g_gtvbao_svgf_normal_power = 128.f;
+static float g_vbgi_full_res_denoise = 0.f;
 static float g_vbgi_temporal_enabled = 1.f;
 static float g_vbgi_history_weight = 0.99f;
 static float g_vbgi_depth_rejection = 0.05f;
 static float g_vbgi_normal_rejection = 0.9f;
 static float g_vbgi_spatial_enabled = 1.f;
+static float g_vbgi_svgf_history_length = 32.f;
+static float g_vbgi_svgf_radius_scale = 1.f;
 static float g_vbgi_svgf_iterations = 5.f;
 static float g_vbgi_svgf_luminance_edge_stop = 16.f;
+static float g_vbgi_svgf_depth_sigma = 8.f;
+static float g_vbgi_svgf_normal_power = 1.f;
 static float g_gtvbao_debug_ui = 0.f;  // GTVBAODebugMode index into kGtvbaoDebugModes
 constexpr int kGtvbaoDebugModes[7] = {0, 1, 22, 23, 24, 25, 26};
 // VBGI Debug View row (0=Off, 1..6) maps to GTVBAO debug modes 30..35 while g_vbgi_enabled.
@@ -1028,6 +1039,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint64_t gtvbao_last_frame = UINT64_MAX;
   std::array<float, kGtvbaoSnapshotFloats> gtvbao_prev_params = {};
   bool gtvbao_prev_params_valid = false;
+  float gtvbao_prev_svgf_history_length = 32.f;
+  float gtvbao_prev_svgf_radius_scale = 1.f;
 
   // Descriptor tables � pre-allocated per pass.
   GTVBAODescriptorTableSet prefilter_tables = {};
@@ -1055,7 +1068,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool vbgi_temporal_last = false;
   uint64_t vbgi_last_frame = UINT64_MAX;
   bool vbgi_prev_params_valid = false;
-  std::array<float, 19> vbgi_prev_params = {};
+  std::array<float, 21> vbgi_prev_params = {};
   // -- VBGI far field (one candidate per texel, resolve into the joint raw GI) --
   reshade::api::pipeline_layout vbgi_far_main_layout = {};  // far main variant: 5 SRVs, 5 UAVs, 56-float push
   reshade::api::pipeline vbgi_far_main_pipeline = {};
@@ -9572,7 +9585,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
       rtao::g_rtao_normal_bias, rtao::g_rtao_two_sided, rtao::g_rtao_isfast, rtao::g_rtao_fade_start_pct,
       rtao::g_rtao_fade_end_pct, rtao::g_rtao_temporal_enabled, rtao::g_rtao_history_weight,
       rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection, rtao::g_rtao_debug, rtao::g_test_freeze_noise,
-      rtao::g_rtao_foliage_skip, rtao::g_rtao_trace_characters, rtao::g_rtao_trace_resolution};
+      rtao::g_rtao_foliage_skip, rtao::g_rtao_trace_characters, rtao::g_rtao_trace_resolution, rtao::g_rtao_svgf_history_length};
   const bool params_changed = rf.prev_params_valid && !(params == rf.prev_params);
   if (params_changed) rf.last_parameter_change = rtao::ParameterFieldName(params, rf.prev_params);
   rf.prev_params = params;
@@ -9610,7 +9623,8 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   svgf_in.spatial = spatial_on && !debug_raw;
   svgf_in.stats = rtao::g_rtao_discovery < 0.5f;
   svgf_in.svgf = {rtao::g_rtao_history_weight, rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection,
-                  reset == rtao::ResetReason::None, rtao::g_rtao_svgf_iterations, rtao::g_rtao_svgf_luminance_edge_stop};
+                  reset == rtao::ResetReason::None, rtao::g_rtao_svgf_iterations,
+                  rtao::g_rtao_svgf_luminance_edge_stop, rtao::g_rtao_svgf_depth_sigma, rtao::g_rtao_svgf_normal_power, rtao::g_rtao_full_res_denoise > 0.5f, rtao::g_rtao_svgf_history_length, rtao::g_rtao_svgf_radius_scale};
   const falcom_world::rtgi::RtgiDenoiseReady ready = rtao::EnsureRtaoSvgf(dev, svgf_in);
   if (!ready.ok) {
     rf.temporal_ran = false;
@@ -9769,7 +9783,7 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
       rtls::g_rtls_light_clearance, rtls::g_rtls_normal_bias, rtls::g_rtls_trace_characters, rtls::g_rtls_isfast,
       rtls::g_rtls_point, rtls::g_rtls_spot, rtls::g_rtls_env_point, rtls::g_rtls_env_spot, rtls::g_rtls_fade_start_pct,
       rtls::g_rtls_fade_end_pct, rtls::g_rtls_trace_resolution, rtls::g_rtls_temporal_enabled, rtls::g_rtls_history_weight,
-      rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection, rtls::g_rtls_debug, rtls::g_rtls_characters, rtls::g_rtls_character_normal_bias};
+      rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection, rtls::g_rtls_debug, rtls::g_rtls_characters, rtls::g_rtls_character_normal_bias, rtls::g_rtls_svgf_history_length};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;
@@ -9778,7 +9792,9 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
       .temporal_on = temporal_on,
       .was_on = frame.temporal_last,
       .resized = rd.denoise.history_color.width != 0u
-          && (rd.denoise.history_color.width != trace_width || rd.denoise.history_color.height != trace_height),
+          && (rd.denoise.history_color.width != (rtls::g_rtls_full_res_denoise > 0.5f ? dd->captured_depth_w : trace_width)
+              || rd.denoise.history_color.height != (rtls::g_rtls_full_res_denoise > 0.5f ? dd->captured_depth_h : trace_height)
+              || rd.denoise.output.width != dd->captured_depth_w || rd.denoise.output.height != dd->captured_depth_h),
       .frame = dd->frame_index,
       .last_frame = frame.dispatched_frame,
       .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
@@ -9813,7 +9829,7 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
       .temporal = temporal_on,
       .spatial = rtls::g_rtls_spatial_enabled > 0.5f,
       .svgf = {rtls::g_rtls_history_weight, rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection,
-               reset == rtao::ResetReason::None, rtls::g_rtls_svgf_iterations, rtls::g_rtls_svgf_luminance_edge_stop}};
+               reset == rtao::ResetReason::None, rtls::g_rtls_svgf_iterations, rtls::g_rtls_svgf_luminance_edge_stop, 1.f, 128.f, rtls::g_rtls_full_res_denoise > 0.5f, rtls::g_rtls_svgf_history_length, rtls::g_rtls_svgf_radius_scale}};
   if (rtls::g_rtls_trace_characters > 0.5f) {
     in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
   }
@@ -9960,7 +9976,7 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
       rtsun::g_rtsun_normal_bias, rtsun::g_rtsun_trace_characters, rtsun::g_rtsun_isfast, rtsun::g_rtsun_trace_resolution,
       rtsun::g_rtsun_temporal_enabled, rtsun::g_rtsun_history_weight, rtsun::g_rtsun_depth_rejection,
       rtsun::g_rtsun_normal_rejection, rtsun::g_rtsun_debug,
-      rtsun::g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias, rtsun::g_rtsun_foliage_intensity};
+      rtsun::g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias, rtsun::g_rtsun_foliage_intensity, rtsun::g_rtsun_svgf_history_length};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;
@@ -9969,7 +9985,9 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
       .temporal_on = temporal_on,
       .was_on = frame.temporal_last,
       .resized = rd.denoise.history_color.width != 0u
-          && (rd.denoise.history_color.width != trace_width || rd.denoise.history_color.height != trace_height),
+          && (rd.denoise.history_color.width != (rtsun::g_rtsun_full_res_denoise > 0.5f ? dd->captured_depth_w : trace_width)
+              || rd.denoise.history_color.height != (rtsun::g_rtsun_full_res_denoise > 0.5f ? dd->captured_depth_h : trace_height)
+              || rd.denoise.output.width != dd->captured_depth_w || rd.denoise.output.height != dd->captured_depth_h),
       .frame = dd->frame_index,
       .last_frame = frame.dispatched_frame,
       .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
@@ -10003,7 +10021,7 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
       .temporal = temporal_on,
       .spatial = rtsun::g_rtsun_spatial_enabled > 0.5f,
       .svgf = {rtsun::g_rtsun_history_weight, rtsun::g_rtsun_depth_rejection, rtsun::g_rtsun_normal_rejection,
-               reset == rtao::ResetReason::None, rtsun::g_rtsun_svgf_iterations, rtsun::g_rtsun_svgf_luminance_edge_stop},
+               reset == rtao::ResetReason::None, rtsun::g_rtsun_svgf_iterations, rtsun::g_rtsun_svgf_luminance_edge_stop, 1.f, 128.f, rtsun::g_rtsun_full_res_denoise > 0.5f, rtsun::g_rtsun_svgf_history_length, rtsun::g_rtsun_svgf_radius_scale},
   };
   if (rtsun::g_rtsun_trace_characters > 0.5f) {
     in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
@@ -10121,22 +10139,30 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       rtgi::g_rtgi_sun_casters_only, rtgi::g_rtgi_sun_contribution, rtgi::g_rtgi_fallback_no_albedo,
       rtgi::g_rtgi_dynamic_lights, rtgi::g_rtgi_dynamic_light_contribution, rtgi::g_rtgi_game_sun, rtgi::g_rtgi_lamp_shadows,
       rtgi::g_rtgi_extra_bounces, rtgi::g_rtgi_feedback_strength,
-      rtgi::g_rtgi_extra_bounce_rays, rtgi::g_rtgi_bounce_saturation, rtgi::g_rtgi_restir, rtgi::g_rtgi_restir_spatial};
-  const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
+      rtgi::g_rtgi_extra_bounce_rays, rtgi::g_rtgi_bounce_saturation, rtgi::g_rtgi_restir, rtgi::g_rtgi_restir_spatial, rtgi::g_rtgi_svgf_history_length};
+  const bool svgf_history_changed = frame.prev_params_valid && params.svgf_history_length != frame.prev_params.svgf_history_length;
+  rtgi::ParameterSnapshot restir_previous = frame.prev_params;
+  restir_previous.svgf_history_length = params.svgf_history_length;
+  const bool params_changed = frame.prev_params_valid && !(params == restir_previous);
   frame.prev_params = params;
   frame.prev_params_valid = true;
   const uint32_t trace_width = rtao::RtgiTraceExtent(dd->captured_depth_w, divisor);
   const uint32_t trace_height = rtao::RtgiTraceExtent(dd->captured_depth_h, divisor);
-  const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
+  rtao::TemporalFrame reset_frame = {
       .temporal_on = temporal_on,
       .was_on = frame.temporal_last,
-      .resized = rd.denoise.history_color.width != 0u && (rd.denoise.history_color.width != trace_width || rd.denoise.history_color.height != trace_height),
+      .resized = rd.denoise.history_color.width != 0u && (rd.denoise.history_color.width != (rtgi::g_rtgi_full_res_denoise > 0.5f ? dd->captured_depth_w : trace_width)
+              || rd.denoise.history_color.height != (rtgi::g_rtgi_full_res_denoise > 0.5f ? dd->captured_depth_h : trace_height)
+              || rd.denoise.output.width != dd->captured_depth_w || rd.denoise.output.height != dd->captured_depth_h),
       .frame = dd->frame_index,
       .last_frame = frame.dispatched_frame,
       .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
       .scaled = false,
       .params_changed = params_changed,
-      .motion_ok = motion_ok});
+      .motion_ok = motion_ok};
+  const rtao::ResetReason restir_reset = rtao::TemporalResetReason(reset_frame);
+  reset_frame.params_changed = params_changed || svgf_history_changed;
+  const rtao::ResetReason reset = rtao::TemporalResetReason(reset_frame);
   frame.reset = reset;
   if (temporal_on && reset != rtao::ResetReason::None) {
     frame.last_reset = reset;
@@ -10207,7 +10233,9 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
       .temporal = temporal_on,
       .svgf = {rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
-               reset == rtao::ResetReason::None, rtgi::g_rtgi_svgf_iterations, rtgi::g_rtgi_svgf_luminance_edge_stop},
+               reset == rtao::ResetReason::None, rtgi::g_rtgi_svgf_iterations,
+               rtgi::g_rtgi_svgf_luminance_edge_stop, rtgi::g_rtgi_svgf_depth_sigma, rtgi::g_rtgi_svgf_normal_power, rtgi::g_rtgi_full_res_denoise > 0.5f, rtgi::g_rtgi_svgf_history_length, rtgi::g_rtgi_svgf_radius_scale},
+      .restir_history_valid = restir_reset == rtao::ResetReason::None,
       .spatial = rtgi::g_rtgi_spatial_enabled > 0.5f,
       .restir_spatial = restir_on && rtgi::g_rtgi_restir_spatial > 0.5f,
       .lights = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightsRegister] : reshade::api::resource{0u},
@@ -13574,6 +13602,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   const bool low_res = shader_injection.gtvbao_resolution > 0.5f
       && d->ao_width >= 32u && d->ao_height >= 32u
       && d->ao_term_a_texture.handle;
+  const float svgf_radius_scale = (low_res ? g_gtvbao_svgf_half_res_radius_scale : g_gtvbao_svgf_radius_scale);
   const uint32_t aw = low_res ? d->ao_width : w;
   const uint32_t ah = low_res ? d->ao_height : h;
   {
@@ -13612,7 +13641,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       && aw == rtao::RtgiTraceExtent(full_w, divisor) && ah == rtao::RtgiTraceExtent(full_h, divisor)
       && rtgi::EnsureRtgiPipeline(dev, &d->gtvbao_denoise.upsample_pipeline, kGtvbaoUpsampleDesc)
       && rtgi::EnsureRtgiTextureSet(dev, &d->gtvbao_svgf_raw, reshade::api::format::r16g16b16a16_float, 8u, aw, ah)) {
-    ready = rtgi::EnsureRtgiDenoise(dev, &d->gtvbao_denoise, {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = aw, .trace_height = ah, .full_width = full_w, .full_height = full_h, .temporal = motion_ok, .spatial = g_gtvbao_svgf_spatial_enabled > 0.5f, .log_prefix = "[gtvbao]"});
+    ready = rtgi::EnsureRtgiDenoise(dev, &d->gtvbao_denoise, {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = aw, .trace_height = ah, .full_width = full_w, .full_height = full_h, .temporal = motion_ok, .spatial = g_gtvbao_svgf_spatial_enabled > 0.5f, .log_prefix = "[gtvbao]", .full_resolution = g_gtvbao_full_res_denoise > 0.5f, .nearest_fallback = true});
   }
   if (!ready.ok) {
     CSLog("gtvbao", "svgf chain not ready (normal, cbv, size, pipelines or targets)", true);
@@ -13656,7 +13685,9 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         .last_frame = d->gtvbao_last_frame,
         .guard = d->dyncube_loadingWipePending || d->frame_index < d->resize_guard_until_frame,
         .scaled = false,
-        .params_changed = d->gtvbao_prev_params_valid && !(snapshot == d->gtvbao_prev_params),
+        .params_changed = d->gtvbao_prev_params_valid
+            && (!(snapshot == d->gtvbao_prev_params) || d->gtvbao_prev_svgf_history_length != g_gtvbao_svgf_history_length
+                || d->gtvbao_prev_svgf_radius_scale != svgf_radius_scale),
         .motion_ok = motion_ok});
     if (reset != rtao::ResetReason::None)
       CSLog("gtvbao", std::string("temporal reset: ") + rtao::ResetReasonName(reset), true);
@@ -13690,7 +13721,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     GtvbaoApplyDescriptors(dev, cl, d->main_layout, &d->main_tables, 4, u);
     // The 4x4 reconstruction reads trace pixels beyond the default 2x2 footprint, so keep those AO samples traced.
-    auto pc = BuildGTVBAOPushConstants(d, {.final_pass = false, .foliage_mask_valid = foliage_mask_valid, .skip_unread = (ready.reproject ? 1 : (low_res && g_gtvbao_upscale_algorithm > 2.5f ? 0 : 2)), .full_width = full_w, .full_height = full_h, .divisor = divisor});
+    auto pc = BuildGTVBAOPushConstants(d, {.final_pass = false, .foliage_mask_valid = foliage_mask_valid, .skip_unread = (g_gtvbao_full_res_denoise > 0.5f ? 0 : (ready.reproject ? 1 : (low_res && g_gtvbao_upscale_algorithm > 2.5f ? 0 : 2))), .full_width = full_w, .full_height = full_h, .divisor = divisor});
     cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
   }
   cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
@@ -13713,7 +13744,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     std::vector<reshade::api::descriptor_table_update> table_nulls;
     const bool gt_conf = GtvbaoDebugMode() == 23 && d->debug_uav.handle != 0u;
     // Half: DispatchRtgiDenoise subtracts log2(divisor) = 1, so + 1 makes Half Res Iterations the effective count.
-    const float svgf_iterations = low_res ? g_gtvbao_svgf_half_res_iterations + 1.f : g_gtvbao_svgf_iterations;
+    const float svgf_iterations = low_res ? g_gtvbao_svgf_half_res_iterations + (g_gtvbao_full_res_denoise > 0.5f ? 0.f : 1.f) : g_gtvbao_svgf_iterations;
     rtgi::DispatchRtgiDenoise(dev, cl, &d->gtvbao_denoise,
                               {.raw_view = d->gtvbao_svgf_raw.srv[0],
                                .depth_view = d->captured_depth_srv,
@@ -13731,7 +13762,8 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
                                .divisor = static_cast<float>(divisor),
                                .debug_mode = gt_conf ? 5 : 0,
                                .svgf = {g_gtvbao_history_weight, g_gtvbao_depth_rejection, g_gtvbao_normal_rejection,
-                                        history_valid, svgf_iterations, g_gtvbao_svgf_luminance_edge_stop},
+                                        history_valid, svgf_iterations, g_gtvbao_svgf_luminance_edge_stop,
+                                        g_gtvbao_svgf_depth_sigma, g_gtvbao_svgf_normal_power, g_gtvbao_full_res_denoise > 0.5f, g_gtvbao_svgf_history_length, svgf_radius_scale},
                                .luminance_weights = rtgi::kSvgfLuminanceAo,
                                .upsample_intensity = 1.f,
                                .upsample_char_intensity = 1.f,
@@ -13751,7 +13783,11 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   d->temporal_seen_w = aw;
   d->temporal_seen_h = ah;
   d->gtvbao_prev_params_valid = temporal_wanted;
-  if (temporal_wanted) d->gtvbao_prev_params = snapshot;
+  if (temporal_wanted) {
+    d->gtvbao_prev_params = snapshot;
+    d->gtvbao_prev_svgf_history_length = g_gtvbao_svgf_history_length;
+    d->gtvbao_prev_svgf_radius_scale = svgf_radius_scale;
+  }
   CSLog("gtvbao", "run exit ok");
   return true;
 }
@@ -14174,11 +14210,11 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     if (denoise_ok) {
       const bool temporal_on = g_vbgi_temporal_enabled > 0.5f && g_cpuopt_deferred_dispatch < 0.5f;
       const bool motion_ok = temporal_on && UpdateRtMotion(dev, d, true);
-      const std::array<float, 19> params = {g_vbgi_quality_level, g_vbgi_resolution, g_vbgi_radius, g_vbgi_bitmask_thickness,
+      const std::array<float, 21> params = {g_vbgi_quality_level, g_vbgi_resolution, g_vbgi_radius, g_vbgi_bitmask_thickness,
                                             g_vbgi_auto_thickness, g_vbgi_base_thickness,
                                             g_vbgi_depth_mip_offset, g_vbgi_noise_type, g_vbgi_mrt_normal, g_vbgi_ambient, g_vbgi_lights, g_vbgi_sun,
                                             g_vbgi_emissive, g_vbgi_backface_mode, g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
-                                            shader_injection.vbgi_multibounce, g_vbgi_multibounce_strength};
+                                            shader_injection.vbgi_multibounce, g_vbgi_multibounce_strength, g_vbgi_svgf_history_length, g_vbgi_svgf_radius_scale};
       const bool params_changed = d->vbgi_prev_params_valid && !(params == d->vbgi_prev_params);
       d->vbgi_prev_params = params;
       d->vbgi_prev_params_valid = true;
@@ -14186,7 +14222,9 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
           .temporal_on = temporal_on,
           .was_on = d->vbgi_temporal_last,
           .resized = d->vbgi_denoise.history_color.width != 0u
-              && (d->vbgi_denoise.history_color.width != d->vbgi_width || d->vbgi_denoise.history_color.height != d->vbgi_height),
+              && (d->vbgi_denoise.history_color.width != (g_vbgi_full_res_denoise > 0.5f ? full_w : d->vbgi_width)
+                  || d->vbgi_denoise.history_color.height != (g_vbgi_full_res_denoise > 0.5f ? full_h : d->vbgi_height)
+                  || d->vbgi_denoise.output.width != full_w || d->vbgi_denoise.output.height != full_h),
           .frame = d->frame_index,
           .last_frame = d->vbgi_last_frame,
           .guard = d->dyncube_loadingWipePending || d->frame_index < d->resize_guard_until_frame,
@@ -14202,7 +14240,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
            .full_height = full_h,
            .temporal = motion_ok,
            .spatial = g_vbgi_spatial_enabled > 0.5f,
-           .log_prefix = "[vbgi]"});
+           .log_prefix = "[vbgi]", .full_resolution = g_vbgi_full_res_denoise > 0.5f, .nearest_fallback = true});
       if (!ready.ok) {
         CSLog("vbgi", "denoise skipped: chain not ready", true);
       } else {
@@ -14228,7 +14266,8 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
                                    .divisor = static_cast<float>(divisor),
                                    .debug_mode = vbgi_conf ? 5 : 0,
                                    .svgf = {g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
-                                            reset == rtao::ResetReason::None, g_vbgi_svgf_iterations, g_vbgi_svgf_luminance_edge_stop},
+                                            reset == rtao::ResetReason::None, g_vbgi_svgf_iterations,
+                                            g_vbgi_svgf_luminance_edge_stop, g_vbgi_svgf_depth_sigma, g_vbgi_svgf_normal_power, g_vbgi_full_res_denoise > 0.5f, g_vbgi_svgf_history_length, g_vbgi_svgf_radius_scale},
                                    .luminance_weights = rtgi::kSvgfLuminanceRgb,
                                    .upsample_intensity = 1.f,
                                    .upsample_char_intensity = 1.f,
@@ -14314,6 +14353,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                                                                           .temporal_section = "GTVBAO Temporal Accumulation",
                                                                                           .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Runs on Sora 1st, Sora 2nd and Kai only; off while Deferred Dispatch is On. Resets on camera cuts, frame gaps and parameter changes.",
                                                                                           .temporal_enabled = &g_gtvbao_temporal_enabled,
+                                                                                          .full_res_denoise = &g_gtvbao_full_res_denoise,
                                                                                           .history_weight = &g_gtvbao_history_weight,
                                                                                           .depth_rejection = &g_gtvbao_depth_rejection,
                                                                                           .normal_rejection = &g_gtvbao_normal_rejection,
@@ -14322,19 +14362,28 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                                                                           .spatial_enabled = &g_gtvbao_svgf_spatial_enabled,
                                                                                           .iterations = &g_gtvbao_svgf_iterations,
                                                                                           .luminance_edge_stop = &g_gtvbao_svgf_luminance_edge_stop,
+                                                                                          .depth_sigma = &g_gtvbao_svgf_depth_sigma,
+                                                                                          .normal_power = &g_gtvbao_svgf_normal_power,
                                                                                           .half_res_iterations = &g_gtvbao_svgf_half_res_iterations,
+                                                                                          .history_length = &g_gtvbao_svgf_history_length,
+                                                                                          .radius_scale = &g_gtvbao_svgf_radius_scale,
+                                                                                          .half_res_radius_scale = &g_gtvbao_svgf_half_res_radius_scale,
                                                                                           .default_temporal_enabled = 1.f,
+                                                                                          .default_full_res_denoise = 1.f,
                                                                                           .default_history_weight = 0.8f,
-                                                                                          .default_depth_rejection = 0.010f,
-                                                                                          .default_normal_rejection = 0.8f,
+                                                                                          .default_history_length = 128.f,
+                                                                                          .default_depth_rejection = 0.200f,
+                                                                                          .default_normal_rejection = 0.f,
                                                                                           .default_spatial_enabled = 1.f,
                                                                                           .default_iterations = 1.f,
-                                                                                          .default_half_res_iterations = 4.f,
-                                                                                          .default_luminance_edge_stop = 16.f});
+                                                                                          .default_half_res_iterations = 1.f,
+                                                                                          .default_luminance_edge_stop = 16.f,
+                                                                                          .default_depth_sigma = 0.10f});
     falcom_world::AddSvgfRows(&settings, []() { return VbgiRowVisible(); }, IsAdvancedSettingsMode, {.prefix = "Vbgi",
                                                                                                      .temporal_section = "GTVBGI Temporal Accumulation",
                                                                                                      .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.",
                                                                                                      .temporal_enabled = &g_vbgi_temporal_enabled,
+                                                                                                     .full_res_denoise = &g_vbgi_full_res_denoise,
                                                                                                      .history_weight = &g_vbgi_history_weight,
                                                                                                      .depth_rejection = &g_vbgi_depth_rejection,
                                                                                                      .normal_rejection = &g_vbgi_normal_rejection,
@@ -14343,13 +14392,19 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                                                                                      .spatial_enabled = &g_vbgi_spatial_enabled,
                                                                                                      .iterations = &g_vbgi_svgf_iterations,
                                                                                                      .luminance_edge_stop = &g_vbgi_svgf_luminance_edge_stop,
+                                                                                                     .depth_sigma = &g_vbgi_svgf_depth_sigma,
+                                                                                                     .normal_power = &g_vbgi_svgf_normal_power,
+                                                                                                     .history_length = &g_vbgi_svgf_history_length,
+                                                                                                     .radius_scale = &g_vbgi_svgf_radius_scale,
                                                                                                      .default_temporal_enabled = 1.f,
                                                                                                      .default_history_weight = 0.99f,
                                                                                                      .default_depth_rejection = 0.2f,
                                                                                                      .default_normal_rejection = 0.f,
                                                                                                      .default_spatial_enabled = 1.f,
                                                                                                      .default_iterations = 5.f,
-                                                                                                     .default_luminance_edge_stop = 16.f});
+                                                                                                     .default_luminance_edge_stop = 16.f,
+                                                                                                     .default_depth_sigma = 8.f,
+                                                                                                     .default_normal_power = 1.f});
     falcom_world::AddSettings(&settings, IsSora2nd(), IsAdvancedSettingsMode);
   }
   falcom_world::Use(fdw_reason, IsSora2nd());

@@ -52,12 +52,13 @@ inline bool IsDevkitPresent() {
 
 // Adds the SVGF rows of RTAO, GTVBAO, RTGI, GTVBGI, RT Local Shadows and RT Sun: Temporal Accumulation (the reprojection,
 // paper Sec. 4.1) and Denoising (Iterations, the a-trous count of Sec. 4.3; Luminance Edge Stop, sigma_l of Sec. 4.4). The
-// sigma_z and sigma_n values are fixed by the paper and not shown. A plain function (MSVC C2326).
+// Optional spatial depth and normal edge stops are exposed independently of temporal rejection.
 struct SvgfRows {
   const char* prefix;  // key prefix: "Rtao", "Gtvbao", "Rtgi", "Vbgi", "Rtls" or "RtSun"
   const char* temporal_section;
   const char* temporal_enabled_tooltip;
   float* temporal_enabled;
+  float* full_res_denoise;
   float* history_weight;
   float* depth_rejection;
   float* normal_rejection;
@@ -66,15 +67,24 @@ struct SvgfRows {
   float* spatial_enabled;
   float* iterations;
   float* luminance_edge_stop;
+  float* depth_sigma = nullptr;
+  float* normal_power = nullptr;
   float* half_res_iterations = nullptr;  // GTVBAO only: Half Res Iterations row; Iterations then applies at Full only
+  float* history_length = nullptr;
+  float* radius_scale = nullptr;
+  float* half_res_radius_scale = nullptr;
   float default_temporal_enabled = 1.f;
+  float default_full_res_denoise = 0.f;
   float default_history_weight = 0.8f;
+  float default_history_length = 32.f;
   float default_depth_rejection = 0.2f;
   float default_normal_rejection = 0.f;
   float default_spatial_enabled = 1.f;
   float default_iterations = 5.f;
   float default_half_res_iterations = 4.f;
   float default_luminance_edge_stop = 4.f;
+  float default_depth_sigma = 1.f;
+  float default_normal_power = 128.f;
 };
 inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::function<bool()>& visible,
                         const std::function<bool()>& advanced, const SvgfRows& rows) {
@@ -93,6 +103,17 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = prefix + "FullResDenoise",
+      .binding = rows.full_res_denoise,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = rows.default_full_res_denoise,
+      .label = "Full Res Denoise",
+      .section = rows.temporal_section,
+      .tooltip = "Reconstruct to full resolution before temporal accumulation and spatial filtering. Uses substantially more GPU memory and processing time.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = prefix + "HistoryWeight",
       .binding = rows.history_weight,
       .value_type = SettingValueType::FLOAT,
@@ -105,6 +126,21 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
       .format = "%.2f",
       .is_visible = visible,
   });
+  if (rows.history_length != nullptr) {
+    settings->push_back(new Setting{
+        .key = prefix + "SvgfHistoryLength",
+        .binding = rows.history_length,
+        .value_type = SettingValueType::INTEGER,
+        .default_value = rows.default_history_length,
+        .label = "SVGF History Length",
+        .section = rows.temporal_section,
+        .tooltip = "Caps accepted per-pixel SVGF history age and sets the minimum current-frame weight. Higher values can smooth more but increase lag and ghosting. For GTVBGI, Far History Length separately caps far reservoir candidates.",
+        .min = 4.f,
+        .max = 128.f,
+        .format = "%d",
+        .is_visible = visible,
+    });
+  }
   settings->push_back(new Setting{
       .key = prefix + "DepthRejection",
       .binding = rows.depth_rejection,
@@ -156,6 +192,21 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
       .format = "%d",
       .is_visible = visible,
   });
+  if (rows.radius_scale != nullptr) {
+    settings->push_back(new Setting{
+        .key = prefix + "SvgfRadiusScale",
+        .binding = rows.radius_scale,
+        .value_type = SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Spatial Radius Scale",
+        .section = rows.spatial_section,
+        .tooltip = "Scales the spacing between a-trous taps without changing the iteration count or kernel. Higher spacing skips neighbors and can cause shimmer or grid patterns.",
+        .min = 1.f,
+        .max = 4.f,
+        .format = "%d",
+        .is_visible = visible,
+    });
+  }
   if (rows.half_res_iterations != nullptr) {
     settings->push_back(new Setting{
         .key = prefix + "SvgfHalfResIterations",
@@ -169,6 +220,51 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
         .max = 4.f,
         .format = "%d",
         .is_visible = visible,
+    });
+  }
+  if (rows.half_res_radius_scale != nullptr) {
+    settings->push_back(new Setting{
+        .key = prefix + "SvgfHalfResRadiusScale",
+        .binding = rows.half_res_radius_scale,
+        .value_type = SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Half Res Spatial Radius Scale",
+        .section = rows.spatial_section,
+        .tooltip = "Scales the spacing between a-trous taps when tracing at Half resolution without changing the iteration count or kernel. Higher spacing skips neighbors and can cause shimmer or grid patterns.",
+        .min = 1.f,
+        .max = 4.f,
+        .format = "%d",
+        .is_visible = visible,
+    });
+  }
+  if (rows.depth_sigma != nullptr) {
+    settings->push_back(new Setting{
+        .key = prefix + "SvgfDepthSigma",
+        .binding = rows.depth_sigma,
+        .value_type = SettingValueType::FLOAT,
+        .default_value = rows.default_depth_sigma,
+        .label = "Spatial Depth Sigma",
+        .section = rows.spatial_section,
+        .tooltip = "A-trous spatial filter edge stop. Higher values weaken depth rejection. Separate from temporal history rejection and upsampling.",
+        .min = 0.1f,
+        .max = 8.f,
+        .format = "%.2f",
+        .is_visible = [visible, advanced]() { return visible() && advanced(); },
+    });
+  }
+  if (rows.normal_power != nullptr) {
+    settings->push_back(new Setting{
+        .key = prefix + "SvgfNormalPower",
+        .binding = rows.normal_power,
+        .value_type = SettingValueType::FLOAT,
+        .default_value = rows.default_normal_power,
+        .label = "Spatial Normal Power",
+        .section = rows.spatial_section,
+        .tooltip = "A-trous spatial filter edge stop. Lower values weaken normal rejection. Separate from temporal history rejection and upsampling.",
+        .min = 1.f,
+        .max = 128.f,
+        .format = "%.1f",
+        .is_visible = [visible, advanced]() { return visible() && advanced(); },
     });
   }
   settings->push_back(new Setting{
@@ -775,6 +871,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .temporal_section = "Temporal Accumulation",
                                             .temporal_enabled_tooltip = "Reprojects the previous frame RTAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Resets on camera cuts, frame gaps and parameter changes.",
                                             .temporal_enabled = &rtao::g_rtao_temporal_enabled,
+                                            .full_res_denoise = &rtao::g_rtao_full_res_denoise,
                                             .history_weight = &rtao::g_rtao_history_weight,
                                             .depth_rejection = &rtao::g_rtao_depth_rejection,
                                             .normal_rejection = &rtao::g_rtao_normal_rejection,
@@ -783,6 +880,10 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .spatial_enabled = &rtao::g_rtao_spatial_enabled,
                                             .iterations = &rtao::g_rtao_svgf_iterations,
                                             .luminance_edge_stop = &rtao::g_rtao_svgf_luminance_edge_stop,
+                                            .depth_sigma = &rtao::g_rtao_svgf_depth_sigma,
+                                            .normal_power = &rtao::g_rtao_svgf_normal_power,
+                                            .history_length = &rtao::g_rtao_svgf_history_length,
+                                            .radius_scale = &rtao::g_rtao_svgf_radius_scale,
                                             .default_temporal_enabled = 1.f,
                                             .default_history_weight = 0.8f,
                                             .default_depth_rejection = 0.2f,
@@ -1165,6 +1266,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .temporal_section = "RTGI Temporal Accumulation",
                                             .temporal_enabled_tooltip = "Reprojects the previous frame GI with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
                                             .temporal_enabled = &rtgi::g_rtgi_temporal_enabled,
+                                            .full_res_denoise = &rtgi::g_rtgi_full_res_denoise,
                                             .history_weight = &rtgi::g_rtgi_history_weight,
                                             .depth_rejection = &rtgi::g_rtgi_depth_rejection,
                                             .normal_rejection = &rtgi::g_rtgi_normal_rejection,
@@ -1173,6 +1275,10 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .spatial_enabled = &rtgi::g_rtgi_spatial_enabled,
                                             .iterations = &rtgi::g_rtgi_svgf_iterations,
                                             .luminance_edge_stop = &rtgi::g_rtgi_svgf_luminance_edge_stop,
+                                            .depth_sigma = &rtgi::g_rtgi_svgf_depth_sigma,
+                                            .normal_power = &rtgi::g_rtgi_svgf_normal_power,
+                                            .history_length = &rtgi::g_rtgi_svgf_history_length,
+                                            .radius_scale = &rtgi::g_rtgi_svgf_radius_scale,
                                             .default_temporal_enabled = 1.f,
                                             .default_history_weight = 0.8f,
                                             .default_depth_rejection = 0.2f,
@@ -1456,6 +1562,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .temporal_section = "RTLS Temporal Accumulation",
                                             .temporal_enabled_tooltip = "Reprojects the previous frame's RT local shadow term with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
                                             .temporal_enabled = &rtls::g_rtls_temporal_enabled,
+                                            .full_res_denoise = &rtls::g_rtls_full_res_denoise,
                                             .history_weight = &rtls::g_rtls_history_weight,
                                             .depth_rejection = &rtls::g_rtls_depth_rejection,
                                             .normal_rejection = &rtls::g_rtls_normal_rejection,
@@ -1464,6 +1571,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .spatial_enabled = &rtls::g_rtls_spatial_enabled,
                                             .iterations = &rtls::g_rtls_svgf_iterations,
                                             .luminance_edge_stop = &rtls::g_rtls_svgf_luminance_edge_stop,
+                                            .history_length = &rtls::g_rtls_svgf_history_length,
+                                            .radius_scale = &rtls::g_rtls_svgf_radius_scale,
                                             .default_temporal_enabled = 1.f,
                                             .default_history_weight = 0.8f,
                                             .default_depth_rejection = 0.2f,
@@ -1723,6 +1832,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .temporal_section = "RT Sun Temporal Accumulation",
                                             .temporal_enabled_tooltip = "Reprojects the previous frame's RT sun term with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes (Trace Resolution, Cascade Range, samples and the other trace settings).",
                                             .temporal_enabled = &rtsun::g_rtsun_temporal_enabled,
+                                            .full_res_denoise = &rtsun::g_rtsun_full_res_denoise,
                                             .history_weight = &rtsun::g_rtsun_history_weight,
                                             .depth_rejection = &rtsun::g_rtsun_depth_rejection,
                                             .normal_rejection = &rtsun::g_rtsun_normal_rejection,
@@ -1731,6 +1841,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                             .spatial_enabled = &rtsun::g_rtsun_spatial_enabled,
                                             .iterations = &rtsun::g_rtsun_svgf_iterations,
                                             .luminance_edge_stop = &rtsun::g_rtsun_svgf_luminance_edge_stop,
+                                            .history_length = &rtsun::g_rtsun_svgf_history_length,
+                                            .radius_scale = &rtsun::g_rtsun_svgf_radius_scale,
                                             .default_temporal_enabled = 1.f,
                                             .default_history_weight = 0.8f,
                                             .default_depth_rejection = 0.2f,

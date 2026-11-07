@@ -32,11 +32,14 @@ inline float g_rtls_isfast = 1.f;              // IS-FAST Noise
 inline float g_rtls_fade_start_pct = 12.5f;    // Fade Start (RTLS Distance Fade)
 inline float g_rtls_fade_end_pct = 25.f;       // Fade End (RTLS Distance Fade)
 inline float g_rtls_trace_resolution = 1.f;    // Trace Resolution: 0 Full, 1 Half, 2 Quarter
+inline float g_rtls_full_res_denoise = 0.f;
 inline float g_rtls_temporal_enabled = 1.f;    // RTLS Temporal Accumulation rows
 inline float g_rtls_history_weight = 0.8f;
 inline float g_rtls_depth_rejection = 0.05f;
 inline float g_rtls_normal_rejection = 0.9f;
 inline float g_rtls_spatial_enabled = 1.f;     // RTLS Denoising rows
+inline float g_rtls_svgf_history_length = 32.f;
+inline float g_rtls_svgf_radius_scale = 1.f;
 inline float g_rtls_svgf_iterations = 5.f;     // Iterations: a-trous iterations of the SVGF filter, 1..5 (not in the snapshot)
 inline float g_rtls_svgf_luminance_edge_stop = 4.f;  // Luminance Edge Stop: sigma_l of the SVGF luminance weight (not in the snapshot)
 
@@ -76,6 +79,7 @@ struct ParameterSnapshot {
   float point, spot, env_point, env_spot, fade_start, fade_end, trace_resolution;
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, debug;
   float characters, character_normal_bias;
+  float svgf_history_length;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 

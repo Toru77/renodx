@@ -117,7 +117,8 @@ inline RtSunDispatchResult Dispatch(reshade::api::device* device, reshade::api::
                                                                   .full_height = in.full_height,
                                                                   .temporal = in.temporal && in.motion_view.handle != 0u,
                                                                   .spatial = in.spatial,
-                                                                  .log_prefix = "[world-rtsun]"});
+                                                                  .log_prefix = "[world-rtsun]",
+                                                                  .full_resolution = in.svgf.full_resolution});
   if (!denoise.ok) return {};
 
   RtSunPushConstants push = in.push;
@@ -229,7 +230,7 @@ inline std::string BuildRtSunJson(const RtSunJsonInput& in) {
   out << "]},\n";
   out << "  \"spatial_filter\": {\"on\": " << (g_rtsun_spatial_enabled > 0.5f ? "true" : "false")
       << ", \"ran\": " << (f.filter_ran ? "true" : "false") << ", \"iterations\": " << g_rtsun_svgf_iterations
-      << ", \"iterations_effective\": " << rtgi::SvgfEffectiveIterations(g_rtsun_svgf_iterations, f.divisor)
+      << ", \"iterations_effective\": " << rtgi::SvgfEffectiveIterations(g_rtsun_svgf_iterations, g_rtsun_full_res_denoise > 0.5f ? 1u : f.divisor)
       << ", \"luminance_edge_stop\": " << g_rtsun_svgf_luminance_edge_stop << "},\n";
   out << "  \"cascades\": {\"requested\": " << f.cascades_requested << ", \"effective\": " << f.cascades_effective
       << ", \"camera\": " << f.cascades_camera << ", \"covered_m\": " << f.covered_m

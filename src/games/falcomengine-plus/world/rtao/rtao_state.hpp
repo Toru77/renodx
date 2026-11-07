@@ -22,13 +22,18 @@ inline float g_rtao_trace_characters = 0.f;  // Trace characters: RTAO rays hit 
 inline float g_rtao_trace_resolution = 0.f;  // Trace Resolution: RTAO traces at 0 Full, 1 Half, 2 Quarter
 inline float g_rtao_char_intensity = 1.f;  // Character Intensity: RTAO kept on character pixels (lighting shader)
 inline float g_rtao_max_darkening = 1.f;  // Max Darkening: AO is never below 1 - this (lighting shader)
+inline float g_rtao_full_res_denoise = 0.f;
 inline float g_rtao_temporal_enabled = 1.f;
 inline float g_rtao_history_weight = 0.8f;
 inline float g_rtao_depth_rejection = 0.2f;
 inline float g_rtao_normal_rejection = 0.f;
 inline float g_rtao_isfast = 1.f;
 inline float g_rtao_spatial_enabled = 1.f;
+inline float g_rtao_svgf_history_length = 32.f;
+inline float g_rtao_svgf_radius_scale = 1.f;
 inline float g_rtao_svgf_iterations = 5.f;
+inline float g_rtao_svgf_depth_sigma = 1.f;
+inline float g_rtao_svgf_normal_power = 128.f;
 inline float g_rtao_svgf_luminance_edge_stop = 4.f;
 inline float g_rtao_fade_start_pct = 15.625f;  // Fade Start: percent of the BVH range (Region)
 inline float g_rtao_fade_end_pct = 31.25f;    // Fade End: percent of the BVH range (Region)
@@ -96,6 +101,7 @@ struct ParameterSnapshot {
   float foliage_skip;
   float trace_characters;
   float trace_resolution;
+  float svgf_history_length;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 
@@ -181,6 +187,7 @@ inline const char* ParameterFieldName(const ParameterSnapshot& a, const Paramete
   if (a.foliage_skip != b.foliage_skip) return "foliage_skip";
   if (a.trace_characters != b.trace_characters) return "trace_characters";
   if (a.trace_resolution != b.trace_resolution) return "trace_resolution";
+  if (a.svgf_history_length != b.svgf_history_length) return "svgf_history_length";
   return "";
 }
 
