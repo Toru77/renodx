@@ -567,8 +567,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                         const float3 sampleRad = g_srcRadiance.SampleLevel(depthSampler, sampleScreenPos, max(mipLevel - GTVBAO_resolution, 0.0f)).rgb;
                         float vis0 = 1.0f;
                         if (GTVBAO_vbgi_backface_mode > 0.5f && GTVBAO_mrt_normal_available > 0.5f) {
-                            const float3 D0 = DecodeFalcomMrtNormal(
-                                mrtNormalTexture.Load(int3(GTVBAO_MrtTexel(sampleScreenPos * float2(g_mrtW, g_mrtH), float2(g_mrtW, g_mrtH)), 0)).xy);
+                            const uint2 packed = mrtNormalTexture.Load(int3(GTVBAO_MrtTexel(sampleScreenPos * float2(g_mrtW, g_mrtH), float2(g_mrtW, g_mrtH)), 0)).xy;
+                            const float senderZ = sourceViewspaceDepth.SampleLevel(depthSampler, sampleScreenPos, 0.0f).x;
+                            const float3 D0 = (senderZ > 0.0f && senderZ < 60000.0f)
+                                ? DecodeFalcomMrtNormalAsGame(packed) : DecodeFalcomMrtNormal(packed);
                             if (FalcomNormalValid(D0)) {
                                 const float3 N0 = TransformNormalToView(D0);
                                 const float3 projN0 = N0 - sliceN * dot(N0, sliceN);
@@ -665,7 +667,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                         const float mip = clamp(log2(max(offsetPx, 1.0f)) - consts.DepthMIPSamplingOffset, 0.0f, (float)GT_VBAO_DEPTH_MIP_LEVELS);
                         const float SZm = sourceViewspaceDepth.SampleLevel(depthSampler, uvm, mip).x;
                         if (SZm >= 60000.0f || Pm.z < SZm || Pm.z > SZm + window) continue;
-                        const float3 nW = DecodeFalcomMrtNormal(mrtNormalTexture.Load(int3(GTVBAO_MrtTexel(uvm * float2(g_mrtW, g_mrtH), float2(g_mrtW, g_mrtH)), 0)).xy);
+                        const uint2 packed = mrtNormalTexture.Load(int3(GTVBAO_MrtTexel(uvm * float2(g_mrtW, g_mrtH), float2(g_mrtW, g_mrtH)), 0)).xy;
+                        const float senderZ = sourceViewspaceDepth.SampleLevel(depthSampler, uvm, 0.0f).x;
+                        const float3 nW = (senderZ > 0.0f && senderZ < 60000.0f)
+                            ? DecodeFalcomMrtNormalAsGame(packed) : DecodeFalcomMrtNormal(packed);
                         if (!FalcomNormalValid(nW) || dot(TransformNormalToView(nW), dir) >= 0.0f) break;
                         const float3 L = g_srcRadiance.SampleLevel(depthSampler, uvm, max(mip - GTVBAO_resolution, 0.0f)).rgb;
                         farPos = float4(VbgiFarViewToWorld(GTVBAO_ComputeViewspacePosition(uvm, SZm, consts)),

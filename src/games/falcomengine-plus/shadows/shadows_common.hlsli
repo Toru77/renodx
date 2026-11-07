@@ -584,6 +584,7 @@ float3 FalcomApplyShadowTerms(float3 lit, float2 screenUV, bool isCharacter,
 struct FalcomContactParams
 {
   float rayLength;    // world units toward the light
+  float lightClearance; // world units to stop before the light
   float thickness;    // assumed occluder thickness
   float bias;         // minimum penetration before a hit counts
   float sampleCount;  // march steps
@@ -616,10 +617,13 @@ float3 FalcomApplyLocalContactShadow(float3 lightColor, float3 lightPos, float3 
   float3 toLight = lightPos - worldPos;
   const float len2 = dot(toLight, toLight);
   if (len2 < 1e-8) return lightColor;
-  toLight *= rsqrt(len2);
+  const float lightDistance = sqrt(len2);
+  const float marchLength = min(max(p.rayLength, 0.0), max(lightDistance - max(p.lightClearance, 0.0), 0.0));
+  if (marchLength <= 0.0) return lightColor;
+  toLight /= lightDistance;
 
   const float4 clipA = mul(float4(worldPos, 1.0), viewProj_g);
-  const float4 clipB = mul(float4(worldPos + toLight * p.rayLength, 1.0), viewProj_g);
+  const float4 clipB = mul(float4(worldPos + toLight * marchLength, 1.0), viewProj_g);
   if (abs(clipA.w) <= 1e-6 || abs(clipB.w) <= 1e-6) return lightColor;
   const float term = FalcomContactShadowMarch(clipA, clipB, unpack, depthTex, pointSampler,
                                               p.thickness, p.bias, p.sampleCount, jitter,

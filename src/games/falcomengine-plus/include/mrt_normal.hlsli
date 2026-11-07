@@ -8,10 +8,9 @@
 // Matches the vanilla lighting decode (see sora2nd/lighting/lighting.asm:
 // `mad r8.zw` -> `sincos` -> `dp3 r3.y, r8.xywx`).
 //
-// GTVBAO (gtvbao_common.hlsl) and the shadow passes (shadows/shadows_common.hlsli)
-// use DecodeFalcomMrtNormal. The RT passes use DecodeFalcomMrtNormalAsGame, the
-// game's own decode with no zero case. Both decode the same encoding, so both live
-// here: a second copy elsewhere would be free to drift.
+// DecodeFalcomMrtNormalAsGame matches the game's decode with no zero case. A packed
+// (0,0) can be a valid -Z normal or cleared data; callers need an independent surface
+// test to distinguish those cases. The legacy decoder keeps the cleared-data fallback.
 
 // Normalize with an explicit fallback instead of a NaN. A zero-length input
 // (a cleared G-buffer texel) is a normal condition here, not an exceptional
@@ -25,12 +24,8 @@ float3 FalcomSafeNormalize3(float3 v, float3 fallback)
 // True when a normal is usable geometry rather than a placeholder.
 bool FalcomNormalValid(float3 n) { return dot(n, n) > 1e-5; }
 
-// Returns a ZERO vector for a texel the G-buffer never wrote (GTVBAO and shadows
-// only; DecodeFalcomMrtNormalAsGame has no zero case). A cleared texel is all-zero,
-// which decodes to enc = (-1,-1) and the world-straight-down normal (0,0,-1): unit
-// length, so it would survive a naive validity test. A written texel has
-// raw.y ~= 32767 when N.z == 0, so an exact (0,0) pair can only mean "no g-buffer
-// data here". Callers fall back to the depth-derived normal on a zero result.
+// Legacy fallback: treats a packed (0,0) as missing data. Cleared texels and a valid
+// world-straight-down normal share this pair, so use only when a surface is not proven.
 float3 DecodeFalcomMrtNormal(uint2 packed)
 {
   if (packed.x == 0u && packed.y == 0u) return float3(0.0, 0.0, 0.0);

@@ -48,7 +48,9 @@ void main(uint2 p : SV_DispatchThreadID)
   const float4 centreWorldH = mul(float4(centreUv.x * 2.0 - 1.0, 1.0 - centreUv.y * 2.0, centreDeviceDepth, 1.0),
                                   viewProjInv_g);
   const float3 centrePos = centreWorldH.xyz / centreWorldH.w;
-  const float3 centreNormal = DecodeFalcomMrtNormal(g_srcMrtNormal.Load(int3(p, 0)).xy);
+  const uint2 centrePacked = g_srcMrtNormal.Load(int3(p, 0)).xy;
+  const float3 centreNormal = (centreDeviceDepth > 0.0 && centreLinearDepth > 0.0)
+      ? DecodeFalcomMrtNormalAsGame(centrePacked) : DecodeFalcomMrtNormal(centrePacked);
 
   const int radius = clamp((int)(shader_injection_data.CONTACT_DENOISE_RADIUS + 0.5), 1, 8);
   const float spatialSigma = FilterSeparableSigma((float)radius);
@@ -70,7 +72,10 @@ void main(uint2 p : SV_DispatchThreadID)
     const float2 tapUv = (float2(q) + 0.5) * invSize;
     const float4 tapWorldH = mul(float4(tapUv.x * 2.0 - 1.0, 1.0 - tapUv.y * 2.0, tapDeviceDepth, 1.0),
                                  viewProjInv_g);
-    const float3 tapNormal = DecodeFalcomMrtNormal(g_srcMrtNormal.Load(int3(q, 0)).xy);
+    const float tapLinearDepth = FalcomLinearDepth(tapDeviceDepth, FalcomDepthUnpackConsts());
+    const uint2 tapPacked = g_srcMrtNormal.Load(int3(q, 0)).xy;
+    const float3 tapNormal = (tapDeviceDepth > 0.0 && tapLinearDepth > 0.0)
+        ? DecodeFalcomMrtNormalAsGame(tapPacked) : DecodeFalcomMrtNormal(tapPacked);
     const float plane = dot(centreNormal, tapWorldH.xyz / tapWorldH.w - centrePos) * planeScale;
     const float normalDistance = (1.0 - saturate(dot(centreNormal, tapNormal))) * normalScale;
     const float weight = FilterGaussianWeight(k, spatialSigma)

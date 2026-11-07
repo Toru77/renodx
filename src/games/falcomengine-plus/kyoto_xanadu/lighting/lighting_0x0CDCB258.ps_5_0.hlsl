@@ -903,6 +903,7 @@ void main(
   const bool csLocalEnvSpotOn  = csLocalOn && shader_injection_data.cs_contact_local_env_spot > 0.5f;
   FalcomContactParams csLocalParams;
   csLocalParams.rayLength = max(0.0, shader_injection_data.cs_contact_local_ray_length);
+  csLocalParams.lightClearance = max(0.0, shader_injection_data.cs_contact_local_light_clearance);
   csLocalParams.thickness = max(0.0, shader_injection_data.cs_contact_thickness);
   csLocalParams.bias = max(0.0, shader_injection_data.cs_contact_bias);
   csLocalParams.sampleCount =

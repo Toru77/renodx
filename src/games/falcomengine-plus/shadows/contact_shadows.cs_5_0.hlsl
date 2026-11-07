@@ -86,7 +86,9 @@ void main(uint2 p : SV_DispatchThreadID)
     return;
   }
 
-  float3 worldNormal = DecodeFalcomMrtNormal(g_srcMrtNormal.Load(int3(p, 0)).xy);
+  const uint2 packedNormal = g_srcMrtNormal.Load(int3(p, 0)).xy;
+  float3 worldNormal = (deviceDepth > 0.0 && linearDepth > 0.0)
+      ? DecodeFalcomMrtNormalAsGame(packedNormal) : DecodeFalcomMrtNormal(packedNormal);
   if (!FalcomNormalValid(worldNormal)) {
     g_outContact[p] = float4(1.0, kContactDiagNoNormal / 255.0, saturate(linearDepth * 0.001), 1.0);
     return;

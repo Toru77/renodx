@@ -122,9 +122,10 @@ float ComputeDepthEdgeMetric(uint2 pix, GTAOConstants consts)
   return saturate(delta * 1.0);
 }
 
-float3 DecodeMrtNormalAsIs(uint2 texel)
+float3 DecodeMrtNormalAsIs(uint2 texel, bool surface)
 {
-  return DecodeFalcomMrtNormal(g_srcMrtNormal.Load(int3(texel, 0)).xy);
+  const uint2 packed = g_srcMrtNormal.Load(int3(texel, 0)).xy;
+  return surface ? DecodeFalcomMrtNormalAsGame(packed) : DecodeFalcomMrtNormal(packed);
 }
 
 float3 BuildDepthFallbackNormal(uint2 pix, GTAOConstants consts)
@@ -147,6 +148,11 @@ float3 BuildDepthFallbackNormal(uint2 pix, GTAOConstants consts)
 
 float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants consts)
 {
+  uint depthWidth, depthHeight;
+  g_srcWorkingDepth.GetDimensions(depthWidth, depthHeight);
+  const int2 rep = GTVBAO_RepresentativePixel(int2(pix), int2(depthWidth, depthHeight));
+  const float receiverDepth = g_srcWorkingDepth.Load(int3(rep, 0));
+  const bool receiverSurface = receiverDepth > 0.0 && receiverDepth < 60000.0;
   // ── Neutral fast path ──
   // At the neutral shaping values below the MRT normal is returned verbatim
   // (final_blend == 1), so the depth fallback normal and the depth edge metric
@@ -165,7 +171,7 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
     {
       int2 omrt_tc = GTVBAO_MrtTexel((float2(pix) + 0.5) * (float2(omw, omh) / max(float2(working_size), 1.0.xx)),
                                      float2(omw, omh));
-      float3 odecoded = DecodeMrtNormalAsIs((uint2)omrt_tc);
+      float3 odecoded = DecodeMrtNormalAsIs((uint2)omrt_tc, receiverSurface);
       if (FalcomNormalValid(odecoded))
       {
         float3 omrt_normal = TransformNormalToView(odecoded);
@@ -190,7 +196,7 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
   int2 mrt_tc = GTVBAO_MrtTexel((float2(pix) + 0.5) * (float2(mw, mh) / max(float2(working_size), 1.0.xx)),
                                 float2(mw, mh));
 
-  float3 decoded = DecodeMrtNormalAsIs((uint2)mrt_tc);
+  float3 decoded = DecodeMrtNormalAsIs((uint2)mrt_tc, receiverSurface);
   if (!FalcomNormalValid(decoded)) return selected;
 
   // Shaping lives in GTVBAO_TuneNormal so every MRT reader applies the

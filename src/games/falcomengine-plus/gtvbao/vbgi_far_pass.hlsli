@@ -30,7 +30,9 @@ bool VbgiFarSurface(int2 t, GTAOConstants consts, out float3 P, out float3 N, ou
   g_farMrt.GetDimensions(mw, mh);
   uv = (float2(t) + 0.5f) * consts.ViewportPixelSize;
   const float z = g_farDepth.Load(int3(GTVBAO_RepresentativePixel(t, int2(fw, fh)), 0)).x;
-  const float3 nw = DecodeFalcomMrtNormal(g_farMrt.Load(int3(GTVBAO_MrtTexel(uv * float2(mw, mh), float2(mw, mh)), 0)).xy);
+  const uint2 packed = g_farMrt.Load(int3(GTVBAO_MrtTexel(uv * float2(mw, mh), float2(mw, mh)), 0)).xy;
+  const float3 nw = (z > 0.0f && z < 60000.0f)
+      ? DecodeFalcomMrtNormalAsGame(packed) : DecodeFalcomMrtNormal(packed);
   N = TransformNormalToView(nw);
   P = GTVBAO_ComputeViewspacePosition(uv, z * 0.99920f, consts);
   return z < 60000.0f && FalcomNormalValid(nw);

@@ -277,7 +277,7 @@ float3 TransformNormalToView(float3 decoded)
   return FalcomSafeNormalize3(vn, float3(0.0, 0.0, 0.0));
 }
 
-float3 DecodeMrtNormalAsIs(uint2 texel);
+float3 DecodeMrtNormalAsIs(uint2 texel, bool surface);
 
 #include "GTVBAO.h"
 #include "GTVBAO.hlsli"

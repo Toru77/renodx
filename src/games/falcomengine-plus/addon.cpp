@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -50,6 +51,10 @@
 
 namespace {
 
+static_assert(sizeof(ShaderInjectData) == 1760u);
+static_assert(alignof(ShaderInjectData) == alignof(float));
+static_assert(offsetof(ShaderInjectData, cs_contact_local_light_clearance) == 80u);
+
 ShaderInjectData shader_injection = {
     .mod_enabled = 1.f,
     .slider_1 = 50.f,
@@ -74,7 +79,7 @@ ShaderInjectData shader_injection = {
   .rtao_debug_show = 0.f,
   .char_shadow_contrast = 9.f,
   .char_shadow_light_screen_fade_start = 0.f,
-  .rtgi_reserved = 0.f,
+  .cs_contact_local_light_clearance = 0.2f,
   .char_shadow_min_occluder_depth_scale = 0.f,
   .char_shadow_jitter_enabled = 1.f,
   .char_shadow_type = 1.f,
@@ -4909,6 +4914,14 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "World-space ray length for the local march. Local lights are short-range, "
                  "so this is much smaller than the sun ray length above.",
       .min = 0.1f, .max = 20.f, .format = "%.1f",
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsLocalLightClearance", .binding = &shader_injection.cs_contact_local_light_clearance,
+      .default_value = 0.2f, .label = "Light Clearance", .section = "Contact Shadows",
+      .tooltip = "Local contact rays stop this far before the light, in world units, so its own housing does not block it. Independent of RT Local Shadows.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },

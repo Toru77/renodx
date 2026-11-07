@@ -72,11 +72,14 @@ void main(uint2 p : SV_DispatchThreadID)
     g_outLocal[p] = float4(0.0, kContactDiagBadDepth / 255.0, 0.0, 1.0);
     return;
   }
-  if (FalcomLinearDepth(deviceDepth, unpack) > shader_injection_data.cs_contact_sky_depth) {
+  const float linearDepth = FalcomLinearDepth(deviceDepth, unpack);
+  if (linearDepth > shader_injection_data.cs_contact_sky_depth) {
     g_outLocal[p] = float4(0.0, kContactDiagSky / 255.0, 0.0, 1.0);
     return;
   }
-  const float3 N = DecodeFalcomMrtNormal(g_srcMrtNormal.Load(int3(p, 0)).xy);
+  const uint2 packedNormal = g_srcMrtNormal.Load(int3(p, 0)).xy;
+  const float3 N = (deviceDepth > 0.0 && linearDepth > 0.0)
+      ? DecodeFalcomMrtNormalAsGame(packedNormal) : DecodeFalcomMrtNormal(packedNormal);
   if (!FalcomNormalValid(N)) {
     g_outLocal[p] = float4(0.0, kContactDiagNoNormal / 255.0, 0.0, 1.0);
     return;
@@ -168,6 +171,7 @@ void main(uint2 p : SV_DispatchThreadID)
 
   FalcomContactParams params;
   params.rayLength = max(0.0, shader_injection_data.cs_contact_local_ray_length);
+  params.lightClearance = max(0.0, shader_injection_data.cs_contact_local_light_clearance);
   params.thickness = max(0.0, shader_injection_data.cs_contact_thickness);
   params.bias = max(0.0, shader_injection_data.cs_contact_bias);
   params.sampleCount = max(1.0, floor(shader_injection_data.cs_contact_local_sample_count + 0.5));
