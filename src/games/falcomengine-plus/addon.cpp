@@ -4865,7 +4865,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalEnvPoint", .binding = &shader_injection.cs_contact_local_env_point,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Env Point", .section = "Contact Shadows",
+      .default_value = 1.f, .label = "Env Point", .section = "Contact Shadows",
       .tooltip = "Contact march for point lights on the diffuse-only material path -- surfaces "
                  "that take their specular from the environment cube instead of dynamic lights. "
                  "The march is identical to Point and costs the same. A disabled class marches "
