@@ -14497,7 +14497,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                                                                                      .normal_power = &g_vbgi_svgf_normal_power,
                                                                                                      .history_length = &g_vbgi_svgf_history_length,
                                                                                                      .radius_scale = &g_vbgi_svgf_radius_scale,
-                                                                                                     .default_temporal_enabled = 0.f,
+                                                                                                     .default_temporal_enabled = 1.f,
                                                                                                      .default_temporal_far_only = 1.f,
                                                                                                      .default_history_weight = 0.99f,
                                                                                                      .default_history_length = 128.f,
