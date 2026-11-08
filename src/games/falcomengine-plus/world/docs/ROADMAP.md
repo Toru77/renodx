@@ -21,7 +21,7 @@ Also found (not owner reports, unchecked):
 
 ## Current state (2026-10-22)
 
-Goal: hardware-free (compute) ray tracing in Trails in the Sky 2nd Chapter (D3D11) on RenoDX. DevKit-gated: `falcom_world::Use`/`AddSettings` do nothing unless `IsSora2nd() && IsDevkitPresent()`. All code is in `src/games/falcomengine-plus/world/`.
+Goal: hardware DXR ray tracing in Trails in the Sky 2nd Chapter, with compute paths retained where a feature still needs them or as a counted fallback. The game API is D3D11; the add-on uses a separate D3D12 device and queue for its DXR path. DevKit-gated: `falcom_world::Use`/`AddSettings` do nothing unless `IsSora2nd() && IsDevkitPresent()`. All code is in `src/games/falcomengine-plus/world/`.
 
 Confirmed in game:
 - Static world: classifier admission, live BVH, primary-ray trace, Depth Compare, inspect (HISTORY: Round 8 result).
@@ -106,7 +106,7 @@ SVGF M3b (tiled variance, bit-exact), implemented, not validated in game: `world
 
 SVGF M3c (execution reordering, identity storage, bit-exact), implemented, not validated in game: `world_svgf_atrous` reorders the threads of a group by remainder class of its step (optimizing_svgf.md Sec. 3.1-3.2, `PosReordToNorm`), so the 5x5 taps come from a 12x12 group-shared tile. The textures stay in pixel layout. Output is bit-identical to the M2 a-trous at steps 1 to 16 (test_gpu_svgf on WARP, 0 mismatches, including sizes smaller than the step and uneven remainders).
 
-RR M2a (DLSS Ray Reconstruction, first live evaluate), implemented, not validated in game: with "DLSS Ray Reconstruction" on, the SR evaluate of the lighting denoise becomes the RR evaluate (preset 6, all six RayReconstruction.Hint keys, guides from M1 and camera matrices). Every RR create goes through `CreateRrFeature` then `CreateFeatureGuarded`; the RR handle is released with the SR handle, at shutdown and when RR is switched off. Any create or evaluate failure latches `g_rr_failed` and returns the SR evaluate. The status row shows the reason (`RrReasonName`) and, once latched, the NGX result and exception. Temporary "[perf test]" rows (Ray Tracing tab) gate the hooks, the present handler, the guide pass and the rows themselves; remove them with the M2a cleanup. Owner test: (1) RR on, DLSS selected: the status row reads "running" within a few seconds and the guides line is "ready"; (2) RR off: the status row reads "off" and the log has no `[world-rr] RR created` line; (3) switch RR off and on mid-session: the status row follows and the log shows one `[world-rr] release` for the RR handle; (4) send the status row text, the `[world-rr]` lines of ReShade.log, and any "NGX result" line.
+RR D3D12 migration M1–M5, implemented and reviewed; owner runtime validation pending. The game remains D3D11: the add-on observes game NGX initialization and keeps the game's DLSS Super Resolution evaluate as the fallback. RR uses a separate same-adapter D3D12 NGX runtime and direct queue. Shared image copies carry color, motion, packed normal/roughness, albedo, specular, depth and output across the API boundary. The handoff is D3D11 input copy and signal A, D3D12 wait/evaluate and signal B, then D3D11 wait/output copy and signal C. Frame owners and feature retirement remain protected until the relevant completions are observed; unknown completion/device-loss states are quarantined. RR Debug Log gates bounded RR-tagged begin/phase/end/failure evidence and failure dumps; these records use the RR A/B/C timelines and identify RT12 values as unavailable. The RR path does not change the add-on RT, GTVBAO or GTVBGI denoisers. M1 captures D3D12 runtime identity; M2 stages guides/resources; M3 evaluates RR and hands output back; M4 handles resets, retries, device loss and deferred lifetime cleanup; M5 adds failure-stage/status reporting and final documentation. Validation after code review: owner enables RR with DLSS selected, checks the status row and output, switches presets and toggles RR, and confirms game SR fallback on failures. The build/review are complete; runtime behavior is not yet validated by the owner.
 
 R1 (zero-cost BVH gating), implemented, not validated in game: with RTAO, RTGI and RTLS all off, the BVH, pool, deform and census path does not run (`RtBvhDemanded`, `ApplyBvhInputs` in `world/bvh/bvh_debug.hpp`). Owner test list:
 1. RTAO, RTGI and RTLS off, Pool Scan unticked, no debug view: the BVH panel shows "BVH inputs: idle (nothing runs)"; the Pool Scan, Live BVH and Deforming meshes rows are unticked, and the Performance tab (Gather on) shows about zero for the pool and deform CPU rows.
@@ -644,6 +644,10 @@ Pass: (a) both Reduced runs at both spots have a lower mean frame time than both
 images match; (c) after `pool reduced`: `vanilla_frames` 0 and `left_by_reason` holds only the owner's toggles; rt12
 `fallback_frames` no higher than in the Full run; (d) no crash or STUCK; the stall step behaves as before G5. A smaller or
 unrepeatable gain goes to the planner with the perf rows.
+
+### RR M1: GPU completion evidence (historical D3D11 diagnostic)
+
+The former M1 implementation used a persistent D3D11 diagnostic fence and RT12 A/B breadcrumbs. That D3D11 fence is no longer part of RR and has been removed. Current RR has an independent D3D12 runtime timeline: A is the D3D11 input-copy completion, B is D3D12 RR command completion, and C is the D3D11 output-copy completion. These values belong to the RR runtime/bridge generations and must not be read as RT12 queue values. RR Debug Log controls detailed RR event logging; the panel's basic status and last failure codes remain available with logging off. `UINT64_MAX` means completion is unavailable/device loss, never a completed fence value.
 
 ## Open decisions
 

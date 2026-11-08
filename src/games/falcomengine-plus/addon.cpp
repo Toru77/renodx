@@ -9597,6 +9597,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   // Temporal (round 2). The motion view is the G-buffer RTV4 owned SRV only. TAA t3 (rcas_motion) is bound
   // after lighting, so it is not used: there is no proof it is written before this hook.
   auto& rf = rtao::g_rtao_frame;
+  const bool rr_bypass = falcom_world::rr::RrOwnsDenoise();
   const bool temporal_on = rtao::g_rtao_temporal_enabled > 0.5f;
   if (temporal_on) rf.temporal_on_frames += 1u;
   static bool taa_never_logged = false;
@@ -9622,10 +9623,10 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
       temporal_on, rf.temporal_last, resized, dd->frame_index, rf.dispatched_frame,
       dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
       false, params_changed, motion_ok});
-  rf.reset = reset;
+  rf.reset = rr_bypass ? rtao::ResetReason::Disabled : reset;
   rf.motion_source = rf.motion_conflict ? rtao::MotionSource::Conflict
-      : (motion_ok ? rtao::MotionSource::Rtv4 : rtao::MotionSource::None);
-  if (temporal_on && reset != rtao::ResetReason::None) {
+                                        : (motion_ok ? rtao::MotionSource::Rtv4 : rtao::MotionSource::None);
+  if (!rr_bypass && temporal_on && reset != rtao::ResetReason::None) {
     rf.last_reset = reset;
     rf.reset_counts[static_cast<size_t>(reset)] += 1u;
   }
@@ -9646,9 +9647,10 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   svgf_in.divisor = in.trace_divisor;
   svgf_in.temporal = temporal_on && motion_ok && !debug_raw;
   svgf_in.spatial = spatial_on && !debug_raw;
+  svgf_in.bypass_svgf = rr_bypass;
   svgf_in.stats = rtao::g_rtao_discovery < 0.5f;
   svgf_in.svgf = {rtao::g_rtao_history_weight, rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection,
-                  reset == rtao::ResetReason::None, rtao::g_rtao_svgf_iterations,
+                  !rr_bypass && reset == rtao::ResetReason::None, rtao::g_rtao_svgf_iterations,
                   rtao::g_rtao_svgf_luminance_edge_stop, rtao::g_rtao_svgf_depth_sigma, rtao::g_rtao_svgf_normal_power, rtao::g_rtao_full_res_denoise > 0.5f, rtao::g_rtao_svgf_history_length, rtao::g_rtao_svgf_radius_scale};
   const falcom_world::rtgi::RtgiDenoiseReady ready = rtao::EnsureRtaoSvgf(dev, svgf_in);
   if (!ready.ok) {
@@ -9676,8 +9678,8 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   rf.temporal_ran = ready.temporal;
   rf.temporal_last = temporal_on && ready.temporal;
   // Temporal requested but the reprojection did not run: the output is the spatial-only or raw AO this frame.
-  if (temporal_on && !debug_raw && !ready.temporal) frame.note = motion_ok ? rtao::Reason::PipelineFailed : rtao::Reason::NoMotion;
-  if (spatial_on && !debug_raw && !ready.spatial && frame.note == rtao::Reason::Off) frame.note = rtao::Reason::FilterFailed;
+  if (!svgf_in.bypass_svgf && temporal_on && !debug_raw && !ready.temporal) frame.note = motion_ok ? rtao::Reason::PipelineFailed : rtao::Reason::NoMotion;
+  if (!svgf_in.bypass_svgf && spatial_on && !debug_raw && !ready.spatial && frame.note == rtao::Reason::Off) frame.note = rtao::Reason::FilterFailed;
   frame.dispatched_frame = dd->frame_index;
   frame.producing = true;
   frame.gpu_ms = rd.timer.last_ms;
@@ -13622,7 +13624,8 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[GTVBAO] RunGTVBAO: creating pipelines...");
   const bool temporal_wanted = g_gtvbao_temporal_enabled > 0.5f
-      && (IsSora1st() || IsSora2nd() || IsKai()) && g_cpuopt_deferred_dispatch < 0.5f;
+                               && (IsSora1st() || IsSora2nd() || IsKai()) && g_cpuopt_deferred_dispatch < 0.5f;
+  const bool rr_bypass = falcom_world::rr::RrOwnsDenoise();
   if (temporal_wanted && d->gtvbao_last_frame == d->frame_index) return true;
   if (!CreateComputePipelinesIfNeeded(dev, d)) return false;
   if (shader_injection.gtvbao_debug_logging > 0.5f)
@@ -13640,8 +13643,8 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   // uses w/h everywhere (existing behavior); low-res uses aw/ah for main,
   // denoise, and �-trous while depth/MRT/light stay full.
   const bool low_res = shader_injection.gtvbao_resolution > 0.5f
-      && d->ao_width >= 32u && d->ao_height >= 32u
-      && d->ao_term_a_texture.handle;
+                       && d->ao_width >= 32u && d->ao_height >= 32u
+                       && d->ao_term_a_texture.handle;
   const float svgf_radius_scale = (low_res ? g_gtvbao_svgf_half_res_radius_scale : g_gtvbao_svgf_radius_scale);
   const uint32_t aw = low_res ? d->ao_width : w;
   const uint32_t ah = low_res ? d->ao_height : h;
@@ -13658,15 +13661,14 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   // Otherwise it holds stale data from an earlier frame (e.g. a previous scene with foliage)
   // and must NOT be consumed by the main pass.
   const bool foliage_mask_valid = had_foliage_draws
-      && shader_injection.gtvbao_exclude_foliage > 0.5f
-      && d->foliage_mask_pipeline.handle
-      && d->foliage_mask_uav.handle
-      && d->captured_mrt_normal_srv.handle;
+                                  && shader_injection.gtvbao_exclude_foliage > 0.5f
+                                  && d->foliage_mask_pipeline.handle
+                                  && d->foliage_mask_uav.handle
+                                  && d->captured_mrt_normal_srv.handle;
 
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info,
-      (std::string("[GTVBAO] RunGTVBAO: dispatching pass 1 (") +
-       std::to_string(w) + "x" + std::to_string(h) + ")").c_str());
+                          (std::string("[GTVBAO] RunGTVBAO: dispatching pass 1 (") + std::to_string(w) + "x" + std::to_string(h) + ")").c_str());
 
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
@@ -13681,7 +13683,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       && aw == rtao::RtgiTraceExtent(full_w, divisor) && ah == rtao::RtgiTraceExtent(full_h, divisor)
       && rtgi::EnsureRtgiPipeline(dev, &d->gtvbao_denoise.upsample_pipeline, kGtvbaoUpsampleDesc)
       && rtgi::EnsureRtgiTextureSet(dev, &d->gtvbao_svgf_raw, reshade::api::format::r16g16b16a16_float, 8u, aw, ah)) {
-    ready = rtgi::EnsureRtgiDenoise(dev, &d->gtvbao_denoise, {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = aw, .trace_height = ah, .full_width = full_w, .full_height = full_h, .temporal = motion_ok, .spatial = g_gtvbao_svgf_spatial_enabled > 0.5f, .log_prefix = "[gtvbao]", .full_resolution = g_gtvbao_full_res_denoise > 0.5f, .nearest_fallback = true});
+    ready = rtgi::EnsureRtgiDenoise(dev, &d->gtvbao_denoise, {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = aw, .trace_height = ah, .full_width = full_w, .full_height = full_h, .temporal = motion_ok, .spatial = g_gtvbao_svgf_spatial_enabled > 0.5f, .log_prefix = "[gtvbao]", .full_resolution = g_gtvbao_full_res_denoise > 0.5f, .nearest_fallback = true, .bypass_svgf = rr_bypass});
   }
   if (!ready.ok) {
     CSLog("gtvbao", "svgf chain not ready (normal, cbv, size, pipelines or targets)", true);
@@ -13694,14 +13696,14 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     uint32_t mkW = aw, mkH = ah;
     GtvbaoBindPipeline(cl, d->foliage_mask_pipeline);
     reshade::api::resource_view fm_srvs[2] = {
-        d->depth_mips_srv,                          // t0 � working depth (GetDimensions)
-        d->captured_mrt_normal_srv                  // t1 � G-buffer normal (bit 15 test)
+        d->depth_mips_srv,          // t0 � working depth (GetDimensions)
+        d->captured_mrt_normal_srv  // t1 � G-buffer normal (bit 15 test)
     };
     reshade::api::descriptor_table_update fu[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,2,reshade::api::descriptor_type::texture_shader_resource_view,fm_srvs},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->foliage_mask_uav},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_clamp_sampler},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, fm_srvs},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->foliage_mask_uav},
     };
     GtvbaoApplyDescriptors(dev, cl, d->foliage_mask_layout, &d->foliage_mask_tables, 4, fu);
     auto pc = BuildGTVBAOPushConstants(d);
@@ -13726,13 +13728,13 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         .guard = d->dyncube_loadingWipePending || d->frame_index < d->resize_guard_until_frame,
         .scaled = false,
         .params_changed = d->gtvbao_prev_params_valid
-            && (!(snapshot == d->gtvbao_prev_params) || d->gtvbao_prev_svgf_history_length != g_gtvbao_svgf_history_length
-                || d->gtvbao_prev_svgf_radius_scale != svgf_radius_scale),
+                          && (!(snapshot == d->gtvbao_prev_params) || d->gtvbao_prev_svgf_history_length != g_gtvbao_svgf_history_length
+                              || d->gtvbao_prev_svgf_radius_scale != svgf_radius_scale),
         .motion_ok = motion_ok});
-    if (reset != rtao::ResetReason::None)
+    if (!rr_bypass && reset != rtao::ResetReason::None)
       CSLog("gtvbao", std::string("temporal reset: ") + rtao::ResetReasonName(reset), true);
   }
-  const bool history_valid = reset == rtao::ResetReason::None;
+  const bool history_valid = !rr_bypass && reset == rtao::ResetReason::None;
 
   // Pass 2: Main
   reshade::api::pipeline mp = d->main_pipeline;
@@ -14299,9 +14301,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
             .params_changed = params_changed || far_toggled || far_params_changed || far_color_params_changed,
             .motion_ok = motion_ok});
         const rtgi::RtgiDenoiseReady far_ready = rtgi::EnsureRtgiDenoise(dev, &far_color,
-            {.output_format = reshade::api::format::r16g16b16a16_float, .output_bytes_per_pixel = 8u,
-             .trace_width = d->vbgi_width, .trace_height = d->vbgi_height, .full_width = full_w, .full_height = full_h,
-             .temporal = true, .spatial = false, .log_prefix = "[vbgi-far-color]", .history_only = true});
+                                                                         {.output_format = reshade::api::format::r16g16b16a16_float, .output_bytes_per_pixel = 8u, .trace_width = d->vbgi_width, .trace_height = d->vbgi_height, .full_width = full_w, .full_height = full_h, .temporal = true, .spatial = false, .log_prefix = "[vbgi-far-color]", .history_only = true, .bypass_svgf = falcom_world::rr::RrOwnsDenoise()});
         if (far_ready.ok && far_ready.temporal) {
           std::vector<reshade::api::descriptor_table_update> far_nulls;
           if (vbgi_conf) GtvbaoBarrier(cl, d->debug_texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
@@ -14343,6 +14343,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
         rtgi::ReleaseRtgiDenoiseTextures(dev, &d->vbgi_far_color_denoise);
         d->vbgi_far_color_prev_params_valid = false;
       }
+      if (falcom_world::rr::RrOwnsDenoise()) d->vbgi_far_color_prev_params_valid = false;
       d->vbgi_far_color_last = far_color_ran;
       if (far_color_ran) {
         d->vbgi_far_color_frame = d->frame_index;
@@ -14350,15 +14351,18 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
         d->vbgi_far_color_full_height = full_h;
       }
       const rtgi::RtgiDenoiseReady ready = rtgi::EnsureRtgiDenoise(dev, &d->vbgi_denoise,
-          {.output_format = reshade::api::format::r11g11b10_float,
-           .output_bytes_per_pixel = 4u,
-           .trace_width = d->vbgi_width,
-           .trace_height = d->vbgi_height,
-           .full_width = full_w,
-           .full_height = full_h,
-           .temporal = temporal_on && motion_ok,
-           .spatial = g_vbgi_spatial_enabled > 0.5f,
-           .log_prefix = "[vbgi]", .full_resolution = g_vbgi_full_res_denoise > 0.5f, .nearest_fallback = true});
+                                                                   {.output_format = reshade::api::format::r11g11b10_float,
+                                                                    .output_bytes_per_pixel = 4u,
+                                                                    .trace_width = d->vbgi_width,
+                                                                    .trace_height = d->vbgi_height,
+                                                                    .full_width = full_w,
+                                                                    .full_height = full_h,
+                                                                    .temporal = temporal_on && motion_ok,
+                                                                    .spatial = g_vbgi_spatial_enabled > 0.5f,
+                                                                    .log_prefix = "[vbgi]",
+                                                                    .full_resolution = g_vbgi_full_res_denoise > 0.5f,
+                                                                    .nearest_fallback = true,
+                                                                    .bypass_svgf = falcom_world::rr::RrOwnsDenoise()});
       if (!ready.ok) {
         CSLog("vbgi", "denoise skipped: chain not ready", true);
       } else {

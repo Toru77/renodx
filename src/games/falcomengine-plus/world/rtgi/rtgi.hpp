@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "../bvh/bvh_trace.hpp"
+#include "../rr/rr_state.hpp"
 #include "../rt12/rt12_mirror.hpp"
 #include "../rtao/rtao.hpp"
 #include "../world_state.hpp"
@@ -141,6 +142,7 @@ struct RtgiDenoiseRequest {
   bool full_resolution = false;
   bool nearest_fallback = false;
   bool history_only = false;
+  bool bypass_svgf = false;  // RR owns denoising; keep input conversion and output reconstruction only.
 };
 
 // The passes the chain can run this frame (ok: the output exists).
@@ -156,15 +158,17 @@ struct RtgiDenoiseReady {
 // integrated and a-trous targets when the spatial filter is requested. A new or resized history starts at index 0 (all
 // invalid). The owner ensures the upsample pipeline itself (kRtgiUpsamplePipelineDesc).
 inline RtgiDenoiseReady EnsureRtgiDenoise(reshade::api::device* device, RtgiDenoiseSet* set, const RtgiDenoiseRequest& request) {
+  const bool temporal = request.temporal && !request.bypass_svgf;
+  const bool spatial = request.spatial && !request.bypass_svgf;
   if (!request.full_resolution && set->reconstructed.texture[0].handle != 0u) {
     DestroyRtgiTextureSet(device, &set->reconstructed);
   }
-  if (!request.spatial) {
+  if (!spatial) {
     DestroyRtgiTextureSet(device, &set->integrated);
     DestroyRtgiTextureSet(device, &set->atrous);
     set->atrous_iterations = 0u;
   }
-  if (!request.temporal && !request.spatial) {
+  if (!temporal && !spatial) {
     DestroyRtgiTextureSet(device, &set->history_color);
     DestroyRtgiTextureSet(device, &set->history_normal);
     DestroyRtgiTextureSet(device, &set->history_moments);
@@ -172,8 +176,7 @@ inline RtgiDenoiseReady EnsureRtgiDenoise(reshade::api::device* device, RtgiDeno
     set->history_index = 0u;
     set->mode_valid = false;
   }
-  if (!request.history_only && !EnsureRtgiTextureSet(device, &set->output, request.output_format, request.output_bytes_per_pixel, request.full_width,
-                                                     request.full_height)) {
+  if (!request.history_only && !EnsureRtgiTextureSet(device, &set->output, request.output_format, request.output_bytes_per_pixel, request.full_width, request.full_height)) {
     renodx::utils::log::w(request.log_prefix, " final texture creation failed");
     set->mode_valid = false;
     return {};
@@ -189,17 +192,15 @@ inline RtgiDenoiseReady EnsureRtgiDenoise(reshade::api::device* device, RtgiDeno
       return {};
     }
   }
-  bool reproject_run = (request.temporal || request.spatial)
-      && EnsureRtgiPipeline(device, &set->reproject_pipeline, {.srv_count = kSvgfReprojectSrvCount, .uav_count = kSvgfReprojectUavCount,
-                                                              .sampler_count = kSvgfReprojectSamplerCount, .push_count = kSvgfPushCount,
-                                                              .code = kSvgfReprojectShader, .name = "reproject"});
+  bool reproject_run = (temporal || spatial)
+                       && EnsureRtgiPipeline(device, &set->reproject_pipeline, {.srv_count = kSvgfReprojectSrvCount, .uav_count = kSvgfReprojectUavCount, .sampler_count = kSvgfReprojectSamplerCount, .push_count = kSvgfPushCount, .code = kSvgfReprojectShader, .name = "reproject"});
   if (reproject_run) {
     const bool history_recreated = set->history_color.texture[0].handle == 0u || set->history_color.width != denoise_width
-        || set->history_color.height != denoise_height;
+                                   || set->history_color.height != denoise_height;
     reproject_run = EnsureRtgiTextureSet(device, &set->history_color, reshade::api::format::r16g16b16a16_float, 8u, denoise_width, denoise_height)
-        && EnsureRtgiTextureSet(device, &set->history_normal, reshade::api::format::r16g16_float, 4u, denoise_width, denoise_height)
-        && EnsureRtgiTextureSet(device, &set->history_moments, reshade::api::format::r32g32b32a32_float, 16u, denoise_width, denoise_height)
-        && EnsureRtgiTextureSet(device, &set->history_guide, reshade::api::format::r32g32b32a32_float, 16u, denoise_width, denoise_height);
+                    && EnsureRtgiTextureSet(device, &set->history_normal, reshade::api::format::r16g16_float, 4u, denoise_width, denoise_height)
+                    && EnsureRtgiTextureSet(device, &set->history_moments, reshade::api::format::r32g32b32a32_float, 16u, denoise_width, denoise_height)
+                    && EnsureRtgiTextureSet(device, &set->history_guide, reshade::api::format::r32g32b32a32_float, 16u, denoise_width, denoise_height);
     if (!reproject_run) {
       renodx::utils::log::w(request.log_prefix, " history texture creation failed");
     } else if (history_recreated) {
@@ -219,25 +220,21 @@ inline RtgiDenoiseReady EnsureRtgiDenoise(reshade::api::device* device, RtgiDeno
     sd.address_u = sd.address_v = sd.address_w = reshade::api::texture_address_mode::clamp;
     reproject_run = device->create_sampler(sd, &set->linear_sampler);
   }
-  bool spatial_run = reproject_run && request.spatial
-      && EnsureRtgiPipeline(device, &set->variance_pipeline, {.srv_count = kSvgfVarianceSrvCount, .uav_count = kSvgfVarianceUavCount,
-                                                             .sampler_count = 0u, .push_count = kSvgfPushCount,
-                                                             .code = kSvgfVarianceShader, .name = "variance"})
-      && EnsureRtgiPipeline(device, &set->atrous_pipeline, {.srv_count = kSvgfAtrousSrvCount, .uav_count = kSvgfAtrousUavCount,
-                                                            .sampler_count = 0u, .push_count = kSvgfPushCount,
-                                                            .code = kSvgfAtrousShader, .name = "atrous"})
-      && EnsureRtgiTextureSet(device, &set->integrated, reshade::api::format::r16g16b16a16_float, 8u, denoise_width, denoise_height)
-      && EnsureRtgiTextureSet(device, &set->atrous, reshade::api::format::r16g16b16a16_float, 8u, denoise_width, denoise_height);
+  bool spatial_run = reproject_run && spatial
+                     && EnsureRtgiPipeline(device, &set->variance_pipeline, {.srv_count = kSvgfVarianceSrvCount, .uav_count = kSvgfVarianceUavCount, .sampler_count = 0u, .push_count = kSvgfPushCount, .code = kSvgfVarianceShader, .name = "variance"})
+                     && EnsureRtgiPipeline(device, &set->atrous_pipeline, {.srv_count = kSvgfAtrousSrvCount, .uav_count = kSvgfAtrousUavCount, .sampler_count = 0u, .push_count = kSvgfPushCount, .code = kSvgfAtrousShader, .name = "atrous"})
+                     && EnsureRtgiTextureSet(device, &set->integrated, reshade::api::format::r16g16b16a16_float, 8u, denoise_width, denoise_height)
+                     && EnsureRtgiTextureSet(device, &set->atrous, reshade::api::format::r16g16b16a16_float, 8u, denoise_width, denoise_height);
   const std::span<const std::uint8_t> kTileCode[kSvgfAtrousTileSteps] = {kSvgfAtrousS1Shader, kSvgfAtrousS2Shader, kSvgfAtrousS4Shader};
   const char* kTileName[kSvgfAtrousTileSteps] = {"atrous s1", "atrous s2", "atrous s4"};
   for (uint32_t k = 0u; k < kSvgfAtrousTileSteps; ++k) {
     spatial_run = spatial_run && EnsureRtgiPipeline(device, &set->atrous_tile_pipeline[k], {.srv_count = kSvgfAtrousSrvCount, .uav_count = kSvgfAtrousUavCount, .sampler_count = 0u, .push_count = kSvgfPushCount, .code = kTileCode[k], .name = kTileName[k]});
   }
-  if (request.full_resolution && ((request.temporal || request.spatial) && !reproject_run || (request.spatial && !spatial_run))) {
+  if (request.full_resolution && ((temporal || spatial) && !reproject_run || (spatial && !spatial_run))) {
     set->mode_valid = false;
     return {};
   }
-  return {.ok = true, .reproject = reproject_run, .temporal = reproject_run && request.temporal, .spatial = spatial_run};
+  return {.ok = true, .reproject = reproject_run, .temporal = reproject_run && temporal, .spatial = spatial_run};
 }
 
 struct RtgiUpsampleSettings {
@@ -605,25 +602,35 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
                                                       .temporal = in.temporal && in.motion_view.handle != 0u,
                                                       .spatial = in.spatial,
                                                       .log_prefix = "[world-rtgi]",
-                                                                  .full_resolution = in.svgf.full_resolution});
+                                                      .full_resolution = in.svgf.full_resolution,
+                                                      .bypass_svgf = falcom_world::rr::RrOwnsDenoise()});
   if (!denoise.ok) return {};
-  // ReSTIR GI temporal reuse (M2): runs on ReSTIR frames whose chain reprojects with motion (RTGI Temporal on); it uses
-  // the chain's samplers. Its reservoirs are kept while ReSTIR is on and marked stale on frames without the pass.
-  const bool restir_temporal = restir && denoise.temporal;
+  // ReSTIR GI temporal reuse is independent of SVGF and remains active when RR bypasses that chain.
+  const bool restir_temporal = restir && in.temporal && in.motion_view.handle != 0u;
   bool restir_history_ok = restir_history;
   if (restir_temporal) {
     const bool recreated = data.restir_res_sample.texture[0].handle == 0u || data.restir_res_sample.width != in.trace_width
-        || data.restir_res_sample.height != in.trace_height;
+                           || data.restir_res_sample.height != in.trace_height;
     if (!EnsureRtgiPipeline(device, &data.restir_temporal_pipeline,
-                            {.srv_count = kRestirTemporalSrvCount, .uav_count = kRestirTemporalUavCount,
-                             .sampler_count = kRestirTemporalSamplerCount, .push_count = kRestirTemporalPushCount,
-                             .code = kRestirTemporalShader, .name = "restir temporal"})
+                            {.srv_count = kRestirTemporalSrvCount, .uav_count = kRestirTemporalUavCount, .sampler_count = kRestirTemporalSamplerCount, .push_count = kRestirTemporalPushCount, .code = kRestirTemporalShader, .name = "restir temporal"})
         || !EnsureRtgiTextureSet(device, &data.restir_raw, reshade::api::format::r16g16b16a16_float, 8u, in.trace_width, in.trace_height)
         || !EnsureRtgiTextureSet(device, &data.restir_res_sample, reshade::api::format::r32g32b32a32_float, 16u, in.trace_width, in.trace_height)
         || !EnsureRtgiTextureSet(device, &data.restir_res_visible, reshade::api::format::r32g32b32a32_float, 16u, in.trace_width, in.trace_height)
         || !EnsureRtgiTextureSet(device, &data.restir_res_data, reshade::api::format::r32g32b32a32_uint, 16u, in.trace_width, in.trace_height)) {
       renodx::utils::log::w("[world-rtgi] ReSTIR temporal resources failed (", in.trace_width, "x", in.trace_height, ")");
       return {};
+    }
+    if (data.restir_point_sampler.handle == 0u || data.restir_linear_sampler.handle == 0u) {
+      reshade::api::sampler_desc sd = {};
+      sd.address_u = sd.address_v = sd.address_w = reshade::api::texture_address_mode::clamp;
+      if (data.restir_point_sampler.handle == 0u) {
+        sd.filter = reshade::api::filter_mode::min_mag_mip_point;
+        if (!device->create_sampler(sd, &data.restir_point_sampler)) return {};
+      }
+      if (data.restir_linear_sampler.handle == 0u) {
+        sd.filter = reshade::api::filter_mode::min_mag_mip_linear;
+        if (!device->create_sampler(sd, &data.restir_linear_sampler)) return {};
+      }
     }
     if (recreated) {
       data.restir_res_index = 0u;
@@ -813,7 +820,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     const reshade::api::resource_view ruavs[kRestirTemporalUavCount] = {
         data.restir_raw.uav[0], data.stats_uav, data.restir_res_sample.uav[rwrite], data.restir_res_visible.uav[rwrite],
         data.restir_res_data.uav[rwrite], restir_debug ? data.debug.uav[0] : reshade::api::resource_view{0u}};
-    const reshade::api::sampler rsamplers[kRestirTemporalSamplerCount] = {data.denoise.point_sampler, data.denoise.linear_sampler};
+    const reshade::api::sampler rsamplers[kRestirTemporalSamplerCount] = {data.restir_point_sampler, data.restir_linear_sampler};
     const reshade::api::buffer_range rscene = rtao::SceneCbvRange(in.scene_cbv_view);
     reshade::api::descriptor_table_update rupdates[4] = {
         {rt.cbv_table, 0, 0, 1, kCbv, &rscene},

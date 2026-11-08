@@ -522,6 +522,8 @@ struct RtgiDeviceData {
   uint32_t restir_res_index = 0u;        // reservoir[restir_res_index] is the newest (read next frame)
   bool restir_res_valid = false;         // reservoir[restir_res_index] holds the previous frame's temporal reservoirs
   RtgiPipeline restir_temporal_pipeline;
+  reshade::api::sampler restir_point_sampler = {0u};
+  reshade::api::sampler restir_linear_sampler = {0u};
   bvh::GpuTimer restir_timer = {};
   RtgiTextureSet<1> restir_sp_raw;      // rgba16f, trace size: raw GI after spatial mode 0 (mode 1's input)
   RtgiTextureSet<1> restir_sp_sample;   // r32g32b32a32_float, trace size: spatial reservoir x_s, W (this dispatch only)
@@ -621,6 +623,8 @@ inline void DestroyRtgiDeviceData(reshade::api::device* device) {
   DestroyRtgiPipeline(device, data.lamp_type_pipeline);
   DestroyRtgiPipeline(device, data.restir_temporal_pipeline);
   DestroyRtgiPipeline(device, data.restir_spatial_pipeline);
+  if (data.restir_point_sampler.handle != 0u) device->destroy_sampler(data.restir_point_sampler);
+  if (data.restir_linear_sampler.handle != 0u) device->destroy_sampler(data.restir_linear_sampler);
   g_rtgi_devices.erase(found);
 }
 

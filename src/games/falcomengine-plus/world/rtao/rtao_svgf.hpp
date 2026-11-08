@@ -64,6 +64,7 @@ struct RtaoSvgfInputs {
   uint32_t divisor = 1u;
   bool temporal = false;
   bool spatial = false;
+  bool bypass_svgf = false;
   bool stats = false;  // the reprojection writes the counters (stats buffer bound)
   rtgi::SvgfSettings svgf = {};
 };
@@ -78,7 +79,7 @@ inline rtgi::RtgiDenoiseReady EnsureRtaoSvgf(reshade::api::device* device, const
     return {};
   }
   return rtgi::EnsureRtgiDenoise(device, &sd.denoise,
-                                 {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = in.trace_width, .trace_height = in.trace_height, .full_width = in.full_width, .full_height = in.full_height, .temporal = in.temporal, .spatial = in.spatial, .log_prefix = "[world-rtao]", .full_resolution = in.svgf.full_resolution, .nearest_fallback = true});
+                                 {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = in.trace_width, .trace_height = in.trace_height, .full_width = in.full_width, .full_height = in.full_height, .temporal = in.temporal, .spatial = in.spatial, .log_prefix = "[world-rtao]", .full_resolution = in.svgf.full_resolution, .nearest_fallback = true, .bypass_svgf = in.bypass_svgf});
 }
 
 // The newest AO output (the upsampled SVGF output); null when the chain has not produced one.

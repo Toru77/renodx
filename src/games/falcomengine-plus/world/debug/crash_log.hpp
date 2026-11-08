@@ -26,16 +26,19 @@
 #include <d3d11.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <shared_mutex>
 
 #include <include/reshade.hpp>
 
 #include "../../../../utils/log.hpp"
+#include "../rr/rr_state.hpp"
 #include "../world_state.hpp"
 #include "./pool_stage.hpp"
 
@@ -45,6 +48,7 @@ inline constexpr uint32_t kCrashMaxReports = 64u;
 inline constexpr uint32_t kCrashMaxFrames = 48u;
 inline constexpr uint32_t kCrashCppHashFrames = 10u;
 inline constexpr uint32_t kCrashMemoryLogFrames = 600u;  // periodic memory line while on
+inline constexpr uint32_t kGpuWorkBreadcrumbCount = 64u;
 inline constexpr DWORD kCrashCppExceptionCode = 0xE06D7363u;
 
 // Shared C runtime entry points (ucrtbase.dll).
@@ -85,10 +89,265 @@ struct CrashLogState {
   std::array<std::atomic_uint64_t, kCrashMaxReports> keys = {};  // reported addresses / stack hashes
   std::atomic_uint64_t native_device{0u};                        // ID3D11Device*, set at present
   std::atomic<long> logged_removed_reason{S_OK};
+  std::atomic_uint64_t logged_removed_device{0u};
   std::atomic_uint32_t presents{0u};
 };
 
 inline CrashLogState g_crash_log;
+
+enum class GpuWorkKind : uint32_t { P2b,
+                                    Tlas,
+                                    Rtao,
+                                    Rtgi,
+                                    Rt12,
+                                    GpuCapture,
+                                    GcCheck };
+
+struct GpuWorkBreadcrumbSlot {
+  std::atomic_uint64_t stamp{0u};
+  std::atomic_uint32_t frame{0u};
+  std::atomic_uint32_t kind{0u};
+  std::atomic_uint32_t detail{0u};
+  std::atomic_uint64_t qpc{0u};
+  std::atomic_uint32_t thread{0u};
+};
+
+struct GpuWorkBreadcrumbSnapshot {
+  uint64_t sequence = 0u;
+  uint32_t frame = 0u;
+  uint32_t kind = 0u;
+  uint32_t detail = 0u;
+  uint64_t qpc = 0u;
+  uint32_t thread = 0u;
+};
+
+inline std::array<GpuWorkBreadcrumbSlot, kGpuWorkBreadcrumbCount> g_gpu_work_breadcrumbs;
+inline std::atomic_uint64_t g_gpu_work_breadcrumb_next{0u};
+
+inline constexpr uint32_t kGpuEvidenceCount = 64u;
+enum class GpuEvidenceEvent : uint8_t { RrBegin,
+                                        RrPhase,
+                                        RrEnd,
+                                        RrFailure,
+                                        Rt12SignalA,
+                                        Rt12SignalB,
+                                        Rt12WaitA,
+                                        Rt12WaitPriorB,
+                                        Rt12WaitB,
+                                        Rt12Submit,
+                                        Rt12Stuck,
+                                        DeviceRemoved };
+enum class GpuEvidenceSource : uint8_t { None,
+                                         Present,
+                                         Rtao,
+                                         Rtgi,
+                                         GcCheck,
+                                         GcBuild,
+                                         RrPre,
+                                         RrPost,
+                                         RrD3D12 };
+
+struct GpuEvidenceSnapshot {
+  uint64_t sequence = 0u;
+  uint64_t qpc = 0u;
+  uint64_t rt12_generation = 0u;
+  uint64_t rt12_submitted = 0u;
+  uint64_t rt12_completed = 0u;
+  uint64_t rt12_progress_age_us = 0u;
+  uint64_t rt12_submission_age_us = 0u;
+  uint64_t a_target = 0u;
+  uint64_t a_completed = 0u;
+  uint64_t b_target = 0u;
+  uint64_t b_completed = 0u;
+  uint64_t d3d12_wait_a_target = 0u;
+  uint64_t d3d12_wait_prior_b_target = 0u;
+  uint64_t d3d11_wait_b_target = 0u;
+  uint64_t d3d11_pre_target = 0u;
+  uint64_t d3d11_post_target = 0u;
+  uint64_t d3d11_pre_completed = 0u;
+  uint64_t d3d11_post_completed = 0u;
+  uint64_t d3d11_fence_generation = 0u;
+  uint64_t rr_runtime_generation = 0u;
+  uint64_t rr_session_generation = 0u;
+  uint64_t rr_bridge_generation = 0u;
+  uint64_t rr_source_generation = 0u;
+  uint64_t rr_signal_c_target = 0u;
+  uint64_t rr_completed_c = UINT64_MAX;
+  uint32_t frame = 0u;
+  uint32_t thread = 0u;
+  uint32_t rr_handle = UINT32_MAX;
+  uint32_t preset = 0u;
+  uint32_t rr_result = 0u;
+  uint32_t rr_exception = 0u;
+  uint32_t rr_hresult = 0u;
+  uint32_t rr_stage = 0u;
+  uint32_t rr_outcome = 0u;
+  uint32_t device_result = 0u;
+  int32_t preset_index = -1;
+  int32_t signal_a_result = 0;
+  int32_t signal_b_result = 0;
+  GpuEvidenceEvent event = GpuEvidenceEvent::Rt12Submit;
+  GpuEvidenceSource source = GpuEvidenceSource::None;
+  bool rt12_pending = false;
+  bool rt12_available = false;
+  bool a_available = false;
+  bool d3d12_wait_a_accepted = false;
+  bool d3d12_wait_prior_b_accepted = false;
+  bool d3d11_wait_b_accepted = false;
+  bool d3d11_fence_available = false;
+  bool rr_c_available = false;
+};
+
+struct GpuEvidenceRing {
+  std::shared_mutex mutex;
+  std::array<GpuEvidenceSnapshot, kGpuEvidenceCount> entries = {};
+  uint64_t next_sequence = 0u;
+};
+
+inline GpuEvidenceRing g_gpu_evidence;
+
+inline void RecordGpuWorkBreadcrumb(GpuWorkKind kind, uint32_t detail = 0u) {
+  if (!rr::RrDebugLogEnabled()) return;
+  const uint64_t sequence = g_gpu_work_breadcrumb_next.fetch_add(1u, std::memory_order_relaxed) + 1u;
+  GpuWorkBreadcrumbSlot& slot = g_gpu_work_breadcrumbs[(sequence - 1u) % kGpuWorkBreadcrumbCount];
+  slot.stamp.store((sequence << 1u) | 1u, std::memory_order_relaxed);
+  slot.frame.store(g_state.frame.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  slot.kind.store(static_cast<uint32_t>(kind), std::memory_order_relaxed);
+  slot.detail.store(detail, std::memory_order_relaxed);
+  LARGE_INTEGER timestamp = {};
+  QueryPerformanceCounter(&timestamp);
+  slot.qpc.store(static_cast<uint64_t>(timestamp.QuadPart), std::memory_order_relaxed);
+  slot.thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+  slot.stamp.store(sequence << 1u, std::memory_order_release);
+}
+
+inline void RecordGpuEvidence(GpuEvidenceSnapshot snapshot) {
+  if (!rr::RrDebugLogEnabled()) return;
+  snapshot.frame = g_state.frame.load(std::memory_order_relaxed);
+  snapshot.thread = GetCurrentThreadId();
+  LARGE_INTEGER timestamp = {};
+  QueryPerformanceCounter(&timestamp);
+  snapshot.qpc = static_cast<uint64_t>(timestamp.QuadPart);
+  std::unique_lock lock(g_gpu_evidence.mutex);
+  snapshot.sequence = ++g_gpu_evidence.next_sequence;
+  g_gpu_evidence.entries[(snapshot.sequence - 1u) % kGpuEvidenceCount] = snapshot;
+}
+
+inline const char* GpuEvidenceEventName(GpuEvidenceEvent event) {
+  switch (event) {
+    case GpuEvidenceEvent::RrBegin:        return "rr_begin";
+    case GpuEvidenceEvent::RrPhase:        return "rr_phase";
+    case GpuEvidenceEvent::RrEnd:          return "rr_end";
+    case GpuEvidenceEvent::RrFailure:      return "rr_failure";
+    case GpuEvidenceEvent::Rt12SignalA:    return "signal_a";
+    case GpuEvidenceEvent::Rt12SignalB:    return "signal_b";
+    case GpuEvidenceEvent::Rt12WaitA:      return "wait_a";
+    case GpuEvidenceEvent::Rt12WaitPriorB: return "wait_prior_b";
+    case GpuEvidenceEvent::Rt12WaitB:      return "wait_b";
+    case GpuEvidenceEvent::Rt12Submit:     return "rt12_submit";
+    case GpuEvidenceEvent::Rt12Stuck:      return "rt12_stuck";
+    case GpuEvidenceEvent::DeviceRemoved:  return "device_removed";
+  }
+  return "unknown";
+}
+
+inline const char* GpuEvidenceSourceName(GpuEvidenceSource source) {
+  switch (source) {
+    case GpuEvidenceSource::None:    return "none";
+    case GpuEvidenceSource::Present: return "present";
+    case GpuEvidenceSource::Rtao:    return "rtao";
+    case GpuEvidenceSource::Rtgi:    return "rtgi";
+    case GpuEvidenceSource::GcCheck: return "gc_check";
+    case GpuEvidenceSource::GcBuild: return "gc_build";
+    case GpuEvidenceSource::RrPre:   return "rr_pre";
+    case GpuEvidenceSource::RrPost:  return "rr_post";
+    case GpuEvidenceSource::RrD3D12: return "rr_d3d12";
+  }
+  return "unknown";
+}
+
+inline void DumpGpuEvidence() {
+  if (!rr::RrDebugLogEnabled()) return;
+  std::array<GpuEvidenceSnapshot, kGpuEvidenceCount> snapshot = {};
+  uint64_t sequence = 0u;
+  {
+    std::shared_lock lock(g_gpu_evidence.mutex);
+    snapshot = g_gpu_evidence.entries;
+    sequence = g_gpu_evidence.next_sequence;
+  }
+  const uint32_t count = static_cast<uint32_t>((std::min)(sequence, static_cast<uint64_t>(kGpuEvidenceCount)));
+  std::sort(snapshot.begin(), snapshot.begin() + count, [](const auto& a, const auto& b) {
+    return a.sequence < b.sequence;
+  });
+  for (uint32_t i = 0u; i < count; ++i) {
+    const GpuEvidenceSnapshot& entry = snapshot[i];
+    renodx::utils::log::e(
+        "[world-gpu] evidence seq=", entry.sequence, " qpc=", entry.qpc, " frame=", entry.frame, " tid=", entry.thread,
+        " event=", GpuEvidenceEventName(entry.event), " source=", GpuEvidenceSourceName(entry.source),
+        " rr_handle=", entry.rr_handle, " preset_index=", entry.preset_index, " preset=", entry.preset,
+        " rr_result=", renodx::utils::log::AsPtr(entry.rr_result), " exception=", renodx::utils::log::AsPtr(entry.rr_exception),
+        " d3d11_pre=", entry.d3d11_pre_target, "/", entry.d3d11_pre_completed,
+        " d3d11_post=", entry.d3d11_post_target, "/", entry.d3d11_post_completed,
+        " d3d11_fence_generation=", entry.d3d11_fence_generation, " d3d11_fence_available=", entry.d3d11_fence_available,
+        " rr_runtime=", entry.rr_runtime_generation, " rr_session=", entry.rr_session_generation,
+        " rr_bridge=", entry.rr_bridge_generation, " rr_source_generation=", entry.rr_source_generation,
+        " rr_stage=", entry.rr_stage, " rr_stage_name=",
+        rr::RrSubmitStageName(static_cast<rr::RrSubmitStage>(entry.rr_stage)), " rr_outcome=", entry.rr_outcome,
+        " rr_outcome_name=", rr::RrSubmitOutcomeName(static_cast<rr::RrSubmitOutcome>(entry.rr_outcome)),
+        " rr_hresult=", renodx::utils::log::AsPtr(entry.rr_hresult),
+        " rr_signal_c=", entry.rr_signal_c_target, " rr_completed_c=", entry.rr_completed_c,
+        " rr_c_available=", entry.rr_c_available,
+        " signal_a=", entry.signal_a_result, "/", entry.a_target, "/", entry.a_completed, "/", entry.a_available,
+        " signal_b=", entry.signal_b_result, "/", entry.b_target, "/", entry.b_completed,
+        " wait_a=", entry.d3d12_wait_a_accepted, "/", entry.d3d12_wait_a_target,
+        " wait_prior_b=", entry.d3d12_wait_prior_b_accepted, "/", entry.d3d12_wait_prior_b_target,
+        " wait_b=", entry.d3d11_wait_b_accepted, "/", entry.d3d11_wait_b_target,
+        " rt12_generation=", entry.rt12_generation, " submitted=", entry.rt12_submitted,
+        " completed=", entry.rt12_completed, " pending=", entry.rt12_pending, " available=", entry.rt12_available,
+        " progress_age_us=", entry.rt12_progress_age_us, " submission_age_us=", entry.rt12_submission_age_us,
+        " device_result=", renodx::utils::log::AsPtr(entry.device_result));
+  }
+}
+
+inline const char* GpuWorkKindName(uint32_t kind) {
+  switch (static_cast<GpuWorkKind>(kind)) {
+    case GpuWorkKind::P2b:        return "P2b";
+    case GpuWorkKind::Tlas:       return "TLAS";
+    case GpuWorkKind::Rtao:       return "RTAO";
+    case GpuWorkKind::Rtgi:       return "RTGI";
+    case GpuWorkKind::Rt12:       return "RT12";
+    case GpuWorkKind::GpuCapture: return "GPU-capture";
+    case GpuWorkKind::GcCheck:    return "GC-check";
+  }
+  return "unknown";
+}
+
+inline void DumpGpuWorkBreadcrumbs() {
+  if (!rr::RrDebugLogEnabled()) return;
+  std::array<GpuWorkBreadcrumbSnapshot, kGpuWorkBreadcrumbCount> snapshot = {};
+  uint32_t count = 0u;
+  for (const GpuWorkBreadcrumbSlot& slot : g_gpu_work_breadcrumbs) {
+    const uint64_t before = slot.stamp.load(std::memory_order_acquire);
+    if (before == 0u || (before & 1u) != 0u) continue;
+    GpuWorkBreadcrumbSnapshot item{};
+    item.sequence = before >> 1u;
+    item.frame = slot.frame.load(std::memory_order_relaxed);
+    item.kind = slot.kind.load(std::memory_order_relaxed);
+    item.detail = slot.detail.load(std::memory_order_relaxed);
+    item.qpc = slot.qpc.load(std::memory_order_relaxed);
+    item.thread = slot.thread.load(std::memory_order_relaxed);
+    if (slot.stamp.load(std::memory_order_acquire) == before) snapshot[count++] = item;
+  }
+  std::sort(snapshot.begin(), snapshot.begin() + count, [](const auto& a, const auto& b) {
+    return a.sequence < b.sequence;
+  });
+  for (uint32_t i = 0u; i < count; ++i) {
+    const GpuWorkBreadcrumbSnapshot& item = snapshot[i];
+    renodx::utils::log::e("[world-gpu] breadcrumb pid=", GetCurrentProcessId(), " seq=", item.sequence,
+                          " qpc=", item.qpc, " frame=", item.frame, " tid=", item.thread,
+                          " work=", GpuWorkKindName(item.kind), " detail=", item.detail);
+  }
+}
 
 inline thread_local bool t_crash_in_handler = false;
 
@@ -489,6 +748,27 @@ inline bool CrashLogEnabled() { return g_crash_log.enabled.load(std::memory_orde
 // Present hook (registered while the module is attached; idle unless on):
 // remembers the device for reports, logs a device removal once, and writes
 // a memory line every kCrashMemoryLogFrames presents.
+inline bool ReportDeviceRemoval(ID3D11Device* device, HRESULT reason) {
+  const bool rr_debug = rr::RrDebugLogEnabled();
+  if (!rr_debug && !CrashLogEnabled()) return false;
+  if (device == nullptr || SUCCEEDED(reason)) return false;
+  const uint64_t native = reinterpret_cast<uint64_t>(device);
+  if (g_crash_log.logged_removed_device.exchange(native, std::memory_order_relaxed) == native) return false;
+  renodx::utils::log::e("falcom_world::crash: device removed at frame=", g_state.frame.load(std::memory_order_relaxed),
+                        " hr=", renodx::utils::log::AsPtr(static_cast<uint32_t>(reason)),
+                        " reason=", CrashRemovedReasonName(reason));
+  if (rr_debug) {
+    GpuEvidenceSnapshot snapshot{};
+    snapshot.event = GpuEvidenceEvent::DeviceRemoved;
+    snapshot.device_result = static_cast<uint32_t>(reason);
+    RecordGpuEvidence(snapshot);
+    DumpGpuWorkBreadcrumbs();
+    DumpGpuEvidence();
+  }
+  return true;
+}
+
+// Present hook checks removal independently of verbose crash logging; memory sampling remains opt-in.
 inline void OnCrashLogPresent(
     reshade::api::command_queue* queue,
     reshade::api::swapchain* swapchain,
@@ -501,21 +781,18 @@ inline void OnCrashLogPresent(
   (void)dest_rect;
   (void)dirty_rect_count;
   (void)dirty_rects;
-  if (!CrashLogEnabled() || queue == nullptr) return;
+  if (queue == nullptr) return;
   reshade::api::device* device = queue->get_device();
   if (device == nullptr || device->get_api() != reshade::api::device_api::d3d11) return;
   const uint64_t native = device->get_native();
-  g_crash_log.native_device.store(native);
+  g_crash_log.native_device.store(native, std::memory_order_relaxed);
   if (native == 0u) return;
-
-  const HRESULT reason = reinterpret_cast<ID3D11Device*>(native)->GetDeviceRemovedReason();
-  if (reason != g_crash_log.logged_removed_reason.exchange(reason) && reason != S_OK) {
-    char line[160] = {};
-    std::snprintf(line, sizeof(line), "falcom_world::crash: device removed at frame %u: 0x%08lX %s",
-                  g_state.frame.load(), static_cast<unsigned long>(reason), CrashRemovedReasonName(reason));
-    renodx::utils::log::e(line);
+  auto* native_device = reinterpret_cast<ID3D11Device*>(native);
+  if ((rr::RrDebugLogEnabled() || CrashLogEnabled()) && g_crash_log.logged_removed_device.load(std::memory_order_relaxed) != native) {
+    ReportDeviceRemoval(native_device, native_device->GetDeviceRemovedReason());
   }
-  if ((g_crash_log.presents.fetch_add(1u) % kCrashMemoryLogFrames) == 0u) {
+  if (!CrashLogEnabled()) return;
+  if ((g_crash_log.presents.fetch_add(1u, std::memory_order_relaxed) % kCrashMemoryLogFrames) == 0u) {
     char memory[128] = {};
     FormatCrashMemory(memory, sizeof(memory));
     char line[192] = {};
@@ -523,5 +800,4 @@ inline void OnCrashLogPresent(
     renodx::utils::log::i(line);
   }
 }
-
 }  // namespace falcom_world

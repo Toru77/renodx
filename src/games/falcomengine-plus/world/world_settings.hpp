@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <functional>
+#include <string>
 
 #include <Windows.h>
 
@@ -16,6 +17,7 @@
 
 #include "world_state.hpp"
 #include "bvh/world_bvh.hpp"
+#include "rr/rr_interop.hpp"
 #include "rr/rr_state.hpp"
 #include "rtao/rtao.hpp"
 #include "rtao/rtao_panel.hpp"
@@ -324,7 +326,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 1.f,
       .label = "DLSS Ray Reconstruction",
       .section = "Ray Tracing",
-      .tooltip = "Replaces the game's DLSS Super Resolution with DLSS Ray Reconstruction (preset F) as the denoiser of the ray-traced effects. Needs an NVIDIA RTX GPU and DLSS selected in the game's graphics options; on other GPUs it stays off. The RT, GTVBAO and GTVBGI denoisers stay on in this build.",
+      .tooltip = "Runs DLSS Ray Reconstruction through a separate D3D12 NGX runtime and shared-resource bridge while the game remains on D3D11. The selected preset is shown below. Needs an NVIDIA RTX GPU and DLSS selected in the game's graphics options; game DLSS Super Resolution is used as the fallback when RR cannot submit an output.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return rr::g_rr_gpu_nvidia.load() == 1; },
       .is_visible = [visible]() { return rr::g_rr_perf_rows > 0.5f && visible(); },  // TEMP perf test (remove)
@@ -352,17 +354,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
-      .key = "RrProbeEnable",
-      .binding = &rr::g_rr_probe_enabled,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 0.f,
-      .label = "Ray Reconstruction create probe",
-      .section = "Ray Tracing",
-      .tooltip = "Diagnostic. Creates and releases one DLSS Ray Reconstruction feature per session, at the first DLSS evaluate, to test whether it can be created. Leave Off unless asked to test it.",
-      .labels = {"Off", "On"},
-      .is_visible = [visible]() { return rr::g_rr_perf_rows > 0.5f && visible(); },  // TEMP perf test (remove)
-  });
-  settings->push_back(new Setting{  // TEMP perf test (remove)
+      // TEMP perf test (remove)
       .key = "RrPerfPresent",
       .binding = &rr::g_rr_perf_present,
       .value_type = SettingValueType::BOOLEAN,
@@ -372,7 +364,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .labels = {"Off", "On"},
       .is_visible = visible,
   });
-  settings->push_back(new Setting{  // TEMP perf test (remove)
+  settings->push_back(new Setting{
+      // TEMP perf test (remove)
       .key = "RrPerfGuides",
       .binding = &rr::g_rr_perf_guides,
       .value_type = SettingValueType::BOOLEAN,
@@ -382,7 +375,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .labels = {"Off", "On"},
       .is_visible = visible,
   });
-  settings->push_back(new Setting{  // TEMP perf test (remove)
+  settings->push_back(new Setting{
+      // TEMP perf test (remove)
       .key = "RrPerfRows",
       .binding = &rr::g_rr_perf_rows,
       .value_type = SettingValueType::BOOLEAN,
@@ -402,14 +396,43 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         if (rr::g_rr_gpu_nvidia.load() == 0) {
           ImGui::TextDisabled("Ray Reconstruction needs an NVIDIA RTX GPU.");
         } else {
+          const int preset_index = std::clamp(static_cast<int>(rr::g_rr_preset_index), 0, 3);
+          ImGui::Text("Backend: D3D12 NGX (game API: D3D11)");
+          ImGui::Text("Preset: %s (%u)", rr::RrPresetName(preset_index), rr::kRrPresetValues[preset_index]);
           ImGui::Text("Ray Reconstruction: %s", rr::RrReasonName(rr::g_rr_reason.load()));
+          ImGui::Text("This attempt: %s", rr::g_rr_running.load() ? "RR output queued; game SR fallback inactive" : "using game SR fallback");
           ImGui::Text("Ray Reconstruction guides: %s", rr::GuideReasonName(rr::g_rr_guide_reason.load()));
+          const std::string bridge_status = rr::RrInteropStatusSnapshot();
+          ImGui::Text("RR input bridge: %s", bridge_status.c_str());
+          const uint32_t submit_stage = rr::g_rr_last_submit_stage.load();
+          if (submit_stage != static_cast<uint32_t>(rr::RrSubmitStage::None)) {
+            const auto submit_outcome = static_cast<rr::RrSubmitOutcome>(rr::g_rr_last_submit_outcome.load());
+            ImGui::Text("Last RR attempt: %s", rr::RrSubmitOutcomeName(submit_outcome));
+            ImGui::Text("Last RR stage: %s", rr::RrSubmitStageName(static_cast<rr::RrSubmitStage>(submit_stage)));
+            ImGui::Text("Last failure: HRESULT 0x%08X, NGX 0x%08X, exception 0x%08X",
+                        rr::g_rr_last_submit_hr.load(), rr::g_rr_last_submit_result.load(),
+                        rr::g_rr_last_submit_exception.load());
+          }
+          const uint64_t signal_a = rr::g_rr_last_signal_a.load();
+          const uint64_t signal_b = rr::g_rr_last_signal_b.load();
+          const uint64_t signal_c = rr::g_rr_last_signal_c.load();
+          const uint64_t completed_b = rr::g_rr_last_completed_b.load();
+          const uint64_t completed_c = rr::g_rr_last_completed_c.load();
+          ImGui::Text("Last handoff: A=%llu, B=%llu, C=%llu (%s)", static_cast<unsigned long long>(signal_a),
+                      static_cast<unsigned long long>(signal_b), static_cast<unsigned long long>(signal_c),
+                      rr::g_rr_last_output_queued.load() ? "output queued" : "output not queued");
+          const std::string completed_b_text = completed_b == UINT64_MAX ? "unavailable" : std::to_string(completed_b);
+          const std::string completed_c_text = completed_c == UINT64_MAX ? "unavailable" : std::to_string(completed_c);
+          ImGui::Text("Observed complete: B=%s, C=%s", completed_b_text.c_str(), completed_c_text.c_str());
           if (rr::g_rr_failed.load()) {
             ImGui::Text("NGX result 0x%08X, exception 0x%08X", rr::g_rr_failed_result.load(), rr::g_rr_failed_exception.load());
           }
+          if (rr::g_rr_d3d12_failure_hr.load() != 0u || rr::g_rr_d3d12_failure_result.load() != 0u) {
+            ImGui::Text("D3D12 setup code: HRESULT 0x%08X, NGX 0x%08X", rr::g_rr_d3d12_failure_hr.load(),
+                        rr::g_rr_d3d12_failure_result.load());
+          }
         }
-        return false;
-      },
+        return false; },
       .is_visible = []() { return rr::g_rr_perf_rows > 0.5f && g_state.supported && (rr::RrRequested() || rr::g_rr_gpu_nvidia.load() == 0); },  // TEMP perf test (remove)
   });
   // Ray Tracing tab row values ("What enters the BVH"). Hidden from the UI (drawn
