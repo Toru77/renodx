@@ -28,12 +28,13 @@
 #include "../../../../utils/data.hpp"
 #include "../../../../utils/log.hpp"
 #include "../../../../utils/scene.hpp"
-#include "bvh_build.hpp"
+#include "../debug/crash_log.hpp"
+#include "../rt12/rt12_mirror.hpp"
 #include "alpha_atlas.hpp"
+#include "bvh_build.hpp"
 #include "bvh_pool.hpp"
 #include "camera_fade.hpp"
 #include "gpu_timer.hpp"
-#include "../rt12/rt12_mirror.hpp"
 
 namespace falcom_world::bvh {
 
@@ -636,6 +637,13 @@ inline uint32_t ProbeBufferCreateHr(reshade::api::device* device, const reshade:
   if (desc.buffer.stride != 0u) {
     native_desc.MiscFlags |= D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
     native_desc.StructureByteStride = desc.buffer.stride;
+  }
+  if (rr::RrDebugLogEnabled()) {
+    const HRESULT removed = native->GetDeviceRemovedReason();
+    if (FAILED(removed)) {
+      ReportDeviceRemoval(native, removed);
+      return static_cast<uint32_t>(removed);
+    }
   }
   ID3D11Buffer* probe = nullptr;
   const HRESULT hr = native->CreateBuffer(&native_desc, nullptr, &probe);

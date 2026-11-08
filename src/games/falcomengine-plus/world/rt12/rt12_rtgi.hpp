@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../debug/crash_log.hpp"
+
 // RTGI on DXR (M2): the RTGI trace on the D3D12 side against pass A's scene (the TLAS, the instance table and the mirror
 // arenas of scene_slot), fed by three D3D11 pack passes (world_rt12_rtgi_pack, _pack_lights, _resolve) into shared
 // textures. Runs on the render thread, under the lock rule of rt12_backend.hpp.
@@ -241,7 +243,7 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
   // 4. This frame's slot: its previous submission must be complete (a timeout is stuck).
   const uint32_t k = r.next;
   Rt12Slot& slot = r.slots[k];
-  if (slot.fence_value > s.fence12->GetCompletedValue()) {
+  if (slot.fence_value > Rt12CompletedValue(s)) {
     const LARGE_INTEGER wait_start = QpcNow();
     const bool done = WaitRt12Fence(s, slot.fence_value, kRt12StuckMs);
     const float wait_ms = static_cast<float>(QpcMsSince(wait_start));
@@ -252,7 +254,7 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
     }
     if (!done) {
       s.stuck = true;
-      renodx::utils::log::w("[world-rt12] rtgi stuck: fence at ", s.fence12->GetCompletedValue(), ", slot submitted ", slot.fence_value);
+      renodx::utils::log::w("[world-rt12] rtgi stuck: fence at ", Rt12CompletedValue(s), ", slot submitted ", slot.fence_value);
       DisableMirror();
       return RtgiFallback(Rt12RtgiReason::Stuck);
     }
@@ -383,9 +385,11 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
     a = renodx::utils::gpu_fence::NO_SIGNAL;
   }
   if (a == renodx::utils::gpu_fence::NO_SIGNAL) {
+    RecordRt12SignalA(s, a, GpuEvidenceSource::Rtgi);
     FailSession(s, Rt12Reason::FenceError, "rtgi fence11 signal");
     return RtgiFallback(Rt12RtgiReason::SubmitFailed);
   }
+  RecordRt12SignalA(s, a, GpuEvidenceSource::Rtgi);
 
   // 7. D3D12 list: timestamp 0, the carrier copies, timestamp 1, the descriptors, the barriers, the trace, timestamp 2.
   ID3D12GraphicsCommandList4* list = r.list.Get();
@@ -621,8 +625,16 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
     FailSession(s, Rt12Reason::SubmitFailed, "rtgi order wait");
     return RtgiFallback(Rt12RtgiReason::SubmitFailed);
   }
+  RecordRt12WaitA(s, a, GpuEvidenceSource::Rtgi);
+  if (s.last_signal != 0u) {
+    RecordRt12WaitPriorB(s, s.last_signal, GpuEvidenceSource::Rtgi);
+  }
   ID3D12CommandList* lists[] = {list};
+  BeginRt12Submission(s);
   s.queue12->ExecuteCommandLists(1u, lists);
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12Submit, GpuEvidenceSource::Rtgi);
+  RecordGpuWorkBreadcrumb(GpuWorkKind::Rt12, static_cast<uint32_t>(k));
+  RecordGpuWorkBreadcrumb(GpuWorkKind::Rtgi, tw);
   uint64_t b = renodx::utils::gpu_fence::NO_SIGNAL;
   try {
     b = renodx::utils::gpu_fence::QueueSignal(s.queue12.Get(), s.fence12.get());
@@ -630,13 +642,15 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
     b = renodx::utils::gpu_fence::NO_SIGNAL;
   }
   if (b == renodx::utils::gpu_fence::NO_SIGNAL) {
+    s.sync_evidence.signal_b_result = E_FAIL;
+    RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::Rtgi);
     FailSession(s, Rt12Reason::SubmitFailed, "rtgi signal");
     return RtgiFallback(Rt12RtgiReason::SubmitFailed);
   }
   slot.fence_value = b;
   for (size_t i = retired_begin; i < s.retired.size(); ++i) s.retired[i].fence_value = b;
-  s.last_signal = b;
-  s.last_signal_qpc = QpcNow();
+  NoteRt12Signal(s, b);
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::Rtgi);
   slot.timestamps = true;
   r.next = (k + 1u) % kRt12Slots;
 
@@ -652,6 +666,7 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
     FailSession(s, Rt12Reason::SubmitFailed, "rtgi d3d11 wait on fence B");
     return RtgiFallback(Rt12RtgiReason::SubmitFailed);
   }
+  RecordRt12WaitB(s, b, GpuEvidenceSource::Rtgi);
 
   // 10. D3D11 copy back (raw, the debug texture when set, the ReSTIR sample textures when on), then the stats resolve into the RTGI stats buffer.
   s.ctx11->CopyResource(reinterpret_cast<ID3D11Resource*>(in.raw_texture.handle),  // NOLINT(performance-no-int-to-ptr)

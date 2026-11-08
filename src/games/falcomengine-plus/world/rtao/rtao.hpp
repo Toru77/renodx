@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../debug/crash_log.hpp"
+
 // RTAO dispatch: pass A (world_rtao.cs_5_0.hlsl, the trace) writes the trace-size raw AO. The SVGF chain that denoises it and
 // upsamples it to full size is in rtao_svgf.hpp. Called inline from the lighting hook (addon.cpp RunRtaoInline), which owns
 // the guards. No module mutex is held around any graphics call here.
@@ -200,6 +202,7 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     cmd_list->push_constants(
         reshade::api::shader_stage::all_compute, data.layout, 3, 0, kRtaoPushConstantCount, &push);
     cmd_list->dispatch((trace_w + 7u) / 8u, (trace_h + 7u) / 8u, 1u);
+    RecordGpuWorkBreadcrumb(GpuWorkKind::Rtao, trace_w);
     NullComputeSlots(cmd_list, kRtaoSrvCount, kRtaoUavCount, 0u);
   }
   cmd_list->barrier(data.trace_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);

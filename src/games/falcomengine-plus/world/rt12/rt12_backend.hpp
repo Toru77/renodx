@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../debug/crash_log.hpp"
+
 // M3 DXR backend: RTAO pass A on a side D3D12 device (DXR 1.1 inline ray queries) against a D3D12 mirror of the live BVH
 // store. Included by rtao.hpp (outside the harness), so everything here runs on the render thread (single-threaded
 // D3D11). Lock rule: no graphics call while a module mutex is held. Sync is renodx::utils::gpu_fence only; no CPU wait
@@ -158,6 +160,22 @@ struct Rt12Retired {
   Microsoft::WRL::ComPtr<IUnknown> object;
 };
 
+struct Rt12SyncEvidence {
+  uint64_t a_target = 0u;
+  uint64_t a_completed = 0u;
+  bool a_available = false;
+  uint64_t d3d12_wait_a_target = 0u;
+  uint64_t b_target = 0u;
+  uint64_t b_completed = 0u;
+  uint64_t d3d11_wait_b_target = 0u;
+  uint64_t d3d12_wait_prior_b_target = 0u;
+  int32_t signal_a_result = S_OK;
+  int32_t signal_b_result = S_OK;
+  bool d3d11_wait_b_accepted = false;
+  bool d3d12_wait_a_accepted = false;
+  bool d3d12_wait_prior_b_accepted = false;
+};
+
 // RTGI on DXR (B): its own slots, list, PSO, heaps, timestamps and textures. The scene (TLAS, instance table) is pass A's.
 struct Rt12RtgiState {
   bool created = false;
@@ -176,6 +194,7 @@ struct Rt12RtgiState {
 };
 
 struct Rt12State {
+  uint64_t generation = 0u;
   reshade::api::device* device = nullptr;  // the D3D11 device this state belongs to
   Microsoft::WRL::ComPtr<ID3D11Device> device11;
   Microsoft::WRL::ComPtr<ID3D11Device1> device11_1;
@@ -193,7 +212,13 @@ struct Rt12State {
   int32_t scene_slot = -1;  // lighting slot whose TLAS and instance table are current (-1 none)
   uint64_t scene_key_version = ~0ull, scene_key_blas = ~0ull;  // tlas_cpu_version and blas_generation of that TLAS
   uint64_t last_signal = 0u;
-  LARGE_INTEGER last_signal_qpc = {};
+  LARGE_INTEGER last_signal_qpc = {};  // time of the most recent accepted D3D12 signal
+  uint64_t completion_value = 0u;
+  LARGE_INTEGER completion_progress_qpc = {};
+  LARGE_INTEGER completion_pending_qpc = {};
+  bool completion_available = true;
+  bool completion_pending = false;
+  Rt12SyncEvidence sync_evidence;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;      // shader visible, kRt12Slots * kRt12Descriptors
@@ -245,6 +270,7 @@ struct Rt12State {
 };
 
 inline std::atomic<bool> g_rt12_enabled{true};  // the panel switch (session only, not saved)
+inline std::atomic_uint64_t g_rt12_generation{0u};
 inline std::unique_ptr<Rt12State> g_rt12;        // one D3D11 device in this game
 
 struct Rt12Panel {  // copied under g_rt12_panel_mutex for the panel and the JSON; written on the render thread
@@ -350,6 +376,146 @@ inline double QpcMsSince(const LARGE_INTEGER& from) {
   }();
   const LARGE_INTEGER now = QpcNow();
   return static_cast<double>(now.QuadPart - from.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart);
+}
+
+inline void ObserveRt12Completion(Rt12State& s) {
+  if (!s.fence12) {
+    s.completion_available = false;
+    return;
+  }
+  const uint64_t completed = s.fence12->GetCompletedValue();
+  if (completed == UINT64_MAX) {
+    s.completion_available = false;
+    if (rr::RrDebugLogEnabled()) s.sync_evidence.b_completed = UINT64_MAX;
+    return;
+  }
+  s.completion_available = true;
+  if (rr::RrDebugLogEnabled()) s.sync_evidence.b_completed = completed;
+  if (completed > s.completion_value) {
+    s.completion_value = completed;
+    s.completion_progress_qpc = QpcNow();
+  }
+  if (s.last_signal == 0u || completed >= s.last_signal) {
+    s.completion_pending = false;
+    s.completion_pending_qpc = {};
+  } else if (!s.completion_pending) {
+    s.completion_pending = true;
+    s.completion_pending_qpc = s.last_signal_qpc;
+    if (s.completion_pending_qpc.QuadPart == 0) s.completion_pending_qpc = QpcNow();
+    if (s.completion_progress_qpc.QuadPart == 0) s.completion_progress_qpc = s.completion_pending_qpc;
+  }
+}
+
+inline uint64_t Rt12CompletedValue(Rt12State& s) {
+  ObserveRt12Completion(s);
+  return s.completion_value;
+}
+
+inline double Rt12ProgressAgeMs(const Rt12State& s) {
+  return s.completion_progress_qpc.QuadPart != 0 ? QpcMsSince(s.completion_progress_qpc) : 0.0;
+}
+
+inline double Rt12SubmissionAgeMs(const Rt12State& s) {
+  return s.last_signal_qpc.QuadPart != 0 ? QpcMsSince(s.last_signal_qpc) : 0.0;
+}
+
+inline GpuEvidenceSnapshot Rt12EvidenceSnapshot(
+    Rt12State& s,
+    GpuEvidenceEvent event,
+    GpuEvidenceSource source) {
+  ObserveRt12Completion(s);
+  GpuEvidenceSnapshot snapshot{};
+  snapshot.event = event;
+  snapshot.source = source;
+  snapshot.rt12_generation = s.generation;
+  snapshot.rt12_submitted = s.last_signal;
+  snapshot.rt12_completed = s.completion_value;
+  snapshot.rt12_pending = s.completion_pending;
+  snapshot.rt12_available = s.completion_available;
+  snapshot.rt12_progress_age_us = s.completion_available && s.completion_pending
+                                      ? static_cast<uint64_t>(Rt12ProgressAgeMs(s) * 1000.0)
+                                      : 0u;
+  snapshot.rt12_submission_age_us = s.last_signal_qpc.QuadPart != 0
+                                        ? static_cast<uint64_t>(Rt12SubmissionAgeMs(s) * 1000.0)
+                                        : 0u;
+  snapshot.a_target = s.sync_evidence.a_target;
+  snapshot.a_completed = s.sync_evidence.a_completed;
+  snapshot.a_available = s.sync_evidence.a_available;
+  snapshot.b_target = s.sync_evidence.b_target;
+  snapshot.b_completed = s.completion_available ? s.completion_value : UINT64_MAX;
+  snapshot.d3d11_wait_b_target = s.sync_evidence.d3d11_wait_b_target;
+  snapshot.d3d12_wait_a_target = s.sync_evidence.d3d12_wait_a_target;
+  snapshot.d3d12_wait_prior_b_target = s.sync_evidence.d3d12_wait_prior_b_target;
+  snapshot.signal_a_result = s.sync_evidence.signal_a_result;
+  snapshot.signal_b_result = s.sync_evidence.signal_b_result;
+  snapshot.d3d11_wait_b_accepted = s.sync_evidence.d3d11_wait_b_accepted;
+  snapshot.d3d12_wait_a_accepted = s.sync_evidence.d3d12_wait_a_accepted;
+  snapshot.d3d12_wait_prior_b_accepted = s.sync_evidence.d3d12_wait_prior_b_accepted;
+  return snapshot;
+}
+
+inline void RecordRt12Evidence(Rt12State& s, GpuEvidenceEvent event, GpuEvidenceSource source) {
+  if (!rr::RrDebugLogEnabled()) return;
+  RecordGpuEvidence(Rt12EvidenceSnapshot(s, event, source));
+}
+
+inline void RecordRt12SignalA(Rt12State& s, uint64_t value, GpuEvidenceSource source) {
+  if (!rr::RrDebugLogEnabled()) return;
+  s.sync_evidence.a_target = value;
+  s.sync_evidence.signal_a_result = value != renodx::utils::gpu_fence::NO_SIGNAL ? S_OK : E_FAIL;
+  s.sync_evidence.a_completed = UINT64_MAX;
+  s.sync_evidence.a_available = false;
+  try {
+    if (s.fence11 != nullptr) {
+      const uint64_t completed = s.fence11->GetCompletedValue();
+      if (completed != UINT64_MAX) {
+        s.sync_evidence.a_completed = completed;
+        s.sync_evidence.a_available = true;
+      }
+    }
+  } catch (const std::exception&) {
+    s.sync_evidence.a_completed = 0u;
+  }
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalA, source);
+}
+
+inline void RecordRt12WaitB(Rt12State& s, uint64_t value, GpuEvidenceSource source) {
+  if (!rr::RrDebugLogEnabled()) return;
+  s.sync_evidence.d3d11_wait_b_target = value;
+  s.sync_evidence.d3d11_wait_b_accepted = true;
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12WaitB, source);
+}
+
+inline void RecordRt12WaitA(Rt12State& s, uint64_t value, GpuEvidenceSource source) {
+  if (!rr::RrDebugLogEnabled()) return;
+  s.sync_evidence.d3d12_wait_a_target = value;
+  s.sync_evidence.d3d12_wait_a_accepted = true;
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12WaitA, source);
+}
+
+inline void RecordRt12WaitPriorB(Rt12State& s, uint64_t value, GpuEvidenceSource source) {
+  if (!rr::RrDebugLogEnabled()) return;
+  s.sync_evidence.d3d12_wait_prior_b_target = value;
+  s.sync_evidence.d3d12_wait_prior_b_accepted = true;
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12WaitPriorB, source);
+}
+
+inline void BeginRt12Submission(Rt12State& s) { ObserveRt12Completion(s); }
+
+inline void NoteRt12Signal(Rt12State& s, uint64_t value) {
+  const LARGE_INTEGER signal_time = QpcNow();
+  if (!s.completion_pending) {
+    s.completion_pending = true;
+    s.completion_pending_qpc = signal_time;
+    s.completion_progress_qpc = signal_time;
+  }
+  s.last_signal = value;
+  s.last_signal_qpc = signal_time;
+  ObserveRt12Completion(s);
+  if (rr::RrDebugLogEnabled()) {
+    s.sync_evidence.b_target = value;
+    s.sync_evidence.signal_b_result = S_OK;
+  }
 }
 
 inline float TicksToMs(uint64_t ticks, uint64_t frequency) {
@@ -550,10 +716,10 @@ inline void DestroyRt12Pipelines(reshade::api::device* device, Rt12State& s) {
 // Waits, bounded by ms, until the D3D12 fence reaches value. False on timeout.
 inline bool WaitRt12Fence(Rt12State& s, uint64_t value, uint32_t ms) {
   const LARGE_INTEGER start = QpcNow();
-  while (s.fence12->GetCompletedValue() < value && QpcMsSince(start) < static_cast<double>(ms)) {
+  while (Rt12CompletedValue(s) < value && s.completion_available && QpcMsSince(start) < static_cast<double>(ms)) {
     Sleep(1);
   }
-  return s.fence12->GetCompletedValue() >= value;
+  return Rt12CompletedValue(s) >= value && s.completion_available;
 }
 
 // Stops the DXR path. A stuck scene is leaked on purpose (the GPU may still touch it).
@@ -608,6 +774,7 @@ inline bool CreateRt12(reshade::api::device* device) {
   }
   g_rt12 = std::make_unique<Rt12State>();
   Rt12State& s = *g_rt12;
+  s.generation = g_rt12_generation.fetch_add(1u, std::memory_order_relaxed) + 1u;
   s.device = device;
   const auto fail = [&](Rt12Reason reason, const char* stage, HRESULT hr) {
     s.failed = true;
@@ -1148,9 +1315,13 @@ inline bool SubmitPresent(Rt12State& s, const bvh::BvhDeviceData* data, const st
       FailSession(s, Rt12Reason::SubmitFailed, "present order wait");
       return false;
     }
+    RecordRt12WaitPriorB(s, s.last_signal, GpuEvidenceSource::Present);
   }
   ID3D12CommandList* lists[] = {list};
+  BeginRt12Submission(s);
   s.queue12->ExecuteCommandLists(1u, lists);
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12Submit, GpuEvidenceSource::Present);
+  RecordGpuWorkBreadcrumb(GpuWorkKind::Rt12, static_cast<uint32_t>(k));
   uint64_t value = renodx::utils::gpu_fence::NO_SIGNAL;
   try {
     value = renodx::utils::gpu_fence::QueueSignal(s.queue12.Get(), s.fence12.get());
@@ -1158,12 +1329,14 @@ inline bool SubmitPresent(Rt12State& s, const bvh::BvhDeviceData* data, const st
     value = renodx::utils::gpu_fence::NO_SIGNAL;
   }
   if (value == renodx::utils::gpu_fence::NO_SIGNAL) {
+    s.sync_evidence.signal_b_result = E_FAIL;
+    RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::Present);
     FailSession(s, Rt12Reason::SubmitFailed, "present signal");
     return false;
   }
   p.fence_value = value;
-  s.last_signal = value;
-  s.last_signal_qpc = QpcNow();
+  NoteRt12Signal(s, value);
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::Present);
   for (size_t i = retired_begin; i < s.retired.size(); ++i) s.retired[i].fence_value = value;
   s.present_next = (k + 1u) % kRt12Slots;
   UpdatePanel([](Rt12Panel& panel) { panel.present_submits += 1u; });
@@ -1186,13 +1359,23 @@ inline void OnPresent(reshade::api::device* device) {
   if (s.failed || s.stuck) return;
 
   // 2. Stuck detection: no fence progress for kRt12StuckMs with work pending.
-  const uint64_t completed = s.fence12->GetCompletedValue();
-  if (completed < s.last_signal && QpcMsSince(s.last_signal_qpc) > static_cast<double>(kRt12StuckMs)) {
-    s.stuck = true;
-    renodx::utils::log::w("[world-rt12] stuck: fence at ", completed, ", submitted ", s.last_signal);
-    UpdatePanel([](Rt12Panel& p) { p.stuck = true; });
-    DisableMirror();
-    return;
+  ObserveRt12Completion(s);
+  const uint64_t completed = s.completion_value;
+  if (s.completion_available && s.completion_pending) {
+    const double progress_age_ms = Rt12ProgressAgeMs(s);
+    if (progress_age_ms > static_cast<double>(kRt12StuckMs)) {
+      const double submission_age_ms = Rt12SubmissionAgeMs(s);
+      s.stuck = true;
+      if (rr::RrDebugLogEnabled()) {
+        RecordRt12Evidence(s, GpuEvidenceEvent::Rt12Stuck, GpuEvidenceSource::Present);
+        DumpGpuEvidence();
+      }
+      renodx::utils::log::w("[world-rt12] stuck: submitted ", s.last_signal, ", completed ", completed,
+                            ", progress_ms=", progress_age_ms, ", submission_ms=", submission_age_ms);
+      UpdatePanel([](Rt12Panel& p) { p.stuck = true; });
+      DisableMirror();
+      return;
+    }
   }
 
   // 2b. G4 (D2): the mirror is dropped while the GPU-cache scene traces, and re-streamed when it stops.
@@ -1458,7 +1641,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     return RtFallback(Rt12Reason::AlphaMirror);
   }
   // 7. The lighting slot must be free.
-  const uint64_t completed = s.fence12->GetCompletedValue();
+  const uint64_t completed = Rt12CompletedValue(s);
   const uint32_t k = s.lighting_next;
   Rt12Slot& L = s.lighting_slots[k];
   if (L.fence_value > completed) {
@@ -1660,9 +1843,11 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     a = renodx::utils::gpu_fence::NO_SIGNAL;
   }
   if (a == renodx::utils::gpu_fence::NO_SIGNAL) {
+    RecordRt12SignalA(s, a, GpuEvidenceSource::Rtao);
     FailSession(s, Rt12Reason::FenceError, "fence11 signal");
     return RtFallback(Rt12Reason::FenceError);
   }
+  RecordRt12SignalA(s, a, GpuEvidenceSource::Rtao);
 
   const auto record_start = bvh::PerfNow();
   // 13. Lighting submission. 13.1: recording starts; the slot is free (busy rule); timestamp.
@@ -2237,8 +2422,18 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     FailSession(s, Rt12Reason::SubmitFailed, "lighting order wait");
     return RtFallback(Rt12Reason::SubmitFailed);
   }
+  RecordRt12WaitA(s, a, GpuEvidenceSource::Rtao);
+  if (s.last_signal != 0u) {
+    RecordRt12WaitPriorB(s, s.last_signal, GpuEvidenceSource::Rtao);
+  }
   ID3D12CommandList* lists[] = {list};
+  BeginRt12Submission(s);
   s.queue12->ExecuteCommandLists(1u, lists);
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12Submit, GpuEvidenceSource::Rtao);
+  RecordGpuWorkBreadcrumb(GpuWorkKind::Rt12, static_cast<uint32_t>(k));
+  if (records > 0u) RecordGpuWorkBreadcrumb(GpuWorkKind::P2b, records);
+  if (rebuild) RecordGpuWorkBreadcrumb(GpuWorkKind::Tlas, static_cast<uint32_t>(desc_count));
+  RecordGpuWorkBreadcrumb(GpuWorkKind::Rtao, trace_w);
   uint64_t b = renodx::utils::gpu_fence::NO_SIGNAL;
   try {
     b = renodx::utils::gpu_fence::QueueSignal(s.queue12.Get(), s.fence12.get());
@@ -2246,6 +2441,8 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     b = renodx::utils::gpu_fence::NO_SIGNAL;
   }
   if (b == renodx::utils::gpu_fence::NO_SIGNAL) {
+    s.sync_evidence.signal_b_result = E_FAIL;
+    RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::Rtao);
     FailSession(s, Rt12Reason::SubmitFailed, "lighting signal");
     return RtFallback(Rt12Reason::SubmitFailed);
   }
@@ -2254,8 +2451,8 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
   // 13.9 Bookkeeping.
   L.fence_value = b;
   for (size_t i = retired_begin; i < s.retired.size(); ++i) s.retired[i].fence_value = b;
-  s.last_signal = b;
-  s.last_signal_qpc = QpcNow();
+  NoteRt12Signal(s, b);
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::Rtao);
   L.dynamic_timed = !characters.empty();
   L.records_timed = records > 0u;
   if (rebuild) {
@@ -2309,6 +2506,7 @@ inline bool RunRtaoPassA(reshade::api::device* device, reshade::api::command_lis
     FailSession(s, Rt12Reason::SubmitFailed, "d3d11 wait on fence B");
     return RtFallback(Rt12Reason::SubmitFailed);
   }
+  RecordRt12WaitB(s, b, GpuEvidenceSource::Rtao);
 
   const auto resolve_start = bvh::PerfNow();
   // 15. D3D11 resolve: the shared outputs into pass A's own targets (u0 AO or u2 raw, u1 stats).

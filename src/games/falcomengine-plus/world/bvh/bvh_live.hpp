@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../debug/crash_log.hpp"
+
 // Live world BVH.
 //
 // Keeps the GPU BVH in step with the pool while the game runs, on the present
@@ -2412,6 +2414,7 @@ inline void ExpandLiveDynamic(reshade::api::device* device, reshade::api::comman
   constants[3] = kPoolMaxPosition;
   cmd_list->push_constants(DS::all_compute, dynamic.layout, 2, 0, 4, constants);
   cmd_list->dispatch(draw_count, 1u, 1u);
+  RecordGpuWorkBreadcrumb(GpuWorkKind::P2b, records);
   // Unbind the records' UAV: the trace binds them as SRV t17.
   const reshade::api::resource_view null_uav = {0u};
   const reshade::api::descriptor_table_update unbind = {dynamic.uav_table, 0, 0, 1, DT::unordered_access_view, &null_uav};

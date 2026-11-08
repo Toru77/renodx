@@ -661,7 +661,9 @@ inline void RunRt12Probe(reshade::api::device* device, uint32_t frame) {
       ComPtr<IDXGIResource1> resource;
       ComPtr<ID3D12Resource> buffer12;
       HANDLE handle = nullptr;
-      HRESULT step = native11->CreateBuffer(&desc11, nullptr, &buffer11);
+      const HRESULT removed = rr::RrDebugLogEnabled() ? native11->GetDeviceRemovedReason() : S_OK;
+      if (FAILED(removed)) ReportDeviceRemoval(native11, removed);
+      HRESULT step = FAILED(removed) ? removed : native11->CreateBuffer(&desc11, nullptr, &buffer11);
       note_step(variant, variant.name + " CreateBuffer", step);
       if (SUCCEEDED(step)) {
         step = buffer11.As(&resource);

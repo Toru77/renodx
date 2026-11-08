@@ -5,6 +5,8 @@
 // G3 adds the GPU instance set (step 7b) and the on-request instance compare (validation only, not traced).
 #pragma once
 
+#include "../debug/crash_log.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -503,7 +505,7 @@ inline bool CreateGc(reshade::api::device* device, Rt12State& s, Rt12GcState& gc
 // pool mesh of the same key, bitwise per triangle. The wait is bounded by kRt12TeardownMs.
 inline void RunGcCheck(Rt12State& s, Rt12GcState& gc) {
   using Microsoft::WRL::ComPtr;
-  const uint64_t completed = s.fence12->GetCompletedValue();
+  const uint64_t completed = Rt12CompletedValue(s);
   const uint32_t k = gc.gc_next;
   if (gc.slots[k].fence_value > completed) {
     g_gc_check_requested.store(true, std::memory_order_relaxed);  // no free slot: retry at the next present
@@ -613,9 +615,13 @@ inline void RunGcCheck(Rt12State& s, Rt12GcState& gc) {
       FailSession(s, Rt12Reason::SubmitFailed, "gc check order wait");
       return;
     }
+    RecordRt12WaitPriorB(s, s.last_signal, GpuEvidenceSource::GcCheck);
   }
   ID3D12CommandList* lists[] = {gc.list.Get()};
+  BeginRt12Submission(s);
   s.queue12->ExecuteCommandLists(1u, lists);
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12Submit, GpuEvidenceSource::GcCheck);
+  RecordGpuWorkBreadcrumb(GpuWorkKind::GcCheck, k);
   uint64_t value = renodx::utils::gpu_fence::NO_SIGNAL;
   try {
     value = renodx::utils::gpu_fence::QueueSignal(s.queue12.Get(), s.fence12.get());
@@ -623,18 +629,20 @@ inline void RunGcCheck(Rt12State& s, Rt12GcState& gc) {
     value = renodx::utils::gpu_fence::NO_SIGNAL;
   }
   if (value == renodx::utils::gpu_fence::NO_SIGNAL) {
+    s.sync_evidence.signal_b_result = E_FAIL;
+    RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::GcCheck);
     FailSession(s, Rt12Reason::SubmitFailed, "gc check signal");
     return;
   }
   slot.fence_value = value;
   gc.gc_next = (k + 1u) % kRt12Slots;
-  s.last_signal = value;
-  s.last_signal_qpc = QpcNow();
+  NoteRt12Signal(s, value);
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::GcCheck);
 
   const LARGE_INTEGER start = QpcNow();
-  while (s.fence12->GetCompletedValue() < value && QpcMsSince(start) < static_cast<double>(kRt12TeardownMs)) Sleep(1);
+  const bool check_completed = WaitRt12Fence(s, value, kRt12TeardownMs);
   result.wait_ms = QpcMsSince(start);
-  if (s.fence12->GetCompletedValue() < value) {
+  if (!check_completed) {
     result.timeouts = 1u;
     gc.check = result;
     RetireObject(s, value, readback);  // not read: the GPU may still write it
@@ -1222,7 +1230,7 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
   }
 
   // 2. Completed work: the build timestamps of the finished GC slots, and the D3D11 decode time (read in Begin below).
-  const uint64_t completed = s.fence12->GetCompletedValue();
+  const uint64_t completed = Rt12CompletedValue(s);
   for (uint32_t k = 0u; k < kRt12Slots; ++k) {
     if (!gc.timed[k] || gc.slots[k].fence_value > completed) continue;
     gc.timed[k] = false;
@@ -1694,9 +1702,11 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
       signal_a = renodx::utils::gpu_fence::NO_SIGNAL;
     }
     if (signal_a == renodx::utils::gpu_fence::NO_SIGNAL) {
+      RecordRt12SignalA(s, signal_a, GpuEvidenceSource::GcBuild);
       FailGc(gc, "fence11 signal", E_FAIL);
       return;
     }
+    RecordRt12SignalA(s, signal_a, GpuEvidenceSource::GcBuild);
   }
 
   // 9. Record the GC submission: placement of the decoded meshes, arena growth (SubmitPresent 9.3), the carrier copies
@@ -1957,6 +1967,7 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
         FailGc(gc, "fence11 wait", E_FAIL);
         return;
       }
+      RecordRt12WaitA(s, signal_a, GpuEvidenceSource::GcBuild);
     }
     if (s.last_signal != 0u) {
       bool ordered = false;
@@ -1969,9 +1980,13 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
         FailGc(gc, "gc order wait", E_FAIL);
         return;
       }
+      RecordRt12WaitPriorB(s, s.last_signal, GpuEvidenceSource::GcBuild);
     }
     ID3D12CommandList* lists[] = {gc.list.Get()};
+    BeginRt12Submission(s);
     s.queue12->ExecuteCommandLists(1u, lists);
+    RecordRt12Evidence(s, GpuEvidenceEvent::Rt12Submit, GpuEvidenceSource::GcBuild);
+    RecordGpuWorkBreadcrumb(GpuWorkKind::GpuCapture, k);
     uint64_t value = renodx::utils::gpu_fence::NO_SIGNAL;
     try {
       value = renodx::utils::gpu_fence::QueueSignal(s.queue12.Get(), s.fence12.get());
@@ -1979,6 +1994,8 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
       value = renodx::utils::gpu_fence::NO_SIGNAL;
     }
     if (value == renodx::utils::gpu_fence::NO_SIGNAL) {
+      s.sync_evidence.signal_b_result = E_FAIL;
+      RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::GcBuild);
       FailSession(s, Rt12Reason::SubmitFailed, "gc signal");
       return;
     }
@@ -1989,8 +2006,8 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
     }
     gc.gc_next = (k + 1u) % kRt12Slots;
     for (size_t i = retired_begin; i < s.retired.size(); ++i) s.retired[i].fence_value = value;
-    s.last_signal = value;
-    s.last_signal_qpc = QpcNow();
+    NoteRt12Signal(s, value);
+    RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::GcBuild);
     for (BlasBuild& build : builds) {
       Rt12GcMesh& mesh = gc.meshes.at(build.key);
       mesh.blas = build.result;
