@@ -195,7 +195,7 @@ inline bool EnsureNrdPrepPipeline(Rt12State& state) {
 #if defined(__world_rtxdi_nrd_prep_EMBED_FILE)
   D3D12_DESCRIPTOR_RANGE ranges[2] = {};
   ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  ranges[0].NumDescriptors = 8u;
+  ranges[0].NumDescriptors = 10u;
   ranges[0].BaseShaderRegister = 0u;
   ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
   ranges[1].NumDescriptors = 5u;
@@ -290,7 +290,7 @@ inline bool EnsureNrdDispatchResources(Rt12State& state, Rt12NrdSlot* slot, uint
     heap_desc.NumDescriptors = dispatch_count * descriptor_stride;
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(state.device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&slot->dispatch_descriptors)))) return false;
-    heap_desc.NumDescriptors = 13u;
+    heap_desc.NumDescriptors = 15u;
     if (FAILED(state.device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&slot->prep_descriptors)))) return false;
     const uint64_t constant_stride = (instance->constantBufferMaxDataSize + 255u) & ~uint64_t{255u};
     if (constant_stride == 0u || constant_stride > UINT64_MAX / dispatch_count
@@ -364,9 +364,11 @@ inline bool EnsureNrdDispatchResources(Rt12State& state, Rt12NrdSlot* slot, uint
   return true;
 }
 
+#if defined(FALCOM_NRD_ENABLED)
 inline bool RecordNrdDiffusePrep(Rt12State& state, Rt12DiTransferSlot& slot, const Rt12DiInputViews& input,
                                  uint32_t correction_index, bool history_valid) {
-  if (!EnsureNrdPrepPipeline(state) || !slot.nrd.prep_descriptors || !slot.depth.texture12
+  if (!EnsureNrdPrepPipeline(state) || !slot.nrd.prep_descriptors || !slot.nrd.hit_distance || !slot.nrd.hit_validity
+      || !slot.depth.texture12
       || !slot.normal.texture12 || !slot.scene.texture12 || !slot.motion.texture12 || !slot.mrt2.texture12
       || !slot.deferred_buffer || !slot.n1_diffuse.texture12 || !slot.n1_status.texture12) return false;
   auto& transfer = state.di_transfer;
@@ -376,24 +378,33 @@ inline bool RecordNrdDiffusePrep(Rt12State& state, Rt12DiTransferSlot& slot, con
   const uint32_t descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   const D3D12_CPU_DESCRIPTOR_HANDLE cpu = nrd_slot.prep_descriptors->GetCPUDescriptorHandleForHeapStart();
   const D3D12_GPU_DESCRIPTOR_HANDLE gpu = nrd_slot.prep_descriptors->GetGPUDescriptorHandleForHeapStart();
-  const std::array<ID3D12Resource*, 8u> srvs = {slot.depth.texture12.Get(), slot.normal.texture12.Get(), slot.scene.texture12.Get(),
-                                                slot.motion.texture12.Get(), slot.mrt2.texture12.Get(), slot.deferred_buffer.Get(),
-                                                slot.n1_diffuse.texture12.Get(), slot.n1_status.texture12.Get()};
-  const std::array<DXGI_FORMAT, 8u> srv_formats = {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32B32A32_UINT,
-                                                   DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT,
-                                                   DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_UNKNOWN,
-                                                   DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_UINT};
-  std::array<D3D12_RESOURCE_BARRIER, 16u> barriers = {};
+  const std::array<ID3D12Resource*, 10u> srvs = {slot.depth.texture12.Get(), slot.normal.texture12.Get(), slot.scene.texture12.Get(),
+                                                 slot.motion.texture12.Get(), slot.mrt2.texture12.Get(), slot.deferred_buffer.Get(),
+                                                 slot.n1_diffuse.texture12.Get(), slot.n1_status.texture12.Get(),
+                                                 slot.nrd.hit_distance.Get(), slot.nrd.hit_validity.Get()};
+  const std::array<DXGI_FORMAT, 10u> srv_formats = {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32B32A32_UINT,
+                                                    DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                                    DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_UNKNOWN,
+                                                    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_UINT,
+                                                    DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+  std::array<D3D12_RESOURCE_BARRIER, 18u> barriers = {};
   uint32_t barrier_count = 0u;
   for (uint32_t index = 0u; index < srvs.size(); ++index) {
     ID3D12Resource* resource = srvs[index];
     if (resource == nullptr) return false;
-    if (index >= 6u) {
+    if (index == 6u || index == 7u) {
       D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
       barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
       barrier.Transition.pResource = resource;
       barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
       barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    } else if (index >= 8u) {
+      D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
+      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barrier.Transition.pResource = resource;
+      barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
       barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     }
     D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
@@ -403,9 +414,13 @@ inline bool RecordNrdDiffusePrep(Rt12State& state, Rt12DiTransferSlot& slot, con
       view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
       view.Buffer.NumElements = std::max(1u, slot.deferred_count);
       view.Buffer.StructureByteStride = RTXDI_INPUT_DEFERRED_STRIDE;
-    } else {
+    } else if (index < 8u) {
       view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
       view.Texture2D.MipLevels = 1u;
+    } else {
+      view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+      view.Buffer.NumElements = static_cast<UINT>(uint64_t{input.width} * input.height);
+      view.Buffer.StructureByteStride = sizeof(uint32_t);
     }
     device->CreateShaderResourceView(resource, &view, {cpu.ptr + static_cast<SIZE_T>(index) * descriptor_size});
   }
@@ -432,7 +447,7 @@ inline bool RecordNrdDiffusePrep(Rt12State& state, Rt12DiTransferSlot& slot, con
     view.Format = texture->format;
     view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     device->CreateUnorderedAccessView(texture->resource.Get(), nullptr, &view,
-                                      {cpu.ptr + static_cast<SIZE_T>(8u + index) * descriptor_size});
+                                      {cpu.ptr + static_cast<SIZE_T>(10u + index) * descriptor_size});
   }
   if (barrier_count != 0u) list->ResourceBarrier(barrier_count, barriers.data());
   ID3D12DescriptorHeap* heaps[] = {nrd_slot.prep_descriptors.Get()};
@@ -447,17 +462,17 @@ inline bool RecordNrdDiffusePrep(Rt12State& state, Rt12DiTransferSlot& slot, con
                                                history_valid ? 1u : 0u, 0u};
   list->SetComputeRoot32BitConstants(0u, static_cast<UINT>(constants.size()), constants.data(), 0u);
   list->SetComputeRootDescriptorTable(1u, gpu);
-  list->SetComputeRootDescriptorTable(2u, {gpu.ptr + static_cast<UINT64>(8u) * descriptor_size});
+  list->SetComputeRootDescriptorTable(2u, {gpu.ptr + static_cast<UINT64>(10u) * descriptor_size});
   list->Dispatch((input.width + 7u) / 8u, (input.height + 7u) / 8u, 1u);
   barriers = {};
   barrier_count = 0u;
-  for (ID3D12Resource* resource : {srvs[6], srvs[7]}) {
+  for (uint32_t index = 6u; index < 10u; ++index) {
     D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = resource;
+    barrier.Transition.pResource = srvs[index];
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = index < 8u ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_COMMON;
   }
   list->ResourceBarrier(barrier_count, barriers.data());
   return true;
@@ -543,6 +558,8 @@ inline bool RecordNrdDenoise(Rt12State& state, Rt12DiTransferSlot& slot, const R
   *accepted_history = current;
   return true;
 }
+
+#endif
 
 inline bool EnsureNrdProbeResources(Rt12State& state, Rt12NrdSlot* slot) {
   if (slot == nullptr || !state.device12) return false;
@@ -1958,7 +1975,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
 #if defined(FALCOM_NRD_ENABLED)
   bool camera_candidate_valid = false;
   bool projection_compatible = false;
-  const bool nrd_allowed = !rr::RrOwnsDenoise();
+  const bool nrd_allowed = Rt12NrdSubmissionAllowed(rr::RrOwnsDenoise());
   if (nrd_allowed && n1_ready && history_valid && previous_slot != nullptr && input.layout.motion_available != 0u
       && slot.nrd.camera.valid && previous_slot->nrd.camera.valid && slot.nrd.camera.capture_frame == in.frame
       && previous_slot->nrd.camera.capture_frame != UINT32_MAX
@@ -1998,7 +2015,220 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   }
   if (nrd_allowed && n1_ready && keep_camera_qualified
       && transfer.nrd.qualification.motion_correction_index < 2u) {
-    nrd_dispatch_recorded = RecordNrdDenoise(s, slot, in, &nrd_accepted_history);
+    Rt12Slot& nrd_scene = s.lighting_slots[static_cast<uint32_t>(in.scene_slot)];
+    Rt12NrdSlot& nrd_slot = slot.nrd;
+    bool hitdistance_recorded = false;
+    if (transfer.nrd_hitdistance_root && transfer.nrd_hitdistance_pso) {
+      hitdistance_recorded = true;
+    } else {
+#if defined(__world_rtxdi_nrd_hitdistance_EMBED_FILE)
+      D3D12_DESCRIPTOR_RANGE hitdistance_ranges[6] = {};
+      hitdistance_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      hitdistance_ranges[0].NumDescriptors = 4u;
+      hitdistance_ranges[0].BaseShaderRegister = 0u;
+      hitdistance_ranges[0].OffsetInDescriptorsFromTableStart = 0u;
+      hitdistance_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      hitdistance_ranges[1].NumDescriptors = 3u;
+      hitdistance_ranges[1].BaseShaderRegister = 14u;
+      hitdistance_ranges[1].OffsetInDescriptorsFromTableStart = 4u;
+      hitdistance_ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      hitdistance_ranges[2].NumDescriptors = 1u;
+      hitdistance_ranges[2].BaseShaderRegister = 29u;
+      hitdistance_ranges[2].OffsetInDescriptorsFromTableStart = 7u;
+      hitdistance_ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      hitdistance_ranges[3].NumDescriptors = 1u;
+      hitdistance_ranges[3].BaseShaderRegister = 30u;
+      hitdistance_ranges[3].OffsetInDescriptorsFromTableStart = 8u;
+      hitdistance_ranges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      hitdistance_ranges[4].NumDescriptors = 4u;
+      hitdistance_ranges[4].BaseShaderRegister = 31u;
+      hitdistance_ranges[4].OffsetInDescriptorsFromTableStart = 9u;
+      hitdistance_ranges[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+      hitdistance_ranges[5].NumDescriptors = 2u;
+      hitdistance_ranges[5].BaseShaderRegister = 0u;
+      hitdistance_ranges[5].OffsetInDescriptorsFromTableStart = 13u;
+      D3D12_ROOT_PARAMETER hitdistance_parameters[3] = {};
+      hitdistance_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+      hitdistance_parameters[0].Constants.ShaderRegister = 0u;
+      hitdistance_parameters[0].Constants.Num32BitValues = 12u;
+      hitdistance_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+      hitdistance_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      hitdistance_parameters[1].DescriptorTable.NumDescriptorRanges = 5u;
+      hitdistance_parameters[1].DescriptorTable.pDescriptorRanges = hitdistance_ranges;
+      hitdistance_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+      hitdistance_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      hitdistance_parameters[2].DescriptorTable.NumDescriptorRanges = 1u;
+      hitdistance_parameters[2].DescriptorTable.pDescriptorRanges = &hitdistance_ranges[5];
+      hitdistance_parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+      D3D12_ROOT_SIGNATURE_DESC hitdistance_desc = {};
+      hitdistance_desc.NumParameters = 3u;
+      hitdistance_desc.pParameters = hitdistance_parameters;
+      ComPtr<ID3DBlob> hitdistance_blob, hitdistance_errors;
+      ComPtr<ID3D12RootSignature> hitdistance_root;
+      ComPtr<ID3D12PipelineState> hitdistance_pso;
+      HRESULT hitdistance_hr = s.serialize(&hitdistance_desc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                           &hitdistance_blob, &hitdistance_errors);
+      if (SUCCEEDED(hitdistance_hr)) {
+        hitdistance_hr = s.device12->CreateRootSignature(0u, hitdistance_blob->GetBufferPointer(),
+                                                         hitdistance_blob->GetBufferSize(),
+                                                         IID_PPV_ARGS(&hitdistance_root));
+      }
+      if (SUCCEEDED(hitdistance_hr)) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC hitdistance_pipeline = {};
+        hitdistance_pipeline.pRootSignature = hitdistance_root.Get();
+        hitdistance_pipeline.CS = {__world_rtxdi_nrd_hitdistance.data(),
+                                   __world_rtxdi_nrd_hitdistance.size()};
+        hitdistance_hr = s.device12->CreateComputePipelineState(&hitdistance_pipeline,
+                                                                IID_PPV_ARGS(&hitdistance_pso));
+      }
+      if (SUCCEEDED(hitdistance_hr)) {
+        transfer.nrd_hitdistance_root = std::move(hitdistance_root);
+        transfer.nrd_hitdistance_pso = std::move(hitdistance_pso);
+        hitdistance_recorded = true;
+      }
+#endif
+    }
+
+    if (hitdistance_recorded && (!nrd_slot.hit_distance || !nrd_slot.hit_validity || !nrd_slot.hitdistance_descriptors || nrd_slot.hitdistance_width != in.width || nrd_slot.hitdistance_height != in.height)) {
+      if (!s.device12 || in.width == 0u || in.height == 0u || uint64_t{in.width} * in.height > UINT32_MAX) {
+        hitdistance_recorded = false;
+      } else {
+        const uint64_t hitdistance_bytes = uint64_t{in.width} * in.height * sizeof(uint32_t);
+        Rt12NrdSlot hitdistance_candidate;
+        D3D12_DESCRIPTOR_HEAP_DESC hitdistance_heap = {};
+        hitdistance_heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hitdistance_heap.NumDescriptors = 15u;
+        hitdistance_heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, hitdistance_bytes,
+                                    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                    hitdistance_candidate.hit_distance))
+            || FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, hitdistance_bytes,
+                                       D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                       hitdistance_candidate.hit_validity))
+            || FAILED(s.device12->CreateDescriptorHeap(&hitdistance_heap,
+                                                       IID_PPV_ARGS(&hitdistance_candidate.hitdistance_descriptors)))) {
+          hitdistance_recorded = false;
+        } else {
+          nrd_slot.hit_distance = std::move(hitdistance_candidate.hit_distance);
+          nrd_slot.hit_validity = std::move(hitdistance_candidate.hit_validity);
+          nrd_slot.hitdistance_descriptors = std::move(hitdistance_candidate.hitdistance_descriptors);
+          nrd_slot.hitdistance_width = in.width;
+          nrd_slot.hitdistance_height = in.height;
+        }
+      }
+    }
+
+    if (hitdistance_recorded && nrd_scene.tlas && nrd_scene.instance_table && slot.n1_status.texture12
+        && vertices && indices && mesh_table && uv_arena && s.atlas.texture12 && s.materials
+        && (s.scene_dynamic_count == 0u || dynamic_vertices)) {
+      ID3D12Device* device12 = s.device12.Get();
+      ID3D12GraphicsCommandList* di_list = transfer.di_list.Get();
+      const uint32_t descriptor_stride = device12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      const D3D12_CPU_DESCRIPTOR_HANDLE cpu = nrd_slot.hitdistance_descriptors->GetCPUDescriptorHandleForHeapStart();
+      const D3D12_GPU_DESCRIPTOR_HANDLE gpu = nrd_slot.hitdistance_descriptors->GetGPUDescriptorHandleForHeapStart();
+      const auto cpu_at = [&](uint32_t index) {
+        return D3D12_CPU_DESCRIPTOR_HANDLE{cpu.ptr + static_cast<SIZE_T>(index) * descriptor_stride};
+      };
+      const auto write_buffer_srv = [&](uint32_t index, ID3D12Resource* resource, uint32_t stride, uint64_t count) {
+        const D3D12_SHADER_RESOURCE_VIEW_DESC view = Rt12BufferSrv(stride, count);
+        device12->CreateShaderResourceView(resource, &view, cpu_at(index));
+      };
+      write_buffer_srv(0u, vertices, 16u, vertex_count);
+      write_buffer_srv(1u, indices, kRt12ArenaStride[kRt12ArenaIndices], index_count);
+      write_buffer_srv(2u, mesh_table, sizeof(bvh::WorldMeshGPU), mesh_count);
+      write_buffer_srv(3u, nrd_scene.instance_table.Get(), sizeof(bvh::WorldInstanceGPU), nrd_scene.instance_count);
+      write_buffer_srv(4u, uv_arena, kRt12ArenaStride[kRt12ArenaUvs], uv_count);
+      D3D12_SHADER_RESOURCE_VIEW_DESC atlas_srv = {};
+      atlas_srv.Format = DXGI_FORMAT_R32_UINT;
+      atlas_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+      atlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      atlas_srv.Texture2DArray.MipLevels = 1u;
+      atlas_srv.Texture2DArray.ArraySize = kRt12AlphaSlices;
+      device12->CreateShaderResourceView(s.atlas.texture12.Get(), &atlas_srv, cpu_at(5u));
+      write_buffer_srv(6u, s.materials.Get(), 32u, kRt12AlphaSlices);
+      D3D12_SHADER_RESOURCE_VIEW_DESC tlas_srv = {};
+      tlas_srv.Format = DXGI_FORMAT_UNKNOWN;
+      tlas_srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+      tlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      tlas_srv.RaytracingAccelerationStructure.Location = nrd_scene.tlas->GetGPUVirtualAddress();
+      device12->CreateShaderResourceView(nullptr, &tlas_srv, cpu_at(7u));
+      write_buffer_srv(8u, dynamic_vertices, 16u,
+                       dynamic_vertices ? uint64_t{kRt12CarrierWidth} * kRt12CarrierHeight : 1u);
+      const D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv = Rt12TextureSrv(DXGI_FORMAT_R32_FLOAT);
+      const D3D12_SHADER_RESOURCE_VIEW_DESC uint4_srv = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT);
+      device12->CreateShaderResourceView(slot.depth.texture12.Get(), &depth_srv, cpu_at(9u));
+      device12->CreateShaderResourceView(slot.normal.texture12.Get(), &uint4_srv, cpu_at(10u));
+      device12->CreateShaderResourceView(slot.scene.texture12.Get(), &uint4_srv, cpu_at(11u));
+      const D3D12_SHADER_RESOURCE_VIEW_DESC status_srv = Rt12TextureSrv(DXGI_FORMAT_R32_UINT);
+      device12->CreateShaderResourceView(slot.n1_status.texture12.Get(), &status_srv, cpu_at(12u));
+      D3D12_UNORDERED_ACCESS_VIEW_DESC distance_uav = {};
+      distance_uav.Format = DXGI_FORMAT_UNKNOWN;
+      distance_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+      distance_uav.Buffer.NumElements = static_cast<UINT>(uint64_t{in.width} * in.height);
+      distance_uav.Buffer.StructureByteStride = sizeof(float);
+      device12->CreateUnorderedAccessView(nrd_slot.hit_distance.Get(), nullptr, &distance_uav, cpu_at(13u));
+      distance_uav.Buffer.StructureByteStride = sizeof(uint32_t);
+      device12->CreateUnorderedAccessView(nrd_slot.hit_validity.Get(), nullptr, &distance_uav, cpu_at(14u));
+
+      std::array<D3D12_RESOURCE_BARRIER, 3u> hitdistance_barriers = {};
+      hitdistance_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      hitdistance_barriers[0].Transition.pResource = slot.n1_status.texture12.Get();
+      hitdistance_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      hitdistance_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      hitdistance_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      for (uint32_t index = 0u; index < 2u; ++index) {
+        D3D12_RESOURCE_BARRIER& barrier = hitdistance_barriers[index + 1u];
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = index == 0u ? nrd_slot.hit_distance.Get() : nrd_slot.hit_validity.Get();
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      }
+      di_list->ResourceBarrier(static_cast<UINT>(hitdistance_barriers.size()), hitdistance_barriers.data());
+      ID3D12DescriptorHeap* hitdistance_heaps[] = {nrd_slot.hitdistance_descriptors.Get()};
+      di_list->SetDescriptorHeaps(1u, hitdistance_heaps);
+      di_list->SetComputeRootSignature(transfer.nrd_hitdistance_root.Get());
+      di_list->SetPipelineState(transfer.nrd_hitdistance_pso.Get());
+      const std::array<uint32_t, 12u> hitdistance_constants = {
+          in.width, in.height, in.frame, scene_resources_valid ? 1u : 0u,
+          s.scene_coverage_valid ? 1u : 0u,
+          std::bit_cast<uint32_t>(rtsun::g_rtsun_normal_bias),
+          std::bit_cast<uint32_t>(rtsun::g_rtsun_character_normal_bias),
+          std::bit_cast<uint32_t>(65504.0f),
+          std::bit_cast<uint32_t>(s.scene_coverage_min[0]),
+          std::bit_cast<uint32_t>(s.scene_coverage_min[1]),
+          std::bit_cast<uint32_t>(s.scene_coverage_min[2]),
+          std::bit_cast<uint32_t>(s.scene_coverage_size)};
+      di_list->SetComputeRoot32BitConstants(0u, static_cast<UINT>(hitdistance_constants.size()),
+                                            hitdistance_constants.data(), 0u);
+      di_list->SetComputeRootDescriptorTable(1u, gpu);
+      di_list->SetComputeRootDescriptorTable(2u, {gpu.ptr + static_cast<UINT64>(13u) * descriptor_stride});
+      di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
+      hitdistance_barriers = {};
+      hitdistance_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+      hitdistance_barriers[0].UAV.pResource = nrd_slot.hit_distance.Get();
+      hitdistance_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+      hitdistance_barriers[1].UAV.pResource = nrd_slot.hit_validity.Get();
+      hitdistance_barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      hitdistance_barriers[2].Transition.pResource = slot.n1_status.texture12.Get();
+      hitdistance_barriers[2].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      hitdistance_barriers[2].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      hitdistance_barriers[2].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      di_list->ResourceBarrier(static_cast<UINT>(hitdistance_barriers.size()), hitdistance_barriers.data());
+      hitdistance_barriers = {};
+      hitdistance_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      hitdistance_barriers[0].Transition.pResource = nrd_slot.hit_distance.Get();
+      hitdistance_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      hitdistance_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      hitdistance_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+      hitdistance_barriers[1] = hitdistance_barriers[0];
+      hitdistance_barriers[1].Transition.pResource = nrd_slot.hit_validity.Get();
+      di_list->ResourceBarrier(2u, hitdistance_barriers.data());
+    } else {
+      hitdistance_recorded = false;
+    }
+    nrd_dispatch_recorded = hitdistance_recorded
+                            && RecordNrdDenoise(s, slot, in, &nrd_accepted_history);
     nrd_history_reset = !nrd_dispatch_recorded;
   } else {
     slot.nrd.dispatch_ready = false;

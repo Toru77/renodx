@@ -73,12 +73,17 @@ struct Rt12NrdSlot {
   ComPtr<ID3D12DescriptorHeap> dispatch_descriptors;
   ComPtr<ID3D12Resource> dispatch_constants;
   ComPtr<ID3D12DescriptorHeap> prep_descriptors;
+  ComPtr<ID3D12DescriptorHeap> hitdistance_descriptors;
   ComPtr<ID3D12Resource> prep_constants;
   ComPtr<ID3D12Resource> prep_diffuse;
   ComPtr<ID3D12Resource> prep_specular;
   ComPtr<ID3D12Resource> prep_normal_roughness;
   ComPtr<ID3D12Resource> prep_viewz;
   ComPtr<ID3D12Resource> prep_mv;
+  ComPtr<ID3D12Resource> hit_distance;
+  ComPtr<ID3D12Resource> hit_validity;
+  uint32_t hitdistance_width = 0u;
+  uint32_t hitdistance_height = 0u;
   std::vector<ComPtr<ID3D12Resource>> staging;
   std::array<Rt12NrdTexture, static_cast<uint32_t>(nrd::ResourceType::MAX_NUM)> resources;
   Rt12NrdCameraCapture camera;
@@ -122,6 +127,10 @@ inline bool Rt12NrdCanContinueHistory(const Rt12NrdHistoryIdentity& previous,
          && previous.generation == current.generation && previous.configuration == current.configuration
          && previous.width == current.width && previous.height == current.height
          && previous.frame != UINT64_MAX && current.frame == previous.frame + 1u;
+}
+
+inline bool Rt12NrdSubmissionAllowed(bool rr_owns_denoise) {
+  return !rr_owns_denoise;
 }
 
 struct Rt12NrdPipelineSet {

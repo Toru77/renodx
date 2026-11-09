@@ -707,7 +707,7 @@ bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12
   ComPtr<ID3D12DescriptorHeap> prep_heap;
   D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
   heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  heap_desc.NumDescriptors = 13u;
+  heap_desc.NumDescriptors = 15u;
   heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   if (!Check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&prep_heap)), "create N1 prep heap")) return false;
   const uint32_t descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -740,6 +740,31 @@ bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12
     }
     device->CreateShaderResourceView(index == 5u ? nullptr : inputs[resource_index].resource.Get(), &view, cpu_at(index));
   }
+  ComPtr<ID3D12Resource> hit_distance_input, hit_validity_input;
+  if (!NrdCreateUploadBuffer(device, pixel_count * sizeof(float), &hit_distance_input)
+      || !NrdCreateUploadBuffer(device, pixel_count * sizeof(uint32_t), &hit_validity_input)) return false;
+  std::vector<float> traced_hit_distance(pixel_count, 3.25f);
+  std::vector<uint32_t> traced_hit_validity(pixel_count, 0u);
+  for (uint32_t pixel = 0u; pixel < pixel_count; ++pixel) {
+    if ((pixel & 3u) < 2u) traced_hit_validity[pixel] = 1u;
+  }
+  void* hit_distance_mapped = nullptr;
+  void* hit_validity_mapped = nullptr;
+  if (FAILED(hit_distance_input->Map(0u, nullptr, &hit_distance_mapped))
+      || FAILED(hit_validity_input->Map(0u, nullptr, &hit_validity_mapped))) return false;
+  std::memcpy(hit_distance_mapped, traced_hit_distance.data(), traced_hit_distance.size() * sizeof(float));
+  std::memcpy(hit_validity_mapped, traced_hit_validity.data(), traced_hit_validity.size() * sizeof(uint32_t));
+  hit_distance_input->Unmap(0u, nullptr);
+  hit_validity_input->Unmap(0u, nullptr);
+  for (uint32_t index = 0u; index < 2u; ++index) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+    view.Format = DXGI_FORMAT_UNKNOWN;
+    view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Buffer.NumElements = pixel_count;
+    view.Buffer.StructureByteStride = sizeof(uint32_t);
+    device->CreateShaderResourceView(index == 0u ? hit_distance_input.Get() : hit_validity_input.Get(), &view, cpu_at(8u + index));
+  }
   const std::array<nrd::ResourceType, 5u> prep_output_types = {nrd::ResourceType::IN_MV,
                                                                nrd::ResourceType::IN_NORMAL_ROUGHNESS,
                                                                nrd::ResourceType::IN_VIEWZ,
@@ -757,7 +782,7 @@ bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12
     D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
     view.Format = target.format;
     view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    device->CreateUnorderedAccessView(target.resource.Get(), nullptr, &view, cpu_at(8u + index));
+    device->CreateUnorderedAccessView(target.resource.Get(), nullptr, &view, cpu_at(10u + index));
   }
   D3D12_FEATURE_DATA_FORMAT_SUPPORT r10_support = {};
   r10_support.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
@@ -833,9 +858,11 @@ bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12
   ComPtr<ID3D12PipelineState> prep_pso;
   D3D12_DESCRIPTOR_RANGE ranges[2] = {};
   ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  ranges[0].NumDescriptors = 8u;
+  ranges[0].NumDescriptors = 10u;
+  ranges[0].OffsetInDescriptorsFromTableStart = 0u;
   ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
   ranges[1].NumDescriptors = 5u;
+  ranges[1].OffsetInDescriptorsFromTableStart = 0u;
   D3D12_ROOT_PARAMETER parameters[3] = {};
   parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   parameters[0].Constants.ShaderRegister = 0u;
@@ -867,7 +894,7 @@ bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12
                                                     std::bit_cast<uint32_t>(-0.25f), 0u, 0u, 1u, 0u};
   slot.command_list->SetComputeRoot32BitConstants(0u, 10u, prep_constants.data(), 0u);
   slot.command_list->SetComputeRootDescriptorTable(1u, heap_gpu);
-  slot.command_list->SetComputeRootDescriptorTable(2u, {heap_gpu.ptr + static_cast<UINT64>(8u) * descriptor_size});
+  slot.command_list->SetComputeRootDescriptorTable(2u, {heap_gpu.ptr + static_cast<UINT64>(10u) * descriptor_size});
   slot.command_list->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
   for (Rt12NrdTexture& source : inputs) {
     if (source.resource == nullptr) continue;
@@ -979,7 +1006,7 @@ bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12
           const float expected = index == 0u && scenario == 0u && channel == 0u   ? 0.5f
                                  : index == 0u && scenario == 0u && channel == 1u ? 0.25f
                                  : index == 0u && scenario == 0u && channel == 2u ? 0.125f
-                                 : index == 0u && scenario == 0u && channel == 3u ? 2.0f
+                                 : index == 0u && scenario < 2u && channel == 3u  ? 3.25f
                                                                                   : 0.0f;
           if (!std::isfinite(component) || std::abs(component - expected) > 0.002f) {
             std::fprintf(stderr, "N1 prep mismatch guide=%u pixel=%u channel=%u status=%u actual=%g expected=%g\n",
@@ -990,7 +1017,7 @@ bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12
       } else if (index == 2u) {
         const auto* viewz = reinterpret_cast<const float*>(value) + x;
         const uint32_t scenario = pixel & 3u;
-        const float expected = scenario < 2u ? 70000.0f : 0.0f;
+        const float expected = scenario < 2u ? 70000.0f : 1000000.0f;
         if (!std::isfinite(*viewz) || std::abs(*viewz - expected) > 0.5f) valid = false;
       } else {
         const auto* half = reinterpret_cast<const uint16_t*>(value) + x * 2u;
@@ -1614,6 +1641,9 @@ bool RunDispatchDescriptionSmoke() {
 bool RunHistoryIdentityContracts() {
   using falcom_world::rt12::Rt12NrdCanContinueHistory;
   using falcom_world::rt12::Rt12NrdHistoryIdentity;
+  using falcom_world::rt12::Rt12NrdSubmissionAllowed;
+  if (!Rt12NrdSubmissionAllowed(false) || Rt12NrdSubmissionAllowed(true)) return false;
+  std::printf("PASS NRD submissions suppressed while RR owns denoising\n");
   constexpr Rt12NrdHistoryIdentity previous = {4u, 8u, 2u, 19u, 13u, 9u, true};
   constexpr Rt12NrdHistoryIdentity next = {4u, 8u, 2u, 20u, 13u, 9u, true};
   if (!Rt12NrdCanContinueHistory(previous, next)) return false;

@@ -287,6 +287,8 @@ struct Rt12DiTransferState {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> nrd_probe_pso;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> nrd_prep_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> nrd_prep_pso;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> nrd_hitdistance_root;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> nrd_hitdistance_pso;
   uint64_t owner_generation = 0u, configuration_generation = 0u;
   uint64_t input_fence = 0u, scene_fence = 0u;
   uint32_t next_slot = 0u, input_frame = UINT32_MAX, attempted_frame = UINT32_MAX;

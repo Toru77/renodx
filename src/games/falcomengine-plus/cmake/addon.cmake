@@ -27,6 +27,11 @@ target_sources(falcom-rtxdi-bridge PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/rtxdi_raw_guard_contract.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/rtxdi_lighting_consumer_contract.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_reconstruct.h")
+target_sources(falcom-rtxdi-bridge PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_hitdistance.h")
+target_sources(falcom-rtxdi-bridge PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_sampling_contract.h"
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_coverage_contract.h")
 target_sources(falcomengine-plus PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_prep.h")
 
@@ -70,5 +75,7 @@ if(FALCOM_NRD_SDK_ROOT)
   if(FALCOM_NRD_ENABLED)
     target_link_libraries(${ADDON} PRIVATE falcom-nrd-sdk)
     target_compile_definitions(${ADDON} PRIVATE FALCOM_NRD_ENABLED=1)
+    target_sources(${ADDON} PRIVATE
+      "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_hitdistance.h")
   endif()
 endif()

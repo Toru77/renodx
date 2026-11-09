@@ -24,6 +24,9 @@
 #include "rtxdi_surface_contract.h"
 #include "world_rtxdi_classify_lights.h"
 #include "world_rtxdi_initial_di.h"
+#include "world_rtxdi_nrd_coverage_contract.h"
+#include "world_rtxdi_nrd_hitdistance.h"
+#include "world_rtxdi_nrd_sampling_contract.h"
 #include "world_rtxdi_reconstruct.h"
 #include "world_rtxdi_spatial_di.h"
 #include "world_rtxdi_sun_visibility.h"
@@ -465,7 +468,13 @@ int RunRtxdiDxrBridge() {
   const char* wait_context = "startup";
   bool wait_has_di_dispatch = false;
   const auto submit_wait = [&]() {
-    if (!Check(list->Close(), "close list")) return false;
+    const HRESULT close_hr = list->Close();
+    if (!Check(close_hr, "close list")) {
+      std::fprintf(stderr, "FAIL close context=%s device-removed=0x%08lx\n", wait_context,
+                   static_cast<unsigned long>(device->GetDeviceRemovedReason()));
+      DumpDebugMessages(device.Get());
+      return false;
+    }
     ID3D12CommandList* lists[] = {list.Get()};
     static UINT64 fence_value = 1;
     const UINT64 signal_value = fence_value++;
@@ -3117,6 +3126,502 @@ int RunRtxdiDxrBridge() {
   std::printf("PASS production lighting selection helper point/spot/blocked/unknown/unbound/invalid fallback; post-material application once\n");
   std::printf("PASS character local DI point/spot charaColor, blocked suppression, unknown/empty/invalid RTLS fallback without double-add\n");
   std::printf("PASS RTXDI sun consumer helper visible/blocked/unknown/unbound/malformed; CSM and character fallback preserved\n");
+
+  constexpr UINT hitdistance_pixels = 6u;
+  constexpr UINT hitdistance_elements = hitdistance_pixels + 1u;
+  D3D12_DESCRIPTOR_RANGE hitdistance_ranges[6] = {};
+  hitdistance_ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4u, 0u, 0u, 0u};
+  hitdistance_ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3u, 14u, 0u, 4u};
+  hitdistance_ranges[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 29u, 0u, 7u};
+  hitdistance_ranges[3] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 30u, 0u, 8u};
+  hitdistance_ranges[4] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4u, 31u, 0u, 9u};
+  hitdistance_ranges[5] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2u, 0u, 0u, 13u};
+  ComPtr<ID3D12RootSignature> hitdistance_root;
+  ComPtr<ID3D12PipelineState> hitdistance_pso;
+  if (!CreateRoot(device.Get(), hitdistance_ranges, 6u, 12u, &hitdistance_root)
+      || !CreatePso(device.Get(), hitdistance_root.Get(), __world_rtxdi_nrd_hitdistance, &hitdistance_pso)) return 1;
+
+  std::array<uint32_t, hitdistance_pixels> hitdistance_status = {9u, 10u, 3u, 25u, 9u, 12u};
+  for (UINT pixel = 0u; pixel < hitdistance_pixels; ++pixel) normal_pixels[pixel * 4u + 3u] = (pixel == 3u ? 0u : 8u);
+  depths.fill(0.5f);
+  depths[4] = 0.0f;
+  wait_context = "N3b synthetic guide upload";
+  if (!Check(allocator->Reset(), "reset N3b guide allocator")
+      || !Check(base_list->Reset(allocator.Get(), nullptr), "reset N3b guide list")
+      || !update_pixel_texture(normal_tex.Get(), normal_upload.Get(), normal_pixels.data(), 3u * 16u)
+      || !update_pixel_texture(depth_tex.Get(), depth_upload.Get(), depths.data(), 3u * sizeof(float))
+      || !update_pixel_texture(scene_tex.Get(), scene_upload.Get(), scene_pixels.data(),
+                               RTXDI_SURFACE_SCENE_ROW_COUNT * 4u * sizeof(uint32_t))) return 1;
+  ComPtr<ID3D12Resource> hitdistance_status_texture, hitdistance_status_upload;
+  if (!CreateTextureUpload(device.Get(), list.Get(), DXGI_FORMAT_R32_UINT, 3u, 2u, hitdistance_status.data(),
+                           3u * sizeof(uint32_t), &hitdistance_status_texture, &hitdistance_status_upload)) return 1;
+  if (!submit_wait()) return 1;
+  if (!Check(allocator->Reset(), "reset N3b dispatch allocator")
+      || !Check(base_list->Reset(allocator.Get(), nullptr), "reset N3b dispatch list")) return 1;
+
+  D3D12_DESCRIPTOR_HEAP_DESC hitdistance_heap_desc = {};
+  hitdistance_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  hitdistance_heap_desc.NumDescriptors = 15u;
+  hitdistance_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> hitdistance_heap;
+  if (!Check(device->CreateDescriptorHeap(&hitdistance_heap_desc, IID_PPV_ARGS(&hitdistance_heap)),
+             "create N3b descriptor heap")) return 1;
+  const UINT hitdistance_descriptor_size = device->GetDescriptorHandleIncrementSize(hitdistance_heap_desc.Type);
+  const auto hitdistance_cpu = hitdistance_heap->GetCPUDescriptorHandleForHeapStart();
+  const auto hitdistance_cpu_at = [&](UINT index) {
+    return D3D12_CPU_DESCRIPTOR_HANDLE{hitdistance_cpu.ptr + static_cast<SIZE_T>(index) * hitdistance_descriptor_size};
+  };
+  CreateBufferSrv(device.Get(), hitdistance_heap.Get(), hitdistance_descriptor_size, 0u, vertices.Get(), 3u, 16u);
+  CreateBufferSrv(device.Get(), hitdistance_heap.Get(), hitdistance_descriptor_size, 1u, indices.Get(), 3u, sizeof(uint32_t));
+  CreateBufferSrv(device.Get(), hitdistance_heap.Get(), hitdistance_descriptor_size, 2u, meshes.Get(), 1u, sizeof(WorldMeshGPU));
+  CreateBufferSrv(device.Get(), hitdistance_heap.Get(), hitdistance_descriptor_size, 3u, instances.Get(), 2u, sizeof(WorldInstanceGPU));
+  CreateBufferSrv(device.Get(), hitdistance_heap.Get(), hitdistance_descriptor_size, 4u, uvs.Get(), 3u, 2u * sizeof(float));
+  D3D12_SHADER_RESOURCE_VIEW_DESC hitdistance_atlas_srv = {};
+  hitdistance_atlas_srv.Format = DXGI_FORMAT_R32_UINT;
+  hitdistance_atlas_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+  hitdistance_atlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  hitdistance_atlas_srv.Texture2DArray.MipLevels = 1u;
+  hitdistance_atlas_srv.Texture2DArray.ArraySize = 256u;
+  device->CreateShaderResourceView(atlas.Get(), &hitdistance_atlas_srv, hitdistance_cpu_at(5u));
+  CreateBufferSrv(device.Get(), hitdistance_heap.Get(), hitdistance_descriptor_size, 6u, alpha_materials.Get(), 1u,
+                  sizeof(AlphaMaterialGPU));
+  D3D12_SHADER_RESOURCE_VIEW_DESC hitdistance_tlas_srv = {};
+  hitdistance_tlas_srv.Format = DXGI_FORMAT_UNKNOWN;
+  hitdistance_tlas_srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+  hitdistance_tlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  hitdistance_tlas_srv.RaytracingAccelerationStructure.Location = tlases[0]->GetGPUVirtualAddress();
+  device->CreateShaderResourceView(nullptr, &hitdistance_tlas_srv, hitdistance_cpu_at(7u));
+  CreateBufferSrv(device.Get(), hitdistance_heap.Get(), hitdistance_descriptor_size, 8u, dynamic_vertices.Get(), 3u, 16u);
+  D3D12_SHADER_RESOURCE_VIEW_DESC hitdistance_depth_srv = {};
+  hitdistance_depth_srv.Format = DXGI_FORMAT_R32_FLOAT;
+  hitdistance_depth_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  hitdistance_depth_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  hitdistance_depth_srv.Texture2D.MipLevels = 1u;
+  device->CreateShaderResourceView(depth_tex.Get(), &hitdistance_depth_srv, hitdistance_cpu_at(9u));
+  device->CreateShaderResourceView(normal_tex.Get(), &uint4_srv, hitdistance_cpu_at(10u));
+  device->CreateShaderResourceView(scene_tex.Get(), &uint4_srv, hitdistance_cpu_at(11u));
+  D3D12_SHADER_RESOURCE_VIEW_DESC hitdistance_status_srv = {};
+  hitdistance_status_srv.Format = DXGI_FORMAT_R32_UINT;
+  hitdistance_status_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  hitdistance_status_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  hitdistance_status_srv.Texture2D.MipLevels = 1u;
+  device->CreateShaderResourceView(hitdistance_status_texture.Get(), &hitdistance_status_srv, hitdistance_cpu_at(12u));
+
+  ComPtr<ID3D12Resource> hitdistance_output, hitvalidity_output;
+  ComPtr<ID3D12Resource> hitdistance_readback, hitvalidity_readback, hitdistance_sentinel_upload, hitvalidity_sentinel_upload;
+  const auto hitdistance_readback_desc = BufferDesc(hitdistance_elements * sizeof(float));
+  const auto hitvalidity_readback_desc = BufferDesc(hitdistance_elements * sizeof(uint32_t));
+  const auto readback_heap = Heap(D3D12_HEAP_TYPE_READBACK);
+  std::array<float, hitdistance_elements> hitdistance_sentinel = {};
+  hitdistance_sentinel.fill(std::bit_cast<float>(0x7FC0DEADu));
+  std::array<uint32_t, hitdistance_elements> hitvalidity_sentinel = {};
+  hitvalidity_sentinel.fill(0xDEADBEEFu);
+  if (!CreateDefaultBuffer(device.Get(), hitdistance_elements * sizeof(float), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_COMMON, &hitdistance_output)
+      || !CreateDefaultBuffer(device.Get(), hitdistance_elements * sizeof(uint32_t), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                              D3D12_RESOURCE_STATE_COMMON, &hitvalidity_output)
+      || !UploadBuffer(device.Get(), hitdistance_sentinel.data(), sizeof(hitdistance_sentinel), &hitdistance_sentinel_upload)
+      || !UploadBuffer(device.Get(), hitvalidity_sentinel.data(), sizeof(hitvalidity_sentinel), &hitvalidity_sentinel_upload)
+      || !Check(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &hitdistance_readback_desc,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&hitdistance_readback)),
+                "create N3b distance readback")
+      || !Check(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &hitvalidity_readback_desc,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&hitvalidity_readback)),
+                "create N3b mask readback")) return 1;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC hitdistance_uav = {};
+  hitdistance_uav.Format = DXGI_FORMAT_UNKNOWN;
+  hitdistance_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  hitdistance_uav.Buffer.NumElements = hitdistance_elements;
+  hitdistance_uav.Buffer.StructureByteStride = sizeof(float);
+  device->CreateUnorderedAccessView(hitdistance_output.Get(), nullptr, &hitdistance_uav, hitdistance_cpu_at(13u));
+  hitdistance_uav.Buffer.StructureByteStride = sizeof(uint32_t);
+  device->CreateUnorderedAccessView(hitvalidity_output.Get(), nullptr, &hitdistance_uav, hitdistance_cpu_at(14u));
+
+  std::array<float, 3u> hitdistance_coverage_min = {-100000.0f, -100000.0f, -100000.0f};
+  float hitdistance_coverage_size = 200000.0f;
+  constexpr uint32_t hitdistance_frame = 73u;
+
+  const auto run_hitdistance = [&](UINT mask_index, bool scene_valid, bool coverage_complete, const char* label,
+                                   std::array<float, hitdistance_pixels>* distances,
+                                   std::array<uint32_t, hitdistance_pixels>* validity) {
+    if (mask_index >= tlases.size() || distances == nullptr || validity == nullptr) return false;
+    wait_context = label;
+    hitdistance_tlas_srv.RaytracingAccelerationStructure.Location = tlases[mask_index]->GetGPUVirtualAddress();
+    device->CreateShaderResourceView(nullptr, &hitdistance_tlas_srv, hitdistance_cpu_at(7u));
+    D3D12_RESOURCE_BARRIER barriers[4] = {};
+    for (UINT index = 0u; index < 2u; ++index) {
+      barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barriers[index].Transition.pResource = index == 0u ? hitdistance_output.Get() : hitvalidity_output.Get();
+      barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+      barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    list->ResourceBarrier(2u, barriers);
+    list->CopyBufferRegion(hitdistance_output.Get(), 0u, hitdistance_sentinel_upload.Get(), 0u, sizeof(hitdistance_sentinel));
+    list->CopyBufferRegion(hitvalidity_output.Get(), 0u, hitvalidity_sentinel_upload.Get(), 0u, sizeof(hitvalidity_sentinel));
+    for (UINT index = 0u; index < 2u; ++index) {
+      barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    list->ResourceBarrier(2u, barriers);
+    ID3D12DescriptorHeap* heaps[] = {hitdistance_heap.Get()};
+    list->SetDescriptorHeaps(1u, heaps);
+    list->SetComputeRootSignature(hitdistance_root.Get());
+    list->SetPipelineState(hitdistance_pso.Get());
+    const std::array<uint32_t, 12u> params = {
+        3u, 2u, hitdistance_frame, scene_valid ? 1u : 0u, coverage_complete ? 1u : 0u,
+        std::bit_cast<uint32_t>(0.01f), std::bit_cast<uint32_t>(0.02f), std::bit_cast<uint32_t>(65504.0f),
+        std::bit_cast<uint32_t>(hitdistance_coverage_min[0]),
+        std::bit_cast<uint32_t>(hitdistance_coverage_min[1]),
+        std::bit_cast<uint32_t>(hitdistance_coverage_min[2]),
+        std::bit_cast<uint32_t>(hitdistance_coverage_size)};
+    list->SetComputeRoot32BitConstants(0u, static_cast<UINT>(params.size()), params.data(), 0u);
+    list->SetComputeRootDescriptorTable(1u, hitdistance_heap->GetGPUDescriptorHandleForHeapStart());
+    list->Dispatch(1u, 1u, 1u);
+    barriers[0] = {};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barriers[0].UAV.pResource = hitdistance_output.Get();
+    barriers[1] = {};
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barriers[1].UAV.pResource = hitvalidity_output.Get();
+    list->ResourceBarrier(2u, barriers);
+    for (UINT index = 0u; index < 2u; ++index) {
+      barriers[index] = {};
+      barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barriers[index].Transition.pResource = index == 0u ? hitdistance_output.Get() : hitvalidity_output.Get();
+      barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+    list->ResourceBarrier(2u, barriers);
+    list->CopyBufferRegion(hitdistance_readback.Get(), 0u, hitdistance_output.Get(), 0u, sizeof(hitdistance_sentinel));
+    list->CopyBufferRegion(hitvalidity_readback.Get(), 0u, hitvalidity_output.Get(), 0u, sizeof(hitvalidity_sentinel));
+    for (UINT index = 0u; index < 2u; ++index) {
+      barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+      barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    }
+    list->ResourceBarrier(2u, barriers);
+    if (!submit_wait()) return false;
+    void* distance_data = nullptr;
+    void* validity_data = nullptr;
+    if (!Check(hitdistance_readback->Map(0u, nullptr, &distance_data), "map N3b distances")
+        || !Check(hitvalidity_readback->Map(0u, nullptr, &validity_data), "map N3b validity")) return false;
+    const auto* all_distances = static_cast<const float*>(distance_data);
+    const auto* all_validity = static_cast<const uint32_t*>(validity_data);
+    bool ok = std::bit_cast<uint32_t>(all_distances[hitdistance_pixels]) == 0x7FC0DEADu
+              && all_validity[hitdistance_pixels] == 0xDEADBEEFu;
+    for (UINT pixel = 0u; pixel < hitdistance_pixels; ++pixel) {
+      (*distances)[pixel] = all_distances[pixel];
+      (*validity)[pixel] = all_validity[pixel];
+      if (!std::isfinite(all_distances[pixel]) || all_distances[pixel] < 0.0f || all_distances[pixel] > 65504.0f) ok = false;
+    }
+    const D3D12_RANGE no_write = {0u, 0u};
+    hitdistance_readback->Unmap(0u, &no_write);
+    hitvalidity_readback->Unmap(0u, &no_write);
+    if (!ok) std::fprintf(stderr, "FAIL %s N3b nonfinite/bounds/sentinel\n", label);
+    return ok && Check(allocator->Reset(), "reset N3b allocator after wait")
+           && Check(base_list->Reset(allocator.Get(), nullptr), "reset N3b list after wait");
+  };
+
+  std::array<float, hitdistance_pixels> reconstructed_distances = {};
+  std::array<uint32_t, hitdistance_pixels> reconstructed_validity = {};
+  if (!run_hitdistance(0u, true, true, "N3b closest opaque", &reconstructed_distances, &reconstructed_validity)) return 1;
+  uint32_t eligible_pixels = 0u;
+  uint32_t valid_distance_pixels = 0u;
+  for (uint32_t pixel = 0u; pixel < hitdistance_pixels; ++pixel) {
+    const uint32_t status = hitdistance_status[pixel] & 0x7u;
+    const bool status_known = (hitdistance_status[pixel] & RTXDI_N1_STATUS_KNOWN_BIT) != 0u
+                              && (status == RTXDI_N1_STATUS_VISIBLE || status == RTXDI_N1_STATUS_BLOCKED);
+    const bool status_character = (hitdistance_status[pixel] & RTXDI_N1_STATUS_CHARACTER_BIT) != 0u;
+    const bool surface_character = (normal_pixels[pixel * 4u + 3u] & 8u) == 0u;
+    if (status_known && status_character == surface_character && std::isfinite(depths[pixel]) && depths[pixel] > 0.0f) {
+      ++eligible_pixels;
+    }
+    if ((reconstructed_validity[pixel] & 1u) != 0u) ++valid_distance_pixels;
+  }
+  if (eligible_pixels != 3u || valid_distance_pixels != eligible_pixels) return 1;
+  std::printf("PASS N3b fixture eligibility/ray bound eligible=%u maximum_rays=%u valid=%u invalid=%u\n",
+              eligible_pixels, eligible_pixels, valid_distance_pixels, hitdistance_pixels - valid_distance_pixels);
+  for (UINT pixel : {0u, 1u, 3u}) {
+    if ((reconstructed_validity[pixel] & 1u) == 0u || reconstructed_distances[pixel] <= 0.0f) {
+      std::fprintf(stderr, "FAIL N3b known visible/blocked/character pixel=%u mask=%u distance=%g\n",
+                   pixel, reconstructed_validity[pixel], reconstructed_distances[pixel]);
+      return 1;
+    }
+  }
+  if (reconstructed_validity[2] != 0u || reconstructed_validity[4] != 0u || reconstructed_validity[5] != 0u
+      || reconstructed_distances[2] != 0.0f || reconstructed_distances[4] != 0.0f || reconstructed_distances[5] != 0.0f) return 1;
+  const float baseline_nearest = reconstructed_distances[0];
+  if (!run_hitdistance(2u, true, true, "N3b shadow-only closest hit", &reconstructed_distances, &reconstructed_validity)
+      || (reconstructed_validity[0] & 1u) == 0u
+      || !run_hitdistance(3u, true, true, "N3b current dynamic closest hit", &reconstructed_distances, &reconstructed_validity)
+      || (reconstructed_validity[0] & 1u) == 0u
+      || !run_hitdistance(4u, true, true, "N3b certified scene miss", &reconstructed_distances, &reconstructed_validity)
+      || reconstructed_distances[0] != 65504.0f || reconstructed_validity[0] != 5u
+      || !run_hitdistance(0u, true, false, "N3b incomplete coverage invalid", &reconstructed_distances, &reconstructed_validity)
+      || reconstructed_distances[0] != 0.0f || reconstructed_validity[0] != 0u
+      || !run_hitdistance(0u, false, true, "N3b invalid scene invalid", &reconstructed_distances, &reconstructed_validity)
+      || reconstructed_distances[0] != 0.0f || reconstructed_validity[0] != 0u) return 1;
+
+  hitdistance_coverage_min = {-2.0f, -2.0f, -2.0f};
+  hitdistance_coverage_size = 4.0f;
+  if (!run_hitdistance(0u, true, true, "N3b hit within clipped coverage", &reconstructed_distances, &reconstructed_validity)
+      || (reconstructed_validity[0] & 1u) == 0u || reconstructed_distances[0] <= 0.0f
+      || reconstructed_distances[0] >= 4.0f) {
+    std::fprintf(stderr, "FAIL N3b clipped hit distance=%g mask=%u\n", reconstructed_distances[0], reconstructed_validity[0]);
+    return 1;
+  }
+  std::printf("PASS N3b short coverage retains interior opaque hit distance=%g\n", reconstructed_distances[0]);
+  if (!run_hitdistance(4u, true, true, "N3b truncated empty scene is invalid",
+                       &reconstructed_distances, &reconstructed_validity)
+      || reconstructed_distances[0] != 0.0f || reconstructed_validity[0] != 0u) {
+    std::fprintf(stderr, "FAIL N3b truncated empty distance=%g mask=%u\n", reconstructed_distances[0], reconstructed_validity[0]);
+    return 1;
+  }
+  std::printf("PASS N3b truncated empty scene stays invalid\n");
+  hitdistance_coverage_min = {1000.0f, 1000.0f, 1000.0f};
+  hitdistance_coverage_size = 10.0f;
+  if (!run_hitdistance(0u, true, true, "N3b ray origin outside coverage is invalid",
+                       &reconstructed_distances, &reconstructed_validity)
+      || reconstructed_distances[0] != 0.0f || reconstructed_validity[0] != 0u) {
+    std::fprintf(stderr, "FAIL N3b outside coverage distance=%g mask=%u\n", reconstructed_distances[0], reconstructed_validity[0]);
+    return 1;
+  }
+  std::printf("PASS N3b ray origin outside coverage invalid\n");
+  hitdistance_coverage_min = {-100000.0f, -100000.0f, -100000.0f};
+  hitdistance_coverage_size = 0.0f;
+  if (!run_hitdistance(0u, true, true, "N3b zero-size coverage is invalid",
+                       &reconstructed_distances, &reconstructed_validity)
+      || reconstructed_distances[0] != 0.0f || reconstructed_validity[0] != 0u) {
+    std::fprintf(stderr, "FAIL N3b zero coverage distance=%g mask=%u\n", reconstructed_distances[0], reconstructed_validity[0]);
+    return 1;
+  }
+  std::printf("PASS N3b zero-size coverage invalid\n");
+  hitdistance_coverage_size = std::numeric_limits<float>::quiet_NaN();
+  if (!run_hitdistance(0u, true, true, "N3b nonfinite coverage is invalid",
+                       &reconstructed_distances, &reconstructed_validity)
+      || reconstructed_distances[0] != 0.0f || reconstructed_validity[0] != 0u) {
+    std::fprintf(stderr, "FAIL N3b nonfinite coverage distance=%g mask=%u\n", reconstructed_distances[0], reconstructed_validity[0]);
+    return 1;
+  }
+  std::printf("PASS N3b nonfinite coverage invalid\n");
+  hitdistance_coverage_min = {-100000.0f, -100000.0f, -100000.0f};
+  hitdistance_coverage_size = 200000.0f;
+
+  hitdistance_coverage_min = {-4.04427f, -0.24334f, -1.38928f};
+  hitdistance_coverage_size = 4.0f;
+  if (!run_hitdistance(0u, true, true, "N3b near opaque hit inside clipped coverage",
+                       &reconstructed_distances, &reconstructed_validity)
+      || reconstructed_validity[0] != 1u || std::abs(reconstructed_distances[0] - baseline_nearest) > 1.0e-4f) {
+    std::fprintf(stderr, "FAIL N3b clipped opaque hit distance=%g mask=%u baseline=%g\n",
+                 reconstructed_distances[0], reconstructed_validity[0], baseline_nearest);
+    return 1;
+  }
+  std::printf("PASS N3b clipped opaque nearest distance=%g\n", reconstructed_distances[0]);
+  mesh.bbox_min[3] = 1.0f;
+  world_instances[0].header[2] = 1.0f;
+  if (!update_upload(meshes.Get(), &mesh, sizeof(mesh))
+      || !update_upload(instances.Get(), world_instances.data(), sizeof(world_instances))
+      || !update_atlas_texel(0xFFFFFFFFu)) return 1;
+  if (!update_atlas_texel(0x00000000u)
+      || !run_hitdistance(0u, true, true, "N3b alpha-rejected near with farther candidate outside coverage",
+                          &reconstructed_distances, &reconstructed_validity)
+      || reconstructed_distances[0] != 0.0f || reconstructed_validity[0] != 0u) {
+    std::fprintf(stderr, "FAIL N3b alpha edge coverage min=(-4.04427,-0.24334,-1.38928) size=4 distance=%g mask=%u\n",
+                 reconstructed_distances[0], reconstructed_validity[0]);
+    return 1;
+  }
+  std::printf("PASS N3b rejected near alpha with farther geometry beyond AABB is invalid min=(-4.04427,-0.24334,-1.38928) size=4\n");
+  hitdistance_coverage_min = {-100000.0f, -100000.0f, -100000.0f};
+  hitdistance_coverage_size = 200000.0f;
+  if (!update_atlas_texel(0x00000000u)) return 1;
+  if (!run_hitdistance(0u, true, true, "N3b alpha-cut nearest candidate continues to farther hit",
+                       &reconstructed_distances, &reconstructed_validity)
+      || reconstructed_validity[0] != 1u || reconstructed_distances[0] <= baseline_nearest) return 1;
+  world_instances[1].header[2] = 1.0f;
+  if (!update_upload(instances.Get(), world_instances.data(), sizeof(world_instances))
+      || !run_hitdistance(0u, true, true, "N3b all alpha candidates cut certify miss",
+                          &reconstructed_distances, &reconstructed_validity)
+      || reconstructed_distances[0] != 65504.0f || reconstructed_validity[0] != 5u) return 1;
+  world_instances[0].header[2] = 0.0f;
+  world_instances[1].header[2] = 0.0f;
+  mesh.bbox_min[3] = 0.0f;
+  if (!update_upload(meshes.Get(), &mesh, sizeof(mesh))
+      || !update_upload(instances.Get(), world_instances.data(), sizeof(world_instances))
+      || !update_atlas_texel(0xFFFFFFFFu)) return 1;
+  std::printf("PASS N3b first-hit distance/mask: closest alpha-aware DXR, opaque/shadow-only/dynamic masks, certified miss vs unknown coverage, invalid receiver/scene, character, guard, light-independent sampling\n");
+
+  constexpr UINT cosine_sample_count = 8192u;
+  constexpr UINT cosine_sample_bytes = cosine_sample_count * 4u * sizeof(float);
+  ComPtr<ID3D12RootSignature> cosine_root;
+  ComPtr<ID3D12PipelineState> cosine_pso;
+  D3D12_DESCRIPTOR_RANGE cosine_range = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1u, 0u, 0u, 0u};
+  if (!CreateRoot(device.Get(), &cosine_range, 1u, 2u, &cosine_root)
+      || !CreatePso(device.Get(), cosine_root.Get(), __world_rtxdi_nrd_sampling_contract, &cosine_pso)) return 1;
+  ComPtr<ID3D12Resource> cosine_output, cosine_readback;
+  if (!CreateDefaultBuffer(device.Get(), cosine_sample_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_COMMON, &cosine_output)) return 1;
+  const auto cosine_readback_desc = BufferDesc(cosine_sample_bytes);
+  const auto cosine_readback_heap = Heap(D3D12_HEAP_TYPE_READBACK);
+  if (!Check(device->CreateCommittedResource(&cosine_readback_heap, D3D12_HEAP_FLAG_NONE, &cosine_readback_desc,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&cosine_readback)),
+             "create cosine sample readback")) return 1;
+  D3D12_DESCRIPTOR_HEAP_DESC cosine_heap_desc = {};
+  cosine_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  cosine_heap_desc.NumDescriptors = 1u;
+  cosine_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> cosine_heap;
+  if (!Check(device->CreateDescriptorHeap(&cosine_heap_desc, IID_PPV_ARGS(&cosine_heap)), "create cosine sample heap")) return 1;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC cosine_uav = {};
+  cosine_uav.Format = DXGI_FORMAT_UNKNOWN;
+  cosine_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  cosine_uav.Buffer.NumElements = cosine_sample_count;
+  cosine_uav.Buffer.StructureByteStride = 4u * sizeof(float);
+  device->CreateUnorderedAccessView(cosine_output.Get(), nullptr, &cosine_uav, cosine_heap->GetCPUDescriptorHandleForHeapStart());
+  D3D12_RESOURCE_BARRIER cosine_barrier = {};
+  cosine_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  cosine_barrier.Transition.pResource = cosine_output.Get();
+  cosine_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  cosine_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+  cosine_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  list->ResourceBarrier(1u, &cosine_barrier);
+  ID3D12DescriptorHeap* cosine_heaps[] = {cosine_heap.Get()};
+  list->SetDescriptorHeaps(1u, cosine_heaps);
+  list->SetComputeRootSignature(cosine_root.Get());
+  list->SetPipelineState(cosine_pso.Get());
+  const std::array<uint32_t, 2u> cosine_params = {cosine_sample_count, 73u};
+  list->SetComputeRoot32BitConstants(0u, static_cast<UINT>(cosine_params.size()), cosine_params.data(), 0u);
+  list->SetComputeRootDescriptorTable(1u, cosine_heap->GetGPUDescriptorHandleForHeapStart());
+  list->Dispatch((cosine_sample_count + 63u) / 64u, 1u, 1u);
+  D3D12_RESOURCE_BARRIER cosine_uav_barrier = {};
+  cosine_uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  cosine_uav_barrier.UAV.pResource = cosine_output.Get();
+  list->ResourceBarrier(1u, &cosine_uav_barrier);
+  cosine_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  cosine_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  list->ResourceBarrier(1u, &cosine_barrier);
+  list->CopyBufferRegion(cosine_readback.Get(), 0u, cosine_output.Get(), 0u, cosine_sample_bytes);
+  cosine_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  cosine_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+  list->ResourceBarrier(1u, &cosine_barrier);
+  wait_context = "N3b cosine distribution moments";
+  if (!submit_wait()) return 1;
+  void* cosine_mapped = nullptr;
+  if (!Check(cosine_readback->Map(0u, nullptr, &cosine_mapped), "map cosine sample directions")) return 1;
+  const auto* cosine_samples = static_cast<const float*>(cosine_mapped);
+  double mean_x = 0.0, mean_y = 0.0, mean_ndot = 0.0, mean_ndot_squared = 0.0;
+  bool cosine_finite = true;
+  for (UINT index = 0u; index < cosine_sample_count; ++index) {
+    const float x = cosine_samples[index * 4u];
+    const float y = cosine_samples[index * 4u + 1u];
+    const float z = cosine_samples[index * 4u + 2u];
+    const float ndot = -z;
+    cosine_finite = cosine_finite && std::isfinite(x) && std::isfinite(y) && std::isfinite(z)
+                    && std::abs(x * x + y * y + z * z - 1.0f) < 1.0e-3f && ndot >= 0.0f;
+    mean_x += x;
+    mean_y += y;
+    mean_ndot += ndot;
+    mean_ndot_squared += ndot * ndot;
+  }
+  cosine_readback->Unmap(0u, nullptr);
+  mean_x /= cosine_sample_count;
+  mean_y /= cosine_sample_count;
+  mean_ndot /= cosine_sample_count;
+  mean_ndot_squared /= cosine_sample_count;
+  if (!cosine_finite || std::abs(mean_x) > 0.025 || std::abs(mean_y) > 0.025
+      || std::abs(mean_ndot - 2.0 / 3.0) > 0.015 || std::abs(mean_ndot_squared - 0.5) > 0.015) {
+    std::fprintf(stderr, "FAIL N3b cosine moments x=%g y=%g ndot=%g ndot2=%g\n",
+                 mean_x, mean_y, mean_ndot, mean_ndot_squared);
+    return 1;
+  }
+  std::printf("PASS N3b deterministic cosine GPU moments samples=%u meanNdot=%g meanNdot2=%g\n",
+              cosine_sample_count, mean_ndot, mean_ndot_squared);
+
+  constexpr UINT coverage_case_count = 4u;
+  constexpr UINT coverage_bytes = coverage_case_count * 2u * sizeof(float);
+  ComPtr<ID3D12RootSignature> coverage_root;
+  ComPtr<ID3D12PipelineState> coverage_pso;
+  D3D12_DESCRIPTOR_RANGE coverage_range = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1u, 0u, 0u, 0u};
+  if (!CreateRoot(device.Get(), &coverage_range, 1u, 1u, &coverage_root)
+      || !CreatePso(device.Get(), coverage_root.Get(), __world_rtxdi_nrd_coverage_contract, &coverage_pso)) return 1;
+  ComPtr<ID3D12Resource> coverage_output, coverage_readback;
+  if (!CreateDefaultBuffer(device.Get(), coverage_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_COMMON, &coverage_output)) return 1;
+  const auto coverage_readback_desc = BufferDesc(coverage_bytes);
+  const auto coverage_readback_heap = Heap(D3D12_HEAP_TYPE_READBACK);
+  if (!Check(device->CreateCommittedResource(&coverage_readback_heap, D3D12_HEAP_FLAG_NONE, &coverage_readback_desc,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&coverage_readback)),
+             "create coverage contract readback")) return 1;
+  D3D12_DESCRIPTOR_HEAP_DESC coverage_heap_desc = {};
+  coverage_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  coverage_heap_desc.NumDescriptors = 1u;
+  coverage_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> coverage_heap;
+  if (!Check(device->CreateDescriptorHeap(&coverage_heap_desc, IID_PPV_ARGS(&coverage_heap)),
+             "create coverage contract heap")) return 1;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC coverage_uav = {};
+  coverage_uav.Format = DXGI_FORMAT_UNKNOWN;
+  coverage_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  coverage_uav.Buffer.NumElements = coverage_case_count;
+  coverage_uav.Buffer.StructureByteStride = 2u * sizeof(float);
+  device->CreateUnorderedAccessView(coverage_output.Get(), nullptr, &coverage_uav,
+                                    coverage_heap->GetCPUDescriptorHandleForHeapStart());
+  if (!Check(allocator->Reset(), "reset coverage contract allocator")
+      || !Check(base_list->Reset(allocator.Get(), nullptr), "reset coverage contract command list")) return 1;
+  D3D12_RESOURCE_BARRIER coverage_barrier = {};
+  coverage_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  coverage_barrier.Transition.pResource = coverage_output.Get();
+  coverage_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  coverage_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+  coverage_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  list->ResourceBarrier(1u, &coverage_barrier);
+  ID3D12DescriptorHeap* coverage_heaps[] = {coverage_heap.Get()};
+  list->SetDescriptorHeaps(1u, coverage_heaps);
+  list->SetComputeRootSignature(coverage_root.Get());
+  list->SetPipelineState(coverage_pso.Get());
+  list->SetComputeRoot32BitConstant(0u, coverage_case_count, 0u);
+  list->SetComputeRootDescriptorTable(1u, coverage_heap->GetGPUDescriptorHandleForHeapStart());
+  list->Dispatch(1u, 1u, 1u);
+  D3D12_RESOURCE_BARRIER coverage_uav_barrier = {};
+  coverage_uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  coverage_uav_barrier.UAV.pResource = coverage_output.Get();
+  list->ResourceBarrier(1u, &coverage_uav_barrier);
+  coverage_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  coverage_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  list->ResourceBarrier(1u, &coverage_barrier);
+  list->CopyBufferRegion(coverage_readback.Get(), 0u, coverage_output.Get(), 0u, coverage_bytes);
+  coverage_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  coverage_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+  list->ResourceBarrier(1u, &coverage_barrier);
+  wait_context = "N3b tiny-component AABB coverage contract";
+  if (!submit_wait()) return 1;
+  void* coverage_mapped = nullptr;
+  if (!Check(coverage_readback->Map(0u, nullptr, &coverage_mapped), "map coverage contract results")) return 1;
+  const auto* coverage_results = static_cast<const float*>(coverage_mapped);
+  const float tiny_coverage_end = coverage_results[0];
+  const float tiny_valid = coverage_results[1];
+  const float resolved_coverage_end = coverage_results[2];
+  const float resolved_valid = coverage_results[3];
+  const float truncated_coverage_end = coverage_results[4];
+  const float truncated_valid = coverage_results[5];
+  const float full_coverage_end = coverage_results[6];
+  const float full_valid = coverage_results[7];
+  coverage_readback->Unmap(0u, nullptr);
+  if (tiny_coverage_end != 0.0f || tiny_valid != 0.0f || !std::isfinite(resolved_coverage_end)
+      || std::abs(resolved_coverage_end - 5.0f) > 0.05f || resolved_valid != 1.0f
+      || truncated_coverage_end != 65503.5f || truncated_valid != 0.0f
+      || full_coverage_end != 65504.0f || full_valid != 1.0f) {
+    std::fprintf(stderr, "FAIL N3b coverage tiny=(%g,%g) resolved=(%g,%g) truncated=(%g,%g) full=(%g,%g)\n",
+                 tiny_coverage_end, tiny_valid, resolved_coverage_end, resolved_valid,
+                 truncated_coverage_end, truncated_valid, full_coverage_end, full_valid);
+    return 1;
+  }
+  std::printf("PASS N3b tiny outward AABB component fails closed; resolved exit=%g; 65503.5 truncated, 65504 fully covered\n",
+              resolved_coverage_end);
   if (!ValidateDebugMessages(info_queue.Get())) return 1;
   std::printf("PASS production surface + DXR visibility (3x2, guard sentinel, masks incl. FORCE_OPAQUE, endpoint, coverage, scene/surface invalids, bias, alpha)\n");
   CloseHandle(event);

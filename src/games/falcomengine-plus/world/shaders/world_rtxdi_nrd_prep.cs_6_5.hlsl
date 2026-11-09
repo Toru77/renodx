@@ -10,6 +10,8 @@ Texture2D<uint2> g_mrt2 : register(t4);
 StructuredBuffer<GameDeferredParam> g_deferred : register(t5);
 Texture2D<float4> g_n1_diffuse : register(t6);
 Texture2D<uint> g_n1_status : register(t7);
+StructuredBuffer<float> g_n3b_hit_distance : register(t8);
+StructuredBuffer<uint> g_n3b_hit_validity : register(t9);
 
 RWTexture2D<float2> g_nrd_mv : register(u0);
 RWTexture2D<float4> g_nrd_normal_roughness : register(u1);
@@ -62,20 +64,24 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
                                  asfloat(g_scene.Load(int3(2, 0, 0))), asfloat(g_scene.Load(int3(3, 0, 0))));
   const float viewz = -mul(float4(world, 1.0), view).z;
   const uint status = g_n1_status.Load(int3(pixel, 0));
+  const uint pixel_index = pixel.y * g_dimensions.x + pixel.x;
+  const float4 packed = g_n1_diffuse.Load(int3(pixel, 0));
+  const float hit_distance = g_n3b_hit_distance[pixel_index];
+  const uint hit_validity = g_n3b_hit_validity[pixel_index];
   const bool known = (status & RTXDI_N1_STATUS_KNOWN_BIT) != 0u
                      && ((status & 0x07u) == RTXDI_N1_STATUS_VISIBLE || (status & 0x07u) == RTXDI_N1_STATUS_BLOCKED);
   const bool character = (mrt0.w & 8u) == 0u;
+  const bool finite_input = all(isfinite(packed.rgb)) && all(packed.rgb >= 0.0) && all(packed.rgb <= 65504.0);
   const bool valid = isfinite(depth) && depth > 0.0 && depth <= 1.0 && isfinite(world_h.w) && abs(world_h.w) > 1.0e-8
                      && all(isfinite(world)) && all(isfinite(normal)) && dot(normal, normal) > 0.5
-                     && isfinite(viewz) && viewz > 0.0 && known;
+                     && isfinite(viewz) && viewz > 0.0 && known && (hit_validity & 1u) != 0u
+                     && isfinite(hit_distance) && hit_distance >= 0.0 && hit_distance <= 65504.0 && finite_input;
   float roughness = 1.0;
   const uint material_index = g_mrt2.Load(int3(pixel, 0)).x;
   if (!character && material_index < g_deferred_count) {
     const float candidate_roughness = g_deferred[material_index].tail[0].z;
     if (isfinite(candidate_roughness)) roughness = saturate(candidate_roughness);
   }
-  const float4 packed = valid ? g_n1_diffuse.Load(int3(pixel, 0)) : 0.0;
-  const bool finite_input = all(isfinite(packed)) && all(packed >= 0.0) && all(packed <= 65504.0);
   const float2 motion = g_motion.Load(int3(pixel, 0)).xy;
   const float2 correction = g_motion_correction_index == 0u ? g_motion_correction_0 : g_motion_correction_1;
   g_nrd_mv[pixel] = g_history_valid != 0u && all(isfinite(motion))
@@ -83,7 +89,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
                         : 0.0;
   g_nrd_normal_roughness[pixel] = valid ? NrdPackNormalRoughness(normal, roughness, character ? 1.0 : 0.0)
                                          : NrdPackNormalRoughness(float3(0.0, 0.0, 1.0), 1.0, 0.0);
-  g_nrd_viewz[pixel] = valid ? viewz : 0.0;
-  g_nrd_diffuse[pixel] = valid && finite_input ? NrdPackDiffuse(packed.rgb, packed.a) : 0.0;
+  g_nrd_viewz[pixel] = valid ? viewz : 1000000.0;
+  g_nrd_diffuse[pixel] = valid ? NrdPackDiffuse(packed.rgb, hit_distance) : 0.0;
   g_nrd_specular[pixel] = 0.0;
 }
