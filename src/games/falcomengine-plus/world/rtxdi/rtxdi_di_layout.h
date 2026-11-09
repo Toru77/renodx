@@ -18,6 +18,15 @@
 #define RTXDI_DI_REASON_INVALID_ALPHA   6u
 #define RTXDI_DI_REASON_TRUNCATED       7u
 
+#define RTXDI_N1_STATUS_INVALID 0u
+#define RTXDI_N1_STATUS_VISIBLE 1u
+#define RTXDI_N1_STATUS_BLOCKED 2u
+#define RTXDI_N1_STATUS_UNKNOWN 3u
+#define RTXDI_N1_STATUS_EMPTY 4u
+#define RTXDI_N1_STATUS_KNOWN_BIT 8u
+#define RTXDI_N1_STATUS_CHARACTER_BIT 16u
+#define RTXDI_N1_CONFIG_VERSION 1u
+
 #ifdef __cplusplus
 #include <cstdint>
 struct RtxdiDiRawResult {

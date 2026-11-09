@@ -233,6 +233,7 @@ struct Rt12DiTransferSlot {
   Rt12Shared lights, tiles, deferred;
   Rt12Shared di_resolved;
   Rt12Shared sun_visibility;
+  Rt12Shared n1_diffuse, n1_specular, n1_status;
   Microsoft::WRL::ComPtr<ID3D12Resource> scene_buffer, lights_buffer, tiles_buffer, deferred_buffer, sun_results;
   Microsoft::WRL::ComPtr<ID3D12Resource> light_types, di_results, di_frame_upload;
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
@@ -248,6 +249,8 @@ struct Rt12DiTransferSlot {
   uint64_t output_b_fence = 0u, output_c_fence = 0u;
   uint64_t output_owner_generation = 0u, output_configuration_generation = 0u;
   uint64_t sun_configuration_generation = 0u;
+  uint32_t n1_configuration_version = 0u;
+  std::array<float, 7> n1_brdf_config = {};
   uint32_t output_frame = UINT32_MAX, output_width = 0u, output_height = 0u;
   int32_t output_scene_slot = -1, output_transfer_slot = -1;
   uint32_t light_count = 0u, tile_count = 0u, deferred_count = 0u;
@@ -255,6 +258,8 @@ struct Rt12DiTransferSlot {
   bool sun = false;
   bool motion_available = false;
   bool output_staged = false;
+  bool n1_resources_ready = false;
+  bool n1_staged = false;
 };
 
 struct Rt12DiTransferState {
@@ -271,6 +276,7 @@ struct Rt12DiTransferState {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> initial_di_pso;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> temporal_di_pso;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> spatial_di_pso;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> n1_resolve_pso;
   uint64_t owner_generation = 0u, configuration_generation = 0u;
   uint64_t input_fence = 0u, scene_fence = 0u;
   uint32_t next_slot = 0u, input_frame = UINT32_MAX, attempted_frame = UINT32_MAX;
@@ -949,7 +955,8 @@ inline void TeardownRt12(const char* why) {
   }
   for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {
     for (Rt12Shared* shared : {&slot.depth, &slot.normal, &slot.scene, &slot.color, &slot.mrt1, &slot.mrt2, &slot.motion,
-                               &slot.lights, &slot.tiles, &slot.deferred, &slot.di_resolved, &slot.sun_visibility}) {
+                               &slot.lights, &slot.tiles, &slot.deferred, &slot.di_resolved, &slot.sun_visibility,
+                               &slot.n1_diffuse, &slot.n1_specular, &slot.n1_status}) {
       if (shared->srv11.handle != 0u) s.device->destroy_resource_view(shared->srv11);
       if (shared->uav11.handle != 0u) s.device->destroy_resource_view(shared->uav11);
     }

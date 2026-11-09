@@ -2,6 +2,7 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <chrono>
@@ -23,6 +24,7 @@
 #include "rtxdi_surface_contract.h"
 #include "world_rtxdi_classify_lights.h"
 #include "world_rtxdi_initial_di.h"
+#include "world_rtxdi_reconstruct.h"
 #include "world_rtxdi_spatial_di.h"
 #include "world_rtxdi_sun_visibility.h"
 #include "world_rtxdi_temporal_di.h"
@@ -214,6 +216,31 @@ bool ValidateDebugMessages(ID3D12InfoQueue* info) {
   std::printf("PASS D3D12 InfoQueue clean (%llu messages, no warnings/errors)\n",
               static_cast<unsigned long long>(info->GetNumStoredMessages()));
   return true;
+}
+
+float HalfToFloat(uint16_t value) {
+  const uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16u;
+  uint32_t exponent = (value >> 10u) & 0x1fu;
+  uint32_t mantissa = value & 0x3ffu;
+  uint32_t bits = sign;
+  if (exponent == 0u) {
+    if (mantissa != 0u) {
+      int32_t adjusted_exponent = -14;
+      while ((mantissa & 0x400u) == 0u) {
+        mantissa <<= 1u;
+        --adjusted_exponent;
+      }
+      mantissa &= 0x3ffu;
+      bits |= static_cast<uint32_t>(adjusted_exponent + 127) << 23u;
+      bits |= mantissa << 13u;
+    }
+  } else if (exponent == 0x1fu) {
+    bits |= 0x7f800000u | (mantissa << 13u);
+  } else {
+    bits |= (exponent + 112u) << 23u;
+    bits |= mantissa << 13u;
+  }
+  return std::bit_cast<float>(bits);
 }
 
 D3D12_HEAP_PROPERTIES Heap(D3D12_HEAP_TYPE type) {
@@ -1169,7 +1196,9 @@ int RunRtxdiDxrBridge() {
   }
   std::array<uint32_t, 3 * 2 * 4> mrt2_pixels = {};
   for (UINT i = 0; i < 6u; ++i) mrt2_pixels[i * 4u + 1u] = 1023u;
-  ComPtr<ID3D12Resource> albedo_tex, albedo_upload, mrt2_tex, mrt2_upload;
+  std::array<uint32_t, 3 * 2 * 4> mrt1_pixels = {};
+  for (UINT i = 0u; i < 6u; ++i) mrt1_pixels[i * 4u + 2u] = 255u;
+  ComPtr<ID3D12Resource> albedo_tex, albedo_upload, mrt1_tex, mrt1_upload, mrt2_tex, mrt2_upload;
   ComPtr<ID3D12Resource> prev_depth_tex, prev_depth_upload, prev_normal_tex, prev_normal_upload;
   ComPtr<ID3D12Resource> prev_scene_tex, prev_scene_upload, prev_albedo_tex, prev_albedo_upload;
   ComPtr<ID3D12Resource> prev_mrt2_tex, prev_mrt2_upload, motion_tex, motion_upload;
@@ -1178,6 +1207,8 @@ int RunRtxdiDxrBridge() {
                            3 * 4 * sizeof(float), &albedo_tex, &albedo_upload)
       || !CreateTextureUpload(device.Get(), list.Get(), DXGI_FORMAT_R32G32B32A32_UINT, 3, 2, mrt2_pixels.data(),
                               3 * 4 * sizeof(uint32_t), &mrt2_tex, &mrt2_upload)
+      || !CreateTextureUpload(device.Get(), list.Get(), DXGI_FORMAT_R32G32B32A32_UINT, 3, 2, mrt1_pixels.data(),
+                              3 * 4 * sizeof(uint32_t), &mrt1_tex, &mrt1_upload)
       || !CreateTextureUpload(device.Get(), list.Get(), DXGI_FORMAT_R32_FLOAT, 3, 2, depths.data(),
                               3 * sizeof(float), &prev_depth_tex, &prev_depth_upload)
       || !CreateTextureUpload(device.Get(), list.Get(), DXGI_FORMAT_R32G32B32A32_UINT, 3, 2, normal_pixels.data(),
@@ -1281,6 +1312,7 @@ int RunRtxdiDxrBridge() {
   const UINT64 di_reservoir_bytes = UINT64{di_reservoir_elements} * sizeof(RTXDI_PackedDIReservoir);
   const UINT64 di_raw_bytes = UINT64{di_guard_count} * sizeof(RtxdiDiRawResult);
   ComPtr<ID3D12Resource> di_types, di_reservoirs, di_raw, di_resolved, di_resolved_readback;
+  ComPtr<ID3D12Resource> n1_diffuse, n1_specular, n1_status, n1_diffuse_readback, n1_specular_readback, n1_status_readback;
   ComPtr<ID3D12Resource> di_type_readback, di_reservoir_readback, di_raw_readback;
   ComPtr<ID3D12Resource> di_type_upload, di_reservoir_upload, di_raw_upload;
   if (!CreateDefaultBuffer(device.Get(), sizeof(uint32_t) * lights.size(), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
@@ -1291,6 +1323,12 @@ int RunRtxdiDxrBridge() {
                               D3D12_RESOURCE_STATE_COMMON, &di_raw)
       || !CreateTexture(device.Get(), DXGI_FORMAT_R32G32B32A32_UINT, 3u, 2u, 1u,
                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &di_resolved)
+      || !CreateTexture(device.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 3u, 2u, 1u,
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &n1_diffuse)
+      || !CreateTexture(device.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 3u, 2u, 1u,
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &n1_specular)
+      || !CreateTexture(device.Get(), DXGI_FORMAT_R32_UINT, 3u, 2u, 1u,
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &n1_status)
       || !UploadBuffer(device.Get(), lights.data(), sizeof(uint32_t) * lights.size(), &di_type_upload)) return 1;
   std::vector<RTXDI_PackedDIReservoir> reservoir_sentinel(di_reservoir_elements);
   std::memset(reservoir_sentinel.data(), 0xEF, di_reservoir_bytes);
@@ -1306,7 +1344,19 @@ int RunRtxdiDxrBridge() {
   const D3D12_RESOURCE_DESC resolved_desc = di_resolved->GetDesc();
   device->GetCopyableFootprints(&resolved_desc, 0u, 1u, 0u, &resolved_footprint, &resolved_readback_rows,
                                 nullptr, &resolved_readback_bytes);
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT n1_diffuse_footprint = {}, n1_specular_footprint = {}, n1_status_footprint = {};
+  UINT n1_rows = 0u;
+  UINT64 n1_diffuse_bytes = 0u, n1_specular_bytes = 0u, n1_status_bytes = 0u;
+  const D3D12_RESOURCE_DESC n1_diffuse_desc = n1_diffuse->GetDesc();
+  const D3D12_RESOURCE_DESC n1_specular_desc = n1_specular->GetDesc();
+  const D3D12_RESOURCE_DESC n1_status_desc = n1_status->GetDesc();
+  device->GetCopyableFootprints(&n1_diffuse_desc, 0u, 1u, 0u, &n1_diffuse_footprint, &n1_rows, nullptr, &n1_diffuse_bytes);
+  device->GetCopyableFootprints(&n1_specular_desc, 0u, 1u, 0u, &n1_specular_footprint, &n1_rows, nullptr, &n1_specular_bytes);
+  device->GetCopyableFootprints(&n1_status_desc, 0u, 1u, 0u, &n1_status_footprint, &n1_rows, nullptr, &n1_status_bytes);
   const auto resolved_readback_desc = BufferDesc(resolved_readback_bytes);
+  const auto n1_diffuse_readback_desc = BufferDesc(n1_diffuse_bytes);
+  const auto n1_specular_readback_desc = BufferDesc(n1_specular_bytes);
+  const auto n1_status_readback_desc = BufferDesc(n1_status_bytes);
   const auto type_readback_desc = BufferDesc(sizeof(uint32_t) * lights.size());
   const auto readback_properties_di = Heap(D3D12_HEAP_TYPE_READBACK);
   if (!Check(device->CreateCommittedResource(&readback_properties_di, D3D12_HEAP_FLAG_NONE, &readback_desc,
@@ -1321,6 +1371,18 @@ int RunRtxdiDxrBridge() {
                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                 IID_PPV_ARGS(&di_resolved_readback)),
                 "create DI resolved readback")
+      || !Check(device->CreateCommittedResource(&readback_properties_di, D3D12_HEAP_FLAG_NONE, &n1_diffuse_readback_desc,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&n1_diffuse_readback)),
+                "create N1 diffuse readback")
+      || !Check(device->CreateCommittedResource(&readback_properties_di, D3D12_HEAP_FLAG_NONE, &n1_specular_readback_desc,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&n1_specular_readback)),
+                "create N1 specular readback")
+      || !Check(device->CreateCommittedResource(&readback_properties_di, D3D12_HEAP_FLAG_NONE, &n1_status_readback_desc,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&n1_status_readback)),
+                "create N1 status readback")
       || !Check(device->CreateCommittedResource(&readback_properties_di, D3D12_HEAP_FLAG_NONE, &type_readback_desc,
                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                 IID_PPV_ARGS(&di_type_readback)),
@@ -1328,7 +1390,7 @@ int RunRtxdiDxrBridge() {
 
   D3D12_DESCRIPTOR_HEAP_DESC di_heap_desc = {};
   di_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  di_heap_desc.NumDescriptors = 35u;
+  di_heap_desc.NumDescriptors = 39u;
   di_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   ComPtr<ID3D12DescriptorHeap> di_heap;
   if (!Check(device->CreateDescriptorHeap(&di_heap_desc, IID_PPV_ARGS(&di_heap)), "create initial DI heap")) return 1;
@@ -1356,6 +1418,7 @@ int RunRtxdiDxrBridge() {
   device->CreateShaderResourceView(albedo_tex.Get(), &albedo_srv, di_cpu_at(9u));
   D3D12_SHADER_RESOURCE_VIEW_DESC mrt2_srv = uint4_srv;
   device->CreateShaderResourceView(mrt2_tex.Get(), &mrt2_srv, di_cpu_at(10u));
+  device->CreateShaderResourceView(mrt1_tex.Get(), &uint4_srv, di_cpu_at(35u));
   CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 11u, deferred_upload.Get(), 2u, RTXDI_INPUT_DEFERRED_STRIDE);
   std::array<int8_t, falcom_world::rtxdi::kNeighborCount * 2u> neighbor_offsets = {};
   for (UINT i = 0u; i < falcom_world::rtxdi::kNeighborCount; ++i) neighbor_offsets[i * 2u] = 32;
@@ -1399,6 +1462,15 @@ int RunRtxdiDxrBridge() {
   device->CreateUnorderedAccessView(di_resolved.Get(), nullptr, &resolved_output_uav, di_cpu_at(20u));
   CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 33u, tile_upload.Get(), RTXDI_INPUT_MAX_TILES, sizeof(RtxdiTileData));
   create_di_uav(34u, di_types.Get(), 4u, sizeof(uint32_t));
+  const auto create_n1_texture_uav = [&](UINT index, ID3D12Resource* resource, DXGI_FORMAT format) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
+    view.Format = format;
+    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(resource, nullptr, &view, di_cpu_at(index));
+  };
+  create_n1_texture_uav(36u, n1_diffuse.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
+  create_n1_texture_uav(37u, n1_specular.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
+  create_n1_texture_uav(38u, n1_status.Get(), DXGI_FORMAT_R32_UINT);
   CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 31u, tile_upload.Get(), RTXDI_INPUT_MAX_TILES, sizeof(RtxdiTileData));
   CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 32u, tile_upload.Get(), RTXDI_INPUT_MAX_TILES, sizeof(RtxdiTileData));
 
@@ -1426,7 +1498,7 @@ int RunRtxdiDxrBridge() {
                 "create classifier root")
       || !CreatePso(device.Get(), classify_root.Get(), __world_rtxdi_classify_lights, &classify_pso)) return 1;
 
-  D3D12_DESCRIPTOR_RANGE di_ranges[9] = {};
+  D3D12_DESCRIPTOR_RANGE di_ranges[11] = {};
   di_ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4u, 0u, 0u, 0u};
   di_ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3u, 14u, 0u, 4u};
   di_ranges[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 6u, 17u, 0u, 7u};
@@ -1436,20 +1508,25 @@ int RunRtxdiDxrBridge() {
   di_ranges[6] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3u, 0u, 0u, 18u};
   di_ranges[7] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 9u, 34u, 0u, 22u};
   di_ranges[8] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2u, 43u, 0u, 31u};
-  D3D12_ROOT_PARAMETER di_params[3] = {};
+  di_ranges[9] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 45u, 0u, 35u};
+  di_ranges[10] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3u, 3u, 0u, 36u};
+  D3D12_ROOT_PARAMETER di_params[4] = {};
   di_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   di_params[0].Constants.Num32BitValues = 17u;
   di_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   di_params[1].Descriptor.ShaderRegister = 1u;
   di_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  di_params[2].DescriptorTable.NumDescriptorRanges = 9u;
+  di_params[2].DescriptorTable.NumDescriptorRanges = 11u;
   di_params[2].DescriptorTable.pDescriptorRanges = di_ranges;
+  di_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  di_params[3].Constants.Num32BitValues = 8u;
+  di_params[3].Constants.ShaderRegister = 12u;
   D3D12_ROOT_SIGNATURE_DESC di_root_desc = {};
-  di_root_desc.NumParameters = 3u;
+  di_root_desc.NumParameters = 4u;
   di_root_desc.pParameters = di_params;
   ComPtr<ID3DBlob> di_root_blob, di_root_errors;
   ComPtr<ID3D12RootSignature> di_root;
-  ComPtr<ID3D12PipelineState> di_pso, di_temporal_pso, di_spatial_pso;
+  ComPtr<ID3D12PipelineState> di_pso, di_temporal_pso, di_spatial_pso, n1_reconstruct_pso;
   if (!Check(D3D12SerializeRootSignature(&di_root_desc, D3D_ROOT_SIGNATURE_VERSION_1,
                                          &di_root_blob, &di_root_errors),
              "serialize DI root")
@@ -1458,7 +1535,8 @@ int RunRtxdiDxrBridge() {
                 "create DI root")
       || !CreatePso(device.Get(), di_root.Get(), __world_rtxdi_initial_di, &di_pso)
       || !CreatePso(device.Get(), di_root.Get(), __world_rtxdi_temporal_di, &di_temporal_pso)
-      || !CreatePso(device.Get(), di_root.Get(), __world_rtxdi_spatial_di, &di_spatial_pso)) return 1;
+      || !CreatePso(device.Get(), di_root.Get(), __world_rtxdi_spatial_di, &di_spatial_pso)
+      || !CreatePso(device.Get(), di_root.Get(), __world_rtxdi_reconstruct, &n1_reconstruct_pso)) return 1;
 
   D3D12_DESCRIPTOR_RANGE raw_guard_range = {};
   raw_guard_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
@@ -1497,6 +1575,13 @@ int RunRtxdiDxrBridge() {
   const auto upload_current_mrt2 = [&]() {
     return update_pixel_texture(mrt2_tex.Get(), mrt2_upload.Get(), mrt2_pixels.data(), 3u * 4u * sizeof(uint32_t));
   };
+  std::array<uint16_t, 3> n1_scale_diffuse = {};
+  std::array<uint16_t, 3> n1_scale_specular = {};
+  std::array<uint16_t, 3> n1_scale_specular_hit_t = {};
+  std::array<uint16_t, 4> n1_formula_diffuse = {};
+  std::array<uint16_t, 4> n1_formula_specular = {};
+  float n1_formula_inverse_pdf = 0.0f;
+  std::array<float, 7> n1_test_config = {0.0f, 1.0f, 0.0f, 1.0f, 4.0f, 0.04f, 1.0f};
   auto run_di = [&](UINT mask_index, UINT local_lights, bool coverage_valid, UINT expected_status,
                     UINT expected_reason, int expected_light_index, const char* label, bool check_types,
                     UINT deferred_count = 1u, bool spatial = false, UINT expected_spatial_m = 0u,
@@ -1596,10 +1681,45 @@ int RunRtxdiDxrBridge() {
       if (spatial) {
         list->SetPipelineState(di_spatial_pso.Get());
         list->Dispatch(1u, 1u, 1u);
-        D3D12_RESOURCE_BARRIER resolved_uav_barrier = {};
-        resolved_uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        resolved_uav_barrier.UAV.pResource = di_resolved.Get();
-        list->ResourceBarrier(1u, &resolved_uav_barrier);
+        D3D12_RESOURCE_BARRIER spatial_uav_barriers[2] = {};
+        spatial_uav_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        spatial_uav_barriers[0].UAV.pResource = di_resolved.Get();
+        spatial_uav_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        spatial_uav_barriers[1].UAV.pResource = di_raw.Get();
+        list->ResourceBarrier(2u, spatial_uav_barriers);
+
+        D3D12_RESOURCE_BARRIER n1_transitions[3] = {};
+        const auto set_n1_transition = [&](UINT index, ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
+                                           D3D12_RESOURCE_STATES after) {
+          n1_transitions[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          n1_transitions[index].Transition.pResource = resource;
+          n1_transitions[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          n1_transitions[index].Transition.StateBefore = before;
+          n1_transitions[index].Transition.StateAfter = after;
+        };
+        set_n1_transition(0u, n1_diffuse.Get(), D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        set_n1_transition(1u, n1_specular.Get(), D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        set_n1_transition(2u, n1_status.Get(), D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        list->ResourceBarrier(3u, n1_transitions);
+        list->SetPipelineState(n1_reconstruct_pso.Get());
+        const UINT n1_params[8] = {RTXDI_N1_CONFIG_VERSION,
+                                   std::bit_cast<UINT>(n1_test_config[0]), std::bit_cast<UINT>(n1_test_config[1]),
+                                   std::bit_cast<UINT>(n1_test_config[2]), std::bit_cast<UINT>(n1_test_config[3]),
+                                   std::bit_cast<UINT>(n1_test_config[4]), std::bit_cast<UINT>(n1_test_config[5]),
+                                   std::bit_cast<UINT>(n1_test_config[6])};
+        list->SetComputeRoot32BitConstants(3u, 8u, n1_params, 0u);
+        list->Dispatch(1u, 1u, 1u);
+        D3D12_RESOURCE_BARRIER n1_uav_barriers[3] = {};
+        n1_uav_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        n1_uav_barriers[0].UAV.pResource = n1_diffuse.Get();
+        n1_uav_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        n1_uav_barriers[1].UAV.pResource = n1_specular.Get();
+        n1_uav_barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        n1_uav_barriers[2].UAV.pResource = n1_status.Get();
+        list->ResourceBarrier(3u, n1_uav_barriers);
       }
     }
     D3D12_RESOURCE_BARRIER barriers[5] = {};
@@ -1637,21 +1757,65 @@ int RunRtxdiDxrBridge() {
       list->CopyTextureRegion(&resolved_destination, 0u, 0u, 0u, &resolved_source, nullptr);
       transition(3u, di_resolved.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
       list->ResourceBarrier(1u, &barriers[3]);
+
+      transition(3u, n1_diffuse.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      transition(4u, n1_specular.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      list->ResourceBarrier(2u, &barriers[3]);
+      D3D12_TEXTURE_COPY_LOCATION n1_source = {};
+      n1_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      D3D12_TEXTURE_COPY_LOCATION n1_destination = {};
+      n1_destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      n1_source.pResource = n1_diffuse.Get();
+      n1_destination.pResource = n1_diffuse_readback.Get();
+      n1_destination.PlacedFootprint = n1_diffuse_footprint;
+      list->CopyTextureRegion(&n1_destination, 0u, 0u, 0u, &n1_source, nullptr);
+      n1_source.pResource = n1_specular.Get();
+      n1_destination.pResource = n1_specular_readback.Get();
+      n1_destination.PlacedFootprint = n1_specular_footprint;
+      list->CopyTextureRegion(&n1_destination, 0u, 0u, 0u, &n1_source, nullptr);
+      transition(3u, n1_status.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      list->ResourceBarrier(1u, &barriers[3]);
+      n1_source.pResource = n1_status.Get();
+      n1_destination.pResource = n1_status_readback.Get();
+      n1_destination.PlacedFootprint = n1_status_footprint;
+      list->CopyTextureRegion(&n1_destination, 0u, 0u, 0u, &n1_source, nullptr);
+      transition(3u, n1_diffuse.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+      transition(4u, n1_specular.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+      list->ResourceBarrier(2u, &barriers[3]);
+      transition(3u, n1_status.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+      list->ResourceBarrier(1u, &barriers[3]);
     }
     transition(0u, di_types.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     transition(1u, di_reservoirs.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     transition(2u, di_raw.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     list->ResourceBarrier(3u, barriers);
-    if (!submit_wait() || !Check(allocator->Reset(), "reset local DI allocator")
+    const UINT64 info_messages_before_submit = info_queue->GetNumStoredMessages();
+    if (!submit_wait()) return false;
+    for (UINT64 message_index = info_messages_before_submit;
+         message_index < info_queue->GetNumStoredMessages(); ++message_index) {
+      SIZE_T message_size = 0;
+      if (FAILED(info_queue->GetMessage(message_index, nullptr, &message_size))) continue;
+      std::vector<uint8_t> message_storage(message_size);
+      auto* debug_message = reinterpret_cast<D3D12_MESSAGE*>(message_storage.data());
+      if (SUCCEEDED(info_queue->GetMessage(message_index, debug_message, &message_size))
+          && debug_message->Severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
+        std::fprintf(stderr, "FAIL %s generated D3D12 debug id=%d: %s\n", label,
+                     static_cast<int>(debug_message->ID), debug_message->pDescription);
+      }
+    }
+    if (!Check(allocator->Reset(), "reset local DI allocator")
         || !Check(base_list->Reset(allocator.Get(), nullptr), "reset local DI list")) return false;
     void* types_mapped = nullptr;
     void* reservoirs_mapped = nullptr;
     void* raw_mapped = nullptr;
     void* resolved_mapped = nullptr;
+    void* n1_diffuse_mapped = nullptr;
+    void* n1_specular_mapped = nullptr;
+    void* n1_status_mapped = nullptr;
     if (!Check(di_type_readback->Map(0u, nullptr, &types_mapped), "map local types")
         || !Check(di_reservoir_readback->Map(0u, nullptr, &reservoirs_mapped), "map local reservoirs")
         || !Check(di_raw_readback->Map(0u, nullptr, &raw_mapped), "map local raw result")) return false;
-    if (spatial && !Check(di_resolved_readback->Map(0u, nullptr, &resolved_mapped), "map local resolved output")) return false;
+    if (spatial && (!Check(di_resolved_readback->Map(0u, nullptr, &resolved_mapped), "map local resolved output") || !Check(n1_diffuse_readback->Map(0u, nullptr, &n1_diffuse_mapped), "map N1 diffuse") || !Check(n1_specular_readback->Map(0u, nullptr, &n1_specular_mapped), "map N1 specular") || !Check(n1_status_readback->Map(0u, nullptr, &n1_status_mapped), "map N1 status"))) return false;
     std::array<uint32_t, 4> read_types = {};
     std::memcpy(read_types.data(), types_mapped, sizeof(read_types));
     const auto* reservoirs = static_cast<const RTXDI_PackedDIReservoir*>(reservoirs_mapped);
@@ -1680,6 +1844,67 @@ int RunRtxdiDxrBridge() {
     for (UINT y = 0; y < 2u; ++y) {
       for (UINT x = 0; x < 3u; ++x) {
         const UINT pixel = y * 3u + x;
+        if (spatial) {
+          const auto* status_row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(n1_status_mapped)
+                                                                     + y * n1_status_footprint.Footprint.RowPitch);
+          const auto* diffuse_row = reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(n1_diffuse_mapped)
+                                                                      + y * n1_diffuse_footprint.Footprint.RowPitch);
+          const auto* specular_row = reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(n1_specular_mapped)
+                                                                       + y * n1_specular_footprint.Footprint.RowPitch);
+          if (y == 0u && x == 0u) {
+            if (std::strcmp(label, "RTXDI N1 formula capture") == 0) {
+              std::copy_n(diffuse_row, 4u, n1_formula_diffuse.begin());
+              std::copy_n(specular_row, 4u, n1_formula_specular.begin());
+            }
+            const char* scale_labels[] = {"RTXDI N1 MRT1.z 0", "RTXDI N1 MRT1.z 128", "RTXDI N1 MRT1.z 255"};
+            for (UINT scale_index = 0u; scale_index < 3u; ++scale_index) {
+              if (std::strcmp(label, scale_labels[scale_index]) == 0) {
+                n1_scale_diffuse[scale_index] = diffuse_row[0];
+                n1_scale_specular[scale_index] = specular_row[0];
+                n1_scale_specular_hit_t[scale_index] = specular_row[3];
+              }
+            }
+          }
+          uint32_t expected_n1_code = RTXDI_N1_STATUS_EMPTY;
+          bool expected_known = false;
+          if (raw[pixel].status == RTXDI_DI_STATUS_VISIBLE) {
+            expected_n1_code = RTXDI_N1_STATUS_VISIBLE;
+            expected_known = true;
+          } else if (raw[pixel].status == RTXDI_DI_STATUS_BLOCKED) {
+            expected_n1_code = RTXDI_N1_STATUS_BLOCKED;
+            expected_known = true;
+          } else if (raw[pixel].status == RTXDI_DI_STATUS_UNKNOWN) {
+            expected_n1_code = RTXDI_N1_STATUS_UNKNOWN;
+          } else if (raw[pixel].reason == RTXDI_DI_REASON_INVALID_SURFACE) {
+            expected_n1_code = RTXDI_N1_STATUS_INVALID;
+          }
+          const uint32_t expected_n1_mask = expected_n1_code | (expected_known ? RTXDI_N1_STATUS_KNOWN_BIT : 0u);
+          const bool outputs_zero = diffuse_row[x * 4u] == 0u && diffuse_row[x * 4u + 1u] == 0u
+                                    && diffuse_row[x * 4u + 2u] == 0u && diffuse_row[x * 4u + 3u] == 0u
+                                    && specular_row[x * 4u] == 0u && specular_row[x * 4u + 1u] == 0u
+                                    && specular_row[x * 4u + 2u] == 0u && specular_row[x * 4u + 3u] == 0u;
+          const bool diffuse_has_rgb = diffuse_row[x * 4u] != 0u || diffuse_row[x * 4u + 1u] != 0u
+                                       || diffuse_row[x * 4u + 2u] != 0u;
+          const bool specular_has_rgb = specular_row[x * 4u] != 0u || specular_row[x * 4u + 1u] != 0u
+                                        || specular_row[x * 4u + 2u] != 0u;
+          const bool n1_character = (status_row[x] & RTXDI_N1_STATUS_CHARACTER_BIT) != 0u;
+          const bool any_n1_rgb = diffuse_has_rgb || specular_has_rgb;
+          if ((status_row[x] & (RTXDI_N1_STATUS_KNOWN_BIT | 0x0fu)) != expected_n1_mask
+              || (!expected_known && !outputs_zero)
+              || (expected_n1_code == RTXDI_N1_STATUS_BLOCKED && !outputs_zero)
+              || (expected_n1_code == RTXDI_N1_STATUS_VISIBLE
+                  && ((diffuse_row[x * 4u + 3u] != 0u) != any_n1_rgb
+                      || (n1_character && specular_row[x * 4u + 3u] != 0u)
+                      || (!any_n1_rgb && specular_row[x * 4u + 3u] != 0u)))) {
+            std::fprintf(stderr, "FAIL %s N1 pixel=%u raw=%u/%u status=%u expected=%u diffuseA=%u specA=%u\n", label,
+                         pixel, raw[pixel].status, raw[pixel].reason, status_row[x], expected_n1_mask,
+                         diffuse_row[x * 4u + 3u], specular_row[x * 4u + 3u]);
+            ok = false;
+          }
+          if (std::strcmp(label, "RTXDI N1 visible environment output") == 0
+              && expected_n1_code == RTXDI_N1_STATUS_VISIBLE
+              && (diffuse_row[x * 4u] == 0u || specular_row[x * 4u] == 0u)) ok = false;
+        }
         if (!compatibility_only && (raw[pixel].status != expected_status || raw[pixel].reason != expected_reason)) {
           std::fprintf(stderr, "FAIL %s pixel=%u status=%u expected=%u reason=%u expectedReason=%u\n", label, pixel,
                        raw[pixel].status, expected_status, raw[pixel].reason, expected_reason);
@@ -1825,7 +2050,12 @@ int RunRtxdiDxrBridge() {
     di_type_readback->Unmap(0u, nullptr);
     di_reservoir_readback->Unmap(0u, nullptr);
     di_raw_readback->Unmap(0u, nullptr);
-    if (spatial) di_resolved_readback->Unmap(0u, nullptr);
+    if (spatial) {
+      di_resolved_readback->Unmap(0u, nullptr);
+      n1_diffuse_readback->Unmap(0u, nullptr);
+      n1_specular_readback->Unmap(0u, nullptr);
+      n1_status_readback->Unmap(0u, nullptr);
+    }
     if (ok && !suppress_di_pass) std::printf("PASS %s\n", label);
     return ok;
   };
@@ -1833,6 +2063,208 @@ int RunRtxdiDxrBridge() {
   di_frame.parameters.di.initialSamplingParams.numLocalLightSamples = 8u;
   di_frame.parameters.di.initialSamplingParams.localLightSamplingMode = ReSTIRDI_LocalLightSamplingMode::Uniform;
   if (!run_di(4u, 4u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0, "RTXDI point sample, empty-scene visible, odd 3x2 guard", true)) return 1;
+  lights[0].translucency = 1.0f;
+  if (!update_upload(light_upload.Get(), lights.data(), sizeof(lights))
+      || !run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+                 "RTXDI N1 visible environment output", true, 2u, true)) return 1;
+  const std::array<uint32_t, 3> mrt1_specular_scales = {0u, 128u, 255u};
+  const char* mrt1_scale_labels[] = {"RTXDI N1 MRT1.z 0", "RTXDI N1 MRT1.z 128", "RTXDI N1 MRT1.z 255"};
+  for (UINT scale_index = 0u; scale_index < mrt1_specular_scales.size(); ++scale_index) {
+    for (UINT pixel = 0u; pixel < 6u; ++pixel) mrt1_pixels[pixel * 4u + 2u] = mrt1_specular_scales[scale_index];
+    if (!update_pixel_texture(mrt1_tex.Get(), mrt1_upload.Get(), mrt1_pixels.data(), 3u * 4u * sizeof(uint32_t))
+        || !run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0, mrt1_scale_labels[scale_index],
+                   true, 2u, true)) return 1;
+  }
+  const float specular_scale_ratio = HalfToFloat(n1_scale_specular[1]) / HalfToFloat(n1_scale_specular[2]);
+  if (n1_scale_specular[0] != 0u || n1_scale_specular[1] == 0u
+      || n1_scale_specular[2] <= n1_scale_specular[1] || n1_scale_diffuse[0] != n1_scale_diffuse[1]
+      || n1_scale_diffuse[1] != n1_scale_diffuse[2]
+      || n1_scale_specular_hit_t[0] == 0u || n1_scale_specular_hit_t[1] == 0u
+      || n1_scale_specular_hit_t[2] == 0u
+      || !std::isfinite(specular_scale_ratio)
+      || std::abs(specular_scale_ratio - (128.0f / 255.0f)) > 0.005f) {
+    std::fprintf(stderr, "FAIL RTXDI N1 MRT1.z scale diffuse=%u,%u,%u specular=%u,%u,%u hitT=%u,%u,%u ratio=%g\n",
+                 n1_scale_diffuse[0], n1_scale_diffuse[1], n1_scale_diffuse[2], n1_scale_specular[0],
+                 n1_scale_specular[1], n1_scale_specular[2], n1_scale_specular_hit_t[0],
+                 n1_scale_specular_hit_t[1], n1_scale_specular_hit_t[2], specular_scale_ratio);
+    return 1;
+  }
+  std::printf("PASS RTXDI N1 MRT1.z scales specular 0/128/255 with invariant diffuse ratio=%g\n",
+              specular_scale_ratio);
+  for (UINT pixel = 0u; pixel < 6u; ++pixel) mrt1_pixels[pixel * 4u + 2u] = 255u;
+  if (!update_pixel_texture(mrt1_tex.Get(), mrt1_upload.Get(), mrt1_pixels.data(), 3u * 4u * sizeof(uint32_t))) return 1;
+
+  const auto original_formula_light = lights[0];
+  const auto original_formula_deferred = deferred[0];
+  const auto original_formula_tile = tile_records[0];
+  lights[0].color[0] = 2.0f;
+  lights[0].color[1] = 3.0f;
+  lights[0].color[2] = 4.0f;
+  lights[0].radius_inv = 0.5f;
+  lights[0].attenuation = 2.0f;
+  lights[0].attenuation_angle = 1.0f;
+  lights[0].spot_angle_inv = 1.0f;
+  lights[0].vec[0] = 0.6f;
+  lights[0].vec[1] = 0.0f;
+  lights[0].vec[2] = 0.8f;
+  lights[0].pos[0] = surface.position[0] + 0.6f;
+  lights[0].pos[1] = surface.position[1];
+  lights[0].pos[2] = surface.position[2] + 0.8f;
+  lights[0].translucency = 0.9f;
+  lights[0].specular_intensity = 1.5f;
+  lights[0].specular_glossiness = 16.0f;
+  const std::array<float, 3> colored_f0 = {0.02f, 0.06f, 0.1f};
+  std::memcpy(deferred[0].bytes + 16u, colored_f0.data(), sizeof(colored_f0));
+  tile_records[0].point_count = 1u;
+  tile_records[0].point_indices[0] = 0;
+  tile_records[0].spot_count = 0u;
+  if (!update_upload(light_upload.Get(), lights.data(), sizeof(lights)) || !upload_deferred_pair()
+      || !update_upload(tile_upload.Get(), tile_records.data(), tile_records.size() * sizeof(RtxdiTileData))) return 1;
+  for (UINT pixel = 0u; pixel < 6u; ++pixel) mrt1_pixels[pixel * 4u + 2u] = 128u;
+  if (!update_pixel_texture(mrt1_tex.Get(), mrt1_upload.Get(), mrt1_pixels.data(), 3u * 4u * sizeof(uint32_t))) return 1;
+  n1_test_config = {0.0f, 1.0f, 0.0f, 0.0f, 4.0f, 0.04f, 1.0f};
+  float formula_inverse_pdf = 0.0f;
+  if (!run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+              "RTXDI N1 formula capture", false, 1u, true, 0u, false, false, false, false, true, false,
+              nullptr, nullptr, nullptr, nullptr, &formula_inverse_pdf)) return 1;
+  const auto check_n1_formula = [&](bool spot_light, const char* case_name) {
+    const float dx = lights[0].pos[0] - surface.position[0];
+    const float dy = lights[0].pos[1] - surface.position[1];
+    const float dz = lights[0].pos[2] - surface.position[2];
+    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (!std::isfinite(distance) || distance <= 0.0f) return false;
+    const std::array<float, 3> direction = {dx / distance, dy / distance, dz / distance};
+    const float ndotl_raw = direction[2];  // Current N1 input MRT0 encodes +Z for this fixture.
+    const float ndotl = (std::clamp)(ndotl_raw, 0.0f, 1.0f);
+    const float lit = (std::max)((std::max)(0.0f, ndotl_raw), lights[0].translucency);
+    const float attenuation = (std::max)(0.0f, 1.0f - std::pow(std::abs(distance * lights[0].radius_inv), lights[0].attenuation));
+    const float spot_dot = direction[0] * lights[0].vec[0] + direction[1] * lights[0].vec[1]
+                           + direction[2] * lights[0].vec[2];
+    const float spot = spot_light
+                           ? (std::max)(0.0f, 1.0f - std::pow((1.0f - (std::max)(0.0f, spot_dot)) * lights[0].spot_angle_inv, lights[0].attenuation_angle))
+                           : 1.0f;
+    const uint32_t packed_gloss = mrt2_pixels[1u];
+    const float gloss_x = static_cast<float>(packed_gloss & 31u) / 31.0f;
+    const float gloss_y = static_cast<float>((packed_gloss >> 5u) & 31u) / 31.0f;
+    float material_gloss[3] = {};
+    std::memcpy(material_gloss, deferred[0].bytes + 64u, sizeof(material_gloss));
+    const float gloss = (std::lerp)((std::lerp)(material_gloss[0], material_gloss[1], gloss_x),
+                                    material_gloss[2], gloss_y);
+    const float exponent = (std::max)(0.001f, lights[0].specular_glossiness * gloss);
+    const float hx = surface.view[0] + direction[0];
+    const float hy = surface.view[1] + direction[1];
+    const float hz = surface.view[2] + direction[2];
+    const float half_length = std::sqrt(hx * hx + hy * hy + hz * hz);
+    const float ndoth = half_length > 1e-6f
+                            ? (std::max)(0.0f, hz / half_length)  // Current N1 input MRT0 encodes +Z.
+                            : 0.0f;
+    const float blinn = std::pow(ndoth, exponent);
+    const float expected_diffuse_scale = attenuation * spot * lit * formula_inverse_pdf;
+    const float expected_specular_scale = lights[0].specular_intensity * (attenuation * spot * lit * blinn)
+                                          * (128.0f / 255.0f) * formula_inverse_pdf;
+    const float actual_diffuse[3] = {HalfToFloat(n1_formula_diffuse[0]), HalfToFloat(n1_formula_diffuse[1]),
+                                     HalfToFloat(n1_formula_diffuse[2])};
+    const float actual_specular[3] = {HalfToFloat(n1_formula_specular[0]), HalfToFloat(n1_formula_specular[1]),
+                                      HalfToFloat(n1_formula_specular[2])};
+    for (UINT channel = 0u; channel < 3u; ++channel) {
+      const float expected_diffuse = lights[0].color[channel] * expected_diffuse_scale;
+      const float expected_specular = lights[0].color[channel] * expected_specular_scale;
+      if (std::abs(actual_diffuse[channel] - expected_diffuse) > (std::max)(0.002f, expected_diffuse * 0.003f)
+          || std::abs(actual_specular[channel] - expected_specular) > (std::max)(0.002f, expected_specular * 0.01f)) {
+        std::fprintf(stderr,
+                     "FAIL %s channel=%u diffuse=%g expected=%g specular=%g expected=%g A=%g spot=%g lit=%g n=%g invPdf=%g\n",
+                     case_name, channel, actual_diffuse[channel], expected_diffuse, actual_specular[channel],
+                     expected_specular, attenuation, spot, lit, ndotl, formula_inverse_pdf);
+        return false;
+      }
+    }
+    return attenuation > 0.0f && (!spot_light || (spot > 0.0f && spot < 1.0f)) && lights[0].translucency > ndotl;
+  };
+  if (!check_n1_formula(false, "RTXDI N1 point game formula")) return 1;
+  std::printf("PASS RTXDI N1 point game formula A!=1, translucency>NdotL, colored lamp/F0, inverse PDF, MRT1 scale\n");
+
+  lights[0].pos[0] = surface.position[0] + 1.0f;
+  lights[0].pos[2] = surface.position[2];
+  lights[0].translucency = 0.4f;
+  if (!update_upload(light_upload.Get(), lights.data(), sizeof(lights))) return 1;
+  formula_inverse_pdf = 0.0f;
+  if (!run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+              "RTXDI N1 formula capture", false, 1u, true, 0u, false, false, false, false, true, false,
+              nullptr, nullptr, nullptr, nullptr, &formula_inverse_pdf)
+      || !check_n1_formula(false, "RTXDI N1 zero NdotL translucent game formula")) return 1;
+  std::printf("PASS RTXDI N1 NdotL=0 with positive translucency follows game terms\n");
+
+  lights[0].pos[0] = surface.position[0] + 0.6f;
+  lights[0].pos[2] = surface.position[2] + 0.8f;
+  lights[0].translucency = 0.9f;
+  lights[0].vec[0] = 0.8f;
+  lights[0].vec[2] = 0.6f;
+  tile_records[0].point_count = 0u;
+  tile_records[0].spot_count = 1u;
+  tile_records[0].spot_indices[0] = 0;
+  if (!update_upload(light_upload.Get(), lights.data(), sizeof(lights))
+      || !update_upload(tile_upload.Get(), tile_records.data(), tile_records.size() * sizeof(RtxdiTileData))) return 1;
+  n1_test_config[3] = 0.0f;
+  formula_inverse_pdf = 0.0f;
+  if (!run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+              "RTXDI N1 formula capture", false, 1u, true, 0u, false, false, false, false, true, false,
+              nullptr, nullptr, nullptr, nullptr, &formula_inverse_pdf)
+      || !check_n1_formula(true, "RTXDI N1 spot game formula")) return 1;
+  std::printf("PASS RTXDI N1 spot game formula cone!=1, attenuation!=1, translucency>NdotL\n");
+
+  tile_records[0].point_count = 1u;
+  tile_records[0].spot_count = 0u;
+  if (!update_upload(light_upload.Get(), lights.data(), sizeof(lights))
+      || !update_upload(tile_upload.Get(), tile_records.data(), tile_records.size() * sizeof(RtxdiTileData))) return 1;
+  n1_test_config[2] = 1.0f;
+  n1_test_config[3] = 0.0f;
+  formula_inverse_pdf = 0.0f;
+  if (!run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+              "RTXDI N1 formula capture", false, 1u, true, 0u, false, false, false, false, true, false,
+              nullptr, nullptr, nullptr, nullptr, &formula_inverse_pdf)
+      || !check_n1_formula(false, "RTXDI N1 GGX strength zero game formula")) return 1;
+  const std::array<uint16_t, 4> strength_zero = n1_formula_specular;
+  n1_test_config[3] = 0.5f;
+  if (!run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+              "RTXDI N1 formula capture", false, 1u, true, 0u, false, false, false, false, true, false,
+              nullptr, nullptr, nullptr, nullptr, &formula_inverse_pdf)) return 1;
+  const std::array<uint16_t, 4> strength_half = n1_formula_specular;
+  n1_test_config[3] = 1.0f;
+  if (!run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+              "RTXDI N1 formula capture", false, 1u, true, 0u, false, false, false, false, true, false,
+              nullptr, nullptr, nullptr, nullptr, &formula_inverse_pdf)) return 1;
+  const std::array<uint16_t, 4> strength_one = n1_formula_specular;
+  for (UINT channel = 0u; channel < 3u; ++channel) {
+    const float zero = HalfToFloat(strength_zero[channel]);
+    const float half = HalfToFloat(strength_half[channel]);
+    const float one = HalfToFloat(strength_one[channel]);
+    if (!std::isfinite(zero) || !std::isfinite(half) || !std::isfinite(one)
+        || std::abs(half - 0.5f * (zero + one)) > (std::max)(0.002f, one * 0.01f)) {
+      std::fprintf(stderr, "FAIL RTXDI N1 GGX strength channel=%u zero=%g half=%g one=%g\n", channel, zero, half,
+                   one);
+      return 1;
+    }
+  }
+  const float ggx_red = HalfToFloat(strength_one[0]) / lights[0].color[0];
+  const float ggx_green = HalfToFloat(strength_one[1]) / lights[0].color[1];
+  const float ggx_blue = HalfToFloat(strength_one[2]) / lights[0].color[2];
+  if (!(ggx_green > ggx_red * 1.4f && ggx_blue > ggx_green * 1.4f)) {
+    std::fprintf(stderr, "FAIL RTXDI N1 colored F0 collapsed specular channels %g,%g,%g\n", ggx_red, ggx_green,
+                 ggx_blue);
+    return 1;
+  }
+  std::printf("PASS RTXDI N1 specular strength 0/0.5/1 blends full colored GGX result F0=%g,%g,%g\n", ggx_red,
+              ggx_green, ggx_blue);
+  n1_test_config = {0.0f, 1.0f, 0.0f, 1.0f, 4.0f, 0.04f, 1.0f};
+  lights[0] = original_formula_light;
+  deferred[0] = original_formula_deferred;
+  tile_records[0] = original_formula_tile;
+  if (!update_upload(light_upload.Get(), lights.data(), sizeof(lights)) || !upload_deferred_pair()
+      || !update_upload(tile_upload.Get(), tile_records.data(), tile_records.size() * sizeof(RtxdiTileData))) return 1;
+  for (UINT pixel = 0u; pixel < 6u; ++pixel) mrt1_pixels[pixel * 4u + 2u] = 255u;
+  if (!update_pixel_texture(mrt1_tex.Get(), mrt1_upload.Get(), mrt1_pixels.data(), 3u * 4u * sizeof(uint32_t))) return 1;
+  lights[0].translucency = 0.0f;
+  if (!update_upload(light_upload.Get(), lights.data(), sizeof(lights))) return 1;
   const auto original_albedo_pixels = albedo_pixels;
   for (size_t pixel = 0; pixel < 6u; ++pixel) {
     albedo_pixels[pixel * 4u + 0u] = 1.0f;
