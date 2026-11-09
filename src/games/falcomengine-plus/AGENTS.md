@@ -2,12 +2,21 @@
 
 Scope: `src/games/falcomengine-plus/`. Long-lived graphics project: ray tracing for Trails in the Sky 2nd Chapter (D3D11) on RenoDX. Correctness, maintainability and compatibility come before quick local fixes.
 
-**Before any work on `world/` (BVH, ray tracing, pool, deforming/moving meshes), read `world/docs/ROADMAP.md`.** Its "Current state" section holds what is deployed and awaiting in-game validation and the next steps; "Reference" holds the code map, invariants, test harness, owner preferences and the per-path design notes. The rounds after those sections are the full history with the evidence behind each decision. `world/docs/ROADMAP.md` is the only handoff document.
+**Start each task by reading `README.md`.** Use its technique index and shared-resource map to find the authoritative source files and focused documentation.
+
+Before work on `world/` (BVH, ray tracing, pool, deforming/moving meshes), read the relevant "Open problems", "Current state", and subsystem sections in `world/docs/ROADMAP.md`. It is the world-ray-tracing handoff; `world/docs/HISTORY.md` preserves past decisions and their evidence.
+
+README maintenance rules:
+
+- Every technique or feature description in `README.md` must be at most three sentences. Put implementation paths, resource inputs, and research/upstream/license links in separate link lists or table fields.
+- When implementing a feature or technique, update the README in the same change with its purpose, technique, implementation path, important inputs, and relevant resource provenance. Update its entry when code or resource ownership moves, and remove obsolete entries when a feature is removed.
+- Keep the README as a concise index. Do not duplicate settings details, test procedures, design documents, history, or changing validation/status claims; link to the authoritative source instead.
+- Keep entries current by checking their source paths, resource bindings, and attribution links while making related changes. State only resource origins and technique behavior verified in the repository or an adjacent authoritative reference.
 
 ## Standing instructions from the project owner
 
 - "No mistakes. No regressions." Work step by step: one milestone at a time, validated in game before the next.
-- Stay inside `falcomengine-plus/`. Do not modify the generic RenoDX framework (`src/utils`, `src/mods`, `external`, CMake) unless the capability is genuinely framework-wide; then first state why it cannot be local, who else benefits, what could regress and which local alternatives were considered. Dependency direction: RenoDX framework -> Falcom Engine+ integration -> Falcom-specific systems.
+- Stay inside `falcomengine-plus/`. Do not modify the generic RenoDX framework (`src/utils`, `src/mods`, `external`, CMake).
 - Shader hashes identify stable, broadly reused renderer behavior (lighting, post, stable passes). Do not use them to special-case individual meshes/materials/variants; generalize behavior instead (the classifier in `world/contract/` recognizes shaders from bytecode).
 
 ## How to work here

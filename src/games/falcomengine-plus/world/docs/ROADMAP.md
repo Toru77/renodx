@@ -1,8 +1,6 @@
-# Falcom Engine+ Ray Tracing Roadmap (snapshot 2026-10-22)
+# Falcom Engine+ Ray Tracing Handoff (snapshot 2026-11-09)
 
-Canonical, editable version: the "Falcom Engine+ Ray Tracing Roadmap" doc (https://claude.ai/code/artifact/f99ea9fb-cd29-48ca-a166-a8e25db546c3). This file is a snapshot for future sessions.
-
-This is the only handoff document for `world/`. Read "Open problems", "Current state" and "Reference" before working. Round-by-round history and the evidence behind each decision is in `HISTORY.md`. RTAO owner test scripts are in `RTAO_DIAG_STEPS.md`. Project rules are in `../../AGENTS.md`.
+This is the repository handoff for `world/`. Read the relevant "Open problems", "Current state" and "Reference" sections before changing a subsystem. Round-by-round history and the evidence behind past decisions are in `HISTORY.md`. Project entry point and source map: `../../README.md`; project rules: `../../AGENTS.md`.
 
 ## Open problems (owner reports, 2026-10-14)
 
@@ -179,7 +177,6 @@ ReSTIR GI M3b (Eq. 9 target), implemented, not validated in game: the resampling
 | Path 3: alpha-tested foliage (default ON since 2026-10-09) | Six-step owner order | Reference: Path 3 |
 | Foliage motion: CPU sway approximation (P-1, P-4) | Not planned yet (see Open decisions) | HISTORY: Owner decisions and dump findings |
 | Sign latency (P-3): P2b and orphan timing | Follow-lag readout, ghosts | Reference: Path 2; HISTORY: Work plan |
-| RTAO round 1 and round 2 (temporal, D1 discovery) | Round 2 steps; D2 to D5 | Reference: RTAO; RTAO_DIAG_STEPS.md |
 | RTAO trace resolution (M5) | Trace Resolution Full, Half, Quarter | HISTORY: RTAO trace resolution (M5) |
 | RTAO on characters, Character Intensity, Max Darkening | Slider checks | HISTORY: RTAO on characters |
 | RTAO Foliage skip, alpha-tested skip (M6a) | Foliage skip On and Off | HISTORY: RTAO Foliage skip; Foliage skip covers alpha-tested meshes |
