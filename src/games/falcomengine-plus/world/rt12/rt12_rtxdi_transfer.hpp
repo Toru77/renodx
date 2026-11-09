@@ -34,6 +34,7 @@ struct Rt12DiInputResult {
 enum class Rt12DiTextureKind { Float,
                                Motion,
                                Uint4,
+                               Uint,
                                Uint2 };
 
 inline bool ValidateDiTexture(reshade::api::resource_view source, uint32_t width, uint32_t height, Rt12DiTextureKind kind) {
@@ -56,6 +57,9 @@ inline bool ValidateDiTexture(reshade::api::resource_view source, uint32_t width
     case Rt12DiTextureKind::Uint4:
       format_ok = desc.Format == DXGI_FORMAT_R8G8B8A8_UINT || desc.Format == DXGI_FORMAT_R16G16B16A16_UINT
                   || desc.Format == DXGI_FORMAT_R32G32B32A32_UINT;
+      break;
+    case Rt12DiTextureKind::Uint:
+      format_ok = desc.Format == DXGI_FORMAT_R32_UINT;
       break;
     case Rt12DiTextureKind::Uint2:
       format_ok = desc.Format == DXGI_FORMAT_R16G16_UINT || desc.Format == DXGI_FORMAT_R32G32_UINT;
@@ -175,7 +179,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       return result;
     }
     // Each slot is replaced only after its B fence completes.
-    if (!slot.allocator || slot.width != in.width || slot.height != in.height || slot.local != in.local
+    if (!slot.allocator || slot.width != in.width || slot.height != in.height || slot.local != in.local || slot.sun != in.sun
         || slot.motion_available != motion_available) {
       if (transfer.configuration_generation == UINT64_MAX) {
         result.status = rtxdi::InputStatus::AllocationFailed;
@@ -185,7 +189,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       auto destroy_candidate = [&](Rt12DiTransferSlot*) {
         for (Rt12Shared* shared : {&candidate.depth, &candidate.normal, &candidate.scene, &candidate.color, &candidate.mrt1,
                                    &candidate.mrt2, &candidate.motion, &candidate.lights, &candidate.tiles, &candidate.deferred,
-                                   &candidate.di_resolved}) {
+                                   &candidate.di_resolved, &candidate.sun_visibility}) {
           if (shared->srv11.handle) {
             device->destroy_resource_view(shared->srv11);
           }
@@ -216,6 +220,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
         if (ok) ok = make_shared(&candidate.di_resolved, DXGI_FORMAT_R32G32B32A32_UINT, in.width, in.height);
       }
       if (ok && motion_available) ok = make_shared(&candidate.motion, DXGI_FORMAT_R32G32B32A32_FLOAT, in.width, in.height);
+      if (ok && in.sun) ok = make_shared(&candidate.sun_visibility, DXGI_FORMAT_R32_UINT, in.width, in.height);
       const auto make_buffer = [&](uint64_t bytes, ComPtr<ID3D12Resource>* buffer) {
         allocation_error = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COMMON,
                                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, *buffer);
@@ -278,7 +283,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
         return result;
       }
       for (Rt12Shared* shared : {&slot.depth, &slot.normal, &slot.scene, &slot.color, &slot.mrt1, &slot.mrt2, &slot.motion,
-                                 &slot.lights, &slot.tiles, &slot.deferred, &slot.di_resolved}) {
+                                 &slot.lights, &slot.tiles, &slot.deferred, &slot.di_resolved, &slot.sun_visibility}) {
         if (shared->srv11.handle) {
           device->destroy_resource_view(shared->srv11);
         }
@@ -291,6 +296,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       candidate.width = in.width;
       candidate.height = in.height;
       candidate.local = in.local;
+      candidate.sun = in.sun;
       candidate.motion_available = motion_available;
       candidate.tile_count = 0u;
       candidate.output_staged = false;
@@ -358,7 +364,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       transfer.unpack_pso = std::move(pso);
     }
     if (in.sun && (!transfer.sun_root || !transfer.sun_pso)) {
-      D3D12_DESCRIPTOR_RANGE ranges[6] = {};
+      D3D12_DESCRIPTOR_RANGE ranges[7] = {};
       ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
       ranges[0].NumDescriptors = 4u;
       ranges[0].BaseShaderRegister = 0u;
@@ -382,11 +388,15 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       ranges[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
       ranges[5].NumDescriptors = 1u;
       ranges[5].OffsetInDescriptorsFromTableStart = 12u;
+      ranges[6].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+      ranges[6].NumDescriptors = 1u;
+      ranges[6].BaseShaderRegister = 1u;
+      ranges[6].OffsetInDescriptorsFromTableStart = 13u;
       D3D12_ROOT_PARAMETER params[2] = {};
       params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
       params[0].Constants.Num32BitValues = 12u;
       params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-      params[1].DescriptorTable.NumDescriptorRanges = 6u;
+      params[1].DescriptorTable.NumDescriptorRanges = 7u;
       params[1].DescriptorTable.pDescriptorRanges = ranges;
       D3D12_ROOT_SIGNATURE_DESC root_desc = {};
       root_desc.NumParameters = 2u;
@@ -627,6 +637,10 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       result_uav.Buffer.NumElements = static_cast<UINT>(pixels);
       result_uav.Buffer.StructureByteStride = RTXDI_SUN_RESULT_STRIDE;
       native->CreateUnorderedAccessView(slot.sun_results.Get(), nullptr, &result_uav, query_cpu(20u));
+      D3D12_UNORDERED_ACCESS_VIEW_DESC visibility_uav = {};
+      visibility_uav.Format = DXGI_FORMAT_R32_UINT;
+      visibility_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+      native->CreateUnorderedAccessView(slot.sun_visibility.texture12.Get(), nullptr, &visibility_uav, query_cpu(21u));
 
       std::vector<D3D12_RESOURCE_BARRIER> query_barriers;
       query_barriers.reserve(16u);
@@ -637,6 +651,8 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
       }
       Transition(query_barriers, slot.sun_results.Get(), D3D12_RESOURCE_STATE_COMMON,
+                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      Transition(query_barriers, slot.sun_visibility.texture12.Get(), D3D12_RESOURCE_STATE_COMMON,
                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
       transfer.list->ResourceBarrier(static_cast<UINT>(query_barriers.size()), query_barriers.data());
       ID3D12DescriptorHeap* query_heaps[] = {slot.descriptors.Get()};
@@ -652,7 +668,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[1]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[2]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_size),
-                                   scene_resources_valid ? 1u : 0u, s.scene_coverage_valid ? 1u : 0u, 0u};
+                                   scene_resources_valid ? 1u : 0u, s.scene_coverage_valid ? 1u : 0u, in.frame};
       transfer.list->SetComputeRoot32BitConstants(0u, 12u, params, 0u);
       auto query_gpu = slot.descriptors->GetGPUDescriptorHandleForHeapStart();
       query_gpu.ptr += static_cast<UINT64>(8u) * s.descriptor_size;
@@ -660,6 +676,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       transfer.list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
       query_barriers.clear();
       UavBarrier(query_barriers, slot.sun_results.Get());
+      UavBarrier(query_barriers, slot.sun_visibility.texture12.Get());
       for (ID3D12Resource* resource : {slot.depth.texture12.Get(), slot.normal.texture12.Get(), vertices, indices,
                                        mesh_table, scene.instance_table.Get(), uv_arena,
                                        s.atlas.texture12.Get(), s.materials.Get(), dynamic_vertices}) {
@@ -667,6 +684,8 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                                  D3D12_RESOURCE_STATE_COMMON);
       }
       Transition(query_barriers, slot.sun_results.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                 D3D12_RESOURCE_STATE_COMMON);
+      Transition(query_barriers, slot.sun_visibility.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                  D3D12_RESOURCE_STATE_COMMON);
       transfer.list->ResourceBarrier(static_cast<UINT>(query_barriers.size()), query_barriers.data());
     }
@@ -732,6 +751,19 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       slot.light_count = result.layout.lights_copied;
       slot.tile_count = result.layout.tiles_copied;
       slot.deferred_count = result.layout.deferred_copied;
+      if (in.sun) {
+        slot.output_b_fence = b;
+        slot.output_c_fence = 0u;
+        slot.output_owner_generation = s.generation;
+        slot.output_configuration_generation = transfer.configuration_generation;
+        slot.sun_configuration_generation = transfer.configuration_generation;
+        slot.output_frame = in.frame;
+        slot.output_width = in.width;
+        slot.output_height = in.height;
+        slot.output_scene_slot = in.scene_slot;
+        slot.output_transfer_slot = static_cast<int32_t>(k);
+        slot.output_staged = true;
+      }
       result.fence = b;
       result.status = rtxdi::InputStatus::Ready;
       result.stage = rtxdi::InputStage::Ready;

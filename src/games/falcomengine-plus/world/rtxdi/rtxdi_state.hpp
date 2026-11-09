@@ -132,6 +132,65 @@ struct DiState {
   DiSnapshot snapshot;
 };
 inline DiState g_di;
+
+enum class SunStatus { Off,
+                       WaitingInput,
+                       Staged,
+                       Failed,
+                       Quarantined };
+struct SunSnapshot {
+  SunStatus status = SunStatus::Off;
+  uint32_t frame = UINT32_MAX, width = 0u, height = 0u;
+  uint64_t owner_generation = 0u, configuration_generation = 0u;
+  uint64_t di_configuration_generation = 0u;
+  uint64_t fence_b = 0u, fence_c = 0u;
+  int32_t scene_slot = -1, transfer_slot = -1;
+  bool output_bound = false;
+  uint32_t output_bound_frame = UINT32_MAX;
+  int32_t output_bound_transfer_slot = -1;
+  uint64_t output_bound_fence_b = 0u;
+  bool lighting_draw_seen = false;
+  int32_t error = 0;
+};
+inline bool MatchesStagedSunIdentity(const SunSnapshot& snapshot, uint32_t frame, uint64_t owner_generation,
+                                     uint64_t configuration_generation, uint64_t di_configuration_generation) {
+  return snapshot.status != SunStatus::Staged
+         || (snapshot.frame == frame && snapshot.owner_generation == owner_generation
+             && snapshot.configuration_generation == configuration_generation
+             && snapshot.di_configuration_generation == di_configuration_generation);
+}
+enum class SunAttemptAction { Off,
+                              PreserveDuplicate,
+                              Invalidate };
+inline void TransitionSunAttempt(SunSnapshot* snapshot, uint32_t frame, SunAttemptAction action) {
+  switch (action) {
+    case SunAttemptAction::Off:
+      *snapshot = {.status = SunStatus::Off, .frame = frame};
+      break;
+    case SunAttemptAction::PreserveDuplicate:
+      break;
+    case SunAttemptAction::Invalidate:
+      *snapshot = {.status = SunStatus::WaitingInput, .frame = frame};
+      break;
+  }
+}
+struct SunState {
+  std::shared_mutex mutex;
+  SunSnapshot snapshot;
+};
+inline SunState g_sun;
+
+inline const char* SunStatusName(SunStatus status) {
+  switch (status) {
+    case SunStatus::Off:          return "off";
+    case SunStatus::WaitingInput: return "waiting input";
+    case SunStatus::Staged:       return "staged";
+    case SunStatus::Failed:       return "failed";
+    case SunStatus::Quarantined:  return "quarantined";
+  }
+  return "unknown";
+}
+
 inline const char* DiStatusName(DiStatus status) {
   switch (status) {
     case DiStatus::Off:          return "off";

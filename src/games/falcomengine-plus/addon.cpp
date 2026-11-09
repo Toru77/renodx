@@ -74,7 +74,7 @@ ShaderInjectData shader_injection = {
     // unless the user deliberately turns the engine's own back on.
     .char_shadow_mode = 0.f,
     .rtxdi_local_bound = 0.f,
-    .char_shadow_hard_shadow_samples = 4.f,
+    .rtxdi_sun_bound = 0.f,
     .char_shadow_fade_out_samples = 16.f,
     .rtao_debug_show = 0.f,
     .char_shadow_contrast = 9.f,
@@ -12006,9 +12006,19 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
   auto* dev = cmd_list->get_device();
   auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
   const uint64_t generation = (rt12::g_rt12 && rt12::g_rt12->device == dev ? rt12::g_rt12->generation : 0u);
+  const uint64_t transfer_configuration = (rt12::g_rt12 && rt12::g_rt12->device == dev
+                                               ? rt12::g_rt12->di_transfer.configuration_generation
+                                               : 0u);
+  const uint64_t di_configuration = (rt12::g_rt12 && rt12::g_rt12->device == dev
+                                         ? rt12::g_rt12->di.configuration_generation
+                                         : 0u);
   if (!request_mask) {
     std::unique_lock lock(di::g_di.mutex);
     di::g_di.snapshot = {.status = di::DiStatus::Off, .frame = frame};
+  }
+  if ((request_mask & 2u) == 0u) {
+    std::unique_lock lock(di::g_sun.mutex);
+    di::TransitionSunAttempt(&di::g_sun.snapshot, frame, di::SunAttemptAction::Off);
   }
   {
     std::unique_lock lock(di::g_scene.mutex);
@@ -12017,16 +12027,40 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
       di::RefreshOffState(&state, frame);
       return;
     }
-    if (di::PreserveAttemptForNonImmediate(state, frame, true, dd && cmd_list != dd->immediate_cmd_list)) return;
+    if (di::PreserveAttemptForNonImmediate(state, frame, true, dd && cmd_list != dd->immediate_cmd_list)) {
+      std::unique_lock sun_lock(di::g_sun.mutex);
+      const bool same_request = state.request_mask == request_mask
+                                && di::MatchesStagedSunIdentity(di::g_sun.snapshot, frame, generation,
+                                                                transfer_configuration, di_configuration);
+      di::TransitionSunAttempt(&di::g_sun.snapshot, frame,
+                               same_request ? di::SunAttemptAction::PreserveDuplicate : di::SunAttemptAction::Invalidate);
+      return;
+    }
     if (!dev || !dd) {
       state.status = di::SceneStatus::NoDevice;
+      std::unique_lock sun_lock(di::g_sun.mutex);
+      di::TransitionSunAttempt(&di::g_sun.snapshot, frame, di::SunAttemptAction::Invalidate);
       return;
     }
     if (cmd_list != dd->immediate_cmd_list) {
       state.status = di::SceneStatus::DeferredContext;
+      std::unique_lock sun_lock(di::g_sun.mutex);
+      di::TransitionSunAttempt(&di::g_sun.snapshot, frame, di::SunAttemptAction::Invalidate);
       return;
     }
-    if (di::IsDuplicate(state, frame, generation)) return;
+    if (di::IsDuplicate(state, frame, generation) && state.request_mask == request_mask) {
+      std::unique_lock sun_lock(di::g_sun.mutex);
+      const auto action = di::MatchesStagedSunIdentity(di::g_sun.snapshot, frame, generation,
+                                                       transfer_configuration, di_configuration)
+                              ? di::SunAttemptAction::PreserveDuplicate
+                              : di::SunAttemptAction::Invalidate;
+      di::TransitionSunAttempt(&di::g_sun.snapshot, frame, action);
+      return;
+    }
+    {
+      std::unique_lock sun_lock(di::g_sun.mutex);
+      di::TransitionSunAttempt(&di::g_sun.snapshot, frame, di::SunAttemptAction::Invalidate);
+    }
     state.attempted_frame = frame;
     state.attempted_generation = generation;
     state.request_mask = request_mask;
@@ -12137,6 +12171,40 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
     } else {
       std::unique_lock lock(di::g_di.mutex);
       di::g_di.snapshot = {.status = di::DiStatus::Off, .frame = frame};
+    }
+    if (request_mask & 2u) {
+      di::SunSnapshot sun;
+      sun.frame = frame;
+      if (input_result.status == di::InputStatus::Ready && input_result.transfer_slot >= 0
+          && input_result.transfer_slot < static_cast<int32_t>(rt12::kRt12Slots)) {
+        const rt12::Rt12DiTransferSlot& slot = rt12::g_rt12->di_transfer.slots[static_cast<uint32_t>(input_result.transfer_slot)];
+        if (slot.output_staged && slot.sun_visibility.srv11.handle) {
+          sun.status = rt12::g_rt12->failed || rt12::g_rt12->stuck ? di::SunStatus::Quarantined : di::SunStatus::Staged;
+          sun.width = slot.output_width;
+          sun.height = slot.output_height;
+          sun.owner_generation = slot.output_owner_generation;
+          sun.configuration_generation = slot.sun_configuration_generation;
+          sun.di_configuration_generation = rt12::g_rt12->di.configuration_generation;
+          sun.fence_b = slot.output_b_fence;
+          sun.scene_slot = slot.output_scene_slot;
+          sun.transfer_slot = slot.output_transfer_slot;
+        } else {
+          sun.status = di::SunStatus::Failed;
+          sun.error = E_FAIL;
+        }
+      } else if (rt12::g_rt12->failed || rt12::g_rt12->stuck) {
+        sun.status = di::SunStatus::Quarantined;
+        sun.error = E_FAIL;
+      } else if (input_result.status == di::InputStatus::SubmitFailed
+                 || input_result.status == di::InputStatus::AllocationFailed) {
+        sun.status = di::SunStatus::Failed;
+        sun.error = input_result.error;
+      } else {
+        sun.status = di::SunStatus::WaitingInput;
+        sun.error = input_result.error;
+      }
+      std::unique_lock lock(di::g_sun.mutex);
+      di::g_sun.snapshot = sun;
     }
   } else {
     std::unique_lock lock(di::g_input.mutex);
@@ -12251,6 +12319,85 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
   }
 }
 
+static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData* dd) {
+  namespace rt12 = falcom_world::rt12;
+  namespace di = falcom_world::rtxdi;
+  shader_injection.rtxdi_sun_bound = 0.f;
+  {
+    std::unique_lock lock(di::g_sun.mutex);
+    di::g_sun.snapshot.output_bound = false;
+    di::g_sun.snapshot.output_bound_frame = UINT32_MAX;
+    di::g_sun.snapshot.output_bound_transfer_slot = -1;
+    di::g_sun.snapshot.output_bound_fence_b = 0u;
+    di::g_sun.snapshot.lighting_draw_seen = false;
+  }
+  if (!IsSora2nd() || !cmd_list) return;
+
+  const reshade::api::resource_view empty_view = {};
+  cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                             reshade::api::descriptor_table_update{{}, 42u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+  if (!dd || cmd_list != dd->immediate_cmd_list || di::g_sun_requested < 0.5f || !rt12::g_rt12
+      || rt12::g_rt12->device != cmd_list->get_device() || rt12::g_rt12->failed || rt12::g_rt12->stuck
+      || rt12::g_rt12->unfenced_execution) return;
+
+  const uint32_t frame = falcom_world::g_state.frame.load();
+  di::SunSnapshot sun;
+  di::InputSnapshot input;
+  di::SceneSnapshot scene;
+  {
+    std::shared_lock lock(di::g_sun.mutex);
+    sun = di::g_sun.snapshot;
+  }
+  {
+    std::shared_lock lock(di::g_input.mutex);
+    input = di::g_input.snapshot;
+  }
+  {
+    std::shared_lock lock(di::g_scene.mutex);
+    scene = di::g_scene.snapshot;
+  }
+  rt12::Rt12State& state = *rt12::g_rt12;
+  if (sun.status != di::SunStatus::Staged || sun.frame != frame || sun.owner_generation != state.generation
+      || sun.configuration_generation != state.di_transfer.configuration_generation
+      || sun.di_configuration_generation != state.di.configuration_generation || sun.scene_slot < 0
+      || sun.transfer_slot < 0 || sun.transfer_slot >= static_cast<int32_t>(rt12::kRt12Slots)
+      || sun.width != dd->captured_depth_w || sun.height != dd->captured_depth_h || sun.fence_b == 0u
+      || input.status != di::InputStatus::Ready || input.ready_frame != frame || input.owner_generation != sun.owner_generation
+      || input.configuration_generation != sun.configuration_generation || input.scene_slot != sun.scene_slot
+      || input.transfer_slot != sun.transfer_slot || input.width != sun.width || input.height != sun.height
+      || scene.prepared_frame != frame || scene.prepared_slot != sun.scene_slot
+      || scene.prepared_generation != sun.owner_generation || scene.prepared_fence != input.scene_fence) return;
+
+  rt12::Rt12DiTransferSlot& slot = state.di_transfer.slots[static_cast<uint32_t>(sun.transfer_slot)];
+  if (!slot.sun || !slot.output_staged || slot.output_frame != frame || slot.output_owner_generation != sun.owner_generation
+      || slot.sun_configuration_generation != sun.configuration_generation || slot.output_scene_slot != sun.scene_slot
+      || slot.output_transfer_slot != sun.transfer_slot || slot.output_width != sun.width || slot.output_height != sun.height
+      || slot.output_b_fence != sun.fence_b || !slot.sun_visibility.srv11.handle
+      || !rt12::ValidateDiTexture(slot.sun_visibility.srv11, sun.width, sun.height, rt12::Rt12DiTextureKind::Uint)) return;
+
+  cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                             reshade::api::descriptor_table_update{{}, 42u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.sun_visibility.srv11});
+  shader_injection.rtxdi_sun_bound = 1.f;
+  bool still_current = false;
+  {
+    std::unique_lock lock(di::g_sun.mutex);
+    still_current = di::g_sun.snapshot.status == di::SunStatus::Staged && di::g_sun.snapshot.frame == frame
+                    && di::g_sun.snapshot.transfer_slot == sun.transfer_slot
+                    && di::g_sun.snapshot.fence_b == sun.fence_b;
+    if (still_current) {
+      di::g_sun.snapshot.output_bound = true;
+      di::g_sun.snapshot.output_bound_frame = frame;
+      di::g_sun.snapshot.output_bound_transfer_slot = sun.transfer_slot;
+      di::g_sun.snapshot.output_bound_fence_b = sun.fence_b;
+    }
+  }
+  if (!still_current) {
+    shader_injection.rtxdi_sun_bound = 0.f;
+    cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                               reshade::api::descriptor_table_update{{}, 42u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+  }
+}
+
 // DLSS Ray Reconstruction guides (M1): the compute pass at the lighting hook. Runs on the first lighting draw of the frame.
 static void RunRrGuidesInline(reshade::api::command_list* cmd_list) {
   if (falcom_world::rr::g_rr_perf_guides < 0.5f) return;  // TEMP perf test (remove)
@@ -12295,11 +12442,17 @@ static void OnDrawnLightingShader(reshade::api::command_list* cmd_list) {
   if (IsSora2nd()) {
     std::unique_lock lock(falcom_world::rtxdi::g_di.mutex);
     auto& output = falcom_world::rtxdi::g_di.snapshot;
-    falcom_world::rtxdi::RecordDiLightingDrawSeen(&output.output_bound, &output.output_bound_frame,
-                                                  &output.output_bound_transfer_slot, &output.output_bound_fence_b,
-                                                  &output.lighting_draw_seen, falcom_world::g_state.frame.load(),
-                                                  output.output_frame, output.output_transfer_slot,
-                                                  output.output_fence_b);
+    falcom_world::rtxdi::RecordOutputLightingDrawSeen(&output.output_bound, &output.output_bound_frame,
+                                                      &output.output_bound_transfer_slot, &output.output_bound_fence_b,
+                                                      &output.lighting_draw_seen, falcom_world::g_state.frame.load(),
+                                                      output.output_frame, output.output_transfer_slot,
+                                                      output.output_fence_b);
+    std::unique_lock sun_lock(falcom_world::rtxdi::g_sun.mutex);
+    auto& sun = falcom_world::rtxdi::g_sun.snapshot;
+    falcom_world::rtxdi::RecordOutputLightingDrawSeen(&sun.output_bound, &sun.output_bound_frame,
+                                                      &sun.output_bound_transfer_slot, &sun.output_bound_fence_b,
+                                                      &sun.lighting_draw_seen, falcom_world::g_state.frame.load(),
+                                                      sun.frame, sun.transfer_slot, sun.fence_b);
   }
   const auto& frame = falcom_world::rtgi::g_rtgi_frame;
   if (!frame.producing || frame.dispatched_frame != dd->frame_index) return;
@@ -12378,13 +12531,18 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   RunRtlsInline(cmd_list);
 
   // RT Sun Shadows (R3a): after RT Local Shadows, same guards; the raw term only, the image is not changed.
-  RunRtSunInline(cmd_list);
+  if (IsSora2nd() && falcom_world::rtxdi::g_sun_requested > 0.5f) {
+    shader_injection.rtsun_flags = 0.f;
+  } else {
+    RunRtSunInline(cmd_list);
+  }
 
   // RTGI after RTAO: it runs only on a frame where RTAO dispatched.
   RunRtgiInline(cmd_list);
   PrepareRtxdiSceneInline(cmd_list);
   auto* lighting_device = cmd_list ? cmd_list->get_device() : nullptr;
   BindRtxdiLocalOutput(cmd_list, lighting_device ? lighting_device->get_private_data<DeviceData>() : nullptr);
+  BindRtxdiSunOutput(cmd_list, lighting_device ? lighting_device->get_private_data<DeviceData>() : nullptr);
   // DLSS Ray Reconstruction guides: builds the RR guide buffers; the lighting output is not changed.
   RunRrGuidesInline(cmd_list);
   if (game_compute_state) {

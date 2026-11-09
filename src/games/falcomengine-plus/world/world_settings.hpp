@@ -721,9 +721,9 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .binding = &rtxdi::g_sun_requested,
       .value_type = SettingValueType::BOOLEAN,
       .default_value = 0.f,
-      .label = "DXR Sun Shadows - scene preparation only",
+      .label = "RTXDI Sun Shadows",
       .section = "RTXDI",
-      .tooltip = "Prepares geometry for future DXR sun shadows. No shadow output is produced yet.",
+      .tooltip = "Traces one directional DXR sun visibility query per valid surface. Unknown results keep the CSM fallback.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });
@@ -762,6 +762,20 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                     di.output_width, di.output_height, di.output_frame,
                     static_cast<unsigned long long>(di.output_fence_b), static_cast<unsigned long long>(di.output_fence_c),
                     static_cast<unsigned int>(di.error));
+        rtxdi::SunSnapshot sun;
+        {
+          std::shared_lock lock(rtxdi::g_sun.mutex);
+          sun = rtxdi::g_sun.snapshot;
+        }
+        ImGui::Text("Sun visibility: %s | frame %u | owner %llu | config %llu (DI %llu) | scene %d | transfer %d | %ux%u | t42 bound %s | lighting draw seen %s | B %llu | C %llu | error 0x%08x",
+                    rtxdi::SunStatusName(sun.status), sun.frame,
+                    static_cast<unsigned long long>(sun.owner_generation),
+                    static_cast<unsigned long long>(sun.configuration_generation),
+                    static_cast<unsigned long long>(sun.di_configuration_generation), sun.scene_slot, sun.transfer_slot,
+                    sun.width, sun.height,
+                    sun.output_bound ? "yes" : "no", sun.lighting_draw_seen ? "yes" : "no",
+                    static_cast<unsigned long long>(sun.fence_b), static_cast<unsigned long long>(sun.fence_c),
+                    static_cast<unsigned int>(sun.error));
         return false;
       },
       .is_visible = visible,

@@ -118,19 +118,19 @@ inline bool CanReuseDiOutput(bool staged, uint64_t consumer_fence_c, uint64_t co
   return !staged || (consumer_fence_c != 0u && completed_fence_c != UINT64_MAX && completed_fence_c >= consumer_fence_c);
 }
 
-inline bool IsCurrentDiLightingDrawBinding(bool output_bound, uint32_t bound_frame, int32_t bound_slot,
-                                           uint64_t bound_fence, uint32_t current_frame, uint32_t output_frame,
-                                           int32_t output_slot, uint64_t output_fence) {
+inline bool IsCurrentOutputLightingDrawBinding(bool output_bound, uint32_t bound_frame, int32_t bound_slot,
+                                               uint64_t bound_fence, uint32_t current_frame, uint32_t output_frame,
+                                               int32_t output_slot, uint64_t output_fence) {
   return output_bound && bound_frame == current_frame && bound_frame == output_frame && bound_slot >= 0
          && bound_slot == output_slot && bound_fence != 0u && bound_fence == output_fence;
 }
 
-inline bool RecordDiLightingDrawSeen(bool* output_bound, uint32_t* bound_frame, int32_t* bound_slot,
-                                     uint64_t* bound_fence, bool* lighting_draw_seen, uint32_t current_frame,
-                                     uint32_t output_frame, int32_t output_slot, uint64_t output_fence) {
+inline bool RecordOutputLightingDrawSeen(bool* output_bound, uint32_t* bound_frame, int32_t* bound_slot,
+                                         uint64_t* bound_fence, bool* lighting_draw_seen, uint32_t current_frame,
+                                         uint32_t output_frame, int32_t output_slot, uint64_t output_fence) {
   if (!output_bound || !bound_frame || !bound_slot || !bound_fence || !lighting_draw_seen) return false;
-  const bool matching_binding = IsCurrentDiLightingDrawBinding(*output_bound, *bound_frame, *bound_slot, *bound_fence,
-                                                               current_frame, output_frame, output_slot, output_fence);
+  const bool matching_binding = IsCurrentOutputLightingDrawBinding(*output_bound, *bound_frame, *bound_slot, *bound_fence,
+                                                                   current_frame, output_frame, output_slot, output_fence);
   *lighting_draw_seen = matching_binding;
   if (!matching_binding) {
     *output_bound = false;

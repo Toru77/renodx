@@ -232,6 +232,7 @@ struct Rt12DiTransferSlot {
   Rt12Shared depth, normal, scene, color, mrt1, mrt2, motion;
   Rt12Shared lights, tiles, deferred;
   Rt12Shared di_resolved;
+  Rt12Shared sun_visibility;
   Microsoft::WRL::ComPtr<ID3D12Resource> scene_buffer, lights_buffer, tiles_buffer, deferred_buffer, sun_results;
   Microsoft::WRL::ComPtr<ID3D12Resource> light_types, di_results, di_frame_upload;
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
@@ -246,10 +247,12 @@ struct Rt12DiTransferSlot {
   uint64_t di_fence_value = 0u;
   uint64_t output_b_fence = 0u, output_c_fence = 0u;
   uint64_t output_owner_generation = 0u, output_configuration_generation = 0u;
+  uint64_t sun_configuration_generation = 0u;
   uint32_t output_frame = UINT32_MAX, output_width = 0u, output_height = 0u;
   int32_t output_scene_slot = -1, output_transfer_slot = -1;
   uint32_t light_count = 0u, tile_count = 0u, deferred_count = 0u;
   bool local = false;
+  bool sun = false;
   bool motion_available = false;
   bool output_staged = false;
 };
@@ -457,6 +460,18 @@ inline void FailSession(Rt12State& s, Rt12Reason reason, const char* stage, HRES
     rtxdi::g_di.snapshot.output_bound_transfer_slot = -1;
     rtxdi::g_di.snapshot.output_bound_fence_b = 0u;
     rtxdi::g_di.snapshot.lighting_draw_seen = false;
+  }
+  {
+    std::unique_lock lock(rtxdi::g_sun.mutex);
+    rtxdi::g_sun.snapshot.output_bound = false;
+    rtxdi::g_sun.snapshot.output_bound_frame = UINT32_MAX;
+    rtxdi::g_sun.snapshot.output_bound_transfer_slot = -1;
+    rtxdi::g_sun.snapshot.output_bound_fence_b = 0u;
+    rtxdi::g_sun.snapshot.lighting_draw_seen = false;
+    if (rtxdi::g_sun_requested > 0.5f) {
+      rtxdi::g_sun.snapshot.status = rtxdi::SunStatus::Quarantined;
+      rtxdi::g_sun.snapshot.error = hr;
+    }
   }
   DisableMirror();
   renodx::utils::log::w("[world-rt12] failed at ", stage, " hr=", renodx::utils::log::AsHex(static_cast<uint32_t>(hr)));
@@ -894,6 +909,17 @@ inline void TeardownRt12(const char* why) {
     rtxdi::g_di.snapshot.output_bound_fence_b = 0u;
     rtxdi::g_di.snapshot.lighting_draw_seen = false;
   }
+  {
+    std::unique_lock lock(rtxdi::g_sun.mutex);
+    rtxdi::g_sun.snapshot.status = rtxdi::g_sun_requested > 0.5f ? rtxdi::SunStatus::WaitingInput : rtxdi::SunStatus::Off;
+    rtxdi::g_sun.snapshot.output_bound = false;
+    rtxdi::g_sun.snapshot.output_bound_frame = UINT32_MAX;
+    rtxdi::g_sun.snapshot.output_bound_transfer_slot = -1;
+    rtxdi::g_sun.snapshot.output_bound_fence_b = 0u;
+    rtxdi::g_sun.snapshot.lighting_draw_seen = false;
+    rtxdi::g_sun.snapshot.fence_b = 0u;
+    rtxdi::g_sun.snapshot.fence_c = 0u;
+  }
   g_rt12_gc_scene = {};
   {
     std::lock_guard lock(g_rt12_mirror.mutex);
@@ -923,7 +949,7 @@ inline void TeardownRt12(const char* why) {
   }
   for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {
     for (Rt12Shared* shared : {&slot.depth, &slot.normal, &slot.scene, &slot.color, &slot.mrt1, &slot.mrt2, &slot.motion,
-                               &slot.lights, &slot.tiles, &slot.deferred, &slot.di_resolved}) {
+                               &slot.lights, &slot.tiles, &slot.deferred, &slot.di_resolved, &slot.sun_visibility}) {
       if (shared->srv11.handle != 0u) s.device->destroy_resource_view(shared->srv11);
       if (shared->uav11.handle != 0u) s.device->destroy_resource_view(shared->uav11);
     }
@@ -1550,6 +1576,7 @@ inline void OnPresent(reshade::api::device* device) {
       consumer_fence = renodx::utils::gpu_fence::NO_SIGNAL;
     }
     if (consumer_fence == renodx::utils::gpu_fence::NO_SIGNAL) {
+      s.stuck = true;
       FailSession(s, Rt12Reason::SubmitFailed, "rtxdi output consumer fence C");
       std::unique_lock lock(rtxdi::g_di.mutex);
       rtxdi::g_di.snapshot.status = rtxdi::DiStatus::Quarantined;
@@ -1559,12 +1586,27 @@ inline void OnPresent(reshade::api::device* device) {
     for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {
       if (slot.output_staged && slot.output_c_fence == 0u) slot.output_c_fence = consumer_fence;
     }
-    std::unique_lock lock(rtxdi::g_di.mutex);
-    const int32_t transfer_slot = rtxdi::g_di.snapshot.output_transfer_slot;
-    if (transfer_slot >= 0 && transfer_slot < static_cast<int32_t>(kRt12Slots)) {
-      const Rt12DiTransferSlot& slot = s.di_transfer.slots[static_cast<uint32_t>(transfer_slot)];
-      if (slot.output_staged && slot.output_frame == rtxdi::g_di.snapshot.output_frame) {
-        rtxdi::g_di.snapshot.output_fence_c = consumer_fence;
+    {
+      std::unique_lock lock(rtxdi::g_di.mutex);
+      const int32_t transfer_slot = rtxdi::g_di.snapshot.output_transfer_slot;
+      if (transfer_slot >= 0 && transfer_slot < static_cast<int32_t>(kRt12Slots)) {
+        const Rt12DiTransferSlot& slot = s.di_transfer.slots[static_cast<uint32_t>(transfer_slot)];
+        if (slot.output_staged && slot.output_frame == rtxdi::g_di.snapshot.output_frame) {
+          rtxdi::g_di.snapshot.output_fence_c = consumer_fence;
+        }
+      }
+    }
+    {
+      std::unique_lock lock(rtxdi::g_sun.mutex);
+      const int32_t sun_transfer_slot = rtxdi::g_sun.snapshot.transfer_slot;
+      const Rt12DiTransferSlot* sun_slot = nullptr;
+      if (sun_transfer_slot >= 0 && sun_transfer_slot < static_cast<int32_t>(kRt12Slots)) {
+        sun_slot = &s.di_transfer.slots[static_cast<uint32_t>(sun_transfer_slot)];
+      }
+      if (sun_slot && rtxdi::g_sun.snapshot.status == rtxdi::SunStatus::Staged
+          && rtxdi::g_sun.snapshot.frame == g_state.frame.load()
+          && rtxdi::g_sun.snapshot.fence_b == sun_slot->output_b_fence) {
+        rtxdi::g_sun.snapshot.fence_c = consumer_fence;
       }
     }
   }

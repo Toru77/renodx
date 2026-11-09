@@ -171,6 +171,7 @@ Texture2D<float4> outlinePrepareTexture : register(t8);
 StructuredBuffer<LightParam> dynamicLights_g : register(t11);
 StructuredBuffer<LightIndexData> lightIndices_g : register(t12);
 Texture2D<uint4> rtxdiResolvedLocal_g : register(t41);
+Texture2D<uint> rtxdiSunVisibility_g : register(t42);
 StructuredBuffer<float4x4> spotShadowMatrices_g : register(t14);
 TextureCube<float4> texEnvMap_g : register(t17);
 TextureCube<float4> dynCubeHistPosTex : register(t29);  // dynamic cube history world pos (.a = capture validity)
@@ -417,9 +418,20 @@ void main(
       if (shader_injection_data.char_shadow_mode >= 0.5f) {
         r3.z = r3.z * saturate(r5.z);
       }
+      if (shader_injection_data.rtxdi_sun_bound > 0.5f) {
+        uint sunWidth, sunHeight;
+        rtxdiSunVisibility_g.GetDimensions(sunWidth, sunHeight);
+        const uint2 sunPixel = (uint2)v0.xy;
+        if (sunPixel.x < sunWidth && sunPixel.y < sunHeight) {
+          const RtxdiSunLightingSelection sunSelection =
+              RtxdiResolveSunLightingSelection(true, rtxdiSunVisibility_g.Load(int3(sunPixel, 0)));
+          if (sunSelection.known) r3.z *= sunSelection.visibility;
+        }
+      }
       // RT Sun Shadows on characters (world/rtsun, R4): the RT sun visibility (denoised, t39) scales the toon lerp factor. Needs
       // the applied and the Receive bits of rtsun_flags. Character Intensity (rtsun_spare) lerps from the CSM visibility (0) to the RT one (1).
-      if (((uint)shader_injection_data.rtsun_flags & (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) == (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) {
+      if (shader_injection_data.rtxdi_sun_bound <= 0.5f
+          && ((uint)shader_injection_data.rtsun_flags & (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) == (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) {
         const float rtsunCharTerm = rtsunTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
         const float rtsunCharVisibility = 1.0 - min(rtsunCharTerm * shader_injection_data.rtsun_strength, shader_injection_data.rtsun_char_max_darkening);
         r3.z *= lerp(1.0, rtsunCharVisibility, saturate(shader_injection_data.rtsun_spare));
@@ -760,7 +772,16 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r3.z = shadowTexture.SampleLevel(samLinear_s, r3.zw, 0).x;
   // RT Sun Shadows (world/rtsun, R3b): inside the RT cascade range the RT sun term replaces the CSM visibility here, before
   // every reader of r3.z. Non-character pixels only: the character branch returned above.
-  if (((uint)shader_injection_data.rtsun_flags & RTSUN_FLAG_APPLIED) != 0u) {
+  if (shader_injection_data.rtxdi_sun_bound > 0.5f) {
+    uint sunWidth, sunHeight;
+    rtxdiSunVisibility_g.GetDimensions(sunWidth, sunHeight);
+    const uint2 sunPixel = (uint2)v0.xy;
+    if (sunPixel.x < sunWidth && sunPixel.y < sunHeight) {
+      const RtxdiSunLightingSelection sunSelection =
+          RtxdiResolveSunLightingSelection(true, rtxdiSunVisibility_g.Load(int3(sunPixel, 0)));
+      if (sunSelection.known) r3.z = sunSelection.visibility;
+    }
+  } else if (((uint)shader_injection_data.rtsun_flags & RTSUN_FLAG_APPLIED) != 0u) {
     const float rtsunDarkening = rtsunTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
     r3.z *= 1.0 - min(rtsunDarkening * shader_injection_data.rtsun_strength, shader_injection_data.rtsun_max_darkening);
   }

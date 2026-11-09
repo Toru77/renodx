@@ -287,7 +287,8 @@ inline void ApplyBvhInputs() {
   store(g_deform_live.enabled, demand || (diagnostic && deform_setting));
   // RT sun count latched for the draw hooks (CSM skip) and the trace: nonzero only while RT sun is requested and produced
   // last frame, with a built BVH range (0 = not ready, never unlimited).
-  const bool rtsun_produced = rtsun::RtSunRequested() && rtsun::g_rtsun_frame.producing && rtsun::g_rtsun_frame.built_range > 0.f;
+  const bool rtsun_produced = rtsun::RtSunRequested() && rtxdi::g_sun_requested < 0.5f
+                              && rtsun::g_rtsun_frame.producing && rtsun::g_rtsun_frame.built_range > 0.f;
   g_state.rt_sun_cascades.store(
       rtsun_produced ? rtsun::RtSunEffectiveCascades(static_cast<int>(rtsun::g_rtsun_cascade_range), g_state.camera, rtsun::g_rtsun_frame.built_range) : 0,
       std::memory_order_relaxed);

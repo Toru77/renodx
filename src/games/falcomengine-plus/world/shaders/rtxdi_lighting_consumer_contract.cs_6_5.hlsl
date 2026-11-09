@@ -14,6 +14,10 @@ struct LightingConsumerCase
   float dynamic_intensity;
   float padding2;
   LightIndexData tile;
+  uint sun_bound;
+  uint sun_status;
+  float csm_visibility;
+  uint padding3;
 };
 
 struct LightingConsumerResult
@@ -26,6 +30,10 @@ struct LightingConsumerResult
   float shaded_local_term;
   uint selected_index;
   uint selected_type;
+  uint sun_known;
+  float environment_sun_visibility;
+  float character_sun_multiplier;
+  uint padding;
 };
 
 StructuredBuffer<LightingConsumerCase> g_cases : register(t0);
@@ -65,5 +73,10 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
   result.shaded_local_term = raw_local_term * input.base_color * input.dynamic_intensity;
   result.selected_index = visible ? selection.index : 0xffffffffu;
   result.selected_type = visible ? selection.type : 0u;
+  const RtxdiSunLightingSelection sun_selection = RtxdiResolveSunLightingSelection(input.sun_bound != 0u, input.sun_status);
+  result.sun_known = sun_selection.known ? 1u : 0u;
+  result.environment_sun_visibility = sun_selection.known ? sun_selection.visibility : input.csm_visibility;
+  result.character_sun_multiplier = sun_selection.known ? sun_selection.visibility : 1.0;
+  result.padding = 0u;
   g_results[index] = result;
 }

@@ -229,6 +229,10 @@ int main() {
   configuration_output.output_configuration_generation++;
   auto not_staged_output = staged_output;
   not_staged_output.staged = false;
+  const DiOutputIdentity sun_only_staged = staged_output;
+  const DiOutputIdentity local_and_sun_staged = staged_output;
+  const bool sun_only_b_before_read = CheckDiOutputIdentity(sun_only_staged) == DiOutputGate::Ready;
+  const bool local_and_sun_b_before_read = CheckDiOutputIdentity(local_and_sun_staged) == DiOutputGate::Ready;
   if (CheckDiOutputIdentity(staged_output) != DiOutputGate::Ready
       || CheckDiOutputIdentity(before_output_b) != DiOutputGate::ProducerPending
       || CheckDiOutputIdentity(stale_output) != DiOutputGate::StaleIdentity
@@ -238,9 +242,16 @@ int main() {
       || CheckDiOutputIdentity(resize_output) != DiOutputGate::ConfigurationMismatch
       || CheckDiOutputIdentity(configuration_output) != DiOutputGate::ConfigurationMismatch
       || CheckDiOutputIdentity(not_staged_output) != DiOutputGate::NotStaged
+      || !sun_only_b_before_read || !local_and_sun_b_before_read
       || CanReuseDiOutput(true, 0u, 100u) || CanReuseDiOutput(true, 27u, 26u)
       || CanReuseDiOutput(true, 27u, std::numeric_limits<uint64_t>::max())
       || !CanReuseDiOutput(true, 27u, 27u) || !CanReuseDiOutput(false, 0u, 0u)) return EXIT_FAILURE;
+  if (CanReuseDiOutput(true, sun_only_staged.producer_fence_b, sun_only_staged.producer_fence_b - 1u)
+      || CanReuseDiOutput(true, local_and_sun_staged.producer_fence_b, local_and_sun_staged.producer_fence_b - 1u)
+      || !CanReuseDiOutput(true, sun_only_staged.producer_fence_b, sun_only_staged.producer_fence_b)
+      || !CanReuseDiOutput(true, local_and_sun_staged.producer_fence_b, local_and_sun_staged.producer_fence_b)) {
+    return EXIT_FAILURE;
+  }
 
   bool output_bound = true;
   bool lighting_draw_seen = false;
@@ -248,8 +259,8 @@ int main() {
   int32_t bound_slot = 1;
   uint64_t bound_fence = 22u;
   if (!output_bound || lighting_draw_seen) return EXIT_FAILURE;
-  falcom_world::rtxdi::RecordDiLightingDrawSeen(&output_bound, &bound_frame, &bound_slot, &bound_fence,
-                                                &lighting_draw_seen, 41u, 41u, 1, 22u);
+  falcom_world::rtxdi::RecordOutputLightingDrawSeen(&output_bound, &bound_frame, &bound_slot, &bound_fence,
+                                                    &lighting_draw_seen, 41u, 41u, 1, 22u);
   if (!output_bound || !lighting_draw_seen) return EXIT_FAILURE;
   // Callback evidence is independent of per-pixel tuple acceptance, including character-only or all-invalid draws.
   bool character_only_bound = true, character_only_seen = false;
@@ -268,16 +279,24 @@ int main() {
   uint32_t stale_slot_frame = 41u;
   int32_t stale_slot_id = 1;
   uint64_t stale_slot_fence = 22u;
-  falcom_world::rtxdi::RecordDiLightingDrawSeen(&character_only_bound, &character_only_frame, &character_only_slot,
-                                                &character_only_fence, &character_only_seen, 41u, 41u, 1, 22u);
-  falcom_world::rtxdi::RecordDiLightingDrawSeen(&all_invalid_bound, &all_invalid_frame, &all_invalid_slot,
-                                                &all_invalid_fence, &all_invalid_seen, 41u, 41u, 1, 22u);
-  falcom_world::rtxdi::RecordDiLightingDrawSeen(&stale_frame_bound, &stale_frame_id, &stale_frame_slot,
-                                                &stale_frame_fence, &stale_frame_seen, 42u, 41u, 1, 22u);
-  falcom_world::rtxdi::RecordDiLightingDrawSeen(&stale_slot_bound, &stale_slot_frame, &stale_slot_id,
-                                                &stale_slot_fence, &stale_slot_seen, 41u, 41u, 2, 22u);
+  falcom_world::rtxdi::RecordOutputLightingDrawSeen(&character_only_bound, &character_only_frame, &character_only_slot,
+                                                    &character_only_fence, &character_only_seen, 41u, 41u, 1, 22u);
+  falcom_world::rtxdi::RecordOutputLightingDrawSeen(&all_invalid_bound, &all_invalid_frame, &all_invalid_slot,
+                                                    &all_invalid_fence, &all_invalid_seen, 41u, 41u, 1, 22u);
+  falcom_world::rtxdi::RecordOutputLightingDrawSeen(&stale_frame_bound, &stale_frame_id, &stale_frame_slot,
+                                                    &stale_frame_fence, &stale_frame_seen, 42u, 41u, 1, 22u);
+  falcom_world::rtxdi::RecordOutputLightingDrawSeen(&stale_slot_bound, &stale_slot_frame, &stale_slot_id,
+                                                    &stale_slot_fence, &stale_slot_seen, 41u, 41u, 2, 22u);
   if (!character_only_bound || !character_only_seen || !all_invalid_bound || !all_invalid_seen || stale_frame_bound
       || stale_frame_seen || stale_slot_bound || stale_slot_seen) return EXIT_FAILURE;
+  bool sun_only_bound = true, sun_only_draw_seen = false;
+  uint32_t sun_only_bound_frame = 41u;
+  int32_t sun_only_bound_slot = 1;
+  uint64_t sun_only_bound_fence = 22u;
+  falcom_world::rtxdi::RecordOutputLightingDrawSeen(&sun_only_bound, &sun_only_bound_frame, &sun_only_bound_slot,
+                                                    &sun_only_bound_fence, &sun_only_draw_seen, 41u, 41u, 1, 22u);
+  if (!sun_only_bound || !sun_only_draw_seen
+      || !CanReuseDiOutput(true, sun_only_bound_fence, sun_only_bound_fence)) return EXIT_FAILURE;
 
   const std::array<int32_t, 64> di_point_indices = [] {
     std::array<int32_t, 64> indices = {};
@@ -304,9 +323,14 @@ int main() {
   using falcom_world::AlphaUvRangeStatus;
   using falcom_world::rtxdi::CanReuseScene;
   using falcom_world::rtxdi::IsDuplicate;
+  using falcom_world::rtxdi::MatchesStagedSunIdentity;
   using falcom_world::rtxdi::SceneReuseInputs;
   using falcom_world::rtxdi::SceneSnapshot;
+  using falcom_world::rtxdi::SunAttemptAction;
+  using falcom_world::rtxdi::SunSnapshot;
+  using falcom_world::rtxdi::SunStatus;
   using falcom_world::rtxdi::SunVisibilityStatus;
+  using falcom_world::rtxdi::TransitionSunAttempt;
   uint32_t alpha_uv_base = 0xA5A5A5A5u;
   const auto validate_alpha_uv = falcom_world::ValidateAlphaUvRange;
   if (falcom_world::ValidAlphaAtlasLayout(falcom_world::kAlphaSliceWords, falcom_world::kAlphaSliceWords,
@@ -394,6 +418,37 @@ int main() {
   falcom_world::rtxdi::RefreshOffState(&failed, 4u);
   if (failed.status != falcom_world::rtxdi::SceneStatus::Off || failed.request_mask != 0u
       || !IsDuplicate(failed, 4u, 3u) || failed.attempts != 1u || failed.skips != 1u) return EXIT_FAILURE;
+  SunSnapshot sun_staged = {.status = SunStatus::Staged,
+                            .frame = 4u,
+                            .width = 1280u,
+                            .height = 720u,
+                            .owner_generation = 3u,
+                            .configuration_generation = 7u,
+                            .fence_b = 9u,
+                            .scene_slot = 1,
+                            .transfer_slot = 2};
+  if (!MatchesStagedSunIdentity(sun_staged, 4u, 3u, 7u, 0u)
+      || MatchesStagedSunIdentity(sun_staged, 5u, 3u, 7u, 0u)
+      || MatchesStagedSunIdentity(sun_staged, 4u, 4u, 7u, 0u)
+      || MatchesStagedSunIdentity(sun_staged, 4u, 3u, 8u, 0u)
+      || MatchesStagedSunIdentity(sun_staged, 4u, 3u, 7u, 1u)) return EXIT_FAILURE;
+  TransitionSunAttempt(&sun_staged, 4u, SunAttemptAction::PreserveDuplicate);
+  if (sun_staged.status != SunStatus::Staged || sun_staged.frame != 4u || sun_staged.fence_b != 9u
+      || sun_staged.transfer_slot != 2) return EXIT_FAILURE;
+  TransitionSunAttempt(&sun_staged, 5u, SunAttemptAction::Invalidate);
+  if (sun_staged.status != SunStatus::WaitingInput || sun_staged.frame != 5u || sun_staged.fence_b != 0u
+      || sun_staged.transfer_slot != -1) return EXIT_FAILURE;
+  sun_staged = {.status = SunStatus::Staged, .frame = 4u, .owner_generation = 3u, .configuration_generation = 7u, .fence_b = 9u, .transfer_slot = 2};
+  TransitionSunAttempt(&sun_staged, 4u, SunAttemptAction::Invalidate);
+  if (sun_staged.status != SunStatus::WaitingInput || sun_staged.fence_b != 0u) return EXIT_FAILURE;
+  sun_staged = {.status = SunStatus::Staged, .frame = 4u, .owner_generation = 3u, .configuration_generation = 7u, .fence_b = 9u, .transfer_slot = 2};
+  TransitionSunAttempt(&sun_staged, 4u, SunAttemptAction::Off);
+  TransitionSunAttempt(&sun_staged, 4u, SunAttemptAction::PreserveDuplicate);
+  if (sun_staged.status != SunStatus::Off || sun_staged.frame != 4u || sun_staged.fence_b != 0u
+      || sun_staged.transfer_slot != -1) return EXIT_FAILURE;
+  sun_staged = {.status = SunStatus::Staged, .frame = 4u, .owner_generation = 3u, .configuration_generation = 7u, .fence_b = 9u, .transfer_slot = 2};
+  TransitionSunAttempt(&sun_staged, 4u, SunAttemptAction::Invalidate);
+  if (sun_staged.status == SunStatus::Staged || sun_staged.fence_b != 0u) return EXIT_FAILURE;
   falcom_world::rtxdi::DiConfig config;
   if (falcom_world::rtxdi::CalculateDiConfig(0u, 1u, &config)
       || falcom_world::rtxdi::CalculateDiConfig(UINT32_MAX, 1u, &config)
@@ -571,6 +626,14 @@ int main() {
       || falcom_world::rtxdi::ResolveSunVisibility(true, 2.f, false, 10.f, 10.f) != SunVisibilityStatus::Unknown
       || falcom_world::rtxdi::ResolveSunVisibility(false, 0.f, true, 10.f, 10.f - 1e-4f) != SunVisibilityStatus::Unknown) return EXIT_FAILURE;
   RtxdiInputLayout inputs = {};
+  RtxdiInputLayout sun_only_inputs = {}, local_only_inputs = {};
+  if (!MakeInputLayout(13u, 9u, false, false, 4096u, 4608u, 20000u, &sun_only_inputs)
+      || sun_only_inputs.flags != 0u || sun_only_inputs.lights_copied != 0u || sun_only_inputs.tiles_copied != 0u
+      || sun_only_inputs.deferred_copied != 0u
+      || !MakeInputLayout(13u, 9u, false, true, 1u, 1u, 1u, &local_only_inputs)
+      || local_only_inputs.flags != 1u || !MakeInputLayout(13u, 9u, false, true, 1u, 1u, 1u, &inputs)) {
+    return EXIT_FAILURE;
+  }
   if (!MakeInputLayout(1280u, 720u, false, true, 1050u, 4608u, 20000u, &inputs)
       || inputs.lights_copied != 1024u || inputs.lights_truncated != 26u
       || MakeInputLayout(1280u, 720u, false, true, 0u, 4609u, 1u, &inputs)

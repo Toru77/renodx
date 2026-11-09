@@ -2,6 +2,7 @@
 #define FALCOM_WORLD_RTXDI_LIGHTING_CONSUMER_HLSLI_
 
 #include "../rtxdi/rtxdi_di_layout.h"
+#include "../rtxdi/rtxdi_surface_layout.h"
 
 struct RtxdiLightingSelection
 {
@@ -11,6 +12,20 @@ struct RtxdiLightingSelection
   float inverse_pdf;
   bool valid;
 };
+
+struct RtxdiSunLightingSelection
+{
+  bool known;
+  float visibility;
+};
+
+RtxdiSunLightingSelection RtxdiResolveSunLightingSelection(bool bound, uint status)
+{
+  RtxdiSunLightingSelection result = (RtxdiSunLightingSelection)0;
+  result.known = bound && (status == RTXDI_SUN_STATUS_VISIBLE || status == RTXDI_SUN_STATUS_BLOCKED);
+  result.visibility = status == RTXDI_SUN_STATUS_VISIBLE ? 1.0 : 0.0;
+  return result;
+}
 
 RtxdiLightingSelection RtxdiResolveLightingSelection(bool bound, uint4 tuple, uint light_count, LightIndexData tile)
 {

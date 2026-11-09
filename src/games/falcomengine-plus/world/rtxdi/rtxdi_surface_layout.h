@@ -41,6 +41,7 @@
 
 #define RTXDI_SUN_FLAG_CHARACTER 1u
 #define RTXDI_SUN_FLAG_TRUNCATED 2u
+#define RTXDI_SUN_FLAG_UNIT_INVERSE_PDF 4u
 
 #ifdef __cplusplus
 struct RtxdiSunVisibilityResult {

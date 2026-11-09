@@ -111,6 +111,10 @@ struct LightingConsumerCase {
   float dynamic_intensity;
   float padding2;
   RtxdiTileData tile;
+  uint32_t sun_bound;
+  uint32_t sun_status;
+  float csm_visibility;
+  uint32_t padding3;
 };
 struct LightingConsumerResult {
   uint32_t mode;
@@ -121,6 +125,10 @@ struct LightingConsumerResult {
   float shaded_local_term;
   uint32_t selected_index;
   uint32_t selected_type;
+  uint32_t sun_known;
+  float environment_sun_visibility;
+  float character_sun_multiplier;
+  uint32_t padding;
 };
 static_assert(sizeof(WorldMeshGPU) == 64);
 static_assert(sizeof(WorldInstanceGPU) == 192);
@@ -130,8 +138,8 @@ static_assert(sizeof(SurfaceResult) == 48);
 static_assert(sizeof(RtxdiLightParam) == RTXDI_INPUT_LIGHT_STRIDE);
 static_assert(sizeof(RtxdiTileData) == RTXDI_INPUT_TILE_STRIDE);
 static_assert(sizeof(DeferredParam) == RTXDI_INPUT_DEFERRED_STRIDE);
-static_assert(sizeof(LightingConsumerCase) == 632u);
-static_assert(sizeof(LightingConsumerResult) == 32u);
+static_assert(sizeof(LightingConsumerCase) == 648u);
+static_assert(sizeof(LightingConsumerResult) == 48u);
 
 bool Check(HRESULT hr, const char* operation) {
   if (FAILED(hr)) std::fprintf(stderr, "FAIL DXR %s: HRESULT 0x%08lx\n", operation, static_cast<unsigned long>(hr));
@@ -596,6 +604,9 @@ int RunRtxdiDxrBridge() {
   scene_pixels[(RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 2) * 4 + 2] = std::bit_cast<uint32_t>(2.f);
   scene_pixels[(RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 3) * 4 + 2] = std::bit_cast<uint32_t>(-2.f);
   scene_pixels[RTXDI_SURFACE_SUN_RESERVED_ROW * 4 + 2] = std::bit_cast<uint32_t>(-1.f);
+  for (UINT channel = 0u; channel < 3u; ++channel) {
+    scene_pixels[(RTXDI_SURFACE_SUN_RESERVED_ROW - 1u) * 4u + channel] = std::bit_cast<uint32_t>(1.f);
+  }
   scene_pixels[RTXDI_SURFACE_RESOLUTION_SCALING_ROW * 4 + 0] = std::bit_cast<uint32_t>(1.f);
   scene_pixels[RTXDI_SURFACE_RESOLUTION_SCALING_ROW * 4 + 1] = std::bit_cast<uint32_t>(1.f);
   scene_pixels[RTXDI_SURFACE_LIGHT_TILE_SIZE_ROW * 4 + 0] = std::bit_cast<uint32_t>(1.f / 32.f);
@@ -655,25 +666,32 @@ int RunRtxdiDxrBridge() {
   std::fprintf(stderr, "DXR AS build submitted and fence completed\n");
   if (!Check(allocator->Reset(), "reset allocator") || !Check(base_list->Reset(allocator.Get(), nullptr), "reset list")) return 1;
 
-  // Production sun shader root table: t0-t3, t14-t16, t29, t30, t31-t33, u0.
-  D3D12_DESCRIPTOR_RANGE sun_ranges[6] = {};
+  // Production sun shader root table: t0-t3, t14-t16, t29, t30, t31-t33, u0-u1.
+  D3D12_DESCRIPTOR_RANGE sun_ranges[7] = {};
   sun_ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0};
   sun_ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 14, 0, 4};
   sun_ranges[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 29, 0, 7};
   sun_ranges[3] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 30, 0, 8};
   sun_ranges[4] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 31, 0, 9};
   sun_ranges[5] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 12};
+  sun_ranges[6] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0, 13};
   ComPtr<ID3D12RootSignature> sun_root;
   ComPtr<ID3D12PipelineState> sun_pso;
-  if (!CreateRoot(device.Get(), sun_ranges, 6, 12, &sun_root)
+  if (!CreateRoot(device.Get(), sun_ranges, 7, 12, &sun_root)
       || !CreatePso(device.Get(), sun_root.Get(), __world_rtxdi_sun_visibility, &sun_pso)) return 1;
   std::fprintf(stderr, "DXR sun root + PSO ready\n");
   D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
   heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  heap_desc.NumDescriptors = 13;
+  heap_desc.NumDescriptors = 14;
   heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   ComPtr<ID3D12DescriptorHeap> sun_heap;
   if (!Check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&sun_heap)), "create sun descriptor heap")) return 1;
+  heap_desc.NumDescriptors = 1;
+  heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+  ComPtr<ID3D12DescriptorHeap> sun_cpu_heap;
+  if (!Check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&sun_cpu_heap)), "create sun CPU descriptor heap")) return 1;
+  heap_desc.NumDescriptors = 14;
+  heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   std::fprintf(stderr, "DXR sun descriptor heap ready\n");
   const UINT descriptor_size = device->GetDescriptorHandleIncrementSize(heap_desc.Type);
   CreateBufferSrv(device.Get(), sun_heap.Get(), descriptor_size, 0, vertices.Get(), 3, 16);
@@ -719,16 +737,43 @@ int RunRtxdiDxrBridge() {
 
   ComPtr<ID3D12Resource> sun_output;
   ComPtr<ID3D12Resource> sun_readback;
+  ComPtr<ID3D12Resource> sun_visibility_output;
+  ComPtr<ID3D12Resource> sun_visibility_readback;
   constexpr UINT pixel_count = 6;
   constexpr UINT sun_output_count = pixel_count + 1;
+  const auto default_properties = Heap(D3D12_HEAP_TYPE_DEFAULT);
   const auto readback_properties = Heap(D3D12_HEAP_TYPE_READBACK);
   const auto sun_readback_desc = BufferDesc(sizeof(SunResult) * sun_output_count);
+  D3D12_RESOURCE_DESC sun_visibility_desc = {};
+  sun_visibility_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  sun_visibility_desc.Width = 4u;
+  sun_visibility_desc.Height = 2u;
+  sun_visibility_desc.DepthOrArraySize = 1u;
+  sun_visibility_desc.MipLevels = 1u;
+  sun_visibility_desc.Format = DXGI_FORMAT_R32_UINT;
+  sun_visibility_desc.SampleDesc.Count = 1u;
+  sun_visibility_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  sun_visibility_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT visibility_footprint = {};
+  UINT visibility_rows = 0u;
+  UINT64 visibility_row_bytes = 0u, visibility_bytes = 0u;
+  device->GetCopyableFootprints(&sun_visibility_desc, 0u, 1u, 0u, &visibility_footprint, &visibility_rows,
+                                &visibility_row_bytes, &visibility_bytes);
+  const auto visibility_readback_desc = BufferDesc(visibility_bytes);
   if (!CreateDefaultBuffer(device.Get(), sizeof(SunResult) * sun_output_count, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                            D3D12_RESOURCE_STATE_COMMON, &sun_output)
       || !Check(device->CreateCommittedResource(&readback_properties, D3D12_HEAP_FLAG_NONE,
                                                 &sun_readback_desc, D3D12_RESOURCE_STATE_COPY_DEST,
                                                 nullptr, IID_PPV_ARGS(&sun_readback)),
-                "create sun readback")) return 1;
+                "create sun readback")
+      || !Check(device->CreateCommittedResource(&default_properties, D3D12_HEAP_FLAG_NONE, &sun_visibility_desc,
+                                                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                IID_PPV_ARGS(&sun_visibility_output)),
+                "create sun visibility output")
+      || !Check(device->CreateCommittedResource(&readback_properties, D3D12_HEAP_FLAG_NONE,
+                                                &visibility_readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&sun_visibility_readback)),
+                "create sun visibility readback")) return 1;
   std::fprintf(stderr, "DXR sun output/readback ready\n");
   cpu = sun_heap->GetCPUDescriptorHandleForHeapStart();
   cpu.ptr += static_cast<SIZE_T>(12) * descriptor_size;
@@ -738,6 +783,13 @@ int RunRtxdiDxrBridge() {
   result_uav.Buffer.NumElements = sun_output_count;
   result_uav.Buffer.StructureByteStride = sizeof(SunResult);
   device->CreateUnorderedAccessView(sun_output.Get(), nullptr, &result_uav, cpu);
+  cpu.ptr += descriptor_size;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC visibility_uav = {};
+  visibility_uav.Format = DXGI_FORMAT_R32_UINT;
+  visibility_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  device->CreateUnorderedAccessView(sun_visibility_output.Get(), nullptr, &visibility_uav, cpu);
+  device->CreateUnorderedAccessView(sun_visibility_output.Get(), nullptr, &visibility_uav,
+                                    sun_cpu_heap->GetCPUDescriptorHandleForHeapStart());
   std::array<UINT, sun_output_count * 4> sentinel_words = {};
   sentinel_words.fill(0xDEADBEEFu);
   ComPtr<ID3D12Resource> sentinel_upload;
@@ -755,6 +807,8 @@ int RunRtxdiDxrBridge() {
   output_to_uav.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
   output_to_uav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   list->ResourceBarrier(1, &output_to_uav);
+  output_to_uav.Transition.pResource = sun_visibility_output.Get();
+  list->ResourceBarrier(1, &output_to_uav);
   const auto dispatch = [&](UINT mask_index, float max_distance, UINT expected_status, UINT expected_reason,
                             bool coverage_valid, const char* label, float expected_distance = -1.f,
                             bool scene_valid = true, float environment_bias = 0.01f, float character_bias = 0.02f) {
@@ -768,7 +822,7 @@ int RunRtxdiDxrBridge() {
     const UINT params[12] = {3, 2, std::bit_cast<UINT>(max_distance), std::bit_cast<UINT>(environment_bias),
                              std::bit_cast<UINT>(character_bias), std::bit_cast<UINT>(-2.f), std::bit_cast<UINT>(-2.f),
                              std::bit_cast<UINT>(-2.f), std::bit_cast<UINT>(4.f), scene_valid ? 1u : 0u,
-                             coverage_valid ? 1u : 0u, 0};
+                             coverage_valid ? 1u : 0u, 1u};
     list->SetComputeRoot32BitConstants(0, 12, params, 0);
     D3D12_RESOURCE_BARRIER output_barrier = {};
     output_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -781,10 +835,19 @@ int RunRtxdiDxrBridge() {
     output_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     output_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     list->ResourceBarrier(1, &output_barrier);
+    const auto sun_visibility_gpu = sun_heap->GetGPUDescriptorHandleForHeapStart();
+    auto sun_visibility_cpu = sun_cpu_heap->GetCPUDescriptorHandleForHeapStart();
+    auto sun_visibility_gpu_offset = sun_visibility_gpu;
+    sun_visibility_gpu_offset.ptr += static_cast<UINT64>(13u) * descriptor_size;
+    const UINT visibility_sentinel[4] = {0xDEADBEEFu, 0u, 0u, 0u};
+    list->ClearUnorderedAccessViewUint(sun_visibility_gpu_offset, sun_visibility_cpu, sun_visibility_output.Get(),
+                                       visibility_sentinel, 0u, nullptr);
     list->Dispatch(1, 1, 1);
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barrier.UAV.pResource = sun_output.Get();
+    list->ResourceBarrier(1, &barrier);
+    barrier.UAV.pResource = sun_visibility_output.Get();
     list->ResourceBarrier(1, &barrier);
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = sun_output.Get();
@@ -793,6 +856,24 @@ int RunRtxdiDxrBridge() {
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     list->ResourceBarrier(1, &barrier);
     list->CopyBufferRegion(sun_readback.Get(), 0, sun_output.Get(), 0, sizeof(SunResult) * sun_output_count);
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = sun_visibility_output.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION visibility_source = {};
+    visibility_source.pResource = sun_visibility_output.Get();
+    visibility_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION visibility_dest = {};
+    visibility_dest.pResource = sun_visibility_readback.Get();
+    visibility_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    visibility_dest.PlacedFootprint = visibility_footprint;
+    list->CopyTextureRegion(&visibility_dest, 0u, 0u, 0u, &visibility_source, nullptr);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(1, &barrier);
+    barrier.Transition.pResource = sun_output.Get();
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     list->ResourceBarrier(1, &barrier);
@@ -809,6 +890,9 @@ int RunRtxdiDxrBridge() {
     if (!Check(sun_readback->Map(0, nullptr, &mapped), "map sun result")) return false;
     const auto* results = static_cast<const SunResult*>(mapped);
     sun_readback->Unmap(0, nullptr);
+    void* visibility_mapped = nullptr;
+    if (!Check(sun_visibility_readback->Map(0u, nullptr, &visibility_mapped), "map sun visibility status")) return false;
+    const auto* visibility_bytes = static_cast<const uint8_t*>(visibility_mapped);
     for (UINT i = 0; i < pixel_count; ++i) {
       if (results[i].status != expected_status || results[i].reason != expected_reason
           || (expected_distance >= 0.f && std::abs(results[i].distance - expected_distance) > 0.02f)) {
@@ -819,7 +903,34 @@ int RunRtxdiDxrBridge() {
         DumpDebugMessages(device.Get());
         return false;
       }
+      const bool sampled_sun = expected_reason == RTXDI_SUN_REASON_NONE
+                               || expected_reason == RTXDI_SUN_REASON_INVALID_ALPHA
+                               || expected_reason == RTXDI_SUN_REASON_COVERAGE_MISS
+                               || expected_reason == RTXDI_SUN_REASON_TRUNCATED;
+      if (sampled_sun != ((results[i].flags & RTXDI_SUN_FLAG_UNIT_INVERSE_PDF) != 0u)) {
+        std::fprintf(stderr, "FAIL %s pixel=%u unit inverse-PDF flag=%u\n", label, i,
+                     (results[i].flags & RTXDI_SUN_FLAG_UNIT_INVERSE_PDF) != 0u);
+        sun_readback->Unmap(0, nullptr);
+        return false;
+      }
+      const UINT x = i % 3u;
+      const UINT y = i / 3u;
+      const auto* row = reinterpret_cast<const UINT*>(visibility_bytes + y * visibility_footprint.Footprint.RowPitch);
+      if (row[x] != expected_status) {
+        std::fprintf(stderr, "FAIL %s t42 pixel=%u status=%u expected=%u\n", label, i, row[x], expected_status);
+        sun_visibility_readback->Unmap(0u, nullptr);
+        return false;
+      }
     }
+    for (UINT y = 0u; y < 2u; ++y) {
+      const auto* row = reinterpret_cast<const UINT*>(visibility_bytes + y * visibility_footprint.Footprint.RowPitch);
+      if (row[3] != 0xDEADBEEFu) {
+        std::fprintf(stderr, "FAIL %s t42 guard overwritten at row=%u status=%u\n", label, y, row[3]);
+        sun_visibility_readback->Unmap(0u, nullptr);
+        return false;
+      }
+    }
+    sun_visibility_readback->Unmap(0u, nullptr);
     for (UINT i = pixel_count; i < sun_output_count; ++i) {
       const auto* words = reinterpret_cast<const UINT*>(&results[i]);
       if (words[0] != 0xDEADBEEFu || words[1] != 0xDEADBEEFu || words[2] != 0xDEADBEEFu
@@ -958,6 +1069,21 @@ int RunRtxdiDxrBridge() {
   if (!update_upload(meshes.Get(), &mesh, sizeof(mesh))
       || !update_upload(alpha_materials.Get(), &alpha_material, sizeof(alpha_material))
       || !dispatch(0, 0.6f, RTXDI_SUN_STATUS_UNKNOWN, RTXDI_SUN_REASON_INVALID_ALPHA, true, "invalid UV metadata")) return 1;
+
+  auto valid_sun_scene = scene_pixels;
+  for (UINT channel = 0u; channel < 3u; ++channel) {
+    scene_pixels[(RTXDI_SURFACE_SUN_RESERVED_ROW - 1u) * 4u + channel] = std::bit_cast<uint32_t>(0.f);
+  }
+  if (!update_pixel_texture(scene_tex.Get(), scene_upload.Get(), scene_pixels.data(), RTXDI_SURFACE_SCENE_ROW_COUNT * 16u)
+      || !dispatch(4, 0.6f, RTXDI_SUN_STATUS_UNKNOWN, RTXDI_SUN_REASON_INVALID_RAY, true,
+                   "invalid sun radiance metadata")) return 1;
+  scene_pixels = valid_sun_scene;
+  scene_pixels[RTXDI_SURFACE_SUN_RESERVED_ROW * 4u + 2u] = std::bit_cast<uint32_t>(0.f);
+  if (!update_pixel_texture(scene_tex.Get(), scene_upload.Get(), scene_pixels.data(), RTXDI_SURFACE_SCENE_ROW_COUNT * 16u)
+      || !dispatch(4, 0.6f, RTXDI_SUN_STATUS_UNKNOWN, RTXDI_SUN_REASON_INVALID_RAY, true,
+                   "invalid sun direction metadata")) return 1;
+  scene_pixels = valid_sun_scene;
+  if (!update_pixel_texture(scene_tex.Get(), scene_upload.Get(), scene_pixels.data(), RTXDI_SURFACE_SCENE_ROW_COUNT * 16u)) return 1;
 
   // Surface contract shader uses the same production reconstruction include with the exact t0-t2/u0 layout.
   D3D12_DESCRIPTOR_RANGE surface_ranges[2] = {};
@@ -2332,6 +2458,19 @@ int RunRtxdiDxrBridge() {
   lighting_cases[6].original_spot_count = 0u;
   lighting_cases[7] = lighting_cases[1];
   lighting_cases[7].tuple[1] = 3u;
+  lighting_cases[0].sun_bound = 1u;
+  lighting_cases[0].sun_status = RTXDI_SUN_STATUS_VISIBLE;
+  lighting_cases[1].sun_bound = 1u;
+  lighting_cases[1].sun_status = RTXDI_SUN_STATUS_BLOCKED;
+  lighting_cases[2].sun_bound = 1u;
+  lighting_cases[2].sun_status = RTXDI_SUN_STATUS_UNKNOWN;
+  lighting_cases[2].csm_visibility = 0.35f;
+  lighting_cases[3].sun_bound = 0u;
+  lighting_cases[3].sun_status = RTXDI_SUN_STATUS_VISIBLE;
+  lighting_cases[3].csm_visibility = 0.65f;
+  lighting_cases[4].sun_bound = 1u;
+  lighting_cases[4].sun_status = 17u;
+  lighting_cases[4].csm_visibility = 0.2f;
   for (LightingConsumerCase& test_case : lighting_cases) {
     test_case.padding[0] = 0u;
     test_case.padding[1] = 0u;
@@ -2431,7 +2570,16 @@ int RunRtxdiDxrBridge() {
       && lighting_results[6].mode == 0u && lighting_results[6].point_count == 0u
       && lighting_results[6].spot_count == 0u && lighting_results[6].raw_local_term == 0.f
       && lighting_results[7].mode == 0u && lighting_results[7].point_count == 2u
-      && lighting_results[7].spot_count == 2u;
+      && lighting_results[7].spot_count == 2u
+      && lighting_results[0].sun_known == 1u && lighting_results[0].environment_sun_visibility == 1.f
+      && lighting_results[0].character_sun_multiplier == 1.f
+      && lighting_results[1].sun_known == 1u && lighting_results[1].environment_sun_visibility == 0.f
+      && lighting_results[1].character_sun_multiplier == 0.f
+      && lighting_results[2].sun_known == 0u && lighting_results[2].environment_sun_visibility == 0.35f
+      && lighting_results[2].character_sun_multiplier == 1.f
+      && lighting_results[3].sun_known == 0u && lighting_results[3].environment_sun_visibility == 0.65f
+      && lighting_results[3].character_sun_multiplier == 1.f
+      && lighting_results[4].sun_known == 0u && lighting_results[4].environment_sun_visibility == 0.2f;
   lighting_readback->Unmap(0u, nullptr);
   if (!lighting_contract_ok) {
     std::fprintf(stderr, "FAIL lighting consumer GPU contract point=(%u,%u,%g,%g) spot=(%u,%u,%g,%g) fallback=%u/%u blocked=%u\n",
@@ -2442,6 +2590,7 @@ int RunRtxdiDxrBridge() {
     return 1;
   }
   std::printf("PASS production lighting selection helper point/spot/blocked/unknown/unbound/invalid fallback; post-material application once\n");
+  std::printf("PASS RTXDI sun consumer helper visible/blocked/unknown/unbound/malformed; CSM and character fallback preserved\n");
   if (!ValidateDebugMessages(info_queue.Get())) return 1;
   std::printf("PASS production surface + DXR visibility (3x2, guard sentinel, masks incl. FORCE_OPAQUE, endpoint, coverage, scene/surface invalids, bias, alpha)\n");
   CloseHandle(event);
