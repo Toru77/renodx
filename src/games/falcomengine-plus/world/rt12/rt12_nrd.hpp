@@ -6,6 +6,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -73,6 +74,8 @@ struct Rt12NrdSlot {
   ComPtr<ID3D12DescriptorHeap> dispatch_descriptors;
   ComPtr<ID3D12Resource> dispatch_constants;
   ComPtr<ID3D12DescriptorHeap> prep_descriptors;
+  ComPtr<ID3D12DescriptorHeap> publication_descriptors;
+  ComPtr<ID3D12Resource> publication_constants;
   ComPtr<ID3D12DescriptorHeap> hitdistance_descriptors;
   ComPtr<ID3D12Resource> prep_constants;
   ComPtr<ID3D12Resource> prep_diffuse;
@@ -100,8 +103,102 @@ struct Rt12NrdSlot {
   bool probe_pending = false;
   bool dispatch_ready = false;
   bool diffuse_output_valid = false;
+  bool diffuse_publication_recorded = false;
   uint64_t fence_value = 0;
 };
+
+struct Rt12NrdDiffusePublicationIdentity {
+  uint64_t owner_generation = 0u;
+  uint64_t transfer_configuration = 0u;
+  uint64_t di_configuration = 0u;
+  uint64_t n1_configuration = 0u;
+  uint64_t nrd_configuration = 0u;
+  uint64_t producer_fence_b = 0u;
+  uint32_t frame = UINT32_MAX;
+  uint32_t width = 0u;
+  uint32_t height = 0u;
+  int32_t scene_slot = -1;
+  int32_t transfer_slot = -1;
+  bool accepted = false;
+};
+
+inline uint64_t Rt12NrdN1ConfigurationIdentity(uint32_t version, const std::array<float, 7>& brdf_config) {
+  uint64_t identity = 1469598103934665603ull ^ version;
+  for (float value : brdf_config) {
+    identity ^= std::bit_cast<uint32_t>(value);
+    identity *= 1099511628211ull;
+  }
+  return identity == 0u ? 1u : identity;
+}
+
+inline uint64_t Rt12NrdConfigurationIdentity(uint64_t transfer_configuration, uint64_t di_configuration,
+                                             uint32_t motion_correction_index) {
+  uint64_t identity = (transfer_configuration ^ (di_configuration * 0x9e3779b97f4a7c15ull)
+                       ^ (uint64_t{motion_correction_index} << 32u) ^ 1u)
+                      ^ 1469598103934665603ull;
+  identity *= 1099511628211ull;
+  return identity == 0u ? 1u : identity;
+}
+
+inline bool Rt12NrdDiffusePublicationMatches(const Rt12NrdDiffusePublicationIdentity& identity,
+                                             uint32_t frame, uint64_t owner_generation,
+                                             uint64_t transfer_configuration, uint64_t di_configuration,
+                                             uint64_t n1_configuration, uint64_t nrd_configuration,
+                                             uint32_t width, uint32_t height, int32_t scene_slot,
+                                             int32_t transfer_slot, uint64_t producer_fence_b) {
+  return identity.accepted && identity.frame == frame && identity.owner_generation == owner_generation
+         && identity.transfer_configuration == transfer_configuration && identity.di_configuration == di_configuration
+         && identity.n1_configuration == n1_configuration && identity.nrd_configuration == nrd_configuration
+         && identity.width == width && identity.height == height && identity.scene_slot == scene_slot
+         && identity.transfer_slot == transfer_slot && identity.producer_fence_b != 0u
+         && identity.producer_fence_b == producer_fence_b;
+}
+
+inline bool Rt12NrdCreateDiffusePublicationPipeline(ID3D12Device* device, const void* shader_bytecode,
+                                                    size_t shader_size,
+                                                    Microsoft::WRL::ComPtr<ID3D12RootSignature>* root,
+                                                    Microsoft::WRL::ComPtr<ID3D12PipelineState>* pipeline) {
+  if (device == nullptr || shader_bytecode == nullptr || shader_size == 0u || root == nullptr || pipeline == nullptr)
+    return false;
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[0].NumDescriptors = 4u;
+  ranges[0].BaseShaderRegister = 0u;
+  ranges[0].OffsetInDescriptorsFromTableStart = 0u;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  ranges[1].NumDescriptors = 1u;
+  ranges[1].BaseShaderRegister = 0u;
+  ranges[1].OffsetInDescriptorsFromTableStart = 0u;
+  D3D12_ROOT_PARAMETER parameters[3] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[0].Constants.ShaderRegister = 0u;
+  parameters[0].Constants.Num32BitValues = 3u;
+  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[1].DescriptorTable.NumDescriptorRanges = 1u;
+  parameters[1].DescriptorTable.pDescriptorRanges = &ranges[0];
+  parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[2].DescriptorTable.NumDescriptorRanges = 1u;
+  parameters[2].DescriptorTable.pDescriptorRanges = &ranges[1];
+  parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_ROOT_SIGNATURE_DESC signature = {};
+  signature.NumParameters = static_cast<UINT>(std::size(parameters));
+  signature.pParameters = parameters;
+  ComPtr<ID3DBlob> blob, errors;
+  if (FAILED(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors))) return false;
+  ComPtr<ID3D12RootSignature> candidate_root;
+  ComPtr<ID3D12PipelineState> candidate_pipeline;
+  if (FAILED(device->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                         IID_PPV_ARGS(&candidate_root)))) return false;
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc = {};
+  pipeline_desc.pRootSignature = candidate_root.Get();
+  pipeline_desc.CS = {shader_bytecode, shader_size};
+  if (FAILED(device->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&candidate_pipeline)))) return false;
+  *root = std::move(candidate_root);
+  *pipeline = std::move(candidate_pipeline);
+  return true;
+}
 
 struct Rt12NrdResourcePools {
   std::vector<Rt12NrdTexture> permanent;
@@ -230,6 +327,132 @@ inline Rt12NrdTexture* Rt12NrdFindTexture(const nrd::ResourceDesc& resource,
   if (index >= static_cast<uint32_t>(nrd::ResourceType::TRANSIENT_POOL)) return nullptr;
   Rt12NrdTexture& texture = slot->resources[index];
   return texture.resource ? &texture : nullptr;
+}
+
+inline bool Rt12NrdRecordDiffusePublication(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                                            ID3D12RootSignature* root, ID3D12PipelineState* pipeline,
+                                            ID3D12DescriptorHeap* descriptors, ID3D12Resource* constants,
+                                            Rt12NrdTexture* relax_diffuse, Rt12NrdTexture* prepared_viewz,
+                                            Rt12NrdTexture* n1_status, Rt12NrdTexture* n3b_hit_validity,
+                                            Rt12NrdTexture* publication, uint32_t width, uint32_t height) {
+  if (device == nullptr || list == nullptr || root == nullptr || pipeline == nullptr || descriptors == nullptr
+      || constants == nullptr || relax_diffuse == nullptr || prepared_viewz == nullptr || n1_status == nullptr
+      || n3b_hit_validity == nullptr || publication == nullptr || width == 0u || height == 0u
+      || uint64_t{width} * height > UINT32_MAX || !relax_diffuse->resource || !prepared_viewz->resource
+      || !n1_status->resource || !n3b_hit_validity->resource || !publication->resource
+      || relax_diffuse->width != width || relax_diffuse->height != height || prepared_viewz->width != width
+      || prepared_viewz->height != height || n1_status->width != width || n1_status->height != height
+      || publication->width != width || publication->height != height
+      || relax_diffuse->format != DXGI_FORMAT_R16G16B16A16_FLOAT
+      || prepared_viewz->format != DXGI_FORMAT_R32_FLOAT || n1_status->format != DXGI_FORMAT_R32_UINT
+      || publication->format != DXGI_FORMAT_R16G16B16A16_FLOAT
+      || n3b_hit_validity->resource->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+      || n3b_hit_validity->resource->GetDesc().Width < uint64_t{width} * height * sizeof(uint32_t)) return false;
+
+  const uint32_t descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  const D3D12_CPU_DESCRIPTOR_HANDLE heap_cpu = descriptors->GetCPUDescriptorHandleForHeapStart();
+  const D3D12_GPU_DESCRIPTOR_HANDLE heap_gpu = descriptors->GetGPUDescriptorHandleForHeapStart();
+  if (constants->GetDesc().Width < 12u) return false;
+  void* mapped = nullptr;
+  const D3D12_RANGE no_read = {0u, 0u};
+  if (FAILED(constants->Map(0u, &no_read, &mapped))) return false;
+  const std::array<uint32_t, 3u> publication_constants = {width, height, std::bit_cast<uint32_t>(500000.0f)};
+  std::memcpy(mapped, publication_constants.data(), sizeof(publication_constants));
+  constants->Unmap(0u, nullptr);
+
+  const std::array<Rt12NrdTexture*, 4u> inputs = {relax_diffuse, prepared_viewz, n1_status, n3b_hit_validity};
+  std::array<D3D12_RESOURCE_STATES, 4u> input_restore_states = {};
+  const std::array<DXGI_FORMAT, 4u> input_formats = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT,
+                                                     DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN};
+  std::array<D3D12_RESOURCE_BARRIER, 16u> barriers = {};
+  uint32_t barrier_count = 0u;
+  for (uint32_t index = 0u; index < inputs.size(); ++index) {
+    Rt12NrdTexture& input = *inputs[index];
+    input_restore_states[index] = input.state;
+    if (input.state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS && input.unordered_access_written) {
+      D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
+      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+      barrier.UAV.pResource = input.resource.Get();
+      input.unordered_access_written = false;
+    }
+    if (input.state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+        && input.state != D3D12_RESOURCE_STATE_GENERIC_READ) {
+      D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
+      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barrier.Transition.pResource = input.resource.Get();
+      barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      barrier.Transition.StateBefore = input.state;
+      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      input.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+    view.Format = input_formats[index];
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (index == 3u) {
+      view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+      view.Buffer.NumElements = width * height;
+      view.Buffer.StructureByteStride = sizeof(uint32_t);
+    } else {
+      view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      view.Texture2D.MipLevels = 1u;
+    }
+    device->CreateShaderResourceView(input.resource.Get(), &view,
+                                     {heap_cpu.ptr + static_cast<SIZE_T>(index) * descriptor_size});
+  }
+  if (publication->state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+    D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = publication->resource.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = publication->state;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    publication->state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  }
+  D3D12_UNORDERED_ACCESS_VIEW_DESC output_view = {};
+  output_view.Format = publication->format;
+  output_view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  device->CreateUnorderedAccessView(publication->resource.Get(), nullptr, &output_view,
+                                    {heap_cpu.ptr + static_cast<SIZE_T>(4u) * descriptor_size});
+  if (barrier_count != 0u) list->ResourceBarrier(barrier_count, barriers.data());
+
+  ID3D12DescriptorHeap* heaps[] = {descriptors};
+  list->SetDescriptorHeaps(1u, heaps);
+  list->SetComputeRootSignature(root);
+  list->SetPipelineState(pipeline);
+  list->SetComputeRoot32BitConstants(0u, static_cast<UINT>(publication_constants.size()),
+                                     publication_constants.data(), 0u);
+  list->SetComputeRootDescriptorTable(1u, heap_gpu);
+  list->SetComputeRootDescriptorTable(2u, {heap_gpu.ptr + static_cast<UINT64>(4u) * descriptor_size});
+  list->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
+  publication->unordered_access_written = true;
+
+  barriers = {};
+  barrier_count = 0u;
+  D3D12_RESOURCE_BARRIER& publication_uav = barriers[barrier_count++];
+  publication_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  publication_uav.UAV.pResource = publication->resource.Get();
+  publication->unordered_access_written = false;
+  D3D12_RESOURCE_BARRIER& publication_common = barriers[barrier_count++];
+  publication_common.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  publication_common.Transition.pResource = publication->resource.Get();
+  publication_common.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  publication_common.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  publication_common.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+  publication->state = D3D12_RESOURCE_STATE_COMMON;
+  for (uint32_t index = 0u; index < inputs.size(); ++index) {
+    Rt12NrdTexture& input = *inputs[index];
+    const D3D12_RESOURCE_STATES restore_state = input_restore_states[index];
+    if (input.state == restore_state) continue;
+    D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = input.resource.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = input.state;
+    barrier.Transition.StateAfter = restore_state;
+    input.state = restore_state;
+  }
+  list->ResourceBarrier(barrier_count, barriers.data());
+  return true;
 }
 
 inline bool Rt12NrdRecordDispatches(ID3D12Device* device, ID3D12GraphicsCommandList* list,

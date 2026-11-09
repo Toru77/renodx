@@ -120,6 +120,14 @@ struct DiSnapshot {
   uint64_t output_fence_b = 0u, output_fence_c = 0u;
   int32_t output_scene_slot = -1, output_transfer_slot = -1;
   bool output_staged = false;
+#if defined(FALCOM_NRD_ENABLED)
+  bool nrd_diffuse_staged = false;
+  bool nrd_diffuse_bound = false;
+  bool nrd_diffuse_lighting_draw_seen = false;
+  uint32_t nrd_diffuse_frame = UINT32_MAX;
+  int32_t nrd_diffuse_transfer_slot = -1;
+  uint64_t nrd_diffuse_fence_b = 0u;
+#endif
   bool output_bound = false;
   uint32_t output_bound_frame = UINT32_MAX;
   int32_t output_bound_transfer_slot = -1;

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <thread>
 #include <vector>
@@ -120,6 +121,11 @@ struct LightingConsumerCase {
   uint32_t sun_status;
   float csm_visibility;
   uint32_t padding3;
+  float nrd_diffuse[4];
+  uint32_t nrd_bound;
+  uint32_t expected_class;
+  float raw_specular;
+  uint32_t padding4;
 };
 struct LightingConsumerResult {
   uint32_t mode;
@@ -137,6 +143,10 @@ struct LightingConsumerResult {
   uint32_t character_mode;
   uint32_t character_type;
   float character_term;
+  uint32_t denoised_used;
+  float diffuse_replaced;
+  float specular_preserved;
+  uint32_t padding2;
 };
 static_assert(sizeof(WorldMeshGPU) == 64);
 static_assert(sizeof(WorldInstanceGPU) == 192);
@@ -146,8 +156,8 @@ static_assert(sizeof(SurfaceResult) == 48);
 static_assert(sizeof(RtxdiLightParam) == RTXDI_INPUT_LIGHT_STRIDE);
 static_assert(sizeof(RtxdiTileData) == RTXDI_INPUT_TILE_STRIDE);
 static_assert(sizeof(DeferredParam) == RTXDI_INPUT_DEFERRED_STRIDE);
-static_assert(sizeof(LightingConsumerCase) == 648u);
-static_assert(sizeof(LightingConsumerResult) == 60u);
+static_assert(sizeof(LightingConsumerCase) == 680u);
+static_assert(sizeof(LightingConsumerResult) == 76u);
 
 bool Check(HRESULT hr, const char* operation) {
   if (FAILED(hr)) std::fprintf(stderr, "FAIL DXR %s: HRESULT 0x%08lx\n", operation, static_cast<unsigned long>(hr));
@@ -2932,7 +2942,7 @@ int RunRtxdiDxrBridge() {
   }
   std::printf("PASS finite-input raw overflow sanitizer writes UNKNOWN and zero diffuse\n");
 
-  constexpr uint32_t lighting_case_count = 9u;
+  constexpr uint32_t lighting_case_count = 17u;
   std::array<LightingConsumerCase, lighting_case_count> lighting_cases = {};
   for (LightingConsumerCase& test_case : lighting_cases) {
     test_case.light_count = 16u;
@@ -2981,6 +2991,47 @@ int RunRtxdiDxrBridge() {
   lighting_cases[7] = lighting_cases[1];
   lighting_cases[7].tuple[1] = 3u;
   lighting_cases[8] = lighting_cases[3];
+  lighting_cases[9] = lighting_cases[0];
+  lighting_cases[9].nrd_diffuse[0] = 0.125f;
+  lighting_cases[9].nrd_diffuse[1] = 0.25f;
+  lighting_cases[9].nrd_diffuse[2] = 0.5f;
+  lighting_cases[9].nrd_diffuse[3] = 1.0f;
+  lighting_cases[9].nrd_bound = 1u;
+  lighting_cases[9].expected_class = 1u;
+  lighting_cases[9].raw_specular = 5.0f;
+  lighting_cases[10] = lighting_cases[1];
+  lighting_cases[10].nrd_diffuse[0] = 0.375f;
+  lighting_cases[10].nrd_diffuse[1] = 0.125f;
+  lighting_cases[10].nrd_diffuse[2] = 0.25f;
+  lighting_cases[10].nrd_diffuse[3] = 1.0f;
+  lighting_cases[10].nrd_bound = 1u;
+  lighting_cases[10].expected_class = 1u;
+  lighting_cases[10].raw_specular = 7.0f;
+  lighting_cases[11] = lighting_cases[0];
+  lighting_cases[11].nrd_diffuse[0] = 0.875f;
+  lighting_cases[11].nrd_diffuse[3] = 1.0f;
+  lighting_cases[11].nrd_bound = 1u;
+  lighting_cases[11].expected_class = 2u;
+  lighting_cases[12] = lighting_cases[9];
+  lighting_cases[12].nrd_diffuse[0] = std::numeric_limits<float>::quiet_NaN();
+  lighting_cases[13] = lighting_cases[9];
+  lighting_cases[13].nrd_diffuse[0] = -0.25f;
+  lighting_cases[14] = lighting_cases[9];
+  lighting_cases[14].nrd_bound = 0u;
+  lighting_cases[15] = lighting_cases[2];
+  lighting_cases[15].nrd_diffuse[0] = 0.25f;
+  lighting_cases[15].nrd_diffuse[1] = 0.125f;
+  lighting_cases[15].nrd_diffuse[2] = 0.0625f;
+  lighting_cases[15].nrd_diffuse[3] = 1.0f;
+  lighting_cases[15].nrd_bound = 1u;
+  lighting_cases[15].expected_class = 1u;
+  lighting_cases[16] = lighting_cases[0];
+  lighting_cases[16].nrd_diffuse[0] = 0.625f;
+  lighting_cases[16].nrd_diffuse[1] = 0.25f;
+  lighting_cases[16].nrd_diffuse[2] = 0.125f;
+  lighting_cases[16].nrd_diffuse[3] = 2.0f;
+  lighting_cases[16].nrd_bound = 1u;
+  lighting_cases[16].expected_class = 2u;
   lighting_cases[0].sun_bound = 1u;
   lighting_cases[0].sun_status = RTXDI_SUN_STATUS_VISIBLE;
   lighting_cases[1].sun_bound = 1u;
@@ -3103,7 +3154,21 @@ int RunRtxdiDxrBridge() {
       && lighting_results[2].character_sun_multiplier == 1.f
       && lighting_results[3].sun_known == 0u && lighting_results[3].environment_sun_visibility == 0.65f
       && lighting_results[3].character_sun_multiplier == 1.f
-      && lighting_results[4].sun_known == 0u && lighting_results[4].environment_sun_visibility == 0.2f;
+      && lighting_results[4].sun_known == 0u && lighting_results[4].environment_sun_visibility == 0.2f
+      && lighting_results[9].denoised_used == 1u && std::abs(lighting_results[9].diffuse_replaced - 0.125f) < 1e-6f
+      && std::abs(lighting_results[9].shaded_local_term - 0.015625f) < 1e-6f
+      && lighting_results[9].specular_preserved == 5.0f
+      && lighting_results[10].denoised_used == 1u && std::abs(lighting_results[10].diffuse_replaced - 0.375f) < 1e-6f
+      && std::abs(lighting_results[10].shaded_local_term - 0.046875f) < 1e-6f
+      && lighting_results[10].specular_preserved == 7.0f
+      && lighting_results[11].denoised_used == 0u && lighting_results[11].diffuse_replaced == 1.0f
+      && lighting_results[12].denoised_used == 0u && lighting_results[12].diffuse_replaced == 1.0f
+      && lighting_results[13].denoised_used == 0u && lighting_results[13].diffuse_replaced == 1.0f
+      && lighting_results[14].denoised_used == 0u && lighting_results[14].diffuse_replaced == 1.0f
+      && lighting_results[15].mode == 2u && lighting_results[15].denoised_used == 1u
+      && std::abs(lighting_results[15].diffuse_replaced - 0.25f) < 1e-6f
+      && lighting_results[16].denoised_used == 1u && std::abs(lighting_results[16].diffuse_replaced - 0.625f) < 1e-6f
+      && lighting_results[16].specular_preserved == 0.0f;
   const bool character_contract_ok =
       lighting_results[0].character_mode == 1u && lighting_results[0].character_type == RTXDI_DI_LIGHT_TYPE_POINT
       && std::abs(lighting_results[0].character_term - 0.375f) < 1e-6f
@@ -3126,6 +3191,7 @@ int RunRtxdiDxrBridge() {
   std::printf("PASS production lighting selection helper point/spot/blocked/unknown/unbound/invalid fallback; post-material application once\n");
   std::printf("PASS character local DI point/spot charaColor, blocked suppression, unknown/empty/invalid RTLS fallback without double-add\n");
   std::printf("PASS RTXDI sun consumer helper visible/blocked/unknown/unbound/malformed; CSM and character fallback preserved\n");
+  std::printf("PASS N3c shared lighting consumer visible/blocked/class, stale/unbound/malformed raw fallback, base/intensity once, specular preserved\n");
 
   constexpr UINT hitdistance_pixels = 6u;
   constexpr UINT hitdistance_elements = hitdistance_pixels + 1u;

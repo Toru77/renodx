@@ -172,6 +172,7 @@ StructuredBuffer<LightParam> dynamicLights_g : register(t11);
 StructuredBuffer<LightIndexData> lightIndices_g : register(t12);
 Texture2D<uint4> rtxdiResolvedLocal_g : register(t41);
 Texture2D<uint> rtxdiSunVisibility_g : register(t42);
+Texture2D<float4> rtxdiDenoisedDiffuse_g : register(t43);
 StructuredBuffer<float4x4> spotShadowMatrices_g : register(t14);
 TextureCube<float4> texEnvMap_g : register(t17);
 TextureCube<float4> dynCubeHistPosTex : register(t29);  // dynamic cube history world pos (.a = capture validity)
@@ -246,6 +247,8 @@ void main(
   uint rtxdi_status = RTXDI_DI_STATUS_EMPTY;
   float rtxdi_inverse_pdf = 0.0;
   bool rtxdi_output_valid = false;
+  float3 rtxdi_nrd_diffuse = 0.0;
+  bool rtxdi_nrd_diffuse_valid = false;
   // Captured here because the flag word in r1.z is consumed and overwritten long
   // before either output site, and the environment/character split needs it.
   // Sora reads "bit 3 CLEAR" as the character flag (inverted vs Kai's bit 8).
@@ -717,7 +720,18 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                 const RtxdiLightingSelection selection =
                     RtxdiResolveLightingSelection(true, resolvedTuple, lightCount, tileData);
                 if (selection.valid) {
-                  if (selection.status == RTXDI_DI_STATUS_BLOCKED) {
+                  RtxdiDenoisedDiffuseResult denoised = (RtxdiDenoisedDiffuseResult)0;
+                  uint denoisedWidth, denoisedHeight;
+                  rtxdiDenoisedDiffuse_g.GetDimensions(denoisedWidth, denoisedHeight);
+                  if (shader_injection_data.rtxdi_diffuse_bound > 0.5f
+                      && pixel.x < denoisedWidth && pixel.y < denoisedHeight) {
+                    denoised = RtxdiResolveDenoisedDiffuse(true, selection,
+                                                          rtxdiDenoisedDiffuse_g.Load(int3(pixel, 0)), 2u);
+                  }
+                  if (denoised.valid) {
+                    charColor += r0.xyz * denoised.radiance;
+                    rtxdiCharResolved = true;
+                  } else if (selection.status == RTXDI_DI_STATUS_BLOCKED) {
                     rtxdiCharResolved = true;
                   } else {
                     const LightParam lamp = dynamicLights_g[selection.index];
@@ -915,6 +929,17 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         const LightIndexData di_tile = lightIndices_g[r1.x];
         rtxdi_selection = RtxdiResolveLightingSelection(true, rtxdi_resolved, light_count, di_tile);
         rtxdi_output_valid = rtxdi_selection.valid;
+        if (rtxdi_output_valid && shader_injection_data.rtxdi_diffuse_bound > 0.5f) {
+          uint denoised_width, denoised_height;
+          rtxdiDenoisedDiffuse_g.GetDimensions(denoised_width, denoised_height);
+          if (resolved_pixel.x < denoised_width && resolved_pixel.y < denoised_height) {
+            const RtxdiDenoisedDiffuseResult denoised =
+                RtxdiResolveDenoisedDiffuse(true, rtxdi_selection,
+                                            rtxdiDenoisedDiffuse_g.Load(int3(resolved_pixel, 0)), 1u);
+            rtxdi_nrd_diffuse_valid = denoised.valid;
+            rtxdi_nrd_diffuse = denoised.radiance;
+          }
+        }
       }
     }
   }
@@ -1413,7 +1438,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
               HammonDiffuseCorrection(saturate(brdf_rawNdotL_pt), brdf_NdotV, brdf_NdotH_pt, brdf_VdotH_pt, brdf_roughness),
               brdf_diffuse_str);
         }
-        r11.xyz = brdf_vanilla_diffuse_pt + r11.xyz;
+        if (!rtxdi_nrd_diffuse_valid) r11.xyz = brdf_vanilla_diffuse_pt + r11.xyz;
         r12.xyz = r14.xyz * r1.yyy + r12.xyz;
         r5.z = dot(r12.xyz, r12.xyz);
         r5.z = rsqrt(r5.z);
@@ -1548,7 +1573,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                 HammonDiffuseCorrection(saturate(brdf_rawNdotL_sp), brdf_NdotV, brdf_NdotH_sp, brdf_VdotH_sp, brdf_roughness),
                 brdf_diffuse_str);
           }
-          r15.yzw = brdf_vanilla_diffuse_sp + r15.yzw;
+          if (!rtxdi_nrd_diffuse_valid) r15.yzw = brdf_vanilla_diffuse_sp + r15.yzw;
           r16.xyz = r14.xyz * r1.yyy + r16.xyz;
           r5.z = dot(r16.xyz, r16.xyz);
           r5.z = rsqrt(r5.z);
@@ -1630,7 +1655,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
               HammonDiffuseCorrection(saturate(brdf_rawNdotL_pt_env), brdf_NdotV, brdf_NdotH_pt_env, brdf_VdotH_pt_env, brdf_roughness),
               brdf_diffuse_str);
         }
-        r10.xyz = brdf_vanilla_diffuse_pt_env + r10.xyz;
+        if (!rtxdi_nrd_diffuse_valid) r10.xyz = brdf_vanilla_diffuse_pt_env + r10.xyz;
       }
       r10.w = (int)r10.w + 1;
     }
@@ -1736,13 +1761,14 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                 HammonDiffuseCorrection(saturate(brdf_rawNdotL_sp_env), brdf_NdotV, brdf_NdotH_sp_env, brdf_VdotH_sp_env, brdf_roughness),
                 brdf_diffuse_str);
           }
-          r11.xyz = brdf_vanilla_diffuse_sp_env + r11.xyz;
+          if (!rtxdi_nrd_diffuse_valid) r11.xyz = brdf_vanilla_diffuse_sp_env + r11.xyz;
         }
       }
       r11.w = (int)r11.w + 1;
     }
     r2.xyw = r11.xyz * r14.www + r9.xyz;
   }
+  if (rtxdi_nrd_diffuse_valid) r2.xyw += rtxdi_nrd_diffuse * r14.www;
   r3.xyz = r3.xyz * r9.www;
   r8.xyz = r22.xyz * r2.xyw + r3.xyz;
   r0.w = cmp(0 < r17.x);

@@ -237,6 +237,7 @@ struct Rt12DiTransferSlot {
   Rt12Shared di_resolved;
   Rt12Shared sun_visibility;
   Rt12Shared n1_diffuse, n1_specular, n1_status;
+  Rt12Shared nrd_diffuse_publication;
   Microsoft::WRL::ComPtr<ID3D12Resource> scene_buffer, lights_buffer, tiles_buffer, deferred_buffer, sun_results;
   Microsoft::WRL::ComPtr<ID3D12Resource> light_types, di_results, di_frame_upload;
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
@@ -252,6 +253,9 @@ struct Rt12DiTransferSlot {
   uint64_t output_b_fence = 0u, output_c_fence = 0u;
   uint64_t output_owner_generation = 0u, output_configuration_generation = 0u;
   uint64_t sun_configuration_generation = 0u;
+#if defined(FALCOM_NRD_ENABLED)
+  Rt12NrdDiffusePublicationIdentity nrd_diffuse_identity = {};
+#endif
   uint32_t n1_configuration_version = 0u;
   std::array<float, 7> n1_brdf_config = {};
   uint32_t output_frame = UINT32_MAX, output_width = 0u, output_height = 0u;
@@ -261,6 +265,9 @@ struct Rt12DiTransferSlot {
   bool sun = false;
   bool motion_available = false;
   bool output_staged = false;
+#if defined(FALCOM_NRD_ENABLED)
+  bool nrd_diffuse_staged = false;
+#endif
   bool n1_resources_ready = false;
   bool n1_staged = false;
 #if defined(FALCOM_NRD_ENABLED)
@@ -289,6 +296,10 @@ struct Rt12DiTransferState {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> nrd_prep_pso;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> nrd_hitdistance_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> nrd_hitdistance_pso;
+#if defined(FALCOM_NRD_ENABLED)
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> nrd_publication_root;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> nrd_publication_pso;
+#endif
   uint64_t owner_generation = 0u, configuration_generation = 0u;
   uint64_t input_fence = 0u, scene_fence = 0u;
   uint32_t next_slot = 0u, input_frame = UINT32_MAX, attempted_frame = UINT32_MAX;
@@ -969,9 +980,26 @@ inline void TeardownRt12(const char* why) {
     if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
   }
   for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {
-    for (Rt12Shared* shared : {&slot.depth, &slot.normal, &slot.scene, &slot.color, &slot.mrt1, &slot.mrt2, &slot.motion,
-                               &slot.lights, &slot.tiles, &slot.deferred, &slot.di_resolved, &slot.sun_visibility,
-                               &slot.n1_diffuse, &slot.n1_specular, &slot.n1_status}) {
+    for (Rt12Shared* shared : {
+             &slot.depth,
+             &slot.normal,
+             &slot.scene,
+             &slot.color,
+             &slot.mrt1,
+             &slot.mrt2,
+             &slot.motion,
+             &slot.lights,
+             &slot.tiles,
+             &slot.deferred,
+             &slot.di_resolved,
+             &slot.sun_visibility,
+             &slot.n1_diffuse,
+             &slot.n1_specular,
+             &slot.n1_status,
+#if defined(FALCOM_NRD_ENABLED)
+             &slot.nrd_diffuse_publication,
+#endif
+         }) {
       if (shared->srv11.handle != 0u) s.device->destroy_resource_view(shared->srv11);
       if (shared->uav11.handle != 0u) s.device->destroy_resource_view(shared->uav11);
     }
@@ -1598,7 +1626,12 @@ inline void OnPresent(reshade::api::device* device) {
 
   bool output_consumer_pending = false;
   for (const Rt12DiTransferSlot& slot : s.di_transfer.slots) {
-    output_consumer_pending = output_consumer_pending || (slot.output_staged && slot.output_c_fence == 0u);
+    output_consumer_pending = output_consumer_pending || ((slot.output_staged
+#if defined(FALCOM_NRD_ENABLED)
+                                                           || slot.nrd_diffuse_staged
+#endif
+                                                           )
+                                                          && slot.output_c_fence == 0u);
   }
   if (output_consumer_pending) {
     uint64_t consumer_fence = renodx::utils::gpu_fence::NO_SIGNAL;
@@ -1616,7 +1649,13 @@ inline void OnPresent(reshade::api::device* device) {
       return;
     }
     for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {
-      if (slot.output_staged && slot.output_c_fence == 0u) slot.output_c_fence = consumer_fence;
+      if ((slot.output_staged
+#if defined(FALCOM_NRD_ENABLED)
+           || slot.nrd_diffuse_staged
+#endif
+           )
+          && slot.output_c_fence == 0u)
+        slot.output_c_fence = consumer_fence;
     }
     {
       std::unique_lock lock(rtxdi::g_di.mutex);

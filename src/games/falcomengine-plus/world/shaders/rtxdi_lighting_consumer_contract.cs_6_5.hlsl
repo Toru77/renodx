@@ -18,6 +18,11 @@ struct LightingConsumerCase
   uint sun_status;
   float csm_visibility;
   uint padding3;
+  float4 nrd_diffuse;
+  uint nrd_bound;
+  uint expected_class;
+  float raw_specular;
+  uint padding4;
 };
 
 struct LightingConsumerResult
@@ -37,6 +42,10 @@ struct LightingConsumerResult
   uint character_mode;
   uint character_type;
   float character_term;
+  uint denoised_used;
+  float diffuse_replaced;
+  float specular_preserved;
+  uint padding2;
 };
 
 StructuredBuffer<LightingConsumerCase> g_cases : register(t0);
@@ -66,6 +75,8 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
                                         : input.original_point_count + input.original_spot_count > 0u
                                               ? input.lamp_radiance
                                               : 0.0;
+  const RtxdiDenoisedDiffuseResult denoised = RtxdiResolveDenoisedDiffuse(
+      input.nrd_bound != 0u, selection, input.nrd_diffuse, input.expected_class);
 
   LightParam character_lamp = (LightParam)0;
   character_lamp.pos = float3(0.0, 0.0, 1.0);
@@ -87,7 +98,8 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
   result.spot_count = spot_count;
   result.inverse_pdf = visible ? selection.inverse_pdf : 0.0;
   result.raw_local_term = raw_local_term;
-  result.shaded_local_term = raw_local_term * input.base_color * input.dynamic_intensity;
+  result.shaded_local_term = (denoised.valid ? denoised.radiance.x : raw_local_term)
+                             * input.base_color * input.dynamic_intensity;
   result.selected_index = visible ? selection.index : 0xffffffffu;
   result.selected_type = visible ? selection.type : 0u;
   const RtxdiSunLightingSelection sun_selection = RtxdiResolveSunLightingSelection(input.sun_bound != 0u, input.sun_status);
@@ -104,5 +116,9 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
   result.character_term = character_selection.resolved ? character_selection.diffuse.x
                             : character_fallback ? input.base_color
                                                  : 0.0;
+  result.denoised_used = denoised.valid ? 1u : 0u;
+  result.diffuse_replaced = denoised.valid ? denoised.radiance.x : raw_local_term;
+  result.specular_preserved = input.raw_specular;
+  result.padding2 = 0u;
   g_results[index] = result;
 }

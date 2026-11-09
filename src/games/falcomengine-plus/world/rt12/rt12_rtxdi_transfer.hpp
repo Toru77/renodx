@@ -279,6 +279,8 @@ inline bool EnsureNrdDispatchResources(Rt12State& state, Rt12NrdSlot* slot, uint
     slot->dispatch_descriptors.Reset();
     slot->dispatch_constants.Reset();
     slot->prep_descriptors.Reset();
+    slot->publication_descriptors.Reset();
+    slot->publication_constants.Reset();
     slot->width = width;
     slot->height = height;
     slot->dispatch_count = dispatch_count;
@@ -292,6 +294,11 @@ inline bool EnsureNrdDispatchResources(Rt12State& state, Rt12NrdSlot* slot, uint
     if (FAILED(state.device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&slot->dispatch_descriptors)))) return false;
     heap_desc.NumDescriptors = 15u;
     if (FAILED(state.device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&slot->prep_descriptors)))) return false;
+    heap_desc.NumDescriptors = 5u;
+    if (FAILED(state.device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&slot->publication_descriptors)))) return false;
+    if (FAILED(CreateRt12Buffer(state.device12.Get(), D3D12_HEAP_TYPE_UPLOAD, 256u,
+                                D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE,
+                                slot->publication_constants))) return false;
     const uint64_t constant_stride = (instance->constantBufferMaxDataSize + 255u) & ~uint64_t{255u};
     if (constant_stride == 0u || constant_stride > UINT64_MAX / dispatch_count
         || FAILED(CreateRt12Buffer(state.device12.Get(), D3D12_HEAP_TYPE_UPLOAD, constant_stride * dispatch_count,
@@ -822,11 +829,21 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       return result;
     }
     const uint64_t consumer_completed = (s.fence11 ? s.fence11->GetCompletedValue() : 0u);
-    if (!rtxdi::CanReuseDiOutput(slot.output_staged, slot.output_c_fence, consumer_completed)) {
+    if (!rtxdi::CanReuseDiOutput(slot.output_staged
+#if defined(FALCOM_NRD_ENABLED)
+                                     || slot.nrd_diffuse_staged
+#endif
+                                 ,
+                                 slot.output_c_fence, consumer_completed)) {
       result.status = rtxdi::InputStatus::Busy;
       return result;
     }
     slot.output_staged = false;
+#if defined(FALCOM_NRD_ENABLED)
+    slot.nrd_diffuse_staged = false;
+    slot.nrd_diffuse_identity = {};
+    slot.nrd.diffuse_publication_recorded = false;
+#endif
     slot.n1_staged = false;
     slot.n1_configuration_version = RTXDI_N1_CONFIG_VERSION;
     slot.n1_brdf_config = in.n1_brdf_config;
@@ -855,10 +872,26 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       }
       Rt12DiTransferSlot candidate;
       auto destroy_candidate = [&](Rt12DiTransferSlot*) {
-        for (Rt12Shared* shared : {&candidate.depth, &candidate.normal, &candidate.scene, &candidate.color, &candidate.mrt1,
-                                   &candidate.mrt2, &candidate.motion, &candidate.lights, &candidate.tiles, &candidate.deferred,
-                                   &candidate.di_resolved, &candidate.sun_visibility, &candidate.n1_diffuse,
-                                   &candidate.n1_specular, &candidate.n1_status}) {
+        for (Rt12Shared* shared : {
+                 &candidate.depth,
+                 &candidate.normal,
+                 &candidate.scene,
+                 &candidate.color,
+                 &candidate.mrt1,
+                 &candidate.mrt2,
+                 &candidate.motion,
+                 &candidate.lights,
+                 &candidate.tiles,
+                 &candidate.deferred,
+                 &candidate.di_resolved,
+                 &candidate.sun_visibility,
+                 &candidate.n1_diffuse,
+                 &candidate.n1_specular,
+                 &candidate.n1_status,
+#if defined(FALCOM_NRD_ENABLED)
+                 &candidate.nrd_diffuse_publication,
+#endif
+             }) {
           if (shared->srv11.handle) {
             device->destroy_resource_view(shared->srv11);
           }
@@ -904,6 +937,12 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       }
       if (ok && motion_available) ok = make_shared(&candidate.motion, DXGI_FORMAT_R32G32B32A32_FLOAT, in.width, in.height);
       if (ok && in.sun) ok = make_shared(&candidate.sun_visibility, DXGI_FORMAT_R32_UINT, in.width, in.height);
+#if defined(FALCOM_NRD_ENABLED)
+      if (ok && in.local) {
+        CreateRt12Shared(s, device, DXGI_FORMAT_R16G16B16A16_FLOAT, in.width, in.height, 1u, true,
+                         &candidate.nrd_diffuse_publication);
+      }
+#endif
       const auto make_buffer = [&](uint64_t bytes, ComPtr<ID3D12Resource>* buffer) {
         allocation_error = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COMMON,
                                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, *buffer);
@@ -965,9 +1004,26 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
         result.error = FAILED(allocation_error) ? allocation_error : E_FAIL;
         return result;
       }
-      for (Rt12Shared* shared : {&slot.depth, &slot.normal, &slot.scene, &slot.color, &slot.mrt1, &slot.mrt2, &slot.motion,
-                                 &slot.lights, &slot.tiles, &slot.deferred, &slot.di_resolved, &slot.sun_visibility,
-                                 &slot.n1_diffuse, &slot.n1_specular, &slot.n1_status}) {
+      for (Rt12Shared* shared : {
+               &slot.depth,
+               &slot.normal,
+               &slot.scene,
+               &slot.color,
+               &slot.mrt1,
+               &slot.mrt2,
+               &slot.motion,
+               &slot.lights,
+               &slot.tiles,
+               &slot.deferred,
+               &slot.di_resolved,
+               &slot.sun_visibility,
+               &slot.n1_diffuse,
+               &slot.n1_specular,
+               &slot.n1_status,
+#if defined(FALCOM_NRD_ENABLED)
+               &slot.nrd_diffuse_publication,
+#endif
+           }) {
         if (shared->srv11.handle) {
           device->destroy_resource_view(shared->srv11);
         }
@@ -1534,6 +1590,14 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                             .output_scene_slot = slot.output_scene_slot,
                             .output_transfer_slot = slot.output_transfer_slot,
                             .output_staged = slot.output_staged,
+#if defined(FALCOM_NRD_ENABLED)
+                            .nrd_diffuse_staged = slot.nrd_diffuse_staged,
+                            .nrd_diffuse_bound = false,
+                            .nrd_diffuse_lighting_draw_seen = false,
+                            .nrd_diffuse_frame = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.frame : UINT32_MAX,
+                            .nrd_diffuse_transfer_slot = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.transfer_slot : -1,
+                            .nrd_diffuse_fence_b = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.producer_fence_b : 0u,
+#endif
                             .output_bound = false,
                             .output_bound_frame = UINT32_MAX,
                             .output_bound_transfer_slot = -1,
@@ -2229,6 +2293,45 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     }
     nrd_dispatch_recorded = hitdistance_recorded
                             && RecordNrdDenoise(s, slot, in, &nrd_accepted_history);
+    slot.nrd.diffuse_publication_recorded = false;
+#if defined(__world_rtxdi_nrd_publish_EMBED_FILE)
+    if (nrd_dispatch_recorded && slot.nrd.diffuse_output_valid && slot.nrd.hit_validity
+        && slot.nrd_diffuse_publication.texture12 && slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST)].resource
+        && slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::IN_VIEWZ)].resource) {
+      if (!transfer.nrd_publication_root || !transfer.nrd_publication_pso) {
+        Rt12NrdCreateDiffusePublicationPipeline(s.device12.Get(), __world_rtxdi_nrd_publish.data(),
+                                                __world_rtxdi_nrd_publish.size(), &transfer.nrd_publication_root,
+                                                &transfer.nrd_publication_pso);
+      }
+      if (transfer.nrd_publication_root && transfer.nrd_publication_pso) {
+        Rt12NrdTexture status_texture;
+        status_texture.resource = slot.n1_status.texture12;
+        status_texture.format = DXGI_FORMAT_R32_UINT;
+        status_texture.width = in.width;
+        status_texture.height = in.height;
+        status_texture.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        status_texture.unordered_access_written = true;
+        Rt12NrdTexture hit_validity;
+        hit_validity.resource = slot.nrd.hit_validity;
+        hit_validity.width = in.width;
+        hit_validity.height = in.height;
+        hit_validity.state = D3D12_RESOURCE_STATE_COMMON;
+        Rt12NrdTexture publication;
+        publication.resource = slot.nrd_diffuse_publication.texture12;
+        publication.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        publication.width = in.width;
+        publication.height = in.height;
+        publication.state = D3D12_RESOURCE_STATE_COMMON;
+        slot.nrd.diffuse_publication_recorded = Rt12NrdRecordDiffusePublication(
+            s.device12.Get(), transfer.di_list.Get(), transfer.nrd_publication_root.Get(),
+            transfer.nrd_publication_pso.Get(), slot.nrd.publication_descriptors.Get(),
+            slot.nrd.publication_constants.Get(),
+            &slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST)],
+            &slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::IN_VIEWZ)], &status_texture,
+            &hit_validity, &publication, in.width, in.height);
+      }
+    }
+#endif
     nrd_history_reset = !nrd_dispatch_recorded;
   } else {
     slot.nrd.dispatch_ready = false;
@@ -2330,6 +2433,29 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   slot.output_transfer_slot = input.transfer_slot;
   slot.output_staged = true;
   slot.n1_staged = n1_ready;
+#if defined(FALCOM_NRD_ENABLED)
+  slot.nrd_diffuse_staged = nrd_dispatch_recorded && slot.nrd.diffuse_publication_recorded
+                            && slot.nrd_diffuse_publication.srv11.handle != 0u;
+  slot.nrd_diffuse_identity = {};
+  if (slot.nrd_diffuse_staged) {
+    slot.nrd_diffuse_identity = {
+        .owner_generation = s.generation,
+        .transfer_configuration = transfer.configuration_generation,
+        .di_configuration = s.di.configuration_generation,
+        .n1_configuration = Rt12NrdN1ConfigurationIdentity(slot.n1_configuration_version, slot.n1_brdf_config),
+        .nrd_configuration = Rt12NrdConfigurationIdentity(transfer.configuration_generation,
+                                                          s.di.configuration_generation,
+                                                          transfer.nrd.qualification.motion_correction_index),
+        .producer_fence_b = di_fence,
+        .frame = in.frame,
+        .width = in.width,
+        .height = in.height,
+        .scene_slot = in.scene_slot,
+        .transfer_slot = input.transfer_slot,
+        .accepted = true,
+    };
+  }
+#endif
   temporal_ran = history_valid;
   s.di.last_use_fence = di_fence;
   s.di.history_valid = true;

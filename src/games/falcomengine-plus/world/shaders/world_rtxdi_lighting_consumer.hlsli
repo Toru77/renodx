@@ -25,6 +25,23 @@ struct RtxdiCharacterLightResult
   float3 diffuse;
 };
 
+struct RtxdiDenoisedDiffuseResult
+{
+  bool valid;
+  float3 radiance;
+};
+
+RtxdiDenoisedDiffuseResult RtxdiResolveDenoisedDiffuse(bool bound, RtxdiLightingSelection selection,
+                                                        float4 published, uint expected_class)
+{
+  RtxdiDenoisedDiffuseResult result = (RtxdiDenoisedDiffuseResult)0;
+  result.valid = bound && selection.valid && (expected_class == 1u || expected_class == 2u)
+                 && isfinite(published.a) && published.a == (float)expected_class
+                 && all(isfinite(published.rgb)) && all(published.rgb >= 0.0) && all(published.rgb <= 65504.0);
+  if (result.valid) result.radiance = published.rgb;
+  return result;
+}
+
 RtxdiSunLightingSelection RtxdiResolveSunLightingSelection(bool bound, uint status)
 {
   RtxdiSunLightingSelection result = (RtxdiSunLightingSelection)0;
@@ -96,8 +113,7 @@ RtxdiCharacterLightResult RtxdiEvaluateCharacterLight(RtxdiLightingSelection sel
   const float cone = selection.type == RTXDI_DI_LIGHT_TYPE_SPOT ? LampSpotCone(lamp, light_direction) : 1.0;
   const float lit = max(lamp.translucency, dot(normal, light_direction));
   const float3 diffuse = lamp.charaColor * (attenuation * cone * lit * selection.inverse_pdf);
-  if (!all(isfinite(light_direction)) || !isfinite(attenuation) || !isfinite(cone) || !isfinite(lit)
-      || !all(isfinite(diffuse)))
+  if (!all(isfinite(light_direction)) || !isfinite(lit) || !all(isfinite(diffuse)))
   {
     return result;
   }

@@ -723,11 +723,13 @@ struct ShaderInjectData {
   // a pre-scaled vector (the Sora/Kai 10-step march needs it to be), and the Ray
   // Length default should be set against a measured number rather than a guess.
   float char_cam_debug;
-  float rt_sun_cascades;      // 0-4 runtime, session only: sun cascade slices below this index are RT-owned and skipped by Sora 2nd shadow resolve (include/rt_sun_range.hlsli); set in SyncISFASTToShaderInjection
-  // Size: 440 floats = 1760 bytes (exactly 110 float4s). The host declares the range as
-  // sizeof(ShaderInjectData) / 4 push values (CreateShadowsPipelinesIfNeeded and RunShadows);
-  // the next added float starts a new float4, and the host range grows with sizeof automatically.
-  // Prefer reusing a RETIRED slot.
+  float rt_sun_cascades;  // 0-4 runtime, session only: sun cascade slices below this index are RT-owned and skipped by Sora 2nd shadow resolve (include/rt_sun_range.hlsli); set in SyncISFASTToShaderInjection
+  // Appended runtime gate; preserves all existing injection offsets.
+  float rtxdi_diffuse_bound;  // 0/1: Sora 2nd t43 holds a matching staged RELAX diffuse publication this draw
+                              // Size: 441 floats = 1764 bytes. The host declares the range as
+                              // sizeof(ShaderInjectData) / 4 push values (CreateShadowsPipelinesIfNeeded and RunShadows);
+                              // the next added float starts a new float4, and the host range grows with sizeof automatically.
+                              // Prefer reusing a RETIRED slot.
  };
 
 #ifndef __cplusplus

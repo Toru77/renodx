@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (C) 2026
  * SPDX-License-Identifier: MIT
  */
@@ -51,7 +51,7 @@
 
 namespace {
 
-static_assert(sizeof(ShaderInjectData) == 1760u);
+static_assert(sizeof(ShaderInjectData) == 1764u);
 static_assert(alignof(ShaderInjectData) == alignof(float));
 static_assert(offsetof(ShaderInjectData, cs_contact_local_light_clearance) == 80u);
 
@@ -499,6 +499,7 @@ ShaderInjectData shader_injection = {
     .char_cam_isfast_enabled = 1.f,
     .char_cam_debug = 0.f,
     .rt_sun_cascades = 0.f,
+    .rtxdi_diffuse_bound = 0.f,
     // ShaderInjectData ends on a float4 boundary with no pad field, so every float in the
     // struct needs a default here. See the closing comment in shared.h.
 };
@@ -12247,7 +12248,11 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
 static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceData* dd) {
   namespace rt12 = falcom_world::rt12;
   namespace di = falcom_world::rtxdi;
+  namespace rr = falcom_world::rr;
   shader_injection.rtxdi_local_bound = 0.f;
+#if defined(FALCOM_NRD_ENABLED)
+  shader_injection.rtxdi_diffuse_bound = 0.f;
+#endif
   {
     std::unique_lock lock(di::g_di.mutex);
     di::g_di.snapshot.output_bound = false;
@@ -12255,12 +12260,20 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
     di::g_di.snapshot.output_bound_transfer_slot = -1;
     di::g_di.snapshot.output_bound_fence_b = 0u;
     di::g_di.snapshot.lighting_draw_seen = false;
+#if defined(FALCOM_NRD_ENABLED)
+    di::g_di.snapshot.nrd_diffuse_bound = false;
+    di::g_di.snapshot.nrd_diffuse_lighting_draw_seen = false;
+#endif
   }
   if (!IsSora2nd() || !cmd_list) return;
 
   const reshade::api::resource_view empty_view = {};
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, 41u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+#if defined(FALCOM_NRD_ENABLED)
+  cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                             reshade::api::descriptor_table_update{{}, 43u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+#endif
   if (!dd || cmd_list != dd->immediate_cmd_list || di::g_local_requested < 0.5f || !rt12::g_rt12
       || rt12::g_rt12->device != cmd_list->get_device() || rt12::g_rt12->failed || rt12::g_rt12->stuck
       || rt12::g_rt12->unfenced_execution) return;
@@ -12326,6 +12339,47 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
     cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                                reshade::api::descriptor_table_update{{}, 41u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
   }
+#if defined(FALCOM_NRD_ENABLED)
+  if (still_current && output.nrd_diffuse_staged && !rr::RrOwnsDenoise()) {
+    const std::array<float, 7u> n1_brdf_config = {
+        shader_injection.brdf_hammon_diffuse_enabled, shader_injection.brdf_diffuse_strength,
+        shader_injection.brdf_multiscatter_specular_enabled, shader_injection.brdf_specular_strength,
+        shader_injection.brdf_specular_peak_clamp, shader_injection.brdf_roughness_min,
+        shader_injection.brdf_roughness_max};
+    const uint64_t n1_identity = rt12::Rt12NrdN1ConfigurationIdentity(RTXDI_N1_CONFIG_VERSION, n1_brdf_config);
+    const uint64_t nrd_identity = rt12::Rt12NrdConfigurationIdentity(
+        state.di_transfer.configuration_generation, state.di.configuration_generation,
+        state.di_transfer.nrd.qualification.motion_correction_index);
+    const auto& identity = slot.nrd_diffuse_identity;
+    if (input.width == dd->captured_depth_w && input.height == dd->captured_depth_h
+        && rt12::Rt12NrdDiffusePublicationMatches(identity, frame, state.generation,
+                                                  state.di_transfer.configuration_generation,
+                                                  state.di.configuration_generation, n1_identity, nrd_identity,
+                                                  dd->captured_depth_w, dd->captured_depth_h,
+                                                  output.output_scene_slot, output.output_transfer_slot,
+                                                  output.output_fence_b)
+        && slot.nrd_diffuse_staged && slot.nrd.diffuse_output_valid && slot.nrd.diffuse_publication_recorded
+        && slot.output_b_fence == identity.producer_fence_b && slot.nrd_diffuse_publication.srv11.handle
+        && rt12::ValidateDiTexture(slot.nrd_diffuse_publication.srv11, identity.width, identity.height,
+                                   rt12::Rt12DiTextureKind::Float)) {
+      cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                                 reshade::api::descriptor_table_update{{}, 43u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.nrd_diffuse_publication.srv11});
+      shader_injection.rtxdi_diffuse_bound = 1.f;
+      std::unique_lock lock(di::g_di.mutex);
+      const bool still_staged = di::g_di.snapshot.nrd_diffuse_staged
+                                && di::g_di.snapshot.frame == frame
+                                && di::g_di.snapshot.nrd_diffuse_transfer_slot == identity.transfer_slot
+                                && di::g_di.snapshot.nrd_diffuse_fence_b == identity.producer_fence_b;
+      if (still_staged) {
+        di::g_di.snapshot.nrd_diffuse_bound = true;
+      } else {
+        shader_injection.rtxdi_diffuse_bound = 0.f;
+        cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                                   reshade::api::descriptor_table_update{{}, 43u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+      }
+    }
+  }
+#endif
 }
 
 static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData* dd) {
@@ -12456,6 +12510,13 @@ static void OnDrawnLightingShader(reshade::api::command_list* cmd_list) {
                                                       &output.lighting_draw_seen, falcom_world::g_state.frame.load(),
                                                       output.output_frame, output.output_transfer_slot,
                                                       output.output_fence_b);
+#if defined(FALCOM_NRD_ENABLED)
+    falcom_world::rtxdi::RecordOutputLightingDrawSeen(&output.nrd_diffuse_bound, &output.nrd_diffuse_frame,
+                                                      &output.nrd_diffuse_transfer_slot, &output.nrd_diffuse_fence_b,
+                                                      &output.nrd_diffuse_lighting_draw_seen,
+                                                      falcom_world::g_state.frame.load(), output.nrd_diffuse_frame,
+                                                      output.nrd_diffuse_transfer_slot, output.nrd_diffuse_fence_b);
+#endif
     std::unique_lock sun_lock(falcom_world::rtxdi::g_sun.mutex);
     auto& sun = falcom_world::rtxdi::g_sun.snapshot;
     falcom_world::rtxdi::RecordOutputLightingDrawSeen(&sun.output_bound, &sun.output_bound_frame,

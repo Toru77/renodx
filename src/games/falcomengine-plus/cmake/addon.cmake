@@ -71,11 +71,13 @@ if(FALCOM_NRD_SDK_ROOT)
   target_include_directories(falcom-nrd-bridge PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed")
   target_sources(falcom-nrd-bridge PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_probe.h"
-    "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_prep.h")
+    "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_prep.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_publish.h")
   if(FALCOM_NRD_ENABLED)
-    target_link_libraries(${ADDON} PRIVATE falcom-nrd-sdk)
+    target_link_libraries(${ADDON} PRIVATE d3d12 falcom-nrd-sdk)
     target_compile_definitions(${ADDON} PRIVATE FALCOM_NRD_ENABLED=1)
     target_sources(${ADDON} PRIVATE
-      "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_hitdistance.h")
+      "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_hitdistance.h"
+      "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_publish.h")
   endif()
 endif()

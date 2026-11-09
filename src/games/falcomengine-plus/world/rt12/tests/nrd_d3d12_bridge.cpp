@@ -1,6 +1,7 @@
 #include "../rt12_nrd.hpp"
 #include "world_rtxdi_nrd_prep.h"
 #include "world_rtxdi_nrd_probe.h"
+#include "world_rtxdi_nrd_publish.h"
 
 #include <dxgi1_2.h>
 #include <windows.h>
@@ -746,7 +747,8 @@ bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12
   std::vector<float> traced_hit_distance(pixel_count, 3.25f);
   std::vector<uint32_t> traced_hit_validity(pixel_count, 0u);
   for (uint32_t pixel = 0u; pixel < pixel_count; ++pixel) {
-    if ((pixel & 3u) < 2u) traced_hit_validity[pixel] = 1u;
+    const uint32_t scenario = pixel & 7u;
+    if (scenario == 0u || scenario == 1u || scenario == 4u || scenario == 5u) traced_hit_validity[pixel] = 1u;
   }
   void* hit_distance_mapped = nullptr;
   void* hit_validity_mapped = nullptr;
@@ -818,11 +820,15 @@ bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12
   for (uint32_t pixel = 0u; pixel < pixel_count; ++pixel) {
     motion[pixel * 4u] = 0.5f;
     motion[pixel * 4u + 1u] = -0.25f;
-    const uint32_t scenario = pixel & 3u;
+    const uint32_t scenario = pixel & 7u;
     n1_status[pixel] = scenario == 0u ? 9u : scenario == 1u ? 10u
                                          : scenario == 2u   ? 3u
-                                                            : 4u;
-    if (scenario == 0u || scenario >= 2u) {
+                                         : scenario == 3u   ? 4u
+                                         : scenario == 4u   ? 25u
+                                         : scenario == 5u   ? 26u
+                                         : scenario == 6u   ? 19u
+                                                            : 20u;
+    if (scenario != 1u && scenario != 5u) {
       n1_diffuse[pixel * 4u + 0u] = NrdFloatToHalf(0.5f);
       n1_diffuse[pixel * 4u + 1u] = NrdFloatToHalf(0.25f);
       n1_diffuse[pixel * 4u + 2u] = NrdFloatToHalf(0.125f);
@@ -961,6 +967,45 @@ bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12
     if (!barriers.empty()) slot.command_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
     return rows == height && total_bytes <= readback->GetDesc().Width;
   };
+  Rt12NrdTexture publication_texture;
+  if (!NrdCreateTexture(device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &publication_texture)) return false;
+  Rt12NrdTexture status_texture = inputs[6];
+  Rt12NrdTexture hit_validity_texture;
+  hit_validity_texture.resource = hit_validity_input;
+  hit_validity_texture.width = width;
+  hit_validity_texture.height = height;
+  hit_validity_texture.state = D3D12_RESOURCE_STATE_GENERIC_READ;
+  D3D12_DESCRIPTOR_HEAP_DESC publication_heap_desc = {};
+  publication_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  publication_heap_desc.NumDescriptors = 5u;
+  publication_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> publication_heap;
+  ComPtr<ID3D12Resource> publication_constants, publication_readback;
+  ComPtr<ID3D12RootSignature> publication_root;
+  ComPtr<ID3D12PipelineState> publication_pso;
+  if (!Check(device->CreateDescriptorHeap(&publication_heap_desc, IID_PPV_ARGS(&publication_heap)),
+             "create diffuse publication heap")
+      || !NrdCreateUploadBuffer(device, 256u, &publication_constants)
+      || !Rt12NrdCreateDiffusePublicationPipeline(device, __world_rtxdi_nrd_publish.data(),
+                                                  __world_rtxdi_nrd_publish.size(),
+                                                  &publication_root, &publication_pso)
+      || !Rt12NrdRecordDiffusePublication(
+          device, slot.command_list.Get(), publication_root.Get(), publication_pso.Get(), publication_heap.Get(),
+          publication_constants.Get(),
+          &slot.resources[static_cast<uint32_t>(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST)],
+          &slot.resources[static_cast<uint32_t>(nrd::ResourceType::IN_VIEWZ)], &status_texture,
+          &hit_validity_texture, &publication_texture, width, height)) {
+    std::fprintf(stderr, "FAIL N3c diffuse publication record\n");
+    return false;
+  }
+  const D3D12_RESOURCE_DESC publication_desc = publication_texture.resource->GetDesc();
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT publication_footprint = {};
+  UINT publication_rows = 0u;
+  UINT64 publication_row_bytes = 0u, publication_total_bytes = 0u;
+  device->GetCopyableFootprints(&publication_desc, 0u, 1u, 0u, &publication_footprint,
+                                &publication_rows, &publication_row_bytes, &publication_total_bytes);
+  if (!NrdCreateReadbackBuffer(device, publication_total_bytes, &publication_readback)
+      || !copy_texture_to_readback(&publication_texture, publication_readback.Get(), &publication_footprint)) return false;
   ComPtr<ID3D12Resource> prep_diffuse_readback, prep_specular_readback, prep_viewz_readback;
   const std::array<nrd::ResourceType, 4u> check_types = {nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST,
                                                          nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST,
@@ -1036,6 +1081,39 @@ bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12
     }
   }
   if (!prep_inputs_valid) return false;
+  void* publication_mapped = nullptr;
+  const D3D12_RANGE publication_read_range = {0u, static_cast<SIZE_T>(publication_readback->GetDesc().Width)};
+  if (FAILED(publication_readback->Map(0u, &publication_read_range, &publication_mapped))) return false;
+  const uint8_t* publication_bytes = static_cast<const uint8_t*>(publication_mapped);
+  uint32_t env_publications = 0u, character_publications = 0u;
+  bool publication_valid = true;
+  for (uint32_t pixel = 0u; pixel < pixel_count && publication_valid; ++pixel) {
+    const uint32_t x = pixel % width, y = pixel / width, scenario = pixel & 7u;
+    const uint8_t* row = publication_bytes + publication_footprint.Offset
+                         + static_cast<size_t>(y) * publication_footprint.Footprint.RowPitch;
+    const auto* half = reinterpret_cast<const uint16_t*>(row) + x * 4u;
+    const std::array<float, 4u> value = {NrdHalfToFloat(half[0]), NrdHalfToFloat(half[1]),
+                                         NrdHalfToFloat(half[2]), NrdHalfToFloat(half[3])};
+    const float expected_class = scenario == 0u || scenario == 1u   ? 1.0f
+                                 : scenario == 4u || scenario == 5u ? 2.0f
+                                                                    : 0.0f;
+    if (!std::isfinite(value[0]) || !std::isfinite(value[1]) || !std::isfinite(value[2])
+        || !std::isfinite(value[3]) || value[3] != expected_class
+        || value[0] < 0.0f || value[1] < 0.0f || value[2] < 0.0f
+        || value[0] > 65504.0f || value[1] > 65504.0f || value[2] > 65504.0f
+        || (expected_class == 0.0f && (value[0] != 0.0f || value[1] != 0.0f || value[2] != 0.0f))) {
+      std::fprintf(stderr, "N3c publication mismatch pixel=%u status=%u hit=%u rgba=(%g,%g,%g,%g) expected-class=%g\n",
+                   pixel, n1_status[pixel], traced_hit_validity[pixel], value[0], value[1], value[2], value[3],
+                   expected_class);
+      publication_valid = false;
+      break;
+    }
+    env_publications += expected_class == 1.0f ? 1u : 0u;
+    character_publications += expected_class == 2.0f ? 1u : 0u;
+  }
+  const D3D12_RANGE no_publication_write = {0u, 0u};
+  publication_readback->Unmap(0u, &no_publication_write);
+  if (!publication_valid || env_publications == 0u || character_publications == 0u) return false;
   if (!NrdReadbackOutput(device,
                          slot.resources[static_cast<uint32_t>(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST)].resource.Get(),
                          slot.diffuse_readback.Get(), width, height, "N1-prepared RELAX diffuse")
@@ -1049,7 +1127,8 @@ bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12
                  static_cast<unsigned long long>(messages));
     return false;
   }
-  std::printf("PASS N1 prep visible/blocked/unknown/empty guide readback, zero spec input, shared RELAX recorder (%ux%u)\n",
+  std::printf("PASS N1 prep + RELAX + N3c publication env=%u character=%u invalid-zero=%u (%ux%u)\n",
+              env_publications, character_publications, pixel_count - env_publications - character_publications,
               width, height);
   return true;
 }
@@ -1640,7 +1719,11 @@ bool RunDispatchDescriptionSmoke() {
 
 bool RunHistoryIdentityContracts() {
   using falcom_world::rt12::Rt12NrdCanContinueHistory;
+  using falcom_world::rt12::Rt12NrdConfigurationIdentity;
+  using falcom_world::rt12::Rt12NrdDiffusePublicationIdentity;
+  using falcom_world::rt12::Rt12NrdDiffusePublicationMatches;
   using falcom_world::rt12::Rt12NrdHistoryIdentity;
+  using falcom_world::rt12::Rt12NrdN1ConfigurationIdentity;
   using falcom_world::rt12::Rt12NrdSubmissionAllowed;
   if (!Rt12NrdSubmissionAllowed(false) || Rt12NrdSubmissionAllowed(true)) return false;
   std::printf("PASS NRD submissions suppressed while RR owns denoising\n");
@@ -1660,6 +1743,56 @@ bool RunHistoryIdentityContracts() {
     if (Rt12NrdCanContinueHistory(previous, current)) return false;
   }
   std::printf("PASS NRD history identity/gap/resize/owner/generation/config/device-reset contracts\n");
+  const std::array<float, 7u> n1_settings = {1.f, 0.5f, 1.f, 0.75f, 8.f, 0.02f, 0.9f};
+  const uint64_t n1_identity = Rt12NrdN1ConfigurationIdentity(1u, n1_settings);
+  const uint64_t nrd_identity = Rt12NrdConfigurationIdentity(4u, 7u, 0u);
+  const Rt12NrdDiffusePublicationIdentity publication = {
+      .owner_generation = 8u,
+      .transfer_configuration = 4u,
+      .di_configuration = 7u,
+      .n1_configuration = n1_identity,
+      .nrd_configuration = nrd_identity,
+      .producer_fence_b = 21u,
+      .frame = 19u,
+      .width = 13u,
+      .height = 9u,
+      .scene_slot = 2,
+      .transfer_slot = 1,
+      .accepted = true};
+  const auto matches_publication = [&](const Rt12NrdDiffusePublicationIdentity& identity,
+                                       uint32_t frame, uint64_t owner, uint64_t transfer_config,
+                                       uint64_t di_config, uint64_t n1_config, uint64_t nrd_config,
+                                       uint32_t width, uint32_t height, int32_t scene_slot,
+                                       int32_t transfer_slot, uint64_t fence) {
+    return Rt12NrdDiffusePublicationMatches(identity, frame, owner, transfer_config, di_config,
+                                            n1_config, nrd_config, width, height, scene_slot,
+                                            transfer_slot, fence);
+  };
+  if (!matches_publication(publication, 19u, 8u, 4u, 7u, n1_identity, nrd_identity,
+                           13u, 9u, 2, 1, 21u)) return false;
+  auto stale_publication = publication;
+  stale_publication.accepted = false;
+  if (matches_publication(stale_publication, 19u, 8u, 4u, 7u, n1_identity, nrd_identity,
+                          13u, 9u, 2, 1, 21u)) return false;
+  stale_publication = publication;
+  stale_publication.producer_fence_b = 0u;
+  if (matches_publication(stale_publication, 19u, 8u, 4u, 7u, n1_identity, nrd_identity,
+                          13u, 9u, 2, 1, 21u)) return false;
+  if (matches_publication(publication, 20u, 8u, 4u, 7u, n1_identity, nrd_identity, 13u, 9u, 2, 1, 21u)
+      || matches_publication(publication, 19u, 9u, 4u, 7u, n1_identity, nrd_identity, 13u, 9u, 2, 1, 21u)
+      || matches_publication(publication, 19u, 8u, 5u, 7u, n1_identity, nrd_identity, 13u, 9u, 2, 1, 21u)
+      || matches_publication(publication, 19u, 8u, 4u, 8u, n1_identity, nrd_identity, 13u, 9u, 2, 1, 21u)
+      || matches_publication(publication, 19u, 8u, 4u, 7u, n1_identity + 1u, nrd_identity, 13u, 9u, 2, 1, 21u)
+      || matches_publication(publication, 19u, 8u, 4u, 7u, n1_identity, nrd_identity + 1u, 13u, 9u, 2, 1, 21u)
+      || matches_publication(publication, 19u, 8u, 4u, 7u, n1_identity, nrd_identity, 14u, 9u, 2, 1, 21u)
+      || matches_publication(publication, 19u, 8u, 4u, 7u, n1_identity, nrd_identity, 13u, 10u, 2, 1, 21u)
+      || matches_publication(publication, 19u, 8u, 4u, 7u, n1_identity, nrd_identity, 13u, 9u, 1, 1, 21u)
+      || matches_publication(publication, 19u, 8u, 4u, 7u, n1_identity, nrd_identity, 13u, 9u, 2, 2, 21u)
+      || matches_publication(publication, 19u, 8u, 4u, 7u, n1_identity, nrd_identity, 13u, 9u, 2, 1, 22u)) return false;
+  auto changed_n1_settings = n1_settings;
+  changed_n1_settings[3] += 0.01f;
+  if (Rt12NrdN1ConfigurationIdentity(1u, changed_n1_settings) == n1_identity) return false;
+  std::printf("PASS N3c publication frame/owner/config/N1-BRDF/NRD/size/scene/slot/B-fence acceptance identity\n");
   return true;
 }
 }  // namespace
