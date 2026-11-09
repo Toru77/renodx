@@ -26,3 +26,34 @@ target_sources(falcom-rtxdi-bridge PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/rtxdi_raw_guard_contract.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/rtxdi_lighting_consumer_contract.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_reconstruct.h")
+
+set(FALCOM_NRD_SDK_ROOT "" CACHE PATH "Optional NRD 4.17.1 SDK root for the private D3D12 adapter harness")
+if(FALCOM_NRD_SDK_ROOT)
+  if(NOT EXISTS "${FALCOM_NRD_SDK_ROOT}/include/NRD.h"
+      OR NOT EXISTS "${FALCOM_NRD_SDK_ROOT}/lib/Debug/NRD.lib"
+      OR NOT EXISTS "${FALCOM_NRD_SDK_ROOT}/lib/Release/NRD.lib"
+      OR NOT EXISTS "${FALCOM_NRD_SDK_ROOT}/lib/Debug/ShaderMakeBlob.lib"
+      OR NOT EXISTS "${FALCOM_NRD_SDK_ROOT}/lib/Release/ShaderMakeBlob.lib")
+    message(FATAL_ERROR "FALCOM_NRD_SDK_ROOT must contain include/NRD.h and Debug/Release NRD and ShaderMakeBlob static libraries")
+  endif()
+
+  add_library(falcom-nrd-shadermakeblob STATIC IMPORTED GLOBAL)
+  set_target_properties(falcom-nrd-shadermakeblob PROPERTIES
+    IMPORTED_CONFIGURATIONS "DEBUG;RELEASE;RELWITHDEBINFO;MINSIZEREL"
+    IMPORTED_LOCATION_DEBUG "${FALCOM_NRD_SDK_ROOT}/lib/Debug/ShaderMakeBlob.lib"
+    IMPORTED_LOCATION_RELEASE "${FALCOM_NRD_SDK_ROOT}/lib/Release/ShaderMakeBlob.lib"
+    IMPORTED_LOCATION_RELWITHDEBINFO "${FALCOM_NRD_SDK_ROOT}/lib/Release/ShaderMakeBlob.lib"
+    IMPORTED_LOCATION_MINSIZEREL "${FALCOM_NRD_SDK_ROOT}/lib/Release/ShaderMakeBlob.lib")
+  add_library(falcom-nrd-sdk STATIC IMPORTED GLOBAL)
+  set_target_properties(falcom-nrd-sdk PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${FALCOM_NRD_SDK_ROOT}/include"
+    INTERFACE_LINK_LIBRARIES falcom-nrd-shadermakeblob
+    IMPORTED_CONFIGURATIONS "DEBUG;RELEASE;RELWITHDEBINFO;MINSIZEREL"
+    IMPORTED_LOCATION_DEBUG "${FALCOM_NRD_SDK_ROOT}/lib/Debug/NRD.lib"
+    IMPORTED_LOCATION_RELEASE "${FALCOM_NRD_SDK_ROOT}/lib/Release/NRD.lib"
+    IMPORTED_LOCATION_RELWITHDEBINFO "${FALCOM_NRD_SDK_ROOT}/lib/Release/NRD.lib"
+    IMPORTED_LOCATION_MINSIZEREL "${FALCOM_NRD_SDK_ROOT}/lib/Release/NRD.lib")
+
+  add_executable(falcom-nrd-bridge EXCLUDE_FROM_ALL "${ADDON_PATH}/world/rt12/tests/nrd_d3d12_bridge.cpp")
+  target_link_libraries(falcom-nrd-bridge PRIVATE d3d12 dxgi falcom-nrd-sdk)
+endif()
