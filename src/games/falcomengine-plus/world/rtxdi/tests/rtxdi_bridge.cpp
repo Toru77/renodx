@@ -168,6 +168,25 @@ int main() {
     D3D11_SUBRESOURCE_DATA const initial_scene = {.pSysMem = scene.data(), .SysMemPitch = 0, .SysMemSlicePitch = 0};
     ComPtr<ID3D11Buffer> scene_cb;
     if (!check(d11->CreateBuffer(&cb_desc, &initial_scene, &scene_cb), "create scene CB") || !ValidateSceneBuffer(scene_cb.Get(), offset, 1536)) return 1;
+    ID3D11Buffer* bound_scene = scene_cb.Get();
+    const UINT first_scene_constant = offset / 16u;
+    const UINT scene_constant_count = 1536u / 16u;
+    ctx1->PSSetConstantBuffers1(0u, 1u, &bound_scene, &first_scene_constant, &scene_constant_count);
+    SceneB0BindingEvidence native_scene_evidence = {};
+    if (!ValidateSceneB0Binding(ctx.Get(), scene_cb.Get(), offset, scene_constant_count, &native_scene_evidence)
+        || !native_scene_evidence.context_query_available || !native_scene_evidence.buffer_available
+        || native_scene_evidence.native_buffer != reinterpret_cast<uint64_t>(scene_cb.Get())
+        || native_scene_evidence.first_constant != first_scene_constant
+        || native_scene_evidence.constant_count != scene_constant_count || native_scene_evidence.buffer_bytes != cb_desc.ByteWidth
+        || ValidateSceneB0Binding(ctx.Get(), scene_cb.Get(), 0u, scene_constant_count)) {
+      std::fprintf(stderr, "FAIL native b0 range evidence offset=%u count=%u bytes=%u\n",
+                   native_scene_evidence.first_constant, native_scene_evidence.constant_count,
+                   native_scene_evidence.buffer_bytes);
+      return 1;
+    }
+    std::printf("PASS native D3D11 b0 evidence offset=%u constants=%u byte_width=%u\n",
+                native_scene_evidence.first_constant * 16u, native_scene_evidence.constant_count,
+                native_scene_evidence.buffer_bytes);
     const SceneRangeSnapshot promoted = {.buffer = 1, .offset = offset, .size = 1536, .frame = 4, .command = 1, .live = true, .known = true, .sequence = 1};
     if (CheckPromotedSceneBinding(promoted, promoted, 4, 1, cb_desc.ByteWidth) != SceneBindingStatus::Ready) {
       std::fprintf(stderr, "FAIL valid CBV binding rejected\n");

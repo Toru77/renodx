@@ -3,6 +3,7 @@
 #include "../rtxdi_camera_qualification.hpp"
 #include "../rtxdi_config.hpp"
 #include "../rtxdi_di_contract.h"
+#include "../rtxdi_diagnostics.hpp"
 #include "../rtxdi_input_validation.hpp"
 #include "../rtxdi_state.hpp"
 #include "../rtxdi_surface_layout.h"
@@ -137,6 +138,229 @@ bool SurfaceIsZero(const TestSurfaceResult& result) {
 }  // namespace
 
 int main() {
+  {
+    using namespace falcom_world::rtxdi;
+    DiagnosticState diagnostics;
+    const DiagnosticEvent disabled_event = {.frame = 1u, .stage = DiagnosticStage::InputValidate, .reason = DiagnosticReason::MissingEntry};
+    RecordDiagnostic(diagnostics, 0u, disabled_event);
+    if (CopyDiagnosticSnapshot(diagnostics).transition_size != 0u) return EXIT_FAILURE;
+    SetDiagnosticCapture(diagnostics, true);
+    const uint64_t first_epoch = DiagnosticCaptureEpoch(diagnostics);
+    DiagnosticEvent repeated_failure = {.owner_generation = 7u, .frame = 10u, .capture_frame = 9u, .value0 = 256u, .value1 = 1536u, .identity_tokens = {1u, 2u, 0u, 0u}, .flags = 0x15u, .stage = DiagnosticStage::InputValidate, .reason = DiagnosticReason::NativeB0Mismatch, .operation = DiagnosticOperation::Validate};
+    for (uint32_t i = 0u; i < 5000u; ++i) {
+      auto event = repeated_failure;
+      event.frame += i;
+      event.fence = i;
+      RecordDiagnostic(diagnostics, first_epoch, event);
+    }
+    auto snapshot = CopyDiagnosticSnapshot(diagnostics);
+    if (snapshot.failure_size != 1u || snapshot.reason_size != 1u
+        || snapshot.first_failures[0].count != 5000u || snapshot.first_failures[0].first.frame != 10u
+        || snapshot.first_failures[0].latest_frame != 5009u || snapshot.reason_counts[0].first_frame != 10u
+        || snapshot.reason_counts[0].latest_frame != 5009u || snapshot.transition_size != 1u) return EXIT_FAILURE;
+    for (uint64_t i = 0u; i < 100u; ++i) {
+      auto event = repeated_failure;
+      event.reason = DiagnosticReason::None;
+      event.value0 = i;
+      RecordDiagnostic(diagnostics, first_epoch, event);
+    }
+    snapshot = CopyDiagnosticSnapshot(diagnostics);
+    if (snapshot.transition_size != kDiagnosticTransitionCapacity || snapshot.transition_overwritten != 37u) {
+      return EXIT_FAILURE;
+    }
+    if (DiagnosticIdentityToken(diagnostics, first_epoch, 0x1234u, 0u) == 0u
+        || DiagnosticIdentityToken(diagnostics, first_epoch, 0x1234u, 1u) == 0u) return EXIT_FAILURE;
+    for (uint64_t i = 1u; i < kDiagnosticIdentityCapacity - 1u; ++i) {
+      if (DiagnosticIdentityToken(diagnostics, first_epoch, 0x10000u + i, 0u) == 0u) return EXIT_FAILURE;
+    }
+    if (DiagnosticIdentityToken(diagnostics, first_epoch, 0xfeedu, 0u) != 0u) return EXIT_FAILURE;
+    snapshot = CopyDiagnosticSnapshot(diagnostics);
+    if (snapshot.identity_size != kDiagnosticIdentityCapacity || snapshot.untracked_identities != 1u) return EXIT_FAILURE;
+    const std::string report = SerializeDiagnosticReport(snapshot);
+    if (report.size() > kDiagnosticReportCapacity || report.find("0x1234") != std::string::npos
+        || report.find("0xfeed") != std::string::npos || report.find("matching_draw_callbacks=") == std::string::npos
+        || report.find("14:NativeB0Mismatch") == std::string::npos
+        || report.find("12:SignalC") == std::string::npos) {
+      return EXIT_FAILURE;
+    }
+    SetDiagnosticCapture(diagnostics, false);
+    if (CopyDiagnosticSnapshot(diagnostics).transition_size != kDiagnosticTransitionCapacity) return EXIT_FAILURE;
+    RecordDiagnostic(diagnostics, first_epoch, repeated_failure);
+    if (CopyDiagnosticSnapshot(diagnostics).first_failures[0].count != 5000u) return EXIT_FAILURE;
+    SetDiagnosticCapture(diagnostics, true);
+    const uint64_t next_epoch = DiagnosticCaptureEpoch(diagnostics);
+    RecordDiagnostic(diagnostics, first_epoch, repeated_failure);
+    if (CopyDiagnosticSnapshot(diagnostics).transition_size != 0u) return EXIT_FAILURE;
+    RecordDiagnostic(diagnostics, next_epoch, repeated_failure);
+    snapshot = CopyDiagnosticSnapshot(diagnostics);
+    if (snapshot.capture_epoch != next_epoch || snapshot.first_failures[0].count != 1u) return EXIT_FAILURE;
+    ClearDiagnosticCapture(diagnostics);
+    snapshot = CopyDiagnosticSnapshot(diagnostics);
+    if (snapshot.transition_size != 0u || snapshot.failure_size != 0u
+        || snapshot.capture_epoch != DiagnosticCaptureEpoch(diagnostics)) return EXIT_FAILURE;
+    const uint64_t overflow_epoch = snapshot.capture_epoch;
+    for (uint32_t i = 0u; i < kDiagnosticFailureCapacity + 1u; ++i) {
+      const auto stage = static_cast<DiagnosticStage>(1u + (i % 14u));
+      const auto reason = i < 14u ? DiagnosticReason::MissingEntry : DiagnosticReason::MissingInput;
+      RecordDiagnostic(diagnostics, overflow_epoch,
+                       {.frame = i,
+                        .stage = stage,
+                        .reason = reason,
+                        .operation = DiagnosticOperation::Validate});
+    }
+    snapshot = CopyDiagnosticSnapshot(diagnostics);
+    if (snapshot.failure_size != kDiagnosticFailureCapacity || snapshot.failure_records_dropped != 1u
+        || snapshot.first_failures[0].first.frame != 0u || snapshot.reason_size != 2u) return EXIT_FAILURE;
+  }
+  {
+    using namespace falcom_world::rtxdi;
+    DiagnosticState diagnostics;
+    SetDiagnosticCapture(diagnostics, true);
+    const uint64_t epoch = DiagnosticCaptureEpoch(diagnostics);
+    DiagnosticEvent event = {.frame = 42u,
+                             .stage = DiagnosticStage::InputValidate,
+                             .reason = DiagnosticReason::InvalidResource,
+                             .operation = DiagnosticOperation::Validate,
+                             .input_kind = DiagnosticInputKind::Depth,
+                             .validation_code = DiagnosticValidationCode::InvalidTextureView};
+    event.input_status = 3u;
+    event.input_stage = 1u;
+    RecordDiagnostic(diagnostics, epoch, event);
+    event.input_kind = DiagnosticInputKind::Normal;
+    RecordDiagnostic(diagnostics, epoch, event);
+    event.input_kind = DiagnosticInputKind::Depth;
+    event.validation_code = DiagnosticValidationCode::OptionalFallback;
+    RecordDiagnostic(diagnostics, epoch, event);
+    event.frame++;
+    RecordDiagnostic(diagnostics, epoch, event);
+    const auto snapshot = CopyDiagnosticSnapshot(diagnostics);
+    if (snapshot.transition_size != 3u || snapshot.first_failures[0].count != 4u
+        || snapshot.first_failures[0].first.input_kind != DiagnosticInputKind::Depth
+        || snapshot.first_failures[0].first.validation_code != DiagnosticValidationCode::InvalidTextureView) {
+      return EXIT_FAILURE;
+    }
+    const std::string report = SerializeDiagnosticReport(snapshot);
+    if (report.find("input_status=3 input_stage=1") == std::string::npos
+        || report.find("input_status=0:Off") == std::string::npos) return EXIT_FAILURE;
+  }
+  {
+    using namespace falcom_world::rtxdi;
+    DiagnosticState diagnostics;
+    SetDiagnosticCapture(diagnostics, true);
+    const uint64_t epoch = DiagnosticCaptureEpoch(diagnostics);
+    for (const auto operation : {DiagnosticOperation::BindLocal, DiagnosticOperation::BindSun}) {
+      RecordDiagnostic(diagnostics, epoch,
+                       {.frame = 8u,
+                        .flags = 0u,
+                        .stage = DiagnosticStage::LightingBind,
+                        .reason = DiagnosticReason::None,
+                        .operation = operation});
+    }
+    auto snapshot = CopyDiagnosticSnapshot(diagnostics);
+    if (snapshot.reason_size != 0u || snapshot.failure_size != 0u) return EXIT_FAILURE;
+    RecordDiagnostic(diagnostics, epoch,
+                     {.frame = 9u,
+                      .flags = 4u,
+                      .stage = DiagnosticStage::LightingBind,
+                      .reason = DiagnosticReason::None,
+                      .operation = DiagnosticOperation::BindLocal});
+    RecordDiagnostic(diagnostics, epoch,
+                     {.frame = 10u,
+                      .flags = 4u,
+                      .stage = DiagnosticStage::LightingBind,
+                      .reason = DiagnosticReason::None,
+                      .operation = DiagnosticOperation::BindSun});
+    snapshot = CopyDiagnosticSnapshot(diagnostics);
+    if (snapshot.reason_size != 0u || snapshot.failure_size != 0u) return EXIT_FAILURE;
+    RecordDiagnostic(diagnostics, epoch,
+                     {.frame = 11u,
+                      .flags = 4u,
+                      .stage = DiagnosticStage::LightingBind,
+                      .reason = DiagnosticReason::MissingInput,
+                      .operation = DiagnosticOperation::BindLocal});
+    RecordDiagnostic(diagnostics, epoch,
+                     {.frame = 12u,
+                      .flags = 4u,
+                      .stage = DiagnosticStage::LightingBind,
+                      .reason = DiagnosticReason::MissingInput,
+                      .operation = DiagnosticOperation::BindSun});
+    snapshot = CopyDiagnosticSnapshot(diagnostics);
+    if (snapshot.reason_size != 1u || snapshot.failure_size != 1u
+        || snapshot.first_failures[0].count != 2u || snapshot.first_failures[0].first.flags != 4u) {
+      return EXIT_FAILURE;
+    }
+  }
+  {
+    using namespace falcom_world::rtxdi;
+    DiagnosticState diagnostics;
+    SetDiagnosticCapture(diagnostics, true);
+    const uint64_t epoch = DiagnosticCaptureEpoch(diagnostics);
+    RecordDiagnostic(diagnostics, epoch,
+                     {.frame = 1u,
+                      .stage = DiagnosticStage::InputSubmit,
+                      .reason = DiagnosticReason::SubmitFailed,
+                      .operation = DiagnosticOperation::Execute});
+    DiagnosticSummary current = {};
+    current.frame = 2u;
+    current.input_status = 9u;
+    current.current_status_reports_failure = 0u;
+    UpdateDiagnosticSummary(diagnostics, epoch, current);
+    const auto snapshot = CopyDiagnosticSnapshot(diagnostics);
+    const std::string report = SerializeDiagnosticReport(snapshot);
+    if (snapshot.failure_size != 1u || snapshot.first_failures[0].count != 1u
+        || report.find("current_status_reports_failure=0") == std::string::npos
+        || report.find("false does not clear failure history") == std::string::npos) return EXIT_FAILURE;
+  }
+  {
+    using namespace falcom_world::rtxdi;
+    const SceneRangeSnapshot promoted = {.buffer = 11u, .offset = 256u, .size = 1536u, .frame = 5u, .command = 7u, .live = true, .known = true, .sequence = 8u, .reset_generation = 3u};
+    SceneBindingEvidence evidence;
+    if (CheckPromotedSceneBinding(promoted, promoted, 5u, 7u, 4096u, &evidence) != SceneBindingStatus::Ready
+        || evidence.reason != DiagnosticReason::None || !evidence.normalized_valid
+        || evidence.normalized_size != 1536u) return EXIT_FAILURE;
+    auto changed = promoted;
+    changed.known = false;
+    if (CheckPromotedSceneBinding(promoted, changed, 5u, 7u, 4096u, &evidence) != SceneBindingStatus::SceneBindingChanged
+        || evidence.reason != DiagnosticReason::UnknownBinding) return EXIT_FAILURE;
+    changed = promoted;
+    changed.live = false;
+    if (CheckPromotedSceneBinding(promoted, changed, 5u, 7u, 4096u, &evidence) != SceneBindingStatus::SceneBindingChanged
+        || evidence.reason != DiagnosticReason::NonliveBinding) return EXIT_FAILURE;
+    changed = promoted;
+    changed.frame--;
+    if (CheckPromotedSceneBinding(promoted, changed, 5u, 7u, 4096u, &evidence) != SceneBindingStatus::SceneBindingChanged
+        || evidence.reason != DiagnosticReason::StaleFrame) return EXIT_FAILURE;
+    changed = promoted;
+    changed.command++;
+    if (CheckPromotedSceneBinding(promoted, changed, 5u, 7u, 4096u, &evidence) != SceneBindingStatus::SceneBindingChanged
+        || evidence.reason != DiagnosticReason::CommandMismatch) return EXIT_FAILURE;
+    changed = promoted;
+    changed.sequence++;
+    if (CheckPromotedSceneBinding(promoted, changed, 5u, 7u, 4096u, &evidence) != SceneBindingStatus::SceneBindingChanged
+        || evidence.reason != DiagnosticReason::SequenceMismatch) return EXIT_FAILURE;
+    changed = promoted;
+    changed.reset_generation++;
+    if (CheckPromotedSceneBinding(promoted, changed, 5u, 7u, 4096u, &evidence) != SceneBindingStatus::SceneBindingChanged
+        || evidence.reason != DiagnosticReason::ResetMismatch) return EXIT_FAILURE;
+    changed = promoted;
+    changed.buffer++;
+    if (CheckPromotedSceneBinding(promoted, changed, 5u, 7u, 4096u, &evidence) != SceneBindingStatus::SceneBindingChanged
+        || evidence.reason != DiagnosticReason::BufferMismatch) return EXIT_FAILURE;
+    changed = promoted;
+    changed.offset += 256u;
+    if (CheckPromotedSceneBinding(promoted, changed, 5u, 7u, 4096u, &evidence) != SceneBindingStatus::SceneBindingChanged
+        || evidence.reason != DiagnosticReason::OffsetMismatch) return EXIT_FAILURE;
+    changed = promoted;
+    changed.size += 256u;
+    if (CheckPromotedSceneBinding(promoted, changed, 5u, 7u, 4096u, &evidence) != SceneBindingStatus::SceneBindingChanged
+        || evidence.reason != DiagnosticReason::NormalizedSizeMismatch) return EXIT_FAILURE;
+    changed = promoted;
+    changed.offset = 1u;
+    auto malformed_promoted = promoted;
+    malformed_promoted.offset = 1u;
+    if (CheckPromotedSceneBinding(malformed_promoted, changed, 5u, 7u, 4096u, &evidence) != SceneBindingStatus::SceneBindingChanged
+        || evidence.reason != DiagnosticReason::InvalidRange || evidence.normalized_valid) return EXIT_FAILURE;
+  }
   using falcom_world::rtxdi::CanReuseDiOutput;
   using falcom_world::rtxdi::CheckDiOutputIdentity;
   using falcom_world::rtxdi::CheckDiSubmissionIdentity;

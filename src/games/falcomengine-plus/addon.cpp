@@ -7546,44 +7546,133 @@ static void ResetRtxdiSceneBinding(reshade::api::command_list* cmd_list) {
 }
 
 static void PromoteRtxdiSceneBinding(reshade::api::command_list* cmd_list) {
-  if (!cmd_list || !falcom_world::rtxdi::SceneRequested()) return;
+  namespace di = falcom_world::rtxdi;
+  if (!cmd_list) return;
+  auto& diagnostics = di::GetDiagnosticState();
+  const bool diagnostic_enabled = di::DiagnosticCaptureEnabled(diagnostics);
+  const uint64_t diagnostic_epoch = diagnostic_enabled ? di::DiagnosticCaptureEpoch(diagnostics) : 0u;
+  const uint32_t request_mask = di::SceneRequestMask();
+  if (request_mask == 0u) {
+    if (diagnostic_enabled) {
+      di::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                           {.frame = falcom_world::g_state.frame.load(),
+                            .stage = di::DiagnosticStage::ScenePromotion,
+                            .reason = di::DiagnosticReason::None,
+                            .operation = di::DiagnosticOperation::Promote});
+    }
+    return;
+  }
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
   if (!shader_state || !IsLightingShader(renodx::utils::shader::GetCurrentPixelShaderHash(shader_state))) return;
   auto* device = cmd_list->get_device();
   auto* data = device ? device->get_private_data<DeviceData>() : nullptr;
-  if (!data) return;
+  if (!data) {
+    if (diagnostic_enabled) {
+      di::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                           {.frame = falcom_world::g_state.frame.load(),
+                            .stage = di::DiagnosticStage::ScenePromotion,
+                            .reason = di::DiagnosticReason::MissingEntry,
+                            .operation = di::DiagnosticOperation::Promote});
+    }
+    return;
+  }
   const uintptr_t command = reinterpret_cast<uintptr_t>(cmd_list);
-  falcom_world::rtxdi::SceneRangeSnapshot binding;
+  di::SceneRangeSnapshot binding;
+  bool entry_found = false;
   {
     std::shared_lock lock(data->rtxdi_scene_range.mutex);
     const auto it = data->rtxdi_scene_range.bindings.find(command);
-    if (it != data->rtxdi_scene_range.bindings.end()) binding = it->second;
+    if (it != data->rtxdi_scene_range.bindings.end()) {
+      binding = it->second;
+      entry_found = true;
+    }
   }
   const uint32_t generation = g_scene_cbv_desc_generation.load(std::memory_order_acquire);
   uint64_t normalized = 0u;
-  bool valid = falcom_world::rtxdi::CanPromoteSceneBinding(binding, data->frame_index, command, true)
-               && device->get_api() == reshade::api::device_api::d3d11;
+  di::DiagnosticReason reason = di::DiagnosticReason::None;
+  bool valid = di::CanPromoteSceneBinding(binding, data->frame_index, command, true);
+  if (!valid) {
+    reason = !entry_found                         ? di::DiagnosticReason::MissingEntry
+             : !binding.known                     ? di::DiagnosticReason::UnknownBinding
+             : !binding.live                      ? di::DiagnosticReason::NonliveBinding
+             : binding.frame != data->frame_index ? di::DiagnosticReason::StaleFrame
+                                                  : di::DiagnosticReason::CommandMismatch;
+  }
+  if (valid && device->get_api() != reshade::api::device_api::d3d11) {
+    valid = false;
+    reason = di::DiagnosticReason::InvalidResource;
+  }
   if (valid) {
     const auto desc = device->get_resource_desc(reshade::api::resource{binding.buffer});
-    valid = desc.type == reshade::api::resource_type::buffer
-            && falcom_world::rtxdi::NormalizeSceneInputRange(desc.buffer.size, binding.offset, binding.size, &normalized)
-            && falcom_world::rtxdi::ValidateSceneBuffer(reinterpret_cast<ID3D11Buffer*>(binding.buffer), binding.offset, binding.size);  // NOLINT(performance-no-int-to-ptr)
+    if (desc.type != reshade::api::resource_type::buffer) {
+      valid = false;
+      reason = di::DiagnosticReason::InvalidResource;
+    } else if (!di::NormalizeSceneInputRange(desc.buffer.size, binding.offset, binding.size, &normalized)) {
+      valid = false;
+      reason = di::DiagnosticReason::InvalidRange;
+    } else if (!di::ValidateSceneBuffer(reinterpret_cast<ID3D11Buffer*>(binding.buffer), binding.offset, binding.size)) {
+      valid = false;
+      reason = di::DiagnosticReason::InvalidRange;
+    }  // NOLINT(performance-no-int-to-ptr)
   }
-  std::unique_lock lock(data->rtxdi_scene_range.mutex);
-  const auto it = data->rtxdi_scene_range.bindings.find(command);
-  if (!valid || generation != g_scene_cbv_desc_generation.load(std::memory_order_acquire)
-      || it == data->rtxdi_scene_range.bindings.end() || it->second.sequence != binding.sequence
-      || it->second.reset_generation != binding.reset_generation || !it->second.live) {
-    data->rtxdi_scene_range.snapshot = {};
-    return;
+  {
+    std::unique_lock lock(data->rtxdi_scene_range.mutex);
+    const auto it = data->rtxdi_scene_range.bindings.find(command);
+    if (valid && generation != g_scene_cbv_desc_generation.load(std::memory_order_acquire)) {
+      valid = false;
+      reason = di::DiagnosticReason::ResetMismatch;
+    }
+    if (valid && it == data->rtxdi_scene_range.bindings.end()) {
+      valid = false;
+      reason = di::DiagnosticReason::MissingEntry;
+    }
+    if (valid && it->second.sequence != binding.sequence) {
+      valid = false;
+      reason = di::DiagnosticReason::SequenceMismatch;
+    }
+    if (valid && it->second.reset_generation != binding.reset_generation) {
+      valid = false;
+      reason = di::DiagnosticReason::ResetMismatch;
+    }
+    if (valid && !it->second.live) {
+      valid = false;
+      reason = di::DiagnosticReason::NonliveBinding;
+    }
+    if (!valid) data->rtxdi_scene_range.snapshot = {};
+    if (valid) {
+      binding.size = normalized;
+      data->rtxdi_scene_range.snapshot = binding;
+    }
   }
-  binding.size = normalized;
-  data->rtxdi_scene_range.snapshot = binding;
+  if (diagnostic_enabled) {
+    di::DiagnosticEvent event = {};
+    event.owner_generation = falcom_world::rt12::g_rt12_generation.load(std::memory_order_relaxed);
+    event.frame = data->frame_index;
+    event.capture_frame = binding.frame;
+    event.value0 = binding.offset;
+    event.value1 = binding.size;
+    event.normalized_size = normalized;
+    event.scene_slot = -1;
+    event.stage = di::DiagnosticStage::ScenePromotion;
+    event.reason = reason;
+    event.operation = di::DiagnosticOperation::Promote;
+    event.flags = (entry_found ? 1u : 0u) | (binding.known ? 2u : 0u) | (binding.live ? 4u : 0u)
+                  | (normalized != 0u ? 8u : 0u) | (valid ? 16u : 0u);
+    event.identity_tokens[0] = di::DiagnosticIdentityToken(diagnostics, diagnostic_epoch, command,
+                                                           binding.reset_generation);
+    event.identity_tokens[1] = di::DiagnosticIdentityToken(diagnostics, diagnostic_epoch, binding.buffer,
+                                                           binding.reset_generation);
+    event.identity_tokens[2] = di::DiagnosticIdentityToken(diagnostics, diagnostic_epoch,
+                                                           reinterpret_cast<uint64_t>(device), event.owner_generation);
+    di::RecordDiagnostic(diagnostics, diagnostic_epoch, event);
+  }
 #if defined(FALCOM_NRD_ENABLED)
-  falcom_world::rtxdi::RegisterSceneCpuMirrorRange(reinterpret_cast<uintptr_t>(device), binding.buffer,
-                                                   binding.offset, binding.size, binding.frame, binding.sequence);
-  falcom_world::SeedInitialSceneCpuMirror(reinterpret_cast<uintptr_t>(device), binding.buffer,
-                                          binding.offset, binding.size);
+  if (valid) {
+    di::RegisterSceneCpuMirrorRange(reinterpret_cast<uintptr_t>(device), binding.buffer,
+                                    binding.offset, binding.size, binding.frame, binding.sequence);
+    falcom_world::SeedInitialSceneCpuMirror(reinterpret_cast<uintptr_t>(device), binding.buffer,
+                                            binding.offset, binding.size);
+  }
 #endif
 }
 
@@ -12022,6 +12111,9 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
   const uint64_t di_configuration = (rt12::g_rt12 && rt12::g_rt12->device == dev
                                          ? rt12::g_rt12->di.configuration_generation
                                          : 0u);
+  auto& diagnostics = di::GetDiagnosticState();
+  const bool diagnostic_enabled = di::DiagnosticCaptureEnabled(diagnostics);
+  const uint64_t diagnostic_epoch = diagnostic_enabled ? di::DiagnosticCaptureEpoch(diagnostics) : 0u;
   if (!request_mask) {
     std::unique_lock lock(di::g_di.mutex);
     di::g_di.snapshot = {.status = di::DiStatus::Off, .frame = frame};
@@ -12035,6 +12127,16 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
     auto& state = di::g_scene.snapshot;
     if (!request_mask) {
       di::RefreshOffState(&state, frame);
+      lock.unlock();
+      if (diagnostic_enabled) {
+        di::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                             {.owner_generation = generation,
+                              .frame = frame,
+                              .capture_frame = dd ? dd->frame_index : UINT32_MAX,
+                              .stage = di::DiagnosticStage::ScenePromotion,
+                              .reason = di::DiagnosticReason::None,
+                              .operation = di::DiagnosticOperation::Validate});
+      }
       return;
     }
     if (di::PreserveAttemptForNonImmediate(state, frame, true, dd && cmd_list != dd->immediate_cmd_list)) {
@@ -12044,18 +12146,51 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
                                                                 transfer_configuration, di_configuration);
       di::TransitionSunAttempt(&di::g_sun.snapshot, frame,
                                same_request ? di::SunAttemptAction::PreserveDuplicate : di::SunAttemptAction::Invalidate);
+      sun_lock.unlock();
+      lock.unlock();
+      if (diagnostic_enabled) {
+        di::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                             {.owner_generation = generation,
+                              .frame = frame,
+                              .capture_frame = dd ? dd->frame_index : UINT32_MAX,
+                              .flags = same_request ? 1u : 0u,
+                              .stage = di::DiagnosticStage::ScenePromotion,
+                              .reason = same_request ? di::DiagnosticReason::None : di::DiagnosticReason::ConfigurationMismatch,
+                              .operation = di::DiagnosticOperation::Validate});
+      }
       return;
     }
     if (!dev || !dd) {
       state.status = di::SceneStatus::NoDevice;
       std::unique_lock sun_lock(di::g_sun.mutex);
       di::TransitionSunAttempt(&di::g_sun.snapshot, frame, di::SunAttemptAction::Invalidate);
+      sun_lock.unlock();
+      lock.unlock();
+      if (diagnostic_enabled) {
+        di::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                             {.owner_generation = generation,
+                              .frame = frame,
+                              .stage = di::DiagnosticStage::ScenePromotion,
+                              .reason = di::DiagnosticReason::MissingInput,
+                              .operation = di::DiagnosticOperation::Validate});
+      }
       return;
     }
     if (cmd_list != dd->immediate_cmd_list) {
       state.status = di::SceneStatus::DeferredContext;
       std::unique_lock sun_lock(di::g_sun.mutex);
       di::TransitionSunAttempt(&di::g_sun.snapshot, frame, di::SunAttemptAction::Invalidate);
+      sun_lock.unlock();
+      lock.unlock();
+      if (diagnostic_enabled) {
+        di::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                             {.owner_generation = generation,
+                              .frame = frame,
+                              .capture_frame = dd->frame_index,
+                              .stage = di::DiagnosticStage::ScenePromotion,
+                              .reason = di::DiagnosticReason::CommandMismatch,
+                              .operation = di::DiagnosticOperation::Validate});
+      }
       return;
     }
     if (di::IsDuplicate(state, frame, generation) && state.request_mask == request_mask) {
@@ -12065,6 +12200,17 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
                               ? di::SunAttemptAction::PreserveDuplicate
                               : di::SunAttemptAction::Invalidate;
       di::TransitionSunAttempt(&di::g_sun.snapshot, frame, action);
+      sun_lock.unlock();
+      lock.unlock();
+      if (diagnostic_enabled) {
+        di::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                             {.owner_generation = generation,
+                              .frame = frame,
+                              .capture_frame = dd->frame_index,
+                              .stage = di::DiagnosticStage::ScenePromotion,
+                              .reason = di::DiagnosticReason::None,
+                              .operation = di::DiagnosticOperation::Validate});
+      }
       return;
     }
     {
@@ -12243,13 +12389,48 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
       ++state.submissions;
     }
   }
+  if (diagnostic_enabled) {
+    const auto reason = status == di::SceneStatus::Busy                ? di::DiagnosticReason::Busy
+                        : status == di::SceneStatus::Quarantined       ? di::DiagnosticReason::Quarantined
+                        : status == di::SceneStatus::Failed            ? di::DiagnosticReason::SubmitFailed
+                        : status == di::SceneStatus::MissingSceneInput ? di::DiagnosticReason::MissingInput
+                                                                       : di::DiagnosticReason::None;
+    di::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                         {.owner_generation = generation,
+                          .frame = frame,
+                          .capture_frame = dd ? dd->frame_index : UINT32_MAX,
+                          .fence = result.fence_b,
+                          .scene_slot = result.slot,
+                          .flags = static_cast<uint32_t>(status),
+                          .stage = di::DiagnosticStage::ScenePromotion,
+                          .reason = reason,
+                          .operation = di::DiagnosticOperation::Validate});
+  }
 }
 
 static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceData* dd) {
   namespace rt12 = falcom_world::rt12;
   namespace di = falcom_world::rtxdi;
   namespace rr = falcom_world::rr;
+  auto& diagnostics = di::GetDiagnosticState();
+  const bool diagnostic_enabled = di::DiagnosticCaptureEnabled(diagnostics);
+  const uint64_t diagnostic_epoch = diagnostic_enabled ? di::DiagnosticCaptureEpoch(diagnostics) : 0u;
+  const auto record_binding = [&](bool bound, di::DiagnosticReason reason, uint32_t frame,
+                                  uint64_t owner_generation, int32_t transfer_slot, uint64_t fence,
+                                  bool requested = true) {
+    if (!diagnostic_enabled) return;
+    di::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                         {.owner_generation = owner_generation,
+                          .frame = frame,
+                          .fence = fence,
+                          .transfer_slot = transfer_slot,
+                          .flags = (bound ? 1u : 0u) | (requested ? 4u : 0u),
+                          .stage = di::DiagnosticStage::LightingBind,
+                          .reason = reason,
+                          .operation = di::DiagnosticOperation::BindLocal});
+  };
   shader_injection.rtxdi_local_bound = 0.f;
+  const bool local_requested = di::g_local_requested >= 0.5f;
 #if defined(FALCOM_NRD_ENABLED)
   shader_injection.rtxdi_diffuse_bound = 0.f;
 #endif
@@ -12265,7 +12446,12 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
     di::g_di.snapshot.nrd_diffuse_lighting_draw_seen = false;
 #endif
   }
-  if (!IsSora2nd() || !cmd_list) return;
+  if (!IsSora2nd() || !cmd_list) {
+    if (local_requested) {
+      record_binding(false, di::DiagnosticReason::MissingInput, falcom_world::g_state.frame.load(), 0u, -1, 0u);
+    }
+    return;
+  }
 
   const reshade::api::resource_view empty_view = {};
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
@@ -12274,9 +12460,18 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, 43u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
 #endif
-  if (!dd || cmd_list != dd->immediate_cmd_list || di::g_local_requested < 0.5f || !rt12::g_rt12
+  if (!local_requested) {
+    record_binding(false, di::DiagnosticReason::None, falcom_world::g_state.frame.load(),
+                   rt12::g_rt12 ? rt12::g_rt12->generation : 0u, -1, 0u, false);
+    return;
+  }
+  if (!dd || cmd_list != dd->immediate_cmd_list || !rt12::g_rt12
       || rt12::g_rt12->device != cmd_list->get_device() || rt12::g_rt12->failed || rt12::g_rt12->stuck
-      || rt12::g_rt12->unfenced_execution) return;
+      || rt12::g_rt12->unfenced_execution) {
+    record_binding(false, !dd ? di::DiagnosticReason::MissingEntry : di::DiagnosticReason::MissingInput,
+                   falcom_world::g_state.frame.load(), rt12::g_rt12 ? rt12::g_rt12->generation : 0u, -1, 0u);
+    return;
+  }
 
   const uint32_t frame = falcom_world::g_state.frame.load();
   di::DiSnapshot output;
@@ -12307,7 +12502,11 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
       || output.output_configuration_generation != state.di.configuration_generation
       || output.output_width != dd->captured_depth_w
       || output.output_height != dd->captured_depth_h || output.output_fence_b == 0u
-      || output.fence != output.output_fence_b) return;
+      || output.fence != output.output_fence_b) {
+    record_binding(false, di::DiagnosticReason::ConfigurationMismatch, frame, state.generation,
+                   output.output_transfer_slot, output.output_fence_b);
+    return;
+  }
 
   rt12::Rt12DiTransferSlot& slot = state.di_transfer.slots[static_cast<uint32_t>(output.output_transfer_slot)];
   if (!slot.output_staged || slot.output_frame != frame || slot.output_owner_generation != output.output_owner_generation
@@ -12316,7 +12515,11 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
       || slot.output_width != output.output_width || slot.output_height != output.output_height
       || slot.output_b_fence != output.output_fence_b || !slot.di_resolved.srv11.handle
       || !rt12::ValidateDiTexture(slot.di_resolved.srv11, output.output_width, output.output_height,
-                                  rt12::Rt12DiTextureKind::Uint4)) return;
+                                  rt12::Rt12DiTextureKind::Uint4)) {
+    record_binding(false, di::DiagnosticReason::InvalidResource, frame, state.generation,
+                   output.output_transfer_slot, output.output_fence_b);
+    return;
+  }
 
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, 41u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.di_resolved.srv11});
@@ -12339,6 +12542,8 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
     cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                                reshade::api::descriptor_table_update{{}, 41u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
   }
+  record_binding(still_current, still_current ? di::DiagnosticReason::None : di::DiagnosticReason::ConfigurationMismatch,
+                 frame, state.generation, output.output_transfer_slot, output.output_fence_b);
 #if defined(FALCOM_NRD_ENABLED)
   const auto effective_rtxdi_settings = di::CaptureEffectiveRtxdiSettings();
   if (still_current && output.nrd_diffuse_staged && !rr::RrRequested() && !rr::RrOwnsDenoise()
@@ -12387,7 +12592,25 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
 static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData* dd) {
   namespace rt12 = falcom_world::rt12;
   namespace di = falcom_world::rtxdi;
+  auto& diagnostics = di::GetDiagnosticState();
+  const bool diagnostic_enabled = di::DiagnosticCaptureEnabled(diagnostics);
+  const uint64_t diagnostic_epoch = diagnostic_enabled ? di::DiagnosticCaptureEpoch(diagnostics) : 0u;
+  const auto record_binding = [&](bool bound, di::DiagnosticReason reason, uint32_t frame,
+                                  uint64_t owner_generation, int32_t transfer_slot, uint64_t fence,
+                                  bool requested = true) {
+    if (!diagnostic_enabled) return;
+    di::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                         {.owner_generation = owner_generation,
+                          .frame = frame,
+                          .fence = fence,
+                          .transfer_slot = transfer_slot,
+                          .flags = (bound ? 1u : 0u) | (requested ? 4u : 0u),
+                          .stage = di::DiagnosticStage::LightingBind,
+                          .reason = reason,
+                          .operation = di::DiagnosticOperation::BindSun});
+  };
   shader_injection.rtxdi_sun_bound = 0.f;
+  const bool sun_requested = di::g_sun_requested >= 0.5f;
   {
     std::unique_lock lock(di::g_sun.mutex);
     di::g_sun.snapshot.output_bound = false;
@@ -12396,14 +12619,28 @@ static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData*
     di::g_sun.snapshot.output_bound_fence_b = 0u;
     di::g_sun.snapshot.lighting_draw_seen = false;
   }
-  if (!IsSora2nd() || !cmd_list) return;
+  if (!IsSora2nd() || !cmd_list) {
+    if (sun_requested) {
+      record_binding(false, di::DiagnosticReason::MissingInput, falcom_world::g_state.frame.load(), 0u, -1, 0u);
+    }
+    return;
+  }
 
   const reshade::api::resource_view empty_view = {};
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, 42u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
-  if (!dd || cmd_list != dd->immediate_cmd_list || di::g_sun_requested < 0.5f || !rt12::g_rt12
+  if (!sun_requested) {
+    record_binding(false, di::DiagnosticReason::None, falcom_world::g_state.frame.load(),
+                   rt12::g_rt12 ? rt12::g_rt12->generation : 0u, -1, 0u, false);
+    return;
+  }
+  if (!dd || cmd_list != dd->immediate_cmd_list || !rt12::g_rt12
       || rt12::g_rt12->device != cmd_list->get_device() || rt12::g_rt12->failed || rt12::g_rt12->stuck
-      || rt12::g_rt12->unfenced_execution) return;
+      || rt12::g_rt12->unfenced_execution) {
+    record_binding(false, !dd ? di::DiagnosticReason::MissingEntry : di::DiagnosticReason::MissingInput,
+                   falcom_world::g_state.frame.load(), rt12::g_rt12 ? rt12::g_rt12->generation : 0u, -1, 0u);
+    return;
+  }
 
   const uint32_t frame = falcom_world::g_state.frame.load();
   di::SunSnapshot sun;
@@ -12431,14 +12668,22 @@ static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData*
       || input.configuration_generation != sun.configuration_generation || input.scene_slot != sun.scene_slot
       || input.transfer_slot != sun.transfer_slot || input.width != sun.width || input.height != sun.height
       || scene.prepared_frame != frame || scene.prepared_slot != sun.scene_slot
-      || scene.prepared_generation != sun.owner_generation || scene.prepared_fence != input.scene_fence) return;
+      || scene.prepared_generation != sun.owner_generation || scene.prepared_fence != input.scene_fence) {
+    record_binding(false, di::DiagnosticReason::ConfigurationMismatch, frame, state.generation,
+                   sun.transfer_slot, sun.fence_b);
+    return;
+  }
 
   rt12::Rt12DiTransferSlot& slot = state.di_transfer.slots[static_cast<uint32_t>(sun.transfer_slot)];
   if (!slot.sun || !slot.output_staged || slot.output_frame != frame || slot.output_owner_generation != sun.owner_generation
       || slot.sun_configuration_generation != sun.configuration_generation || slot.output_scene_slot != sun.scene_slot
       || slot.output_transfer_slot != sun.transfer_slot || slot.output_width != sun.width || slot.output_height != sun.height
       || slot.output_b_fence != sun.fence_b || !slot.sun_visibility.srv11.handle
-      || !rt12::ValidateDiTexture(slot.sun_visibility.srv11, sun.width, sun.height, rt12::Rt12DiTextureKind::Uint)) return;
+      || !rt12::ValidateDiTexture(slot.sun_visibility.srv11, sun.width, sun.height, rt12::Rt12DiTextureKind::Uint)) {
+    record_binding(false, di::DiagnosticReason::InvalidResource, frame, state.generation,
+                   sun.transfer_slot, sun.fence_b);
+    return;
+  }
 
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, 42u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.sun_visibility.srv11});
@@ -12461,6 +12706,8 @@ static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData*
     cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                                reshade::api::descriptor_table_update{{}, 42u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
   }
+  record_binding(still_current, still_current ? di::DiagnosticReason::None : di::DiagnosticReason::ConfigurationMismatch,
+                 frame, state.generation, sun.transfer_slot, sun.fence_b);
 }
 
 // DLSS Ray Reconstruction guides (M1): the compute pass at the lighting hook. Runs on the first lighting draw of the frame.
@@ -12505,26 +12752,72 @@ static void OnDrawnLightingShader(reshade::api::command_list* cmd_list) {
   auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
   if (dd == nullptr || cmd_list != dd->immediate_cmd_list) return;
   if (IsSora2nd()) {
-    std::unique_lock lock(falcom_world::rtxdi::g_di.mutex);
-    auto& output = falcom_world::rtxdi::g_di.snapshot;
-    falcom_world::rtxdi::RecordOutputLightingDrawSeen(&output.output_bound, &output.output_bound_frame,
-                                                      &output.output_bound_transfer_slot, &output.output_bound_fence_b,
-                                                      &output.lighting_draw_seen, falcom_world::g_state.frame.load(),
-                                                      output.output_frame, output.output_transfer_slot,
-                                                      output.output_fence_b);
+    namespace di = falcom_world::rtxdi;
+    const uint32_t frame_index = falcom_world::g_state.frame.load();
+    bool local_bound = false;
+    bool local_draw_seen = false;
+    uint32_t local_frame = UINT32_MAX;
+    int32_t local_transfer_slot = -1;
+    uint64_t local_fence = 0u;
+    bool sun_bound = false;
+    bool sun_draw_seen = false;
+    uint32_t sun_frame = UINT32_MAX;
+    int32_t sun_transfer_slot = -1;
+    uint64_t sun_fence = 0u;
+    {
+      std::unique_lock lock(di::g_di.mutex);
+      auto& output = di::g_di.snapshot;
+      di::RecordOutputLightingDrawSeen(&output.output_bound, &output.output_bound_frame,
+                                       &output.output_bound_transfer_slot, &output.output_bound_fence_b,
+                                       &output.lighting_draw_seen, frame_index, output.output_frame,
+                                       output.output_transfer_slot, output.output_fence_b);
 #if defined(FALCOM_NRD_ENABLED)
-    falcom_world::rtxdi::RecordOutputLightingDrawSeen(&output.nrd_diffuse_bound, &output.nrd_diffuse_frame,
-                                                      &output.nrd_diffuse_transfer_slot, &output.nrd_diffuse_fence_b,
-                                                      &output.nrd_diffuse_lighting_draw_seen,
-                                                      falcom_world::g_state.frame.load(), output.nrd_diffuse_frame,
-                                                      output.nrd_diffuse_transfer_slot, output.nrd_diffuse_fence_b);
+      di::RecordOutputLightingDrawSeen(&output.nrd_diffuse_bound, &output.nrd_diffuse_frame,
+                                       &output.nrd_diffuse_transfer_slot, &output.nrd_diffuse_fence_b,
+                                       &output.nrd_diffuse_lighting_draw_seen, frame_index, output.nrd_diffuse_frame,
+                                       output.nrd_diffuse_transfer_slot, output.nrd_diffuse_fence_b);
 #endif
-    std::unique_lock sun_lock(falcom_world::rtxdi::g_sun.mutex);
-    auto& sun = falcom_world::rtxdi::g_sun.snapshot;
-    falcom_world::rtxdi::RecordOutputLightingDrawSeen(&sun.output_bound, &sun.output_bound_frame,
-                                                      &sun.output_bound_transfer_slot, &sun.output_bound_fence_b,
-                                                      &sun.lighting_draw_seen, falcom_world::g_state.frame.load(),
-                                                      sun.frame, sun.transfer_slot, sun.fence_b);
+      local_bound = output.output_bound;
+      local_draw_seen = output.lighting_draw_seen;
+      local_frame = output.output_frame;
+      local_transfer_slot = output.output_transfer_slot;
+      local_fence = output.output_fence_b;
+    }
+    {
+      std::unique_lock lock(di::g_sun.mutex);
+      auto& sun = di::g_sun.snapshot;
+      di::RecordOutputLightingDrawSeen(&sun.output_bound, &sun.output_bound_frame,
+                                       &sun.output_bound_transfer_slot, &sun.output_bound_fence_b,
+                                       &sun.lighting_draw_seen, frame_index, sun.frame, sun.transfer_slot, sun.fence_b);
+      sun_bound = sun.output_bound;
+      sun_draw_seen = sun.lighting_draw_seen;
+      sun_frame = sun.frame;
+      sun_transfer_slot = sun.transfer_slot;
+      sun_fence = sun.fence_b;
+    }
+    auto& diagnostics = di::GetDiagnosticState();
+    const bool diagnostic_enabled = di::DiagnosticCaptureEnabled(diagnostics);
+    if (diagnostic_enabled) {
+      const uint64_t epoch = di::DiagnosticCaptureEpoch(diagnostics);
+      di::RecordDiagnostic(diagnostics, epoch,
+                           {.frame = frame_index,
+                            .capture_frame = local_frame,
+                            .fence = local_fence,
+                            .transfer_slot = local_transfer_slot,
+                            .flags = (local_bound ? 1u : 0u) | (local_draw_seen ? 2u : 0u),
+                            .stage = di::DiagnosticStage::LightingDraw,
+                            .reason = di::DiagnosticReason::None,
+                            .operation = di::DiagnosticOperation::LightingCallback});
+      di::RecordDiagnostic(diagnostics, epoch,
+                           {.frame = frame_index,
+                            .capture_frame = sun_frame,
+                            .fence = sun_fence,
+                            .transfer_slot = sun_transfer_slot,
+                            .flags = (sun_bound ? 1u : 0u) | (sun_draw_seen ? 2u : 0u),
+                            .stage = di::DiagnosticStage::LightingDraw,
+                            .reason = di::DiagnosticReason::None,
+                            .operation = di::DiagnosticOperation::LightingCallback});
+    }
   }
   const auto& frame = falcom_world::rtgi::g_rtgi_frame;
   if (!frame.producing || frame.dispatched_frame != dd->frame_index) return;

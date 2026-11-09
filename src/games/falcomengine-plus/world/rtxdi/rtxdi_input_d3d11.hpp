@@ -4,11 +4,51 @@
 #include <cstdint>
 
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <wrl/client.h>
 
 #include "rtxdi_input_validation.hpp"
 
 namespace falcom_world::rtxdi {
+
+struct SceneB0BindingEvidence {
+  uint64_t native_buffer = 0u;
+  uint32_t first_constant = 0u;
+  uint32_t constant_count = 0u;
+  uint32_t buffer_bytes = 0u;
+  HRESULT context_query_result = E_POINTER;
+  bool context_query_available = false;
+  bool buffer_available = false;
+};
+
+inline bool ValidateSceneB0Binding(ID3D11DeviceContext* context, ID3D11Buffer* expected_buffer,
+                                   uint64_t expected_offset, uint32_t minimum_constants,
+                                   SceneB0BindingEvidence* evidence = nullptr) {
+  if (evidence != nullptr) *evidence = {};
+  if (context == nullptr || expected_buffer == nullptr) return false;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext1> context1;
+  const HRESULT query_result = context->QueryInterface(IID_PPV_ARGS(&context1));
+  if (evidence != nullptr) {
+    evidence->context_query_result = query_result;
+    evidence->context_query_available = SUCCEEDED(query_result);
+  }
+  if (FAILED(query_result)) return false;
+  Microsoft::WRL::ComPtr<ID3D11Buffer> buffer;
+  UINT first = 0u, count = 0u;
+  context1->PSGetConstantBuffers1(0u, 1u, &buffer, &first, &count);
+  if (evidence != nullptr) {
+    evidence->native_buffer = reinterpret_cast<uint64_t>(buffer.Get());  // NOLINT(performance-no-int-to-ptr)
+    evidence->first_constant = first;
+    evidence->constant_count = count;
+    evidence->buffer_available = buffer != nullptr;
+    if (buffer != nullptr) {
+      D3D11_BUFFER_DESC desc = {};
+      buffer->GetDesc(&desc);
+      evidence->buffer_bytes = desc.ByteWidth;
+    }
+  }
+  return buffer.Get() == expected_buffer && uint64_t{first} * 16u == expected_offset && count >= minimum_constants;
+}
 
 inline bool GetTextureViewExtent(ID3D11ShaderResourceView* view, uint32_t* width, uint32_t* height) {
   if (!view || !width || !height) return false;

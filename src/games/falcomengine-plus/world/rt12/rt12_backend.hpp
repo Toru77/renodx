@@ -1638,6 +1638,9 @@ inline void OnPresent(reshade::api::device* device) {
                                                           && slot.output_c_fence == 0u);
   }
   if (output_consumer_pending) {
+    auto& diagnostics = rtxdi::GetDiagnosticState();
+    const bool diagnostic_enabled = rtxdi::DiagnosticCaptureEnabled(diagnostics);
+    const uint64_t diagnostic_epoch = diagnostic_enabled ? rtxdi::DiagnosticCaptureEpoch(diagnostics) : 0u;
     uint64_t consumer_fence = renodx::utils::gpu_fence::NO_SIGNAL;
     try {
       consumer_fence = renodx::utils::gpu_fence::QueueSignal(s.ctx11.Get(), s.fence11.get());
@@ -1647,9 +1650,20 @@ inline void OnPresent(reshade::api::device* device) {
     if (consumer_fence == renodx::utils::gpu_fence::NO_SIGNAL) {
       s.stuck = true;
       FailSession(s, Rt12Reason::SubmitFailed, "rtxdi output consumer fence C");
-      std::unique_lock lock(rtxdi::g_di.mutex);
-      rtxdi::g_di.snapshot.status = rtxdi::DiStatus::Quarantined;
-      rtxdi::g_di.snapshot.error = E_FAIL;
+      {
+        std::unique_lock lock(rtxdi::g_di.mutex);
+        rtxdi::g_di.snapshot.status = rtxdi::DiStatus::Quarantined;
+        rtxdi::g_di.snapshot.error = E_FAIL;
+      }
+      if (diagnostic_enabled) {
+        rtxdi::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                                {.owner_generation = s.generation,
+                                 .frame = g_state.frame.load(),
+                                 .hresult = E_FAIL,
+                                 .stage = rtxdi::DiagnosticStage::SlotConsumer,
+                                 .reason = rtxdi::DiagnosticReason::SignalFailed,
+                                 .operation = rtxdi::DiagnosticOperation::SignalC});
+      }
       return;
     }
     for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {
@@ -1683,6 +1697,31 @@ inline void OnPresent(reshade::api::device* device) {
           && rtxdi::g_sun.snapshot.fence_b == sun_slot->output_b_fence) {
         rtxdi::g_sun.snapshot.fence_c = consumer_fence;
       }
+    }
+    if (diagnostic_enabled) {
+      uint32_t accepted_slots = 0u;
+      int32_t first_slot = -1;
+      for (uint32_t index = 0u; index < kRt12Slots; ++index) {
+        const Rt12DiTransferSlot& slot = s.di_transfer.slots[index];
+        if ((slot.output_staged
+#if defined(FALCOM_NRD_ENABLED)
+             || slot.nrd_diffuse_staged
+#endif
+             )
+            && slot.output_c_fence == consumer_fence) {
+          if (first_slot < 0) first_slot = static_cast<int32_t>(index);
+          ++accepted_slots;
+        }
+      }
+      rtxdi::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                              {.owner_generation = s.generation,
+                               .frame = g_state.frame.load(),
+                               .fence = consumer_fence,
+                               .value0 = accepted_slots,
+                               .transfer_slot = first_slot,
+                               .stage = rtxdi::DiagnosticStage::SlotConsumer,
+                               .reason = rtxdi::DiagnosticReason::None,
+                               .operation = rtxdi::DiagnosticOperation::SignalC});
     }
   }
 

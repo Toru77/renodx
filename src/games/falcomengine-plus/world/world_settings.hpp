@@ -28,6 +28,7 @@
 #include "rtls/rtls_panel.hpp"
 #include "rtsun/rtsun_panel.hpp"
 #include "rtxdi/rtxdi_config.hpp"
+#include "rtxdi/rtxdi_diagnostics.hpp"
 #include "rtxdi/rtxdi_state.hpp"
 #include "world_state.hpp"
 
@@ -1043,6 +1044,150 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                     sun.output_bound ? "yes" : "no", sun.lighting_draw_seen ? "yes" : "no",
                     static_cast<unsigned long long>(sun.fence_b), static_cast<unsigned long long>(sun.fence_c),
                     static_cast<unsigned int>(sun.error));
+        return false;
+      },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "",
+      .binding = &rtxdi::g_debug_logging,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "RTXDI Debug Logging",
+      .section = "RTXDI",
+      .tooltip = "Session-only bounded diagnostics. No scene or shader contents are included.",
+      .labels = {"Off", "On"},
+      .on_change_value = [](float, float current) {
+        rtxdi::SetDiagnosticCapture(rtxdi::GetDiagnosticState(), current > 0.5f);
+      },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiDebugReport",
+      .value_type = SettingValueType::CUSTOM,
+      .can_reset = false,
+      .label = "RTXDI diagnostic report",
+      .section = "RTXDI",
+      .on_draw = []() {
+        auto& diagnostic_state = rtxdi::GetDiagnosticState();
+        const bool logging = rtxdi::DiagnosticCaptureEnabled(diagnostic_state);
+        rtxdi::SceneSnapshot scene;
+        {
+          std::shared_lock lock(rtxdi::g_scene.mutex);
+          scene = rtxdi::g_scene.snapshot;
+        }
+        rtxdi::InputSnapshot input;
+        {
+          std::shared_lock lock(rtxdi::g_input.mutex);
+          input = rtxdi::g_input.snapshot;
+        }
+        rtxdi::DiSnapshot di;
+        {
+          std::shared_lock lock(rtxdi::g_di.mutex);
+          di = rtxdi::g_di.snapshot;
+        }
+        rtxdi::SunSnapshot sun;
+        {
+          std::shared_lock lock(rtxdi::g_sun.mutex);
+          sun = rtxdi::g_sun.snapshot;
+        }
+        if (logging) {
+          rtxdi::DiagnosticSummary summary = {};
+          summary.frame = di.frame != UINT32_MAX ? di.frame : input.attempted_frame;
+          summary.capture_frame = input.attempted_frame;
+          summary.owner_generation = input.owner_generation;
+          summary.requested_settings = rtxdi::SceneRequestMask();
+          summary.effective_settings = di.settings_identity;
+          summary.configuration_generation = input.configuration_generation;
+          summary.n1_configuration = 0u;
+          summary.nrd_configuration = 0u;
+          summary.scene_age = scene.prepared_frame != UINT32_MAX && scene.prepared_frame <= summary.frame
+                                  ? summary.frame - scene.prepared_frame
+                                  : UINT64_MAX;
+          summary.input_age = input.ready_frame != UINT32_MAX && input.ready_frame <= summary.frame
+                                  ? summary.frame - input.ready_frame
+                                  : UINT64_MAX;
+          summary.di_age = di.frame != UINT32_MAX && di.frame <= summary.frame ? summary.frame - di.frame : UINT64_MAX;
+          summary.sun_age = sun.frame != UINT32_MAX && sun.frame <= summary.frame
+                                ? summary.frame - sun.frame
+                                : UINT64_MAX;
+          summary.scene_fence = scene.prepared_fence;
+          summary.input_fence_b = input.fence;
+          summary.consumer_fence_c = di.output_fence_c;
+          summary.attempts = scene.attempts;
+          summary.submissions = scene.submissions;
+          summary.skips = scene.skips;
+          summary.current_status_reports_failure = scene.status == rtxdi::SceneStatus::Failed
+                                                           || input.status == rtxdi::InputStatus::SubmitFailed
+                                                       ? 1u
+                                                       : 0u;
+          summary.bindings = static_cast<uint64_t>(di.output_bound) + static_cast<uint64_t>(sun.output_bound);
+          summary.matching_draw_callbacks = static_cast<uint64_t>(di.lighting_draw_seen)
+                                            + static_cast<uint64_t>(sun.lighting_draw_seen);
+          summary.width = input.width;
+          summary.height = input.height;
+          summary.scene_slot = scene.prepared_slot >= 0 ? static_cast<uint32_t>(scene.prepared_slot) : UINT32_MAX;
+          summary.transfer_slot = input.transfer_slot >= 0 ? static_cast<uint32_t>(input.transfer_slot) : UINT32_MAX;
+          summary.scene_status = static_cast<uint32_t>(scene.status);
+          summary.input_status = static_cast<uint32_t>(input.status);
+          summary.input_stage = static_cast<uint32_t>(input.stage);
+          summary.di_status = static_cast<uint32_t>(di.status);
+          summary.sun_status = static_cast<uint32_t>(sun.status);
+          summary.publication_status = static_cast<uint32_t>(di.output_staged);
+          summary.binding_status = static_cast<uint32_t>(di.output_bound);
+          summary.rr_requested = rr::RrRequested() ? 1u : 0u;
+          summary.rr_owns_denoise = rr::RrOwnsDenoise() ? 1u : 0u;
+          summary.denoiser_reason = summary.rr_requested || summary.rr_owns_denoise ? 1u
+                                    : rtxdi::g_diffuse_denoiser > 0.5f              ? 2u
+                                                                                    : 0u;
+          summary.last_hresult = input.error != 0 ? input.error : di.error;
+          summary.requested_candidates = rtxdi::g_local_candidates > 0.f
+                                             ? static_cast<uint32_t>(rtxdi::g_local_candidates)
+                                             : 0u;
+          summary.effective_candidates = di.local_candidates;
+          summary.requested_spatial_samples = rtxdi::g_spatial_samples > 0.f
+                                                  ? static_cast<uint32_t>(rtxdi::g_spatial_samples)
+                                                  : 0u;
+          summary.effective_spatial_samples = di.spatial_samples;
+          summary.requested_denoiser = rtxdi::g_diffuse_denoiser > 0.5f ? 1u : 0u;
+          summary.effective_denoiser = summary.denoiser_reason == 2u ? 1u : 0u;
+          summary.runtime_gates = (falcom_world::g_state.supported ? 1u : 0u)
+                                  | (rtxdi::g_local_requested > 0.5f ? 2u : 0u)
+                                  | (rtxdi::g_sun_requested > 0.5f ? 4u : 0u);
+          summary.available_mask = rtxdi::DiagnosticStatesAvailable | rtxdi::DiagnosticSettingsAvailable
+                                   | rtxdi::DiagnosticRrStateAvailable;
+          if (summary.frame != UINT32_MAX) summary.available_mask |= rtxdi::DiagnosticFrameAvailable;
+          if (input.transfer_slot >= 0) summary.available_mask |= rtxdi::DiagnosticInputIdentityAvailable;
+          if (input.width != 0u && input.height != 0u) summary.available_mask |= rtxdi::DiagnosticDimensionsAvailable;
+          if (scene.prepared_fence != 0u) summary.available_mask |= rtxdi::DiagnosticSceneFenceAvailable;
+          if (input.fence != 0u) summary.available_mask |= rtxdi::DiagnosticInputFenceBAvailable;
+          if (di.output_fence_c != 0u) summary.available_mask |= rtxdi::DiagnosticConsumerFenceCAvailable;
+          rtxdi::UpdateDiagnosticSummary(diagnostic_state, rtxdi::DiagnosticCaptureEpoch(diagnostic_state), summary);
+        }
+        const auto snapshot = rtxdi::CopyDiagnosticSnapshot(diagnostic_state);
+        ImGui::Text("Logging %s | epoch %llu | recent %u/%u (overwritten %llu) | first failures %u/%u | untracked %llu",
+                    logging ? "on" : "off", static_cast<unsigned long long>(snapshot.capture_epoch),
+                    snapshot.transition_size, rtxdi::kDiagnosticTransitionCapacity,
+                    static_cast<unsigned long long>(snapshot.transition_overwritten), snapshot.failure_size,
+                    rtxdi::kDiagnosticFailureCapacity, static_cast<unsigned long long>(snapshot.untracked_identities));
+        ImGui::BeginDisabled(!logging);
+        static bool copied = false;
+        if (ImGui::Button("Copy Report")) {
+          const auto copy = rtxdi::CopyDiagnosticSnapshot(diagnostic_state);
+          const std::string report = rtxdi::SerializeDiagnosticReport(copy);
+          ImGui::SetClipboardText(report.c_str());
+          copied = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Clear Report")) {
+          rtxdi::ClearDiagnosticCapture(diagnostic_state);
+          copied = false;
+        }
+        if (copied) {
+          ImGui::SameLine();
+          ImGui::TextUnformatted("Copied");
+        }
         return false;
       },
       .is_visible = visible,

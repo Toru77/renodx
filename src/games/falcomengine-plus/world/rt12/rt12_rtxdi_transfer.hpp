@@ -30,6 +30,8 @@ struct Rt12DiInputResult {
   rtxdi::InputStatus status = rtxdi::InputStatus::MissingInput;
   rtxdi::InputStage stage = rtxdi::InputStage::Validate;
   HRESULT error = S_OK;
+  rtxdi::DiagnosticInputKind validation_input = rtxdi::DiagnosticInputKind::None;
+  rtxdi::DiagnosticValidationCode validation_code = rtxdi::DiagnosticValidationCode::None;
   RtxdiInputLayout layout = {};
   uint64_t fence = 0u;
   int32_t transfer_slot = -1;
@@ -74,45 +76,152 @@ inline bool ValidateDiTexture(reshade::api::resource_view source, uint32_t width
 
 // Scene CBV identity is checked against the current binding before each stage.
 inline bool CurrentDiSceneRange(reshade::api::device* device, reshade::api::command_list* cmd_list,
-                                const Rt12DiInputViews& in, ID3D11Buffer* expected_scene, reshade::api::buffer_range* range) {
-  if (!device || !cmd_list || !in.scene_tracker || !range) return false;
+                                const Rt12DiInputViews& in, ID3D11Buffer* expected_scene,
+                                reshade::api::buffer_range* range,
+                                rtxdi::SceneRangeEvidence* evidence = nullptr) {
+  if (evidence != nullptr) *evidence = {};
+  if (!device || !cmd_list || !in.scene_tracker || !range) {
+    if (evidence != nullptr) evidence->binding.reason = rtxdi::DiagnosticReason::InvalidResource;
+    return false;
+  }
   const uintptr_t command = reinterpret_cast<uintptr_t>(cmd_list);
   rtxdi::SceneRangeSnapshot promoted, binding;
   {
     std::shared_lock lock(in.scene_tracker->mutex);
     promoted = in.scene_tracker->snapshot;
     const auto found = in.scene_tracker->bindings.find(command);
-    if (found == in.scene_tracker->bindings.end()) return false;
+    if (found == in.scene_tracker->bindings.end()) {
+      if (evidence != nullptr) {
+        evidence->binding.promoted = promoted;
+        evidence->binding.reason = rtxdi::DiagnosticReason::MissingEntry;
+        evidence->expected_buffer = reinterpret_cast<uint64_t>(expected_scene);
+      }
+      return false;
+    }
     binding = found->second;
   }
+  if (evidence != nullptr) {
+    evidence->entry_found = true;
+    evidence->binding.promoted = promoted;
+    evidence->binding.current = binding;
+    evidence->expected_buffer = reinterpret_cast<uint64_t>(expected_scene);
+  }
   if (!promoted.live || !binding.live || promoted.buffer == 0u
-      || reinterpret_cast<uint64_t>(expected_scene) != promoted.buffer) return false;
+      || reinterpret_cast<uint64_t>(expected_scene) != promoted.buffer) {
+    if (evidence != nullptr) {
+      evidence->binding.reason = !promoted.live || !binding.live ? rtxdi::DiagnosticReason::NonliveBinding
+                                 : promoted.buffer == 0u         ? rtxdi::DiagnosticReason::InvalidResource
+                                                                 : rtxdi::DiagnosticReason::BufferMismatch;
+    }
+    return false;
+  }
   const auto desc = device->get_resource_desc(reshade::api::resource{promoted.buffer});
-  if (desc.type != reshade::api::resource_type::buffer
-      || rtxdi::CheckPromotedSceneBinding(promoted, binding, in.capture_frame, command, desc.buffer.size)
-             != rtxdi::SceneBindingStatus::Ready
-      || !rtxdi::ValidateSceneBuffer(reinterpret_cast<ID3D11Buffer*>(promoted.buffer), promoted.offset, RTXDI_INPUT_SCENE_ROWS * 16u)) return false;  // NOLINT(performance-no-int-to-ptr)
+  if (evidence != nullptr) {
+    evidence->resource_desc_valid = desc.type == reshade::api::resource_type::buffer;
+    evidence->resource_buffer = evidence->resource_desc_valid;
+    evidence->binding.buffer_bytes = desc.buffer.size;
+  }
+  if (desc.type != reshade::api::resource_type::buffer) {
+    if (evidence != nullptr) evidence->binding.reason = rtxdi::DiagnosticReason::InvalidResource;
+    return false;
+  }
+  if (rtxdi::CheckPromotedSceneBinding(promoted, binding, in.capture_frame, command, desc.buffer.size,
+                                       evidence != nullptr ? &evidence->binding : nullptr)
+      != rtxdi::SceneBindingStatus::Ready) return false;
+  if (!rtxdi::ValidateSceneBuffer(reinterpret_cast<ID3D11Buffer*>(promoted.buffer), promoted.offset,
+                                  RTXDI_INPUT_SCENE_ROWS * 16u)) {
+    if (evidence != nullptr) evidence->binding.reason = rtxdi::DiagnosticReason::InvalidRange;
+    return false;
+  }  // NOLINT(performance-no-int-to-ptr)
   {
     std::shared_lock lock(in.scene_tracker->mutex);
     const auto found = in.scene_tracker->bindings.find(command);
-    if (found == in.scene_tracker->bindings.end()
-        || rtxdi::CheckPromotedSceneBinding(in.scene_tracker->snapshot, found->second, in.capture_frame, command, desc.buffer.size)
-               != rtxdi::SceneBindingStatus::Ready
-        || in.scene_tracker->snapshot.sequence != promoted.sequence) return false;
+    if (found == in.scene_tracker->bindings.end()) {
+      if (evidence != nullptr) evidence->binding.reason = rtxdi::DiagnosticReason::MissingEntry;
+      return false;
+    }
+    if (rtxdi::CheckPromotedSceneBinding(in.scene_tracker->snapshot, found->second, in.capture_frame,
+                                         command, desc.buffer.size,
+                                         evidence != nullptr ? &evidence->binding : nullptr)
+        != rtxdi::SceneBindingStatus::Ready) return false;
+    if (in.scene_tracker->snapshot.sequence != promoted.sequence) {
+      if (evidence != nullptr) evidence->binding.reason = rtxdi::DiagnosticReason::SequenceMismatch;
+      return false;
+    }
   }
   *range = {reshade::api::resource{promoted.buffer}, promoted.offset, RTXDI_INPUT_SCENE_ROWS * 16u};
   return true;
 }
 
-inline bool ValidateBoundDiScene(ID3D11DeviceContext* context, const reshade::api::buffer_range& range) {
-  if (!context || range.buffer.handle == 0u) return false;
-  Microsoft::WRL::ComPtr<ID3D11DeviceContext1> context1;
-  if (FAILED(context->QueryInterface(IID_PPV_ARGS(&context1)))) return false;
-  Microsoft::WRL::ComPtr<ID3D11Buffer> buffer;
-  UINT first = 0u, count = 0u;
-  context1->PSGetConstantBuffers1(0u, 1u, &buffer, &first, &count);
-  return reinterpret_cast<uint64_t>(buffer.Get()) == range.buffer.handle
-         && uint64_t{first} * 16u == range.offset && count >= RTXDI_INPUT_SCENE_ROWS;
+struct DiSceneNativeBindingEvidence {
+  uint64_t native_buffer = 0u;
+  uint32_t first_constant = 0u;
+  uint32_t constant_count = 0u;
+  uint32_t buffer_bytes = 0u;
+  HRESULT context_query_result = E_POINTER;
+  bool context_query_available = false;
+  bool buffer_available = false;
+};
+
+inline void RecordDiSceneEvidence(rtxdi::DiagnosticState& diagnostics, uint64_t epoch,
+                                  rtxdi::DiagnosticStage stage, uint64_t owner_generation,
+                                  uint64_t frame, int32_t scene_slot, int32_t transfer_slot,
+                                  const rtxdi::SceneRangeEvidence& scene,
+                                  const DiSceneNativeBindingEvidence& native, bool passed = false) {
+  rtxdi::DiagnosticEvent event = {};
+  event.owner_generation = owner_generation;
+  event.frame = frame;
+  event.capture_frame = scene.binding.current.frame;
+  event.scene_slot = scene_slot;
+  event.transfer_slot = transfer_slot;
+  event.stage = stage;
+  event.operation = rtxdi::DiagnosticOperation::Validate;
+  event.reason = passed ? rtxdi::DiagnosticReason::None : scene.binding.reason;
+  if (!passed && scene.binding.reason == rtxdi::DiagnosticReason::None) {
+    event.reason = native.context_query_available ? rtxdi::DiagnosticReason::NativeB0Mismatch
+                                                  : rtxdi::DiagnosticReason::ContextQueryFailed;
+  }
+  event.hresult = FAILED(native.context_query_result) ? native.context_query_result : 0;
+  event.value0 = scene.binding.promoted.offset;
+  event.value1 = scene.binding.promoted.size;
+  event.buffer_bytes = scene.binding.buffer_bytes;
+  event.normalized_size = scene.binding.normalized_size;
+  event.native_buffer_bytes = native.buffer_bytes;
+  event.first_constant = native.first_constant;
+  event.constant_count = native.constant_count;
+  event.flags = (scene.entry_found ? 1u : 0u) | (scene.resource_desc_valid ? 2u : 0u)
+                | (scene.binding.normalized_valid ? 4u : 0u) | (native.context_query_available ? 8u : 0u)
+                | (native.buffer_available ? 16u : 0u)
+                | (native.native_buffer == scene.expected_buffer ? 32u : 0u);
+  event.identity_tokens[0] = rtxdi::DiagnosticIdentityToken(
+      diagnostics, epoch, scene.binding.current.command, owner_generation);
+  event.identity_tokens[1] = rtxdi::DiagnosticIdentityToken(
+      diagnostics, epoch, scene.binding.promoted.buffer, scene.binding.promoted.reset_generation);
+  event.identity_tokens[2] = rtxdi::DiagnosticIdentityToken(
+      diagnostics, epoch, scene.binding.current.buffer, scene.binding.current.reset_generation);
+  event.identity_tokens[3] = rtxdi::DiagnosticIdentityToken(
+      diagnostics, epoch, native.native_buffer,
+      scene.binding.current.reset_generation);
+  rtxdi::RecordDiagnostic(diagnostics, epoch, event);
+}
+
+inline bool ValidateBoundDiScene(ID3D11DeviceContext* context, const reshade::api::buffer_range& range,
+                                 DiSceneNativeBindingEvidence* evidence = nullptr) {
+  if (evidence != nullptr) *evidence = {};
+  rtxdi::SceneB0BindingEvidence native;
+  const bool valid = rtxdi::ValidateSceneB0Binding(
+      context, reinterpret_cast<ID3D11Buffer*>(range.buffer.handle), range.offset,
+      RTXDI_INPUT_SCENE_ROWS, evidence != nullptr ? &native : nullptr);  // NOLINT(performance-no-int-to-ptr)
+  if (evidence != nullptr) {
+    evidence->native_buffer = native.native_buffer;
+    evidence->first_constant = native.first_constant;
+    evidence->constant_count = native.constant_count;
+    evidence->buffer_bytes = native.buffer_bytes;
+    evidence->context_query_result = native.context_query_result;
+    evidence->context_query_available = native.context_query_available;
+    evidence->buffer_available = native.buffer_available;
+  }
+  return valid;
 }
 
 #if defined(FALCOM_NRD_ENABLED)
@@ -793,47 +902,207 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
   using DT = reshade::api::descriptor_type;
   using Microsoft::WRL::ComPtr;
   Rt12DiInputResult result;
+  auto& diagnostics = rtxdi::GetDiagnosticState();
+  const bool diagnostic_enabled = rtxdi::DiagnosticCaptureEnabled(diagnostics);
+  const uint64_t diagnostic_epoch = diagnostic_enabled ? rtxdi::DiagnosticCaptureEpoch(diagnostics) : 0u;
+  rtxdi::DiagnosticReason forced_diagnostic_reason = rtxdi::DiagnosticReason::None;
+  const auto finish = [&]() {
+    if (diagnostic_enabled) {
+      rtxdi::DiagnosticEvent event = {};
+      event.frame = in.frame;
+      event.capture_frame = in.capture_frame;
+      event.owner_generation = g_rt12 && g_rt12->device == device ? g_rt12->generation : 0u;
+      event.settings_identity = in.effective_settings.identity;
+      event.effective_identity = in.effective_settings.identity;
+      event.fence = result.fence;
+      event.scene_slot = in.scene_slot;
+      event.transfer_slot = result.transfer_slot;
+      event.hresult = result.error;
+      event.input_kind = result.validation_input;
+      event.validation_code = result.validation_code;
+      event.input_status = static_cast<uint16_t>(result.status);
+      event.input_stage = static_cast<uint16_t>(result.stage);
+      switch (result.stage) {
+        case rtxdi::InputStage::None:
+        case rtxdi::InputStage::Validate: event.stage = rtxdi::DiagnosticStage::InputValidate; break;
+        case rtxdi::InputStage::Allocate: event.stage = rtxdi::DiagnosticStage::InputAllocate; break;
+        case rtxdi::InputStage::Pack:     event.stage = rtxdi::DiagnosticStage::InputRecord; break;
+        case rtxdi::InputStage::SignalA:  event.stage = rtxdi::DiagnosticStage::InputSignalA; break;
+        case rtxdi::InputStage::Record:
+        case rtxdi::InputStage::Order:    event.stage = rtxdi::DiagnosticStage::InputRecord; break;
+        case rtxdi::InputStage::Submit:   event.stage = rtxdi::DiagnosticStage::InputSubmit; break;
+        case rtxdi::InputStage::WaitB:
+        case rtxdi::InputStage::Ready:    event.stage = rtxdi::DiagnosticStage::InputWaitB; break;
+      }
+      switch (result.status) {
+        case rtxdi::InputStatus::Off:
+        case rtxdi::InputStatus::AlreadyAttempted:
+        case rtxdi::InputStatus::Ready:               event.reason = rtxdi::DiagnosticReason::None; break;
+        case rtxdi::InputStatus::WaitingForScene:     event.reason = rtxdi::DiagnosticReason::MissingInput; break;
+        case rtxdi::InputStatus::MissingInput:        event.reason = rtxdi::DiagnosticReason::MissingInput; break;
+        case rtxdi::InputStatus::SceneBindingChanged: event.reason = rtxdi::DiagnosticReason::None; break;
+        case rtxdi::InputStatus::Busy:                event.reason = rtxdi::DiagnosticReason::Busy; break;
+        case rtxdi::InputStatus::AllocationFailed:    event.reason = rtxdi::DiagnosticReason::ResourceCreateFailed; break;
+        case rtxdi::InputStatus::SubmitFailed:
+          event.reason = result.stage == rtxdi::InputStage::SignalA ? rtxdi::DiagnosticReason::SignalFailed
+                                                                    : rtxdi::DiagnosticReason::SubmitFailed;
+          break;
+        case rtxdi::InputStatus::Quarantined: event.reason = rtxdi::DiagnosticReason::Quarantined; break;
+      }
+      if (forced_diagnostic_reason != rtxdi::DiagnosticReason::None) event.reason = forced_diagnostic_reason;
+      switch (result.stage) {
+        case rtxdi::InputStage::None:
+        case rtxdi::InputStage::Validate: event.operation = rtxdi::DiagnosticOperation::Validate; break;
+        case rtxdi::InputStage::Allocate: event.operation = rtxdi::DiagnosticOperation::Allocate; break;
+        case rtxdi::InputStage::Pack:     event.operation = rtxdi::DiagnosticOperation::Pack; break;
+        case rtxdi::InputStage::SignalA:  event.operation = rtxdi::DiagnosticOperation::SignalA; break;
+        case rtxdi::InputStage::Record:
+        case rtxdi::InputStage::Order:    event.operation = rtxdi::DiagnosticOperation::Execute; break;
+        case rtxdi::InputStage::Submit:   event.operation = rtxdi::DiagnosticOperation::Execute; break;
+        case rtxdi::InputStage::WaitB:
+        case rtxdi::InputStage::Ready:    event.operation = rtxdi::DiagnosticOperation::WaitB; break;
+      }
+      rtxdi::RecordDiagnostic(diagnostics, diagnostic_epoch, event);
+    }
+    return result;
+  };
   try {
-    if (!g_rt12 || g_rt12->device != device || !cmd_list) return result;
+    if (!g_rt12 || g_rt12->device != device || !cmd_list) {
+      result.status = rtxdi::InputStatus::MissingInput;
+      return finish();
+    }
     Rt12State& s = *g_rt12;
-    if (s.failed || s.stuck || s.unfenced_execution || in.scene_slot < 0
-        || in.scene_slot >= static_cast<int32_t>(kRt12Slots)
-        || !rtxdi::ValidSceneLease(s.scene_slot, s.scene_frame, in.scene_slot, in.frame, s.scene_fence, in.scene_fence)
-        || (in.sun && !rtxdi::SceneCoverageSnapshotMatches(s.scene_slot, s.scene_frame, s.scene_generation, s.scene_fence, s.scene_gc_version, s.scene_coverage_slot, s.scene_coverage_frame, s.scene_coverage_generation, s.scene_coverage_fence, s.scene_coverage_gc_version))
-        || reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()) != s.ctx11.Get()) return result;  // NOLINT(performance-no-int-to-ptr)
+    if (s.failed || s.stuck || s.unfenced_execution) {
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::Quarantined;
+      return finish();
+    }
+    if (in.scene_slot < 0 || in.scene_slot >= static_cast<int32_t>(kRt12Slots)) {
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidResource;
+      return finish();
+    }
+    if (!rtxdi::ValidSceneLease(s.scene_slot, s.scene_frame, in.scene_slot, in.frame, s.scene_fence, in.scene_fence)) {
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::StaleFrame;
+      return finish();
+    }
+    if (in.sun && !rtxdi::SceneCoverageSnapshotMatches(s.scene_slot, s.scene_frame, s.scene_generation, s.scene_fence, s.scene_gc_version, s.scene_coverage_slot, s.scene_coverage_frame, s.scene_coverage_generation, s.scene_coverage_fence, s.scene_coverage_gc_version)) {
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidRange;
+      return finish();
+    }
+    if (reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()) != s.ctx11.Get()) {  // NOLINT(performance-no-int-to-ptr)
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::CommandMismatch;
+      return finish();
+    }
 #if defined(FALCOM_NRD_ENABLED)
     ProcessNrdProbeReadbacks(s);
 #endif
     auto& transfer = s.di_transfer;
     if (rtxdi::TransferAttemptDuplicate(transfer.attempted_frame, transfer.attempted_generation, in.frame, s.generation)) {
       result.status = rtxdi::InputStatus::AlreadyAttempted;
-      return result;
+      return finish();
     }
     transfer.attempted_frame = in.frame;
     transfer.attempted_generation = s.generation;
     transfer.input_frame = UINT32_MAX;
-    if (!in.width || !in.height) return result;
+    if (!in.width || !in.height) {
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidRange;
+      return finish();
+    }
     ComPtr<ID3D11Buffer> current_scene;
     s.ctx11->PSGetConstantBuffers(0u, 1u, &current_scene);
     reshade::api::buffer_range scene_range = {};
-    if (!CurrentDiSceneRange(device, cmd_list, in, current_scene.Get(), &scene_range)
-        || !ValidateBoundDiScene(s.ctx11.Get(), scene_range)) {
+    rtxdi::SceneRangeEvidence scene_evidence = {};
+    DiSceneNativeBindingEvidence native_evidence = {};
+    const bool scene_range_valid = CurrentDiSceneRange(device, cmd_list, in, current_scene.Get(), &scene_range,
+                                                       diagnostic_enabled ? &scene_evidence : nullptr);
+    const bool native_range_valid = scene_range_valid
+                                    && ValidateBoundDiScene(s.ctx11.Get(), scene_range,
+                                                            diagnostic_enabled ? &native_evidence : nullptr);
+    if (!scene_range_valid || !native_range_valid) {
       result.status = rtxdi::InputStatus::SceneBindingChanged;
-      return result;
+      if (diagnostic_enabled) {
+        RecordDiSceneEvidence(diagnostics, diagnostic_epoch, rtxdi::DiagnosticStage::InputValidate,
+                              s.generation, in.frame, in.scene_slot, -1, scene_evidence, native_evidence);
+      }
+      return finish();
     }
-    if (!ValidateDiTexture(in.depth, in.width, in.height, Rt12DiTextureKind::Float)
-        || !ValidateDiTexture(in.normal, in.width, in.height, Rt12DiTextureKind::Uint4)) return result;
-    const bool motion_available = in.motion.handle != 0u
-                                  && ValidateDiTexture(in.motion, in.width, in.height, Rt12DiTextureKind::Motion);
-    if (in.local && (!ValidateDiTexture(in.color, in.width, in.height, Rt12DiTextureKind::Float) || !ValidateDiTexture(in.mrt1, in.width, in.height, Rt12DiTextureKind::Uint4) || !ValidateDiTexture(in.mrt2, in.width, in.height, Rt12DiTextureKind::Uint2))) return result;
+    if (diagnostic_enabled) {
+      RecordDiSceneEvidence(diagnostics, diagnostic_epoch, rtxdi::DiagnosticStage::InputValidate,
+                            s.generation, in.frame, in.scene_slot, -1, scene_evidence, native_evidence, true);
+    }
+    if (!ValidateDiTexture(in.depth, in.width, in.height, Rt12DiTextureKind::Float)) {
+      result.validation_input = rtxdi::DiagnosticInputKind::Depth;
+      result.validation_code = rtxdi::DiagnosticValidationCode::InvalidTextureView;
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidResource;
+      return finish();
+    }
+    if (!ValidateDiTexture(in.normal, in.width, in.height, Rt12DiTextureKind::Uint4)) {
+      result.validation_input = rtxdi::DiagnosticInputKind::Normal;
+      result.validation_code = rtxdi::DiagnosticValidationCode::InvalidTextureView;
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidResource;
+      return finish();
+    }
+    const bool motion_valid = in.motion.handle != 0u
+                              && ValidateDiTexture(in.motion, in.width, in.height, Rt12DiTextureKind::Motion);
+    const bool motion_available = motion_valid;
+    if (in.motion.handle && !motion_valid) {
+      result.validation_input = rtxdi::DiagnosticInputKind::Motion;
+      result.validation_code = rtxdi::DiagnosticValidationCode::OptionalFallback;
+    }
+    if (in.local && !ValidateDiTexture(in.color, in.width, in.height, Rt12DiTextureKind::Float)) {
+      result.validation_input = rtxdi::DiagnosticInputKind::Color;
+      result.validation_code = rtxdi::DiagnosticValidationCode::InvalidTextureView;
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidResource;
+      return finish();
+    }
+    if (in.local && !ValidateDiTexture(in.mrt1, in.width, in.height, Rt12DiTextureKind::Uint4)) {
+      result.validation_input = rtxdi::DiagnosticInputKind::Mrt1;
+      result.validation_code = rtxdi::DiagnosticValidationCode::InvalidTextureView;
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidResource;
+      return finish();
+    }
+    if (in.local && !ValidateDiTexture(in.mrt2, in.width, in.height, Rt12DiTextureKind::Uint2)) {
+      result.validation_input = rtxdi::DiagnosticInputKind::Mrt2;
+      result.validation_code = rtxdi::DiagnosticValidationCode::InvalidTextureView;
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidResource;
+      return finish();
+    }
     rtxdi::StructuredInputRange lights = {}, tiles = {}, deferred = {};
-    if (in.local && ((in.lights.handle && !rtxdi::ValidateStructuredView(reinterpret_cast<ID3D11ShaderResourceView*>(in.lights.handle), RTXDI_INPUT_LIGHT_STRIDE, &lights)) || !rtxdi::ValidateStructuredView(reinterpret_cast<ID3D11ShaderResourceView*>(in.tiles.handle), RTXDI_INPUT_TILE_STRIDE, &tiles) || !rtxdi::ValidateStructuredView(reinterpret_cast<ID3D11ShaderResourceView*>(in.deferred.handle), RTXDI_INPUT_DEFERRED_STRIDE, &deferred))) return result;  // NOLINT(performance-no-int-to-ptr)
-    if (!rtxdi::MakeInputLayout(in.width, in.height, motion_available, in.local, lights.element_count, tiles.element_count, deferred.element_count, &result.layout)) return result;
+    if (in.local && in.lights.handle
+        && !rtxdi::ValidateStructuredView(reinterpret_cast<ID3D11ShaderResourceView*>(in.lights.handle),
+                                          RTXDI_INPUT_LIGHT_STRIDE, &lights)) {  // NOLINT(performance-no-int-to-ptr)
+      result.validation_input = rtxdi::DiagnosticInputKind::Lights;
+      result.validation_code = rtxdi::DiagnosticValidationCode::InvalidStructuredView;
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidResource;
+      return finish();
+    }
+    if (in.local
+        && !rtxdi::ValidateStructuredView(reinterpret_cast<ID3D11ShaderResourceView*>(in.tiles.handle),
+                                          RTXDI_INPUT_TILE_STRIDE, &tiles)) {  // NOLINT(performance-no-int-to-ptr)
+      result.validation_input = rtxdi::DiagnosticInputKind::Tiles;
+      result.validation_code = rtxdi::DiagnosticValidationCode::InvalidStructuredView;
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidResource;
+      return finish();
+    }
+    if (in.local
+        && !rtxdi::ValidateStructuredView(reinterpret_cast<ID3D11ShaderResourceView*>(in.deferred.handle),
+                                          RTXDI_INPUT_DEFERRED_STRIDE, &deferred)) {  // NOLINT(performance-no-int-to-ptr)
+      result.validation_input = rtxdi::DiagnosticInputKind::Deferred;
+      result.validation_code = rtxdi::DiagnosticValidationCode::InvalidStructuredView;
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidResource;
+      return finish();
+    }
+    if (!rtxdi::MakeInputLayout(in.width, in.height, motion_available, in.local, lights.element_count,
+                                tiles.element_count, deferred.element_count, &result.layout)) {
+      result.validation_input = rtxdi::DiagnosticInputKind::Layout;
+      result.validation_code = rtxdi::DiagnosticValidationCode::LayoutRejected;
+      forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidRange;
+      return finish();
+    }
     const uint32_t k = transfer.next_slot;
     Rt12DiTransferSlot& slot = transfer.slots[k];
     if (!rtxdi::TransferSlotAvailable((std::max)(slot.fence_value, slot.di_fence_value), Rt12CompletedValue(s))) {
       result.status = rtxdi::InputStatus::Busy;
-      return result;
+      return finish();
     }
     const uint64_t consumer_completed = (s.fence11 ? s.fence11->GetCompletedValue() : 0u);
     if (!rtxdi::CanReuseDiOutput(slot.output_staged
@@ -843,7 +1112,24 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                                  ,
                                  slot.output_c_fence, consumer_completed)) {
       result.status = rtxdi::InputStatus::Busy;
-      return result;
+      return finish();
+    }
+    if (diagnostic_enabled && (slot.output_staged
+#if defined(FALCOM_NRD_ENABLED)
+                               || slot.nrd_diffuse_staged
+#endif
+                               )) {
+      rtxdi::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                              {.owner_generation = s.generation,
+                               .frame = in.frame,
+                               .capture_frame = slot.output_frame,
+                               .fence = slot.output_c_fence,
+                               .value0 = slot.output_b_fence,
+                               .scene_slot = slot.output_scene_slot,
+                               .transfer_slot = static_cast<int32_t>(k),
+                               .stage = rtxdi::DiagnosticStage::SlotConsumer,
+                               .reason = rtxdi::DiagnosticReason::None,
+                               .operation = rtxdi::DiagnosticOperation::Retire});
     }
     slot.output_staged = false;
 #if defined(FALCOM_NRD_ENABLED)
@@ -863,19 +1149,19 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       result.status = rtxdi::InputStatus::Quarantined;
       result.error = E_FAIL;
       UpdatePanel([](Rt12Panel& p) { p.stuck = true; });
-      return result;
+      return finish();
     }
     if (in.local && !EnsureRt12DiResources(s, true, in.width, in.height, in.effective_settings)) {
       result.status = rtxdi::InputStatus::AllocationFailed;
       result.error = E_FAIL;
-      return result;
+      return finish();
     }
     // Each slot is replaced only after its B fence completes.
     if (!slot.allocator || slot.width != in.width || slot.height != in.height || slot.local != in.local || slot.sun != in.sun
         || slot.motion_available != motion_available) {
       if (transfer.configuration_generation == UINT64_MAX) {
         result.status = rtxdi::InputStatus::AllocationFailed;
-        return result;
+        return finish();
       }
       Rt12DiTransferSlot candidate;
       auto destroy_candidate = [&](Rt12DiTransferSlot*) {
@@ -1009,7 +1295,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       if (!ok) {
         result.status = rtxdi::InputStatus::AllocationFailed;
         result.error = FAILED(allocation_error) ? allocation_error : E_FAIL;
-        return result;
+        return finish();
       }
       for (Rt12Shared* shared : {
                &slot.depth,
@@ -1059,7 +1345,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       if (!rtxdi::CheckedSunResultBytes(in.width, in.height, &output_bytes)) {
         result.status = rtxdi::InputStatus::AllocationFailed;
         result.error = E_INVALIDARG;
-        return result;
+        return finish();
       }
       const HRESULT output_hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT,
                                                  output_bytes, D3D12_RESOURCE_STATE_COMMON,
@@ -1067,7 +1353,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       if (FAILED(output_hr)) {
         result.status = rtxdi::InputStatus::AllocationFailed;
         result.error = output_hr;
-        return result;
+        return finish();
       }
     }
     if (!transfer.unpack_root || !transfer.unpack_pso) {
@@ -1107,7 +1393,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       if (FAILED(hr)) {
         result.status = rtxdi::InputStatus::AllocationFailed;
         result.error = hr;
-        return result;
+        return finish();
       }
       transfer.unpack_root = std::move(root);
       transfer.unpack_pso = std::move(pso);
@@ -1170,7 +1456,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       if (FAILED(hr)) {
         result.status = rtxdi::InputStatus::AllocationFailed;
         result.error = hr;
-        return result;
+        return finish();
       }
       transfer.sun_root = std::move(root);
       transfer.sun_pso = std::move(pso);
@@ -1184,7 +1470,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       if (FAILED(hr)) {
         result.status = rtxdi::InputStatus::AllocationFailed;
         result.error = hr;
-        return result;
+        return finish();
       }
       transfer.list = std::move(list);
     }
@@ -1193,18 +1479,35 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
         if (!renodx::utils::gpu_fence::QueueWait(s.ctx11.Get(), s.fence12.get(), slot.fence_value)) {
           result.status = rtxdi::InputStatus::SubmitFailed;
           result.error = E_FAIL;
-          return result;
+          return finish();
         }
       } catch (...) {
         result.status = rtxdi::InputStatus::SubmitFailed;
         result.error = E_FAIL;
-        return result;
+        return finish();
       }
     }
-    if (!CurrentDiSceneRange(device, cmd_list, in, current_scene.Get(), &scene_range)
-        || !ValidateBoundDiScene(s.ctx11.Get(), scene_range)) {
+    rtxdi::SceneRangeEvidence allocation_scene_evidence = {};
+    DiSceneNativeBindingEvidence allocation_native_evidence = {};
+    const bool allocation_scene_valid = CurrentDiSceneRange(
+        device, cmd_list, in, current_scene.Get(), &scene_range,
+        diagnostic_enabled ? &allocation_scene_evidence : nullptr);
+    const bool allocation_native_valid = allocation_scene_valid
+                                         && ValidateBoundDiScene(s.ctx11.Get(), scene_range,
+                                                                 diagnostic_enabled ? &allocation_native_evidence : nullptr);
+    if (!allocation_scene_valid || !allocation_native_valid) {
       result.status = rtxdi::InputStatus::SceneBindingChanged;
-      return result;
+      if (diagnostic_enabled) {
+        RecordDiSceneEvidence(diagnostics, diagnostic_epoch, rtxdi::DiagnosticStage::InputAllocate,
+                              s.generation, in.frame, in.scene_slot, static_cast<int32_t>(k),
+                              allocation_scene_evidence, allocation_native_evidence);
+      }
+      return finish();
+    }
+    if (diagnostic_enabled) {
+      RecordDiSceneEvidence(diagnostics, diagnostic_epoch, rtxdi::DiagnosticStage::InputAllocate,
+                            s.generation, in.frame, in.scene_slot, static_cast<int32_t>(k),
+                            allocation_scene_evidence, allocation_native_evidence, true);
     }
 #if defined(FALCOM_NRD_ENABLED)
     CaptureNrdCameraRows(reinterpret_cast<uintptr_t>(device), in, scene_range, s.generation, &slot.nrd.camera);
@@ -1276,12 +1579,29 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       FailSession(s, Rt12Reason::SubmitFailed, "rtxdi D3D11 signal A");
       result.status = rtxdi::InputStatus::SubmitFailed;
       result.error = E_FAIL;
-      return result;
+      return finish();
     }
-    if (!CurrentDiSceneRange(device, cmd_list, in, slot.source_scene.Get(), &scene_range)
-        || !ValidateBoundDiScene(s.ctx11.Get(), scene_range)) {
+    rtxdi::SceneRangeEvidence signal_scene_evidence = {};
+    DiSceneNativeBindingEvidence signal_native_evidence = {};
+    const bool signal_scene_valid = CurrentDiSceneRange(
+        device, cmd_list, in, slot.source_scene.Get(), &scene_range,
+        diagnostic_enabled ? &signal_scene_evidence : nullptr);
+    const bool signal_native_valid = signal_scene_valid
+                                     && ValidateBoundDiScene(s.ctx11.Get(), scene_range,
+                                                             diagnostic_enabled ? &signal_native_evidence : nullptr);
+    if (!signal_scene_valid || !signal_native_valid) {
       result.status = rtxdi::InputStatus::SceneBindingChanged;
-      return result;
+      if (diagnostic_enabled) {
+        RecordDiSceneEvidence(diagnostics, diagnostic_epoch, rtxdi::DiagnosticStage::InputSignalA,
+                              s.generation, in.frame, in.scene_slot, static_cast<int32_t>(k),
+                              signal_scene_evidence, signal_native_evidence);
+      }
+      return finish();
+    }
+    if (diagnostic_enabled) {
+      RecordDiSceneEvidence(diagnostics, diagnostic_epoch, rtxdi::DiagnosticStage::InputSignalA,
+                            s.generation, in.frame, in.scene_slot, static_cast<int32_t>(k),
+                            signal_scene_evidence, signal_native_evidence, true);
     }
     result.stage = rtxdi::InputStage::Record;
     HRESULT hr = slot.allocator->Reset();
@@ -1291,7 +1611,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     if (FAILED(hr)) {
       result.status = rtxdi::InputStatus::SubmitFailed;
       result.error = hr;
-      return result;
+      return finish();
     }
     ID3D12Device5* native = s.device12.Get();
     const auto cpu_at = [&](uint32_t index) {
@@ -1461,7 +1781,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     if (FAILED(hr)) {
       result.status = rtxdi::InputStatus::SubmitFailed;
       result.error = hr;
-      return result;
+      return finish();
     }
     result.stage = rtxdi::InputStage::Order;
     bool ordered = false;
@@ -1476,7 +1796,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     if (!ordered) {
       result.status = rtxdi::InputStatus::SubmitFailed;
       result.error = E_FAIL;
-      return result;
+      return finish();
     }
     ID3D12CommandList* lists[] = {transfer.list.Get()};
     uint64_t b = renodx::utils::gpu_fence::NO_SIGNAL;
@@ -1528,24 +1848,43 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       result.error = E_FAIL;
       UpdatePanel([](Rt12Panel& p) { p.stuck = true; });
       FailSession(s, Rt12Reason::SubmitFailed, "rtxdi input handoff");
-      return result;
+      return finish();
     }
     NoteRt12Signal(s, b);
-    return result;
+    return finish();
   } catch (...) {
     if (result.status != rtxdi::InputStatus::Ready && result.status != rtxdi::InputStatus::Quarantined) {
       result.status = rtxdi::InputStatus::SubmitFailed;
       result.error = E_FAIL;
     }
-    return result;
+    return finish();
   }
 }
 
 inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, reshade::api::command_list* cmd_list,
                                               const Rt12DiInputViews& in, const Rt12DiInputResult& input) {
   using Microsoft::WRL::ComPtr;
+  auto& diagnostics = rtxdi::GetDiagnosticState();
+  const bool diagnostic_enabled = rtxdi::DiagnosticCaptureEnabled(diagnostics);
+  const uint64_t diagnostic_epoch = diagnostic_enabled ? rtxdi::DiagnosticCaptureEpoch(diagnostics) : 0u;
   if (!g_rt12 || g_rt12->device != device || !cmd_list || !in.local || input.status != rtxdi::InputStatus::Ready
       || input.transfer_slot < 0 || input.transfer_slot >= static_cast<int32_t>(kRt12Slots)) {
+    if (diagnostic_enabled) {
+      rtxdi::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                              {.owner_generation = g_rt12 && g_rt12->device == device ? g_rt12->generation : 0u,
+                               .frame = in.frame,
+                               .capture_frame = in.capture_frame,
+                               .settings_identity = in.effective_settings.identity,
+                               .hresult = input.error,
+                               .scene_slot = in.scene_slot,
+                               .transfer_slot = input.transfer_slot,
+                               .stage = rtxdi::DiagnosticStage::DiPreflight,
+                               .reason = input.status == rtxdi::InputStatus::Busy ? rtxdi::DiagnosticReason::Busy
+                                         : input.status == rtxdi::InputStatus::SceneBindingChanged
+                                             ? rtxdi::DiagnosticReason::NativeB0Mismatch
+                                             : rtxdi::DiagnosticReason::MissingInput,
+                               .operation = rtxdi::DiagnosticOperation::Validate});
+    }
     return rtxdi::DiStatus::WaitingInput;
   }
   Rt12State& s = *g_rt12;
@@ -1579,52 +1918,84 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   uint32_t temporal_source_index = UINT32_MAX;
   uint32_t temporal_output_index = UINT32_MAX;
   const auto publish = [&](rtxdi::DiStatus status, int32_t error = 0, uint64_t fence = 0u) {
-    std::unique_lock lock(rtxdi::g_di.mutex);
-    rtxdi::g_di.snapshot = {.status = status,
-                            .frame = in.frame,
-                            .configuration_generation = s.di.configuration_generation,
-                            .settings_identity = s.di.settings_identity,
-                            .fence = fence,
-                            .local_candidates = in.effective_settings.local_candidates,
-                            .spatial_samples = in.effective_settings.spatial_samples,
-                            .spatial_disocclusion = in.effective_settings.spatial_disocclusion,
-                            .history_length = in.effective_settings.history_length,
-                            .temporal_enabled = in.effective_settings.temporal_enabled,
-                            .spatial_enabled = in.effective_settings.spatial_enabled,
-                            .relax_selected = in.effective_settings.relax_diffuse,
-                            .scene_slot = in.scene_slot,
-                            .transfer_slot = input.transfer_slot,
-                            .spatial_ran = spatial_ran,
-                            .temporal_ran = temporal_ran,
-                            .history_valid = history_valid,
-                            .temporal_source_index = temporal_source_index,
-                            .temporal_output_index = temporal_output_index,
-                            .spatial_source_index = spatial_source_index,
-                            .spatial_output_index = spatial_output_index,
-                            .output_frame = slot.output_frame,
-                            .output_width = slot.output_width,
-                            .output_height = slot.output_height,
-                            .output_owner_generation = slot.output_owner_generation,
-                            .output_configuration_generation = slot.output_configuration_generation,
-                            .output_fence_b = slot.output_b_fence,
-                            .output_fence_c = slot.output_c_fence,
-                            .output_scene_slot = slot.output_scene_slot,
-                            .output_transfer_slot = slot.output_transfer_slot,
-                            .output_staged = slot.output_staged,
+    {
+      std::unique_lock lock(rtxdi::g_di.mutex);
+      rtxdi::g_di.snapshot = {.status = status,
+                              .frame = in.frame,
+                              .configuration_generation = s.di.configuration_generation,
+                              .settings_identity = s.di.settings_identity,
+                              .fence = fence,
+                              .local_candidates = in.effective_settings.local_candidates,
+                              .spatial_samples = in.effective_settings.spatial_samples,
+                              .spatial_disocclusion = in.effective_settings.spatial_disocclusion,
+                              .history_length = in.effective_settings.history_length,
+                              .temporal_enabled = in.effective_settings.temporal_enabled,
+                              .spatial_enabled = in.effective_settings.spatial_enabled,
+                              .relax_selected = in.effective_settings.relax_diffuse,
+                              .scene_slot = in.scene_slot,
+                              .transfer_slot = input.transfer_slot,
+                              .spatial_ran = spatial_ran,
+                              .temporal_ran = temporal_ran,
+                              .history_valid = history_valid,
+                              .temporal_source_index = temporal_source_index,
+                              .temporal_output_index = temporal_output_index,
+                              .spatial_source_index = spatial_source_index,
+                              .spatial_output_index = spatial_output_index,
+                              .output_frame = slot.output_frame,
+                              .output_width = slot.output_width,
+                              .output_height = slot.output_height,
+                              .output_owner_generation = slot.output_owner_generation,
+                              .output_configuration_generation = slot.output_configuration_generation,
+                              .output_fence_b = slot.output_b_fence,
+                              .output_fence_c = slot.output_c_fence,
+                              .output_scene_slot = slot.output_scene_slot,
+                              .output_transfer_slot = slot.output_transfer_slot,
+                              .output_staged = slot.output_staged,
 #if defined(FALCOM_NRD_ENABLED)
-                            .nrd_diffuse_staged = slot.nrd_diffuse_staged,
-                            .nrd_diffuse_bound = false,
-                            .nrd_diffuse_lighting_draw_seen = false,
-                            .nrd_diffuse_frame = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.frame : UINT32_MAX,
-                            .nrd_diffuse_transfer_slot = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.transfer_slot : -1,
-                            .nrd_diffuse_fence_b = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.producer_fence_b : 0u,
+                              .nrd_diffuse_staged = slot.nrd_diffuse_staged,
+                              .nrd_diffuse_bound = false,
+                              .nrd_diffuse_lighting_draw_seen = false,
+                              .nrd_diffuse_frame = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.frame : UINT32_MAX,
+                              .nrd_diffuse_transfer_slot = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.transfer_slot : -1,
+                              .nrd_diffuse_fence_b = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.producer_fence_b : 0u,
 #endif
-                            .output_bound = false,
-                            .output_bound_frame = UINT32_MAX,
-                            .output_bound_transfer_slot = -1,
-                            .output_bound_fence_b = 0u,
-                            .lighting_draw_seen = false,
-                            .error = error};
+                              .output_bound = false,
+                              .output_bound_frame = UINT32_MAX,
+                              .output_bound_transfer_slot = -1,
+                              .output_bound_fence_b = 0u,
+                              .lighting_draw_seen = false,
+                              .error = error};
+    }
+    if (diagnostic_enabled) {
+      rtxdi::DiagnosticReason reason = rtxdi::DiagnosticReason::None;
+      switch (status) {
+        case rtxdi::DiStatus::Off:
+        case rtxdi::DiStatus::Submitted:    reason = rtxdi::DiagnosticReason::None; break;
+        case rtxdi::DiStatus::WaitingInput: reason = rtxdi::DiagnosticReason::MissingInput; break;
+        case rtxdi::DiStatus::ZeroLights:   reason = rtxdi::DiagnosticReason::MissingInput; break;
+        case rtxdi::DiStatus::Busy:         reason = rtxdi::DiagnosticReason::Busy; break;
+        case rtxdi::DiStatus::Failed:       reason = error == E_INVALIDARG ? rtxdi::DiagnosticReason::ConfigurationMismatch
+                                                                     : rtxdi::DiagnosticReason::SubmitFailed;
+        case rtxdi::DiStatus::Quarantined: reason = rtxdi::DiagnosticReason::Quarantined; break;
+      }
+      rtxdi::RecordDiagnostic(diagnostics, diagnostic_epoch,
+                              {.owner_generation = s.generation,
+                               .frame = in.frame,
+                               .capture_frame = in.capture_frame,
+                               .settings_identity = in.effective_settings.identity,
+                               .effective_identity = s.di.settings_identity,
+                               .fence = fence,
+                               .value0 = static_cast<uint64_t>(status),
+                               .value1 = static_cast<uint64_t>(input.status),
+                               .hresult = error,
+                               .scene_slot = in.scene_slot,
+                               .transfer_slot = input.transfer_slot,
+                               .stage = rtxdi::DiagnosticStage::DiPreflight,
+                               .reason = reason,
+                               .operation = status == rtxdi::DiStatus::Submitted
+                                                ? rtxdi::DiagnosticOperation::Dispatch
+                                                : rtxdi::DiagnosticOperation::Validate});
+    }
     return status;
   };
   if (s.failed || s.stuck || s.unfenced_execution) return publish(rtxdi::DiStatus::Quarantined, E_FAIL);
@@ -1670,9 +2041,25 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   ComPtr<ID3D11Buffer> current_scene;
   s.ctx11->PSGetConstantBuffers(0u, 1u, &current_scene);
   reshade::api::buffer_range scene_range = {};
-  if (!CurrentDiSceneRange(device, cmd_list, in, current_scene.Get(), &scene_range)
-      || !ValidateBoundDiScene(s.ctx11.Get(), scene_range)) {
+  rtxdi::SceneRangeEvidence scene_evidence = {};
+  DiSceneNativeBindingEvidence native_evidence = {};
+  const bool scene_range_valid = CurrentDiSceneRange(device, cmd_list, in, current_scene.Get(), &scene_range,
+                                                     diagnostic_enabled ? &scene_evidence : nullptr);
+  const bool native_range_valid = scene_range_valid
+                                  && ValidateBoundDiScene(s.ctx11.Get(), scene_range,
+                                                          diagnostic_enabled ? &native_evidence : nullptr);
+  if (!scene_range_valid || !native_range_valid) {
+    if (diagnostic_enabled) {
+      RecordDiSceneEvidence(diagnostics, diagnostic_epoch, rtxdi::DiagnosticStage::DiPreflight,
+                            s.generation, in.frame, in.scene_slot, input.transfer_slot,
+                            scene_evidence, native_evidence);
+    }
     return publish(rtxdi::DiStatus::WaitingInput, E_FAIL);
+  }
+  if (diagnostic_enabled) {
+    RecordDiSceneEvidence(diagnostics, diagnostic_epoch, rtxdi::DiagnosticStage::DiPreflight,
+                          s.generation, in.frame, in.scene_slot, input.transfer_slot,
+                          scene_evidence, native_evidence, true);
   }
 
   const uint32_t light_count = input.layout.lights_copied;

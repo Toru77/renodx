@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "rtxdi_diagnostics.hpp"
 #include "rtxdi_input_layout.h"
 #include "rtxdi_surface_layout.h"
 
@@ -314,17 +315,80 @@ inline bool CanPromoteSceneBinding(const SceneRangeSnapshot& binding, uint64_t f
 enum class SceneBindingStatus { Ready,
                                 SceneBindingChanged };
 
+struct SceneBindingEvidence {
+  SceneRangeSnapshot promoted = {};
+  SceneRangeSnapshot current = {};
+  uint64_t buffer_bytes = 0u;
+  uint64_t normalized_size = 0u;
+  DiagnosticReason reason = DiagnosticReason::None;
+  bool normalized_valid = false;
+};
+
+struct SceneRangeEvidence {
+  SceneBindingEvidence binding = {};
+  uint64_t expected_buffer = 0u;
+  bool entry_found = false;
+  bool resource_desc_valid = false;
+  bool resource_buffer = false;
+};
+
 // Call with a coherent tracker snapshot, then recheck the native buffer before recording a pack.
 inline SceneBindingStatus CheckPromotedSceneBinding(const SceneRangeSnapshot& promoted, const SceneRangeSnapshot& current,
-                                                    uint64_t frame, uintptr_t command, uint64_t buffer_bytes) {
+                                                    uint64_t frame, uintptr_t command, uint64_t buffer_bytes,
+                                                    SceneBindingEvidence* evidence = nullptr) {
   uint64_t current_size = 0u;
-  if (!CanPromoteSceneBinding(promoted, frame, command, true) || !CanPromoteSceneBinding(current, frame, command, true)
-      || promoted.sequence != current.sequence || promoted.reset_generation != current.reset_generation
-      || promoted.buffer != current.buffer || promoted.offset != current.offset
-      || !NormalizeSceneInputRange(buffer_bytes, current.offset, current.size, &current_size)
-      || promoted.size != current_size) {
+  if (evidence != nullptr) {
+    evidence->promoted = promoted;
+    evidence->current = current;
+    evidence->buffer_bytes = buffer_bytes;
+  }
+  const auto binding_reason = [&](const SceneRangeSnapshot& binding) {
+    if (!binding.known) return DiagnosticReason::UnknownBinding;
+    if (!binding.live) return DiagnosticReason::NonliveBinding;
+    if (binding.frame != frame) return DiagnosticReason::StaleFrame;
+    if (binding.command == 0u || binding.command != command) return DiagnosticReason::CommandMismatch;
+    return DiagnosticReason::MissingEntry;
+  };
+  if (!CanPromoteSceneBinding(promoted, frame, command, true)) {
+    if (evidence != nullptr) evidence->reason = binding_reason(promoted);
     return SceneBindingStatus::SceneBindingChanged;
   }
+  if (!CanPromoteSceneBinding(current, frame, command, true)) {
+    if (evidence != nullptr) evidence->reason = binding_reason(current);
+    return SceneBindingStatus::SceneBindingChanged;
+  }
+  if (promoted.sequence != current.sequence) {
+    if (evidence != nullptr) evidence->reason = DiagnosticReason::SequenceMismatch;
+    return SceneBindingStatus::SceneBindingChanged;
+  }
+  if (promoted.reset_generation != current.reset_generation) {
+    if (evidence != nullptr) evidence->reason = DiagnosticReason::ResetMismatch;
+    return SceneBindingStatus::SceneBindingChanged;
+  }
+  if (promoted.buffer != current.buffer) {
+    if (evidence != nullptr) evidence->reason = DiagnosticReason::BufferMismatch;
+    return SceneBindingStatus::SceneBindingChanged;
+  }
+  if (promoted.offset != current.offset) {
+    if (evidence != nullptr) evidence->reason = DiagnosticReason::OffsetMismatch;
+    return SceneBindingStatus::SceneBindingChanged;
+  }
+  if (!NormalizeSceneInputRange(buffer_bytes, current.offset, current.size, &current_size)) {
+    if (evidence != nullptr) {
+      evidence->reason = DiagnosticReason::InvalidRange;
+      evidence->normalized_valid = false;
+    }
+    return SceneBindingStatus::SceneBindingChanged;
+  }
+  if (evidence != nullptr) {
+    evidence->normalized_valid = true;
+    evidence->normalized_size = current_size;
+  }
+  if (promoted.size != current_size) {
+    if (evidence != nullptr) evidence->reason = DiagnosticReason::NormalizedSizeMismatch;
+    return SceneBindingStatus::SceneBindingChanged;
+  }
+  if (evidence != nullptr) evidence->reason = DiagnosticReason::None;
   return SceneBindingStatus::Ready;
 }
 

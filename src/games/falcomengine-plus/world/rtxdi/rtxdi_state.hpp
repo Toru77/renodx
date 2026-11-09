@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <shared_mutex>
 
+#include "rtxdi_diagnostics.hpp"
+
 namespace falcom_world::rtxdi {
 
 inline float g_local_requested = 0.f;
@@ -20,6 +22,7 @@ inline float g_temporal_normal_threshold = 0.5f;
 inline float g_spatial_depth_threshold = 0.05f;
 inline float g_spatial_normal_threshold = 0.9f;
 inline float g_diffuse_denoiser = 1.f;
+inline float g_debug_logging = 0.f;
 inline float g_relax_diffuse_history = 30.f;
 inline float g_relax_fast_history = 6.f;
 inline float g_relax_prepass_radius = 30.f;
