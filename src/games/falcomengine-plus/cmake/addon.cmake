@@ -23,11 +23,18 @@ target_sources(falcom-rtxdi-bridge PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_initial_di.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_spatial_di.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_temporal_di.h"
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_probe.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/rtxdi_raw_guard_contract.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/rtxdi_lighting_consumer_contract.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_reconstruct.h")
+target_sources(falcomengine-plus PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_prep.h")
 
+option(FALCOM_NRD_ENABLED "Enable the private NRD path in falcomengine-plus" OFF)
 set(FALCOM_NRD_SDK_ROOT "" CACHE PATH "Optional NRD 4.17.1 SDK root for the private D3D12 adapter harness")
+if(FALCOM_NRD_ENABLED AND NOT FALCOM_NRD_SDK_ROOT)
+  message(FATAL_ERROR "FALCOM_NRD_ENABLED requires FALCOM_NRD_SDK_ROOT")
+endif()
 if(FALCOM_NRD_SDK_ROOT)
   if(NOT EXISTS "${FALCOM_NRD_SDK_ROOT}/include/NRD.h"
       OR NOT EXISTS "${FALCOM_NRD_SDK_ROOT}/lib/Debug/NRD.lib"
@@ -56,4 +63,12 @@ if(FALCOM_NRD_SDK_ROOT)
 
   add_executable(falcom-nrd-bridge EXCLUDE_FROM_ALL "${ADDON_PATH}/world/rt12/tests/nrd_d3d12_bridge.cpp")
   target_link_libraries(falcom-nrd-bridge PRIVATE d3d12 dxgi falcom-nrd-sdk)
+  target_include_directories(falcom-nrd-bridge PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed")
+  target_sources(falcom-nrd-bridge PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_probe.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_prep.h")
+  if(FALCOM_NRD_ENABLED)
+    target_link_libraries(${ADDON} PRIVATE falcom-nrd-sdk)
+    target_compile_definitions(${ADDON} PRIVATE FALCOM_NRD_ENABLED=1)
+  endif()
 endif()

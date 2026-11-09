@@ -23,13 +23,18 @@
 
 #include <include/reshade.hpp>
 
-#include "../world_state.hpp"
 #include "../bvh/perf_gate.hpp"
+#include "../rtxdi/rtxdi_input_validation.hpp"
+#include "../world_state.hpp"
 
 namespace falcom_world {
 
 inline constexpr uint64_t kTrackedCbMaxBytes = 1536u;
-inline constexpr uint32_t kTrackedCbBytes = 768u;  // wind sway reads cb_scene up to byte 752 (windForce_g)
+#if defined(FALCOM_NRD_ENABLED)
+inline constexpr uint32_t kTrackedCbBytes = 1536u;  // RTXDI camera uses the exact 96-row scene CB range
+#else
+inline constexpr uint32_t kTrackedCbBytes = 768u;
+#endif
 inline constexpr uint32_t kCbEpochInit = UINT32_MAX;  // mirror holds only the creation data; valid until the first tracked write
 
 struct TrackedCb {
@@ -37,6 +42,7 @@ struct TrackedCb {
   uint64_t size = 0u;
   uint8_t* mapped = nullptr;
   uint64_t valid_bytes = 0u;  // contiguous prefix of the buffer the mirror holds
+  uint64_t write_sequence = 0u;
   uint32_t epoch = 0u;
 };
 
@@ -53,6 +59,23 @@ inline CbValueTracker& CbTracker() {
   static CbValueTracker tracker;
   return tracker;
 }
+
+#if defined(FALCOM_NRD_ENABLED)
+inline bool SeedInitialSceneCpuMirror(uintptr_t device, uint64_t buffer, uint64_t offset, uint64_t size) {
+  if (offset != 0u || size != RTXDI_SURFACE_SCENE_ROW_COUNT * 16u) return false;
+  std::array<uint8_t, kTrackedCbBytes> initial = {};
+  {
+    auto& tracker = CbTracker();
+    std::lock_guard lock(tracker.mutex);
+    const auto found = tracker.buffers.find(buffer);
+    if (found == tracker.buffers.end() || found->second.epoch != kCbEpochInit
+        || found->second.size != size || found->second.valid_bytes < size) return false;
+    initial = found->second.bytes;
+  }
+  rtxdi::SeedSceneCpuMirrorInitial(device, buffer, offset, size, initial.data());
+  return true;
+}
+#endif
 
 inline bool CbMirrorCurrent(const TrackedCb& tracked, uint32_t epoch) { return tracked.epoch == epoch || tracked.epoch == kCbEpochInit; }
 
@@ -82,6 +105,7 @@ inline void MirrorCbWrite(TrackedCb* tracked, const void* data, uint64_t offset,
   }
   const uint64_t count = (std::min)(size, static_cast<uint64_t>(kTrackedCbBytes) - offset);
   std::memcpy(tracked->bytes.data() + offset, data, static_cast<size_t>(count));
+  if (tracked->write_sequence != UINT64_MAX) ++tracked->write_sequence;
   if (offset <= tracked->valid_bytes && offset + count > tracked->valid_bytes) {
     tracked->valid_bytes = offset + count;
   }
@@ -118,7 +142,11 @@ inline void OnInitResourceCbTracker(
 }
 
 inline void OnDestroyResourceCbTracker(reshade::api::device* device, reshade::api::resource resource) {
+#if defined(FALCOM_NRD_ENABLED)
+  rtxdi::InvalidateSceneCpuMirror(reinterpret_cast<uintptr_t>(device), resource.handle);
+#else
   (void)device;
+#endif
   auto& tracker = CbTracker();
   std::lock_guard lock(tracker.mutex);
   const auto it = tracker.buffers.find(resource.handle);
@@ -137,6 +165,11 @@ inline void OnMapBufferRegionCbTracker(
     reshade::api::map_access access,
     void** data) {
   const bvh::PoolCpuTimer cb_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockCbHooks]};
+#if defined(FALCOM_NRD_ENABLED)
+  if (access != reshade::api::map_access::read_only && data != nullptr && *data != nullptr) {
+    rtxdi::BeginSceneCpuMap(reinterpret_cast<uintptr_t>(device), resource.handle, offset, size, *data);
+  }
+#endif
   if (!CaptureActive()) {
     if (access != reshade::api::map_access::read_only) {
       NoteUntrackedCbWrite(resource);
@@ -158,6 +191,9 @@ inline void OnMapBufferRegionCbTracker(
 
 inline void OnUnmapBufferRegionCbTracker(reshade::api::device* device, reshade::api::resource resource) {
   const bvh::PoolCpuTimer cb_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockCbHooks]};
+#if defined(FALCOM_NRD_ENABLED)
+  rtxdi::FinishSceneCpuMap(reinterpret_cast<uintptr_t>(device), resource.handle, g_state.frame.load(std::memory_order_relaxed));
+#endif
   (void)device;
   auto& tracker = CbTracker();
   if (tracker.mapped_count.load(std::memory_order_relaxed) == 0u && !CaptureActive()) return;
@@ -209,7 +245,21 @@ inline bool OnUpdateBufferRegionCbTracker(
     reshade::api::resource resource,
     uint64_t offset,
     uint64_t size) {
+#if defined(FALCOM_NRD_ENABLED)
+  uint64_t write_size = size;
+  if (size == UINT64_MAX && device != nullptr) {
+    const auto desc = device->get_resource_desc(resource);
+    if (desc.type == reshade::api::resource_type::buffer && offset <= desc.buffer.size) {
+      write_size = desc.buffer.size - offset;
+    }
+  }
+  if (write_size != UINT64_MAX) {
+    rtxdi::MirrorSceneCpuWrite(reinterpret_cast<uintptr_t>(device), resource.handle, data, offset,
+                               write_size, g_state.frame.load(std::memory_order_relaxed));
+  }
+#else
   (void)device;
+#endif
   TrackCbUpdate(nullptr, resource, data, offset, size);
   return false;
 }
@@ -242,8 +292,10 @@ inline void OnDestroyCommandListCbTracker(reshade::api::command_list* cmd_list) 
 
 // The first `bytes` of a tracked constant buffer as a draw recorded on
 // `cmd_list` sees them.
-inline bool ReadTrackedCbBytes(reshade::api::command_list* cmd_list, reshade::api::resource resource, void* out, uint64_t bytes) {
-  if (out == nullptr || resource.handle == 0u || bytes > kTrackedCbBytes) return false;
+inline bool ReadTrackedCbBytes(reshade::api::command_list* cmd_list, reshade::api::resource resource, void* out,
+                               uint64_t bytes, uint64_t offset = 0u, uint64_t* write_sequence = nullptr) {
+  if (out == nullptr || resource.handle == 0u || offset > kTrackedCbBytes || bytes > kTrackedCbBytes - offset) return false;
+  const uint64_t end = offset + bytes;
   auto& tracker = CbTracker();
   std::lock_guard lock(tracker.mutex);
   const uint32_t epoch = g_state.tracking_epoch.load(std::memory_order_relaxed);
@@ -251,15 +303,18 @@ inline bool ReadTrackedCbBytes(reshade::api::command_list* cmd_list, reshade::ap
     const auto list_it = tracker.deferred.find(reinterpret_cast<uintptr_t>(cmd_list));
     if (list_it != tracker.deferred.end()) {
       const auto entry_it = list_it->second.find(resource.handle);
-      if (entry_it != list_it->second.end() && CbMirrorCurrent(entry_it->second, epoch) && entry_it->second.valid_bytes >= bytes) {
-        std::memcpy(out, entry_it->second.bytes.data(), static_cast<size_t>(bytes));
+      if (entry_it != list_it->second.end() && CbMirrorCurrent(entry_it->second, epoch)
+          && entry_it->second.valid_bytes >= end) {
+        std::memcpy(out, entry_it->second.bytes.data() + offset, static_cast<size_t>(bytes));
+        if (write_sequence != nullptr) *write_sequence = entry_it->second.write_sequence;
         return true;
       }
     }
   }
   const auto it = tracker.buffers.find(resource.handle);
-  if (it == tracker.buffers.end() || !CbMirrorCurrent(it->second, epoch) || it->second.valid_bytes < bytes) return false;
-  std::memcpy(out, it->second.bytes.data(), static_cast<size_t>(bytes));
+  if (it == tracker.buffers.end() || !CbMirrorCurrent(it->second, epoch) || it->second.valid_bytes < end) return false;
+  std::memcpy(out, it->second.bytes.data() + offset, static_cast<size_t>(bytes));
+  if (write_sequence != nullptr) *write_sequence = it->second.write_sequence;
   return true;
 }
 
@@ -267,6 +322,7 @@ struct TrackedCbInfo {
   bool tracked = false;
   uint64_t size = 0u;
   uint64_t valid_bytes = 0u;
+  uint64_t write_sequence = 0u;
 };
 
 // What the tracker holds for a buffer (no bytes): tracked, its size and the mirrored prefix.
@@ -280,6 +336,7 @@ inline void DescribeTrackedCb(reshade::api::resource resource, TrackedCbInfo* ou
   out->tracked = true;
   out->size = it->second.size;
   out->valid_bytes = CbMirrorCurrent(it->second, epoch) ? it->second.valid_bytes : 0u;
+  out->write_sequence = it->second.write_sequence;
 }
 
 // First int of a tracked constant buffer (instanceOffset_g for b1).

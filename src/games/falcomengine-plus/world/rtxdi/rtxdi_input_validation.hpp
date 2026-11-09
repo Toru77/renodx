@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "rtxdi_input_layout.h"
 #include "rtxdi_surface_layout.h"
@@ -31,6 +33,181 @@ struct SceneRangeCapture {
   SceneRangeSnapshot snapshot;
   uint64_t sequence = 0u;
 };
+
+struct SceneCpuMirror {
+  uintptr_t device = 0u;
+  uint64_t buffer = 0u, offset = 0u, size = 0u;
+  uint64_t binding_sequence = 0u, write_sequence = 0u, last_read_sequence = 0u;
+  uint64_t binding_frame = UINT64_MAX, write_frame = UINT64_MAX;
+  std::vector<uint8_t> bytes;
+  std::vector<uint8_t> coverage;
+  const uint8_t* mapped = nullptr;
+  uint64_t mapped_offset = 0u, mapped_size = 0u;
+  bool valid = false, immutable_initial = false;
+};
+
+struct SceneCpuMirrorRegistry {
+  std::mutex mutex;
+  std::vector<SceneCpuMirror> mirrors;
+};
+
+inline SceneCpuMirrorRegistry& GetSceneCpuMirrorRegistry() {
+  static SceneCpuMirrorRegistry registry;
+  return registry;
+}
+
+inline SceneCpuMirror* FindSceneCpuMirror(std::vector<SceneCpuMirror>& mirrors, uintptr_t device, uint64_t buffer) {
+  for (auto& mirror : mirrors) {
+    if (mirror.device == device && mirror.buffer == buffer) return &mirror;
+  }
+  return nullptr;
+}
+
+inline void RegisterSceneCpuMirrorRange(uintptr_t device, uint64_t buffer, uint64_t offset, uint64_t size,
+                                        uint64_t frame, uint64_t binding_sequence) {
+  if (device == 0u || buffer == 0u || size != RTXDI_SURFACE_SCENE_ROW_COUNT * 16u
+      || offset > UINT64_MAX - size || binding_sequence == 0u) return;
+  auto& registry = GetSceneCpuMirrorRegistry();
+  std::lock_guard lock(registry.mutex);
+  SceneCpuMirror* mirror = FindSceneCpuMirror(registry.mirrors, device, buffer);
+  if (mirror == nullptr) {
+    registry.mirrors.push_back({.device = device, .buffer = buffer});
+    mirror = &registry.mirrors.back();
+  }
+  if (mirror->offset != offset || mirror->size != size || mirror->bytes.size() != size
+      || mirror->coverage.size() != size) {
+    mirror->offset = offset;
+    mirror->size = size;
+    mirror->bytes.assign(static_cast<size_t>(size), 0u);
+    mirror->coverage.assign(static_cast<size_t>(size), 0u);
+    mirror->write_sequence = 0u;
+    mirror->last_read_sequence = 0u;
+    mirror->write_frame = UINT64_MAX;
+    mirror->mapped = nullptr;
+    mirror->valid = mirror->immutable_initial = false;
+  }
+  mirror->binding_frame = frame;
+  mirror->binding_sequence = binding_sequence;
+}
+
+inline void MirrorSceneCpuWriteLocked(SceneCpuMirror* mirror, const void* data, uint64_t write_offset,
+                                      uint64_t write_size, uint64_t frame) {
+  if (data == nullptr || write_size == 0u || write_offset > UINT64_MAX - write_size) return;
+  if (mirror == nullptr || mirror->size == 0u) return;
+  if (mirror->immutable_initial) {
+    std::fill(mirror->coverage.begin(), mirror->coverage.end(), 0u);
+    mirror->valid = false;
+    mirror->immutable_initial = false;
+  }
+  const uint64_t write_end = write_offset + write_size;
+  const uint64_t mirror_end = mirror->offset + mirror->size;
+  const uint64_t begin = (std::max)(write_offset, mirror->offset);
+  const uint64_t end = (std::min)(write_end, mirror_end);
+  if (begin >= end) return;
+  const uint64_t destination_offset = begin - mirror->offset;
+  const uint64_t source_offset = begin - write_offset;
+  const size_t count = static_cast<size_t>(end - begin);
+  std::memcpy(mirror->bytes.data() + destination_offset,
+              static_cast<const uint8_t*>(data) + source_offset, count);
+  std::fill(mirror->coverage.begin() + static_cast<std::ptrdiff_t>(destination_offset),
+            mirror->coverage.begin() + static_cast<std::ptrdiff_t>(destination_offset + count), 1u);
+  if (mirror->write_sequence != UINT64_MAX) ++mirror->write_sequence;
+  mirror->write_frame = frame;
+  mirror->valid = std::all_of(mirror->coverage.begin(), mirror->coverage.end(), [](uint8_t value) { return value != 0u; });
+}
+
+inline void SeedSceneCpuMirrorInitial(uintptr_t device, uint64_t buffer, uint64_t offset, uint64_t size,
+                                      const void* data) {
+  if (data == nullptr || size != RTXDI_SURFACE_SCENE_ROW_COUNT * 16u || offset > UINT64_MAX - size) return;
+  auto& registry = GetSceneCpuMirrorRegistry();
+  std::lock_guard lock(registry.mutex);
+  SceneCpuMirror* mirror = FindSceneCpuMirror(registry.mirrors, device, buffer);
+  if (mirror == nullptr || mirror->offset != offset || mirror->size != size) return;
+  std::memcpy(mirror->bytes.data(), data, static_cast<size_t>(size));
+  std::fill(mirror->coverage.begin(), mirror->coverage.end(), 1u);
+  mirror->write_sequence = (std::max)(mirror->write_sequence, uint64_t{1u});
+  mirror->last_read_sequence = 0u;
+  mirror->write_frame = UINT64_MAX;
+  mirror->valid = true;
+  mirror->immutable_initial = true;
+}
+
+inline void MirrorSceneCpuWrite(uintptr_t device, uint64_t buffer, const void* data, uint64_t write_offset,
+                                uint64_t write_size, uint64_t frame) {
+  auto& registry = GetSceneCpuMirrorRegistry();
+  std::lock_guard lock(registry.mutex);
+  MirrorSceneCpuWriteLocked(FindSceneCpuMirror(registry.mirrors, device, buffer), data, write_offset, write_size, frame);
+}
+
+inline void BeginSceneCpuMap(uintptr_t device, uint64_t buffer, uint64_t offset, uint64_t size, const void* data) {
+  auto& registry = GetSceneCpuMirrorRegistry();
+  std::lock_guard lock(registry.mutex);
+  SceneCpuMirror* mirror = FindSceneCpuMirror(registry.mirrors, device, buffer);
+  if (mirror == nullptr) return;
+  mirror->mapped = static_cast<const uint8_t*>(data);
+  mirror->mapped_offset = offset;
+  mirror->mapped_size = size;
+}
+
+inline void FinishSceneCpuMap(uintptr_t device, uint64_t buffer, uint64_t frame) {
+  auto& registry = GetSceneCpuMirrorRegistry();
+  std::lock_guard lock(registry.mutex);
+  SceneCpuMirror* mirror = FindSceneCpuMirror(registry.mirrors, device, buffer);
+  if (mirror == nullptr || mirror->mapped == nullptr) return;
+  const uint8_t* data = mirror->mapped;
+  const uint64_t offset = mirror->mapped_offset;
+  const uint64_t size = mirror->mapped_size;
+  mirror->mapped = nullptr;
+  mirror->mapped_offset = 0u;
+  mirror->mapped_size = 0u;
+  const uint64_t write_size = size == UINT64_MAX ? mirror->offset + mirror->size : size;
+  if (size != UINT64_MAX || offset == 0u) MirrorSceneCpuWriteLocked(mirror, data, offset, write_size, frame);
+}
+
+inline bool ReadSceneCpuMirror(uintptr_t device, uint64_t buffer, uint64_t offset, uint64_t size,
+                               uint64_t frame, uint64_t binding_sequence, void* output,
+                               uint64_t* write_sequence, uint64_t* write_frame) {
+  if (output == nullptr || size == 0u) return false;
+  auto& registry = GetSceneCpuMirrorRegistry();
+  std::lock_guard lock(registry.mutex);
+  SceneCpuMirror* mirror = FindSceneCpuMirror(registry.mirrors, device, buffer);
+  if (mirror == nullptr || !mirror->valid || mirror->offset != offset || mirror->size != size
+      || mirror->binding_frame != frame || mirror->binding_sequence != binding_sequence || mirror->write_sequence == 0u
+      || (!mirror->immutable_initial && mirror->write_sequence <= mirror->last_read_sequence)) return false;
+  std::memcpy(output, mirror->bytes.data(), static_cast<size_t>(size));
+  if (write_sequence != nullptr) *write_sequence = mirror->write_sequence;
+  if (write_frame != nullptr) *write_frame = mirror->write_frame;
+  if (!mirror->immutable_initial) {
+    mirror->last_read_sequence = mirror->write_sequence;
+    std::fill(mirror->coverage.begin(), mirror->coverage.end(), 0u);
+    mirror->valid = false;
+  }
+  return true;
+}
+
+inline void InvalidateSceneCpuMirror(uintptr_t device, uint64_t buffer) {
+  auto& registry = GetSceneCpuMirrorRegistry();
+  std::lock_guard lock(registry.mutex);
+  SceneCpuMirror* mirror = FindSceneCpuMirror(registry.mirrors, device, buffer);
+  if (mirror != nullptr) {
+    mirror->valid = false;
+    mirror->mapped = nullptr;
+    mirror->offset = 0u;
+    mirror->size = 0u;
+    mirror->bytes.clear();
+    mirror->coverage.clear();
+    mirror->write_sequence = 0u;
+    mirror->last_read_sequence = 0u;
+    mirror->write_frame = UINT64_MAX;
+    mirror->immutable_initial = false;
+  }
+}
+
+inline void ResetSceneCpuMirrorsForDevice(uintptr_t device) {
+  auto& registry = GetSceneCpuMirrorRegistry();
+  std::lock_guard lock(registry.mutex);
+  std::erase_if(registry.mirrors, [&](const SceneCpuMirror& mirror) { return mirror.device == device; });
+}
 
 inline void TrackSceneBinding(SceneRangeCapture* tracker, SceneRangeSnapshot binding) {
   std::unique_lock lock(tracker->mutex);
@@ -173,9 +350,9 @@ inline bool ValidSceneLease(int32_t current_slot, uint32_t current_frame, int32_
 }
 
 inline bool SceneCoverageSnapshotMatches(int32_t current_slot, uint32_t current_frame, uint64_t current_generation,
-                                          uint64_t current_fence, uint64_t current_gc_version, int32_t snapshot_slot,
-                                          uint32_t snapshot_frame, uint64_t snapshot_generation,
-                                          uint64_t snapshot_fence, uint64_t snapshot_gc_version) {
+                                         uint64_t current_fence, uint64_t current_gc_version, int32_t snapshot_slot,
+                                         uint32_t snapshot_frame, uint64_t snapshot_generation,
+                                         uint64_t snapshot_fence, uint64_t snapshot_gc_version) {
   return current_slot >= 0 && current_slot == snapshot_slot && current_frame == snapshot_frame
          && current_generation == snapshot_generation && current_fence != 0u && current_fence == snapshot_fence
          && current_gc_version == snapshot_gc_version;

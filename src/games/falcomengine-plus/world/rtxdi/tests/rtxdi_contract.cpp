@@ -1,5 +1,6 @@
 #include "../rtxdi_contract.h"
 #include "../../bvh/alpha_atlas.hpp"
+#include "../rtxdi_camera_qualification.hpp"
 #include "../rtxdi_config.hpp"
 #include "../rtxdi_di_contract.h"
 #include "../rtxdi_input_validation.hpp"
@@ -7,6 +8,7 @@
 #include "../rtxdi_surface_layout.h"
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -805,5 +807,189 @@ int main() {
       || falcom_world::rtxdi::ValidDiHistoryIdentity(changed_config_history)
       || falcom_world::rtxdi::ValidDiHistoryIdentity(reused_slot_history)
       || falcom_world::rtxdi::ValidDiHistoryIdentity(missing_slot_history)) return EXIT_FAILURE;
+  using falcom_world::rtxdi::BeginSceneCpuMap;
+  using falcom_world::rtxdi::FinishSceneCpuMap;
+  using falcom_world::rtxdi::InvalidateSceneCpuMirror;
+  using falcom_world::rtxdi::MirrorSceneCpuWrite;
+  using falcom_world::rtxdi::ReadSceneCpuMirror;
+  using falcom_world::rtxdi::RegisterSceneCpuMirrorRange;
+  using falcom_world::rtxdi::ResetSceneCpuMirrorsForDevice;
+  using falcom_world::rtxdi::SeedSceneCpuMirrorInitial;
+  constexpr uintptr_t camera_device = 0xA11u;
+  constexpr uint64_t camera_buffer = 0xB22u;
+  constexpr uint64_t camera_offset = 64u;
+  constexpr uint64_t camera_bytes = RTXDI_SURFACE_SCENE_ROW_COUNT * 16u;
+  std::array<uint8_t, camera_bytes> camera_source = {};
+  std::array<uint8_t, camera_bytes> camera_copy = {};
+  for (uint32_t index = 0u; index < camera_source.size(); ++index) camera_source[index] = static_cast<uint8_t>(index * 17u);
+  RegisterSceneCpuMirrorRange(camera_device, camera_buffer, camera_offset, camera_bytes, 4u, 12u);
+  if (ReadSceneCpuMirror(camera_device, camera_buffer, camera_offset, camera_bytes, 4u, 12u,
+                         camera_copy.data(), nullptr, nullptr)) return EXIT_FAILURE;
+  MirrorSceneCpuWrite(camera_device, camera_buffer, camera_source.data(), camera_offset, 700u, 4u);
+  MirrorSceneCpuWrite(camera_device, camera_buffer, camera_source.data() + 700u, camera_offset + 700u,
+                      camera_bytes - 700u, 4u);
+  RegisterSceneCpuMirrorRange(camera_device, camera_buffer, camera_offset, camera_bytes, 5u, 13u);
+  uint64_t camera_write_sequence = 0u;
+  uint64_t camera_write_frame = UINT64_MAX;
+  if (!ReadSceneCpuMirror(camera_device, camera_buffer, camera_offset, camera_bytes, 5u, 13u,
+                          camera_copy.data(), &camera_write_sequence, &camera_write_frame)
+      || camera_copy != camera_source || camera_write_sequence != 2u || camera_write_frame != 4u
+      || ReadSceneCpuMirror(camera_device, camera_buffer, camera_offset, camera_bytes, 5u, 12u,
+                            camera_copy.data(), nullptr, nullptr)) return EXIT_FAILURE;
+  if (ReadSceneCpuMirror(camera_device, camera_buffer, camera_offset, camera_bytes, 5u, 13u,
+                         camera_copy.data(), nullptr, nullptr)) return EXIT_FAILURE;
+  MirrorSceneCpuWrite(camera_device, camera_buffer, camera_source.data(), camera_offset, 128u, 5u);
+  RegisterSceneCpuMirrorRange(camera_device, camera_buffer, camera_offset, camera_bytes, 6u, 14u);
+  if (ReadSceneCpuMirror(camera_device, camera_buffer, camera_offset, camera_bytes, 6u, 14u,
+                         camera_copy.data(), nullptr, nullptr)) return EXIT_FAILURE;
+  MirrorSceneCpuWrite(camera_device, camera_buffer, camera_source.data() + 128u, camera_offset + 128u,
+                      camera_bytes - 128u, 5u);
+  if (!ReadSceneCpuMirror(camera_device, camera_buffer, camera_offset, camera_bytes, 6u, 14u,
+                          camera_copy.data(), &camera_write_sequence, &camera_write_frame)
+      || camera_copy != camera_source || camera_write_sequence != 4u || camera_write_frame != 5u) return EXIT_FAILURE;
+  constexpr uint64_t initial_buffer = 0xB24u;
+  RegisterSceneCpuMirrorRange(camera_device, initial_buffer, 0u, camera_bytes, 7u, 16u);
+  SeedSceneCpuMirrorInitial(camera_device, initial_buffer, 0u, camera_bytes, camera_source.data());
+  if (!ReadSceneCpuMirror(camera_device, initial_buffer, 0u, camera_bytes, 7u, 16u,
+                          camera_copy.data(), &camera_write_sequence, &camera_write_frame)
+      || camera_copy != camera_source || camera_write_frame != UINT64_MAX) return EXIT_FAILURE;
+  RegisterSceneCpuMirrorRange(camera_device, initial_buffer, 0u, camera_bytes, 8u, 17u);
+  if (!ReadSceneCpuMirror(camera_device, initial_buffer, 0u, camera_bytes, 8u, 17u,
+                          camera_copy.data(), nullptr, nullptr)) return EXIT_FAILURE;
+  MirrorSceneCpuWrite(camera_device, initial_buffer, camera_source.data(), 0u, 128u, 8u);
+  RegisterSceneCpuMirrorRange(camera_device, initial_buffer, 0u, camera_bytes, 9u, 18u);
+  if (ReadSceneCpuMirror(camera_device, initial_buffer, 0u, camera_bytes, 9u, 18u,
+                         camera_copy.data(), nullptr, nullptr)) return EXIT_FAILURE;
+  std::array<uint8_t, camera_offset + camera_bytes> camera_mapped = {};
+  for (uint32_t index = 0u; index < camera_bytes; ++index) camera_mapped[camera_offset + index] = static_cast<uint8_t>(255u - camera_source[index]);
+  constexpr uint64_t mapped_buffer = 0xB23u;
+  RegisterSceneCpuMirrorRange(camera_device, mapped_buffer, camera_offset, camera_bytes, 5u, 14u);
+  BeginSceneCpuMap(camera_device, mapped_buffer, 0u, camera_mapped.size(), camera_mapped.data());
+  FinishSceneCpuMap(camera_device, mapped_buffer, 5u);
+  if (!ReadSceneCpuMirror(camera_device, mapped_buffer, camera_offset, camera_bytes, 5u, 14u,
+                          camera_copy.data(), &camera_write_sequence, nullptr)
+      || camera_write_sequence != 1u) return EXIT_FAILURE;
+  for (uint32_t index = 0u; index < camera_bytes; ++index) {
+    if (camera_copy[index] != camera_mapped[camera_offset + index]) return EXIT_FAILURE;
+  }
+  InvalidateSceneCpuMirror(camera_device, camera_buffer);
+  if (ReadSceneCpuMirror(camera_device, camera_buffer, camera_offset, camera_bytes, 5u, 13u,
+                         camera_copy.data(), nullptr, nullptr)) return EXIT_FAILURE;
+  RegisterSceneCpuMirrorRange(camera_device, camera_buffer, camera_offset, camera_bytes, 6u, 15u);
+  if (ReadSceneCpuMirror(camera_device, camera_buffer, camera_offset, camera_bytes, 6u, 15u,
+                         camera_copy.data(), nullptr, nullptr)) return EXIT_FAILURE;
+  ResetSceneCpuMirrorsForDevice(camera_device);
+  using falcom_world::rtxdi::BuildCameraCandidate;
+  using falcom_world::rtxdi::CameraCandidate;
+  using falcom_world::rtxdi::CameraMatrix;
+  using falcom_world::rtxdi::CameraQualification;
+  using falcom_world::rtxdi::CameraQualificationMatches;
+  using falcom_world::rtxdi::InvertCameraMatrix;
+  using falcom_world::rtxdi::MultiplyCameraMatrices;
+  using falcom_world::rtxdi::ObserveCameraProbe;
+  using falcom_world::rtxdi::ShouldRunCameraProbe;
+  constexpr uint32_t probe_width = 64u, probe_height = 32u;
+  std::array<uint8_t, RTXDI_SURFACE_SCENE_ROW_COUNT * 16u> previous_scene = {};
+  std::array<uint8_t, RTXDI_SURFACE_SCENE_ROW_COUNT * 16u> current_scene = {};
+  CameraMatrix previous_view = {1.0f, 0.0f, 0.0f, 0.0f,
+                                0.0f, 1.0f, 0.0f, 0.0f,
+                                0.0f, 0.0f, 1.0f, 0.0f,
+                                -2.0f, 1.0f, -3.0f, 1.0f};
+  CameraMatrix current_view = {1.0f, 0.0f, 0.0f, 0.0f,
+                               0.0f, 1.0f, 0.0f, 0.0f,
+                               0.0f, 0.0f, 1.0f, 0.0f,
+                               -2.5f, 1.25f, -3.0f, 1.0f};
+  CameraMatrix previous_projection = {1.2f, 0.0f, 0.0f, 0.0f,
+                                      0.0f, 1.4f, 0.0f, 0.0f,
+                                      0.00625f, 0.00625f, 1.01f, 1.0f,
+                                      0.0f, 0.0f, -0.1f, 0.0f};
+  CameraMatrix current_projection = {1.2f, 0.0f, 0.0f, 0.0f,
+                                     0.0f, 1.4f, 0.0f, 0.0f,
+                                     0.003125f, -0.009375f, 1.01f, 1.0f,
+                                     0.0f, 0.0f, -0.1f, 0.0f};
+  const auto store_game_matrix = [](auto* scene, uint32_t row, const CameraMatrix& matrix) {
+    std::array<float, 16u> packed = {};
+    for (uint32_t y = 0u; y < 4u; ++y) {
+      for (uint32_t x = 0u; x < 4u; ++x) packed[x * 4u + y] = matrix[y * 4u + x];
+    }
+    std::memcpy(scene->data() + row * 16u, packed.data(), sizeof(packed));
+  };
+  const auto store_scene = [&](auto* scene, const CameraMatrix& view, const CameraMatrix& projection,
+                               const CameraMatrix& previous_view_projection, std::array<float, 2u> jitter_delta) {
+    CameraMatrix view_inverse = {}, projection_inverse = {};
+    const CameraMatrix view_projection = MultiplyCameraMatrices(view, projection);
+    CameraMatrix view_projection_inverse = {};
+    if (!InvertCameraMatrix(view, &view_inverse) || !InvertCameraMatrix(projection, &projection_inverse)
+        || !InvertCameraMatrix(view_projection, &view_projection_inverse)) return false;
+    store_game_matrix(scene, 0u, view);
+    store_game_matrix(scene, 4u, view_inverse);
+    store_game_matrix(scene, 8u, projection);
+    store_game_matrix(scene, 12u, projection_inverse);
+    store_game_matrix(scene, 16u, view_projection);
+    store_game_matrix(scene, 20u, view_projection_inverse);
+    store_game_matrix(scene, 75u, previous_view_projection);
+    const std::array<float, 4u> packed_jitter = {jitter_delta[0], jitter_delta[1], 0.0f, 0.0f};
+    std::memcpy(scene->data() + 79u * 16u, packed_jitter.data(), sizeof(packed_jitter));
+    return true;
+  };
+  const CameraMatrix previous_view_projection = MultiplyCameraMatrices(previous_view, previous_projection);
+  const CameraMatrix current_view_projection = MultiplyCameraMatrices(current_view, current_projection);
+  if (!store_scene(&previous_scene, previous_view, previous_projection, previous_view_projection, {0.0f, 0.0f})
+      || !store_scene(&current_scene, current_view, current_projection, previous_view_projection, {0.1f, -0.25f})) return EXIT_FAILURE;
+  CameraCandidate camera_candidate;
+  if (!BuildCameraCandidate(current_scene.data(), previous_scene.data(), probe_width, probe_height, &camera_candidate)
+      || !camera_candidate.matrices_valid || !camera_candidate.absolute_jitter_valid
+      || std::abs(camera_candidate.jitter_pixels[0] - 0.1f) > 1.0e-5f
+      || std::abs(camera_candidate.jitter_pixels[1] - 0.15f) > 1.0e-5f
+      || std::abs(camera_candidate.jitter_pixels_previous[0] - 0.2f) > 1.0e-5f
+      || std::abs(camera_candidate.jitter_pixels_previous[1] + 0.1f) > 1.0e-5f
+      || std::abs(camera_candidate.motion_correction_candidates[0][0] - 0.1f) > 1.0e-5f
+      || std::abs(camera_candidate.motion_correction_candidates[0][1] + 0.25f) > 1.0e-5f
+      || std::abs(camera_candidate.motion_correction_candidates[1][0] - 0.2f) > 1.0e-5f
+      || std::abs(camera_candidate.motion_correction_candidates[1][1] + 0.5f) > 1.0e-5f
+      || camera_candidate.world_to_view[12] != current_view[12]
+      || camera_candidate.view_to_clip[8] != 0.0f || camera_candidate.view_to_clip[9] != 0.0f) return EXIT_FAILURE;
+  std::array<uint8_t, RTXDI_SURFACE_SCENE_ROW_COUNT * 16u> bad_previous_scene = previous_scene;
+  CameraMatrix bad_previous_view_projection = previous_view_projection;
+  bad_previous_view_projection[12] += 10.0f;
+  store_game_matrix(&bad_previous_scene, 16u, bad_previous_view_projection);
+  if (BuildCameraCandidate(current_scene.data(), bad_previous_scene.data(), probe_width, probe_height,
+                           &camera_candidate)) return EXIT_FAILURE;
+  std::array<uint8_t, RTXDI_SURFACE_SCENE_ROW_COUNT * 16u> singular_camera_scene = current_scene;
+  CameraMatrix singular_projection = current_projection;
+  singular_projection.fill(0.0f);
+  store_game_matrix(&singular_camera_scene, 8u, singular_projection);
+  if (BuildCameraCandidate(singular_camera_scene.data(), previous_scene.data(), probe_width, probe_height,
+                           &camera_candidate)) return EXIT_FAILURE;
+  CameraQualification qualification;
+  for (uint32_t frame_index = 0u; frame_index < 3u; ++frame_index) {
+    if (ObserveCameraProbe(&qualification, frame_index, 1u, 1u, 7u, probe_width, probe_height, true, true, 0u)) return EXIT_FAILURE;
+  }
+  if (!ObserveCameraProbe(&qualification, 3u, 1u, 1u, 7u, probe_width, probe_height, true, true, 0u)
+      || !CameraQualificationMatches(qualification, 1u, 1u, 7u, probe_width, probe_height, true, true)
+      || ShouldRunCameraProbe(qualification, 1u, 1u, 7u, probe_width, probe_height, true, true)
+      || !ShouldRunCameraProbe(qualification, 1u, 1u, 7u, probe_width, probe_height, true, false)
+      || !ShouldRunCameraProbe(qualification, 1u, 2u, 7u, probe_width, probe_height, true, true)
+      || !ShouldRunCameraProbe(qualification, 1u, 1u, 8u, probe_width, probe_height, true, true)
+      || !ShouldRunCameraProbe(qualification, 1u, 1u, 7u, probe_width + 1u, probe_height, true, true)) return EXIT_FAILURE;
+  const auto skip_path_start = std::chrono::steady_clock::now();
+  for (uint32_t index = 0u; index < 1000u; ++index) {
+    CameraCandidate repeated_candidate;
+    if (!BuildCameraCandidate(current_scene.data(), previous_scene.data(), probe_width, probe_height,
+                              &repeated_candidate)
+        || ShouldRunCameraProbe(qualification, 1u, 1u, 7u, probe_width, probe_height,
+                                repeated_candidate.matrices_valid && repeated_candidate.absolute_jitter_valid, true)) {
+      return EXIT_FAILURE;
+    }
+  }
+  const double skip_path_microseconds =
+      std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - skip_path_start).count() / 1000.0;
+  std::printf("PASS NRD qualified skip path matrix checks average=%.2f us without probe dispatch\n", skip_path_microseconds);
+  if (ObserveCameraProbe(&qualification, 4u, 1u, 1u, 7u, probe_width, probe_height, false, true, 0u)
+      || qualification.qualified || ObserveCameraProbe(&qualification, 5u, 1u, 1u, 7u, probe_width, probe_height, true, true, 0u)
+      || ObserveCameraProbe(&qualification, 6u, 1u, 1u, 8u, probe_width, probe_height, true, true, 1u)
+      || ObserveCameraProbe(&qualification, 7u, 1u, 1u, 8u, probe_width, probe_height, true, true, 1u)
+      || ObserveCameraProbe(&qualification, 8u, 1u, 1u, 8u, probe_width, probe_height, true, true, 1u)
+      || !ObserveCameraProbe(&qualification, 9u, 1u, 1u, 8u, probe_width, probe_height, true, true, 1u)) return EXIT_FAILURE;
   return EXIT_SUCCESS;
 }

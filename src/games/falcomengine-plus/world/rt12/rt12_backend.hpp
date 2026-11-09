@@ -43,6 +43,9 @@
 #include "../rtxdi/rtxdi_config.hpp"
 #include "../rtxdi/rtxdi_state.hpp"
 #include "rt12_mirror.hpp"
+#if defined(FALCOM_NRD_ENABLED)
+#include "rt12_nrd.hpp"
+#endif
 
 namespace falcom_world::rt12 {
 
@@ -260,6 +263,9 @@ struct Rt12DiTransferSlot {
   bool output_staged = false;
   bool n1_resources_ready = false;
   bool n1_staged = false;
+#if defined(FALCOM_NRD_ENABLED)
+  Rt12NrdSlot nrd;
+#endif
 };
 
 struct Rt12DiTransferState {
@@ -277,12 +283,19 @@ struct Rt12DiTransferState {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> temporal_di_pso;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> spatial_di_pso;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> n1_resolve_pso;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> nrd_probe_root;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> nrd_probe_pso;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> nrd_prep_root;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> nrd_prep_pso;
   uint64_t owner_generation = 0u, configuration_generation = 0u;
   uint64_t input_fence = 0u, scene_fence = 0u;
   uint32_t next_slot = 0u, input_frame = UINT32_MAX, attempted_frame = UINT32_MAX;
   uint64_t attempted_generation = 0u;
   int32_t scene_slot = -1;
   int32_t input_slot = -1;
+#if defined(FALCOM_NRD_ENABLED)
+  Rt12NrdGeneration nrd;
+#endif
 };
 
 struct Rt12State {
@@ -1241,6 +1254,16 @@ inline bool CreateRt12(reshade::api::device* device) {
     renodx::utils::log::w("[world-rt12] alpha mirror not created hr=", renodx::utils::log::AsHex(static_cast<uint32_t>(hr)));
     s.atlas = Rt12Shared{};
   }
+
+#if defined(FALCOM_NRD_ENABLED)
+  if (!s.di_transfer.nrd.CreateRelaxDiffuseSpecular()
+      || !s.di_transfer.nrd.CreateD3D12Backend(s.device12.Get(), s.serialize)) {
+    s.di_transfer.nrd.Reset();
+    renodx::utils::log::w("[world-rt12] NRD 4.17.1 initialization failed; raw RTXDI remains available");
+  } else {
+    renodx::utils::log::i("[world-rt12] private NRD 4.17.1 RELAX backend initialized; output consumer remains disabled");
+  }
+#endif
 
   // 17. Success: the mirror starts, and the live store re-streams every mesh through its hooks.
   {

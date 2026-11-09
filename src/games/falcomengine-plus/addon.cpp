@@ -7279,6 +7279,9 @@ static void OnInitDevice(reshade::api::device* device) {
 }
 
 static void OnDestroyDevice(reshade::api::device* device) {
+#if defined(FALCOM_NRD_ENABLED)
+  falcom_world::rtxdi::ResetSceneCpuMirrorsForDevice(reinterpret_cast<uintptr_t>(device));
+#endif
   auto* d = device->get_private_data<DeviceData>();
   if (d) {
     DestroyGTVBAOResources(device, d);
@@ -7575,6 +7578,12 @@ static void PromoteRtxdiSceneBinding(reshade::api::command_list* cmd_list) {
   }
   binding.size = normalized;
   data->rtxdi_scene_range.snapshot = binding;
+#if defined(FALCOM_NRD_ENABLED)
+  falcom_world::rtxdi::RegisterSceneCpuMirrorRange(reinterpret_cast<uintptr_t>(device), binding.buffer,
+                                                   binding.offset, binding.size, binding.frame, binding.sequence);
+  falcom_world::SeedInitialSceneCpuMirror(reinterpret_cast<uintptr_t>(device), binding.buffer,
+                                          binding.offset, binding.size);
+#endif
 }
 
 // -- Push-descriptors event ? capture lighting inputs (kai pattern) --

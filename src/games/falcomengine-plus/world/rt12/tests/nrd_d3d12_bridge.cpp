@@ -1,4 +1,6 @@
 #include "../rt12_nrd.hpp"
+#include "world_rtxdi_nrd_prep.h"
+#include "world_rtxdi_nrd_probe.h"
 
 #include <dxgi1_2.h>
 #include <windows.h>
@@ -22,92 +24,6 @@ bool Check(HRESULT hr, const char* operation) {
   return SUCCEEDED(hr);
 }
 
-struct NrdNativePipelines {
-  ComPtr<ID3D12Device> device;
-  ComPtr<ID3D12RootSignature> root_signature;
-  std::vector<ComPtr<ID3D12PipelineState>> pipelines;
-
-  bool Create(ID3D12Device* input_device, const nrd::InstanceDesc& instance_desc) {
-    device = input_device;
-    std::array<D3D12_DESCRIPTOR_RANGE, 2> ranges = {};
-    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = instance_desc.descriptorPoolDesc.perSetTexturesMaxNum;
-    ranges[0].BaseShaderRegister = instance_desc.resourcesBaseRegisterIndex;
-    ranges[0].RegisterSpace = instance_desc.resourcesSpaceIndex;
-    ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = instance_desc.descriptorPoolDesc.perSetStorageTexturesMaxNum;
-    ranges[1].BaseShaderRegister = instance_desc.resourcesBaseRegisterIndex;
-    ranges[1].RegisterSpace = instance_desc.resourcesSpaceIndex;
-    ranges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-
-    std::array<D3D12_ROOT_PARAMETER, 3> parameters = {};
-    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    parameters[0].Descriptor.ShaderRegister = instance_desc.constantBufferRegisterIndex;
-    parameters[0].Descriptor.RegisterSpace = instance_desc.constantBufferAndSamplersSpaceIndex;
-    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    for (uint32_t index = 0; index < 2; ++index) {
-      parameters[index + 1u].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-      parameters[index + 1u].DescriptorTable.NumDescriptorRanges = 1u;
-      parameters[index + 1u].DescriptorTable.pDescriptorRanges = &ranges[index];
-      parameters[index + 1u].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    }
-
-    std::array<D3D12_STATIC_SAMPLER_DESC, static_cast<uint32_t>(nrd::Sampler::MAX_NUM)> samplers = {};
-    for (uint32_t index = 0; index < samplers.size(); ++index) {
-      auto& sampler = samplers[index];
-      sampler.Filter = instance_desc.samplers[index] == nrd::Sampler::NEAREST_CLAMP
-                           ? D3D12_FILTER_MIN_MAG_MIP_POINT
-                           : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-      sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-      sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-      sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-      sampler.MipLODBias = 0.0f;
-      sampler.MaxAnisotropy = 1u;
-      sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-      sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-      sampler.MinLOD = 0.0f;
-      sampler.MaxLOD = D3D12_FLOAT32_MAX;
-      sampler.ShaderRegister = instance_desc.samplersBaseRegisterIndex + index;
-      sampler.RegisterSpace = instance_desc.constantBufferAndSamplersSpaceIndex;
-      sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    }
-
-    D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-    root_desc.NumParameters = static_cast<UINT>(parameters.size());
-    root_desc.pParameters = parameters.data();
-    root_desc.NumStaticSamplers = static_cast<UINT>(samplers.size());
-    root_desc.pStaticSamplers = samplers.data();
-    root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-
-    ComPtr<ID3DBlob> signature;
-    ComPtr<ID3DBlob> errors;
-    if (!Check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &errors),
-               "serialize root signature")) {
-      if (errors) std::fprintf(stderr, "%s\n", static_cast<const char*>(errors->GetBufferPointer()));
-      return false;
-    }
-    if (!Check(device->CreateRootSignature(0u, signature->GetBufferPointer(), signature->GetBufferSize(),
-                                           IID_PPV_ARGS(&root_signature)),
-               "create root signature")) return false;
-
-    pipelines.resize(instance_desc.pipelinesNum);
-    for (uint32_t index = 0; index < pipelines.size(); ++index) {
-      const auto& source = instance_desc.pipelines[index].computeShaderDXIL;
-      if (source.bytecode == nullptr || source.size == 0u) {
-        std::fprintf(stderr, "FAIL NRD missing DXIL pipeline bytecode at %u\n", index);
-        return false;
-      }
-      D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc = {};
-      pipeline_desc.pRootSignature = root_signature.Get();
-      pipeline_desc.CS = {source.bytecode, static_cast<SIZE_T>(source.size)};
-      if (!Check(device->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&pipelines[index])),
-                 instance_desc.pipelines[index].shaderIdentifier)) return false;
-    }
-    return true;
-  }
-};
-
 DXGI_FORMAT NrdDxgiFormat(nrd::Format format) {
   switch (format) {
     case nrd::Format::R8_UNORM:             return DXGI_FORMAT_R8_UNORM;
@@ -127,7 +43,7 @@ DXGI_FORMAT NrdExternalFormat(nrd::ResourceType type) {
   switch (type) {
     case nrd::ResourceType::IN_MV:                     return DXGI_FORMAT_R16G16_FLOAT;
     case nrd::ResourceType::IN_NORMAL_ROUGHNESS:       return DXGI_FORMAT_R10G10B10A2_UNORM;
-    case nrd::ResourceType::IN_VIEWZ:                  return DXGI_FORMAT_R16_FLOAT;
+    case nrd::ResourceType::IN_VIEWZ:                  return DXGI_FORMAT_R32_FLOAT;
     case nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST:
     case nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST:
     case nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST:
@@ -148,7 +64,10 @@ uint32_t NrdPixelBytes(DXGI_FORMAT format) {
     case DXGI_FORMAT_R16G16_FLOAT:       return 4u;
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8u;
     case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R32_UINT:
     case DXGI_FORMAT_R11G11B10_FLOAT:    return 4u;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_UINT:  return 16u;
     default:                             return 0u;
   }
 }
@@ -236,10 +155,14 @@ bool NrdCreateUploadBuffer(ID3D12Device* device, uint64_t bytes, ComPtr<ID3D12Re
   desc.SampleDesc.Count = 1u;
   desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
   const D3D12_HEAP_PROPERTIES heap = NrdHeapProperties(D3D12_HEAP_TYPE_UPLOAD);
-  return Check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                               IID_PPV_ARGS(output->GetAddressOf())),
-               "create NRD upload buffer");
+  const HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                     IID_PPV_ARGS(output->GetAddressOf()));
+  if (FAILED(hr)) {
+    std::fprintf(stderr, "NRD upload allocation removed reason=0x%08lx bytes=%llu\n",
+                 static_cast<unsigned long>(device->GetDeviceRemovedReason()), static_cast<unsigned long long>(bytes));
+  }
+  return Check(hr, "create NRD upload buffer");
 }
 
 bool NrdCreateReadbackBuffer(ID3D12Device* device, uint64_t bytes, ComPtr<ID3D12Resource>* output) {
@@ -257,6 +180,25 @@ bool NrdCreateReadbackBuffer(ID3D12Device* device, uint64_t bytes, ComPtr<ID3D12
                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                IID_PPV_ARGS(output->GetAddressOf())),
                "create NRD readback buffer");
+}
+
+bool NrdCreateBuffer(ID3D12Device* device, D3D12_HEAP_TYPE heap_type, uint64_t bytes,
+                     D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES initial_state,
+                     ComPtr<ID3D12Resource>* output) {
+  if (device == nullptr || bytes == 0u || output == nullptr) return false;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  desc.Width = bytes;
+  desc.Height = 1u;
+  desc.DepthOrArraySize = 1u;
+  desc.MipLevels = 1u;
+  desc.SampleDesc.Count = 1u;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  desc.Flags = flags;
+  const D3D12_HEAP_PROPERTIES heap = NrdHeapProperties(heap_type);
+  return Check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, initial_state,
+                                               nullptr, IID_PPV_ARGS(output->GetAddressOf())),
+               "create camera probe buffer");
 }
 
 bool NrdCreateSlotResources(ID3D12Device* device, const nrd::InstanceDesc& instance_desc,
@@ -326,6 +268,9 @@ bool NrdCreateSlotResources(ID3D12Device* device, const nrd::InstanceDesc& insta
   const uint64_t cb_stride = (instance_desc.constantBufferMaxDataSize + 255u) & ~uint64_t(255u);
   const uint64_t cb_bytes = cb_stride * dispatches_num;
   if (!NrdCreateUploadBuffer(device, cb_bytes, &slot->constants)) return false;
+  slot->dispatch_descriptors = slot->descriptors;
+  slot->dispatch_constants = slot->constants;
+  slot->dispatch_count = dispatches_num;
   D3D12_RANGE no_read = {0u, 0u};
   void* constants = nullptr;
   if (!Check(slot->constants->Map(0u, &no_read, &constants), "map NRD constants")) return false;
@@ -592,7 +537,8 @@ bool NrdUploadSyntheticInputs(ID3D12Device* device, ID3D12GraphicsCommandList* l
 
 bool NrdRecordDispatches(ID3D12Device* device, const nrd::InstanceDesc& instance_desc,
                          const nrd::DispatchDesc* dispatches, uint32_t dispatches_num,
-                         NrdNativePipelines* native_pipelines, falcom_world::rt12::Rt12NrdResourcePools* pools,
+                         falcom_world::rt12::Rt12NrdPipelineSet* native_pipelines,
+                         falcom_world::rt12::Rt12NrdResourcePools* pools,
                          falcom_world::rt12::Rt12NrdSlot* slot, uint32_t descriptor_stride) {
   if (device == nullptr || dispatches == nullptr || native_pipelines == nullptr || pools == nullptr || slot == nullptr) {
     return false;
@@ -745,6 +691,715 @@ bool NrdRecordDispatches(ID3D12Device* device, const nrd::InstanceDesc& instance
   return Check(list->Close(), "close NRD command list");
 }
 
+bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fence* fence,
+                         ID3D12InfoQueue* info_queue, bool debug_layer_enabled,
+                         falcom_world::rt12::Rt12NrdGeneration* generation, const nrd::InstanceDesc& instance_desc,
+                         falcom_world::rt12::Rt12NrdPipelineSet* pipelines,
+                         falcom_world::rt12::Rt12NrdResourcePools* pools, falcom_world::rt12::Rt12NrdSlot* nrd_slot,
+                         const nrd::DispatchDesc* dispatches, uint32_t dispatch_count,
+                         uint32_t descriptor_stride, uint64_t* fence_value) {
+  using namespace falcom_world::rt12;
+  constexpr uint32_t width = 13u, height = 9u, pixel_count = width * height;
+  if (device == nullptr || queue == nullptr || fence == nullptr || info_queue == nullptr || generation == nullptr
+      || pipelines == nullptr || pools == nullptr || nrd_slot == nullptr || dispatches == nullptr
+      || fence_value == nullptr) return false;
+  Rt12NrdSlot& slot = *nrd_slot;
+  ComPtr<ID3D12DescriptorHeap> prep_heap;
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  heap_desc.NumDescriptors = 13u;
+  heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  if (!Check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&prep_heap)), "create N1 prep heap")) return false;
+  const uint32_t descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  const D3D12_CPU_DESCRIPTOR_HANDLE heap_cpu = prep_heap->GetCPUDescriptorHandleForHeapStart();
+  const D3D12_GPU_DESCRIPTOR_HANDLE heap_gpu = prep_heap->GetGPUDescriptorHandleForHeapStart();
+  const auto cpu_at = [&](uint32_t index) {
+    return D3D12_CPU_DESCRIPTOR_HANDLE{heap_cpu.ptr + static_cast<SIZE_T>(index) * descriptor_size};
+  };
+  const std::array<DXGI_FORMAT, 8u> formats = {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32B32A32_UINT,
+                                               DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                               DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_UNKNOWN,
+                                               DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_UINT};
+  std::array<Rt12NrdTexture, 7u> inputs = {};
+  for (uint32_t index = 0u; index < formats.size(); ++index) {
+    if (index == 5u) continue;
+    const uint32_t resource_index = index < 5u ? index : index - 1u;
+    const uint32_t input_width = index == 2u ? RTXDI_SURFACE_SCENE_ROW_COUNT : width;
+    const uint32_t input_height = index == 2u ? 1u : height;
+    if (!NrdCreateTexture(device, input_width, input_height, formats[index], false, &inputs[resource_index])) return false;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+    view.Format = formats[index];
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (index == 5u) {
+      view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+      view.Buffer.NumElements = 1u;
+      view.Buffer.StructureByteStride = 144u;
+    } else {
+      view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      view.Texture2D.MipLevels = 1u;
+    }
+    device->CreateShaderResourceView(index == 5u ? nullptr : inputs[resource_index].resource.Get(), &view, cpu_at(index));
+  }
+  const std::array<nrd::ResourceType, 5u> prep_output_types = {nrd::ResourceType::IN_MV,
+                                                               nrd::ResourceType::IN_NORMAL_ROUGHNESS,
+                                                               nrd::ResourceType::IN_VIEWZ,
+                                                               nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST,
+                                                               nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST};
+  for (uint32_t index = 0u; index < prep_output_types.size(); ++index) {
+    Rt12NrdTexture& target = slot.resources[static_cast<uint32_t>(prep_output_types[index])];
+    Rt12NrdTexture uav_target;
+    if (!NrdCreateTexture(device, width, height, target.format, true, &uav_target)) {
+      std::fprintf(stderr, "FAIL N1 prep output texture type=%u format=%u\n",
+                   static_cast<uint32_t>(prep_output_types[index]), static_cast<uint32_t>(target.format));
+      return false;
+    }
+    target = std::move(uav_target);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
+    view.Format = target.format;
+    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(target.resource.Get(), nullptr, &view, cpu_at(8u + index));
+  }
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT r10_support = {};
+  r10_support.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+  const HRESULT feature_hr = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &r10_support, sizeof(r10_support));
+  if (FAILED(feature_hr) || (r10_support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) == 0u) {
+    std::fprintf(stderr, "FAIL N1 prep R10 typed UAV feature hr=0x%08lx support=0x%08lx\n",
+                 static_cast<unsigned long>(feature_hr), static_cast<unsigned long>(r10_support.Support1));
+    return false;
+  }
+  const auto bytes = [](const auto& values) {
+    std::vector<uint8_t> result(values.size() * sizeof(values[0]));
+    std::memcpy(result.data(), values.data(), result.size());
+    return result;
+  };
+  std::vector<float> depth(pixel_count, 0.5f);
+  std::vector<uint32_t> normal(pixel_count * 4u, 0u);
+  std::vector<uint32_t> scene(RTXDI_SURFACE_SCENE_ROW_COUNT * 4u, 0u);
+  const auto set_row = [&](uint32_t row, std::array<float, 4u> values) {
+    for (uint32_t component = 0u; component < 4u; ++component) scene[row * 4u + component] = std::bit_cast<uint32_t>(values[component]);
+  };
+  set_row(0u, {1.0f, 0.0f, 0.0f, 0.0f});
+  set_row(1u, {0.0f, 1.0f, 0.0f, 0.0f});
+  set_row(2u, {0.0f, 0.0f, -140000.0f, 0.0f});
+  set_row(3u, {0.0f, 0.0f, 0.0f, 1.0f});
+  set_row(20u, {1.0f, 0.0f, 0.0f, 0.0f});
+  set_row(21u, {0.0f, 1.0f, 0.0f, 0.0f});
+  set_row(22u, {0.0f, 0.0f, 1.0f, 0.0f});
+  set_row(23u, {0.0f, 0.0f, 0.0f, 1.0f});
+  std::vector<float> motion(pixel_count * 4u, 0.0f);
+  std::vector<uint32_t> mrt2(pixel_count * 4u, 0u);
+  std::vector<uint16_t> n1_diffuse(pixel_count * 4u, 0u);
+  std::vector<uint32_t> n1_status(pixel_count, 0u);
+  for (uint32_t pixel = 0u; pixel < pixel_count; ++pixel) {
+    motion[pixel * 4u] = 0.5f;
+    motion[pixel * 4u + 1u] = -0.25f;
+    const uint32_t scenario = pixel & 3u;
+    n1_status[pixel] = scenario == 0u ? 9u : scenario == 1u ? 10u
+                                         : scenario == 2u   ? 3u
+                                                            : 4u;
+    if (scenario == 0u || scenario >= 2u) {
+      n1_diffuse[pixel * 4u + 0u] = NrdFloatToHalf(0.5f);
+      n1_diffuse[pixel * 4u + 1u] = NrdFloatToHalf(0.25f);
+      n1_diffuse[pixel * 4u + 2u] = NrdFloatToHalf(0.125f);
+      n1_diffuse[pixel * 4u + 3u] = NrdFloatToHalf(2.0f);
+    }
+  }
+  Rt12NrdSlot upload_slot;
+  if (!Check(slot.allocator->Reset(), "reset N1 prep allocator")
+      || !Check(slot.command_list->Reset(slot.allocator.Get(), nullptr), "reset N1 prep list")) return false;
+  const std::array<std::vector<uint8_t>, 7u> upload_pixels = {bytes(depth), bytes(normal), bytes(scene), bytes(motion),
+                                                              bytes(mrt2), bytes(n1_diffuse), bytes(n1_status)};
+  for (uint32_t index = 0u; index < inputs.size(); ++index) {
+    if (!NrdUploadTexture(device, slot.command_list.Get(), &upload_slot, &inputs[index], upload_pixels[index])) {
+      std::fprintf(stderr, "FAIL N1 prep synthetic input upload index=%u width=%u height=%u format=%u bytes=%llu\n",
+                   index, inputs[index].width, inputs[index].height, static_cast<uint32_t>(inputs[index].format),
+                   static_cast<unsigned long long>(upload_pixels[index].size()));
+      return false;
+    }
+  }
+  for (Rt12NrdTexture& source : inputs) {
+    if (source.resource == nullptr) continue;
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    NrdTransition(slot.command_list.Get(), &source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &barriers);
+    if (!barriers.empty()) slot.command_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  }
+  for (nrd::ResourceType type : prep_output_types) {
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    NrdTransition(slot.command_list.Get(), &slot.resources[static_cast<uint32_t>(type)],
+                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &barriers);
+    if (!barriers.empty()) slot.command_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  }
+  ComPtr<ID3D12RootSignature> prep_root;
+  ComPtr<ID3D12PipelineState> prep_pso;
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[0].NumDescriptors = 8u;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  ranges[1].NumDescriptors = 5u;
+  D3D12_ROOT_PARAMETER parameters[3] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[0].Constants.ShaderRegister = 0u;
+  parameters[0].Constants.Num32BitValues = 10u;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[1].DescriptorTable.NumDescriptorRanges = 1u;
+  parameters[1].DescriptorTable.pDescriptorRanges = &ranges[0];
+  parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[2].DescriptorTable.NumDescriptorRanges = 1u;
+  parameters[2].DescriptorTable.pDescriptorRanges = &ranges[1];
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 3u;
+  root_desc.pParameters = parameters;
+  ComPtr<ID3DBlob> root_blob, root_errors;
+  if (!Check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &root_blob, &root_errors),
+             "serialize N1 prep root")) return false;
+  if (!Check(device->CreateRootSignature(0u, root_blob->GetBufferPointer(), root_blob->GetBufferSize(), IID_PPV_ARGS(&prep_root)),
+             "create N1 prep root")) return false;
+  D3D12_COMPUTE_PIPELINE_STATE_DESC prep_pipeline = {};
+  prep_pipeline.pRootSignature = prep_root.Get();
+  prep_pipeline.CS = {__world_rtxdi_nrd_prep.data(), __world_rtxdi_nrd_prep.size()};
+  if (!Check(device->CreateComputePipelineState(&prep_pipeline, IID_PPV_ARGS(&prep_pso)), "create N1 prep PSO")) return false;
+  ID3D12DescriptorHeap* prep_heaps[] = {prep_heap.Get()};
+  slot.command_list->SetDescriptorHeaps(1u, prep_heaps);
+  slot.command_list->SetComputeRootSignature(prep_root.Get());
+  slot.command_list->SetPipelineState(prep_pso.Get());
+  const std::array<uint32_t, 10u> prep_constants = {width, height, 0u, 0u,
+                                                    std::bit_cast<uint32_t>(0.125f),
+                                                    std::bit_cast<uint32_t>(-0.25f), 0u, 0u, 1u, 0u};
+  slot.command_list->SetComputeRoot32BitConstants(0u, 10u, prep_constants.data(), 0u);
+  slot.command_list->SetComputeRootDescriptorTable(1u, heap_gpu);
+  slot.command_list->SetComputeRootDescriptorTable(2u, {heap_gpu.ptr + static_cast<UINT64>(8u) * descriptor_size});
+  slot.command_list->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
+  for (Rt12NrdTexture& source : inputs) {
+    if (source.resource == nullptr) continue;
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    NrdTransition(slot.command_list.Get(), &source, D3D12_RESOURCE_STATE_COMMON, &barriers);
+    if (!barriers.empty()) slot.command_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  }
+  for (nrd::ResourceType type : prep_output_types) slot.resources[static_cast<uint32_t>(type)].unordered_access_written = true;
+
+  nrd::CommonSettings common = {};
+  for (uint32_t diagonal = 0u; diagonal < 4u; ++diagonal) {
+    common.viewToClipMatrix[diagonal * 5u] = common.viewToClipMatrixPrev[diagonal * 5u] = 1.0f;
+    common.worldToViewMatrix[diagonal * 5u] = common.worldToViewMatrixPrev[diagonal * 5u] = 1.0f;
+  }
+  common.resourceSize[0] = common.resourceSizePrev[0] = common.rectSize[0] = common.rectSizePrev[0] = width;
+  common.resourceSize[1] = common.resourceSizePrev[1] = common.rectSize[1] = common.rectSizePrev[1] = height;
+  common.motionVectorScale[0] = common.motionVectorScale[1] = 1.0f;
+  common.accumulationMode = nrd::AccumulationMode::RESTART;
+  common.frameIndex = 0u;
+  if (nrd::SetCommonSettings(*generation->Instance(), common) != nrd::Result::SUCCESS) return false;
+  nrd::RelaxSettings relax = {};
+  relax.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::OFF;
+  relax.minMaterialForDiffuse = 0.0f;
+  relax.minMaterialForSpecular = 0.0f;
+  if (nrd::SetDenoiserSettings(*generation->Instance(), 1u, &relax) != nrd::Result::SUCCESS) return false;
+  const nrd::Identifier identifier = 1u;
+  const nrd::DispatchDesc* frame_dispatches = nullptr;
+  uint32_t frame_dispatch_count = 0u;
+  if (nrd::GetComputeDispatches(*generation->Instance(), &identifier, 1u, frame_dispatches, frame_dispatch_count)
+          != nrd::Result::SUCCESS
+      || frame_dispatches == nullptr || frame_dispatch_count == 0u) return false;
+  slot.dispatch_descriptors = slot.descriptors;
+  slot.dispatch_constants = slot.constants;
+  slot.dispatch_count = frame_dispatch_count;
+  // The prep pass wrote external input UAVs, so preserve their tracked state for the shared recorder.
+  for (nrd::ResourceType type : prep_output_types) {
+    slot.resources[static_cast<uint32_t>(type)].state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  }
+  if (!Rt12NrdRecordDispatches(device, slot.command_list.Get(), instance_desc, frame_dispatches,
+                               frame_dispatch_count, pipelines, pools, &slot, descriptor_stride)) {
+    std::fprintf(stderr, "FAIL shared N1 prep RELAX dispatch recorder count=%u\n", frame_dispatch_count);
+    return false;
+  }
+  const auto copy_texture_to_readback = [&](Rt12NrdTexture* texture, ID3D12Resource* readback,
+                                            D3D12_PLACED_SUBRESOURCE_FOOTPRINT* footprint_out) {
+    if (texture == nullptr || !texture->resource || readback == nullptr || footprint_out == nullptr) return false;
+    const D3D12_RESOURCE_DESC desc = texture->resource->GetDesc();
+    UINT rows = 0u;
+    UINT64 row_bytes = 0u, total_bytes = 0u;
+    device->GetCopyableFootprints(&desc, 0u, 1u, 0u, footprint_out, &rows, &row_bytes, &total_bytes);
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    NrdTransition(slot.command_list.Get(), texture, D3D12_RESOURCE_STATE_COPY_SOURCE, &barriers);
+    if (!barriers.empty()) slot.command_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    D3D12_TEXTURE_COPY_LOCATION source = {};
+    source.pResource = texture->resource.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION destination = {};
+    destination.pResource = readback;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint = *footprint_out;
+    slot.command_list->CopyTextureRegion(&destination, 0u, 0u, 0u, &source, nullptr);
+    barriers.clear();
+    NrdTransition(slot.command_list.Get(), texture, D3D12_RESOURCE_STATE_COMMON, &barriers);
+    if (!barriers.empty()) slot.command_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    return rows == height && total_bytes <= readback->GetDesc().Width;
+  };
+  ComPtr<ID3D12Resource> prep_diffuse_readback, prep_specular_readback, prep_viewz_readback;
+  const std::array<nrd::ResourceType, 4u> check_types = {nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST,
+                                                         nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST,
+                                                         nrd::ResourceType::IN_VIEWZ,
+                                                         nrd::ResourceType::IN_MV};
+  std::array<ComPtr<ID3D12Resource>, 4u> check_readbacks = {};
+  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 4u> check_footprints = {};
+  bool prep_inputs_valid = true;
+  for (uint32_t index = 0u; index < check_types.size(); ++index) {
+    Rt12NrdTexture& texture = slot.resources[static_cast<uint32_t>(check_types[index])];
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    UINT rows = 0u;
+    UINT64 row_bytes = 0u, total_bytes = 0u;
+    const D3D12_RESOURCE_DESC texture_desc = texture.resource->GetDesc();
+    device->GetCopyableFootprints(&texture_desc, 0u, 1u, 0u, &footprint, &rows, &row_bytes, &total_bytes);
+    if (!NrdCreateReadbackBuffer(device, total_bytes, &check_readbacks[index])
+        || !copy_texture_to_readback(&texture, check_readbacks[index].Get(), &check_footprints[index])) return false;
+  }
+  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2u> output_footprints = {};
+  if (!copy_texture_to_readback(&slot.resources[static_cast<uint32_t>(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST)],
+                                slot.diffuse_readback.Get(), &output_footprints[0])
+      || !copy_texture_to_readback(&slot.resources[static_cast<uint32_t>(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST)],
+                                   slot.specular_readback.Get(), &output_footprints[1])) return false;
+  if (!Check(slot.command_list->Close(), "close N1 prep + RELAX list")) return false;
+  ID3D12CommandList* lists[] = {slot.command_list.Get()};
+  queue->ExecuteCommandLists(1u, lists);
+  if (!NrdWaitForFence(queue, fence, ++*fence_value)) return false;
+  for (uint32_t index = 0u; index < check_types.size(); ++index) {
+    void* mapped = nullptr;
+    const D3D12_RANGE range = {0u, static_cast<SIZE_T>(check_readbacks[index]->GetDesc().Width)};
+    if (FAILED(check_readbacks[index]->Map(0u, &range, &mapped))) return false;
+    const uint8_t* pixels = static_cast<const uint8_t*>(mapped);
+    bool valid = true;
+    for (uint32_t pixel = 0u; pixel < pixel_count && valid; ++pixel) {
+      const uint32_t x = pixel % width, y = pixel / width;
+      const uint8_t* value = pixels + check_footprints[index].Offset
+                             + static_cast<size_t>(y) * check_footprints[index].Footprint.RowPitch;
+      if (index < 2u) {
+        const auto* half = reinterpret_cast<const uint16_t*>(value) + x * 4u;
+        for (uint32_t channel = 0u; channel < 4u; ++channel) {
+          const float component = NrdHalfToFloat(half[channel]);
+          const uint32_t scenario = pixel & 3u;
+          const float expected = index == 0u && scenario == 0u && channel == 0u   ? 0.5f
+                                 : index == 0u && scenario == 0u && channel == 1u ? 0.25f
+                                 : index == 0u && scenario == 0u && channel == 2u ? 0.125f
+                                 : index == 0u && scenario == 0u && channel == 3u ? 2.0f
+                                                                                  : 0.0f;
+          if (!std::isfinite(component) || std::abs(component - expected) > 0.002f) {
+            std::fprintf(stderr, "N1 prep mismatch guide=%u pixel=%u channel=%u status=%u actual=%g expected=%g\n",
+                         index, pixel, channel, n1_status[pixel], component, expected);
+            valid = false;
+          }
+        }
+      } else if (index == 2u) {
+        const auto* viewz = reinterpret_cast<const float*>(value) + x;
+        const uint32_t scenario = pixel & 3u;
+        const float expected = scenario < 2u ? 70000.0f : 0.0f;
+        if (!std::isfinite(*viewz) || std::abs(*viewz - expected) > 0.5f) valid = false;
+      } else {
+        const auto* half = reinterpret_cast<const uint16_t*>(value) + x * 2u;
+        const float expected_x = (0.5f - 0.125f) / static_cast<float>(width);
+        const float expected_y = 0.0f;
+        if (!std::isfinite(NrdHalfToFloat(half[0])) || !std::isfinite(NrdHalfToFloat(half[1]))
+            || std::abs(NrdHalfToFloat(half[0]) - expected_x) > 0.0001f
+            || std::abs(NrdHalfToFloat(half[1]) - expected_y) > 0.0001f) valid = false;
+      }
+    }
+    const D3D12_RANGE no_write = {0u, 0u};
+    check_readbacks[index]->Unmap(0u, &no_write);
+    if (!valid) {
+      std::fprintf(stderr, "FAIL N1 prep guide/status output index=%u\n", index);
+      prep_inputs_valid = false;
+    }
+  }
+  if (!prep_inputs_valid) return false;
+  if (!NrdReadbackOutput(device,
+                         slot.resources[static_cast<uint32_t>(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST)].resource.Get(),
+                         slot.diffuse_readback.Get(), width, height, "N1-prepared RELAX diffuse")
+      || !NrdReadbackOutput(device,
+                            slot.resources[static_cast<uint32_t>(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST)].resource.Get(),
+                            slot.specular_readback.Get(), width, height, "N1-prepared zero-spec RELAX specular")) return false;
+  if (!debug_layer_enabled) return false;
+  const UINT64 messages = info_queue->GetNumStoredMessagesAllowedByRetrievalFilter();
+  if (messages != 0u) {
+    std::fprintf(stderr, "FAIL N1 prep + RELAX D3D12 InfoQueue messages=%llu\n",
+                 static_cast<unsigned long long>(messages));
+    return false;
+  }
+  std::printf("PASS N1 prep visible/blocked/unknown/empty guide readback, zero spec input, shared RELAX recorder (%ux%u)\n",
+              width, height);
+  return true;
+}
+
+bool RunCameraProbeSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12InfoQueue* info_queue) {
+  using namespace falcom_world::rt12;
+  constexpr uint32_t width = 64u, height = 36u, sample_count = 32u * 18u;
+  std::array<Rt12NrdTexture, 5u> inputs = {};
+  const std::array<DXGI_FORMAT, 5u> formats = {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT,
+                                               DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_UINT,
+                                               DXGI_FORMAT_R32G32B32A32_UINT};
+  for (uint32_t index = 0u; index < inputs.size(); ++index) {
+    if (!NrdCreateTexture(device, width, height, formats[index], false, &inputs[index])) return false;
+  }
+
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  heap_desc.NumDescriptors = 6u;
+  heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> descriptors;
+  if (!Check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&descriptors)), "create camera probe heap")) return false;
+  const uint32_t descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  auto cpu_at = [&](uint32_t index) {
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = descriptors->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(index) * descriptor_size;
+    return handle;
+  };
+  for (uint32_t index = 0u; index < inputs.size(); ++index) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+    view.Format = formats[index];
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2D.MipLevels = 1u;
+    device->CreateShaderResourceView(inputs[index].resource.Get(), &view, cpu_at(index));
+  }
+
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[0].NumDescriptors = 5u;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  ranges[1].NumDescriptors = 1u;
+  D3D12_ROOT_PARAMETER parameters[3] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  parameters[0].Descriptor.ShaderRegister = 0u;
+  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[1].DescriptorTable.NumDescriptorRanges = 1u;
+  parameters[1].DescriptorTable.pDescriptorRanges = &ranges[0];
+  parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[2].DescriptorTable.NumDescriptorRanges = 1u;
+  parameters[2].DescriptorTable.pDescriptorRanges = &ranges[1];
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 3u;
+  root_desc.pParameters = parameters;
+  ComPtr<ID3DBlob> root_blob, root_errors;
+  if (!Check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &root_blob, &root_errors),
+             "serialize camera probe root")) return false;
+  ComPtr<ID3D12RootSignature> root;
+  if (!Check(device->CreateRootSignature(0u, root_blob->GetBufferPointer(), root_blob->GetBufferSize(),
+                                         IID_PPV_ARGS(&root)),
+             "create camera probe root")) return false;
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc = {};
+  pso_desc.pRootSignature = root.Get();
+  pso_desc.CS = {__world_rtxdi_nrd_probe.data(), __world_rtxdi_nrd_probe.size()};
+  ComPtr<ID3D12PipelineState> pso;
+  if (!Check(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso)), "create camera probe PSO")) return false;
+
+  ComPtr<ID3D12Resource> constants, output, readback, timestamps;
+  if (!NrdCreateUploadBuffer(device, 512u, &constants)
+      || !NrdCreateBuffer(device, D3D12_HEAP_TYPE_DEFAULT, sample_count * 2u * sizeof(uint32_t),
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &output)
+      || !NrdCreateReadbackBuffer(device, sample_count * 2u * sizeof(uint32_t), &readback)
+      || !NrdCreateReadbackBuffer(device, 2u * sizeof(uint64_t), &timestamps)) return false;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC output_view = {};
+  output_view.Format = DXGI_FORMAT_UNKNOWN;
+  output_view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  output_view.Buffer.NumElements = sample_count * 2u;
+  output_view.Buffer.StructureByteStride = sizeof(uint32_t);
+  device->CreateUnorderedAccessView(output.Get(), nullptr, &output_view, cpu_at(5u));
+
+  ComPtr<ID3D12QueryHeap> query_heap;
+  D3D12_QUERY_HEAP_DESC query_desc = {};
+  query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  query_desc.Count = 2u;
+  if (!Check(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&query_heap)), "create camera probe timestamps")) return false;
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ComPtr<ID3D12GraphicsCommandList> list;
+  if (!Check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
+             "create camera probe allocator")
+      || !Check(device->CreateCommandList(0u, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), pso.Get(),
+                                          IID_PPV_ARGS(&list)),
+                "create camera probe list")) return false;
+
+  constexpr float near_z = 0.1f, far_z = 100.0f;
+  const auto make_projection = [&](float jitter_x, float jitter_y) {
+    const float p22 = far_z / (near_z - far_z);
+    const float p32 = near_z * far_z / (near_z - far_z);
+    return falcom_world::rtxdi::CameraMatrix{1.0f, 0.0f, 0.0f, 0.0f,
+                                             0.0f, 1.0f, 0.0f, 0.0f,
+                                             -2.0f * jitter_x / width, 2.0f * jitter_y / height, p22, -1.0f,
+                                             0.0f, 0.0f, p32, 0.0f};
+  };
+  constexpr float current_jitter_x = 0.1f, current_jitter_y = -0.1f;
+  constexpr float previous_jitter_x = 0.3f, previous_jitter_y = 0.2f;
+  const auto current_projection = make_projection(current_jitter_x, current_jitter_y);
+  const auto previous_projection = make_projection(previous_jitter_x, previous_jitter_y);
+  auto non_jittered_projection = make_projection(0.0f, 0.0f);
+  falcom_world::rtxdi::CameraMatrix current_inverse = {}, previous_inverse = {};
+  if (!falcom_world::rtxdi::InvertCameraMatrix(current_projection, &current_inverse)
+      || !falcom_world::rtxdi::InvertCameraMatrix(previous_projection, &previous_inverse)) return false;
+  const auto pack_matrix = [](const falcom_world::rtxdi::CameraMatrix& matrix, float* output_values) {
+    std::copy(matrix.begin(), matrix.end(), output_values);
+  };
+
+  std::vector<uint8_t> depth_pixels(static_cast<size_t>(width) * height * sizeof(float));
+  const float plane_depth = far_z / (far_z - near_z) - (near_z * far_z / (far_z - near_z)) / 10.0f;
+  for (size_t pixel = 0u; pixel < static_cast<size_t>(width) * height; ++pixel) {
+    std::memcpy(depth_pixels.data() + pixel * sizeof(float), &plane_depth, sizeof(plane_depth));
+  }
+  std::vector<uint8_t> motion_pixels(static_cast<size_t>(width) * height * sizeof(float) * 4u, 0u);
+  std::vector<uint8_t> normal_pixels(static_cast<size_t>(width) * height * sizeof(uint32_t) * 4u, 0u);
+  const std::array<uint32_t, 4u> normal = {1024u, 1024u, 3072u, 8u};
+  for (size_t pixel = 0u; pixel < static_cast<size_t>(width) * height; ++pixel) {
+    std::memcpy(normal_pixels.data() + pixel * sizeof(normal), normal.data(), sizeof(normal));
+  }
+
+  Rt12NrdSlot staging_slot;
+  if (!NrdUploadTexture(device, list.Get(), &staging_slot, &inputs[0], depth_pixels)
+      || !NrdUploadTexture(device, list.Get(), &staging_slot, &inputs[1], depth_pixels)
+      || !NrdUploadTexture(device, list.Get(), &staging_slot, &inputs[2], motion_pixels)
+      || !NrdUploadTexture(device, list.Get(), &staging_slot, &inputs[3], normal_pixels)
+      || !NrdUploadTexture(device, list.Get(), &staging_slot, &inputs[4], normal_pixels)) return false;
+  D3D12_RESOURCE_BARRIER input_barriers[5] = {};
+  for (uint32_t index = 0u; index < inputs.size(); ++index) {
+    input_barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    input_barriers[index].Transition.pResource = inputs[index].resource.Get();
+    input_barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    input_barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    input_barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    inputs[index].state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  }
+  list->ResourceBarrier(static_cast<UINT>(inputs.size()), input_barriers);
+  if (!Check(list->Close(), "close camera probe upload list")) return false;
+  ID3D12CommandList* upload_lists[] = {list.Get()};
+  queue->ExecuteCommandLists(1u, upload_lists);
+  ComPtr<ID3D12Fence> fence;
+  if (!Check(device->CreateFence(0u, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "create camera probe fence")) return false;
+  uint64_t fence_value = 1u;
+  if (!NrdWaitForFence(queue, fence.Get(), fence_value)) return false;
+  staging_slot.staging.clear();
+
+  const std::array<std::array<float, 2u>, 2u> corrections = {{{0.2f, 0.3f}, {0.4f, 0.6f}}};
+  float best_gpu_microseconds = -1.0f;
+  falcom_world::rtxdi::CameraQualification qualification = {};
+  double record_cpu_microseconds = 0.0;
+  double readback_cpu_microseconds = 0.0;
+  for (uint32_t scenario = 0u; scenario < 7u; ++scenario) {
+    const uint32_t expected_correction = scenario == 4u ? 1u : 0u;
+    const bool reject_previous_class = scenario == 5u;
+    const bool reject_previous_depth = scenario == 6u;
+    const auto record_start = std::chrono::steady_clock::now();
+    Rt12NrdProbeConstants probe_constants = {};
+    probe_constants.resource_size[0] = width;
+    probe_constants.resource_size[1] = height;
+    probe_constants.current_jitter_pixels[0] = current_jitter_x;
+    probe_constants.current_jitter_pixels[1] = current_jitter_y;
+    probe_constants.previous_jitter_pixels[0] = previous_jitter_x;
+    probe_constants.previous_jitter_pixels[1] = previous_jitter_y;
+    for (uint32_t index = 0u; index < 2u; ++index) {
+      probe_constants.motion_correction_pixels[index][0] = corrections[index][0];
+      probe_constants.motion_correction_pixels[index][1] = corrections[index][1];
+    }
+    falcom_world::rtxdi::CameraMatrix previous_view = {1.0f, 0.0f, 0.0f, 0.0f,
+                                                       0.0f, 1.0f, 0.0f, 0.0f,
+                                                       0.0f, 0.0f, 1.0f, 0.0f,
+                                                       -0.05f, 0.0f, 0.0f, 1.0f};
+    const auto previous_jittered_vp = falcom_world::rtxdi::MultiplyCameraMatrices(previous_view, previous_projection);
+    const auto previous_non_jittered_vp = falcom_world::rtxdi::MultiplyCameraMatrices(previous_view,
+                                                                                      non_jittered_projection);
+    if (!falcom_world::rtxdi::InvertCameraMatrix(previous_jittered_vp, &previous_inverse)) return false;
+    pack_matrix(current_inverse, probe_constants.current_inverse_view_projection);
+    pack_matrix(previous_inverse, probe_constants.previous_inverse_view_projection);
+    pack_matrix(non_jittered_projection, probe_constants.current_view_projection_non_jittered);
+    pack_matrix(previous_non_jittered_vp, probe_constants.previous_view_projection_non_jittered);
+    pack_matrix(previous_view, probe_constants.previous_view);
+    void* constants_map = nullptr;
+    const D3D12_RANGE no_read = {0u, 0u};
+    if (!Check(constants->Map(0u, &no_read, &constants_map), "map camera probe constants")) return false;
+    std::memset(constants_map, 0, 512u);
+    std::memcpy(constants_map, &probe_constants, sizeof(probe_constants));
+    constants->Unmap(0u, nullptr);
+
+    std::vector<uint8_t> selected_motion(static_cast<size_t>(width) * height * sizeof(float) * 4u, 0u);
+    const std::array<float, 2u> expected_motion = {-0.16f, 0.0f};
+    const std::array<uint32_t, 4u> mismatched_previous_normal = {1024u, 1024u, 3072u, 0u};
+    std::vector<uint8_t> previous_normal_pixels;
+    if (reject_previous_class) previous_normal_pixels.resize(normal_pixels.size());
+    std::vector<uint8_t> invalid_previous_depth;
+    if (reject_previous_depth) invalid_previous_depth.resize(depth_pixels.size(), 0u);
+    for (size_t pixel = 0u; pixel < static_cast<size_t>(width) * height; ++pixel) {
+      const std::array<float, 2u> game_motion = {corrections[expected_correction][0] + expected_motion[0],
+                                                 corrections[expected_correction][1] + expected_motion[1]};
+      std::memcpy(selected_motion.data() + pixel * sizeof(float) * 4u, game_motion.data(), sizeof(game_motion));
+      if (reject_previous_class) {
+        std::memcpy(previous_normal_pixels.data() + pixel * sizeof(mismatched_previous_normal),
+                    mismatched_previous_normal.data(), sizeof(mismatched_previous_normal));
+      }
+    }
+    if (!Check(list->Reset(allocator.Get(), pso.Get()), "reset camera probe list")) return false;
+    if (!NrdUploadTexture(device, list.Get(), &staging_slot, &inputs[2], selected_motion)) return false;
+    if (reject_previous_class
+        && !NrdUploadTexture(device, list.Get(), &staging_slot, &inputs[4], previous_normal_pixels)) return false;
+    if (reject_previous_depth
+        && !NrdUploadTexture(device, list.Get(), &staging_slot, &inputs[4], normal_pixels)) return false;
+    if (reject_previous_depth
+        && !NrdUploadTexture(device, list.Get(), &staging_slot, &inputs[1], invalid_previous_depth)) return false;
+    D3D12_RESOURCE_BARRIER to_shader[3] = {};
+    to_shader[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_shader[0].Transition.pResource = inputs[2].resource.Get();
+    to_shader[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_shader[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    to_shader[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    inputs[2].state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    UINT to_shader_count = 1u;
+    if (reject_previous_class || reject_previous_depth) {
+      to_shader[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      to_shader[1].Transition.pResource = inputs[4].resource.Get();
+      to_shader[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      to_shader[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+      to_shader[1].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      inputs[4].state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      to_shader_count = 2u;
+    }
+    if (reject_previous_depth) {
+      to_shader[to_shader_count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      to_shader[to_shader_count].Transition.pResource = inputs[1].resource.Get();
+      to_shader[to_shader_count].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      to_shader[to_shader_count].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+      to_shader[to_shader_count].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      inputs[1].state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      ++to_shader_count;
+    }
+    list->ResourceBarrier(to_shader_count, to_shader);
+    D3D12_RESOURCE_BARRIER to_uav = {};
+    to_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_uav.Transition.pResource = output.Get();
+    to_uav.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_uav.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    to_uav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(1u, &to_uav);
+    ID3D12DescriptorHeap* visible_heaps[] = {descriptors.Get()};
+    list->SetDescriptorHeaps(1u, visible_heaps);
+    list->SetComputeRootSignature(root.Get());
+    list->SetComputeRootConstantBufferView(0u, constants->GetGPUVirtualAddress());
+    const D3D12_GPU_DESCRIPTOR_HANDLE table = descriptors->GetGPUDescriptorHandleForHeapStart();
+    list->SetComputeRootDescriptorTable(1u, table);
+    D3D12_GPU_DESCRIPTOR_HANDLE output_table = table;
+    output_table.ptr += static_cast<UINT64>(5u) * descriptor_size;
+    list->SetComputeRootDescriptorTable(2u, output_table);
+    list->SetPipelineState(pso.Get());
+    list->EndQuery(query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0u);
+    list->Dispatch(4u, 3u, 1u);
+    list->EndQuery(query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1u);
+    D3D12_RESOURCE_BARRIER output_barriers[2] = {};
+    output_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    output_barriers[0].UAV.pResource = output.Get();
+    output_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    output_barriers[1].Transition.pResource = output.Get();
+    output_barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    output_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    output_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(2u, output_barriers);
+    list->CopyBufferRegion(readback.Get(), 0u, output.Get(), 0u, sample_count * 2u * sizeof(uint32_t));
+    D3D12_RESOURCE_BARRIER output_to_common = {};
+    output_to_common.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    output_to_common.Transition.pResource = output.Get();
+    output_to_common.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    output_to_common.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    output_to_common.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    list->ResourceBarrier(1u, &output_to_common);
+    list->ResolveQueryData(query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0u, 2u, timestamps.Get(), 0u);
+    if (!Check(list->Close(), "close camera probe dispatch list")) return false;
+    record_cpu_microseconds += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - record_start).count();
+    ID3D12CommandList* dispatch_lists[] = {list.Get()};
+    queue->ExecuteCommandLists(1u, dispatch_lists);
+    if (!NrdWaitForFence(queue, fence.Get(), ++fence_value)) return false;
+
+    const auto readback_start = std::chrono::steady_clock::now();
+    void* result_map = nullptr;
+    const D3D12_RANGE read_range = {0u, sample_count * 2u * sizeof(uint32_t)};
+    if (!Check(readback->Map(0u, &read_range, &result_map), "map camera probe output")) return false;
+    const auto* result_bits = static_cast<const uint32_t*>(result_map);
+    std::array<float, sample_count> residuals[2] = {};
+    std::array<uint32_t, 2u> valid_count = {};
+    std::array<uint32_t, 16u> rejected = {};
+    for (uint32_t sample = 0u; sample < sample_count; ++sample) {
+      for (uint32_t candidate = 0u; candidate < 2u; ++candidate) {
+        const uint32_t bits = result_bits[sample * 2u + candidate];
+        const float error = std::bit_cast<float>(bits);
+        if (std::isfinite(error))
+          residuals[candidate][valid_count[candidate]++] = error;
+        else if ((bits & 0xfffffff0u) == 0x7fc00000u && (bits & 0xfu) < rejected.size())
+          ++rejected[bits & 0xfu];
+      }
+    }
+    const D3D12_RANGE no_write = {0u, 0u};
+    readback->Unmap(0u, &no_write);
+    uint32_t selected = UINT32_MAX;
+    uint32_t qualified_candidates = 0u;
+    for (uint32_t candidate = 0u; candidate < 2u; ++candidate) {
+      if (valid_count[candidate] < 64u) continue;
+      std::sort(residuals[candidate].begin(), residuals[candidate].begin() + valid_count[candidate]);
+      const float median = residuals[candidate][valid_count[candidate] / 2u];
+      const float p90 = residuals[candidate][(valid_count[candidate] * 9u) / 10u];
+      if (median <= 0.35f && p90 <= 1.0f) {
+        selected = candidate;
+        ++qualified_candidates;
+      }
+    }
+    const bool reject_all = reject_previous_class || reject_previous_depth;
+    const uint32_t expected_reason = reject_previous_class ? 8u : (reject_previous_depth ? 9u : 0u);
+    if (reject_all ? (valid_count[0] != 0u || valid_count[1] != 0u || rejected[expected_reason] != sample_count * 2u)
+                   : (selected != expected_correction || qualified_candidates != 1u)) {
+      std::fprintf(stderr, "FAIL NRD camera probe scenario=%u expected=%u actual=%u valid=%u/%u\n",
+                   scenario,
+                   expected_correction, selected, valid_count[0], valid_count[1]);
+      if (valid_count[0] != 0u) {
+        std::sort(residuals[0].begin(), residuals[0].begin() + valid_count[0]);
+        std::fprintf(stderr, "NRD camera probe diagnostic finite median=%.4f max=%.4f\n",
+                     residuals[0][valid_count[0] / 2u], residuals[0][valid_count[0] - 1u]);
+      }
+      for (uint32_t reason = 1u; reason < rejected.size(); ++reason) {
+        if (rejected[reason] != 0u) std::fprintf(stderr, "NRD camera probe rejected reason=%u count=%u\n", reason,
+                                                 rejected[reason] / 2u);
+      }
+      return false;
+    }
+    readback_cpu_microseconds += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - readback_start).count();
+    void* timestamp_map = nullptr;
+    const D3D12_RANGE timestamp_range = {0u, 2u * sizeof(uint64_t)};
+    if (!Check(timestamps->Map(0u, &timestamp_range, &timestamp_map), "map camera probe timestamps")) return false;
+    const auto* timestamp_values = static_cast<const uint64_t*>(timestamp_map);
+    uint64_t timestamp_frequency = 0u;
+    if (!Check(queue->GetTimestampFrequency(&timestamp_frequency), "get camera probe timestamp frequency")
+        || timestamp_frequency == 0u) return false;
+    best_gpu_microseconds = static_cast<double>(timestamp_values[1] - timestamp_values[0]) * 1.0e6
+                            / timestamp_frequency;
+    timestamps->Unmap(0u, &no_write);
+    staging_slot.staging.clear();
+    if (!reject_all) {
+      const bool qualified = falcom_world::rtxdi::ObserveCameraProbe(
+          &qualification, scenario, 1u, 1u, 7u, width, height, true, true, selected);
+      if (scenario < 3u && qualified) return false;
+      if (scenario == 3u && !qualified) return false;
+      std::printf("PASS NRD camera probe static-world camera-move correction=%u samples=%u median=%.4f p90=%.4f GPU=%.2f us\n",
+                  selected, valid_count[selected], residuals[selected][valid_count[selected] / 2u],
+                  residuals[selected][(valid_count[selected] * 9u) / 10u], best_gpu_microseconds);
+      if (scenario == 3u) std::printf("PASS NRD camera probe four completed frames qualify only on frame 4\n");
+    } else {
+      const bool qualified = falcom_world::rtxdi::ObserveCameraProbe(
+          &qualification, scenario, 1u, 1u, 7u, width, height, true, false, UINT32_MAX);
+      if (qualified || qualification.qualified) return false;
+      std::printf("PASS NRD camera probe rejects previous %s samples=%u and resets streak\n",
+                  reject_previous_class ? "character class" : "depth/disocclusion", rejected[expected_reason] / 2u);
+    }
+    if (info_queue->GetNumStoredMessagesAllowedByRetrievalFilter() != 0u) {
+      std::fprintf(stderr, "FAIL NRD camera probe InfoQueue messages=%llu\n",
+                   static_cast<unsigned long long>(info_queue->GetNumStoredMessagesAllowedByRetrievalFilter()));
+      return false;
+    }
+  }
+  if (qualification.qualified || qualification.consecutive_passes != 0u) return false;
+  std::printf("PASS NRD camera probe CPU staging+readback %.2f/%.2f us across seven completed submissions\n",
+              record_cpu_microseconds / 7.0, readback_cpu_microseconds / 7.0);
+  return true;
+}
+
 bool RunDispatchDescriptionSmoke() {
   using namespace falcom_world::rt12;
   Rt12NrdGeneration generation;
@@ -811,8 +1466,8 @@ bool RunDispatchDescriptionSmoke() {
     std::fprintf(stderr, "SKIP NRD D3D12 device unavailable: 0x%08lx\n", static_cast<unsigned long>(device_hr));
     return false;
   }
-  NrdNativePipelines native_pipelines;
-  if (!native_pipelines.Create(device.Get(), *instance_desc)) return false;
+  if (!generation.CreateD3D12Backend(device.Get(), D3D12SerializeRootSignature)) return false;
+  auto& native_pipelines = generation.pipelines;
   nrd::RelaxSettings relax_settings = {};
   relax_settings.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::OFF;
   const auto dispatch_stride = instance_desc->descriptorPoolDesc.perSetTexturesMaxNum
@@ -847,7 +1502,16 @@ bool RunDispatchDescriptionSmoke() {
   ComPtr<ID3D12Fence> fence;
   if (!Check(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)), "create NRD queue")
       || !Check(device->CreateFence(0u, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "create NRD fence")) return false;
+  ComPtr<ID3D12InfoQueue> info_queue;
+  if (!debug_layer_enabled || FAILED(device.As(&info_queue))) return false;
+  info_queue->ClearStoredMessages();
   uint64_t fence_value = 0u;
+  if (!RunN1PrepRelaxSmoke(device.Get(), queue.Get(), fence.Get(), info_queue.Get(), debug_layer_enabled,
+                           &generation, *instance_desc, &native_pipelines, &pools, &slot, dispatches, dispatches_num,
+                           dispatch_stride, &fence_value)) {
+    std::fprintf(stderr, "FAIL N1 prep + RELAX diffuse-only chain\n");
+    return false;
+  }
   const auto execute_frame = [&](uint32_t width, uint32_t height, uint32_t frame_index,
                                  nrd::AccumulationMode accumulation_mode,
                                  Rt12NrdSlot* frame_slot, Rt12NrdResourcePools* frame_pools) {
@@ -936,6 +1600,12 @@ bool RunDispatchDescriptionSmoke() {
       || !NrdCreateSlotResources(device.Get(), *instance_desc, dispatches, dispatches_num, 7u, 5u, &resized_pools,
                                  &resized_slot, dispatch_stride, true)
       || !execute_frame(7u, 5u, 0u, nrd::AccumulationMode::RESTART, &resized_slot, &resized_pools)) return false;
+  ComPtr<ID3D12InfoQueue> probe_info_queue;
+  if (debug_layer_enabled && SUCCEEDED(device.As(&probe_info_queue))) probe_info_queue->ClearStoredMessages();
+  if (!probe_info_queue || !RunCameraProbeSmoke(device.Get(), queue.Get(), probe_info_queue.Get())) {
+    std::fprintf(stderr, "FAIL NRD asynchronous camera-probe bridge\n");
+    return false;
+  }
   std::printf("PASS NRD D3D12 InfoQueue clean across four submissions\n");
   std::printf("PASS NRD size recreation 13x9 -> 7x5 after completed slot fence\n");
   return true;
