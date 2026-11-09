@@ -1,0 +1,52 @@
+#pragma once
+
+#ifdef __cplusplus
+#include <cstdint>
+#endif
+
+#define RTXDI_SURFACE_SCENE_ROW_COUNT             96u
+#define RTXDI_SURFACE_VIEW_ROW                    0u
+#define RTXDI_SURFACE_INVERSE_VIEW_ROW            4u
+#define RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW 20u
+#define RTXDI_SURFACE_SUN_RESERVED_ROW            26u
+#define RTXDI_SURFACE_LIGHT_TILE_SIZE_ROW          29u
+#define RTXDI_SURFACE_RESOLUTION_SCALING_ROW      49u
+
+#define RTXDI_SURFACE_FLAG_VALID     1u
+#define RTXDI_SURFACE_FLAG_CHARACTER 2u
+
+#define RTXDI_SURFACE_REJECT_NONE           0u
+#define RTXDI_SURFACE_REJECT_DIMENSIONS     1u
+#define RTXDI_SURFACE_REJECT_PIXEL          2u
+#define RTXDI_SURFACE_REJECT_SCALING        3u
+#define RTXDI_SURFACE_REJECT_DEPTH          4u
+#define RTXDI_SURFACE_REJECT_NORMAL         5u
+#define RTXDI_SURFACE_REJECT_HOMOGENEOUS_W  6u
+#define RTXDI_SURFACE_REJECT_POSITION       7u
+#define RTXDI_SURFACE_REJECT_VIEW_DIRECTION 8u
+#define RTXDI_SURFACE_REJECT_VIEW_DEPTH     9u
+
+#define RTXDI_SUN_RESULT_STRIDE 16u
+#define RTXDI_SUN_STATUS_UNKNOWN 0u
+#define RTXDI_SUN_STATUS_VISIBLE 1u
+#define RTXDI_SUN_STATUS_BLOCKED 2u
+
+#define RTXDI_SUN_REASON_NONE             0u
+#define RTXDI_SUN_REASON_INVALID_SURFACE  1u
+#define RTXDI_SUN_REASON_INVALID_SCENE    2u
+#define RTXDI_SUN_REASON_INVALID_ALPHA    3u
+#define RTXDI_SUN_REASON_COVERAGE_MISS   4u
+#define RTXDI_SUN_REASON_TRUNCATED       5u
+#define RTXDI_SUN_REASON_INVALID_RAY     6u
+
+#define RTXDI_SUN_FLAG_CHARACTER 1u
+#define RTXDI_SUN_FLAG_TRUNCATED 2u
+
+#ifdef __cplusplus
+struct RtxdiSunVisibilityResult {
+  uint32_t status;
+  float distance;
+  uint32_t reason;
+  uint32_t flags;
+};
+#endif

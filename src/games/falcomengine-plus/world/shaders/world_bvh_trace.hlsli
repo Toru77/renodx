@@ -213,18 +213,34 @@ bool AlphaCutHit(uint material, float uv_slot, uint i0, uint i1, uint i2, float2
     uint material_count;
     uint material_stride;
     g_alpha_materials.GetDimensions(material_count, material_stride);
-    uint uv_count;
-    uint uv_stride;
-    g_trace_uvs.GetDimensions(uv_count, uv_stride);
-    if (material - 1u >= material_count || uv_slot < 1.0)
+    if (material - 1u >= material_count)
     {
         counters.invalid_refs++;
         return false;
     }
     const AlphaMaterialGPU entry = g_alpha_materials[material - 1u];
-    if ((entry.swizzle & 1u) != 0u) return false;  // alpha forced to 1: solid
+    if ((entry.swizzle & 1u) != 0u) return false;  // alpha forced to 1: no UV or atlas lookup
+    if (!isfinite(uv_slot) || uv_slot < 1.0 || uv_slot != floor(uv_slot) || uv_slot >= 4294967296.0)
+    {
+        counters.invalid_refs++;
+        return false;
+    }
     const uint uv_base = (uint)uv_slot - 1u;
-    if (uv_base + max(i0, max(i1, i2)) >= uv_count)
+    const uint max_index = max(i0, max(i1, i2));
+    uint uv_count;
+    uint uv_stride;
+    g_trace_uvs.GetDimensions(uv_count, uv_stride);
+    if (uv_base >= uv_count || max_index >= uv_count - uv_base)
+    {
+        counters.invalid_refs++;
+        return false;
+    }
+    uint atlas_width;
+    uint atlas_height;
+    uint atlas_slices;
+    g_alpha_atlas.GetDimensions(atlas_width, atlas_height, atlas_slices);
+    if (entry.slice >= atlas_slices || atlas_width != 256u || atlas_height != 256u || atlas_slices != 256u
+        || !all(isfinite(entry.scroll)) || !isfinite(entry.threshold))
     {
         counters.invalid_refs++;
         return false;
@@ -233,6 +249,11 @@ bool AlphaCutHit(uint material, float uv_slot, uint i0, uint i1, uint i2, float2
     const float2 uv0 = g_trace_uvs[uv_base + i0];
     const float2 uv1 = g_trace_uvs[uv_base + i1];
     const float2 uv2 = g_trace_uvs[uv_base + i2];
+    if (!all(isfinite(bary)) || !all(isfinite(uv0)) || !all(isfinite(uv1)) || !all(isfinite(uv2)))
+    {
+        counters.invalid_refs++;
+        return false;
+    }
     const float2 uv = (1.0 - bary.x - bary.y) * uv0 + bary.x * uv1 + bary.y * uv2;
     const uint x = min((uint)floor(frac(uv.x + entry.scroll.x) * 1024.0), 1023u);
     const uint y = min((uint)floor(frac(1.0 - (uv.y + entry.scroll.y)) * 256.0), 255u);

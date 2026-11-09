@@ -5,7 +5,9 @@
 // Texture2DArray. AlphaSliceTable is the slice bookkeeping; AlphaGpu holds the GPU objects that
 // alpha_live.hpp creates while alpha_foliage is on (none while it is off).
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 
 namespace falcom_world {
@@ -21,6 +23,30 @@ inline constexpr uint32_t kAlphaKeylessSourcesMax = 16u;  // live keyless copies
 inline constexpr uint64_t kAlphaSourceBytesMax = 256ull << 20;  // bytes of live source copies (mip 0)
 inline constexpr uint32_t kAlphaSliceQuarantineFrames = 16u;  // a released slice is reused after this many frames
 inline constexpr uint32_t kAlphaOrphanFrames = 600u;  // a keyless copy (indirect draw) is held this many presents for its resolve
+
+enum class AlphaUvRangeStatus { NotRequired,
+                                Valid,
+                                Invalid };
+
+inline AlphaUvRangeStatus ValidateAlphaUvRange(uint32_t material, bool force_opaque, float uv_slot, uint32_t uv_count,
+                                               uint32_t i0, uint32_t i1, uint32_t i2, uint32_t* uv_base) {
+  if (material == 0u || force_opaque) return AlphaUvRangeStatus::NotRequired;
+  if (uv_base == nullptr || !std::isfinite(uv_slot) || uv_slot < 1.f || uv_slot != std::floor(uv_slot)
+      || uv_slot >= 4294967296.f) return AlphaUvRangeStatus::Invalid;
+  const uint32_t base = static_cast<uint32_t>(uv_slot) - 1u;
+  const uint32_t max_index = (std::max)({i0, i1, i2});
+  if (base >= uv_count || max_index >= uv_count - base) return AlphaUvRangeStatus::Invalid;
+  *uv_base = base;
+  return AlphaUvRangeStatus::Valid;
+}
+
+inline bool ValidAlphaAtlasLayout(uint32_t word_width, uint32_t height, uint32_t slices) {
+  return word_width == kAlphaSliceWords && height == kAlphaSliceWords && slices == kAlphaAtlasSlices;
+}
+
+inline bool ValidAlphaAtlasSlice(uint32_t slice, uint32_t layers) {
+  return layers == kAlphaAtlasSlices && slice < layers;
+}
 
 // One per slice, read by the trace (material slot = slice). 32 bytes.
 struct AlphaMaterialGPU {
@@ -54,7 +80,7 @@ struct AlphaSliceTable {
   }
 
   void Release(uint32_t slice) {
-    if (slice >= kAlphaAtlasSlices || owner[slice] == 0u) return;
+    if (!ValidAlphaAtlasSlice(slice, kAlphaAtlasSlices) || owner[slice] == 0u) return;
     owner[slice] = 0u;
     used -= 1u;
   }

@@ -12,6 +12,7 @@
 
 #include <embed/shaders.h>
 
+#include <Windows.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -30,24 +31,23 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <Windows.h>
 
 #include "../../mods/shader.hpp"
 #include "../../utils/descriptor.hpp"
+#include "../../utils/dlss_hook.hpp"
 #include "../../utils/pipeline_layout.hpp"
 #include "../../utils/settings.hpp"
 #include "../../utils/shader.hpp"
 #include "../../utils/state.hpp"
-#include "../../utils/dlss_hook.hpp"
-#include "./shared.h"
-#include "./fast_noise_ea.h"  // baked-in fast_noise_ea.dds (embed_file.exe output)
-#include "./world/world.hpp"  // Phase 0 world-space research module (DevKit-only)
-#include "./world/rtao/rtao.hpp"  // RTAO round 1 (inline lighting-hook dispatch)
-#include "./world/rtao/rtao_svgf.hpp"  // RTAO SVGF glue (inline lighting-hook dispatch)
-#include "./world/rr/rr_state.hpp"
-#include "./world/bvh/deform_probe.hpp"  // native D3D11 event query (DynCube validity readback poll)
-#include "./world/bvh/gpu_timer.hpp"  // GpuTimer (Dynamic Cubemaps GPU Timing Log)
+#include "./fast_noise_ea.h"     // baked-in fast_noise_ea.dds (embed_file.exe output)
 #include "./kai_hero_light.hpp"  // Kai hero light: matches and zeroes the hero light in mapped light records
+#include "./shared.h"
+#include "./world/bvh/deform_probe.hpp"  // native D3D11 event query (DynCube validity readback poll)
+#include "./world/bvh/gpu_timer.hpp"     // GpuTimer (Dynamic Cubemaps GPU Timing Log)
+#include "./world/rr/rr_state.hpp"
+#include "./world/rtao/rtao.hpp"       // RTAO round 1 (inline lighting-hook dispatch)
+#include "./world/rtao/rtao_svgf.hpp"  // RTAO SVGF glue (inline lighting-hook dispatch)
+#include "./world/world.hpp"           // Phase 0 world-space research module (DevKit-only)
 
 namespace {
 
@@ -69,452 +69,452 @@ ShaderInjectData shader_injection = {
     .volfog_isfast_spatial_scale = 1.f,
     .volfog_noise_strength = 1.f,
     .volfog_isfast_dedicated_sampler = 0.f,
-  // 0 = off, 1 = the engine's own character shadow march. Default off, matching
-  // the CharShadowMode setting: the contact term owns character shadowing
-  // unless the user deliberately turns the engine's own back on.
-  .char_shadow_mode = 0.f,
-  .char_shadow_sample_count = 32.f,
-  .char_shadow_hard_shadow_samples = 4.f,
-  .char_shadow_fade_out_samples = 16.f,
-  .rtao_debug_show = 0.f,
-  .char_shadow_contrast = 9.f,
-  .char_shadow_light_screen_fade_start = 0.f,
-  .cs_contact_local_light_clearance = 0.2f,
-  .char_shadow_min_occluder_depth_scale = 0.f,
-  .char_shadow_jitter_enabled = 1.f,
-  .char_shadow_type = 1.f,
-  .char_shadow_camera_strength = 1.f,
-  .char_shadow_world_strength = 1.f,
-  .env_sss_enabled = 1.f,
-  .env_sss_strength = 1.0f,
-  .env_sss_sample_count = 24.f,
-  .env_sss_hard_shadow_samples = 0.f,
-  .env_sss_fade_out_samples = 0.f,
-  .env_sss_surface_thickness = 0.005f,
-  .env_sss_contrast = 2.f,
-  .env_sss_jitter_enabled = 1.f,
-  .env_sss_height_enabled = 1.f,
-  .env_sss_height_min = 0.f,
-  .env_sss_height_max = 1.f,
-  .env_sss_height_fade = 0.1f,
-  .env_sss_vertical_reject = 0.3f,
-  .env_sss_max_darkening = 0.40f,
-  .env_sss_bright_reject_threshold = 0.19f,
-  .env_sss_bright_reject_fade = 0.5f,
-  .env_sss_csm_gate = 0.f,
-  .debug_show_env_sss = 0.f,
-  .rtls_flags = 0.f,
-  .rtls_strength = 1.f,
-  .rtls_max_darkening = 1.f,
-  .rtls_char_lamp = 1.f,
-  .rtsun_flags = 0.f,
-  .rtsun_strength = 1.f,
-  .rtsun_max_darkening = 1.f,
-  .rtsun_spare = 0.f,
-  .rtsun_char_max_darkening = 1.f,
-  .cs_contact_local_bound = 0.f,
-  .cs_contact_local_normal_bias = 0.05f,
-  .gtvbao_mode = 1.f,
-  .gtvbao_quality_level = 2.f,
-  .gtvbao_denoise_passes = 1.f,
-  .gtvbao_radius = 0.5f,
-  .gtvbao_falloff_range = 0.615f,
-  .gtvbao_radius_multiplier = 1.5f,
-  .gtvbao_final_power = 2.0f,
-  .gtvbao_sample_distribution = 1.5f,
-  .gtvbao_bitmask_thickness = 0.2f,
-  .gtvbao_depth_mip_offset = 3.30f,
-  .gtvbao_denoise_blur_beta = 20.0f,
-  .gtvbao_denoise_leak_threshold = 2.5f,
-  .gtvbao_denoise_leak_strength = 0.5f,
-  .gtvbao_temporal_blend = 0.f,
-  .gtvbao_disocclusion_threshold = 0.01f,
-  .gtvbao_debug_view = 0.f,
-  .gtvbao_debug_logging = 0.f,
-  .gtvbao_dedicated_bound = 0.f,
-  .gtvbao_fix_experimental = 0.f,
-  .gtvbao_vbgi_bound = 0.f,
-  .gtvbao_vbgi_debug = 0.f,
-  .vbgi_enabled = 0.f,
-  .vbgi_intensity = 1.0f,
-  .vbgi_saturation = 1.0f,
-  .vbgi_char_mask_strength = 0.f,
-  .vbgi_multibounce = 1.f,
-  .vbgi_multibounce_strength = 1.f,
-  .vbgi_multibounce_bounce_fraction = 0.15f,
-  .vbgi_multibounce_saturation = 1.f,
-  .vbgi_multibounce_max_clamp = 0.f,
-  .vbgi_adaptive_r = 0.f,
-  .vbgi_adaptive_g = 0.f,
-  .vbgi_adaptive_b = 0.f,
-  .vbgi_adaptive_mode = 0.f,
-  .vbgi_adaptive_luma_strength = 0.f,
-  .vbgi_adaptive_luma_blend = 0.5f,
-  .vbgi_max_clamp = 0.f,
-  .vbgi_reduce_ao = 0.f,
-  .vbgi_reduce_ao_strength = 1.f,
-  .vbgi_debug_logging = 0.f,
-  .vbgi_debug_view = 0.f,
-  .vbgi_affect_lights = 0.f,
-  .vbgi_lights_strength = 1.f,
-  .vbgi_lights_saturation = 1.f,
-  .vbgi_cascade_debug = 0.f,
-  .shadow_filter_method = 1.f,
-  .shadow_edge_tint = 2.f,
-  .shadow_pcss_jitter_enabled = 1.f,
-  .shadow_pcss_jitter_amount = 1.f,
-  .shadow_pcss_jitter_speed = 237.f,
-  .shadow_chss_noise_mode = 0.f,
-  .shadow_base_softness = 0.2f,
-  .shadow_chss_search_radius = 1.f,
-  .shadow_chss_penumbra_scale = 80.f,
-  .shadow_chss_depth_cap = 0.05f,
-  .shadow_chss_min_radius = 0.f,
-  .shadow_chss_post_blur = 0.f,
-  .shadow_chss_blocker_count = 16.f,
-  .shadow_chss_sample_count = 16.f,
-  .shadow_chss_onset_bias = 0.f,
-  .shadow_chss_penumbra_curve = 2.f,
-  .shadow_penumbra_color_strength = 1.f,
-  .shadow_penumbra_vibrance = 1.f,
-  .shadow_penumbra_detection = 0.5f,
-  .shadow_penumbra_debug_view = 0.f,
-  .shadow_penumbra_color_brightness = 1.f,
-  .shadow_penumbra_falcom_blend = 0.f,
-  .shadow_penumbra_edge_vibrance = 1.f,
-  .shadow_penumbra_lightcolor_blend = 0.f,
-  .shadow_penumbra_lightcolor_saturation = 1.f,
-  .shadow_isfast_enabled = 0.f,
-  .shadow_isfast_texture_loaded = 0.f,
-  .shadow_isfast_spatial_scale = 1.f,
-  .shadow_isfast_temporal_speed = 1.f,
-  .shadow_isfast_seed_offset = 0.f,
-  // -- Kai-specific defaults --
-  .cubemap_improvements_enabled = 1.f,
-  .cubemap_lighting_mip_boost = 1.5f,
-  .floor_cubemap_mip_scale = 4.f,
-  .ssgi_mod_enabled = 1.f,
-  .ssgi_color_boost = 1.f,
-  .ssgi_alpha_boost = 1.f,
-  .ssgi_pow = 1.f,
-  .dof_mode = 1.f,
-  .dof_strength = 1.f,
-  .dof_radius_scale = 1.33f,
-  .dof_sample_count = 24.f,
-  .dof_near_scale = 1.f,
-  .dof_far_scale = 1.f,
-  .dof_coc_curve = 1.f,
-  .dof_edge_threshold = 0.25f,
-  .char_gi_strength = 3.0f,
-  .char_gi_alpha_scale = 1.0f,
-  .char_gi_chroma_strength = 0.50f,
-  .char_gi_luma_strength = 0.0f,
-  .char_gi_shadow_power = 1.25f,
-  .char_gi_dark_boost = 0.0f,
-  .char_gi_bright_boost = 3.0f,
-  .char_gi_headroom_power = 1.25f,
-  .char_gi_max_add = 0.020f,
-  .char_gi_peak_luma_cap = 0.0f,
-  .char_gi_depth_reject = 2.0f,
-  .fog_color_correction_enabled = 1.f,
-  .fog_hue = 0.f,
-  .fog_chrominance = 0.f,
-  .fog_avg_brightness = 0.85f,
-  .fog_min_brightness = 0.f,
-  .fog_min_chroma_change = 0.f,
-  .fog_max_chroma_change = 0.f,
-  .fog_lightness_strength = 1.f,
-  .fog_color_correction_strength = 0.5f,
-  .ssr_mode = 1.f,
-  .ssr_ray_count_scale = 1.f,
-  .foliage_translucency_scale = 1.f,
-  .foliage_opacity_scale = 1.f,
-  .foliage_ssao_scale = 1.f,
-  .char_shadow_strength = 1.f,
-  .foliage_debug_mode = 0.f,
-  .sss_dedicated_bound = 0.f,
-  .char_gi_enabled = 1.f,
-  .volfog_enabled = 1.f,
-  .volfog_tricubic_enabled = 1.f,
-  .volfog_color_correction_strength = 0.5f,
-  .vbgi_kai_consume_falcom = 0.f,
-  .vbgi_kai_falcom_blend = 0.5f,
-  .vbgi_kai_gtvbao_only = 0.f,
-  .shadow_edge_tint_kai = 1.f,
-  .character_light_strength = 0.f,
-  .gtvbao_cdf_enabled = 1.f,
-  .gtvbao_cosine_enabled = 1.f,
-  .gtvbao_cosine_mode = 2.f,
-  .gtvbao_thickness_enabled = 1.f,
-  // -- Bitmask fix toggles: all default OFF = previously shipped behaviour --
-  .char_gtvbao_mode = 0.f,
-  .char_gtvbao_mask_strength = 0.f,
-  .char_gtvbgi_mask_strength = 0.75f,
-  .gtvbao_prefilter_enabled = 1.f,
-  .brdf_hammon_diffuse_enabled = 0.f,
-  .brdf_multiscatter_specular_enabled = 0.f,
-  .brdf_diffuse_strength = 1.f,
-  .brdf_specular_strength = 1.f,
-  .brdf_specular_peak_clamp = 4.f,
-  .brdf_roughness_min = 0.04f,
-  .brdf_roughness_max = 1.f,
-  .brdf_f0_source = 0.f,
-  .gtvbao_exclude_foliage = 1.f,
-  .gtvbao_foliage_ao_value = 1.f,
-  .gtvbao_foliage_channel_mode = 0.f,
-  .foliage_grass_ao_enabled = 0.f,
-  .foliage_grass_ao_base = 0.25f,
-  .foliage_grass_ao_tip = 1.f,
-  .foliage_grass_ao_curve = 0.5f,
-  .dof_sign_softness = 0.4f,
-  .dof_coverage_enabled = 1.f,
-  .gtvbao_atrous_enabled = 0.f,
-  .gtvbao_atrous_depth_sigma = 1.f,
-  .gtvbao_atrous_normal_sigma = 32.f,
-  .gtvbao_atrous_passes = 3.f,
-  // �� Dynamic Cubemaps (Sora 2nd) ��
-  .dynCube_enabled = 0.f,
-  .dynCube_debug = 0.f,
-  .dynCube_resolution = 0.f,
-  .dynCube_history = 0.f,
-  .dynCube_ggx = 0.f,
-  .dynCube_capture_interval = 1.f,
-  .dynCube_roughness_boost = 1.f,
-  .dynCube_debug_logging = 0.f,
-  .dynCube_debug_face = 0.f,
-  .dynCube_debug_mip = 0.f,
-  .dynCube_force_mip = -1.f,
-  .dynCube_ssr_enabled = 0.f,
-  .dynCube_ssr_samples = 16.f,
-  .dynCube_ssr_distance = 20.f,
-  .dynCube_ssr_blur = 2.f,
-  .dynCube_ssr_symmetric_weights = 0.f,
-  .dynCube_ssr_distance_fade = 0.5f,
-  .dynCube_ssr_edge_fade = 0.3f,
-  .dynCube_ssr_grazing_fade = 0.5f,
-  .dynCube_ssr_thickness = 0.1f,
-  .dynCube_ssr_char_occ_strength = 0.8f,
-  .dynCube_ssr_char_occ_upness = 0.5f,
-  .dynCube_vanilla_blur = 0.f,
-  .dynCube_capture_boost = 1.f,
-  .dynCube_history_blend = 0.5f,
-  .dynCube_history_pos_threshold = 0.5f,
-  .dynCube_character_capture = 0.f,
-  .dynCube_force_vanilla = 0.f,
-  .dynCube_force_dynamic = 0.f,
-  .dynCube_force_ssr = 0.f,
-  .dynCube_layer_mix = -1.f,
-  .dynCube_blur = 0.f,
-  .dynCube_lookup_direction_flip = 0.f,
-  .dynCube_coverage_fade = 0.f,
-  .dynCube_coverage_width = 2.f,
-  .dynCube_ssr_isfast_enabled = 1.f,
-  .dynCube_ssr_isfast_strength = 1.f,
-  .dynCube_ssr_isfast_spatial = 1.f,
-  .dynCube_ssr_isfast_temporal = 1.f,
-  .dynCube_ssr_confidence_fallback = 0.f,
-  .dynCube_vertical_offset = 0.f,
-  .dynCube_worldbox_contrib = 0.25f,
-  .dynCube_capture_soften = 0.f,
-  .dynCube_global_strength = 1.f,
-  .dynCube_ssr_replacement = 0.f,
-  .dynCube_ssr_replacement_debug = 0.f,
-  .dynCube_game_ssr = 1.f,
-  .dynCube_vanilla_refine_fix = 1.f,
-  .dynCube_vanilla_refine_threshold = 0.5f,
-  .dynCube_vanilla_history_fixed = 0.f,
-  .dynCube_vanilla_history_weight = 0.9f,
-  .dynCube_vanilla_disoc_reject = 1.f,
-  .dynCube_vanilla_disoc_depth = 0.25f,
-  .dynCube_vanilla_disoc_uv = 0.05f,
-  .dynCube_vanilla_isfast = 1.f,
-  .dynCube_vanilla_isfast_frame = -1.f,
-  .dynCube_vanilla_ssr_enabled = 1.f,
-  .character_outline_thickness = 1.f,
-  .custom_shader_logging = 0.f,
-  .dynCube_sparkle_rejection = 0.f,
-  .char_outline_intensity = 1.f,
-  // -- Custom TAA (Sora 1st/2nd) defaults: off = vanilla TAA runs untouched --
-  .custom_taa_enabled = 0.f,
-  .custom_taa_history_filter = 0.f,
-  .custom_taa_clip_mode = 0.f,
-  .custom_taa_kdop_axes = 0.f,
-  .custom_taa_dmin = 0.048f,
-  .custom_taa_kdop_epsilon = 0.00001f,
-  .custom_taa_static_feedback = 0.9f,
-  .custom_taa_dynamic_feedback = 0.5f,
-  .custom_taa_motion_scale = 0.125f,
-  .custom_taa_debug = 0.f,
-  .custom_taa_history_valid = 0.f,
-  .custom_taa_overshoot_softness = 1.f,
-  .custom_taa_silhouette_rejection = 4.f,
-  .custom_taa_squared_motion_response = 0.f,
-  .custom_taa_detail_restore = 0.f,
-  .custom_taa_detail_target = 0.85f,
-  // -- RCAS post-TAA sharpening defaults: always on, strength 0 = off --
-  .rcas_strength = 0.2f,
-  .rcas_enabled = 1.f,
-  .rcas_denoise = 0.f,
-  .rcas_motion_on = 1.f,
-  .rcas_motion_multiplier = 2.0f,
-  .rcas_motion_max = 1.0f,
-  .rcas_motion_threshold = 1.0f,
-  .rcas_motion_range = 2.0f,
-  .rcas_motion_response = 1.0f,
-  .rcas_debug = 0.f,
-  // -- FXAA post-TAA defaults: on (between TAA and RCAS), High quality --
-  .fxaa_enabled = 1.f,
-  .fxaa_quality = 1.f,
-  .fxaa_subpix = 0.75f,
-  .fxaa_edge_threshold = 0.166f,
-  .fxaa_edge_threshold_min = 0.0625f,
-  // �� GTVBAO low-resolution spatial pipeline defaults: Full = existing behavior ��
-  .gtvbao_resolution = 0.f,
-  .gtvbao_upscale_plane_sigma = 40.f,
-  .gtvbao_upscale_normal_power = 16.f,
-  .gtvbao_upscale_debug = 0.f,
-  // �� DOF IS-FAST rotated gather ��
-  .dof_isfast_enabled = 1.f,
-  .dof_isfast_noise_frame = -1.f,
-  // �� Motion Blur (Guertin 2013) defaults: off = no dispatches, no pushes ��
-  .mb_mode = 0.f,
-  .mb_intensity = 1.f,
-        .mb_sample_count = 16.f,
-  .mb_max_radius_px = 40.f,
-  .mb_center_weight_k = 40.f,
-  .mb_jitter_h = 0.95f,
-  .mb_min_velocity_g = 1.5f,
-  .mb_neighbor_t = 1.f,
-  .mb_depth_tolerance = 0.1f,
-  .mb_velocity_format = 0.f,  // DEPRECATED, unread (no velocity surface remains)
-  .mb_jitter_source = 0.f,
-  .mb_jitter_ready = 0.f,
-  .mb_debug_view = 0.f,
-  .mb_working_w = 0.f,
-  .mb_working_h = 0.f,
-  .mb_depth_w = 0.f,
-  .mb_depth_h = 0.f,
-  .mb_motion_w = 0.f,
-  .mb_motion_h = 0.f,
-  .mb_tiles_x = 1.f,
-  .mb_tiles_y = 1.f,
-  .mb_tile_uv = 0.f,
-  .mb_frame_index = 0.f,
-  .mb_motion_valid = 0.f,
-  .mb_debug_chain = 0.f,
-  .mb_local_velocity_weights = 1.f,
-  .mb_depth_test = 1.f,
-  .mb_halfres = 0.f,
-  .mb_output_mask = 0.f,
-  .mb_gather_side = 0.f,
-  .mb_halfres_px = 10.f,
-  .mb_frame_rate_reference = 60.f,
-      .mb_frame_scale = 1.f,
-      .rtao_active = 0.f,
-      .mb_camera_sign = 1.f,
-        .mb_camera_jitter = 1.f,
-        .mb_camera_cut = 1.f,
-        .mb_camera_cut_px = 120.f,
-  // -- Contact Shadows --
-  .cs_contact_denoise_enabled = 1.f,
-  .cs_contact_denoise_radius = 4.f,
-  .cs_contact_denoise_depth_sigma = 0.02f,
-  .cs_contact_denoise_normal_sigma = 0.1f,
-  .cs_contact_denoise_passes = 1.f,
-  .cs_denoise_axis = 0.f,
-  .cs_contact_local_denoise_enabled = 1.f,
-  .cs_contact_local_denoise_radius = 4.f,
-  .cs_contact_enabled = 0.f,
-  .cs_contact_strength = 1.f,
-  .cs_contact_env_strength = 1.f,
-  .cs_contact_char_strength = 1.f,
-  .cs_contact_sample_count = 8.f,
-  .cs_contact_ray_length = 50.f,
-  .cs_contact_thickness = 0.35f,
-  .cs_contact_bias = 0.0001f,
-  .cs_contact_normal_bias = 0.0001f,
-  .cs_contact_sky_depth = 100000.f,
-  .cs_contact_max_darkening = 1.f,
-  .cs_contact_isfast_enabled = 1.f,
-  .cs_contact_debug = 0.f,
-  .cs_contact_local_enabled = 0.f,
-  .cs_contact_local_strength = 1.f,
-  // Medium (8 steps): the local march default moved up from the old raw-slider
-  // default of 4 when the sample count became a quality tier, matching the sun
-  // march above. Keep in sync with ContactShadowsLocalQuality.
-  .cs_contact_local_sample_count = 8.f,
-  .cs_contact_local_ray_length = 2.f,
-  .cs_contact_local_max_lights = 4.f,
-  // Runtime values, written by the addon immediately before the push.
-  .cs_noise_frame = -1.f,
-  .cs_working_w = 0.f,
-  .cs_working_h = 0.f,
-  .cs_contact_local_denoise_depth_sigma = 0.02f,
-  .cs_contact_local_denoise_normal_sigma = 0.1f,
-  .cs_contact_dedicated_bound = 0.f,
-  .cs_contact_local_denoise_passes = 1.f,
-  // 0 = derive the sun-contact range gate from the engine's last cascade split.
-  .cs_contact_sun_range = 0.f,
-  // 4 reproduces the original 4-sample appearance exactly, so the estimator change is
-  // a no-op at the default Sample Count.
-  .cs_contact_response_scale = 4.f,
-  // All four local light loops marched by default, which is exactly what the
-  // feature did before the per-class toggles existed. Must stay in declaration
-  // order with shared.h: designated initialisers are evaluated in the order
-  // written, so a mismatch here is a hard compile error rather than a silent
-  // misassignment.
-  .cs_contact_local_point = 1.f,
-  .cs_contact_local_spot = 1.f,
-  .cs_contact_local_env_point = 1.f,
-  .cs_contact_local_env_spot = 1.f,
-  // ── Character Shadowing: custom camera pass ──
-  // On by default but only does anything in char_shadow_mode 2. Declaration order must
-  // match shared.h.
-  .char_cam_enabled = 1.f,
-  .char_cam_strength = 1.f,
-  .char_cam_sample_count = 8.f,
-  // Silhouette reach, in the same neighbourhood as the engine's own march (the vanilla
-  // block steps 0.0005..0.002 for 10 steps, so ~0.005..0.02 world units).
-  .char_cam_ray_length = 0.02f,
-  // Must be comparable to the ray length. A band much larger than the ray puts the
-  // whole ray inside or outside it, the coverage estimator degenerates to a binary
-  // any-hit test, and Sample Count stops doing anything.
-  .char_cam_thickness = 0.008f,
-  .char_cam_bias = 0.0001f,
-  // The shader folds this into the hit threshold (bias = lift + char_cam_bias) so the
-  // receiver cannot occlude itself, so it is the true clearance off the surface. A
-  // millimetre suits a 2 cm ray; anything comparable to the ray would start the march
-  // in free air beside the face.
-  .char_cam_normal_bias = 0.0015f,
-  // 2, not 4: at 4 with 8 samples a single spurious sample already costs half the
-  // available darkening, which is what made this read as a hard patch. The
-  // 4-is-the-original invariant is documented on the environment contact pass and is
-  // meaningful THERE, where the geometry is a wall or a floor and its numbers -- a 0.29
-  // band against a 2.0 ray -- are proportionate to it. Those numbers are not
-  // transferable to a character at all.
-  .char_cam_response_scale = 2.f,
-  // Below 1 because this multiplies probe-lit ambient and cannot prove the pixel was
-  // lit; a face going to solid black reads as a hole.
-  .char_cam_max_darkening = 0.6f,
-  .char_cam_isfast_enabled = 1.f,
-  .char_cam_debug = 0.f,
-  .rt_sun_cascades = 0.f,
-  // ShaderInjectData ends on a float4 boundary with no pad field, so every float in the
-  // struct needs a default here. See the closing comment in shared.h.
-  };
+    // 0 = off, 1 = the engine's own character shadow march. Default off, matching
+    // the CharShadowMode setting: the contact term owns character shadowing
+    // unless the user deliberately turns the engine's own back on.
+    .char_shadow_mode = 0.f,
+    .char_shadow_sample_count = 32.f,
+    .char_shadow_hard_shadow_samples = 4.f,
+    .char_shadow_fade_out_samples = 16.f,
+    .rtao_debug_show = 0.f,
+    .char_shadow_contrast = 9.f,
+    .char_shadow_light_screen_fade_start = 0.f,
+    .cs_contact_local_light_clearance = 0.2f,
+    .char_shadow_min_occluder_depth_scale = 0.f,
+    .char_shadow_jitter_enabled = 1.f,
+    .char_shadow_type = 1.f,
+    .char_shadow_camera_strength = 1.f,
+    .char_shadow_world_strength = 1.f,
+    .env_sss_enabled = 1.f,
+    .env_sss_strength = 1.0f,
+    .env_sss_sample_count = 24.f,
+    .env_sss_hard_shadow_samples = 0.f,
+    .env_sss_fade_out_samples = 0.f,
+    .env_sss_surface_thickness = 0.005f,
+    .env_sss_contrast = 2.f,
+    .env_sss_jitter_enabled = 1.f,
+    .env_sss_height_enabled = 1.f,
+    .env_sss_height_min = 0.f,
+    .env_sss_height_max = 1.f,
+    .env_sss_height_fade = 0.1f,
+    .env_sss_vertical_reject = 0.3f,
+    .env_sss_max_darkening = 0.40f,
+    .env_sss_bright_reject_threshold = 0.19f,
+    .env_sss_bright_reject_fade = 0.5f,
+    .env_sss_csm_gate = 0.f,
+    .debug_show_env_sss = 0.f,
+    .rtls_flags = 0.f,
+    .rtls_strength = 1.f,
+    .rtls_max_darkening = 1.f,
+    .rtls_char_lamp = 1.f,
+    .rtsun_flags = 0.f,
+    .rtsun_strength = 1.f,
+    .rtsun_max_darkening = 1.f,
+    .rtsun_spare = 0.f,
+    .rtsun_char_max_darkening = 1.f,
+    .cs_contact_local_bound = 0.f,
+    .cs_contact_local_normal_bias = 0.05f,
+    .gtvbao_mode = 1.f,
+    .gtvbao_quality_level = 2.f,
+    .gtvbao_denoise_passes = 1.f,
+    .gtvbao_radius = 0.5f,
+    .gtvbao_falloff_range = 0.615f,
+    .gtvbao_radius_multiplier = 1.5f,
+    .gtvbao_final_power = 2.0f,
+    .gtvbao_sample_distribution = 1.5f,
+    .gtvbao_bitmask_thickness = 0.2f,
+    .gtvbao_depth_mip_offset = 3.30f,
+    .gtvbao_denoise_blur_beta = 20.0f,
+    .gtvbao_denoise_leak_threshold = 2.5f,
+    .gtvbao_denoise_leak_strength = 0.5f,
+    .gtvbao_temporal_blend = 0.f,
+    .gtvbao_disocclusion_threshold = 0.01f,
+    .gtvbao_debug_view = 0.f,
+    .gtvbao_debug_logging = 0.f,
+    .gtvbao_dedicated_bound = 0.f,
+    .gtvbao_fix_experimental = 0.f,
+    .gtvbao_vbgi_bound = 0.f,
+    .gtvbao_vbgi_debug = 0.f,
+    .vbgi_enabled = 0.f,
+    .vbgi_intensity = 1.0f,
+    .vbgi_saturation = 1.0f,
+    .vbgi_char_mask_strength = 0.f,
+    .vbgi_multibounce = 1.f,
+    .vbgi_multibounce_strength = 1.f,
+    .vbgi_multibounce_bounce_fraction = 0.15f,
+    .vbgi_multibounce_saturation = 1.f,
+    .vbgi_multibounce_max_clamp = 0.f,
+    .vbgi_adaptive_r = 0.f,
+    .vbgi_adaptive_g = 0.f,
+    .vbgi_adaptive_b = 0.f,
+    .vbgi_adaptive_mode = 0.f,
+    .vbgi_adaptive_luma_strength = 0.f,
+    .vbgi_adaptive_luma_blend = 0.5f,
+    .vbgi_max_clamp = 0.f,
+    .vbgi_reduce_ao = 0.f,
+    .vbgi_reduce_ao_strength = 1.f,
+    .vbgi_debug_logging = 0.f,
+    .vbgi_debug_view = 0.f,
+    .vbgi_affect_lights = 0.f,
+    .vbgi_lights_strength = 1.f,
+    .vbgi_lights_saturation = 1.f,
+    .vbgi_cascade_debug = 0.f,
+    .shadow_filter_method = 1.f,
+    .shadow_edge_tint = 2.f,
+    .shadow_pcss_jitter_enabled = 1.f,
+    .shadow_pcss_jitter_amount = 1.f,
+    .shadow_pcss_jitter_speed = 237.f,
+    .shadow_chss_noise_mode = 0.f,
+    .shadow_base_softness = 0.2f,
+    .shadow_chss_search_radius = 1.f,
+    .shadow_chss_penumbra_scale = 80.f,
+    .shadow_chss_depth_cap = 0.05f,
+    .shadow_chss_min_radius = 0.f,
+    .shadow_chss_post_blur = 0.f,
+    .shadow_chss_blocker_count = 16.f,
+    .shadow_chss_sample_count = 16.f,
+    .shadow_chss_onset_bias = 0.f,
+    .shadow_chss_penumbra_curve = 2.f,
+    .shadow_penumbra_color_strength = 1.f,
+    .shadow_penumbra_vibrance = 1.f,
+    .shadow_penumbra_detection = 0.5f,
+    .shadow_penumbra_debug_view = 0.f,
+    .shadow_penumbra_color_brightness = 1.f,
+    .shadow_penumbra_falcom_blend = 0.f,
+    .shadow_penumbra_edge_vibrance = 1.f,
+    .shadow_penumbra_lightcolor_blend = 0.f,
+    .shadow_penumbra_lightcolor_saturation = 1.f,
+    .shadow_isfast_enabled = 0.f,
+    .shadow_isfast_texture_loaded = 0.f,
+    .shadow_isfast_spatial_scale = 1.f,
+    .shadow_isfast_temporal_speed = 1.f,
+    .shadow_isfast_seed_offset = 0.f,
+    // -- Kai-specific defaults --
+    .cubemap_improvements_enabled = 1.f,
+    .cubemap_lighting_mip_boost = 1.5f,
+    .floor_cubemap_mip_scale = 4.f,
+    .ssgi_mod_enabled = 1.f,
+    .ssgi_color_boost = 1.f,
+    .ssgi_alpha_boost = 1.f,
+    .ssgi_pow = 1.f,
+    .dof_mode = 1.f,
+    .dof_strength = 1.f,
+    .dof_radius_scale = 1.33f,
+    .dof_sample_count = 24.f,
+    .dof_near_scale = 1.f,
+    .dof_far_scale = 1.f,
+    .dof_coc_curve = 1.f,
+    .dof_edge_threshold = 0.25f,
+    .char_gi_strength = 3.0f,
+    .char_gi_alpha_scale = 1.0f,
+    .char_gi_chroma_strength = 0.50f,
+    .char_gi_luma_strength = 0.0f,
+    .char_gi_shadow_power = 1.25f,
+    .char_gi_dark_boost = 0.0f,
+    .char_gi_bright_boost = 3.0f,
+    .char_gi_headroom_power = 1.25f,
+    .char_gi_max_add = 0.020f,
+    .char_gi_peak_luma_cap = 0.0f,
+    .char_gi_depth_reject = 2.0f,
+    .fog_color_correction_enabled = 1.f,
+    .fog_hue = 0.f,
+    .fog_chrominance = 0.f,
+    .fog_avg_brightness = 0.85f,
+    .fog_min_brightness = 0.f,
+    .fog_min_chroma_change = 0.f,
+    .fog_max_chroma_change = 0.f,
+    .fog_lightness_strength = 1.f,
+    .fog_color_correction_strength = 0.5f,
+    .ssr_mode = 1.f,
+    .ssr_ray_count_scale = 1.f,
+    .foliage_translucency_scale = 1.f,
+    .foliage_opacity_scale = 1.f,
+    .foliage_ssao_scale = 1.f,
+    .char_shadow_strength = 1.f,
+    .foliage_debug_mode = 0.f,
+    .sss_dedicated_bound = 0.f,
+    .char_gi_enabled = 1.f,
+    .volfog_enabled = 1.f,
+    .volfog_tricubic_enabled = 1.f,
+    .volfog_color_correction_strength = 0.5f,
+    .vbgi_kai_consume_falcom = 0.f,
+    .vbgi_kai_falcom_blend = 0.5f,
+    .vbgi_kai_gtvbao_only = 0.f,
+    .shadow_edge_tint_kai = 1.f,
+    .character_light_strength = 0.f,
+    .gtvbao_cdf_enabled = 1.f,
+    .gtvbao_cosine_enabled = 1.f,
+    .gtvbao_cosine_mode = 2.f,
+    .gtvbao_thickness_enabled = 1.f,
+    // -- Bitmask fix toggles: all default OFF = previously shipped behaviour --
+    .char_gtvbao_mode = 0.f,
+    .char_gtvbao_mask_strength = 0.f,
+    .char_gtvbgi_mask_strength = 0.75f,
+    .gtvbao_prefilter_enabled = 1.f,
+    .brdf_hammon_diffuse_enabled = 0.f,
+    .brdf_multiscatter_specular_enabled = 0.f,
+    .brdf_diffuse_strength = 1.f,
+    .brdf_specular_strength = 1.f,
+    .brdf_specular_peak_clamp = 4.f,
+    .brdf_roughness_min = 0.04f,
+    .brdf_roughness_max = 1.f,
+    .brdf_f0_source = 0.f,
+    .gtvbao_exclude_foliage = 1.f,
+    .gtvbao_foliage_ao_value = 1.f,
+    .gtvbao_foliage_channel_mode = 0.f,
+    .foliage_grass_ao_enabled = 0.f,
+    .foliage_grass_ao_base = 0.25f,
+    .foliage_grass_ao_tip = 1.f,
+    .foliage_grass_ao_curve = 0.5f,
+    .dof_sign_softness = 0.4f,
+    .dof_coverage_enabled = 1.f,
+    .gtvbao_atrous_enabled = 0.f,
+    .gtvbao_atrous_depth_sigma = 1.f,
+    .gtvbao_atrous_normal_sigma = 32.f,
+    .gtvbao_atrous_passes = 3.f,
+    // �� Dynamic Cubemaps (Sora 2nd) ��
+    .dynCube_enabled = 0.f,
+    .dynCube_debug = 0.f,
+    .dynCube_resolution = 0.f,
+    .dynCube_history = 0.f,
+    .dynCube_ggx = 0.f,
+    .dynCube_capture_interval = 1.f,
+    .dynCube_roughness_boost = 1.f,
+    .dynCube_debug_logging = 0.f,
+    .dynCube_debug_face = 0.f,
+    .dynCube_debug_mip = 0.f,
+    .dynCube_force_mip = -1.f,
+    .dynCube_ssr_enabled = 0.f,
+    .dynCube_ssr_samples = 16.f,
+    .dynCube_ssr_distance = 20.f,
+    .dynCube_ssr_blur = 2.f,
+    .dynCube_ssr_symmetric_weights = 0.f,
+    .dynCube_ssr_distance_fade = 0.5f,
+    .dynCube_ssr_edge_fade = 0.3f,
+    .dynCube_ssr_grazing_fade = 0.5f,
+    .dynCube_ssr_thickness = 0.1f,
+    .dynCube_ssr_char_occ_strength = 0.8f,
+    .dynCube_ssr_char_occ_upness = 0.5f,
+    .dynCube_vanilla_blur = 0.f,
+    .dynCube_capture_boost = 1.f,
+    .dynCube_history_blend = 0.5f,
+    .dynCube_history_pos_threshold = 0.5f,
+    .dynCube_character_capture = 0.f,
+    .dynCube_force_vanilla = 0.f,
+    .dynCube_force_dynamic = 0.f,
+    .dynCube_force_ssr = 0.f,
+    .dynCube_layer_mix = -1.f,
+    .dynCube_blur = 0.f,
+    .dynCube_lookup_direction_flip = 0.f,
+    .dynCube_coverage_fade = 0.f,
+    .dynCube_coverage_width = 2.f,
+    .dynCube_ssr_isfast_enabled = 1.f,
+    .dynCube_ssr_isfast_strength = 1.f,
+    .dynCube_ssr_isfast_spatial = 1.f,
+    .dynCube_ssr_isfast_temporal = 1.f,
+    .dynCube_ssr_confidence_fallback = 0.f,
+    .dynCube_vertical_offset = 0.f,
+    .dynCube_worldbox_contrib = 0.25f,
+    .dynCube_capture_soften = 0.f,
+    .dynCube_global_strength = 1.f,
+    .dynCube_ssr_replacement = 0.f,
+    .dynCube_ssr_replacement_debug = 0.f,
+    .dynCube_game_ssr = 1.f,
+    .dynCube_vanilla_refine_fix = 1.f,
+    .dynCube_vanilla_refine_threshold = 0.5f,
+    .dynCube_vanilla_history_fixed = 0.f,
+    .dynCube_vanilla_history_weight = 0.9f,
+    .dynCube_vanilla_disoc_reject = 1.f,
+    .dynCube_vanilla_disoc_depth = 0.25f,
+    .dynCube_vanilla_disoc_uv = 0.05f,
+    .dynCube_vanilla_isfast = 1.f,
+    .dynCube_vanilla_isfast_frame = -1.f,
+    .dynCube_vanilla_ssr_enabled = 1.f,
+    .character_outline_thickness = 1.f,
+    .custom_shader_logging = 0.f,
+    .dynCube_sparkle_rejection = 0.f,
+    .char_outline_intensity = 1.f,
+    // -- Custom TAA (Sora 1st/2nd) defaults: off = vanilla TAA runs untouched --
+    .custom_taa_enabled = 0.f,
+    .custom_taa_history_filter = 0.f,
+    .custom_taa_clip_mode = 0.f,
+    .custom_taa_kdop_axes = 0.f,
+    .custom_taa_dmin = 0.048f,
+    .custom_taa_kdop_epsilon = 0.00001f,
+    .custom_taa_static_feedback = 0.9f,
+    .custom_taa_dynamic_feedback = 0.5f,
+    .custom_taa_motion_scale = 0.125f,
+    .custom_taa_debug = 0.f,
+    .custom_taa_history_valid = 0.f,
+    .custom_taa_overshoot_softness = 1.f,
+    .custom_taa_silhouette_rejection = 4.f,
+    .custom_taa_squared_motion_response = 0.f,
+    .custom_taa_detail_restore = 0.f,
+    .custom_taa_detail_target = 0.85f,
+    // -- RCAS post-TAA sharpening defaults: always on, strength 0 = off --
+    .rcas_strength = 0.2f,
+    .rcas_enabled = 1.f,
+    .rcas_denoise = 0.f,
+    .rcas_motion_on = 1.f,
+    .rcas_motion_multiplier = 2.0f,
+    .rcas_motion_max = 1.0f,
+    .rcas_motion_threshold = 1.0f,
+    .rcas_motion_range = 2.0f,
+    .rcas_motion_response = 1.0f,
+    .rcas_debug = 0.f,
+    // -- FXAA post-TAA defaults: on (between TAA and RCAS), High quality --
+    .fxaa_enabled = 1.f,
+    .fxaa_quality = 1.f,
+    .fxaa_subpix = 0.75f,
+    .fxaa_edge_threshold = 0.166f,
+    .fxaa_edge_threshold_min = 0.0625f,
+    // �� GTVBAO low-resolution spatial pipeline defaults: Full = existing behavior ��
+    .gtvbao_resolution = 0.f,
+    .gtvbao_upscale_plane_sigma = 40.f,
+    .gtvbao_upscale_normal_power = 16.f,
+    .gtvbao_upscale_debug = 0.f,
+    // �� DOF IS-FAST rotated gather ��
+    .dof_isfast_enabled = 1.f,
+    .dof_isfast_noise_frame = -1.f,
+    // �� Motion Blur (Guertin 2013) defaults: off = no dispatches, no pushes ��
+    .mb_mode = 0.f,
+    .mb_intensity = 1.f,
+    .mb_sample_count = 16.f,
+    .mb_max_radius_px = 40.f,
+    .mb_center_weight_k = 40.f,
+    .mb_jitter_h = 0.95f,
+    .mb_min_velocity_g = 1.5f,
+    .mb_neighbor_t = 1.f,
+    .mb_depth_tolerance = 0.1f,
+    .mb_velocity_format = 0.f,  // DEPRECATED, unread (no velocity surface remains)
+    .mb_jitter_source = 0.f,
+    .mb_jitter_ready = 0.f,
+    .mb_debug_view = 0.f,
+    .mb_working_w = 0.f,
+    .mb_working_h = 0.f,
+    .mb_depth_w = 0.f,
+    .mb_depth_h = 0.f,
+    .mb_motion_w = 0.f,
+    .mb_motion_h = 0.f,
+    .mb_tiles_x = 1.f,
+    .mb_tiles_y = 1.f,
+    .mb_tile_uv = 0.f,
+    .mb_frame_index = 0.f,
+    .mb_motion_valid = 0.f,
+    .mb_debug_chain = 0.f,
+    .mb_local_velocity_weights = 1.f,
+    .mb_depth_test = 1.f,
+    .mb_halfres = 0.f,
+    .mb_output_mask = 0.f,
+    .mb_gather_side = 0.f,
+    .mb_halfres_px = 10.f,
+    .mb_frame_rate_reference = 60.f,
+    .mb_frame_scale = 1.f,
+    .rtao_active = 0.f,
+    .mb_camera_sign = 1.f,
+    .mb_camera_jitter = 1.f,
+    .mb_camera_cut = 1.f,
+    .mb_camera_cut_px = 120.f,
+    // -- Contact Shadows --
+    .cs_contact_denoise_enabled = 1.f,
+    .cs_contact_denoise_radius = 4.f,
+    .cs_contact_denoise_depth_sigma = 0.02f,
+    .cs_contact_denoise_normal_sigma = 0.1f,
+    .cs_contact_denoise_passes = 1.f,
+    .cs_denoise_axis = 0.f,
+    .cs_contact_local_denoise_enabled = 1.f,
+    .cs_contact_local_denoise_radius = 4.f,
+    .cs_contact_enabled = 0.f,
+    .cs_contact_strength = 1.f,
+    .cs_contact_env_strength = 1.f,
+    .cs_contact_char_strength = 1.f,
+    .cs_contact_sample_count = 8.f,
+    .cs_contact_ray_length = 50.f,
+    .cs_contact_thickness = 0.35f,
+    .cs_contact_bias = 0.0001f,
+    .cs_contact_normal_bias = 0.0001f,
+    .cs_contact_sky_depth = 100000.f,
+    .cs_contact_max_darkening = 1.f,
+    .cs_contact_isfast_enabled = 1.f,
+    .cs_contact_debug = 0.f,
+    .cs_contact_local_enabled = 0.f,
+    .cs_contact_local_strength = 1.f,
+    // Medium (8 steps): the local march default moved up from the old raw-slider
+    // default of 4 when the sample count became a quality tier, matching the sun
+    // march above. Keep in sync with ContactShadowsLocalQuality.
+    .cs_contact_local_sample_count = 8.f,
+    .cs_contact_local_ray_length = 2.f,
+    .cs_contact_local_max_lights = 4.f,
+    // Runtime values, written by the addon immediately before the push.
+    .cs_noise_frame = -1.f,
+    .cs_working_w = 0.f,
+    .cs_working_h = 0.f,
+    .cs_contact_local_denoise_depth_sigma = 0.02f,
+    .cs_contact_local_denoise_normal_sigma = 0.1f,
+    .cs_contact_dedicated_bound = 0.f,
+    .cs_contact_local_denoise_passes = 1.f,
+    // 0 = derive the sun-contact range gate from the engine's last cascade split.
+    .cs_contact_sun_range = 0.f,
+    // 4 reproduces the original 4-sample appearance exactly, so the estimator change is
+    // a no-op at the default Sample Count.
+    .cs_contact_response_scale = 4.f,
+    // All four local light loops marched by default, which is exactly what the
+    // feature did before the per-class toggles existed. Must stay in declaration
+    // order with shared.h: designated initialisers are evaluated in the order
+    // written, so a mismatch here is a hard compile error rather than a silent
+    // misassignment.
+    .cs_contact_local_point = 1.f,
+    .cs_contact_local_spot = 1.f,
+    .cs_contact_local_env_point = 1.f,
+    .cs_contact_local_env_spot = 1.f,
+    // ── Character Shadowing: custom camera pass ──
+    // On by default but only does anything in char_shadow_mode 2. Declaration order must
+    // match shared.h.
+    .char_cam_enabled = 1.f,
+    .char_cam_strength = 1.f,
+    .char_cam_sample_count = 8.f,
+    // Silhouette reach, in the same neighbourhood as the engine's own march (the vanilla
+    // block steps 0.0005..0.002 for 10 steps, so ~0.005..0.02 world units).
+    .char_cam_ray_length = 0.02f,
+    // Must be comparable to the ray length. A band much larger than the ray puts the
+    // whole ray inside or outside it, the coverage estimator degenerates to a binary
+    // any-hit test, and Sample Count stops doing anything.
+    .char_cam_thickness = 0.008f,
+    .char_cam_bias = 0.0001f,
+    // The shader folds this into the hit threshold (bias = lift + char_cam_bias) so the
+    // receiver cannot occlude itself, so it is the true clearance off the surface. A
+    // millimetre suits a 2 cm ray; anything comparable to the ray would start the march
+    // in free air beside the face.
+    .char_cam_normal_bias = 0.0015f,
+    // 2, not 4: at 4 with 8 samples a single spurious sample already costs half the
+    // available darkening, which is what made this read as a hard patch. The
+    // 4-is-the-original invariant is documented on the environment contact pass and is
+    // meaningful THERE, where the geometry is a wall or a floor and its numbers -- a 0.29
+    // band against a 2.0 ray -- are proportionate to it. Those numbers are not
+    // transferable to a character at all.
+    .char_cam_response_scale = 2.f,
+    // Below 1 because this multiplies probe-lit ambient and cannot prove the pixel was
+    // lit; a face going to solid black reads as a hole.
+    .char_cam_max_darkening = 0.6f,
+    .char_cam_isfast_enabled = 1.f,
+    .char_cam_debug = 0.f,
+    .rt_sun_cascades = 0.f,
+    // ShaderInjectData ends on a float4 boundary with no pad field, so every float in the
+    // struct needs a default here. See the closing comment in shared.h.
+};
 
 // ----------- GTVBAO Backend � constants, types, fwd decls -----------
 
 constexpr uint32_t kLightingGtvbaoRegister = 22u;
-constexpr uint32_t kLightingVbgiRegister   = 23u;  // t23 = vbgiTexture
-constexpr uint32_t kLightingRtgiRegister   = 37u;  // t37 = rtgiTexture (RTGI final GI, world/rtgi)
-constexpr uint32_t kLightingRtlsRegister   = 38u;  // t38 = rtlsTexture (RT Local Shadows term, world/rtls)
-constexpr uint32_t kLightingRtSunRegister  = 39u;  // t39 = rtsunTexture (RT Sun Shadows term, world/rtsun)
-constexpr uint32_t kLightingDepthRegister = 4u;   // t4 = depthTexture (Sora)
-constexpr uint32_t kLightingDepthRegisterKai = 3u; // t3 = depthTexture (Kai)
-constexpr uint32_t kLightingSsaoRegister = 5u;    // t5 = ssaoTexture (Sora)
-constexpr uint32_t kLightingSsaoRegisterKai = 4u; // t4 = ssaoTexture (Kai)
-constexpr uint32_t kLightingSceneCbRegister = 0u; // b0 = cb_scene
+constexpr uint32_t kLightingVbgiRegister = 23u;     // t23 = vbgiTexture
+constexpr uint32_t kLightingRtgiRegister = 37u;     // t37 = rtgiTexture (RTGI final GI, world/rtgi)
+constexpr uint32_t kLightingRtlsRegister = 38u;     // t38 = rtlsTexture (RT Local Shadows term, world/rtls)
+constexpr uint32_t kLightingRtSunRegister = 39u;    // t39 = rtsunTexture (RT Sun Shadows term, world/rtsun)
+constexpr uint32_t kLightingDepthRegister = 4u;     // t4 = depthTexture (Sora)
+constexpr uint32_t kLightingDepthRegisterKai = 3u;  // t3 = depthTexture (Kai)
+constexpr uint32_t kLightingSsaoRegister = 5u;      // t5 = ssaoTexture (Sora)
+constexpr uint32_t kLightingSsaoRegisterKai = 4u;   // t4 = ssaoTexture (Kai)
+constexpr uint32_t kLightingSceneCbRegister = 0u;   // b0 = cb_scene
 constexpr uint32_t kGTVBAODepthMipLevels = 5u;
 constexpr uint32_t kGtvbaoDescriptorTableParamCount = 4u;  // sampler, cbv, srv, uav
 constexpr uint32_t kGtvbaoPushConstantsLayoutParam = 4u;   // push_constants at b13
@@ -541,9 +541,9 @@ constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
 // is fixed and used to size the DeviceData arrays, so the shader, the host and
 // the two resource sets cannot drift apart.
 enum ShadowsPass : uint32_t {
-  kShadowsPassContact = 0u,  // contact_shadows.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 noise -> u0)
-  kShadowsPassDenoise = 1u,  // contact_denoise.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 contact -> u0), one axis per dispatch
-  kShadowsPassLocal = 2u,  // contact_local.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 noise, t3 lamps, t4 light cells, t5 material index, t6 materials -> u0), one dispatch writes all four channels
+  kShadowsPassContact = 0u,       // contact_shadows.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 noise -> u0)
+  kShadowsPassDenoise = 1u,       // contact_denoise.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 contact -> u0), one axis per dispatch
+  kShadowsPassLocal = 2u,         // contact_local.cs_5_0.hlsl  (t0 depth, t1 mrt, t2 noise, t3 lamps, t4 light cells, t5 material index, t6 materials -> u0), one dispatch writes all four channels
   kShadowsPassLocalDenoise = 3u,  // contact_local_denoise.cs_5_0.hlsl (t0 depth, t1 mrt, t2 local -> u0), one axis per dispatch
   kShadowsPassCount = 4u,
 };
@@ -593,7 +593,11 @@ enum MotionBlurPass : uint32_t {
   // centre sample unchanged, so a static frame routed through the reduction would
   // come out softened. It restores unblurred pixels from the full-res source using
   // the mask the gather leaves in alpha.
-  kMbDownsample = 0, kMbTileMax = 1, kMbNeighborMax = 2, kMbGather = 3, kMbComposite = 4,
+  kMbDownsample = 0,
+  kMbTileMax = 1,
+  kMbNeighborMax = 2,
+  kMbGather = 3,
+  kMbComposite = 4,
   // Appended last so the indices above keep their meaning. Splits the game's
   // single motion texture into camera and object components at per-pixel
   // resolution, which TileMax cannot do because it is a reduction. Writes one
@@ -624,7 +628,7 @@ constexpr uint32_t kKaiTonemapHash = 0x034581D3u;
 // predicate.
 static bool MotionBlurActive(bool cutscene) {
   return shader_injection.mb_mode >= 1.5f
-      || (shader_injection.mb_mode >= 0.5f && cutscene);
+         || (shader_injection.mb_mode >= 0.5f && cutscene);
 }
 // The settings that hang off the chain (Max Radius, Quality, Half Resolution,
 // the debug views) pass cutscene=true to ask whether the mode could EVER run,
@@ -705,14 +709,14 @@ constexpr uint32_t kMotionBlurLogFrameGap = 120u;
 // ResetSettings() restores default_value on top of them, so a divergence
 // between the two is silently lost at runtime. Keep them in sync; the values
 // here only apply before the first LoadSettings() pass.
-static float g_gtvbao_normal_input_mode     = 1.f;   // 1 = use the g-buffer normal
-static float g_gtvbao_normal_influence      = 1.f;   // xy scale: 1 = untouched
+static float g_gtvbao_normal_input_mode = 1.f;       // 1 = use the g-buffer normal
+static float g_gtvbao_normal_influence = 1.f;        // xy scale: 1 = untouched
 static float g_gtvbao_normal_z_preservation = 1.f;   // z  scale: 1 = untouched
-static float g_gtvbao_normal_depth_blend    = 1.f;   // MRT weight before shaping
-static float g_gtvbao_normal_sharpness      = 1.f;   // gamma: 1 = passthrough
+static float g_gtvbao_normal_depth_blend = 1.f;      // MRT weight before shaping
+static float g_gtvbao_normal_sharpness = 1.f;        // gamma: 1 = passthrough
 static float g_gtvbao_normal_edge_rejection = 0.f;   // 0 = no silhouette rejection
-static float g_gtvbao_normal_detail_response = 0.f; // 0 = no disagreement reweight
-static float g_gtvbao_normal_max_darkening  = 1.f;   // cap: 1 = uncapped
+static float g_gtvbao_normal_detail_response = 0.f;  // 0 = no disagreement reweight
+static float g_gtvbao_normal_max_darkening = 1.f;    // cap: 1 = uncapped
 static float g_gtvbao_hemisphere_weighting = 0.f;
 static float g_gtvbao_auto_thickness = 1.f;
 static float g_gtvbao_base_thickness = 0.20f;
@@ -723,18 +727,18 @@ static float g_gtvbao_upscale_bilinear_sharpness = 1.f;
 static float g_gtvbao_upscale_nearest_fallback = 1.f;
 
 // -- Dynamic Cubemaps (Sora 2nd) � standalone t17 replacement --
-constexpr uint32_t kDynCubeRegister = 17u; // t17 texEnvMap_g
-constexpr uint32_t kDynCubeHistPosRegister = 29u; // t29 dynCubeHistPosTex (debug 11/12)
-constexpr uint32_t kDynCubeVanillaRegister = 30u; // t30 dynCubeVanillaTex (vanilla cube fallback)
-constexpr uint32_t kDynCubeSSRRegister = 31u;     // t31 dynCubeSSRTex (blurred SSR result)
-constexpr uint32_t kDynCubeSSRRawRegister = 32u;  // t32 dynCubeSSRRawTex (raw SSR, debug 17)
+constexpr uint32_t kDynCubeRegister = 17u;         // t17 texEnvMap_g
+constexpr uint32_t kDynCubeHistPosRegister = 29u;  // t29 dynCubeHistPosTex (debug 11/12)
+constexpr uint32_t kDynCubeVanillaRegister = 30u;  // t30 dynCubeVanillaTex (vanilla cube fallback)
+constexpr uint32_t kDynCubeSSRRegister = 31u;      // t31 dynCubeSSRTex (blurred SSR result)
+constexpr uint32_t kDynCubeSSRRawRegister = 32u;   // t32 dynCubeSSRRawTex (raw SSR, debug 17)
 constexpr uint32_t kDynCubeSSRLayoutVersion = 6u;
 constexpr uint32_t kDynCubeSSRBlurLayoutVersion = 6u;
 constexpr uint32_t kDynCubeWorldBoxLayoutVersion = 2u;
 constexpr uint32_t kDynCubeWorldBoxChunkPartials = 256u;  // must match kChunkPartials in DynCubeBoundsReduceCS
-constexpr uint32_t kDynCubeCaptureLayoutVersion = 2u;  // bump when the capture pipeline layout shape changes (forces recreate)
-constexpr uint32_t kRCASLayoutVersion = 5u;  // bump when the RCAS pipeline layout shape changes (forces recreate)
-constexpr uint32_t kFXAALayoutVersion = 1u;  // bump when the FXAA pipeline layout shape changes (forces recreate)
+constexpr uint32_t kDynCubeCaptureLayoutVersion = 2u;     // bump when the capture pipeline layout shape changes (forces recreate)
+constexpr uint32_t kRCASLayoutVersion = 5u;               // bump when the RCAS pipeline layout shape changes (forces recreate)
+constexpr uint32_t kFXAALayoutVersion = 1u;               // bump when the FXAA pipeline layout shape changes (forces recreate)
 // Strip sRGB encoding for UAV-compatible temp storage and raw (non-decoding)
 // SRV reads. Copies stay bitwise so the game keeps decoding exactly as before.
 // Non-sRGB formats map to identity (FP16 HDR path unchanged).
@@ -743,7 +747,7 @@ static reshade::api::format RCASLinearFormat(reshade::api::format fmt) {
   switch (fmt) {
     case F::r8g8b8a8_unorm_srgb: return F::r8g8b8a8_unorm;
     case F::b8g8r8a8_unorm_srgb: return F::b8g8r8a8_unorm;
-    default: return fmt;
+    default:                     return fmt;
   }
 }
 constexpr uint32_t kDynCubeDefaultSize = 128u;
@@ -786,15 +790,15 @@ static float g_vbgi_far_spatial_radius = 1.f;
 static float g_vbgi_far_multibounce_strength = 0.25f;
 
 // -- IS-FAST noise --
-static float g_isfast_enabled       = 0.f;
-static float g_isfast_strength      = 1.f;
+static float g_isfast_enabled = 0.f;
+static float g_isfast_strength = 1.f;
 static float g_isfast_debug_logging = 0.f;
 static float g_isfast_spatial_scale = 1.f;
 static float g_isfast_temporal_speed = 1.f;
-static float g_isfast_seed_offset   = 0.f;
+static float g_isfast_seed_offset = 0.f;
 
 // -- Settings visibility --
-static float g_settings_mode            = 0.f;   // 0=Basic, 1=Advanced
+static float g_settings_mode = 0.f;  // 0=Basic, 1=Advanced
 static bool IsAdvancedSettingsMode() { return g_settings_mode >= 0.5f; }
 
 // -- Kai detection --
@@ -932,17 +936,17 @@ static bool LocalContactComputeRunning() {
 
 // -- Lighting shader identification (Sora + Kai) --
 static bool IsLightingShader(uint32_t hash) {
-  return hash == 0xFDAAF80Eu    // Sora lighting
-      || hash == 0xCA3D8596u    // Sora 2nd lighting
-      || hash == 0x0CDCB258u    // Kyoto lighting
-      || hash == 0x430ED091u    // Kai lighting
-      || hash == 0xF6C55E5Fu;   // Kai lighting soft
+  return hash == 0xFDAAF80Eu      // Sora lighting
+         || hash == 0xCA3D8596u   // Sora 2nd lighting
+         || hash == 0x0CDCB258u   // Kyoto lighting
+         || hash == 0x430ED091u   // Kai lighting
+         || hash == 0xF6C55E5Fu;  // Kai lighting soft
 }
 
 // -- CPU optimization toggles --
-static float g_gtvbao_cs_dispatch_fix    = 0.f;  // 0=Off, 1=Restore, 2=Null, 3=Null+Restore
-static float g_cpuopt_deferred_dispatch   = 1.f;  // dispatch GTVBAO/VBGI in OnPresent, not inline (default ON for Kai)
-static float g_cpuopt_ensure_pipelines    = 0.f;  // kai-style: don't destroy/recreate pipelines every frame
+static float g_gtvbao_cs_dispatch_fix = 0.f;    // 0=Off, 1=Restore, 2=Null, 3=Null+Restore
+static float g_cpuopt_deferred_dispatch = 1.f;  // dispatch GTVBAO/VBGI in OnPresent, not inline (default ON for Kai)
+static float g_cpuopt_ensure_pipelines = 0.f;   // kai-style: don't destroy/recreate pipelines every frame
 
 static float g_gtvbao_full_res_denoise = 0.f;
 static float g_gtvbao_temporal_enabled = 0.f;
@@ -1058,8 +1062,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // VBGI radiance inputs (lighting draw): 0 mrt1 t2, 1 mrt2 t3, 2 deferredParams t6, 3 shadow t7 (Sora 2nd) / t9 (Sora 1st), 4 dynamicLights t11, 5 lightIndices t12.
   reshade::api::resource_view vbgi_in_srv[6] = {};
   uint64_t vbgi_in_frame[6] = {UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
-  uint64_t vbgi_in_res[6] = {};                 // resource of vbgi_in_srv[k] (destroy-event liveness)
-  std::atomic<bool> vbgi_in_live[6] = {};       // false after the view or its resource is destroyed
+  uint64_t vbgi_in_res[6] = {};            // resource of vbgi_in_srv[k] (destroy-event liveness)
+  std::atomic<bool> vbgi_in_live[6] = {};  // false after the view or its resource is destroyed
   reshade::api::resource vbgi_radiance_texture = {};
   reshade::api::resource_view vbgi_radiance_srv = {};
   reshade::api::resource_view vbgi_radiance_mip_srv[4] = {};
@@ -1111,9 +1115,9 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   falcom_world::rtgi::RtgiTextureSet<1> vbgi_far_sp_nrm = {};  // rgba16f, trace size: sender normal, accepted fraction
 
   reshade::api::resource_view captured_depth_srv = {};
-  std::atomic<bool> captured_depth_live{true};  // destroy-event driven; false = target freed since capture
-  uint64_t captured_depth_res = 0u;             // resource behind the view (destroy matching)
-  std::string captured_depth_dims = "none";     // cached at capture (push context only)
+  std::atomic<bool> captured_depth_live{true};            // destroy-event driven; false = target freed since capture
+  uint64_t captured_depth_res = 0u;                       // resource behind the view (destroy matching)
+  std::string captured_depth_dims = "none";               // cached at capture (push context only)
   uint32_t captured_depth_w = 0u, captured_depth_h = 0u;  // same, numeric (shadow pass sizing)
   reshade::api::resource_view captured_ssao_srv = {};
   // The game SSAO is only ever an OPTIONAL input, so unlike depth
@@ -1122,23 +1126,24 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // from "left over from an earlier frame, possibly a different resolution".
   uint64_t captured_ssao_frame = 0u;
   reshade::api::resource_view captured_mrt_normal_srv = {};
-  std::atomic<bool> captured_mrt_live{true};    // destroy-event driven; false = target freed since capture
-  uint64_t captured_mrt_res = 0u;               // resource behind the view (destroy matching)
-  std::string captured_mrt_dims = "none";       // cached at capture (push context only)
-  reshade::api::resource_view captured_color_srv = {};   // t0 � lighting input color texture
-  std::atomic<bool> captured_color_live{true};  // destroy-event driven; false = target freed since capture
-  uint64_t captured_color_res = 0u;             // resource behind the view (destroy matching)
-  std::string captured_color_dims = "none";     // cached at capture (push context only)
-  uint32_t captured_color_w = 0u, captured_color_h = 0u;  // cached dims (SSR sizing, no draw-time query)
-  reshade::api::resource_view captured_ssr1_srv = {};   // ssr2-draw t0 � vanilla ssr1 march result (replacement debug view 2)
-  std::atomic<bool> captured_ssr1_live{true};   // destroy-event driven
-  uint64_t captured_ssr1_res = 0u;              // resource behind the view (destroy matching)
-  reshade::api::resource_view captured_ssr_mrt_srv = {};  // ssr1-draw t2 � march's own mrt0 (composite gate + normal decode)
-  std::atomic<bool> captured_ssr_mrt_live{true};  // destroy-event driven
-  uint64_t captured_ssr_mrt_res = 0u;             // resource behind the view (destroy matching)
+  std::atomic<bool> captured_mrt_live{true};                  // destroy-event driven; false = target freed since capture
+  uint64_t captured_mrt_res = 0u;                             // resource behind the view (destroy matching)
+  std::string captured_mrt_dims = "none";                     // cached at capture (push context only)
+  reshade::api::resource_view captured_color_srv = {};        // t0 � lighting input color texture
+  std::atomic<bool> captured_color_live{true};                // destroy-event driven; false = target freed since capture
+  uint64_t captured_color_res = 0u;                           // resource behind the view (destroy matching)
+  std::string captured_color_dims = "none";                   // cached at capture (push context only)
+  uint32_t captured_color_w = 0u, captured_color_h = 0u;      // cached dims (SSR sizing, no draw-time query)
+  reshade::api::resource_view captured_ssr1_srv = {};         // ssr2-draw t0 � vanilla ssr1 march result (replacement debug view 2)
+  std::atomic<bool> captured_ssr1_live{true};                 // destroy-event driven
+  uint64_t captured_ssr1_res = 0u;                            // resource behind the view (destroy matching)
+  reshade::api::resource_view captured_ssr_mrt_srv = {};      // ssr1-draw t2 � march's own mrt0 (composite gate + normal decode)
+  std::atomic<bool> captured_ssr_mrt_live{true};              // destroy-event driven
+  uint64_t captured_ssr_mrt_res = 0u;                         // resource behind the view (destroy matching)
   reshade::api::resource_view captured_vanilla_env_srv = {};  // game's texEnvMap_g (t17) binding � vanilla cube fallback
-  reshade::api::resource_view captured_scene_cbv_view = {};  // push_descriptors passes CBV as resource_view
+  reshade::api::resource_view captured_scene_cbv_view = {};   // push_descriptors passes CBV as resource_view
   reshade::api::buffer_range captured_scene_cbv = {};
+  falcom_world::rtxdi::SceneRangeCapture rtxdi_scene_range;
   bool captured_scene_cbv_valid = false;
   std::atomic<bool> captured_cbv_live{true};  // destroy-event driven; false = buffer freed since capture
   uint64_t captured_cbv_res = 0u;             // buffer behind the range (destroy matching)
@@ -1147,8 +1152,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   std::atomic<bool> defDepthLive{true}, defMrtLive{true}, defCbvLive{true};
   uint64_t deferred_depth_res = 0u, deferred_mrt_res = 0u, deferred_cbv_res = 0u;
   uint64_t captured_scene_cbv_frame = UINT64_MAX;
-  uint64_t captured_color_frame = UINT64_MAX;   // frame_index of last lighting t0 capture (stale = loading screen)
-  uint64_t captured_depth_frame = UINT64_MAX;   // frame_index of last lighting depth capture (kept for future detectors)
+  uint64_t captured_color_frame = UINT64_MAX;  // frame_index of last lighting t0 capture (stale = loading screen)
+  uint64_t captured_depth_frame = UINT64_MAX;  // frame_index of last lighting depth capture (kept for future detectors)
   bool resources_created = false;
   uint64_t frame_index = 0u;
   uint64_t gtvbao_debug_frame = UINT64_MAX;
@@ -1197,10 +1202,10 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
 
   // -- Dynamic Cubemaps (Sora 2nd) � Phase 0A/B + Phase 1 history --
   // Aliases to the current (just-written) history set � dyncube_srv is the cube SRV for t17.
-  reshade::api::resource dyncube_texture = {};        // current color resource (alias)
-  reshade::api::resource_view dyncube_srv = {};       // current color cube SRV (alias, t17)
-  reshade::api::resource_view dyncube_uav = {};       // current color UAV (alias, capture/solid write)
-  reshade::api::sampler dyncube_sampler = {};         // point clamp
+  reshade::api::resource dyncube_texture = {};   // current color resource (alias)
+  reshade::api::resource_view dyncube_srv = {};  // current color cube SRV (alias, t17)
+  reshade::api::resource_view dyncube_uav = {};  // current color UAV (alias, capture/solid write)
+  reshade::api::sampler dyncube_sampler = {};    // point clamp
   reshade::api::pipeline_layout dyncube_capture_layout = {};
   reshade::api::pipeline dyncube_capture_pipeline = {};
   uint32_t dyncube_capture_layout_version = 0u;  // recreate layout/tables/pipeline when shape changes
@@ -1213,15 +1218,15 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool dyncube_solid_written = false;
   // Ping-pong history sets (Phase 1). Index 0 = A, 1 = B. dyncube_hist_cur = current write set.
   struct {
-    reshade::api::resource color;          // RGBA16F cube-compatible, 128x128x6x1
+    reshade::api::resource color;                // RGBA16F cube-compatible, 128x128x6x1
     reshade::api::resource_view color_cube_srv;  // TextureCube SRV (t17)
     reshade::api::resource_view color_arr_srv;   // Texture2DArray SRV (compute prev read)
     reshade::api::resource_view color_uav;       // Texture2DArray UAV (compute current write)
-    reshade::api::resource pos;            // RGBA16F (rgb=scaled pos, a=validity)
+    reshade::api::resource pos;                  // RGBA16F (rgb=scaled pos, a=validity)
     reshade::api::resource_view pos_arr_srv;
-    reshade::api::resource_view pos_cube_srv;   // TextureCube SRV (debug 11/12 histPos lookup)
+    reshade::api::resource_view pos_cube_srv;  // TextureCube SRV (debug 11/12 histPos lookup)
     reshade::api::resource_view pos_uav;
-    reshade::api::resource contrib;        // R16F (history contribution for debug 6)
+    reshade::api::resource contrib;  // R16F (history contribution for debug 6)
     reshade::api::resource_view contrib_arr_srv;
     reshade::api::resource_view contrib_uav;
   } dyncube_hist[2];
@@ -1229,117 +1234,120 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource dyncube_cam[2];
   reshade::api::resource_view dyncube_cam_srv[2];
   reshade::api::resource_view dyncube_cam_uav[2];
-  uint32_t dyncube_hist_cur = 0;           // current write set (0=A,1=B); reads use dyncube_readSet
-  bool dyncube_needs_reset = true;         // clear history + first-frame reset
-  bool dyncube_was_enabled = false;        // rising-edge latch for enabled->reset
-  reshade::api::sampler dyncube_linear_sampler = {};     // trilinear clamp (GGX input mips)
+  uint32_t dyncube_hist_cur = 0;                      // current write set (0=A,1=B); reads use dyncube_readSet
+  bool dyncube_needs_reset = true;                    // clear history + first-frame reset
+  bool dyncube_was_enabled = false;                   // rising-edge latch for enabled->reset
+  reshade::api::sampler dyncube_linear_sampler = {};  // trilinear clamp (GGX input mips)
   // Character mask (Phase 2)
-  reshade::api::resource dyncube_charmask = {};          // RGBA16F cube, 1 mip (character mask)
-  reshade::api::resource_view dyncube_charmask_srv = {};   // TextureCube SRV (for debug 9)
-  reshade::api::resource_view dyncube_charmask_arr_srv = {}; // Texture2DArray SRV (world-box reduction read)
-  reshade::api::resource_view dyncube_charmask_uav = {};   // Texture2DArray UAV (compute write)
+  reshade::api::resource dyncube_charmask = {};               // RGBA16F cube, 1 mip (character mask)
+  reshade::api::resource_view dyncube_charmask_srv = {};      // TextureCube SRV (for debug 9)
+  reshade::api::resource_view dyncube_charmask_arr_srv = {};  // Texture2DArray SRV (world-box reduction read)
+  reshade::api::resource_view dyncube_charmask_uav = {};      // Texture2DArray UAV (compute write)
   // World-fixed parallax proxy (Sora2nd v1): persistent GPU bounds, no CPU readback.
   // Survives cache round-trips (size-independent); destroyed + re-initialized on recreate.
-  reshade::api::resource dyncube_worldbox_bounds = {};       // structured buffer, 2x float4: [0]=(min,valid) [1]=(max,spare)
-  reshade::api::resource_view dyncube_worldbox_bounds_srv = {}; // buffer SRV (t33 lighting read)
-  reshade::api::resource_view dyncube_worldbox_bounds_uav = {}; // buffer UAV (reduction merge write)
-  reshade::api::resource dyncube_faceextents = {};              // structured buffer, 2x float4: [0]=(+X,+Y,+Z,mask) [1]=(-X,-Y,-Z,spare)
-  reshade::api::resource_view dyncube_faceextents_uav = {};     // buffer UAV (reduction per-face extent write)
-  reshade::api::resource dyncube_faceExtStaging = {};           // 32B gpu_to_cpu staging copy of extents
-  reshade::api::resource dyncube_worldbox_scratch = {};      // structured buffer, groups*2 float4 partials (sized per cube size)
-  uint64_t dyncube_worldbox_scratch_groups = 0u;  // pass-0 group capacity of the live scratch buffer
-  reshade::api::resource_view dyncube_worldbox_scratch_srv = {}; // buffer SRV (pass-1 read)
-  reshade::api::resource_view dyncube_worldbox_scratch_uav = {}; // buffer UAV (pass-0 write)
+  reshade::api::resource dyncube_worldbox_bounds = {};            // structured buffer, 2x float4: [0]=(min,valid) [1]=(max,spare)
+  reshade::api::resource_view dyncube_worldbox_bounds_srv = {};   // buffer SRV (t33 lighting read)
+  reshade::api::resource_view dyncube_worldbox_bounds_uav = {};   // buffer UAV (reduction merge write)
+  reshade::api::resource dyncube_faceextents = {};                // structured buffer, 2x float4: [0]=(+X,+Y,+Z,mask) [1]=(-X,-Y,-Z,spare)
+  reshade::api::resource_view dyncube_faceextents_uav = {};       // buffer UAV (reduction per-face extent write)
+  reshade::api::resource dyncube_faceExtStaging = {};             // 32B gpu_to_cpu staging copy of extents
+  reshade::api::resource dyncube_worldbox_scratch = {};           // structured buffer, groups*2 float4 partials (sized per cube size)
+  uint64_t dyncube_worldbox_scratch_groups = 0u;                  // pass-0 group capacity of the live scratch buffer
+  reshade::api::resource_view dyncube_worldbox_scratch_srv = {};  // buffer SRV (pass-1 read)
+  reshade::api::resource_view dyncube_worldbox_scratch_uav = {};  // buffer UAV (pass-0 write)
   reshade::api::pipeline_layout dyncube_worldbox_layout = {};
   reshade::api::pipeline dyncube_worldbox_pipeline = {};
   uint32_t dyncube_worldbox_layout_version = 0u;  // recreate layout/tables/pipeline when shape changes
   GTVBAODescriptorTableSet dyncube_worldbox_tables = {};
-   bool dyncube_worldbox_reset_pending = true;
+  bool dyncube_worldbox_reset_pending = true;
   // Delayed-validate commit (loading protection): consumers follow readSet, which
   // advances only to validated captures. Staging holds the latest bounds copy.
-  reshade::api::resource dyncube_validStaging = {}; // 32B gpu_to_cpu staging copy of bounds
-  uint32_t dyncube_readSet = 0;            // validated consumer set (t29/previews/aliases/filter input)
-  uint32_t dyncube_filteredReadSet = 99u;  // readSet last fed into GGX filter (99 = none yet)
-  bool dyncube_boxCopyPending = false;     // staged validity copy enqueued, not yet consumed
-  uint64_t dyncube_valid_event = 0u;       // native D3D11 event query ended after the staging copies (0 = unavailable)
-  bool dyncube_valid_event_armed = false;  // the latest staging copies were followed by an End on the immediate context
-  uint32_t dyncube_valid_wait_ticks = 0u;  // consecutive immediate ticks the armed copy was not complete yet
-  uint64_t dyncube_valid_poll_misses = 0u; // scheduler ticks where the staged copy was not complete yet
-  uint64_t dyncube_valid_timeouts = 0u;    // armed copies that hit DYNCUBE_VALIDITY_MAX_WAIT_TICKS (blocking map fallback)
-  float dyncube_map_wait_ms_max = 0.f;     // longest validity-staging map wait since the last scheduler log line (CPU ms)
+  reshade::api::resource dyncube_validStaging = {};  // 32B gpu_to_cpu staging copy of bounds
+  uint32_t dyncube_readSet = 0;                      // validated consumer set (t29/previews/aliases/filter input)
+  uint32_t dyncube_filteredReadSet = 99u;            // readSet last fed into GGX filter (99 = none yet)
+  bool dyncube_boxCopyPending = false;               // staged validity copy enqueued, not yet consumed
+  uint64_t dyncube_valid_event = 0u;                 // native D3D11 event query ended after the staging copies (0 = unavailable)
+  bool dyncube_valid_event_armed = false;            // the latest staging copies were followed by an End on the immediate context
+  uint32_t dyncube_valid_wait_ticks = 0u;            // consecutive immediate ticks the armed copy was not complete yet
+  uint64_t dyncube_valid_poll_misses = 0u;           // scheduler ticks where the staged copy was not complete yet
+  uint64_t dyncube_valid_timeouts = 0u;              // armed copies that hit DYNCUBE_VALIDITY_MAX_WAIT_TICKS (blocking map fallback)
+  float dyncube_map_wait_ms_max = 0.f;               // longest validity-staging map wait since the last scheduler log line (CPU ms)
   // Dynamic Cubemaps > GPU Timing Log: one timer per step, read without waiting.
   falcom_world::bvh::GpuTimer dyncube_gpu_capture_timer = {};
   falcom_world::bvh::GpuTimer dyncube_gpu_filter_timer = {};
   falcom_world::bvh::GpuTimer dyncube_gpu_variant_timer = {};
   falcom_world::bvh::GpuTimer dyncube_gpu_ssr_timer = {};
-  falcom_world::bvh::GpuTimer dyncube_gpu_box_timer = {};   // world-box merge (split out of the capture timer)
-  std::chrono::steady_clock::time_point present_last_time = {};   // previous present, for the frame-interval log
-  std::chrono::steady_clock::time_point present_window_t0 = {};   // first interval of the current log window
-  bool present_last_valid = false;                                  // false until the first interval after the toggle is turned on
-  double present_sum_ms = 0.0;                                      // frame intervals in the current log window
-  float present_max_ms = 0.f;                                       // longest frame interval in the current log window
-  uint32_t present_count = 0u;                                      // frame intervals in the current log window
-  uint32_t present_slow_count = 0u;                                 // frames longer than 1.5x the previous window's average
-  double present_prev_avg_ms = 0.0;                                 // average of the previous log window (0 = none yet)
-  bool dyncube_wasRejected = false;        // edge latch for reject/resume logging
-  bool dyncube_rejectedGap = false;        // a capture was rejected since the last dispatched capture (one-shot: first accepted capture hard-replaces history)
-  bool dyncube_loadingWipeDone = false;   // loading wipe already applied for the current stale episode (edge latch)
-  bool dyncube_loadingWipePending = false;  // OnPresent saw a loading-stale episode: wipe on the next scheduler tick
-  bool dyncube_captureDirty = false;          // capture-content settings changed since last filter: force one filter pass
-  bool dyncube_dirtyFastForward = false;      // settings-dirty one-shot: next dispatched capture hard-replaces history
-  float dyncube_lastVariantSoften = -1.f;      // soften value baked into the variant (-1 = none yet)
-  float dyncube_lastVariantStrength = -1.f;    // strength value baked into the variant (-1 = none yet)
-  float dyncube_lastCharCapture = -1.f;       // character-capture value fed into the last filter pass
+  falcom_world::bvh::GpuTimer dyncube_gpu_box_timer = {};        // world-box merge (split out of the capture timer)
+  std::chrono::steady_clock::time_point present_last_time = {};  // previous present, for the frame-interval log
+  std::chrono::steady_clock::time_point present_window_t0 = {};  // first interval of the current log window
+  bool present_last_valid = false;                               // false until the first interval after the toggle is turned on
+  double present_sum_ms = 0.0;                                   // frame intervals in the current log window
+  float present_max_ms = 0.f;                                    // longest frame interval in the current log window
+  uint32_t present_count = 0u;                                   // frame intervals in the current log window
+  uint32_t present_slow_count = 0u;                              // frames longer than 1.5x the previous window's average
+  double present_prev_avg_ms = 0.0;                              // average of the previous log window (0 = none yet)
+  bool dyncube_wasRejected = false;                              // edge latch for reject/resume logging
+  bool dyncube_rejectedGap = false;                              // a capture was rejected since the last dispatched capture (one-shot: first accepted capture hard-replaces history)
+  bool dyncube_loadingWipeDone = false;                          // loading wipe already applied for the current stale episode (edge latch)
+  bool dyncube_loadingWipePending = false;                       // OnPresent saw a loading-stale episode: wipe on the next scheduler tick
+  bool dyncube_captureDirty = false;                             // capture-content settings changed since last filter: force one filter pass
+  bool dyncube_dirtyFastForward = false;                         // settings-dirty one-shot: next dispatched capture hard-replaces history
+  float dyncube_lastVariantSoften = -1.f;                        // soften value baked into the variant (-1 = none yet)
+  float dyncube_lastVariantStrength = -1.f;                      // strength value baked into the variant (-1 = none yet)
+  float dyncube_lastCharCapture = -1.f;                          // character-capture value fed into the last filter pass
   float dyncube_lastSparkleRejection = -1.f;
   bool dyncube_hasValidRead = false;       // any validated readSet exists (gates first filter)
   uint64_t dyncube_rejected_captures = 0;  // rejected (unpromoted) capture count
   // Phase 3 GGX prefilter � double-buffered filtered cube (Active/Building) so a
   // partially-written cube is never exposed to lighting.
-  uint32_t dyncube_mip_count = 8;                        // computed mips (8 for 128..4096)
-  reshade::api::resource dyncube_ggx_in = {};            // RGBA16F cube, N mips (GGX input chain)
+  uint32_t dyncube_mip_count = 8;              // computed mips (8 for 128..4096)
+  reshade::api::resource dyncube_ggx_in = {};  // RGBA16F cube, N mips (GGX input chain)
   reshade::api::resource_view dyncube_ggx_in_cube_srv = {};
-  reshade::api::resource dyncube_ggx_out[2] = {};        // RGBA16F cubes, N mips (filtered output)
+  reshade::api::resource dyncube_ggx_out[2] = {};  // RGBA16F cubes, N mips (filtered output)
   reshade::api::resource_view dyncube_ggx_out_cube_srv[2] = {};
   reshade::api::resource_view dyncube_ggx_out_mip_uav[2][8] = {};  // per-mip array UAVs (mips 1..N-1)
-  uint32_t dyncube_ggx_active = 0;                       // index of the completed cube bound to t17
-  bool dyncube_ggx_valid = false;                        // a completed filter has been produced
+  uint32_t dyncube_ggx_active = 0;                                 // index of the completed cube bound to t17
+  bool dyncube_ggx_valid = false;                                  // a completed filter has been produced
   // Multi-frame update scheduler (Capture -> Filter -> Done -> wait -> Capture).
-  enum class DynCubePhase : uint32_t { Done = 0, Capture = 1, Filter = 2, Variant = 3 };
+  enum class DynCubePhase : uint32_t { Done = 0,
+                                       Capture = 1,
+                                       Filter = 2,
+                                       Variant = 3 };
   DynCubePhase dyncube_phase = DynCubePhase::Done;
-  uint64_t dyncube_next_update_frame = 0;                // next frame a capture may begin
-  uint64_t dyncube_sched_frame = UINT64_MAX;             // last present frame the scheduler ran
+  uint64_t dyncube_next_update_frame = 0;     // next frame a capture may begin
+  uint64_t dyncube_sched_frame = UINT64_MAX;  // last present frame the scheduler ran
   // Actual GPU-work counters (prove capture/filter frequency; reported in the throttled log).
-  uint64_t dyncube_capture_dispatches = 0;               // RunDynCubeCapture dispatched
-  uint64_t dyncube_filter_updates = 0;                   // RunDynCubeFilter completed
-  uint64_t dyncube_ggx_mip_dispatches = 0;               // GGX per-mip dispatches issued
-  uint64_t dyncube_face_copies = 0;                      // 6-face mip0 copies issued
+  uint64_t dyncube_capture_dispatches = 0;  // RunDynCubeCapture dispatched
+  uint64_t dyncube_filter_updates = 0;      // RunDynCubeFilter completed
+  uint64_t dyncube_ggx_mip_dispatches = 0;  // GGX per-mip dispatches issued
+  uint64_t dyncube_face_copies = 0;         // 6-face mip0 copies issued
   reshade::api::pipeline_layout dyncube_ggx_layout = {};
   reshade::api::pipeline dyncube_ggx_pipeline = {};
   GTVBAODescriptorTableSet dyncube_ggx_tables = {};
   // Global-push variant cube (soften + strength for non-lighting t17 consumers).
   // Derived from ggx_out[active]; rebuilt on demand, never part of per-size cache.
-  reshade::api::resource dyncube_variant = {};                // RGBA16F cube, N mips
-  reshade::api::resource_view dyncube_variant_cube_srv = {};  // full-chain SRV (global serve)
+  reshade::api::resource dyncube_variant = {};                  // RGBA16F cube, N mips
+  reshade::api::resource_view dyncube_variant_cube_srv = {};    // full-chain SRV (global serve)
   reshade::api::resource_view dyncube_variant_mip_uav[8] = {};  // per-mip array UAVs (variant write, mip0..N-1)
   reshade::api::pipeline_layout dyncube_variant_layout = {};
   reshade::api::pipeline dyncube_variant_pipeline = {};
   GTVBAODescriptorTableSet dyncube_variant_tables = {};
-  bool dyncube_variant_valid = false;          // variant matches current ggx_out + settings
+  bool dyncube_variant_valid = false;  // variant matches current ggx_out + settings
   // Dedicated solid-color debug cube (Phase 0A). Never aliases history/ggx resources.
-  reshade::api::resource dyncube_solid_cube = {};          // RGBA16F cube, 1 mip
-  reshade::api::resource_view dyncube_solid_cube_srv = {};   // TextureCube SRV (t17 for debug 3)
-  reshade::api::resource_view dyncube_solid_cube_uav = {};   // Texture2DArray UAV (solid write)
+  reshade::api::resource dyncube_solid_cube = {};           // RGBA16F cube, 1 mip
+  reshade::api::resource_view dyncube_solid_cube_srv = {};  // TextureCube SRV (t17 for debug 3)
+  reshade::api::resource_view dyncube_solid_cube_uav = {};  // Texture2DArray UAV (solid write)
   // Simple SSR (screen-space ray march) � independent of history/ggx/inferred.
-  reshade::api::resource dyncube_ssr_raw = {};          // RGBA16F 2D, march output (rgb=color, a=confidence)
+  reshade::api::resource dyncube_ssr_raw = {};  // RGBA16F 2D, march output (rgb=color, a=confidence)
   reshade::api::resource_view dyncube_ssr_raw_srv = {};
   reshade::api::resource_view dyncube_ssr_raw_uav = {};
-  reshade::api::resource dyncube_ssr_blur_h = {};       // RGBA16F 2D, horizontal blur intermediate
+  reshade::api::resource dyncube_ssr_blur_h = {};  // RGBA16F 2D, horizontal blur intermediate
   reshade::api::resource_view dyncube_ssr_blur_h_srv = {};
   reshade::api::resource_view dyncube_ssr_blur_h_uav = {};
-  reshade::api::resource dyncube_ssr_blur = {};         // RGBA16F 2D, final blurred result (t31)
+  reshade::api::resource dyncube_ssr_blur = {};  // RGBA16F 2D, final blurred result (t31)
   reshade::api::resource_view dyncube_ssr_blur_srv = {};
   reshade::api::resource_view dyncube_ssr_blur_uav = {};
-  reshade::api::resource dyncube_ssr_hitmask = {};      // R32_UINT 2D, per-8x8-tile SSR hit mask (atomics require R32)
+  reshade::api::resource dyncube_ssr_hitmask = {};  // R32_UINT 2D, per-8x8-tile SSR hit mask (atomics require R32)
   reshade::api::resource_view dyncube_ssr_hitmask_srv = {};
   reshade::api::resource_view dyncube_ssr_hitmask_uav = {};
   reshade::api::pipeline_layout dyncube_ssr_layout = {};
@@ -1350,33 +1358,33 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline dyncube_ssr_blur_pipeline = {};
   uint32_t dyncube_ssr_blur_layout_version = 0u;  // recreate layout/tables/pipeline when shape changes
   GTVBAODescriptorTableSet dyncube_ssr_blur_tables = {};
-  uint32_t dyncube_pending_size = 0;                     // requested cube size, recreated at frame boundary
-  bool dyncube_pending_recreate = false;                 // recreate (old set release deferred to Present)
-  bool dyncube_pending_destroy = false;                  // feature disabled -> free the set at Present
+  uint32_t dyncube_pending_size = 0;      // requested cube size, recreated at frame boundary
+  bool dyncube_pending_recreate = false;  // recreate (old set release deferred to Present)
+  bool dyncube_pending_destroy = false;   // feature disabled -> free the set at Present
   // -- RCAS post-TAA sharpening (Stage 1; motion sharpening is Stage 2) --
   // Flow per frame when enabled: TAA draw completes -> copy unsharpened TAA
   // output to rcas_hist (this copy alone is ever bound as next frame's t2) ->
   // RCAS compute reads TAA output, writes rcas_temp -> copy rcas_temp back
   // over the TAA output so downstream reads see sharpened pixels. History
   // isolation is structural: sharpened data never enters rcas_hist or t2.
-  reshade::api::resource rcas_temp_texture = {};         // owned sharpened target (dims of TAA output, linear/UAV-legal variant format)
-  reshade::api::resource_view rcas_temp_srv = {};        // (kept for debugging; not bound downstream)
-  reshade::api::resource_view rcas_temp_uav = {};        // compute write target (u0)
-  reshade::api::resource rcas_hist_texture = {};         // owned UNSHARPENED copy; sole source of overridden t2
-  reshade::api::resource_view rcas_hist_srv = {};        // bound as t2 when RCAS serves history; also the dispatch input (t0)
-  uint32_t rcas_w = 0u, rcas_h = 0u;                     // live dims of temp/hist set
+  reshade::api::resource rcas_temp_texture = {};                  // owned sharpened target (dims of TAA output, linear/UAV-legal variant format)
+  reshade::api::resource_view rcas_temp_srv = {};                 // (kept for debugging; not bound downstream)
+  reshade::api::resource_view rcas_temp_uav = {};                 // compute write target (u0)
+  reshade::api::resource rcas_hist_texture = {};                  // owned UNSHARPENED copy; sole source of overridden t2
+  reshade::api::resource_view rcas_hist_srv = {};                 // bound as t2 when RCAS serves history; also the dispatch input (t0)
+  uint32_t rcas_w = 0u, rcas_h = 0u;                              // live dims of temp/hist set
   reshade::api::format rcas_fmt = reshade::api::format::unknown;  // live format (preserved, never converted)
-  bool rcas_have_copy = false;                           // true once an unsharpened copy exists for t2 override
-  bool rcas_format_logged = false;                       // one-time format log per resource set
-  bool rcas_dispatch_logged = false;                     // one-time dispatch-shape log per resource set
+  bool rcas_have_copy = false;                                    // true once an unsharpened copy exists for t2 override
+  bool rcas_format_logged = false;                                // one-time format log per resource set
+  bool rcas_dispatch_logged = false;                              // one-time dispatch-shape log per resource set
   reshade::api::pipeline_layout rcas_layout = {};
   reshade::api::pipeline rcas_pipeline = {};
   uint32_t rcas_layout_version = 0u;
   std::array<reshade::api::descriptor_table, 2> rcas_tables = {};  // [0]=srv t0, [1]=uav u0
-  reshade::api::resource_view rcas_last_rtv0 = {};            // latest bound RTV0 (D3D11 immediate-list assumption; sampled at TAA on_draw)
-  reshade::api::resource_view rcas_motion_srv = {};          // game motion buffer (t3) captured from TAA draws (Stage 2)
+  reshade::api::resource_view rcas_last_rtv0 = {};                 // latest bound RTV0 (D3D11 immediate-list assumption; sampled at TAA on_draw)
+  reshade::api::resource_view rcas_motion_srv = {};                // game motion buffer (t3) captured from TAA draws (Stage 2)
   uint64_t rcas_motion_res = 0u;
-  std::atomic<bool> rcas_motion_live{true};                  // destroy-event driven; false = buffer freed since capture
+  std::atomic<bool> rcas_motion_live{true};  // destroy-event driven; false = buffer freed since capture
   // Motion vectors read from the GBuffer's fourth render target instead of the
   // TAA's t3. Same buffer, different bind point: the writers are
   // staticfoliage_0xF1EC53A8.ps_5_0.hlsl:201-207 and its 13 siblings, all
@@ -1386,11 +1394,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // and this needs no shader change. The difference is availability, not data:
   // RTV4 is written by the GBuffer pass every frame, whereas t3 only exists once the
   // TAA draw has run.
-  reshade::api::resource_view mb_rtv4_srv = {};              // GBuffer RTV4, captured from bind_render_targets
+  reshade::api::resource_view mb_rtv4_srv = {};  // GBuffer RTV4, captured from bind_render_targets
   std::atomic<uint64_t> mb_rtv4_res{0u};
   std::atomic<bool> mb_rtv4_live{true};
-  bool mb_rtv4_warned_fmt = false;                           // one-shot format sanity warning
-  bool mb_logged_rtv4_dims = false;                          // one-shot RTV4 dimensions log
+  bool mb_rtv4_warned_fmt = false;   // one-shot format sanity warning
+  bool mb_logged_rtv4_dims = false;  // one-shot RTV4 dimensions log
   // OUR OWN shader-resource view on the motion resource, and nothing else.
   //
   // This is not a safety measure, it is a correctness one. ReShade's D3D11
@@ -1426,18 +1434,18 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // -- FXAA post-TAA (TAA -> FXAA -> RCAS; never feeds TAA history) --
   // Layout/tables are shared by all three FXAA pipelines (same t0/t1/u0
   // shape); only the bytecode differs (luma prepass vs quality preset).
-  reshade::api::resource fxaa_temp_texture = {};       // owned FXAA output (dims of TAA output, linear/UAV-legal variant format)
-  reshade::api::resource_view fxaa_temp_srv = {};      // RCAS t0 when FXAA serves (or publish source when RCAS skips)
-  reshade::api::resource_view fxaa_temp_uav = {};      // FXAA main write target (u0)
-  reshade::api::resource fxaa_luma_texture = {};       // owned perceptual luma (R8_UNORM)
-  reshade::api::resource_view fxaa_luma_srv = {};      // FXAA main luma input (t1)
-  reshade::api::resource_view fxaa_luma_uav = {};      // luma prepass write target (u0)
-  reshade::api::resource_view fxaa_hist_srv = {};      // linear-variant view of rcas_hist_texture (no sRGB decode); falls back to rcas_hist_srv
-  bool fxaa_hist_srv_owned = false;                  // false when fxaa_hist_srv aliases rcas_hist_srv (do not destroy)
-  reshade::api::resource fxaa_hist_seen = {};          // hist texture handle the views above were built from (recreate on change)
-  uint32_t fxaa_w = 0u, fxaa_h = 0u;                   // live dims of the FXAA set
+  reshade::api::resource fxaa_temp_texture = {};                  // owned FXAA output (dims of TAA output, linear/UAV-legal variant format)
+  reshade::api::resource_view fxaa_temp_srv = {};                 // RCAS t0 when FXAA serves (or publish source when RCAS skips)
+  reshade::api::resource_view fxaa_temp_uav = {};                 // FXAA main write target (u0)
+  reshade::api::resource fxaa_luma_texture = {};                  // owned perceptual luma (R8_UNORM)
+  reshade::api::resource_view fxaa_luma_srv = {};                 // FXAA main luma input (t1)
+  reshade::api::resource_view fxaa_luma_uav = {};                 // luma prepass write target (u0)
+  reshade::api::resource_view fxaa_hist_srv = {};                 // linear-variant view of rcas_hist_texture (no sRGB decode); falls back to rcas_hist_srv
+  bool fxaa_hist_srv_owned = false;                               // false when fxaa_hist_srv aliases rcas_hist_srv (do not destroy)
+  reshade::api::resource fxaa_hist_seen = {};                     // hist texture handle the views above were built from (recreate on change)
+  uint32_t fxaa_w = 0u, fxaa_h = 0u;                              // live dims of the FXAA set
   reshade::api::format fxaa_fmt = reshade::api::format::unknown;  // live format
-  bool fxaa_logged = false;                            // one-time log per resource set
+  bool fxaa_logged = false;                                       // one-time log per resource set
   reshade::api::pipeline_layout fxaa_layout = {};
   reshade::api::pipeline fxaa_luma_pipeline = {};
   reshade::api::pipeline fxaa_standard_pipeline = {};
@@ -1454,15 +1462,15 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource mb_neighbormax_texture = {};
   reshade::api::resource_view mb_neighbormax_srv = {};
   reshade::api::resource_view mb_neighbormax_uav = {};
-  reshade::api::resource mb_output_texture = {};       // gather result
+  reshade::api::resource mb_output_texture = {};  // gather result
   reshade::api::resource_view mb_output_srv = {};
   reshade::api::resource_view mb_output_uav = {};
   // Half-resolution chain, allocated ONLY while MotionBlurHalfRes is on so the
   // default path costs nothing. Both are ceil(W/2) x ceil(H/2).
-  reshade::api::resource mb_half_color_texture = {};   // downsampled gather input
+  reshade::api::resource mb_half_color_texture = {};  // downsampled gather input
   reshade::api::resource_view mb_half_color_srv = {};
   reshade::api::resource_view mb_half_color_uav = {};
-  reshade::api::resource mb_half_result_texture = {}; // half-res gather output
+  reshade::api::resource mb_half_result_texture = {};  // half-res gather output
   reshade::api::resource_view mb_half_result_srv = {};
   reshade::api::resource_view mb_half_result_uav = {};
   // 1x1x1 stand-in bound at the gather's t4 when IS-FAST is off or missing, so
@@ -1498,7 +1506,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   float mb_last_frame_scale = -1.f;
   // Per-channel weights resolved once by the deploy gate, which is where the
   // cutscene signal lives, and pushed by PrepareMotionBlur.
-  bool mb_halfres = false;         // half-res surfaces currently allocated
+  bool mb_halfres = false;  // half-res surfaces currently allocated
   reshade::api::format mb_output_fmt = reshade::api::format::unknown;
   // The resolve surface's active width: true when it is RG16F (the shipping
   // path), false when RGBA16F (either a camera-term debug view is selected or
@@ -1591,7 +1599,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool taa_slot_claimed = false;
   uint32_t taa_claimed_hash = 0u;
   std::span<const uint8_t> taa_claimed_code = {};  // embed bytes currently in the slot (static storage)
-  bool taa_other_addon_active = false;  // another payload was seen for a TAA hash
+  bool taa_other_addon_active = false;             // another payload was seen for a TAA hash
   // Per-pipeline deep clones of TAA pipeline subobjects, captured at
   // init_pipeline (handle known there) keyed by pipeline handle. Feeds the
   // draw-time rebuild, which cannot use details->subobjects (only stored by
@@ -1610,13 +1618,13 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
 static bool VbgiGiFresh(const DeviceData* d, uint64_t max_age) {
   const auto& out = d->vbgi_denoise.output;
   return d->vbgi_gi_frame != UINT64_MAX
-      && d->frame_index - d->vbgi_gi_frame <= max_age
-      && out.srv[d->vbgi_denoise.output_index].handle != 0u
-      && out.width == d->captured_depth_w && out.height == d->captured_depth_h;
+         && d->frame_index - d->vbgi_gi_frame <= max_age
+         && out.srv[d->vbgi_denoise.output_index].handle != 0u
+         && out.width == d->captured_depth_w && out.height == d->captured_depth_h;
 }
 
 static void CreateGTVBAOResources(reshade::api::device* device, DeviceData* data,
-                                   uint32_t gw, uint32_t gh);
+                                  uint32_t gw, uint32_t gh);
 static void DestroyGTVBAOResources(reshade::api::device* device, DeviceData* data);
 static bool CreateComputePipelinesIfNeeded(reshade::api::device* device, DeviceData* data);
 static bool RunGTVBAO(reshade::api::command_list* cmd_list, DeviceData* data);
@@ -1803,13 +1811,19 @@ static void OnInitPipelineCapture(
     const uint32_t h = renodx::utils::hash::ComputeCRC32(
         static_cast<const uint8_t*>(desc->code), desc->code_size);
     for (uint32_t want : kTAAHashes) {
-      if (h == want) { match = true; break; }
+      if (h == want) {
+        match = true;
+        break;
+      }
     }
   }
   if (!match) {
     for (const auto& shader : info->shader_details) {
       for (uint32_t want : kTAAHashes) {
-        if (shader.shader_hash == want) { match = true; break; }
+        if (shader.shader_hash == want) {
+          match = true;
+          break;
+        }
       }
       if (match) break;
     }
@@ -1852,14 +1866,19 @@ static bool OnBeforeSsaoShaderDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeCharLightingDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list);
 static void OnPushDescriptorsCapture(reshade::api::command_list* cmd_list,
-    reshade::api::shader_stage stages, reshade::api::pipeline_layout layout,
-    uint32_t param_index, const reshade::api::descriptor_table_update& update);
+                                     reshade::api::shader_stage stages, reshade::api::pipeline_layout layout,
+                                     uint32_t param_index, const reshade::api::descriptor_table_update& update);
 
 // -- Custom Shader crash-tracing log (defined before OnPresent; used everywhere) --
 static void CSLog(const char* tag, const std::string& msg, bool warn = false);
 static std::string CSViewDims(reshade::api::device* dev, reshade::api::resource_view v);
 static bool DynCubeSceneLive(const DeviceData* d);
-struct CapturedViewInfo { uint64_t res; std::string dims; uint32_t w; uint32_t h; };
+struct CapturedViewInfo {
+  uint64_t res;
+  std::string dims;
+  uint32_t w;
+  uint32_t h;
+};
 static CapturedViewInfo CSResolveCapture(reshade::api::device* dev, reshade::api::resource_view v);
 
 // -- IS-FAST sync helpers (sync g_isfast_* globals ? shader_injection) --
@@ -1884,14 +1903,18 @@ static bool OnBeforeShadowCSMDraw(reshade::api::command_list* cmd_list) {
     if (auto* dev = cmd_list->get_device()) {
       if (auto* d = dev->get_private_data<DeviceData>()) {
         reshade::api::resource_view srv = d->isfast_noise_srv.handle
-            ? d->isfast_noise_srv : d->fallback_srv;
+                                              ? d->isfast_noise_srv
+                                              : d->fallback_srv;
         if (srv.handle) {
           cmd_list->push_descriptors(
               reshade::api::shader_stage::pixel,
               reshade::api::pipeline_layout{0},
               0,
               reshade::api::descriptor_table_update{
-                  {}, 3u, 0, 1,
+                  {},
+                  3u,
+                  0,
+                  1,
                   reshade::api::descriptor_type::texture_shader_resource_view,
                   &srv,
               });
@@ -1918,9 +1941,10 @@ static void SyncVolFogISFASTToShaderInjection(reshade::api::command_list* cmd_li
   // Derive effective IS-FAST flag from master + volfog toggle
   shader_injection.volfog_isfast_enabled =
       g_isfast_enabled >= 0.5f
-      && shader_injection.volfog_jitter_enabled >= 0.5f
-      && shader_injection.volfog_jitter_amount > 0.0001f
-      ? 1.f : 0.f;
+              && shader_injection.volfog_jitter_enabled >= 0.5f
+              && shader_injection.volfog_jitter_amount > 0.0001f
+          ? 1.f
+          : 0.f;
 }
 
 static bool OnBeforeVolFogDraw(reshade::api::command_list* cmd_list) {
@@ -1930,13 +1954,17 @@ static bool OnBeforeVolFogDraw(reshade::api::command_list* cmd_list) {
     if (auto* dev = cmd_list->get_device()) {
       if (auto* d = dev->get_private_data<DeviceData>()) {
         reshade::api::resource_view srv = d->isfast_noise_srv.handle
-            ? d->isfast_noise_srv : d->fallback_srv;
+                                              ? d->isfast_noise_srv
+                                              : d->fallback_srv;
         if (srv.handle) {
           cmd_list->push_descriptors(
               reshade::api::shader_stage::pixel,
               reshade::api::pipeline_layout{0}, 0,
               reshade::api::descriptor_table_update{
-                  {}, 3u, 0, 1,
+                  {},
+                  3u,
+                  0,
+                  1,
                   reshade::api::descriptor_type::texture_shader_resource_view,
                   &srv,
               });
@@ -1964,13 +1992,17 @@ static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list) {
     if (auto* dev = cmd_list->get_device()) {
       if (auto* d = dev->get_private_data<DeviceData>()) {
         reshade::api::resource_view srv = d->isfast_noise_srv.handle
-            ? d->isfast_noise_srv : d->fallback_srv;
+                                              ? d->isfast_noise_srv
+                                              : d->fallback_srv;
         if (srv.handle) {
           cmd_list->push_descriptors(
               reshade::api::shader_stage::pixel,
               reshade::api::pipeline_layout{0}, 0,
               reshade::api::descriptor_table_update{
-                  {}, 15u, 0, 1,
+                  {},
+                  15u,
+                  0,
+                  1,
                   reshade::api::descriptor_type::texture_shader_resource_view,
                   &srv,
               });
@@ -2022,9 +2054,7 @@ static void pushInlineShadowInputs(reshade::api::command_list* cmd_list, DeviceD
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
-            {}, kLightingShadowNoiseRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &d->isfast_noise_srv});
+            {}, kLightingShadowNoiseRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->isfast_noise_srv});
   }
 }
 
@@ -2064,8 +2094,8 @@ static void DeployShadows(reshade::api::command_list* cmd_list, int fromHook) {
     if (d->shadows_log_frame != d->frame_index) {
       d->shadows_log_frame = d->frame_index;
       reshade::log::message(reshade::log::level::warning,
-          "[Shadows] blocked: scene depth has not been captured yet (no lighting "
-          "draw has pushed its depth register this frame).");
+                            "[Shadows] blocked: scene depth has not been captured yet (no lighting "
+                            "draw has pushed its depth register this frame).");
       CSLog("shadows", "blocked: depth not captured yet");
     }
     return;
@@ -2092,9 +2122,7 @@ static void DeployShadows(reshade::api::command_list* cmd_list, int fromHook) {
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
-            {}, kLightingContactShadowRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &d->contact_shadow_srv});
+            {}, kLightingContactShadowRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->contact_shadow_srv});
     shader_injection.cs_contact_dedicated_bound = 1.f;
   }
   if (local_compute && d->shadows_local_ran_frame == d->frame_index && d->contact_local_srv.handle
@@ -2102,9 +2130,7 @@ static void DeployShadows(reshade::api::command_list* cmd_list, int fromHook) {
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
-            {}, kLightingLocalContactRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &d->contact_local_srv});
+            {}, kLightingLocalContactRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->contact_local_srv});
     shader_injection.cs_contact_local_bound = 1.f;
   }
 }
@@ -2135,14 +2161,13 @@ static void charShadowsPushISFAST(reshade::api::command_list* cmd_list) {
   if (g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, d);
   const bool ready = d->isfast_texture_loaded && d->isfast_noise_srv.handle != 0u;
   shader_injection.cs_noise_frame = ready
-      ? static_cast<float>(d->frame_index % 32u) : -1.f;
+                                        ? static_cast<float>(d->frame_index % 32u)
+                                        : -1.f;
   if (!ready) return;
   cmd_list->push_descriptors(
       reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
       reshade::api::descriptor_table_update{
-          {}, kCharShadowNoiseRegister, 0, 1,
-          reshade::api::descriptor_type::texture_shader_resource_view,
-          &d->isfast_noise_srv});
+          {}, kCharShadowNoiseRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->isfast_noise_srv});
 }
 
 // -- Kai + Daybreak 2 character lighting callback (Env SSS + Character Shadowing) --
@@ -2179,21 +2204,20 @@ static bool OnBeforeDofGatherDraw(reshade::api::command_list* cmd_list) {
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return true;
   const bool noiseUsable = g_isfast_enabled > 0.5f
-      && shader_injection.dof_isfast_enabled > 0.5f
-      && shader_injection.dof_mode >= 0.5f
-      && d->isfast_noise_srv.handle != 0u;
+                           && shader_injection.dof_isfast_enabled > 0.5f
+                           && shader_injection.dof_mode >= 0.5f
+                           && d->isfast_noise_srv.handle != 0u;
   // -1 disables sampling in the shader, which keeps the gather deterministic.
   shader_injection.dof_isfast_noise_frame = noiseUsable
-      ? (float)(d->frame_index % 64u) : -1.f;
+                                                ? (float)(d->frame_index % 64u)
+                                                : -1.f;
   if (noiseUsable) {
     reshade::api::resource_view srv = d->isfast_noise_srv;
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel,
         reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
-            {}, 5u, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &srv});
+            {}, 5u, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &srv});
   }
   return true;
 }
@@ -2622,7 +2646,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeLightingShaderDraw,
         },
     },
-    //Kyoto lighting (GTVBAO + VBGI)
+    // Kyoto lighting (GTVBAO + VBGI)
     {
         0x0CDCB258u,
         renodx::mods::shader::CustomShader{
@@ -2666,13 +2690,13 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     // draws only when the game dispatches depth of field. Same shape as the Sora
     // 0xCD6FC25D entry below.
     {
-    0x2734F870u,
-    renodx::mods::shader::CustomShader{
-    .crc32 = 0x2734F870u,
-    .code = __0x2734F870,
-    .on_draw = OnBeforeDofGatherDraw,
-    .on_drawn = OnDrawnDofGather,
-    },
+        0x2734F870u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x2734F870u,
+            .code = __0x2734F870,
+            .on_draw = OnBeforeDofGatherDraw,
+            .on_drawn = OnDrawnDofGather,
+        },
     },
     // -- Sora 2nd DOF shaders (port Kai improved) --
     CustomShaderEntryCallback(0x5BBEC5A3, nullptr),
@@ -2710,7 +2734,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeTonemapDraw,
         },
     },
-  //__ALL_CUSTOM_SHADERS,
+    //__ALL_CUSTOM_SHADERS,
 };
 
 // ----------- Settings -----------
@@ -2747,230 +2771,327 @@ renodx::utils::settings::Settings settings = {
     },
     // �� IS-FAST Master Toggle (top-level) ��
     new renodx::utils::settings::Setting{
-      .key = "ISFASTMasterEnable", .binding = &g_isfast_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "IS-FAST Noise", .section = "IS-FAST",
-      .tooltip = "Master toggle for IS-FAST spatio-temporal blue noise. Uses the baked-in fast_noise_ea.dds (no file needed next to the game .exe).",
-      .labels = {"Off", "On"},
+        .key = "ISFASTMasterEnable",
+        .binding = &g_isfast_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "IS-FAST Noise",
+        .section = "IS-FAST",
+        .tooltip = "Master toggle for IS-FAST spatio-temporal blue noise. Uses the baked-in fast_noise_ea.dds (no file needed next to the game .exe).",
+        .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
-      .key = "ISFASTStrength", .binding = &g_isfast_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Noise Strength", .section = "IS-FAST",
-      .tooltip = "0 = deterministic (banding), 1 = full noise.",
-      .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return g_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ISFASTStrength",
+        .binding = &g_isfast_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Noise Strength",
+        .section = "IS-FAST",
+        .tooltip = "0 = deterministic (banding), 1 = full noise.",
+        .min = 0.0f,
+        .max = 1.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_isfast_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ISFASTDebugLogging", .binding = &g_isfast_debug_logging,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Debug Logging", .section = "IS-FAST",
-      .tooltip = "Log IS-FAST status: whether the baked-in noise texture loaded and which noise source is active.",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ISFASTDebugLogging",
+        .binding = &g_isfast_debug_logging,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Debug Logging",
+        .section = "IS-FAST",
+        .tooltip = "Log IS-FAST status: whether the baked-in noise texture loaded and which noise source is active.",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ISFASTSpatialScale", .binding = &g_isfast_spatial_scale,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Spatial Scale", .section = "IS-FAST",
-      .tooltip = "Scale noise spatial frequency. <1 zooms in (smoother), >1 adds more detail.",
-      .min = 0.25f, .max = 4.0f, .format = "%.2f",
-      .is_enabled = []() { return g_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ISFASTSpatialScale",
+        .binding = &g_isfast_spatial_scale,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Spatial Scale",
+        .section = "IS-FAST",
+        .tooltip = "Scale noise spatial frequency. <1 zooms in (smoother), >1 adds more detail.",
+        .min = 0.25f,
+        .max = 4.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_isfast_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ISFASTTemporalSpeed", .binding = &g_isfast_temporal_speed,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Temporal Speed", .section = "IS-FAST",
-      .tooltip = "Scale noise animation speed. 0 = frozen, 1 = default, 5 = fast flicker.",
-      .min = 0.0f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return g_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ISFASTTemporalSpeed",
+        .binding = &g_isfast_temporal_speed,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Temporal Speed",
+        .section = "IS-FAST",
+        .tooltip = "Scale noise animation speed. 0 = frozen, 1 = default, 5 = fast flicker.",
+        .min = 0.0f,
+        .max = 5.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_isfast_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ISFASTSeedOffset", .binding = &g_isfast_seed_offset,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Seed Offset", .section = "IS-FAST",
-      .tooltip = "Offset the noise seed pattern (0-64). Shift to find optimal noise distribution.",
-      .labels = {"0","4","8","12","16","20","24","28","32","36","40","44","48","52","56","60"},
-      .is_enabled = []() { return g_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ISFASTSeedOffset",
+        .binding = &g_isfast_seed_offset,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Seed Offset",
+        .section = "IS-FAST",
+        .tooltip = "Offset the noise seed pattern (0-64). Shift to find optimal noise distribution.",
+        .labels = {"0", "4", "8", "12", "16", "20", "24", "28", "32", "36", "40", "44", "48", "52", "56", "60"},
+        .is_enabled = []() { return g_isfast_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
 
     // ----------- Kai / Daybreak 2 - Specific Sections -----------
 
     // -- SSGI (Falcom) --
     new renodx::utils::settings::Setting{
-      .key = "KaiSSGIEnable", .binding = &shader_injection.ssgi_mod_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Enable", .section = "SSGI (Falcom)",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiSSGIEnable",
+        .binding = &shader_injection.ssgi_mod_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Enable",
+        .section = "SSGI (Falcom)",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "KaiSSGIColorBoost", .binding = &shader_injection.ssgi_color_boost,
-      .default_value = 1.f, .label = "Color Boost", .section = "SSGI (Falcom)",
-      .tooltip = "Scales SSGI RGB contribution before power shaping.",
-      .min = 0.f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.ssgi_mod_enabled >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiSSGIColorBoost",
+        .binding = &shader_injection.ssgi_color_boost,
+        .default_value = 1.f,
+        .label = "Color Boost",
+        .section = "SSGI (Falcom)",
+        .tooltip = "Scales SSGI RGB contribution before power shaping.",
+        .min = 0.f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.ssgi_mod_enabled >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "KaiSSGIAlphaBoost", .binding = &shader_injection.ssgi_alpha_boost,
-      .default_value = 1.f, .label = "Alpha Boost", .section = "SSGI (Falcom)",
-      .tooltip = "Scales SSGI alpha before saturate.",
-      .min = 0.f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.ssgi_mod_enabled >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiSSGIAlphaBoost",
+        .binding = &shader_injection.ssgi_alpha_boost,
+        .default_value = 1.f,
+        .label = "Alpha Boost",
+        .section = "SSGI (Falcom)",
+        .tooltip = "Scales SSGI alpha before saturate.",
+        .min = 0.f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.ssgi_mod_enabled >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "KaiSSGIPower", .binding = &shader_injection.ssgi_pow,
-      .default_value = 1.f, .label = "Power", .section = "SSGI (Falcom)",
-      .tooltip = "Applies pow(abs(color), Power) to shape bounce response.",
-      .min = 0.1f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.ssgi_mod_enabled >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiSSGIPower",
+        .binding = &shader_injection.ssgi_pow,
+        .default_value = 1.f,
+        .label = "Power",
+        .section = "SSGI (Falcom)",
+        .tooltip = "Applies pow(abs(color), Power) to shape bounce response.",
+        .min = 0.1f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.ssgi_mod_enabled >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
 
     // -- Depth of Field --
     new renodx::utils::settings::Setting{
-      .key = "DOFMode", .binding = &shader_injection.dof_mode,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Mode", .section = "Depth of Field",
-      .tooltip = "Vanilla keeps the original blur shader. Improved uses DOF method 3 (gather).",
-      .labels = {"Vanilla", "Improved"},
+        .key = "DOFMode",
+        .binding = &shader_injection.dof_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Mode",
+        .section = "Depth of Field",
+        .tooltip = "Vanilla keeps the original blur shader. Improved uses DOF method 3 (gather).",
+        .labels = {"Vanilla", "Improved"},
     },
     new renodx::utils::settings::Setting{
-      .key = "DOFStrength", .binding = &shader_injection.dof_strength,
-      .default_value = 1.f, .label = "Strength", .section = "Depth of Field",
-      .tooltip = "Overall blend strength for improved DOF output.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DOFStrength",
+        .binding = &shader_injection.dof_strength,
+        .default_value = 1.f,
+        .label = "Strength",
+        .section = "Depth of Field",
+        .tooltip = "Overall blend strength for improved DOF output.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DOFRadiusScale", .binding = &shader_injection.dof_radius_scale,
-      .default_value = 1.33f, .label = "Radius Scale", .section = "Depth of Field",
-      .tooltip = "Scales blur radius derived from game CoC.",
-      .min = 0.25f, .max = 2.5f, .format = "%.2fx",
+        .key = "DOFRadiusScale",
+        .binding = &shader_injection.dof_radius_scale,
+        .default_value = 1.33f,
+        .label = "Radius Scale",
+        .section = "Depth of Field",
+        .tooltip = "Scales blur radius derived from game CoC.",
+        .min = 0.25f,
+        .max = 2.5f,
+        .format = "%.2fx",
     },
     new renodx::utils::settings::Setting{
-      // Deliberately a different key from the old raw "DOFSampleCount" slider.
-      // That setting stored the tap count itself, and this one stores a 0-3
-      // quality INDEX, so the two cannot share a key: a saved preset holding 12,
-      // 24 or 64 would be clamped by LoadSetting into the valid index range and
-      // every one of them would silently resolve to "Ultra". Renaming orphans the
-      // stale value instead, so the tiers start clean at their default.
-      .key = "DOFQuality", .binding = &shader_injection.dof_sample_count,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Quality", .section = "Depth of Field",
-      .tooltip = "Bokeh gather quality: Low 12, Medium 18, High 24, Ultra 30 taps. "
-                 "Higher tiers produce smoother bokeh at higher cost. With Adaptive "
-                 "Samples on, this becomes the MAXIMUM and only the most blurred "
-                 "pixels reach it.",
-      .labels = {"Low", "Medium", "High", "Ultra"},
-      // .min must be 0: with .labels, GetMax() is labels.size() - 1, and a .min of
-      // 4 would clamp the index into the empty range [4, 3] on load.
-      .min = 0.f,
-      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .parse = [](float value) {
+        // Deliberately a different key from the old raw "DOFSampleCount" slider.
+        // That setting stored the tap count itself, and this one stores a 0-3
+        // quality INDEX, so the two cannot share a key: a saved preset holding 12,
+        // 24 or 64 would be clamped by LoadSetting into the valid index range and
+        // every one of them would silently resolve to "Ultra". Renaming orphans the
+        // stale value instead, so the tiers start clean at their default.
+        .key = "DOFQuality",
+        .binding = &shader_injection.dof_sample_count,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "Quality",
+        .section = "Depth of Field",
+        .tooltip = "Bokeh gather quality: Low 12, Medium 18, High 24, Ultra 30 taps. "
+                   "Higher tiers produce smoother bokeh at higher cost. With Adaptive "
+                   "Samples on, this becomes the MAXIMUM and only the most blurred "
+                   "pixels reach it.",
+        .labels = {"Low", "Medium", "High", "Ultra"},
+        // .min must be 0: with .labels, GetMax() is labels.size() - 1, and a .min of
+        // 4 would clamp the index into the empty range [4, 3] on load.
+        .min = 0.f,
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .parse = [](float value) {
         static constexpr float taps[] = {12.f, 18.f, 24.f, 30.f};
         const int index = static_cast<int>(value);
-        return taps[index < 0 ? 0 : (index > 3 ? 3 : index)];
-      },
+        return taps[index < 0 ? 0 : (index > 3 ? 3 : index)]; },
     },
     new renodx::utils::settings::Setting{
-      .key = "DOFAdaptiveSamples", .binding = &shader_injection.dof_adaptive_samples,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Adaptive Samples", .section = "Depth of Field",
-      .tooltip = "Scales each pixel's tap count to its own blur radius, so lightly "
-                 "blurred pixels cost far less. Quality becomes the maximum. "
-                 "Off = every blurred pixel uses the full Quality tap count, as before.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DOFAdaptiveSamples",
+        .binding = &shader_injection.dof_adaptive_samples,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Adaptive Samples",
+        .section = "Depth of Field",
+        .tooltip = "Scales each pixel's tap count to its own blur radius, so lightly "
+                   "blurred pixels cost far less. Quality becomes the maximum. "
+                   "Off = every blurred pixel uses the full Quality tap count, as before.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DOFTapCountView", .binding = &shader_injection.dof_debug_view,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Tap Count View", .section = "Depth of Field",
-      .tooltip = "Replaces the image with a per-pixel map of the adaptive ladder: one "
-                 "hue per tap-count rung, and BLACK where the pixel early-outs and "
-                 "costs nothing. Read the area fractions to find the real average tap "
-                 "count, which is what the ladder thresholds should be tuned against.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DOFTapCountView",
+        .binding = &shader_injection.dof_debug_view,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Tap Count View",
+        .section = "Depth of Field",
+        .tooltip = "Replaces the image with a per-pixel map of the adaptive ladder: one "
+                   "hue per tap-count rung, and BLACK where the pixel early-outs and "
+                   "costs nothing. Read the area fractions to find the real average tap "
+                   "count, which is what the ladder thresholds should be tuned against.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DOFNearScale", .binding = &shader_injection.dof_near_scale,
-      .default_value = 1.f, .label = "Near Scale", .section = "Depth of Field",
-      .tooltip = "Scales near-field CoC response.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DOFNearScale",
+        .binding = &shader_injection.dof_near_scale,
+        .default_value = 1.f,
+        .label = "Near Scale",
+        .section = "Depth of Field",
+        .tooltip = "Scales near-field CoC response.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DOFFarScale", .binding = &shader_injection.dof_far_scale,
-      .default_value = 1.35f, .label = "Far Scale", .section = "Depth of Field",
-      .tooltip = "Scales far-field CoC response.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DOFFarScale",
+        .binding = &shader_injection.dof_far_scale,
+        .default_value = 1.35f,
+        .label = "Far Scale",
+        .section = "Depth of Field",
+        .tooltip = "Scales far-field CoC response.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DOFCoCCurve", .binding = &shader_injection.dof_coc_curve,
-      .default_value = 1.f, .label = "CoC Curve", .section = "Depth of Field",
-      .tooltip = "Applies pow(CoC, Curve) before blur; >1 tightens focus transition.",
-      .min = 0.25f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DOFCoCCurve",
+        .binding = &shader_injection.dof_coc_curve,
+        .default_value = 1.f,
+        .label = "CoC Curve",
+        .section = "Depth of Field",
+        .tooltip = "Applies pow(CoC, Curve) before blur; >1 tightens focus transition.",
+        .min = 0.25f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DOFEdgeThreshold", .binding = &shader_injection.dof_edge_threshold,
-      .default_value = 0.3f, .label = "Edge Threshold", .section = "Depth of Field",
-      .tooltip = "Rejects CoC-mismatched taps to reduce foreground/background bleeding.",
-      .min = 0.02f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DOFEdgeThreshold",
+        .binding = &shader_injection.dof_edge_threshold,
+        .default_value = 0.3f,
+        .label = "Edge Threshold",
+        .section = "Depth of Field",
+        .tooltip = "Rejects CoC-mismatched taps to reduce foreground/background bleeding.",
+        .min = 0.02f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DOFISFAST", .binding = &shader_injection.dof_isfast_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "IS-FAST Rotation", .section = "Depth of Field",
-      .tooltip = "Rotates the bokeh gather per pixel with IS-FAST noise. The golden-angle spiral is otherwise identical at every pixel, so undersampling shows up as fixed spiral/ring ghosting; rotating decorrelates neighbouring pixels and turns it into fine noise. Needs the IS-FAST master toggle.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f && g_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DOFISFAST",
+        .binding = &shader_injection.dof_isfast_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "IS-FAST Rotation",
+        .section = "Depth of Field",
+        .tooltip = "Rotates the bokeh gather per pixel with IS-FAST noise. The golden-angle spiral is otherwise identical at every pixel, so undersampling shows up as fixed spiral/ring ghosting; rotating decorrelates neighbouring pixels and turns it into fine noise. Needs the IS-FAST master toggle.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f && g_isfast_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DOFSignSoftness", .binding = &shader_injection.dof_sign_softness,
-      .default_value = 1.f, .label = "Layer Softness", .section = "Depth of Field",
-      .tooltip = "Fixes sharp character lines in near blur. Acceptance of taps from the opposite depth layer: 0 = hard reject (vanilla behavior, can leave thin features unblurred), higher = softer separation (more bleed).",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DOFSignSoftness",
+        .binding = &shader_injection.dof_sign_softness,
+        .default_value = 1.f,
+        .label = "Layer Softness",
+        .section = "Depth of Field",
+        .tooltip = "Fixes sharp character lines in near blur. Acceptance of taps from the opposite depth layer: 0 = hard reject (vanilla behavior, can leave thin features unblurred), higher = softer separation (more bleed).",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DOFCoverageFix", .binding = &shader_injection.dof_coverage_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Coverage Composite", .section = "Depth of Field",
-      .tooltip = "Fixes sharp character lines in near blur. Blends same-layer bokeh toward the full-disc average weighted by how much of the blur disc the feature actually covers.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DOFCoverageFix",
+        .binding = &shader_injection.dof_coverage_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Coverage Composite",
+        .section = "Depth of Field",
+        .tooltip = "Fixes sharp character lines in near blur. Blends same-layer bokeh toward the full-disc average weighted by how much of the blur disc the feature actually covers.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
 
     // -- Motion Blur (Guertin et al. 2013) --.
     new renodx::utils::settings::Setting{
-      // Key kept from the pre-split Mode so existing configs keep working.
-      .key = "MotionBlurMode", .binding = &shader_injection.mb_mode,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Mode", .section = "Motion Blur",
-      .tooltip = "When the blur runs: never, only inside cutscenes, or always.",
-      .labels = {"Off", "Cutscene Only", "Always On"},
-      .is_visible = []() { return IsMotionBlurGame(); },
+        // Key kept from the pre-split Mode so existing configs keep working.
+        .key = "MotionBlurMode",
+        .binding = &shader_injection.mb_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Mode",
+        .section = "Motion Blur",
+        .tooltip = "When the blur runs: never, only inside cutscenes, or always.",
+        .labels = {"Off", "Cutscene Only", "Always On"},
+        .is_visible = []() { return IsMotionBlurGame(); },
     },
     new renodx::utils::settings::Setting{
         .key = "MotionBlurCSDispatchFix",
@@ -2987,373 +3108,570 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurCameraDirection", .binding = &shader_injection.mb_camera_sign,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Camera Direction", .section = "Motion Blur",
-      .tooltip = "Convention probe, not a look control. The game writes motion as one signed difference of the previous and current clip positions, but the shader varyings holding them are unlabelled, so which way round it is can only be settled from the image. On a static scene with the camera moving, set Debug View to Object Residual: the correct value here renders it BLACK, because object motion is then zero by definition. A lit residual that mirrors Camera Velocity means this is backwards. Leave it alone once you have picked the right one.",
-      .labels = {"Forward (cur - prev)", "Reversed (prev - cur)"},
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+        .key = "MotionBlurCameraDirection",
+        .binding = &shader_injection.mb_camera_sign,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Camera Direction",
+        .section = "Motion Blur",
+        .tooltip = "Convention probe, not a look control. The game writes motion as one signed difference of the previous and current clip positions, but the shader varyings holding them are unlabelled, so which way round it is can only be settled from the image. On a static scene with the camera moving, set Debug View to Object Residual: the correct value here renders it BLACK, because object motion is then zero by definition. A lit residual that mirrors Camera Velocity means this is backwards. Leave it alone once you have picked the right one.",
+        .labels = {"Forward (cur - prev)", "Reversed (prev - cur)"},
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurCameraCut", .binding = &shader_injection.mb_camera_cut,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Reject Camera Cuts", .section = "Motion Blur",
-      .tooltip = "Detects a teleport or a cutscene transition, where the view transform is replaced in a single frame, and writes zero velocity for that frame. Without it the whole screen smears toward the warp point for one frame. The test is on the camera transform, not the motion buffer, so a fast camera whip and a moving object cannot trigger it on their own. Toggle this off to A/B against a cut you can see; a false positive costs one sharp frame, a false negative costs the smear.",
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+        .key = "MotionBlurCameraCut",
+        .binding = &shader_injection.mb_camera_cut,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Reject Camera Cuts",
+        .section = "Motion Blur",
+        .tooltip = "Detects a teleport or a cutscene transition, where the view transform is replaced in a single frame, and writes zero velocity for that frame. Without it the whole screen smears toward the warp point for one frame. The test is on the camera transform, not the motion buffer, so a fast camera whip and a moving object cannot trigger it on their own. Toggle this off to A/B against a cut you can see; a false positive costs one sharp frame, a false negative costs the smear.",
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurLogging", .binding = &g_mb_logging,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Logging", .section = "Motion Blur",
-      .tooltip = "Writes motion blur diagnostics to the ReShade log: the frame rate scale, which chain stage is running, a one-time report of the colour, motion and depth buffer sizes, and any reason the effect could not run. Turn it off to keep the log quiet. The effect itself is not affected either way.",
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+        .key = "MotionBlurLogging",
+        .binding = &g_mb_logging,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Logging",
+        .section = "Motion Blur",
+        .tooltip = "Writes motion blur diagnostics to the ReShade log: the frame rate scale, which chain stage is running, a one-time report of the colour, motion and depth buffer sizes, and any reason the effect could not run. Turn it off to keep the log quiet. The effect itself is not affected either way.",
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CapturePerfLog", .binding = &g_capture_perf_log,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Capture Hook Timing", .section = "Motion Blur",
-      .tooltip = "Logs the CPU time of the push-descriptor capture hook once per second (DevKit not loaded only). No rendering change.",
-      .is_visible = []() { return IsAdvancedSettingsMode() && IsMotionBlurGame() && !falcom_world::g_state.supported; },
-    },
-    new renodx::utils::settings::Setting{      .key = "MotionBlurCameraCutThreshold", .binding = &shader_injection.mb_camera_cut_px,
-      .default_value = 360.f, .label = "Camera Cut Threshold", .section = "Motion Blur",
-      .tooltip = "How far the view transform may move in one frame before it counts as a cut, in 1080-reference pixels, measured at a nominal depth. A fast whip at 60 fps is roughly 30-80 px; a scene cut is hundreds. Raise it if ordinary camera movement is being rejected, lower it if a real cut is smearing.",
-      .min = 8.f, .max = 512.f, .format = "%.0f px",
-      .is_enabled = []() { return MotionBlurActive(true) && shader_injection.mb_camera_cut > 0.5f; },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{      .key = "MotionBlurCameraJitter", .binding = &shader_injection.mb_camera_jitter,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Camera Jitter", .section = "Motion Blur",
-      .tooltip = "Convention probe, not a look control. The game adds a per-frame jitter delta to every motion vector, and prevViewProj_g may already contain that jitter. Adding it again inflates the camera term, and because object motion is computed as game minus camera, the inflation lands in the object channel at full size. Judge it the same way as Camera Direction: with the camera moving on a static scene, Object Residual must be BLACK.",
-      .labels = {"Add jitter delta", "Omit jitter delta"},
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+        .key = "CapturePerfLog",
+        .binding = &g_capture_perf_log,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Capture Hook Timing",
+        .section = "Motion Blur",
+        .tooltip = "Logs the CPU time of the push-descriptor capture hook once per second (DevKit not loaded only). No rendering change.",
+        .is_visible = []() { return IsAdvancedSettingsMode() && IsMotionBlurGame() && !falcom_world::g_state.supported; },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurIntensity", .binding = &shader_injection.mb_intensity,
-      .default_value = 0.50f, .label = "Intensity", .section = "Motion Blur",
-      .tooltip = "How far the blur smears, as a fraction of how far things actually moved: 0 is off, higher is softer.",
-      .min = 0.f, .max = 2.f, .format = "%.2fx",
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame(); },
+        .key = "MotionBlurCameraCutThreshold",
+        .binding = &shader_injection.mb_camera_cut_px,
+        .default_value = 360.f,
+        .label = "Camera Cut Threshold",
+        .section = "Motion Blur",
+        .tooltip = "How far the view transform may move in one frame before it counts as a cut, in 1080-reference pixels, measured at a nominal depth. A fast whip at 60 fps is roughly 30-80 px; a scene cut is hundreds. Raise it if ordinary camera movement is being rejected, lower it if a real cut is smearing.",
+        .min = 8.f,
+        .max = 512.f,
+        .format = "%.0f px",
+        .is_enabled = []() { return MotionBlurActive(true) && shader_injection.mb_camera_cut > 0.5f; },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurMotionVectorInput", .binding = &g_mb_motion_input,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Motion Vector Input", .section = "Motion Blur",
-      .tooltip = "Where the blur reads its motion vectors from. TAA Motion Buffer is the copy the anti-aliasing pass reads, and is the safe default. Game RTV is the engine's own motion output, which is the only source available when anti-aliasing is switched off; the blur makes its own view onto it, so it is worth trying if the blur is missing without anti-aliasing. Both hold the same values, so they should look identical. Kai has no anti-aliasing in this addon, so it always reads the render target.",
-      // Index order must match the tests: < 0.5 selects the render target, >= 0.5
-      // selects TAA t3. The default is therefore 1, which is why TAA is the
-      // default despite being listed second.
-      .labels = {"Game RTV", "TAA Motion Buffer"},
-      .is_enabled = []() { return MotionBlurActive(true); },
-      // Hidden on Kai: its TAA hash resolves to none, so the t3 capture can never
-      // happen and this option could only ever mean "no blur". Offering a choice
-      // that has one dead branch is worse than not offering it.
-      .is_visible = []() { return IsMotionBlurGame() && !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "MotionBlurCameraJitter",
+        .binding = &shader_injection.mb_camera_jitter,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Camera Jitter",
+        .section = "Motion Blur",
+        .tooltip = "Convention probe, not a look control. The game adds a per-frame jitter delta to every motion vector, and prevViewProj_g may already contain that jitter. Adding it again inflates the camera term, and because object motion is computed as game minus camera, the inflation lands in the object channel at full size. Judge it the same way as Camera Direction: with the camera moving on a static scene, Object Residual must be BLACK.",
+        .labels = {"Add jitter delta", "Omit jitter delta"},
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurQuality", .binding = &g_mb_quality,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Quality", .section = "Motion Blur",
-      .tooltip = "How many times a pixel gets sampled while blurring, which keeps fast movement smooth instead of steppy, at a performance cost.",
-      .labels = {"Low", "Medium", "High", "Ultra"},
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame(); },
+        .key = "MotionBlurIntensity",
+        .binding = &shader_injection.mb_intensity,
+        .default_value = 0.50f,
+        .label = "Intensity",
+        .section = "Motion Blur",
+        .tooltip = "How far the blur smears, as a fraction of how far things actually moved: 0 is off, higher is softer.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2fx",
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurMaxRadius", .binding = &shader_injection.mb_max_radius_px,
-      .default_value = 40.f, .label = "Max Radius", .section = "Motion Blur",
-      .tooltip = "The longest streak the blur can produce.",
-      .min = 8.f, .max = 80.f, .format = "%.0f px",
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame(); },
+        .key = "MotionBlurMotionVectorInput",
+        .binding = &g_mb_motion_input,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Motion Vector Input",
+        .section = "Motion Blur",
+        .tooltip = "Where the blur reads its motion vectors from. TAA Motion Buffer is the copy the anti-aliasing pass reads, and is the safe default. Game RTV is the engine's own motion output, which is the only source available when anti-aliasing is switched off; the blur makes its own view onto it, so it is worth trying if the blur is missing without anti-aliasing. Both hold the same values, so they should look identical. Kai has no anti-aliasing in this addon, so it always reads the render target.",
+        // Index order must match the tests: < 0.5 selects the render target, >= 0.5
+        // selects TAA t3. The default is therefore 1, which is why TAA is the
+        // default despite being listed second.
+        .labels = {"Game RTV", "TAA Motion Buffer"},
+        .is_enabled = []() { return MotionBlurActive(true); },
+        // Hidden on Kai: its TAA hash resolves to none, so the t3 capture can never
+        // happen and this option could only ever mean "no blur". Offering a choice
+        // that has one dead branch is worse than not offering it.
+        .is_visible = []() { return IsMotionBlurGame() && !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurCenterWeight", .binding = &shader_injection.mb_center_weight_k,
-      .default_value = 1.f, .label = "Center Weight", .section = "Motion Blur",
-      .tooltip = "Centre-sample weight divisor (paper k). The unblurred centre contributes N/(k*|v|) of the total, so LOWER keeps more of the original pixel and higher lets the streak dominate. Raise it if thin objects ghost, lower it if fast motion smears too little.",
-      .min = 1.f, .max = 100.f, .format = "%.0f",
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+        .key = "MotionBlurQuality",
+        .binding = &g_mb_quality,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "Quality",
+        .section = "Motion Blur",
+        .tooltip = "How many times a pixel gets sampled while blurring, which keeps fast movement smooth instead of steppy, at a performance cost.",
+        .labels = {"Low", "Medium", "High", "Ultra"},
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurJitter", .binding = &shader_injection.mb_jitter_h,
-      .default_value = 0.95f, .label = "Jitter", .section = "Motion Blur",
-      .tooltip = "How far past the streak length the integration domain reaches (paper h). Breaks up banding; too high softens the streak.",
-      .min = 0.f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+        .key = "MotionBlurMaxRadius",
+        .binding = &shader_injection.mb_max_radius_px,
+        .default_value = 40.f,
+        .label = "Max Radius",
+        .section = "Motion Blur",
+        .tooltip = "The longest streak the blur can produce.",
+        .min = 8.f,
+        .max = 80.f,
+        .format = "%.0f px",
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurMinVelocity", .binding = &shader_injection.mb_min_velocity_g,
-      .default_value = 1.5f, .label = "Velocity Threshold", .section = "Motion Blur",
-      .tooltip = "Below this a pixel's own velocity is replaced by the direction perpendicular to the tile velocity (paper g).",
-      .min = 0.f, .max = 8.f, .format = "%.2f",
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+        .key = "MotionBlurCenterWeight",
+        .binding = &shader_injection.mb_center_weight_k,
+        .default_value = 1.f,
+        .label = "Center Weight",
+        .section = "Motion Blur",
+        .tooltip = "Centre-sample weight divisor (paper k). The unblurred centre contributes N/(k*|v|) of the total, so LOWER keeps more of the original pixel and higher lets the streak dominate. Raise it if thin objects ghost, lower it if fast motion smears too little.",
+        .min = 1.f,
+        .max = 100.f,
+        .format = "%.0f",
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurNeighborFalloff", .binding = &shader_injection.mb_neighbor_t,
-      .default_value = 1.f, .label = "NB Max Falloff", .section = "Motion Blur",
-      .tooltip = "Slope of the stochastic tile lookup near tile borders (paper t), in tiles. Trades tile-edge banding for noise.",
-      .min = 0.f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+        .key = "MotionBlurJitter",
+        .binding = &shader_injection.mb_jitter_h,
+        .default_value = 0.95f,
+        .label = "Jitter",
+        .section = "Motion Blur",
+        .tooltip = "How far past the streak length the integration domain reaches (paper h). Breaks up banding; too high softens the streak.",
+        .min = 0.f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurDepthTolerance", .binding = &shader_injection.mb_depth_tolerance,
-      .default_value = 0.1f, .label = "Depth Tolerance", .section = "Motion Blur",
-      .tooltip = "Width of the soft depth transition that separates foreground from background samples. Higher lets more background bleed across depth edges.",
-      .min = 0.01f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+        .key = "MotionBlurMinVelocity",
+        .binding = &shader_injection.mb_min_velocity_g,
+        .default_value = 1.5f,
+        .label = "Velocity Threshold",
+        .section = "Motion Blur",
+        .tooltip = "Below this a pixel's own velocity is replaced by the direction perpendicular to the tile velocity (paper g).",
+        .min = 0.f,
+        .max = 8.f,
+        .format = "%.2f",
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurJitterSource", .binding = &shader_injection.mb_jitter_source,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Jitter Source", .section = "Motion Blur",
-      .tooltip = "Halton is the paper's deterministic per-pixel sequence. IS-FAST uses the blue-noise volume already loaded for DoF and shadows; it animates, so residual sampling noise reads much less. Falls back to Halton when the volume is unavailable.",
-      .labels = {"Halton", "IS-FAST"},
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+        .key = "MotionBlurNeighborFalloff",
+        .binding = &shader_injection.mb_neighbor_t,
+        .default_value = 1.f,
+        .label = "NB Max Falloff",
+        .section = "Motion Blur",
+        .tooltip = "Slope of the stochastic tile lookup near tile borders (paper t), in tiles. Trades tile-edge banding for noise.",
+        .min = 0.f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurFrameRateReference", .binding = &shader_injection.mb_frame_rate_reference,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Frame Rate Reference", .section = "Motion Blur",
-      .tooltip = "How the streak is tied to framerate. 0 (default) matches Unreal's r.MotionBlurTargetFPS 0: the measured frame time is tracked with a 0.1 moving average and the shutter spans the REAL frame, so a lower framerate gives a proportionally longer streak, and a change of rate ramps over about ten frames instead of stepping. Set a framerate above 0 to rescale the motion into that rate's units instead, which makes the result identical at every framerate at the cost of no longer being physically scaled.",
-      .min = 0.f, .max = 240.f, .format = "%d",
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
-      },
-    new renodx::utils::settings::Setting{
-      .key = "MotionBlurHalfResThreshold", .binding = &shader_injection.mb_halfres_px,
-      .default_value = 10.f, .label = "Half Res Threshold", .section = "Motion Blur",
-      .tooltip = "Streak length, in 1080p-equivalent pixels, at which a tile switches to half resolution. Below it the gather runs at full resolution, because a streak that short is dominated by detail that half resolution has already thrown away. Above it the blur dominates and the cheaper path costs little visually. Sits where the sample ladder jumps to its most expensive rungs, so the tiles doing the most work are the ones that get cheaper. Try 4, 6 and 10.",
-      .min = 0.f, .max = 96.f, .format = "%.0f px",
-      .is_enabled = []() { return MotionBlurActive(true) && shader_injection.mb_halfres > 0.5f; },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
-      },
-    new renodx::utils::settings::Setting{
-      .key = "MotionBlurHalfRes", .binding = &shader_injection.mb_halfres,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Half Resolution", .section = "Motion Blur",
-      .tooltip = "Splits the gather by motion magnitude: tiles whose streak is short run at full resolution, tiles whose streak is long run at half resolution, and the result is selected per tile rather than blended. A streak too short to see cannot hide the detail that half resolution discards, so this keeps the two aligned. Off by default because the extra full-resolution pass costs about as much as the static gather it replaces. Toggling rebuilds the buffers, costing one frame.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
-      },
-    new renodx::utils::settings::Setting{
-      .key = "MotionBlurDepthTest", .binding = &shader_injection.mb_depth_test,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Depth Test", .section = "Motion Blur",
-      .tooltip = "On: every tap reads the game depth and taps that disagree with the centre pixel are down-weighted, which is what separates foreground from background. Off: that fetch and the two cone terms are dropped and only the cylinder term remains, saving one texture load per tap, at the cost of bleeding across depth edges. Note Depth Tolerance already scales the same terms, so a very low value suppresses most of their effect while still paying for the fetch.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
-      },
-    new renodx::utils::settings::Setting{
-      .key = "MotionBlurLocalVelocity", .binding = &shader_injection.mb_local_velocity_weights,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Local Velocity Weights", .section = "Motion Blur",
-      .tooltip = "On: each tap reads the motion texture and is weighted by its own direction, which is the paper's feature-aware term and what stops foreground bleeding across depth edges. Off: taps reuse the composite direction, removing ~25 texture loads per pixel (roughly a third of the gather). A/B it on a high-contrast edge.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
-      },
-    new renodx::utils::settings::Setting{
-      .key = "MotionBlurDebugChain", .binding = &shader_injection.mb_debug_chain,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Debug Chain", .section = "Motion Blur",
-      .tooltip = "Diagnostic only. Full runs everything. Prep Only runs the three preprocessing dispatches and skips the gather, leaving the image untouched. Gather Only runs just the gather, reusing the PREVIOUS frame's prep, so do not read its image as a correctness comparison, and do not use it to time a moving scene: with prep frozen the tile grid is stale and almost nothing passes the gather's early-out. If preparation has never run it falls back to Full for that frame.",
-      .labels = {"Full", "Prep Only", "Gather Only"},
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+        .key = "MotionBlurDepthTolerance",
+        .binding = &shader_injection.mb_depth_tolerance,
+        .default_value = 0.1f,
+        .label = "Depth Tolerance",
+        .section = "Motion Blur",
+        .tooltip = "Width of the soft depth transition that separates foreground from background samples. Higher lets more background bleed across depth edges.",
+        .min = 0.01f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurDebugView", .binding = &shader_injection.mb_debug_view,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Debug View", .section = "Motion Blur",
-      .tooltip = "Velocity, NeighborMax, the tile grid, linearized depth, blur amount, sample count, the half resolution split, the reconstructed camera term, or the error in it. Use these to confirm the motion buffer is live and the tile grid is resolution independent. Sample Count shows black where the blur early-outs and one distinct hue per rung of the adaptive ladder, which is what Quality now bounds: this is also the readout for tuning the rungs later. Half Res Detect draws the split partition itself: GREEN = blurred at full resolution, RED = blurred at half resolution, GREY = below the early-out so it will not blur at all, BLUE = Half Resolution is off so everything is full resolution. Boundaries are tile-quantised, so it also reads as the verification that the split no longer changes with framerate. Camera Velocity is the reconstructed camera term on its own. Object Residual is the difference against the game's own motion, and it is the one to settle the Camera Direction and Camera Jitter settings: on a STATIC scene with the camera moving it must be BLACK, because object motion is then zero by definition. A lit residual that mirrors Camera Velocity means the camera estimate is inverted or mis-scaled. It is also a direct readout of what the blur is doing, because the streak length is the camera's share of the total, so anything bright here is exactly the object contribution that was removed.",
-      .labels = {"Off", "Velocity", "Neighbor Max", "Tile Grid", "Linear Depth", "Blur Amount", "Sample Count", "Half Res Detect", "Camera Velocity", "Object Residual"},
-      .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+        .key = "MotionBlurJitterSource",
+        .binding = &shader_injection.mb_jitter_source,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Jitter Source",
+        .section = "Motion Blur",
+        .tooltip = "Halton is the paper's deterministic per-pixel sequence. IS-FAST uses the blue-noise volume already loaded for DoF and shadows; it animates, so residual sampling noise reads much less. Falls back to Halton when the volume is unavailable.",
+        .labels = {"Halton", "IS-FAST"},
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "MotionBlurFrameRateReference",
+        .binding = &shader_injection.mb_frame_rate_reference,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Frame Rate Reference",
+        .section = "Motion Blur",
+        .tooltip = "How the streak is tied to framerate. 0 (default) matches Unreal's r.MotionBlurTargetFPS 0: the measured frame time is tracked with a 0.1 moving average and the shutter spans the REAL frame, so a lower framerate gives a proportionally longer streak, and a change of rate ramps over about ten frames instead of stepping. Set a framerate above 0 to rescale the motion into that rate's units instead, which makes the result identical at every framerate at the cost of no longer being physically scaled.",
+        .min = 0.f,
+        .max = 240.f,
+        .format = "%d",
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "MotionBlurHalfResThreshold",
+        .binding = &shader_injection.mb_halfres_px,
+        .default_value = 10.f,
+        .label = "Half Res Threshold",
+        .section = "Motion Blur",
+        .tooltip = "Streak length, in 1080p-equivalent pixels, at which a tile switches to half resolution. Below it the gather runs at full resolution, because a streak that short is dominated by detail that half resolution has already thrown away. Above it the blur dominates and the cheaper path costs little visually. Sits where the sample ladder jumps to its most expensive rungs, so the tiles doing the most work are the ones that get cheaper. Try 4, 6 and 10.",
+        .min = 0.f,
+        .max = 96.f,
+        .format = "%.0f px",
+        .is_enabled = []() { return MotionBlurActive(true) && shader_injection.mb_halfres > 0.5f; },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "MotionBlurHalfRes",
+        .binding = &shader_injection.mb_halfres,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Half Resolution",
+        .section = "Motion Blur",
+        .tooltip = "Splits the gather by motion magnitude: tiles whose streak is short run at full resolution, tiles whose streak is long run at half resolution, and the result is selected per tile rather than blended. A streak too short to see cannot hide the detail that half resolution discards, so this keeps the two aligned. Off by default because the extra full-resolution pass costs about as much as the static gather it replaces. Toggling rebuilds the buffers, costing one frame.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "MotionBlurDepthTest",
+        .binding = &shader_injection.mb_depth_test,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Depth Test",
+        .section = "Motion Blur",
+        .tooltip = "On: every tap reads the game depth and taps that disagree with the centre pixel are down-weighted, which is what separates foreground from background. Off: that fetch and the two cone terms are dropped and only the cylinder term remains, saving one texture load per tap, at the cost of bleeding across depth edges. Note Depth Tolerance already scales the same terms, so a very low value suppresses most of their effect while still paying for the fetch.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "MotionBlurLocalVelocity",
+        .binding = &shader_injection.mb_local_velocity_weights,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Local Velocity Weights",
+        .section = "Motion Blur",
+        .tooltip = "On: each tap reads the motion texture and is weighted by its own direction, which is the paper's feature-aware term and what stops foreground bleeding across depth edges. Off: taps reuse the composite direction, removing ~25 texture loads per pixel (roughly a third of the gather). A/B it on a high-contrast edge.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "MotionBlurDebugChain",
+        .binding = &shader_injection.mb_debug_chain,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Debug Chain",
+        .section = "Motion Blur",
+        .tooltip = "Diagnostic only. Full runs everything. Prep Only runs the three preprocessing dispatches and skips the gather, leaving the image untouched. Gather Only runs just the gather, reusing the PREVIOUS frame's prep, so do not read its image as a correctness comparison, and do not use it to time a moving scene: with prep frozen the tile grid is stale and almost nothing passes the gather's early-out. If preparation has never run it falls back to Full for that frame.",
+        .labels = {"Full", "Prep Only", "Gather Only"},
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "MotionBlurDebugView",
+        .binding = &shader_injection.mb_debug_view,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Debug View",
+        .section = "Motion Blur",
+        .tooltip = "Velocity, NeighborMax, the tile grid, linearized depth, blur amount, sample count, the half resolution split, the reconstructed camera term, or the error in it. Use these to confirm the motion buffer is live and the tile grid is resolution independent. Sample Count shows black where the blur early-outs and one distinct hue per rung of the adaptive ladder, which is what Quality now bounds: this is also the readout for tuning the rungs later. Half Res Detect draws the split partition itself: GREEN = blurred at full resolution, RED = blurred at half resolution, GREY = below the early-out so it will not blur at all, BLUE = Half Resolution is off so everything is full resolution. Boundaries are tile-quantised, so it also reads as the verification that the split no longer changes with framerate. Camera Velocity is the reconstructed camera term on its own. Object Residual is the difference against the game's own motion, and it is the one to settle the Camera Direction and Camera Jitter settings: on a STATIC scene with the camera moving it must be BLACK, because object motion is then zero by definition. A lit residual that mirrors Camera Velocity means the camera estimate is inverted or mis-scaled. It is also a direct readout of what the blur is doing, because the streak length is the camera's share of the total, so anything bright here is exactly the object contribution that was removed.",
+        .labels = {"Off", "Velocity", "Neighbor Max", "Tile Grid", "Linear Depth", "Blur Amount", "Sample Count", "Half Res Detect", "Camera Velocity", "Object Residual"},
+        .is_enabled = []() { return MotionBlurActive(true); },
+        .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
 
     // -- Character SSGI --
     new renodx::utils::settings::Setting{
-      .key = "CharacterSSGICompositeMethod", .binding = &g_char_vbgi_composite_method,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Apply Game SSGI", .section = "Character SSGI",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return IsKai(); },
+        .key = "CharacterSSGICompositeMethod",
+        .binding = &g_char_vbgi_composite_method,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Apply Game SSGI",
+        .section = "Character SSGI",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return IsKai(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharacterSSGICompositeStrength", .binding = &shader_injection.char_gi_strength,
-      .default_value = 3.0f, .label = "Strength", .section = "Character SSGI",
-      .tooltip = "Overall contribution scale for character GI.",
-      .min = 0.f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "CharacterSSGICompositeStrength",
+        .binding = &shader_injection.char_gi_strength,
+        .default_value = 3.0f,
+        .label = "Strength",
+        .section = "Character SSGI",
+        .tooltip = "Overall contribution scale for character GI.",
+        .min = 0.f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharacterSSGICompositeAlphaScale", .binding = &shader_injection.char_gi_alpha_scale,
-      .default_value = 1.0f, .label = "Alpha Scale", .section = "Character SSGI",
-      .tooltip = "Scales sampled SSGI alpha before blending.",
-      .min = 0.f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "CharacterSSGICompositeAlphaScale",
+        .binding = &shader_injection.char_gi_alpha_scale,
+        .default_value = 1.0f,
+        .label = "Alpha Scale",
+        .section = "Character SSGI",
+        .tooltip = "Scales sampled SSGI alpha before blending.",
+        .min = 0.f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharacterSSGICompositeChroma", .binding = &shader_injection.char_gi_chroma_strength,
-      .default_value = 0.50f, .label = "Chroma", .section = "Character SSGI",
-      .tooltip = "Scales colorful GI component; lower values reduce tinting.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "CharacterSSGICompositeChroma",
+        .binding = &shader_injection.char_gi_chroma_strength,
+        .default_value = 0.50f,
+        .label = "Chroma",
+        .section = "Character SSGI",
+        .tooltip = "Scales colorful GI component; lower values reduce tinting.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharacterSSGICompositeLuma", .binding = &shader_injection.char_gi_luma_strength,
-      .default_value = 0.0f, .label = "Luma", .section = "Character SSGI",
-      .tooltip = "Scales neutral GI brightness; keep low to avoid white haze.",
-      .min = 0.f, .max = 1.f, .format = "%.3f",
-      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "CharacterSSGICompositeLuma",
+        .binding = &shader_injection.char_gi_luma_strength,
+        .default_value = 0.0f,
+        .label = "Luma",
+        .section = "Character SSGI",
+        .tooltip = "Scales neutral GI brightness; keep low to avoid white haze.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.3f",
+        .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharacterSSGICompositeShadowPower", .binding = &shader_injection.char_gi_shadow_power,
-      .default_value = 1.25f, .label = "Shadow Power", .section = "Character SSGI",
-      .tooltip = "Higher values concentrate GI toward darker areas.",
-      .min = 0.1f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "CharacterSSGICompositeShadowPower",
+        .binding = &shader_injection.char_gi_shadow_power,
+        .default_value = 1.25f,
+        .label = "Shadow Power",
+        .section = "Character SSGI",
+        .tooltip = "Higher values concentrate GI toward darker areas.",
+        .min = 0.1f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharacterSSGICompositeDarkBoost", .binding = &shader_injection.char_gi_dark_boost,
-      .default_value = 0.0f, .label = "Dark Boost", .section = "Character SSGI",
-      .tooltip = "Extra GI multiplier in darker regions (after shadow mask).",
-      .min = 0.f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "CharacterSSGICompositeDarkBoost",
+        .binding = &shader_injection.char_gi_dark_boost,
+        .default_value = 0.0f,
+        .label = "Dark Boost",
+        .section = "Character SSGI",
+        .tooltip = "Extra GI multiplier in darker regions (after shadow mask).",
+        .min = 0.f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharacterSSGICompositeBrightBoost", .binding = &shader_injection.char_gi_bright_boost,
-      .default_value = 3.0f, .label = "Bright Boost", .section = "Character SSGI",
-      .tooltip = "Boosts GI on brighter regions (values above 1.0 increase bright-side contribution).",
-      .min = 0.f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "CharacterSSGICompositeBrightBoost",
+        .binding = &shader_injection.char_gi_bright_boost,
+        .default_value = 3.0f,
+        .label = "Bright Boost",
+        .section = "Character SSGI",
+        .tooltip = "Boosts GI on brighter regions (values above 1.0 increase bright-side contribution).",
+        .min = 0.f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharacterSSGICompositeHeadroomPower", .binding = &shader_injection.char_gi_headroom_power,
-      .default_value = 1.25f, .label = "Headroom Power", .section = "Character SSGI",
-      .tooltip = "Controls how strongly bright pixels reject additional GI.",
-      .min = 0.1f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "CharacterSSGICompositeHeadroomPower",
+        .binding = &shader_injection.char_gi_headroom_power,
+        .default_value = 1.25f,
+        .label = "Headroom Power",
+        .section = "Character SSGI",
+        .tooltip = "Controls how strongly bright pixels reject additional GI.",
+        .min = 0.1f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharacterSSGICompositeMaxAdd", .binding = &shader_injection.char_gi_max_add,
-      .default_value = 0.020f, .label = "Max Add", .section = "Character SSGI",
-      .tooltip = "Per-channel cap for added GI to prevent haze/bloomy washout.",
-      .min = 0.f, .max = 1.f, .format = "%.3f",
-      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "CharacterSSGICompositeMaxAdd",
+        .binding = &shader_injection.char_gi_max_add,
+        .default_value = 0.020f,
+        .label = "Max Add",
+        .section = "Character SSGI",
+        .tooltip = "Per-channel cap for added GI to prevent haze/bloomy washout.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.3f",
+        .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharacterSSGICompositePeakLumaCap", .binding = &shader_injection.char_gi_peak_luma_cap,
-      .default_value = 0.0f, .label = "Peak Luma Cap", .section = "Character SSGI",
-      .tooltip = "Caps peak GI brightness on characters after blending weights. Set 0 to disable.",
-      .min = 0.f, .max = 1.f, .format = "%.3f",
-      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "CharacterSSGICompositePeakLumaCap",
+        .binding = &shader_injection.char_gi_peak_luma_cap,
+        .default_value = 0.0f,
+        .label = "Peak Luma Cap",
+        .section = "Character SSGI",
+        .tooltip = "Caps peak GI brightness on characters after blending weights. Set 0 to disable.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.3f",
+        .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharacterSSGICompositeDepthReject", .binding = &shader_injection.char_gi_depth_reject,
-      .default_value = 2.0f, .label = "Depth Reject", .section = "Character SSGI",
-      .tooltip = "Higher values suppress GI across depth discontinuities and silhouette edges.",
-      .min = 0.f, .max = 16.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "CharacterSSGICompositeDepthReject",
+        .binding = &shader_injection.char_gi_depth_reject,
+        .default_value = 2.0f,
+        .label = "Depth Reject",
+        .section = "Character SSGI",
+        .tooltip = "Higher values suppress GI across depth discontinuities and silhouette edges.",
+        .min = 0.f,
+        .max = 16.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
 
     // -- Fog Color Correction --
     new renodx::utils::settings::Setting{
-      .key = "FogColorCorrectionMode", .binding = &shader_injection.fog_color_correction_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Mode", .section = "Fog Color Correction",
-      .labels = {"Vanilla", "Improved"},
-      .is_visible = []() { return IsKai(); },
+        .key = "FogColorCorrectionMode",
+        .binding = &shader_injection.fog_color_correction_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Mode",
+        .section = "Fog Color Correction",
+        .labels = {"Vanilla", "Improved"},
+        .is_visible = []() { return IsKai(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FogHue", .binding = &shader_injection.fog_hue,
-      .default_value = 0.f, .label = "Fog Hue", .section = "Fog Color Correction",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "FogHue",
+        .binding = &shader_injection.fog_hue,
+        .default_value = 0.f,
+        .label = "Fog Hue",
+        .section = "Fog Color Correction",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FogChrominance", .binding = &shader_injection.fog_chrominance,
-      .default_value = 0.f, .label = "Fog Chroma", .section = "Fog Color Correction",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "FogChrominance",
+        .binding = &shader_injection.fog_chrominance,
+        .default_value = 0.f,
+        .label = "Fog Chroma",
+        .section = "Fog Color Correction",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FogAvgBrightness", .binding = &shader_injection.fog_avg_brightness,
-      .default_value = 0.85f, .label = "Fog Avg Bright", .section = "Fog Color Correction",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "FogAvgBrightness",
+        .binding = &shader_injection.fog_avg_brightness,
+        .default_value = 0.85f,
+        .label = "Fog Avg Bright",
+        .section = "Fog Color Correction",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FogMinBrightness", .binding = &shader_injection.fog_min_brightness,
-      .default_value = 0.f, .label = "Fog Min Bright", .section = "Fog Color Correction",
-      .min = -0.5f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "FogMinBrightness",
+        .binding = &shader_injection.fog_min_brightness,
+        .default_value = 0.f,
+        .label = "Fog Min Bright",
+        .section = "Fog Color Correction",
+        .min = -0.5f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FogMinChroma", .binding = &shader_injection.fog_min_chroma_change,
-      .default_value = 0.f, .label = "Fog Min Chroma", .section = "Fog Color Correction",
-      .tooltip = "Minimum chroma ratio applied during fog hue/chroma restoration.",
-      .min = 0.f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "FogMinChroma",
+        .binding = &shader_injection.fog_min_chroma_change,
+        .default_value = 0.f,
+        .label = "Fog Min Chroma",
+        .section = "Fog Color Correction",
+        .tooltip = "Minimum chroma ratio applied during fog hue/chroma restoration.",
+        .min = 0.f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FogMaxChroma", .binding = &shader_injection.fog_max_chroma_change,
-      .default_value = 0.f, .label = "Fog Max Chroma", .section = "Fog Color Correction",
-      .tooltip = "Maximum chroma ratio applied during fog hue/chroma restoration.",
-      .min = 0.f, .max = 8.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "FogMaxChroma",
+        .binding = &shader_injection.fog_max_chroma_change,
+        .default_value = 0.f,
+        .label = "Fog Max Chroma",
+        .section = "Fog Color Correction",
+        .tooltip = "Maximum chroma ratio applied during fog hue/chroma restoration.",
+        .min = 0.f,
+        .max = 8.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FogLightnessStrength", .binding = &shader_injection.fog_lightness_strength,
-      .default_value = 1.f, .label = "Fog Lightness", .section = "Fog Color Correction",
-      .tooltip = "Scales fog lightness restoration amount.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "FogLightnessStrength",
+        .binding = &shader_injection.fog_lightness_strength,
+        .default_value = 1.f,
+        .label = "Fog Lightness",
+        .section = "Fog Color Correction",
+        .tooltip = "Scales fog lightness restoration amount.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FogColorCorrectionStrength", .binding = &shader_injection.fog_color_correction_strength,
-      .default_value = 0.5f, .label = "2D Fog Correction Strength", .section = "Fog Color Correction",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "FogColorCorrectionStrength",
+        .binding = &shader_injection.fog_color_correction_strength,
+        .default_value = 0.5f,
+        .label = "2D Fog Correction Strength",
+        .section = "Fog Color Correction",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "Fog3DCorrectionStrength", .binding = &shader_injection.volfog_color_correction_strength,
-      .default_value = 0.5f, .label = "3D Fog Correction Strength", .section = "Fog Color Correction",
-      .tooltip = "Controls how strongly fog color correction is applied to volumetric fog. 0 = off, 1 = full.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "Fog3DCorrectionStrength",
+        .binding = &shader_injection.volfog_color_correction_strength,
+        .default_value = 0.5f,
+        .label = "3D Fog Correction Strength",
+        .section = "Fog Color Correction",
+        .tooltip = "Controls how strongly fog color correction is applied to volumetric fog. 0 = off, 1 = full.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "VolFogHazeAAMode",
@@ -3366,433 +3684,583 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Vanilla", "Improved"},
     },
     new renodx::utils::settings::Setting{
-      .key = "CharShadowMode", .binding = &shader_injection.char_shadow_mode,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f,
-      .label = "Mode",
-      .section = "Character Shadowing",
-      .tooltip = "Off = Disables Screen Space Shadows on characters. Vanilla = Falcom Algorithm. Custom = Customized algorithm.",
-      .labels = {"Off", "Vanilla", "Custom"},
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+        .key = "CharShadowMode",
+        .binding = &shader_injection.char_shadow_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "Mode",
+        .section = "Character Shadowing",
+        .tooltip = "Off = Disables Screen Space Shadows on characters. Vanilla = Falcom Algorithm. Custom = Customized algorithm.",
+        .labels = {"Off", "Vanilla", "Custom"},
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     // ── Character Shadowing: custom camera pass ──
     new renodx::utils::settings::Setting{
-      .key = "CharCamEnabled", .binding = &shader_injection.char_cam_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Camera Pass", .section = "Character Shadowing",
-      .tooltip = "A depth march along the engine's own camera-facing character axis, "
-                 "replacing the vanilla 10-step version with a tunable sample count, "
-                 "coverage-based response and IS-FAST dither. The result is written to "
-                 "the same AO channel the vanilla march used, so the game's temporal "
-                 "blend resolves the dither with no extra resolve pass.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
+        .key = "CharCamEnabled",
+        .binding = &shader_injection.char_cam_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Camera Pass",
+        .section = "Character Shadowing",
+        .tooltip = "A depth march along the engine's own camera-facing character axis, "
+                   "replacing the vanilla 10-step version with a tunable sample count, "
+                   "coverage-based response and IS-FAST dither. The result is written to "
+                   "the same AO channel the vanilla march used, so the game's temporal "
+                   "blend resolves the dither with no extra resolve pass.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f; },
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharCamStrength", .binding = &shader_injection.char_cam_strength,
-      .default_value = 1.f, .label = "Camera Strength", .section = "Character Shadowing",
-      .tooltip = "Blend strength for the camera-facing character term.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
+        .key = "CharCamStrength",
+        .binding = &shader_injection.char_cam_strength,
+        .default_value = 1.f,
+        .label = "Camera Strength",
+        .section = "Character Shadowing",
+        .tooltip = "Blend strength for the camera-facing character term.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
+                                    && shader_injection.char_cam_enabled >= 0.5f; },
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharCamSamples", .binding = &shader_injection.char_cam_sample_count,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 8.f, .label = "Camera Sample Count", .section = "Character Shadowing",
-      .tooltip = "March steps for the camera pass. Because the combiner counts "
-                 "coverage rather than taking the first hit, this is a pure "
-                 "quality/noise control: raising it does not make the shadow wider "
-                 "or darker.",
-      .min = 1.f, .max = 32.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
+        .key = "CharCamSamples",
+        .binding = &shader_injection.char_cam_sample_count,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 8.f,
+        .label = "Camera Sample Count",
+        .section = "Character Shadowing",
+        .tooltip = "March steps for the camera pass. Because the combiner counts "
+                   "coverage rather than taking the first hit, this is a pure "
+                   "quality/noise control: raising it does not make the shadow wider "
+                   "or darker.",
+        .min = 1.f,
+        .max = 32.f,
+        .format = "%d",
+        .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
+                                    && shader_injection.char_cam_enabled >= 0.5f; },
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharCamRayLength", .binding = &shader_injection.char_cam_ray_length,
-      .default_value = 0.02f, .label = "Camera Ray Length", .section = "Character Shadowing",
-      .tooltip = "March length in world units (1 unit is about 1 metre, a head about "
-                 "0.18). This is a SILHOUETTE reach, not a contact one: the axis is the "
-                 "camera axis, so the ray always heads into the receiver's own surface "
-                 "and a screen-space depth test cannot tell that from a real occluder. "
-                 "The engine's vanilla march has the same degeneracy and only survives "
-                 "it because it is a binary any-hit that the AO channel smooths "
-                 "temporally. Expect a softened depth gradient, not a shadow.",
-      .min = 0.001f, .max = 0.2f, .format = "%.4f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
+        .key = "CharCamRayLength",
+        .binding = &shader_injection.char_cam_ray_length,
+        .default_value = 0.02f,
+        .label = "Camera Ray Length",
+        .section = "Character Shadowing",
+        .tooltip = "March length in world units (1 unit is about 1 metre, a head about "
+                   "0.18). This is a SILHOUETTE reach, not a contact one: the axis is the "
+                   "camera axis, so the ray always heads into the receiver's own surface "
+                   "and a screen-space depth test cannot tell that from a real occluder. "
+                   "The engine's vanilla march has the same degeneracy and only survives "
+                   "it because it is a binary any-hit that the AO channel smooths "
+                   "temporally. Expect a softened depth gradient, not a shadow.",
+        .min = 0.001f,
+        .max = 0.2f,
+        .format = "%.4f",
+        .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
+                                    && shader_injection.char_cam_enabled >= 0.5f; },
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharCamThickness", .binding = &shader_injection.char_cam_thickness,
-      .default_value = 0.2f, .label = "Camera Surface Thickness", .section = "Character Shadowing",
-      .tooltip = "How thick an occluder is assumed to be, in world units. KEEP THIS "
-                 "COMPARABLE TO RAY LENGTH. A band much larger than the ray puts the "
-                 "whole ray inside or outside it, which collapses the coverage "
-                 "estimator into a binary any-hit test and makes Sample Count do "
-                 "nothing. At the original 0.29 against a 0.02 ray that is exactly what "
-                 "happened. It also acts as the validity filter for samples that have "
-                 "drifted out of register with the depth they are compared against.",
-      .min = 0.0005f, .max = 0.2f, .format = "%.4f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
+        .key = "CharCamThickness",
+        .binding = &shader_injection.char_cam_thickness,
+        .default_value = 0.2f,
+        .label = "Camera Surface Thickness",
+        .section = "Character Shadowing",
+        .tooltip = "How thick an occluder is assumed to be, in world units. KEEP THIS "
+                   "COMPARABLE TO RAY LENGTH. A band much larger than the ray puts the "
+                   "whole ray inside or outside it, which collapses the coverage "
+                   "estimator into a binary any-hit test and makes Sample Count do "
+                   "nothing. At the original 0.29 against a 0.02 ray that is exactly what "
+                   "happened. It also acts as the validity filter for samples that have "
+                   "drifted out of register with the depth they are compared against.",
+        .min = 0.0005f,
+        .max = 0.2f,
+        .format = "%.4f",
+        .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
+                                    && shader_injection.char_cam_enabled >= 0.5f; },
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharCamBias", .binding = &shader_injection.char_cam_bias,
-      .default_value = 0.0001f, .label = "Camera Depth Bias", .section = "Character Shadowing",
-      .tooltip = "Extra penetration required beyond the normal lift. The shader passes "
-                 "lift + this to the marcher as its hit threshold, which is what stops "
-                 "the receiver reporting itself as its own occluder.",
-      .min = 0.f, .max = 0.05f, .format = "%.4f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
+        .key = "CharCamBias",
+        .binding = &shader_injection.char_cam_bias,
+        .default_value = 0.0001f,
+        .label = "Camera Depth Bias",
+        .section = "Character Shadowing",
+        .tooltip = "Extra penetration required beyond the normal lift. The shader passes "
+                   "lift + this to the marcher as its hit threshold, which is what stops "
+                   "the receiver reporting itself as its own occluder.",
+        .min = 0.f,
+        .max = 0.05f,
+        .format = "%.4f",
+        .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
+                                    && shader_injection.char_cam_enabled >= 0.5f; },
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharCamNormalBias", .binding = &shader_injection.char_cam_normal_bias,
-      .default_value = 0.0015f, .label = "Camera Normal Bias", .section = "Character Shadowing",
-      .tooltip = "Lift along the surface normal, and simultaneously the floor of the "
-                 "marcher's hit threshold (the shader passes lift + Depth Bias). "
-                 "Without it the first sample sits on the receiver's own depth and "
-                 "reports a self-hit, which reads as a dark band over the whole "
-                 "character. Keep it small relative to Ray Length: the original 0.0075 "
-                 "was a third of a 0.02 ray, so the march started in free air beside "
-                 "the face.",
-      .min = 0.f, .max = 0.05f, .format = "%.4f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
+        .key = "CharCamNormalBias",
+        .binding = &shader_injection.char_cam_normal_bias,
+        .default_value = 0.0015f,
+        .label = "Camera Normal Bias",
+        .section = "Character Shadowing",
+        .tooltip = "Lift along the surface normal, and simultaneously the floor of the "
+                   "marcher's hit threshold (the shader passes lift + Depth Bias). "
+                   "Without it the first sample sits on the receiver's own depth and "
+                   "reports a self-hit, which reads as a dark band over the whole "
+                   "character. Keep it small relative to Ray Length: the original 0.0075 "
+                   "was a third of a 0.02 ray, so the march started in free air beside "
+                   "the face.",
+        .min = 0.f,
+        .max = 0.05f,
+        .format = "%.4f",
+        .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
+                                    && shader_injection.char_cam_enabled >= 0.5f; },
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharCamResponseScale", .binding = &shader_injection.char_cam_response_scale,
-      .default_value = 2.f, .label = "Camera Response Scale", .section = "Character Shadowing",
-      .tooltip = "How strongly the camera term reads. Higher makes each agreeing "
-                 "sample count for more, so this is a strength control once the band "
-                 "and the ray are the same size. It defaults to 2 rather than the 4 "
-                 "that reproduces the old binary any-hit exactly: at 4 with 8 samples a "
-                 "single spurious sample already costs half the available darkening, "
-                 "which is what made this read as a hard patch.",
-      .min = 0.f, .max = 8.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
+        .key = "CharCamResponseScale",
+        .binding = &shader_injection.char_cam_response_scale,
+        .default_value = 2.f,
+        .label = "Camera Response Scale",
+        .section = "Character Shadowing",
+        .tooltip = "How strongly the camera term reads. Higher makes each agreeing "
+                   "sample count for more, so this is a strength control once the band "
+                   "and the ray are the same size. It defaults to 2 rather than the 4 "
+                   "that reproduces the old binary any-hit exactly: at 4 with 8 samples a "
+                   "single spurious sample already costs half the available darkening, "
+                   "which is what made this read as a hard patch.",
+        .min = 0.f,
+        .max = 8.f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
+                                    && shader_injection.char_cam_enabled >= 0.5f; },
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharCamMaxDarkening", .binding = &shader_injection.char_cam_max_darkening,
-      .default_value = 1.0f, .label = "Camera Max Darkening", .section = "Character Shadowing",
-      .tooltip = "Cap on how dark a shadowed character pixel may get. 0 removes the "
-                 "effect, 1 permits solid black. Capped below 1 by default because "
-                 "this pass multiplies probe-lit ambient and cannot prove the pixel "
-                 "was lit, and a face going to solid black reads as a hole.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
+        .key = "CharCamMaxDarkening",
+        .binding = &shader_injection.char_cam_max_darkening,
+        .default_value = 1.0f,
+        .label = "Camera Max Darkening",
+        .section = "Character Shadowing",
+        .tooltip = "Cap on how dark a shadowed character pixel may get. 0 removes the "
+                   "effect, 1 permits solid black. Capped below 1 by default because "
+                   "this pass multiplies probe-lit ambient and cannot prove the pixel "
+                   "was lit, and a face going to solid black reads as a hole.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
+                                    && shader_injection.char_cam_enabled >= 0.5f; },
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharCamISFAST", .binding = &shader_injection.char_cam_isfast_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Camera IS-FAST Jitter", .section = "Character Shadowing",
-      .tooltip = "Dither the step offset with IS-FAST blue noise so a fixed step does "
-                 "not band. The camera term is written to the AO channel the game "
-                 "already resolves temporally, so the dither is free to leave on. "
-                 "There is no IGN fallback by design; without the volume this marches "
-                 "at a fixed midpoint and bands visibly.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
+        .key = "CharCamISFAST",
+        .binding = &shader_injection.char_cam_isfast_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Camera IS-FAST Jitter",
+        .section = "Character Shadowing",
+        .tooltip = "Dither the step offset with IS-FAST blue noise so a fixed step does "
+                   "not band. The camera term is written to the AO channel the game "
+                   "already resolves temporally, so the dither is free to leave on. "
+                   "There is no IGN fallback by design; without the volume this marches "
+                   "at a fixed midpoint and bands visibly.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
+                                    && shader_injection.char_cam_enabled >= 0.5f; },
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharCamDebug", .binding = &shader_injection.char_cam_debug,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Camera Debug View", .section = "Character Shadowing",
-      .tooltip = "Axis Length reports the magnitude of the engine's rayMarchShadowDir_g "
-                 "on a log scale. It is on a log scale because nothing in the engine "
-                 "settles whether that symbol is a unit direction (Daybreak 2's 39-step "
-                 "character march reads as if it is) or a pre-scaled vector (the Sora "
-                 "and Kai 10-step march needs it to be), and a linear greyscale cannot "
-                 "show both.",
-      .labels = {"Off", "Raw Term", "Coverage", "Axis Length"},
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
+        .key = "CharCamDebug",
+        .binding = &shader_injection.char_cam_debug,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Camera Debug View",
+        .section = "Character Shadowing",
+        .tooltip = "Axis Length reports the magnitude of the engine's rayMarchShadowDir_g "
+                   "on a log scale. It is on a log scale because nothing in the engine "
+                   "settles whether that symbol is a unit direction (Daybreak 2's 39-step "
+                   "character march reads as if it is) or a pre-scaled vector (the Sora "
+                   "and Kai 10-step march needs it to be), and a linear greyscale cannot "
+                   "show both.",
+        .labels = {"Off", "Raw Term", "Coverage", "Axis Length"},
+        .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
+                                    && shader_injection.char_cam_enabled >= 0.5f; },
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharGTVBAOMode", .binding = &shader_injection.char_gtvbao_mode,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Allow GTVBAO", .section = "GTVBAO",
-      .labels = {"Off", "On", "Combined"},
-      .is_enabled = []() { return !falcom_world::rtao::RtaoRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "CharGTVBAOMode",
+        .binding = &shader_injection.char_gtvbao_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "Allow GTVBAO",
+        .section = "GTVBAO",
+        .labels = {"Off", "On", "Combined"},
+        .is_enabled = []() { return !falcom_world::rtao::RtaoRequested(); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharGTVBAOMaskStr", .binding = &shader_injection.char_gtvbao_mask_strength,
-      .default_value = 75.f, .label = "GTVBAO Char Mask", .section = "GTVBAO",
-      .min = 0.f, .max = 100.f,
-      .is_enabled = []() { return shader_injection.char_gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested(); },
-      .parse = [](float v) { return v * 0.01f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "CharGTVBAOMaskStr",
+        .binding = &shader_injection.char_gtvbao_mask_strength,
+        .default_value = 75.f,
+        .label = "GTVBAO Char Mask",
+        .section = "GTVBAO",
+        .min = 0.f,
+        .max = 100.f,
+        .is_enabled = []() { return shader_injection.char_gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested(); },
+        .parse = [](float v) { return v * 0.01f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+
     new renodx::utils::settings::Setting{
-      .key = "DebugShowEnvSSS", .binding = &shader_injection.debug_show_env_sss,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f,
-      .label = "Foliage / Char Mask Debug",
-      .section = "GTVBAO",
-      .tooltip = "Inspects the foliage and character mask the GTVBAO character "
-                 "options act on. View 2 now shows the Contact Shadow term; it used to "
-                 "show the retired screen-space shadow channel.",
-      .labels = {"Off", "Mask", "Contact Term", "SSAO Sample", "Raw mrt0.z"},
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DebugShowEnvSSS",
+        .binding = &shader_injection.debug_show_env_sss,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Foliage / Char Mask Debug",
+        .section = "GTVBAO",
+        .tooltip = "Inspects the foliage and character mask the GTVBAO character "
+                   "options act on. View 2 now shows the Contact Shadow term; it used to "
+                   "show the retired screen-space shadow channel.",
+        .labels = {"Off", "Mask", "Contact Term", "SSAO Sample", "Raw mrt0.z"},
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // �� GTVBAO ��
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOMode", .binding = &shader_injection.gtvbao_mode,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "GTVBAO mode", .section = "GTVBAO",
-      .tooltip = "Off = vanilla game AO. On = GTVBAO compute-shader AO.",
-      .labels = {"Off (Vanilla AO)", "On (GTVBAO)"},
-      .is_enabled = []() { return !falcom_world::rtao::RtaoRequested(); },
+        .key = "GTVBAOMode",
+        .binding = &shader_injection.gtvbao_mode,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "GTVBAO mode",
+        .section = "GTVBAO",
+        .tooltip = "Off = vanilla game AO. On = GTVBAO compute-shader AO.",
+        .labels = {"Off (Vanilla AO)", "On (GTVBAO)"},
+        .is_enabled = []() { return !falcom_world::rtao::RtaoRequested(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOQuality", .binding = &shader_injection.gtvbao_quality_level,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Quality Level", .section = "GTVBAO",
-      .tooltip = "Slices x steps per side. Low 2x4, Medium 3x4, High 3x6, Ultra 4x10.",
-      .labels = {"Low", "Medium", "High", "Ultra"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .key = "GTVBAOQuality",
+        .binding = &shader_injection.gtvbao_quality_level,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "Quality Level",
+        .section = "GTVBAO",
+        .tooltip = "Slices x steps per side. Low 2x4, Medium 3x4, High 3x6, Ultra 4x10.",
+        .labels = {"Low", "Medium", "High", "Ultra"},
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOResolution", .binding = &shader_injection.gtvbao_resolution,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "GTVBAO Resolution", .section = "GTVBAO",
-      .tooltip = "Full = native. Half = half size per axis (a quarter of the pixels). Lower resolutions are upsampled with depth and normal aware weights and are softer. The size is relative to the render resolution, so in-game upscaling makes it smaller.",
-      .labels = {"Full", "Half"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .key = "GTVBAOResolution",
+        .binding = &shader_injection.gtvbao_resolution,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "GTVBAO Resolution",
+        .section = "GTVBAO",
+        .tooltip = "Full = native. Half = half size per axis (a quarter of the pixels). Lower resolutions are upsampled with depth and normal aware weights and are softer. The size is relative to the render resolution, so in-game upscaling makes it smaller.",
+        .labels = {"Full", "Half"},
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOUpscaleAlgorithm", .binding = &g_gtvbao_upscale_algorithm,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 3.f, .label = "Reconstruction", .section = "GTVBAO Upscaling",
-      .tooltip = "Joint Bilateral (Current) preserves the existing 2x2 depth and normal aware filter. Bilinear is smoother but can bleed across edges. Nearest Valid selects one edge-aware tap and can look blocky. Wider Joint Bilateral uses a 4x4 footprint and costs more. All modes pass through at native resolution.",
-      .labels = {"Joint Bilateral (Current)", "Bilinear", "Nearest Valid", "Wider Joint Bilateral"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOUpscaleAlgorithm",
+        .binding = &g_gtvbao_upscale_algorithm,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 3.f,
+        .label = "Reconstruction",
+        .section = "GTVBAO Upscaling",
+        .tooltip = "Joint Bilateral (Current) preserves the existing 2x2 depth and normal aware filter. Bilinear is smoother but can bleed across edges. Nearest Valid selects one edge-aware tap and can look blocky. Wider Joint Bilateral uses a 4x4 footprint and costs more. All modes pass through at native resolution.",
+        .labels = {"Joint Bilateral (Current)", "Bilinear", "Nearest Valid", "Wider Joint Bilateral"},
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOUpscalePlaneSigma", .binding = &g_gtvbao_upscale_plane_sigma,
-      .default_value = 0.02f, .label = "Depth Plane Sigma", .section = "GTVBAO Upscaling",
-      .tooltip = "Current value 0.02. Higher values allow more blending across depth-plane differences; lower values preserve depth edges more strongly and may leave gaps.",
-      .min = 0.005f, .max = 0.10f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOUpscalePlaneSigma",
+        .binding = &g_gtvbao_upscale_plane_sigma,
+        .default_value = 0.02f,
+        .label = "Depth Plane Sigma",
+        .section = "GTVBAO Upscaling",
+        .tooltip = "Current value 0.02. Higher values allow more blending across depth-plane differences; lower values preserve depth edges more strongly and may leave gaps.",
+        .min = 0.005f,
+        .max = 0.10f,
+        .format = "%.3f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOUpscaleNormalPower", .binding = &g_gtvbao_upscale_normal_power,
-      .default_value = 64.f, .label = "Normal Edge Power", .section = "GTVBAO Upscaling",
-      .tooltip = "Current value 16. Higher values reject taps with different surface normals more strongly; lower values blend across normal edges more.",
-      .min = 1.f, .max = 64.f, .format = "%.0f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOUpscaleNormalPower",
+        .binding = &g_gtvbao_upscale_normal_power,
+        .default_value = 64.f,
+        .label = "Normal Edge Power",
+        .section = "GTVBAO Upscaling",
+        .tooltip = "Current value 16. Higher values reject taps with different surface normals more strongly; lower values blend across normal edges more.",
+        .min = 1.f,
+        .max = 64.f,
+        .format = "%.0f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOUpscaleBilinearSharpness", .binding = &g_gtvbao_upscale_bilinear_sharpness,
-      .default_value = 1.f, .label = "Bilinear Weight Sharpness", .section = "GTVBAO Upscaling",
-      .tooltip = "1.0 keeps the current spatial weights. Higher values favor the strongest tap and look sharper; lower values spread weight more evenly. Used by Joint Bilateral, Bilinear and Nearest Valid.",
-      .min = 0.5f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_upscale_algorithm < 2.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOUpscaleBilinearSharpness",
+        .binding = &g_gtvbao_upscale_bilinear_sharpness,
+        .default_value = 1.f,
+        .label = "Bilinear Weight Sharpness",
+        .section = "GTVBAO Upscaling",
+        .tooltip = "1.0 keeps the current spatial weights. Higher values favor the strongest tap and look sharper; lower values spread weight more evenly. Used by Joint Bilateral, Bilinear and Nearest Valid.",
+        .min = 0.5f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_upscale_algorithm < 2.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOUpscaleNearestFallback", .binding = &g_gtvbao_upscale_nearest_fallback,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Nearest Valid Fallback", .section = "GTVBAO Upscaling",
-      .tooltip = "When all joint-bilateral taps are rejected by the edge weights, use the valid tap with the strongest spatial weight. Off leaves neutral AO at that pixel.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOUpscaleNearestFallback",
+        .binding = &g_gtvbao_upscale_nearest_fallback,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Nearest Valid Fallback",
+        .section = "GTVBAO Upscaling",
+        .tooltip = "When all joint-bilateral taps are rejected by the edge weights, use the valid tap with the strongest spatial weight. Off leaves neutral AO at that pixel.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAONoiseType", .binding = &shader_injection.gtvbao_noise_type,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Noise Type", .section = "GTVBAO",
-      .tooltip = "IS-FAST = pre-computed blue noise (baked into the addon). "
-                 "IGN = Interleaved Gradient Noise. Hilbert = Hilbert curve noise. "
-                 "Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
-      .labels = {"IS-FAST", "IGN", "Hilbert"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAONoiseType",
+        .binding = &shader_injection.gtvbao_noise_type,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "Noise Type",
+        .section = "GTVBAO",
+        .tooltip = "IS-FAST = pre-computed blue noise (baked into the addon). "
+                   "IGN = Interleaved Gradient Noise. Hilbert = Hilbert curve noise. "
+                   "Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
+        .labels = {"IS-FAST", "IGN", "Hilbert"},
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_isfast_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAORadius", .binding = &shader_injection.gtvbao_radius,
-      .default_value = 0.4f, .label = "Radius", .section = "GTVBAO",
-      .min = 0.01f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAORadius",
+        .binding = &shader_injection.gtvbao_radius,
+        .default_value = 0.4f,
+        .label = "Radius",
+        .section = "GTVBAO",
+        .min = 0.01f,
+        .max = 5.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAORadiusMultiplier", .binding = &shader_injection.gtvbao_radius_multiplier,
-      .default_value = 1.f, .label = "Radius Multiplier", .section = "GTVBAO",
-      .min = 0.3f, .max = 3.0f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAORadiusMultiplier",
+        .binding = &shader_injection.gtvbao_radius_multiplier,
+        .default_value = 1.f,
+        .label = "Radius Multiplier",
+        .section = "GTVBAO",
+        .min = 0.3f,
+        .max = 3.0f,
+        .format = "%.3f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOFinalPower", .binding = &shader_injection.gtvbao_final_power,
-      .default_value = 0.8f, .label = "Final Power", .section = "GTVBAO",
-      .min = 0.5f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOFinalPower",
+        .binding = &shader_injection.gtvbao_final_power,
+        .default_value = 0.8f,
+        .label = "Final Power",
+        .section = "GTVBAO",
+        .min = 0.5f,
+        .max = 5.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOSampleDistribution", .binding = &shader_injection.gtvbao_sample_distribution,
-      .default_value = 1.5f, .label = "Sample Distribution", .section = "GTVBAO",
-      .min = 1.0f, .max = 3.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOSampleDistribution",
+        .binding = &shader_injection.gtvbao_sample_distribution,
+        .default_value = 1.5f,
+        .label = "Sample Distribution",
+        .section = "GTVBAO",
+        .min = 1.0f,
+        .max = 3.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOAutoThickness", .binding = &g_gtvbao_auto_thickness,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Auto Thickness", .section = "GTVBAO",
-      .tooltip = "Estimate occluder thickness from connected depth samples. Base Thickness sets the starting thickness.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOAutoThickness",
+        .binding = &g_gtvbao_auto_thickness,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Auto Thickness",
+        .section = "GTVBAO",
+        .tooltip = "Estimate occluder thickness from connected depth samples. Base Thickness sets the starting thickness.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOBitmaskThickness", .binding = &shader_injection.gtvbao_bitmask_thickness,
-      .default_value = 0.30f, .label = "Bitmask Thickness", .section = "GTVBAO",
-      .tooltip = "Constant thickness used when Auto Thickness is off.",
-      .min = 0.01f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_auto_thickness < 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOBitmaskThickness",
+        .binding = &shader_injection.gtvbao_bitmask_thickness,
+        .default_value = 0.30f,
+        .label = "Bitmask Thickness",
+        .section = "GTVBAO",
+        .tooltip = "Constant thickness used when Auto Thickness is off.",
+        .min = 0.01f,
+        .max = 2.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_auto_thickness < 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOBaseThickness", .binding = &g_gtvbao_base_thickness,
-      .default_value = 0.20f, .label = "Base Thickness", .section = "GTVBAO",
-      .tooltip = "Starting thickness for the Auto Thickness estimate.",
-      .min = 0.01f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_auto_thickness > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOBaseThickness",
+        .binding = &g_gtvbao_base_thickness,
+        .default_value = 0.20f,
+        .label = "Base Thickness",
+        .section = "GTVBAO",
+        .tooltip = "Starting thickness for the Auto Thickness estimate.",
+        .min = 0.01f,
+        .max = 2.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_auto_thickness > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOGTVBAOCosineMode", .binding = &shader_injection.gtvbao_cosine_mode,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Cosine Sampling Mode", .section = "GTVBAO",
-      .tooltip = "Weight = uniform slices with a per-slice weight (reference mode 1). Project = cosine-lobe projection (mode 2, default). CDF = approximate inverse-CDF sampling (mode 3). Only used with Cosine weighting.",
-      .labels = {"Weight", "Project", "CDF"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_hemisphere_weighting < 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOGTVBAOCosineMode",
+        .binding = &shader_injection.gtvbao_cosine_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "Cosine Sampling Mode",
+        .section = "GTVBAO",
+        .tooltip = "Weight = uniform slices with a per-slice weight (reference mode 1). Project = cosine-lobe projection (mode 2, default). CDF = approximate inverse-CDF sampling (mode 3). Only used with Cosine weighting.",
+        .labels = {"Weight", "Project", "CDF"},
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_hemisphere_weighting < 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOHemisphereWeighting", .binding = &g_gtvbao_hemisphere_weighting,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Hemisphere Weighting", .section = "GTVBAO",
-      .tooltip = "Cosine = ground-truth cosine-weighted AO (default). Uniform = uniform-weighted hemisphere.",
-      .labels = {"Cosine", "Uniform"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOHemisphereWeighting",
+        .binding = &g_gtvbao_hemisphere_weighting,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Hemisphere Weighting",
+        .section = "GTVBAO",
+        .tooltip = "Cosine = ground-truth cosine-weighted AO (default). Uniform = uniform-weighted hemisphere.",
+        .labels = {"Cosine", "Uniform"},
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAODepthMIPOffset", .binding = &shader_injection.gtvbao_depth_mip_offset,
-      .default_value = 3.5f, .label = "Depth MIP Offset", .section = "GTVBAO",
-      .min = 2.0f, .max = 6.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAODepthMIPOffset",
+        .binding = &shader_injection.gtvbao_depth_mip_offset,
+        .default_value = 3.5f,
+        .label = "Depth MIP Offset",
+        .section = "GTVBAO",
+        .min = 2.0f,
+        .max = 6.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAONormalInputMode", .binding = &g_gtvbao_normal_input_mode,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "MRT Normal Input", .section = "GTVBAO",
-      .tooltip = "Off = depth normals only. On = use game g-buffer normals.",
-      .labels = {"Off (Depth)", "On (MRT)"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAONormalInputMode",
+        .binding = &g_gtvbao_normal_input_mode,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "MRT Normal Input",
+        .section = "GTVBAO",
+        .tooltip = "Off = depth normals only. On = use game g-buffer normals.",
+        .labels = {"Off (Depth)", "On (MRT)"},
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAONormalInfluence", .binding = &g_gtvbao_normal_influence,
-      .default_value = 1.f, .label = "Normal Influence", .section = "GTVBAO",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAONormalInfluence",
+        .binding = &g_gtvbao_normal_influence,
+        .default_value = 1.f,
+        .label = "Normal Influence",
+        .section = "GTVBAO",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAONormalDepthBlend", .binding = &g_gtvbao_normal_depth_blend,
-      .default_value = 1.f, .label = "Normal Depth Blend", .section = "GTVBAO",
-      .tooltip = "Base blend weight between the depth-derived normal and the MRT normal. 1.0 (neutral) uses the MRT normal in full; the depth normal is then only a fallback.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAONormalDepthBlend",
+        .binding = &g_gtvbao_normal_depth_blend,
+        .default_value = 1.f,
+        .label = "Normal Depth Blend",
+        .section = "GTVBAO",
+        .tooltip = "Base blend weight between the depth-derived normal and the MRT normal. 1.0 (neutral) uses the MRT normal in full; the depth normal is then only a fallback.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAONormalSharpness", .binding = &g_gtvbao_normal_sharpness,
-      .default_value = 1.f, .label = "Normal Sharpness", .section = "GTVBAO",
-      .tooltip = "Gamma applied to the depth blend. 1.0 (neutral) is a straight passthrough; higher values push the weight toward the depth normal faster.",
-      .min = 0.01f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAONormalSharpness",
+        .binding = &g_gtvbao_normal_sharpness,
+        .default_value = 1.f,
+        .label = "Normal Sharpness",
+        .section = "GTVBAO",
+        .tooltip = "Gamma applied to the depth blend. 1.0 (neutral) is a straight passthrough; higher values push the weight toward the depth normal faster.",
+        .min = 0.01f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAONormalEdgeRejection", .binding = &g_gtvbao_normal_edge_rejection,
-      .default_value = 0.f, .label = "Normal Edge Rejection", .section = "GTVBAO",
-      .tooltip = "Rejects the MRT normal on depth discontinuities. 0.0 (neutral) applies no rejection; raise it to fall back toward the depth normal at silhouettes.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAONormalEdgeRejection",
+        .binding = &g_gtvbao_normal_edge_rejection,
+        .default_value = 0.f,
+        .label = "Normal Edge Rejection",
+        .section = "GTVBAO",
+        .tooltip = "Rejects the MRT normal on depth discontinuities. 0.0 (neutral) applies no rejection; raise it to fall back toward the depth normal at silhouettes.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAONormalZPreservation", .binding = &g_gtvbao_normal_z_preservation,
-      .default_value = 2.0f, .label = "Normal Z Preservation", .section = "GTVBAO",
-      .tooltip = "Scales the view-space n.z of the MRT normal. 1.0 keeps the encoded normal intact; lower values tilt it. The shader floors this so it can never reach 0 and flatten the normal.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAONormalZPreservation",
+        .binding = &g_gtvbao_normal_z_preservation,
+        .default_value = 2.0f,
+        .label = "Normal Z Preservation",
+        .section = "GTVBAO",
+        .tooltip = "Scales the view-space n.z of the MRT normal. 1.0 keeps the encoded normal intact; lower values tilt it. The shader floors this so it can never reach 0 and flatten the normal.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAONormalDetailResponse", .binding = &g_gtvbao_normal_detail_response,
-      .default_value = 1.f, .label = "Normal Detail Response", .section = "GTVBAO",
-      .tooltip = "Reweights the MRT normal by how far it disagrees with the depth normal. 0.0 (neutral) is an exact no-op; 1.0 leans on the depth normal where they agree and the MRT normal where they diverge.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAONormalDetailResponse",
+        .binding = &g_gtvbao_normal_detail_response,
+        .default_value = 1.f,
+        .label = "Normal Detail Response",
+        .section = "GTVBAO",
+        .tooltip = "Reweights the MRT normal by how far it disagrees with the depth normal. 0.0 (neutral) is an exact no-op; 1.0 leans on the depth normal where they agree and the MRT normal where they diverge.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAONormalMaxDarkening", .binding = &g_gtvbao_normal_max_darkening,
-      .default_value = 1.f, .label = "Normal Max Darkening", .section = "GTVBAO",
-      .tooltip = "Caps the final MRT normal blend weight in Multiply mode. 1.0 (neutral) applies no cap.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAONormalMaxDarkening",
+        .binding = &g_gtvbao_normal_max_darkening,
+        .default_value = 1.f,
+        .label = "Normal Max Darkening",
+        .section = "GTVBAO",
+        .tooltip = "Caps the final MRT normal blend weight in Multiply mode. 1.0 (neutral) applies no cap.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "GTVBAODebugMode",
@@ -3806,1983 +4274,2888 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAODebugLogging", .binding = &shader_injection.gtvbao_debug_logging,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Debug Logging", .section = "GTVBAO",
-      .labels = {"Off", "On"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAODebugLogging",
+        .binding = &shader_injection.gtvbao_debug_logging,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Debug Logging",
+        .section = "GTVBAO",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOFixExperimental", .binding = &shader_injection.gtvbao_fix_experimental,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Fix Experimental", .section = "GTVBAO",
-      .tooltip = "Composite-side AO encoding diagnostic (Sora lighting shaders only). 0=Off (baseline).",
-      .labels = {"Off", "1:Neutral 1.0", "2:No 0xFF mask", "3:Inverted", "4:All channels"},
-      .is_enabled = []() { return !falcom_world::rtao::RtaoRequested(); },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOFixExperimental",
+        .binding = &shader_injection.gtvbao_fix_experimental,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Fix Experimental",
+        .section = "GTVBAO",
+        .tooltip = "Composite-side AO encoding diagnostic (Sora lighting shaders only). 0=Off (baseline).",
+        .labels = {"Off", "1:Neutral 1.0", "2:No 0xFF mask", "3:Inverted", "4:All channels"},
+        .is_enabled = []() { return !falcom_world::rtao::RtaoRequested(); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // -- GTVBAO Foliage --
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOExcludeFoliage", .binding = &shader_injection.gtvbao_exclude_foliage,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Exclude Foliage", .section = "GTVBAO",
-      .tooltip = "Skip AO computation on foliage pixels (prevent wind disocclusion noise).",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOExcludeFoliage",
+        .binding = &shader_injection.gtvbao_exclude_foliage,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Exclude Foliage",
+        .section = "GTVBAO",
+        .tooltip = "Skip AO computation on foliage pixels (prevent wind disocclusion noise).",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOFoliageAOValue", .binding = &shader_injection.gtvbao_foliage_ao_value,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Foliage AO Value", .section = "GTVBAO",
-      .tooltip = "Blends foliage AO toward fully bright. 1.0 = keep normal GTVBAO AO (like foliage exclusion OFF). 0.0 = no AO on foliage (fully bright).",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_exclude_foliage > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOFoliageAOValue",
+        .binding = &shader_injection.gtvbao_foliage_ao_value,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "Foliage AO Value",
+        .section = "GTVBAO",
+        .tooltip = "Blends foliage AO toward fully bright. 1.0 = keep normal GTVBAO AO (like foliage exclusion OFF). 0.0 = no AO on foliage (fully bright).",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_exclude_foliage > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // -- Foliage Grass AO --
     new renodx::utils::settings::Setting{
-      .key = "FoliageGrassAOEnabled", .binding = &shader_injection.foliage_grass_ao_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Grass AO", .section = "Foliage Grass AO",
-      .tooltip = "Per-blade vertical AO gradient: dark at root, bright at tip. Replaces noisy SSAO/GTAO on foliage with a stable bake. (Ghost of Tsushima �1.5e-ii)",
-      .labels = {"Off", "On"},
+        .key = "FoliageGrassAOEnabled",
+        .binding = &shader_injection.foliage_grass_ao_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Grass AO",
+        .section = "Foliage Grass AO",
+        .tooltip = "Per-blade vertical AO gradient: dark at root, bright at tip. Replaces noisy SSAO/GTAO on foliage with a stable bake. (Ghost of Tsushima �1.5e-ii)",
+        .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
-      .key = "FoliageGrassAOBase", .binding = &shader_injection.foliage_grass_ao_base,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.15f, .label = "Grass AO Base", .section = "Foliage Grass AO",
-      .tooltip = "AO multiplier at the blade root. Lower = darker base (more self-occlusion).",
-      .min = 0.f, .max = 0.8f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.foliage_grass_ao_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "FoliageGrassAOBase",
+        .binding = &shader_injection.foliage_grass_ao_base,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.15f,
+        .label = "Grass AO Base",
+        .section = "Foliage Grass AO",
+        .tooltip = "AO multiplier at the blade root. Lower = darker base (more self-occlusion).",
+        .min = 0.f,
+        .max = 0.8f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.foliage_grass_ao_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FoliageGrassAOTip", .binding = &shader_injection.foliage_grass_ao_tip,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.2f, .label = "Grass AO Tip", .section = "Foliage Grass AO",
-      .tooltip = "AO multiplier at the blade tip. Values > 1.0 slightly brighten the tip (rim-light effect).",
-      .min = 0.5f, .max = 1.5f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.foliage_grass_ao_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "FoliageGrassAOTip",
+        .binding = &shader_injection.foliage_grass_ao_tip,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.2f,
+        .label = "Grass AO Tip",
+        .section = "Foliage Grass AO",
+        .tooltip = "AO multiplier at the blade tip. Values > 1.0 slightly brighten the tip (rim-light effect).",
+        .min = 0.5f,
+        .max = 1.5f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.foliage_grass_ao_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FoliageGrassAOCurve", .binding = &shader_injection.foliage_grass_ao_curve,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.25f, .label = "Grass AO Curve", .section = "Foliage Grass AO",
-      .tooltip = "Power curve exponent. <1.0 = darkening concentrated at base (recommended). 1.0 = linear. >1.0 = darkening extends further up the blade.",
-      .min = 0.1f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.foliage_grass_ao_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "FoliageGrassAOCurve",
+        .binding = &shader_injection.foliage_grass_ao_curve,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.25f,
+        .label = "Grass AO Curve",
+        .section = "Foliage Grass AO",
+        .tooltip = "Power curve exponent. <1.0 = darkening concentrated at base (recommended). 1.0 = linear. >1.0 = darkening extends further up the blade.",
+        .min = 0.1f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.foliage_grass_ao_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // -- BRDF Improvement --
     new renodx::utils::settings::Setting{
-      .key = "BRDFHammonDiffuse", .binding = &shader_injection.brdf_hammon_diffuse_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Hammon 2017 Diffuse", .section = "BRDF Improvement",
-      .tooltip = "Applies the Hammon 2017 GGX+Smith multi-scatter energy-conserving diffuse correction to the sun and point/spot/environment lights (GDC 2017).",
-      .labels = {"Off", "On"},
+        .key = "BRDFHammonDiffuse",
+        .binding = &shader_injection.brdf_hammon_diffuse_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Hammon 2017 Diffuse",
+        .section = "BRDF Improvement",
+        .tooltip = "Applies the Hammon 2017 GGX+Smith multi-scatter energy-conserving diffuse correction to the sun and point/spot/environment lights (GDC 2017).",
+        .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
-      .key = "BRDFDiffuseStrength", .binding = &shader_injection.brdf_diffuse_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Diffuse Blend", .section = "BRDF Improvement",
-      .tooltip = "Blend between vanilla Lambert and Hammon diffuse. 0=vanilla, 1=full Hammon, 2=2x boost.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.brdf_hammon_diffuse_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "BRDFDiffuseStrength",
+        .binding = &shader_injection.brdf_diffuse_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.0f,
+        .label = "Diffuse Blend",
+        .section = "BRDF Improvement",
+        .tooltip = "Blend between vanilla Lambert and Hammon diffuse. 0=vanilla, 1=full Hammon, 2=2x boost.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.brdf_hammon_diffuse_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "BRDFMultiScatterSpecular", .binding = &shader_injection.brdf_multiscatter_specular_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.0f, .label = "Multi-Scatter GGX Specular", .section = "BRDF Improvement",
-      .tooltip = "Replaces Blinn-Phong specular with GGX D�V�F + Kulla-Conty multi-scatter compensation (SIGGRAPH 2017).",
-      .labels = {"Off", "On"},
+        .key = "BRDFMultiScatterSpecular",
+        .binding = &shader_injection.brdf_multiscatter_specular_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.0f,
+        .label = "Multi-Scatter GGX Specular",
+        .section = "BRDF Improvement",
+        .tooltip = "Replaces Blinn-Phong specular with GGX D�V�F + Kulla-Conty multi-scatter compensation (SIGGRAPH 2017).",
+        .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
-      .key = "BRDFSpecularStrength", .binding = &shader_injection.brdf_specular_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Specular Blend", .section = "BRDF Improvement",
-      .tooltip = "Blend between vanilla Blinn-Phong and GGX+multi-scatter specular. 0=vanilla, 1=full GGX+MS, 2=2x boost.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.brdf_multiscatter_specular_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "BRDFSpecularStrength",
+        .binding = &shader_injection.brdf_specular_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.5f,
+        .label = "Specular Blend",
+        .section = "BRDF Improvement",
+        .tooltip = "Blend between vanilla Blinn-Phong and GGX+multi-scatter specular. 0=vanilla, 1=full GGX+MS, 2=2x boost.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.brdf_multiscatter_specular_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "BRDFSpecularPeakClamp", .binding = &shader_injection.brdf_specular_peak_clamp,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 2.0f, .label = "Specular Peak Clamp", .section = "BRDF Improvement",
-      .tooltip = "Soft cap on GGX highlight intensity. Identity below half the value, asymptotes to it. 0 = off.",
-      .min = 0.f, .max = 16.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.brdf_multiscatter_specular_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "BRDFSpecularPeakClamp",
+        .binding = &shader_injection.brdf_specular_peak_clamp,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 2.0f,
+        .label = "Specular Peak Clamp",
+        .section = "BRDF Improvement",
+        .tooltip = "Soft cap on GGX highlight intensity. Identity below half the value, asymptotes to it. 0 = off.",
+        .min = 0.f,
+        .max = 16.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.brdf_multiscatter_specular_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "BRDFRoughnessMin", .binding = &shader_injection.brdf_roughness_min,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.65f, .label = "Roughness Min", .section = "BRDF Improvement",
-      .tooltip = "Clamp minimum perceptual roughness to prevent GGX singularity. 0.04 is a safe minimum for most materials.",
-      .min = 0.f, .max = 0.8f, .format = "%.2f",
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "BRDFRoughnessMin",
+        .binding = &shader_injection.brdf_roughness_min,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.65f,
+        .label = "Roughness Min",
+        .section = "BRDF Improvement",
+        .tooltip = "Clamp minimum perceptual roughness to prevent GGX singularity. 0.04 is a safe minimum for most materials.",
+        .min = 0.f,
+        .max = 0.8f,
+        .format = "%.2f",
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "BRDFRoughnessMax", .binding = &shader_injection.brdf_roughness_max,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Roughness Max", .section = "BRDF Improvement",
-      .tooltip = "Clamp maximum perceptual roughness. 1.0 = no clamping.",
-      .min = 0.2f, .max = 1.f, .format = "%.2f",
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "BRDFRoughnessMax",
+        .binding = &shader_injection.brdf_roughness_max,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.0f,
+        .label = "Roughness Max",
+        .section = "BRDF Improvement",
+        .tooltip = "Clamp maximum perceptual roughness. 1.0 = no clamping.",
+        .min = 0.2f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // -- GTVBAO dispatch Fix (for double volumetrics) --
     new renodx::utils::settings::Setting{
-      .key = "GTVBAOCSDispatchFix", .binding = &g_gtvbao_cs_dispatch_fix,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "CS Dispatch Fix", .section = "GTVBAO",
-      .tooltip = "Fixes double volumetrics caused by stale compute descriptor bindings. Fix 1: restore state via Apply(). Fix 2: null compute descriptors. Fix 3: null + restore.",
-      .labels = {"Off", "Fix 1: Restore State", "Fix 2: Null Compute", "Fix 3: Null + Restore"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "GTVBAOCSDispatchFix",
+        .binding = &g_gtvbao_cs_dispatch_fix,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "CS Dispatch Fix",
+        .section = "GTVBAO",
+        .tooltip = "Fixes double volumetrics caused by stale compute descriptor bindings. Fix 1: restore state via Apply(). Fix 2: null compute descriptors. Fix 3: null + restore.",
+        .labels = {"Off", "Fix 1: Restore State", "Fix 2: Null Compute", "Fix 3: Null + Restore"},
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // -- VBGI --
     new renodx::utils::settings::Setting{
-      .key = "SSGIEnable", .binding = &g_vbgi_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "GTVBGI Enabled", .section = "GTVBGI",
-      .tooltip = "GTVBGI: ground-truth visibility bitmask indirect diffuse GI (Sora 1st and Sora 2nd). Added to the lit image after the shadow terms. On by default.",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return VbgiGameSupported(); },
+        .key = "SSGIEnable",
+        .binding = &g_vbgi_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "GTVBGI Enabled",
+        .section = "GTVBGI",
+        .tooltip = "GTVBGI: ground-truth visibility bitmask indirect diffuse GI (Sora 1st and Sora 2nd). Added to the lit image after the shadow terms. On by default.",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return VbgiGameSupported(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIQuality", .binding = &g_vbgi_quality_level,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Quality Level", .section = "GTVBGI",
-      .tooltip = "Slices x steps per side. Low 2x4, Medium 3x4, High 3x6, Ultra 4x10.",
-      .labels = {"Low", "Medium", "High", "Ultra"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiGameSupported(); },
+        .key = "VBGIQuality",
+        .binding = &g_vbgi_quality_level,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "Quality Level",
+        .section = "GTVBGI",
+        .tooltip = "Slices x steps per side. Low 2x4, Medium 3x4, High 3x6, Ultra 4x10.",
+        .labels = {"Low", "Medium", "High", "Ultra"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiGameSupported(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIResolution", .binding = &g_vbgi_resolution,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "GTVBGI Resolution", .section = "GTVBGI",
-      .tooltip = "Trace size per axis relative to the render size: 1/2 = one trace pixel per 2 x 2 block, 1/4 = per 4 x 4, 1/8 = per 8 x 8. Lower is faster and softer; the depth and light sampling covers the same screen area at every size. Default 1/4.",
-      .labels = {"Full", "1/2", "1/4", "1/8"},
-      .min = 1.f,  // index = log2 divisor; Full (0) is hidden and a saved 0 loads as 1/2
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIResolution",
+        .binding = &g_vbgi_resolution,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "GTVBGI Resolution",
+        .section = "GTVBGI",
+        .tooltip = "Trace size per axis relative to the render size: 1/2 = one trace pixel per 2 x 2 block, 1/4 = per 4 x 4, 1/8 = per 8 x 8. Lower is faster and softer; the depth and light sampling covers the same screen area at every size. Default 1/4.",
+        .labels = {"Full", "1/2", "1/4", "1/8"},
+        .min = 1.f,  // index = log2 divisor; Full (0) is hidden and a saved 0 loads as 1/2
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIUpscaleAlgorithm", .binding = &g_vbgi_upscale_algorithm,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 3.f, .label = "Reconstruction", .section = "GTVBGI Upscaling",
-      .tooltip = "Joint Bilateral (Current) preserves the existing 2x2 depth and normal aware filter. Bilinear is smoother but can bleed across edges. Nearest Valid selects one edge-aware tap and can look blocky. Wider Joint Bilateral uses a 4x4 footprint and costs more. All modes pass through at native resolution.",
-      .labels = {"Joint Bilateral (Current)", "Bilinear", "Nearest Valid", "Wider Joint Bilateral"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIUpscaleAlgorithm",
+        .binding = &g_vbgi_upscale_algorithm,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 3.f,
+        .label = "Reconstruction",
+        .section = "GTVBGI Upscaling",
+        .tooltip = "Joint Bilateral (Current) preserves the existing 2x2 depth and normal aware filter. Bilinear is smoother but can bleed across edges. Nearest Valid selects one edge-aware tap and can look blocky. Wider Joint Bilateral uses a 4x4 footprint and costs more. All modes pass through at native resolution.",
+        .labels = {"Joint Bilateral (Current)", "Bilinear", "Nearest Valid", "Wider Joint Bilateral"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIUpscalePlaneSigma", .binding = &g_vbgi_upscale_plane_sigma,
-      .default_value = 0.02f, .label = "Depth Plane Sigma", .section = "GTVBGI Upscaling",
-      .tooltip = "Current value 0.02. Higher values allow more blending across depth-plane differences; lower values preserve depth edges more strongly and may leave gaps.",
-      .min = 0.005f, .max = 0.10f, .format = "%.3f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && (g_vbgi_upscale_algorithm < 0.5f || g_vbgi_upscale_algorithm > 1.5f); },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIUpscalePlaneSigma",
+        .binding = &g_vbgi_upscale_plane_sigma,
+        .default_value = 0.02f,
+        .label = "Depth Plane Sigma",
+        .section = "GTVBGI Upscaling",
+        .tooltip = "Current value 0.02. Higher values allow more blending across depth-plane differences; lower values preserve depth edges more strongly and may leave gaps.",
+        .min = 0.005f,
+        .max = 0.10f,
+        .format = "%.3f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && (g_vbgi_upscale_algorithm < 0.5f || g_vbgi_upscale_algorithm > 1.5f); },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIUpscaleNormalPower", .binding = &g_vbgi_upscale_normal_power,
-      .default_value = 1.f, .label = "Normal Edge Power", .section = "GTVBGI Upscaling",
-      .tooltip = "Default 1. Higher values reject taps with different surface normals more strongly; lower values blend across normal edges more.",
-      .min = 1.f, .max = 64.f, .format = "%.0f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && (g_vbgi_upscale_algorithm < 0.5f || g_vbgi_upscale_algorithm > 1.5f); },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIUpscaleNormalPower",
+        .binding = &g_vbgi_upscale_normal_power,
+        .default_value = 1.f,
+        .label = "Normal Edge Power",
+        .section = "GTVBGI Upscaling",
+        .tooltip = "Default 1. Higher values reject taps with different surface normals more strongly; lower values blend across normal edges more.",
+        .min = 1.f,
+        .max = 64.f,
+        .format = "%.0f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && (g_vbgi_upscale_algorithm < 0.5f || g_vbgi_upscale_algorithm > 1.5f); },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIUpscaleBilinearSharpness", .binding = &g_vbgi_upscale_bilinear_sharpness,
-      .default_value = 1.f, .label = "Bilinear Weight Sharpness", .section = "GTVBGI Upscaling",
-      .tooltip = "1.0 keeps the current spatial weights. Higher values favor the strongest tap and look sharper; lower values spread weight more evenly. Used by Joint Bilateral, Bilinear and Nearest Valid.",
-      .min = 0.5f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_upscale_algorithm < 2.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIUpscaleBilinearSharpness",
+        .binding = &g_vbgi_upscale_bilinear_sharpness,
+        .default_value = 1.f,
+        .label = "Bilinear Weight Sharpness",
+        .section = "GTVBGI Upscaling",
+        .tooltip = "1.0 keeps the current spatial weights. Higher values favor the strongest tap and look sharper; lower values spread weight more evenly. Used by Joint Bilateral, Bilinear and Nearest Valid.",
+        .min = 0.5f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_upscale_algorithm < 2.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIUpscaleNearestFallback", .binding = &g_vbgi_upscale_nearest_fallback,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Nearest Valid Fallback", .section = "GTVBGI Upscaling",
-      .tooltip = "When all joint-bilateral taps are rejected by the edge weights, use the valid tap with the strongest spatial weight. Off leaves black at that pixel.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && (g_vbgi_upscale_algorithm < 0.5f || g_vbgi_upscale_algorithm > 1.5f); },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIUpscaleNearestFallback",
+        .binding = &g_vbgi_upscale_nearest_fallback,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Nearest Valid Fallback",
+        .section = "GTVBGI Upscaling",
+        .tooltip = "When all joint-bilateral taps are rejected by the edge weights, use the valid tap with the strongest spatial weight. Off leaves black at that pixel.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && (g_vbgi_upscale_algorithm < 0.5f || g_vbgi_upscale_algorithm > 1.5f); },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGINoiseType", .binding = &g_vbgi_noise_type,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Noise Type", .section = "GTVBGI",
-      .tooltip = "IS-FAST = pre-computed blue noise (baked into the addon). IGN = Interleaved Gradient Noise. Hilbert = Hilbert curve noise. Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
-      .labels = {"IS-FAST", "IGN", "Hilbert"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_isfast_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGINoiseType",
+        .binding = &g_vbgi_noise_type,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "Noise Type",
+        .section = "GTVBGI",
+        .tooltip = "IS-FAST = pre-computed blue noise (baked into the addon). IGN = Interleaved Gradient Noise. Hilbert = Hilbert curve noise. Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
+        .labels = {"IS-FAST", "IGN", "Hilbert"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_isfast_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIIntensity", .binding = &shader_injection.vbgi_intensity,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Intensity", .section = "GTVBGI",
-      .min = 0.0f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "SSGIIntensity",
+        .binding = &shader_injection.vbgi_intensity,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.0f,
+        .label = "Intensity",
+        .section = "GTVBGI",
+        .min = 0.0f,
+        .max = 5.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharGTVBGIMaskStr", .binding = &shader_injection.char_gtvbgi_mask_strength,
-      .default_value = 75.f, .label = "Character Mask Strength", .section = "GTVBGI",
-      .min = 0.f, .max = 100.f,
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .parse = [](float v) { return v * 0.01f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "CharGTVBGIMaskStr",
+        .binding = &shader_injection.char_gtvbgi_mask_strength,
+        .default_value = 75.f,
+        .label = "Character Mask Strength",
+        .section = "GTVBGI",
+        .min = 0.f,
+        .max = 100.f,
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .parse = [](float v) { return v * 0.01f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIRadius", .binding = &g_vbgi_radius,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Radius", .section = "GTVBGI",
-      .tooltip = "World-space radius of the visibility search.",
-      .min = 0.1f, .max = 10.0f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIRadius",
+        .binding = &g_vbgi_radius,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.5f,
+        .label = "Radius",
+        .section = "GTVBGI",
+        .tooltip = "World-space radius of the visibility search.",
+        .min = 0.1f,
+        .max = 10.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIAutoThickness", .binding = &g_vbgi_auto_thickness,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Auto Thickness", .section = "GTVBGI",
-      .tooltip = "Estimate occluder thickness from connected depth samples. Base Thickness sets the starting thickness.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIAutoThickness",
+        .binding = &g_vbgi_auto_thickness,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Auto Thickness",
+        .section = "GTVBGI",
+        .tooltip = "Estimate occluder thickness from connected depth samples. Base Thickness sets the starting thickness.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIThickness", .binding = &g_vbgi_bitmask_thickness,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.30f, .label = "Bitmask Thickness", .section = "GTVBGI",
-      .tooltip = "Constant thickness used when Auto Thickness is off.",
-      .min = 0.01f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_auto_thickness < 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIThickness",
+        .binding = &g_vbgi_bitmask_thickness,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.30f,
+        .label = "Bitmask Thickness",
+        .section = "GTVBGI",
+        .tooltip = "Constant thickness used when Auto Thickness is off.",
+        .min = 0.01f,
+        .max = 2.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_auto_thickness < 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIBaseThickness", .binding = &g_vbgi_base_thickness,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.20f, .label = "Base Thickness", .section = "GTVBGI",
-      .tooltip = "Starting thickness for the Auto Thickness estimate.",
-      .min = 0.01f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_auto_thickness > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIBaseThickness",
+        .binding = &g_vbgi_base_thickness,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.20f,
+        .label = "Base Thickness",
+        .section = "GTVBGI",
+        .tooltip = "Starting thickness for the Auto Thickness estimate.",
+        .min = 0.01f,
+        .max = 2.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_auto_thickness > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIBackfaceMode", .binding = &g_vbgi_backface_mode,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Backface Rejection", .section = "GTVBGI",
-      .labels = {"Off", "Simple", "Exact"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIBackfaceMode",
+        .binding = &g_vbgi_backface_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Backface Rejection",
+        .section = "GTVBGI",
+        .labels = {"Off", "Simple", "Exact"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIDepthMipOffset", .binding = &g_vbgi_depth_mip_offset,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 6.f, .label = "Depth MIP Offset", .section = "GTVBGI",
-      .min = 2.0f, .max = 6.0f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIDepthMipOffset",
+        .binding = &g_vbgi_depth_mip_offset,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 6.f,
+        .label = "Depth MIP Offset",
+        .section = "GTVBGI",
+        .min = 2.0f,
+        .max = 6.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIMrtNormal", .binding = &g_vbgi_mrt_normal,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "MRT Normal Input", .section = "GTVBGI",
-      .tooltip = "Off = depth normals only. On = use game g-buffer normals.",
-      .labels = {"Off (Depth)", "On (MRT)"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIMrtNormal",
+        .binding = &g_vbgi_mrt_normal,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "MRT Normal Input",
+        .section = "GTVBGI",
+        .tooltip = "Off = depth normals only. On = use game g-buffer normals.",
+        .labels = {"Off (Depth)", "On (MRT)"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIAmbient", .binding = &g_vbgi_ambient,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Ambient Contribution", .section = "GTVBGI",
-      .min = 0.0f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIAmbient",
+        .binding = &g_vbgi_ambient,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.5f,
+        .label = "Ambient Contribution",
+        .section = "GTVBGI",
+        .min = 0.0f,
+        .max = 2.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGILights", .binding = &g_vbgi_lights,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 2.0f, .label = "Light Contribution", .section = "GTVBGI",
-      .min = 0.0f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGILights",
+        .binding = &g_vbgi_lights,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 2.0f,
+        .label = "Light Contribution",
+        .section = "GTVBGI",
+        .min = 0.0f,
+        .max = 2.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGISun", .binding = &g_vbgi_sun,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Sun Contribution", .section = "GTVBGI",
-      .min = 0.0f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGISun",
+        .binding = &g_vbgi_sun,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.0f,
+        .label = "Sun Contribution",
+        .section = "GTVBGI",
+        .min = 0.0f,
+        .max = 2.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIEmissive", .binding = &g_vbgi_emissive,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Emissive Contribution", .section = "GTVBGI",
-      .min = 0.0f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIEmissive",
+        .binding = &g_vbgi_emissive,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.0f,
+        .label = "Emissive Contribution",
+        .section = "GTVBGI",
+        .min = 0.0f,
+        .max = 2.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIMultiBounce", .binding = &shader_injection.vbgi_multibounce,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Multi-Bounce", .section = "GTVBGI",
-      .tooltip = "Enables multi-bounce GI: previous frame's indirect light feeds back into the GI computation.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "SSGIMultiBounce",
+        .binding = &shader_injection.vbgi_multibounce,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Multi-Bounce",
+        .section = "GTVBGI",
+        .tooltip = "Enables multi-bounce GI: previous frame's indirect light feeds back into the GI computation.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIMultiBounceStrength", .binding = &g_vbgi_multibounce_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Multi-Bounce Strength", .section = "GTVBGI",
-      .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIMultiBounceStrength",
+        .binding = &g_vbgi_multibounce_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.5f,
+        .label = "Multi-Bounce Strength",
+        .section = "GTVBGI",
+        .min = 0.0f,
+        .max = 1.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIFarField", .binding = &g_vbgi_far_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Far Field", .section = "GTVBGI",
-      .tooltip = "Adds bounce light from beyond Radius: one screen-space ray per texel through the directions the near field left open. Off = GTVBGI unchanged.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIFarField",
+        .binding = &g_vbgi_far_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Far Field",
+        .section = "GTVBGI",
+        .tooltip = "Adds bounce light from beyond Radius: one screen-space ray per texel through the directions the near field left open. Off = GTVBGI unchanged.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIFarDistance", .binding = &g_vbgi_far_distance,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = IsKai() ? 1.f : 3.f, .label = "Far Distance", .section = "GTVBGI",
-      .tooltip = "World-space end of the far-field ray.",
-      .min = 1.f, .max = 30.f, .format = "%.1f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIFarDistance",
+        .binding = &g_vbgi_far_distance,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = IsKai() ? 1.f : 3.f,
+        .label = "Far Distance",
+        .section = "GTVBGI",
+        .tooltip = "World-space end of the far-field ray.",
+        .min = 1.f,
+        .max = 30.f,
+        .format = "%.1f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIFarIntensity", .binding = &g_vbgi_far_intensity,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 2.f, .label = "Far Intensity", .section = "GTVBGI",
-      .tooltip = "Scales the far-field bounce light before the denoise. 1 = physically matched to the near field.",
-      .min = 0.f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIFarIntensity",
+        .binding = &g_vbgi_far_intensity,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 2.f,
+        .label = "Far Intensity",
+        .section = "GTVBGI",
+        .tooltip = "Scales the far-field bounce light before the denoise. 1 = physically matched to the near field.",
+        .min = 0.f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIFarHitWindow", .binding = &g_vbgi_far_hit_window,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Far Hit Window", .section = "GTVBGI",
-      .tooltip = "Thin = active thickness tolerance. Wide also counts surfaces crossed between march steps (more hits; may add faint halos).",
-      .labels = {"Thin", "Wide"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIFarHitWindow",
+        .binding = &g_vbgi_far_hit_window,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Far Hit Window",
+        .section = "GTVBGI",
+        .tooltip = "Thin = active thickness tolerance. Wide also counts surfaces crossed between march steps (more hits; may add faint halos).",
+        .labels = {"Thin", "Wide"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIFarCandidates", .binding = &g_vbgi_far_candidates,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 4.f, .label = "Far Candidates", .section = "GTVBGI",
-      .tooltip = "Fresh far-field rays per texel each frame (at most the Quality's slice count). More = less boiling, more cost.",
-      .min = 1.f, .max = 4.f, .format = "%.0f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIFarCandidates",
+        .binding = &g_vbgi_far_candidates,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 4.f,
+        .label = "Far Candidates",
+        .section = "GTVBGI",
+        .tooltip = "Fresh far-field rays per texel each frame (at most the Quality's slice count). More = less boiling, more cost.",
+        .min = 1.f,
+        .max = 4.f,
+        .format = "%.0f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIFarTemporal", .binding = &g_vbgi_far_temporal,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Far Temporal Reuse", .section = "GTVBGI",
-      .tooltip = "Reuses last frame's far-field sample per texel (ReSTIR). Runs only with inline dispatch (Deferred Dispatch Off).",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIFarTemporal",
+        .binding = &g_vbgi_far_temporal,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Far Temporal Reuse",
+        .section = "GTVBGI",
+        .tooltip = "Reuses last frame's far-field sample per texel (ReSTIR). Runs only with inline dispatch (Deferred Dispatch Off).",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIFarHistory", .binding = &g_vbgi_far_history_length,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 30.f, .label = "Far History Length", .section = "GTVBGI",
-      .tooltip = "Frames of far-field history a texel can keep. Lower = faster response to light changes, more noise.",
-      .min = 4.f, .max = 30.f, .format = "%.0f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && g_vbgi_far_temporal > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIFarHistory",
+        .binding = &g_vbgi_far_history_length,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 30.f,
+        .label = "Far History Length",
+        .section = "GTVBGI",
+        .tooltip = "Frames of far-field history a texel can keep. Lower = faster response to light changes, more noise.",
+        .min = 4.f,
+        .max = 30.f,
+        .format = "%.0f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && g_vbgi_far_temporal > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIFarSpatial", .binding = &g_vbgi_far_spatial,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Far Spatial Reuse", .section = "GTVBGI",
-      .tooltip = "Shares far-field samples between nearby texels (ReSTIR).",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIFarSpatial",
+        .binding = &g_vbgi_far_spatial,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Far Spatial Reuse",
+        .section = "GTVBGI",
+        .tooltip = "Shares far-field samples between nearby texels (ReSTIR).",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIFarSpatialNeighbors", .binding = &g_vbgi_far_spatial_neighbors,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 4.f, .label = "Far Spatial Neighbours", .section = "GTVBGI",
-      .tooltip = "Nearby texels each texel borrows far samples from. More = less noise, slightly more cost.",
-      .min = 1.f, .max = 8.f, .format = "%.0f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && g_vbgi_far_spatial > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIFarSpatialNeighbors",
+        .binding = &g_vbgi_far_spatial_neighbors,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 4.f,
+        .label = "Far Spatial Neighbours",
+        .section = "GTVBGI",
+        .tooltip = "Nearby texels each texel borrows far samples from. More = less noise, slightly more cost.",
+        .min = 1.f,
+        .max = 8.f,
+        .format = "%.0f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && g_vbgi_far_spatial > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIFarSpatialRadius", .binding = &g_vbgi_far_spatial_radius,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Far Spatial Radius", .section = "GTVBGI",
-      .tooltip = "Scale of the spatial reuse radius. Larger = calmer, but more rejections and possible halos at edges.",
-      .min = 0.5f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && g_vbgi_far_spatial > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIFarSpatialRadius",
+        .binding = &g_vbgi_far_spatial_radius,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Far Spatial Radius",
+        .section = "GTVBGI",
+        .tooltip = "Scale of the spatial reuse radius. Larger = calmer, but more rejections and possible halos at edges.",
+        .min = 0.5f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && g_vbgi_far_spatial > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "VBGIFarMultiBounceStrength", .binding = &g_vbgi_far_multibounce_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.25f, .label = "Far Multi-Bounce Strength", .section = "GTVBGI",
-      .tooltip = "Feeds the far field's share of last frame's GI back as sender light. 0 = only the near field feeds back.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIFarMultiBounceStrength",
+        .binding = &g_vbgi_far_multibounce_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.25f,
+        .label = "Far Multi-Bounce Strength",
+        .section = "GTVBGI",
+        .tooltip = "Feeds the far field's share of last frame's GI back as sender light. 0 = only the near field feeds back.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && g_vbgi_far_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     // �� VBGI debug ��
     new renodx::utils::settings::Setting{
-      .key = "VBGIDebugMode", .binding = &g_vbgi_debug_mode,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "GTVBGI Debug View", .section = "GTVBGI",
-      .tooltip = "Replace scene with GTVBGI debug textures. Temporal Confidence shows far-color history when Temporal Far Field only is active, and joint history otherwise. While not Off this replaces the GTVBAO debug view.",
-      .labels = {"Off", "Final GI", "Raw GI", "Radiance Input", "Bitmask", "Temporal Confidence", "Term Split", "Far Field", "Far Samples", "Far Reservoir"},
-      .is_visible = []() { return VbgiRowVisible(); },
+        .key = "VBGIDebugMode",
+        .binding = &g_vbgi_debug_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "GTVBGI Debug View",
+        .section = "GTVBGI",
+        .tooltip = "Replace scene with GTVBGI debug textures. Temporal Confidence shows far-color history when Temporal Far Field only is active, and joint history otherwise. While not Off this replaces the GTVBAO debug view.",
+        .labels = {"Off", "Final GI", "Raw GI", "Radiance Input", "Bitmask", "Temporal Confidence", "Term Split", "Far Field", "Far Samples", "Far Reservoir"},
+        .is_visible = []() { return VbgiRowVisible(); },
     },
     // -- Kai: GTVBAO VBGI Falcom SSGI consumption --
     new renodx::utils::settings::Setting{
-      .key = "SSGIKaiConsumeFalcom", .binding = &shader_injection.vbgi_kai_consume_falcom,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Consume Falcom SSGI (Kai)", .section = "GTVBGI",
-      .tooltip = "When ON, Falcom's SSGI color modulates the GTVBGI contribution (main path) before it is added. Multiplicative and not energy preserving.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "SSGIKaiConsumeFalcom",
+        .binding = &shader_injection.vbgi_kai_consume_falcom,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Consume Falcom SSGI (Kai)",
+        .section = "GTVBGI",
+        .tooltip = "When ON, Falcom's SSGI color modulates the GTVBGI contribution (main path) before it is added. Multiplicative and not energy preserving.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIKaiFalcomBlend", .binding = &shader_injection.vbgi_kai_falcom_blend,
-      .default_value = 0.5f, .label = "Falcom SSGI Blend (Kai)", .section = "GTVBGI",
-      .tooltip = "How much Falcom SSGI color modulates GTVBGI. 0 = no modulation (additive only), 1 = full multiplicative blend.",
-      .min = 0.f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f && shader_injection.vbgi_kai_consume_falcom > 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "SSGIKaiFalcomBlend",
+        .binding = &shader_injection.vbgi_kai_falcom_blend,
+        .default_value = 0.5f,
+        .label = "Falcom SSGI Blend (Kai)",
+        .section = "GTVBGI",
+        .tooltip = "How much Falcom SSGI color modulates GTVBGI. 0 = no modulation (additive only), 1 = full multiplicative blend.",
+        .min = 0.f,
+        .max = 1.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f && shader_injection.vbgi_kai_consume_falcom > 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIKaiGTVBAOOnly", .binding = &shader_injection.vbgi_kai_gtvbao_only,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "GTVBAO VBGI Only (Kai)", .section = "GTVBGI",
-      .tooltip = "When ON, Falcom's own SSGI is suppressed (its ambient and shadow-colour terms) and only GTVBGI provides indirect light. OFF keeps both.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "SSGIKaiGTVBAOOnly",
+        .binding = &shader_injection.vbgi_kai_gtvbao_only,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "GTVBAO VBGI Only (Kai)",
+        .section = "GTVBGI",
+        .tooltip = "When ON, Falcom's own SSGI is suppressed (its ambient and shadow-colour terms) and only GTVBGI provides indirect light. OFF keeps both.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CPUOptDeferredDispatch", .binding = &g_cpuopt_deferred_dispatch,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Deferred Dispatch", .section = "CPU Opt",
-      .tooltip = "Move GTVBAO/VBGI dispatch to OnPresent (1-frame latency). Kai-only, default OFF � avoids latency. Temporal Accumulation is disabled while this is On. Debug views are one frame behind.",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "CPUOptDeferredDispatch",
+        .binding = &g_cpuopt_deferred_dispatch,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Deferred Dispatch",
+        .section = "CPU Opt",
+        .tooltip = "Move GTVBAO/VBGI dispatch to OnPresent (1-frame latency). Kai-only, default OFF � avoids latency. Temporal Accumulation is disabled while this is On. Debug views are one frame behind.",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CPUOptEnsurePipelines", .binding = &g_cpuopt_ensure_pipelines,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Ensure Pipelines", .section = "CPU Opt",
-      .tooltip = "Don't destroy/recreate pipelines every frame (kai-style).",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "CPUOptEnsurePipelines",
+        .binding = &g_cpuopt_ensure_pipelines,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Ensure Pipelines",
+        .section = "CPU Opt",
+        .tooltip = "Don't destroy/recreate pipelines every frame (kai-style).",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // �� Shadow Maps ��
     new renodx::utils::settings::Setting{
-      .key = "ShadowFilterMethod", .binding = &shader_injection.shadow_filter_method,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Shadow Filter Method", .section = "Shadow Maps",
-      .tooltip = "CSM filtering: Off = single sample. Falcom = vanilla 10-tap PCF. CHSS = contact-hardening soft shadows (Vogel disk + variable-radius PCF).",
-      .labels = {"Off", "Falcom", "CHSS"},
-      .is_visible = []() { return !IsKai(); },
+        .key = "ShadowFilterMethod",
+        .binding = &shader_injection.shadow_filter_method,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "Shadow Filter Method",
+        .section = "Shadow Maps",
+        .tooltip = "CSM filtering: Off = single sample. Falcom = vanilla 10-tap PCF. CHSS = contact-hardening soft shadows (Vogel disk + variable-radius PCF).",
+        .labels = {"Off", "Falcom", "CHSS"},
+        .is_visible = []() { return !IsKai(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowEdgeTint", .binding = &shader_injection.shadow_edge_tint,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Colored Shadow Penumbra", .section = "Shadow Maps",
-      .tooltip = "Off = neutral edges. Falcom = vanilla red tint. Improved = vibrancy boost in penumbra.",
-      .labels = {"Off", "Falcom", "Improved"},
-      .is_visible = []() { return !IsKai(); },
+        .key = "ShadowEdgeTint",
+        .binding = &shader_injection.shadow_edge_tint,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "Colored Shadow Penumbra",
+        .section = "Shadow Maps",
+        .tooltip = "Off = neutral edges. Falcom = vanilla red tint. Improved = vibrancy boost in penumbra.",
+        .labels = {"Off", "Falcom", "Improved"},
+        .is_visible = []() { return !IsKai(); },
     },
     // �� CHSS Settings (enabled when ShadowFilterMethod = CHSS) ��
     new renodx::utils::settings::Setting{
-      .key = "ShadowCHSSJitter", .binding = &shader_injection.shadow_pcss_jitter_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "CHSS Jitter", .section = "Shadow Maps",
-      .tooltip = "Rotate the CHSS sample pattern each frame using the selected noise source (see Noise Mode).",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowCHSSJitter",
+        .binding = &shader_injection.shadow_pcss_jitter_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "CHSS Jitter",
+        .section = "Shadow Maps",
+        .tooltip = "Rotate the CHSS sample pattern each frame using the selected noise source (see Noise Mode).",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowCHSSNoiseMode", .binding = &shader_injection.shadow_chss_noise_mode,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Noise Mode", .section = "Shadow Maps",
-      .tooltip = "Jitter noise source. IGN = interleaved gradient noise (no texture needed). IS-FAST = pre-computed spatio-temporal blue noise (baked into the addon; requires ISFASTMasterEnable; falls back to IGN if unavailable).",
-      .labels = {"IGN", "IS-FAST"},
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f && shader_injection.shadow_pcss_jitter_enabled > 0.5f && g_isfast_enabled > 0.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowCHSSNoiseMode",
+        .binding = &shader_injection.shadow_chss_noise_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Noise Mode",
+        .section = "Shadow Maps",
+        .tooltip = "Jitter noise source. IGN = interleaved gradient noise (no texture needed). IS-FAST = pre-computed spatio-temporal blue noise (baked into the addon; requires ISFASTMasterEnable; falls back to IGN if unavailable).",
+        .labels = {"IGN", "IS-FAST"},
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f && shader_injection.shadow_pcss_jitter_enabled > 0.5f && g_isfast_enabled > 0.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowCHSSBlockerSamples", .binding = &shader_injection.shadow_chss_blocker_count,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 16.f, .label = "Blocker Samples", .section = "Shadow Maps",
-      .tooltip = "Sample count for the average blocker search. Higher = smoother penumbra estimate, lower = faster.",
-      .min = 4.f, .max = 64.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowCHSSBlockerSamples",
+        .binding = &shader_injection.shadow_chss_blocker_count,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 16.f,
+        .label = "Blocker Samples",
+        .section = "Shadow Maps",
+        .tooltip = "Sample count for the average blocker search. Higher = smoother penumbra estimate, lower = faster.",
+        .min = 4.f,
+        .max = 64.f,
+        .format = "%d",
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowCHSSFilterSamples", .binding = &shader_injection.shadow_chss_sample_count,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 64.f, .label = "Filter Samples", .section = "Shadow Maps",
-      .tooltip = "Sample count for the variable-radius PCF filter. Higher = softer, less noisy shadows, lower = faster.",
-      .min = 4.f, .max = 64.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowCHSSFilterSamples",
+        .binding = &shader_injection.shadow_chss_sample_count,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 64.f,
+        .label = "Filter Samples",
+        .section = "Shadow Maps",
+        .tooltip = "Sample count for the variable-radius PCF filter. Higher = softer, less noisy shadows, lower = faster.",
+        .min = 4.f,
+        .max = 64.f,
+        .format = "%d",
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowCHSSJitterAmount", .binding = &shader_injection.shadow_pcss_jitter_amount,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Jitter Amount", .section = "Shadow Maps",
-      .tooltip = "0 = static Vogel disk, 1 = full temporal rotation.",
-      .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f && shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowCHSSJitterAmount",
+        .binding = &shader_injection.shadow_pcss_jitter_amount,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Jitter Amount",
+        .section = "Shadow Maps",
+        .tooltip = "0 = static Vogel disk, 1 = full temporal rotation.",
+        .min = 0.0f,
+        .max = 1.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f && shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowCHSSJitterSpeed", .binding = &shader_injection.shadow_pcss_jitter_speed,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 237.f, .label = "Jitter Speed", .section = "Shadow Maps",
-      .tooltip = "Temporal animation speed. Higher = faster rotation.",
-      .min = 0.0f, .max = 500.0f, .format = "%.0f",
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f && shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowCHSSJitterSpeed",
+        .binding = &shader_injection.shadow_pcss_jitter_speed,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 237.f,
+        .label = "Jitter Speed",
+        .section = "Shadow Maps",
+        .tooltip = "Temporal animation speed. Higher = faster rotation.",
+        .min = 0.0f,
+        .max = 500.0f,
+        .format = "%.0f",
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f && shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowBaseSoftness", .binding = &shader_injection.shadow_base_softness,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.0f, .label = "Base Softness", .section = "Shadow Maps",
-      .tooltip = "Constant minimum penumbra width. Contact-hard at 0, always soft at 0.5.",
-      .min = 0.0f, .max = 1.0f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowBaseSoftness",
+        .binding = &shader_injection.shadow_base_softness,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.0f,
+        .label = "Base Softness",
+        .section = "Shadow Maps",
+        .tooltip = "Constant minimum penumbra width. Contact-hard at 0, always soft at 0.5.",
+        .min = 0.0f,
+        .max = 1.0f,
+        .format = "%.3f",
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowCHSSSearchRadius", .binding = &shader_injection.shadow_chss_search_radius,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "World Softness", .section = "Shadow Maps",
-      .tooltip = "Desired softness in world units. Same value = same penumbra width across all cascades. 0.1=sharp, 5=very soft.",
-      .min = 0.1f, .max = 5.0f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowCHSSSearchRadius",
+        .binding = &shader_injection.shadow_chss_search_radius,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "World Softness",
+        .section = "Shadow Maps",
+        .tooltip = "Desired softness in world units. Same value = same penumbra width across all cascades. 0.1=sharp, 5=very soft.",
+        .min = 0.1f,
+        .max = 5.0f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowCHSSPenumbraScale", .binding = &shader_injection.shadow_chss_penumbra_scale,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 5000.f, .label = "Penumbra Scale", .section = "Shadow Maps",
-      .tooltip = "How fast penumbra widens with occluder distance (the paper's 80.0 constant). Higher = softer distant shadows.",
-      .min = 1.0f, .max = 10000.0f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowCHSSPenumbraScale",
+        .binding = &shader_injection.shadow_chss_penumbra_scale,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 5000.f,
+        .label = "Penumbra Scale",
+        .section = "Shadow Maps",
+        .tooltip = "How fast penumbra widens with occluder distance (the paper's 80.0 constant). Higher = softer distant shadows.",
+        .min = 1.0f,
+        .max = 10000.0f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowCHSSDepthCap", .binding = &shader_injection.shadow_chss_depth_cap,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Depth Sensitivity", .section = "Shadow Maps",
-      .tooltip = "Max depth difference for penumbra. Higher = more distance-based softening.",
-      .min = 0.01f, .max = 1.0f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowCHSSDepthCap",
+        .binding = &shader_injection.shadow_chss_depth_cap,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.0f,
+        .label = "Depth Sensitivity",
+        .section = "Shadow Maps",
+        .tooltip = "Max depth difference for penumbra. Higher = more distance-based softening.",
+        .min = 0.01f,
+        .max = 1.0f,
+        .format = "%.3f",
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowCHSSMinRadius", .binding = &shader_injection.shadow_chss_min_radius,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Min Filter Radius", .section = "Shadow Maps",
-      .tooltip = "Guaranteed minimum PCF filter radius in shadow map texels. Prevents filter from collapsing. 0=off.",
-      .min = 0.f, .max = 100.0f, .format = "%.0f",
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowCHSSMinRadius",
+        .binding = &shader_injection.shadow_chss_min_radius,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "Min Filter Radius",
+        .section = "Shadow Maps",
+        .tooltip = "Guaranteed minimum PCF filter radius in shadow map texels. Prevents filter from collapsing. 0=off.",
+        .min = 0.f,
+        .max = 100.0f,
+        .format = "%.0f",
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowCHSSPostBlur", .binding = &shader_injection.shadow_chss_post_blur,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 100.f, .label = "Post Blur", .section = "Shadow Maps",
-      .tooltip = "Strength of the screen-space bilateral blur applied to the CHSS shadow mask. 0 = off (passthrough), 100 = full strength.",
-      .min = 0.0f, .max = 100.0f, .format = "%.0f",
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowCHSSPostBlur",
+        .binding = &shader_injection.shadow_chss_post_blur,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 100.f,
+        .label = "Post Blur",
+        .section = "Shadow Maps",
+        .tooltip = "Strength of the screen-space bilateral blur applied to the CHSS shadow mask. 0 = off (passthrough), 100 = full strength.",
+        .min = 0.0f,
+        .max = 100.0f,
+        .format = "%.0f",
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowCHSSOnsetBias", .binding = &shader_injection.shadow_chss_onset_bias,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Softening Onset", .section = "Shadow Maps",
-      .tooltip = "Adds depth separation before the penumbra response. Higher values start soft shadows closer to contact; 0 preserves vanilla contact hardening.",
-      .min = 0.0f, .max = 0.2f, .format = "%.4f",
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowCHSSOnsetBias",
+        .binding = &shader_injection.shadow_chss_onset_bias,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "Softening Onset",
+        .section = "Shadow Maps",
+        .tooltip = "Adds depth separation before the penumbra response. Higher values start soft shadows closer to contact; 0 preserves vanilla contact hardening.",
+        .min = 0.0f,
+        .max = 0.2f,
+        .format = "%.4f",
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowCHSSPenumbraCurve", .binding = &shader_injection.shadow_chss_penumbra_curve,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.5f, .label = "Penumbra Curve", .section = "Shadow Maps",
-      .tooltip = "Exponent applied to normalized penumbra separation. Values below 2 respond more aggressively near contact; values above 2 stay harder longer.",
-      .min = 0.5f, .max = 4.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowCHSSPenumbraCurve",
+        .binding = &shader_injection.shadow_chss_penumbra_curve,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.5f,
+        .label = "Penumbra Curve",
+        .section = "Shadow Maps",
+        .tooltip = "Exponent applied to normalized penumbra separation. Values below 2 respond more aggressively near contact; values above 2 stay harder longer.",
+        .min = 0.5f,
+        .max = 4.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     // �� Colored Shadow Penumbra (Improved mode) ��
     new renodx::utils::settings::Setting{
-      .key = "ShadowPenumbraColorStrength", .binding = &shader_injection.shadow_penumbra_color_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.65f, .label = "Penumbra Color Strength", .section = "Shadow Maps",
-      .tooltip = "How strongly the vibrancy effect is applied in penumbra regions. 0=off, 1=full.",
-      .min = 0.f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowPenumbraColorStrength",
+        .binding = &shader_injection.shadow_penumbra_color_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.65f,
+        .label = "Penumbra Color Strength",
+        .section = "Shadow Maps",
+        .tooltip = "How strongly the vibrancy effect is applied in penumbra regions. 0=off, 1=full.",
+        .min = 0.f,
+        .max = 2.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowPenumbraVibrance", .binding = &shader_injection.shadow_penumbra_vibrance,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 30.f, .label = "Penumbra Vibrance", .section = "Shadow Maps",
-      .tooltip = "Vibrance adjustment in penumbra. 0=grayscale, 1=neutral, >1=more vivid. Protects already-saturated colors.",
-      .min = 0.f, .max = 100.0f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowPenumbraVibrance",
+        .binding = &shader_injection.shadow_penumbra_vibrance,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 30.f,
+        .label = "Penumbra Vibrance",
+        .section = "Shadow Maps",
+        .tooltip = "Vibrance adjustment in penumbra. 0=grayscale, 1=neutral, >1=more vivid. Protects already-saturated colors.",
+        .min = 0.f,
+        .max = 100.0f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowPenumbraDetection", .binding = &shader_injection.shadow_penumbra_detection,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Penumbra Detection", .section = "Shadow Maps",
-      .tooltip = "What counts as penumbra. Higher = wider detection area, more of the image gets the effect.",
-      .min = 0.01f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowPenumbraDetection",
+        .binding = &shader_injection.shadow_penumbra_detection,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.0f,
+        .label = "Penumbra Detection",
+        .section = "Shadow Maps",
+        .tooltip = "What counts as penumbra. Higher = wider detection area, more of the image gets the effect.",
+        .min = 0.01f,
+        .max = 1.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowPenumbraColorBrightness", .binding = &shader_injection.shadow_penumbra_color_brightness,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Penumbra Color Brightness", .section = "Shadow Maps",
-      .tooltip = "Brightness multiplier for the vibrancy tint color. 1=neutral, 0=black, >1=brighter.",
-      .min = 0.f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowPenumbraColorBrightness",
+        .binding = &shader_injection.shadow_penumbra_color_brightness,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Penumbra Color Brightness",
+        .section = "Shadow Maps",
+        .tooltip = "Brightness multiplier for the vibrancy tint color. 1=neutral, 0=black, >1=brighter.",
+        .min = 0.f,
+        .max = 5.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowPenumbraFalcomBlend", .binding = &shader_injection.shadow_penumbra_falcom_blend,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Falcom Penumbra Blend", .section = "Shadow Maps",
-      .tooltip = "Blend the vibrancy effect toward Falcom's red shadowEdgeColor tint. 0=pure vibrancy, 1=pure Falcom.",
-      .min = 0.f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowPenumbraFalcomBlend",
+        .binding = &shader_injection.shadow_penumbra_falcom_blend,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.5f,
+        .label = "Falcom Penumbra Blend",
+        .section = "Shadow Maps",
+        .tooltip = "Blend the vibrancy effect toward Falcom's red shadowEdgeColor tint. 0=pure vibrancy, 1=pure Falcom.",
+        .min = 0.f,
+        .max = 1.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowPenumbraEdgeVibrance", .binding = &shader_injection.shadow_penumbra_edge_vibrance,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.3f, .label = "Edge Color Vibrance", .section = "Shadow Maps",
-      .tooltip = "Vibrance applied to shadowEdgeColor when Falcom blend > 0. 0=grayscale, 1=neutral, >1=vivid.",
-      .min = 0.f, .max = 100.0f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowPenumbraEdgeVibrance",
+        .binding = &shader_injection.shadow_penumbra_edge_vibrance,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.3f,
+        .label = "Edge Color Vibrance",
+        .section = "Shadow Maps",
+        .tooltip = "Vibrance applied to shadowEdgeColor when Falcom blend > 0. 0=grayscale, 1=neutral, >1=vivid.",
+        .min = 0.f,
+        .max = 100.0f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowPenumbraLightColorBlend", .binding = &shader_injection.shadow_penumbra_lightcolor_blend,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Light Color Blend", .section = "Shadow Maps",
-      .tooltip = "Blend the penumbra tint toward the sun's lightColor. 0=no effect, 1=fully sun-colored penumbra.",
-      .min = 0.f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowPenumbraLightColorBlend",
+        .binding = &shader_injection.shadow_penumbra_lightcolor_blend,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "Light Color Blend",
+        .section = "Shadow Maps",
+        .tooltip = "Blend the penumbra tint toward the sun's lightColor. 0=no effect, 1=fully sun-colored penumbra.",
+        .min = 0.f,
+        .max = 1.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowPenumbraLightColorSaturation", .binding = &shader_injection.shadow_penumbra_lightcolor_saturation,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Light Color Saturation", .section = "Shadow Maps",
-      .tooltip = "Vibrance applied to lightColor before blending. 0=grayscale, 1=neutral, >1=vivid sun color.",
-      .min = 0.f, .max = 100.0f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowPenumbraLightColorSaturation",
+        .binding = &shader_injection.shadow_penumbra_lightcolor_saturation,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "Light Color Saturation",
+        .section = "Shadow Maps",
+        .tooltip = "Vibrance applied to lightColor before blending. 0=grayscale, 1=neutral, >1=vivid sun color.",
+        .min = 0.f,
+        .max = 100.0f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ShadowPenumbraDebugView", .binding = &shader_injection.shadow_penumbra_debug_view,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Penumbra Debug View", .section = "Shadow Maps",
-      .tooltip = "Visualize penumbra processing. PenumbraMask=detection area, TintColor=adjusted color, Result=final blend.",
-      .labels = {"Off", "Penumbra Mask", "Tint Color", "Result", "Sun Color"},
-      .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+        .key = "ShadowPenumbraDebugView",
+        .binding = &shader_injection.shadow_penumbra_debug_view,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Penumbra Debug View",
+        .section = "Shadow Maps",
+        .tooltip = "Visualize penumbra processing. PenumbraMask=detection area, TintColor=adjusted color, Result=final blend.",
+        .labels = {"Off", "Penumbra Mask", "Tint Color", "Result", "Sun Color"},
+        .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+        .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     // �� Shadows (Kai) ��
     new renodx::utils::settings::Setting{
-      .key = "KaiShadowBaseSoftness", .binding = &shader_injection.shadow_base_softness,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.05f, .label = "Base Softness", .section = "Shadows",
-      .tooltip = "Constant minimum penumbra width for PCSS shadows. 0 = contact-hard, higher = always soft.",
-      .min = 0.0f, .max = 1.0f, .format = "%.3f",
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiShadowBaseSoftness",
+        .binding = &shader_injection.shadow_base_softness,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.05f,
+        .label = "Base Softness",
+        .section = "Shadows",
+        .tooltip = "Constant minimum penumbra width for PCSS shadows. 0 = contact-hard, higher = always soft.",
+        .min = 0.0f,
+        .max = 1.0f,
+        .format = "%.3f",
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "KaiShadowJitter", .binding = &shader_injection.shadow_pcss_jitter_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "PCSS Jitter", .section = "Shadows",
-      .tooltip = "Use IS-FAST blue noise to rotate PCSS sample pattern each frame.",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiShadowJitter",
+        .binding = &shader_injection.shadow_pcss_jitter_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "PCSS Jitter",
+        .section = "Shadows",
+        .tooltip = "Use IS-FAST blue noise to rotate PCSS sample pattern each frame.",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "KaiShadowJitterAmount", .binding = &shader_injection.shadow_pcss_jitter_amount,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Jitter Amount", .section = "Shadows",
-      .tooltip = "0 = static Poisson, 1 = full temporal rotation.",
-      .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiShadowJitterAmount",
+        .binding = &shader_injection.shadow_pcss_jitter_amount,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Jitter Amount",
+        .section = "Shadows",
+        .tooltip = "0 = static Poisson, 1 = full temporal rotation.",
+        .min = 0.0f,
+        .max = 1.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "KaiShadowJitterSpeed", .binding = &shader_injection.shadow_pcss_jitter_speed,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 237.f, .label = "Jitter Speed", .section = "Shadows",
-      .tooltip = "Temporal animation speed. Higher = faster rotation.",
-      .min = 0.0f, .max = 500.0f, .format = "%.0f",
-      .is_enabled = []() { return shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiShadowJitterSpeed",
+        .binding = &shader_injection.shadow_pcss_jitter_speed,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 237.f,
+        .label = "Jitter Speed",
+        .section = "Shadows",
+        .tooltip = "Temporal animation speed. Higher = faster rotation.",
+        .min = 0.0f,
+        .max = 500.0f,
+        .format = "%.0f",
+        .is_enabled = []() { return shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     // -- Colored Shadow Penumbra (Kai) --
     new renodx::utils::settings::Setting{
-      .key = "KaiPenumbraMode", .binding = &shader_injection.shadow_edge_tint_kai,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Colored Penumbra", .section = "Shadows",
-      .tooltip = "Improved mode applies vibrance boost in shadow penumbra regions. No Falcom fallback on Kai.",
-      .labels = {"Off", "Improved"},
-      .is_visible = []() { return IsKai(); },
+        .key = "KaiPenumbraMode",
+        .binding = &shader_injection.shadow_edge_tint_kai,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Colored Penumbra",
+        .section = "Shadows",
+        .tooltip = "Improved mode applies vibrance boost in shadow penumbra regions. No Falcom fallback on Kai.",
+        .labels = {"Off", "Improved"},
+        .is_visible = []() { return IsKai(); },
     },
     // �� Character hero light (Kai) ��
     new renodx::utils::settings::Setting{
-      .key = "KaiCharacterLight", .binding = &shader_injection.character_light_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Hero Light Suppression", .section = "Shadows",
-      .tooltip = "Suppresses dynamic point/spot lights on character pixels. 0=off (vanilla), 1=fully remove.",
-      .min = 0.f, .max = 1.0f, .format = "%.2f",
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiCharacterLight",
+        .binding = &shader_injection.character_light_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Hero Light Suppression",
+        .section = "Shadows",
+        .tooltip = "Suppresses dynamic point/spot lights on character pixels. 0=off (vanilla), 1=fully remove.",
+        .min = 0.f,
+        .max = 1.0f,
+        .format = "%.2f",
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "KaiPenumbraStrength", .binding = &shader_injection.shadow_penumbra_color_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.15f, .label = "Penumbra Strength", .section = "Shadows",
-      .tooltip = "Overall strength of the colored penumbra effect.",
-      .min = 0.0f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint_kai >= 1.0f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiPenumbraStrength",
+        .binding = &shader_injection.shadow_penumbra_color_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.15f,
+        .label = "Penumbra Strength",
+        .section = "Shadows",
+        .tooltip = "Overall strength of the colored penumbra effect.",
+        .min = 0.0f,
+        .max = 2.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.shadow_edge_tint_kai >= 1.0f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "KaiPenumbraVibrance", .binding = &shader_injection.shadow_penumbra_vibrance,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 30.f, .label = "Penumbra Vibrance", .section = "Shadows",
-      .tooltip = "Vibrance applied to surface color in penumbra. 0=grayscale, 1=neutral, >1=vivid.",
-      .min = 0.0f, .max = 100.0f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint_kai >= 1.0f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiPenumbraVibrance",
+        .binding = &shader_injection.shadow_penumbra_vibrance,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 30.f,
+        .label = "Penumbra Vibrance",
+        .section = "Shadows",
+        .tooltip = "Vibrance applied to surface color in penumbra. 0=grayscale, 1=neutral, >1=vivid.",
+        .min = 0.0f,
+        .max = 100.0f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.shadow_edge_tint_kai >= 1.0f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "KaiPenumbraDetection", .binding = &shader_injection.shadow_penumbra_detection,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 2.0f, .label = "Penumbra Detection", .section = "Shadows",
-      .tooltip = "Penumbra detection width. Higher = wider area gets the effect.",
-      .min = 0.01f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint_kai >= 1.0f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiPenumbraDetection",
+        .binding = &shader_injection.shadow_penumbra_detection,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 2.0f,
+        .label = "Penumbra Detection",
+        .section = "Shadows",
+        .tooltip = "Penumbra detection width. Higher = wider area gets the effect.",
+        .min = 0.01f,
+        .max = 2.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.shadow_edge_tint_kai >= 1.0f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "KaiPenumbraBrightness", .binding = &shader_injection.shadow_penumbra_color_brightness,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Penumbra Brightness", .section = "Shadows",
-      .tooltip = "Brightness multiplier for the penumbra tint color.",
-      .min = 0.0f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint_kai >= 1.0f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiPenumbraBrightness",
+        .binding = &shader_injection.shadow_penumbra_color_brightness,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Penumbra Brightness",
+        .section = "Shadows",
+        .tooltip = "Brightness multiplier for the penumbra tint color.",
+        .min = 0.0f,
+        .max = 5.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.shadow_edge_tint_kai >= 1.0f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "KaiPenumbraDebug", .binding = &shader_injection.shadow_penumbra_debug_view,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Penumbra Debug", .section = "Shadows",
-      .tooltip = "Visualize penumbra: 0=Off, 1=Detection Mask, 2=Tint Color, 3=Result, 4=Sun Color.",
-      .labels = {"Off", "Penumbra Mask", "Tint Color", "Result", "Sun Color"},
-      .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+        .key = "KaiPenumbraDebug",
+        .binding = &shader_injection.shadow_penumbra_debug_view,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Penumbra Debug",
+        .section = "Shadows",
+        .tooltip = "Visualize penumbra: 0=Off, 1=Detection Mask, 2=Tint Color, 3=Result, 4=Sun Color.",
+        .labels = {"Off", "Penumbra Mask", "Tint Color", "Result", "Sun Color"},
+        .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
+        .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     // -- Contact Shadows ------------------------------------------------
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsEnabled", .binding = &shader_injection.cs_contact_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f,
-      .label = "Sun Contact Shadows",
-      .section = "Contact Shadows",
-      .tooltip = "Sun Contact Shadows add subtle shadows where objects and characters meet the ground, making them feel more naturally connected to their surroundings.",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
+        .key = "ContactShadowsEnabled",
+        .binding = &shader_injection.cs_contact_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Sun Contact Shadows",
+        .section = "Contact Shadows",
+        .tooltip = "Sun Contact Shadows add subtle shadows where objects and characters meet the ground, making them feel more naturally connected to their surroundings.",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsEnvStrength", .binding = &shader_injection.cs_contact_env_strength,
-      .default_value = 1.f, .label = "Environment Strength", .section = "Contact Shadows",
-      .tooltip = "Strength of the contact term on non-character pixels.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsEnvStrength",
+        .binding = &shader_injection.cs_contact_env_strength,
+        .default_value = 1.f,
+        .label = "Environment Strength",
+        .section = "Contact Shadows",
+        .tooltip = "Strength of the contact term on non-character pixels.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsCharStrength", .binding = &shader_injection.cs_contact_char_strength,
-      .default_value = 1.f, .label = "Character Strength", .section = "Contact Shadows",
-      .tooltip = "Strength of the contact term on character pixels, selected by the "
-                 "foliage/character mask.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsCharStrength",
+        .binding = &shader_injection.cs_contact_char_strength,
+        .default_value = 1.f,
+        .label = "Character Strength",
+        .section = "Contact Shadows",
+        .tooltip = "Strength of the contact term on character pixels, selected by the "
+                   "foliage/character mask.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      // Deliberately a different key from the old raw "ContactShadowsSamples"
-      // slider. That setting stored the step count itself; this one stores a 0-3
-      // quality INDEX, so a saved preset holding 32 would be clamped into the
-      // index range and silently resolve to Ultra. Renaming orphans the stale
-      // value instead, so the tiers start clean at their default. Same reasoning
-      // as DOFQuality.
-      .key = "ContactShadowsQuality", .binding = &shader_injection.cs_contact_sample_count,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Quality", .section = "Contact Shadows",
-      .tooltip = "March quality: Low 4, Medium 8, High 12, Ultra 16 steps. Higher "
-                 "tiers resolve a cleaner contact term at linearly higher cost.",
-      .labels = {"Low", "Medium", "High", "Ultra"},
-      // .min must be 0: with .labels, GetMax() is labels.size() - 1, and a .min of
-      // 1 would clamp a saved "Low" (0) up to Medium and make Low unreachable
-      // across restarts.
-      .min = 0.f,
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .parse = [](float value) { return ContactShadowQualitySamples(value); },
-      .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
+        // Deliberately a different key from the old raw "ContactShadowsSamples"
+        // slider. That setting stored the step count itself; this one stores a 0-3
+        // quality INDEX, so a saved preset holding 32 would be clamped into the
+        // index range and silently resolve to Ultra. Renaming orphans the stale
+        // value instead, so the tiers start clean at their default. Same reasoning
+        // as DOFQuality.
+        .key = "ContactShadowsQuality",
+        .binding = &shader_injection.cs_contact_sample_count,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Quality",
+        .section = "Contact Shadows",
+        .tooltip = "March quality: Low 4, Medium 8, High 12, Ultra 16 steps. Higher "
+                   "tiers resolve a cleaner contact term at linearly higher cost.",
+        .labels = {"Low", "Medium", "High", "Ultra"},
+        // .min must be 0: with .labels, GetMax() is labels.size() - 1, and a .min of
+        // 1 would clamp a saved "Low" (0) up to Medium and make Low unreachable
+        // across restarts.
+        .min = 0.f,
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+        .parse = [](float value) { return ContactShadowQualitySamples(value); },
+        .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsRayLength", .binding = &shader_injection.cs_contact_ray_length,
-      .default_value = 2.f, .label = "Ray Length", .section = "Contact Shadows",
-      .tooltip = "World-space distance the ray travels toward the light. Short values keep "
-                 "the term to contact; long values reach genuine occluders.",
-      .min = 1.f, .max = 200.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsRayLength",
+        .binding = &shader_injection.cs_contact_ray_length,
+        .default_value = 2.f,
+        .label = "Ray Length",
+        .section = "Contact Shadows",
+        .tooltip = "World-space distance the ray travels toward the light. Short values keep "
+                   "the term to contact; long values reach genuine occluders.",
+        .min = 1.f,
+        .max = 200.f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsThickness", .binding = &shader_injection.cs_contact_thickness,
-      .default_value = 0.29f, .label = "Surface Thickness", .section = "Contact Shadows",
-      .tooltip = "How deep a hit must penetrate before it counts. Raise it to stop thin "
-                 "geometry and depth noise from self-shadowing.",
-      .min = 0.001f, .max = 4.f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsThickness",
+        .binding = &shader_injection.cs_contact_thickness,
+        .default_value = 0.29f,
+        .label = "Surface Thickness",
+        .section = "Contact Shadows",
+        .tooltip = "How deep a hit must penetrate before it counts. Raise it to stop thin "
+                   "geometry and depth noise from self-shadowing.",
+        .min = 0.001f,
+        .max = 4.f,
+        .format = "%.3f",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsBias", .binding = &shader_injection.cs_contact_bias,
-      .default_value = 0.0001f, .label = "Depth Bias", .section = "Contact Shadows",
-      .tooltip = "Minimum penetration before a hit counts, in device depth. Raise only if "
-                 "you see acne.",
-      .min = 0.f, .max = 0.2f, .format = "%.4f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsBias",
+        .binding = &shader_injection.cs_contact_bias,
+        .default_value = 0.0001f,
+        .label = "Depth Bias",
+        .section = "Contact Shadows",
+        .tooltip = "Minimum penetration before a hit counts, in device depth. Raise only if "
+                   "you see acne.",
+        .min = 0.f,
+        .max = 0.2f,
+        .format = "%.4f",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsNormalBias", .binding = &shader_injection.cs_contact_normal_bias,
-      .default_value = 0.1000f, .label = "Normal Bias", .section = "Contact Shadows",
-      .tooltip = "Lifts the ray origin along the surface normal. More stable than depth "
-                 "bias on curved surfaces.",
-      .min = 0.f, .max = 1.f, .format = "%.4f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsNormalBias",
+        .binding = &shader_injection.cs_contact_normal_bias,
+        .default_value = 0.1000f,
+        .label = "Normal Bias",
+        .section = "Contact Shadows",
+        .tooltip = "Lifts the ray origin along the surface normal. More stable than depth "
+                   "bias on curved surfaces.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.4f",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowResponseScale",
-      .binding = &shader_injection.cs_contact_response_scale,
-      .default_value = 4.f, .label = "Contact Shadow Response Scale",
-      .section = "Contact Shadows",
-      .tooltip = "How strong the contact shadow reads, relative to the ORIGINAL "
-                 "4-sample contact shadow appearance. This is NOT a physically based "
-                 "parameter and 4 is not a physical unit: 4 is simply the sample count "
-                 "whose average appearance is being reproduced, so that the Quality "
-                 "setting can be a pure quality control. At Quality Low (4 steps) and "
-                 "scale 4 the march reproduces the old any-hit test exactly, value for "
-                 "value. Raise this for a darker contact, lower it for a lighter one; "
-                 "Quality then only changes how noisy the result is, not how wide or "
-                 "how dark it is. Defaults to 4.",
-      .min = 0.f, .max = 8.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowResponseScale",
+        .binding = &shader_injection.cs_contact_response_scale,
+        .default_value = 4.f,
+        .label = "Contact Shadow Response Scale",
+        .section = "Contact Shadows",
+        .tooltip = "How strong the contact shadow reads, relative to the ORIGINAL "
+                   "4-sample contact shadow appearance. This is NOT a physically based "
+                   "parameter and 4 is not a physical unit: 4 is simply the sample count "
+                   "whose average appearance is being reproduced, so that the Quality "
+                   "setting can be a pure quality control. At Quality Low (4 steps) and "
+                   "scale 4 the march reproduces the old any-hit test exactly, value for "
+                   "value. Raise this for a darker contact, lower it for a lighter one; "
+                   "Quality then only changes how noisy the result is, not how wide or "
+                   "how dark it is. Defaults to 4.",
+        .min = 0.f,
+        .max = 8.f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsSunRange", .binding = &shader_injection.cs_contact_sun_range,
-      .default_value = 0.f, .label = "Sun Range", .section = "Contact Shadows",
-      .tooltip = "World distance past which sun contact shadows stop being applied, "
-                 "because the CSM no longer has real coverage there. 0 = use the "
-                 "engine's own last cascade split. This is the gate that keeps contact "
-                 "shadows off interior walls: indoors the engine keeps a sun term "
-                 "because the cascade clamps past its split instead of falling off, so "
-                 "without this the effect darkens rooms. Raise it only if contact "
-                 "shadows vanish too early outdoors; lower it if they still reach into "
-                 "interiors. Contact shadows are a near-field effect, so a smaller "
-                 "value is usually the honest one.",
-      .min = 0.f, .max = 500.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsSunRange",
+        .binding = &shader_injection.cs_contact_sun_range,
+        .default_value = 0.f,
+        .label = "Sun Range",
+        .section = "Contact Shadows",
+        .tooltip = "World distance past which sun contact shadows stop being applied, "
+                   "because the CSM no longer has real coverage there. 0 = use the "
+                   "engine's own last cascade split. This is the gate that keeps contact "
+                   "shadows off interior walls: indoors the engine keeps a sun term "
+                   "because the cascade clamps past its split instead of falling off, so "
+                   "without this the effect darkens rooms. Raise it only if contact "
+                   "shadows vanish too early outdoors; lower it if they still reach into "
+                   "interiors. Contact shadows are a near-field effect, so a smaller "
+                   "value is usually the honest one.",
+        .min = 0.f,
+        .max = 500.f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsSkyDepth", .binding = &shader_injection.cs_contact_sky_depth,
-      .default_value = 100000.f, .label = "Sky Depth", .section = "Contact Shadows",
-      .tooltip = "A device depth linearizing beyond this counts as no geometry, so the "
-                 "march is skipped early. Higher is safer, lower is cheaper on open sky.",
-      .min = 100.f, .max = 1000000.f, .format = "%.0f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsSkyDepth",
+        .binding = &shader_injection.cs_contact_sky_depth,
+        .default_value = 100000.f,
+        .label = "Sky Depth",
+        .section = "Contact Shadows",
+        .tooltip = "A device depth linearizing beyond this counts as no geometry, so the "
+                   "march is skipped early. Higher is safer, lower is cheaper on open sky.",
+        .min = 100.f,
+        .max = 1000000.f,
+        .format = "%.0f",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsMaxDarkening", .binding = &shader_injection.cs_contact_max_darkening,
-      .default_value = 0.5f, .label = "Max Darkening", .section = "Contact Shadows",
-      .tooltip = "Caps how dark a contact-shadowed pixel may get. 1 allows full "
-                 "black, 0 disables the darkening entirely. Lower it to keep "
-                 "contact shadows from crushing in dark scenes.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsMaxDarkening",
+        .binding = &shader_injection.cs_contact_max_darkening,
+        .default_value = 0.5f,
+        .label = "Max Darkening",
+        .section = "Contact Shadows",
+        .tooltip = "Caps how dark a contact-shadowed pixel may get. 1 allows full "
+                   "black, 0 disables the darkening entirely. Lower it to keep "
+                   "contact shadows from crushing in dark scenes.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsISFAST", .binding = &shader_injection.cs_contact_isfast_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "IS-FAST Jitter", .section = "Contact Shadows",
-      .tooltip = "Jitters the march with the IS-FAST blue-noise volume and lets TAA resolve "
-                 "it. There is no IGN fallback: without the volume the march runs unjittered "
-                 "and bands visibly, which the log reports once.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsISFAST",
+        .binding = &shader_injection.cs_contact_isfast_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "IS-FAST Jitter",
+        .section = "Contact Shadows",
+        .tooltip = "Jitters the march with the IS-FAST blue-noise volume and lets TAA resolve "
+                   "it. There is no IGN fallback: without the volume the march runs unjittered "
+                   "and bands visibly, which the log reports once.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f || shader_injection.cs_contact_local_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsDebug", .binding = &shader_injection.cs_contact_debug,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Debug View", .section = "Contact Shadows",
-      .tooltip = "Stage Ladder colours each pixel by where the contact pass stopped: white = "
-                 "lit, grey = the pass never wrote this pixel, red = the march ran and is occluded, magenta = no normal, "
-                 "yellow = bad projection, cyan = beyond the sky cutoff, orange = bad depth, blue = "
-                 "no light direction. Linear Depth shows the scene depth, 0 to 1 over 1000 world units.",
-      .labels = {"Off", "Stage Ladder", "Linear Depth"},
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsDebug",
+        .binding = &shader_injection.cs_contact_debug,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Debug View",
+        .section = "Contact Shadows",
+        .tooltip = "Stage Ladder colours each pixel by where the contact pass stopped: white = "
+                   "lit, grey = the pass never wrote this pixel, red = the march ran and is occluded, magenta = no normal, "
+                   "yellow = bad projection, cyan = beyond the sky cutoff, orange = bad depth, blue = "
+                   "no light direction. Linear Depth shows the scene depth, 0 to 1 over 1000 world units.",
+        .labels = {"Off", "Stage Ladder", "Linear Depth"},
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsSunDenoise", .binding = &shader_injection.cs_contact_denoise_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Sun Denoise", .section = "Contact Shadows",
-      .tooltip = "Smooths the IS-FAST grain of the sun contact term with an edge-aware blur that stops at depth and normal edges. Off leaves the term exactly as marched.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
+        .key = "ContactShadowsSunDenoise",
+        .binding = &shader_injection.cs_contact_denoise_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Sun Denoise",
+        .section = "Contact Shadows",
+        .tooltip = "Smooths the IS-FAST grain of the sun contact term with an edge-aware blur that stops at depth and normal edges. Off leaves the term exactly as marched.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsSunDenoiseRadius", .binding = &shader_injection.cs_contact_denoise_radius,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 4.f, .label = "Sun Denoise Radius", .section = "Contact Shadows",
-      .tooltip = "Blur radius in pixels along each axis. Larger is smoother and costs more.",
-      .min = 1.f, .max = 8.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_contact_denoise_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsSunDenoiseRadius",
+        .binding = &shader_injection.cs_contact_denoise_radius,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 4.f,
+        .label = "Sun Denoise Radius",
+        .section = "Contact Shadows",
+        .tooltip = "Blur radius in pixels along each axis. Larger is smoother and costs more.",
+        .min = 1.f,
+        .max = 8.f,
+        .format = "%d",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_contact_denoise_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsSunDenoiseDepthSigma", .binding = &shader_injection.cs_contact_denoise_depth_sigma,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.02f, .label = "Sun Denoise Depth Sigma", .section = "Contact Shadows",
-      .tooltip = "How far a neighbour may sit off this pixel's surface plane, relative to its distance, before it stops contributing. Lower keeps depth edges sharper.",
-      .min = 0.001f, .max = 0.2f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_contact_denoise_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsSunDenoiseDepthSigma",
+        .binding = &shader_injection.cs_contact_denoise_depth_sigma,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.02f,
+        .label = "Sun Denoise Depth Sigma",
+        .section = "Contact Shadows",
+        .tooltip = "How far a neighbour may sit off this pixel's surface plane, relative to its distance, before it stops contributing. Lower keeps depth edges sharper.",
+        .min = 0.001f,
+        .max = 0.2f,
+        .format = "%.3f",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_contact_denoise_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsSunDenoiseNormalSigma", .binding = &shader_injection.cs_contact_denoise_normal_sigma,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.1f, .label = "Sun Denoise Normal Sigma", .section = "Contact Shadows",
-      .tooltip = "How different a neighbour's surface normal may be before it stops contributing. Lower keeps creases and corners sharper.",
-      .min = 0.01f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_contact_denoise_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsSunDenoiseNormalSigma",
+        .binding = &shader_injection.cs_contact_denoise_normal_sigma,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.1f,
+        .label = "Sun Denoise Normal Sigma",
+        .section = "Contact Shadows",
+        .tooltip = "How different a neighbour's surface normal may be before it stops contributing. Lower keeps creases and corners sharper.",
+        .min = 0.01f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_contact_denoise_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsSunDenoisePasses", .binding = &shader_injection.cs_contact_denoise_passes,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Sun Denoise Passes", .section = "Contact Shadows",
-      .tooltip = "Horizontal + vertical iterations. Each extra pass widens the blur and adds the same cost again.",
-      .min = 1.f, .max = 4.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_contact_denoise_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsSunDenoisePasses",
+        .binding = &shader_injection.cs_contact_denoise_passes,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Sun Denoise Passes",
+        .section = "Contact Shadows",
+        .tooltip = "Horizontal + vertical iterations. Each extra pass widens the blur and adds the same cost again.",
+        .min = 1.f,
+        .max = 4.f,
+        .format = "%d",
+        .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && shader_injection.cs_contact_denoise_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalEnabled", .binding = &shader_injection.cs_contact_local_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Local Lights", .section = "Contact Shadows",
-      .tooltip = "Local Light Contact Shadows add subtle shadows around objects and characters where nearby lights would naturally create them, making them feel more grounded in the scene. Greyed out and off while RT Local Shadows is on.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+        .key = "ContactShadowsLocalEnabled",
+        .binding = &shader_injection.cs_contact_local_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Local Lights",
+        .section = "Contact Shadows",
+        .tooltip = "Local Light Contact Shadows add subtle shadows around objects and characters where nearby lights would naturally create them, making them feel more grounded in the scene. Greyed out and off while RT Local Shadows is on.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return !falcom_world::rtls::RtlsRequested(); },
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalPoint", .binding = &shader_injection.cs_contact_local_point,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Point", .section = "Contact Shadows",
-      .tooltip = "Contact march for point lights on the specular-enabled material path. Point "
-                 "lights have NO shadow map of their own in this engine, so this march is their "
-                 "only contact detail. A disabled class marches zero times and spends none of the "
-                 "Local Light Budget, so the classes left on get all of it.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsLocalPoint",
+        .binding = &shader_injection.cs_contact_local_point,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Point",
+        .section = "Contact Shadows",
+        .tooltip = "Contact march for point lights on the specular-enabled material path. Point "
+                   "lights have NO shadow map of their own in this engine, so this march is their "
+                   "only contact detail. A disabled class marches zero times and spends none of the "
+                   "Local Light Budget, so the classes left on get all of it.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalSpot", .binding = &shader_injection.cs_contact_local_spot,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Spot", .section = "Contact Shadows",
-      .tooltip = "Contact march for spot lights on the specular-enabled material path. Spot "
-                 "lights can already carry a real shadow map (a 5-tap PCF) whenever their "
-                 "shadowmapIndex is not -1, so for them the march mostly adds the near-field "
-                 "detail a shadow map cannot. A disabled class marches zero times and spends "
-                 "none of the Local Light Budget.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsLocalSpot",
+        .binding = &shader_injection.cs_contact_local_spot,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Spot",
+        .section = "Contact Shadows",
+        .tooltip = "Contact march for spot lights on the specular-enabled material path. Spot "
+                   "lights can already carry a real shadow map (a 5-tap PCF) whenever their "
+                   "shadowmapIndex is not -1, so for them the march mostly adds the near-field "
+                   "detail a shadow map cannot. A disabled class marches zero times and spends "
+                   "none of the Local Light Budget.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalEnvPoint", .binding = &shader_injection.cs_contact_local_env_point,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Env Point", .section = "Contact Shadows",
-      .tooltip = "Contact march for point lights on the diffuse-only material path -- surfaces "
-                 "that take their specular from the environment cube instead of dynamic lights. "
-                 "The march is identical to Point and costs the same. A disabled class marches "
-                 "zero times and spends none of the Local Light Budget.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsLocalEnvPoint",
+        .binding = &shader_injection.cs_contact_local_env_point,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Env Point",
+        .section = "Contact Shadows",
+        .tooltip = "Contact march for point lights on the diffuse-only material path -- surfaces "
+                   "that take their specular from the environment cube instead of dynamic lights. "
+                   "The march is identical to Point and costs the same. A disabled class marches "
+                   "zero times and spends none of the Local Light Budget.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalEnvSpot", .binding = &shader_injection.cs_contact_local_env_spot,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Env Spot", .section = "Contact Shadows",
-      .tooltip = "Contact march for spot lights on the diffuse-only material path, the env-path "
-                 "counterpart of Spot. The march is identical and costs the same. A disabled "
-                 "class marches zero times and spends none of the Local Light Budget.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsLocalEnvSpot",
+        .binding = &shader_injection.cs_contact_local_env_spot,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Env Spot",
+        .section = "Contact Shadows",
+        .tooltip = "Contact march for spot lights on the diffuse-only material path, the env-path "
+                   "counterpart of Spot. The march is identical and costs the same. A disabled "
+                   "class marches zero times and spends none of the Local Light Budget.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalStrength", .binding = &shader_injection.cs_contact_local_strength,
-      .default_value = 1.f, .label = "Local Strength", .section = "Contact Shadows",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsLocalStrength",
+        .binding = &shader_injection.cs_contact_local_strength,
+        .default_value = 1.f,
+        .label = "Local Strength",
+        .section = "Contact Shadows",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      // Key renamed with the slider-to-tier change, same reasoning as
-      // ContactShadowsQuality above. The default is also new: Medium (8 steps)
-      // rather than the old raw slider's 4.
-      .key = "ContactShadowsLocalQuality", .binding = &shader_injection.cs_contact_local_sample_count,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Local Quality", .section = "Contact Shadows",
-      .tooltip = "March quality per local light: Low 4, Medium 8, High 12, Ultra 16 "
-                 "steps. Paid once per light, per pixel, so higher tiers cost more "
-                 "here than the sun march's equivalents in a crowded scene.",
-      .labels = {"Low", "Medium", "High", "Ultra"},
-      .min = 0.f,
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .parse = [](float value) { return ContactShadowQualitySamples(value); },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+        // Key renamed with the slider-to-tier change, same reasoning as
+        // ContactShadowsQuality above. The default is also new: Medium (8 steps)
+        // rather than the old raw slider's 4.
+        .key = "ContactShadowsLocalQuality",
+        .binding = &shader_injection.cs_contact_local_sample_count,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Local Quality",
+        .section = "Contact Shadows",
+        .tooltip = "March quality per local light: Low 4, Medium 8, High 12, Ultra 16 "
+                   "steps. Paid once per light, per pixel, so higher tiers cost more "
+                   "here than the sun march's equivalents in a crowded scene.",
+        .labels = {"Low", "Medium", "High", "Ultra"},
+        .min = 0.f,
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .parse = [](float value) { return ContactShadowQualitySamples(value); },
+        .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalRayLength", .binding = &shader_injection.cs_contact_local_ray_length,
-      .default_value = 2.f, .label = "Local Ray Length", .section = "Contact Shadows",
-      .tooltip = "World-space ray length for the local march. Local lights are short-range, "
-                 "so this is much smaller than the sun ray length above.",
-      .min = 0.1f, .max = 20.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsLocalRayLength",
+        .binding = &shader_injection.cs_contact_local_ray_length,
+        .default_value = 2.f,
+        .label = "Local Ray Length",
+        .section = "Contact Shadows",
+        .tooltip = "World-space ray length for the local march. Local lights are short-range, "
+                   "so this is much smaller than the sun ray length above.",
+        .min = 0.1f,
+        .max = 20.f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalLightClearance", .binding = &shader_injection.cs_contact_local_light_clearance,
-      .default_value = 0.2f, .label = "Light Clearance", .section = "Contact Shadows",
-      .tooltip = "Local contact rays stop this far before the light, in world units, so its own housing does not block it. Independent of RT Local Shadows.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsLocalLightClearance",
+        .binding = &shader_injection.cs_contact_local_light_clearance,
+        .default_value = 0.2f,
+        .label = "Light Clearance",
+        .section = "Contact Shadows",
+        .tooltip = "Local contact rays stop this far before the light, in world units, so its own housing does not block it. Independent of RT Local Shadows.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalNormalBias", .binding = &shader_injection.cs_contact_local_normal_bias,
-      .default_value = 0.05f, .label = "Local Normal Bias", .section = "Contact Shadows",
-      .tooltip = "Lifts the local light march's ray origin along the surface normal (against it for a light behind "
-                 "the surface), so a lit face does not shadow itself. Separate from the sun's Normal Bias because "
-                 "local rays are much shorter. 0 marches from the surface itself.",
-      .min = 0.f, .max = 0.5f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
+        .key = "ContactShadowsLocalNormalBias",
+        .binding = &shader_injection.cs_contact_local_normal_bias,
+        .default_value = 0.05f,
+        .label = "Local Normal Bias",
+        .section = "Contact Shadows",
+        .tooltip = "Lifts the local light march's ray origin along the surface normal (against it for a light behind "
+                   "the surface), so a lit face does not shadow itself. Separate from the sun's Normal Bias because "
+                   "local rays are much shorter. 0 marches from the surface itself.",
+        .min = 0.f,
+        .max = 0.5f,
+        .format = "%.3f",
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalMaxLights", .binding = &shader_injection.cs_contact_local_max_lights,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 16.f, .label = "Local Light Budget", .section = "Contact Shadows",
-      .tooltip = "Per-pixel cap on how many local lights get a march, so a crowded scene "
-                 "cannot multiply the cost without limit. Sora and Kai march the strongest lights first.",
-      .min = 1.f, .max = 16.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsLocalMaxLights",
+        .binding = &shader_injection.cs_contact_local_max_lights,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 16.f,
+        .label = "Local Light Budget",
+        .section = "Contact Shadows",
+        .tooltip = "Per-pixel cap on how many local lights get a march, so a crowded scene "
+                   "cannot multiply the cost without limit. Sora and Kai march the strongest lights first.",
+        .min = 1.f,
+        .max = 16.f,
+        .format = "%d",
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalDenoise", .binding = &shader_injection.cs_contact_local_denoise_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Local Denoise", .section = "Contact Shadows",
-      .tooltip = "Smooths the IS-FAST grain of the local light contact term with an edge-aware blur that stops at depth and normal edges. Off leaves the term exactly as marched.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
-      .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
+        .key = "ContactShadowsLocalDenoise",
+        .binding = &shader_injection.cs_contact_local_denoise_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Local Denoise",
+        .section = "Contact Shadows",
+        .tooltip = "Smooths the IS-FAST grain of the local light contact term with an edge-aware blur that stops at depth and normal edges. Off leaves the term exactly as marched.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalDenoiseRadius", .binding = &shader_injection.cs_contact_local_denoise_radius,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 4.f, .label = "Local Denoise Radius", .section = "Contact Shadows",
-      .tooltip = "Blur radius in pixels along each axis. Larger is smoother and costs more.",
-      .min = 1.f, .max = 8.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsLocalDenoiseRadius",
+        .binding = &shader_injection.cs_contact_local_denoise_radius,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 4.f,
+        .label = "Local Denoise Radius",
+        .section = "Contact Shadows",
+        .tooltip = "Blur radius in pixels along each axis. Larger is smoother and costs more.",
+        .min = 1.f,
+        .max = 8.f,
+        .format = "%d",
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalDenoiseDepthSigma", .binding = &shader_injection.cs_contact_local_denoise_depth_sigma,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.02f, .label = "Local Denoise Depth Sigma", .section = "Contact Shadows",
-      .tooltip = "How far a neighbour may sit off this pixel's surface plane, relative to its distance, before it stops contributing. Lower keeps depth edges sharper.",
-      .min = 0.001f, .max = 0.2f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsLocalDenoiseDepthSigma",
+        .binding = &shader_injection.cs_contact_local_denoise_depth_sigma,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.02f,
+        .label = "Local Denoise Depth Sigma",
+        .section = "Contact Shadows",
+        .tooltip = "How far a neighbour may sit off this pixel's surface plane, relative to its distance, before it stops contributing. Lower keeps depth edges sharper.",
+        .min = 0.001f,
+        .max = 0.2f,
+        .format = "%.3f",
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalDenoiseNormalSigma", .binding = &shader_injection.cs_contact_local_denoise_normal_sigma,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.1f, .label = "Local Denoise Normal Sigma", .section = "Contact Shadows",
-      .tooltip = "How different a neighbour's surface normal may be before it stops contributing. Lower keeps creases and corners sharper.",
-      .min = 0.01f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsLocalDenoiseNormalSigma",
+        .binding = &shader_injection.cs_contact_local_denoise_normal_sigma,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.1f,
+        .label = "Local Denoise Normal Sigma",
+        .section = "Contact Shadows",
+        .tooltip = "How different a neighbour's surface normal may be before it stops contributing. Lower keeps creases and corners sharper.",
+        .min = 0.01f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalDenoisePasses", .binding = &shader_injection.cs_contact_local_denoise_passes,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Local Denoise Passes", .section = "Contact Shadows",
-      .tooltip = "Horizontal + vertical iterations. Each extra pass widens the blur and adds the same cost again.",
-      .min = 1.f, .max = 4.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "ContactShadowsLocalDenoisePasses",
+        .binding = &shader_injection.cs_contact_local_denoise_passes,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Local Denoise Passes",
+        .section = "Contact Shadows",
+        .tooltip = "Horizontal + vertical iterations. Each extra pass widens the blur and adds the same cost again.",
+        .min = 1.f,
+        .max = 4.f,
+        .format = "%d",
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
 
     // �� Dynamic Cubemaps � standalone t17 replacement ��
     new renodx::utils::settings::Setting{
-      .key = "DynCubeEnabled", .binding = &shader_injection.dynCube_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Dynamic Cubemaps", .section = "Dynamic Cubemaps",
-      .tooltip = "Dynamic cubemap generation replacing game's static cubemaps.",
-      .labels = {"Off", "On"},
+        .key = "DynCubeEnabled",
+        .binding = &shader_injection.dynCube_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Dynamic Cubemaps",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Dynamic cubemap generation replacing game's static cubemaps.",
+        .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeHistory", .binding = &shader_injection.dynCube_history,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Temporal", .section = "Dynamic Cubemaps",
-      .tooltip = "Phase1: temporal accumulation. On = blend current capture with previous history. Off = no history (fresh capture each frame).",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeHistory",
+        .binding = &shader_injection.dynCube_history,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Temporal",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Phase1: temporal accumulation. On = blend current capture with previous history. Off = no history (fresh capture each frame).",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeDebug", .binding = &shader_injection.dynCube_debug,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Debug View", .section = "Dynamic Cubemaps",
-      .tooltip = "0=Normal (dynamic cube in lighting), 1=Show Dynamic Cube, 2=Face Visualization, 3=Solid Face Colors, 4=No Override (vanilla t17), 5=History Validity, 6=History Contribution, 7=Character Mask, 8=GGX Filtered Cube (mip-selectable), 9=SSR Result (blurred), 10=SSR Confidence, 11=Reflection Source, 12=SSR Raw, 13=SSR Edge Fade.",
-      .labels = {"Normal", "Show Cube", "Face Viz", "Solid Colors", "No Override", "History Validity", "History Contribution", "Character Mask", "GGX Filtered", "SSR Result", "SSR Confidence", "Reflection Source", "SSR Raw", "SSR Edge Fade"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeDebug",
+        .binding = &shader_injection.dynCube_debug,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Debug View",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "0=Normal (dynamic cube in lighting), 1=Show Dynamic Cube, 2=Face Visualization, 3=Solid Face Colors, 4=No Override (vanilla t17), 5=History Validity, 6=History Contribution, 7=Character Mask, 8=GGX Filtered Cube (mip-selectable), 9=SSR Result (blurred), 10=SSR Confidence, 11=Reflection Source, 12=SSR Raw, 13=SSR Edge Fade.",
+        .labels = {"Normal", "Show Cube", "Face Viz", "Solid Colors", "No Override", "History Validity", "History Contribution", "Character Mask", "GGX Filtered", "SSR Result", "SSR Confidence", "Reflection Source", "SSR Raw", "SSR Edge Fade"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeResolution", .binding = &shader_injection.dynCube_resolution,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 4.f, .label = "Resolution", .section = "Dynamic Cubemaps",
-      .tooltip = "Cubemap face size. 1536+ costs significant VRAM (a full 2048 set needs ~2GB with history+GGX). Preview rectangle is clamped for visibility.",
-      .labels = {"128", "256", "512", "768", "1024", "1536", "2048"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .key = "DynCubeResolution",
+        .binding = &shader_injection.dynCube_resolution,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 4.f,
+        .label = "Resolution",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Cubemap face size. 1536+ costs significant VRAM (a full 2048 set needs ~2GB with history+GGX). Preview rectangle is clamped for visibility.",
+        .labels = {"128", "256", "512", "768", "1024", "1536", "2048"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeCharacterCapture", .binding = &shader_injection.dynCube_character_capture,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Character Capture", .section = "Dynamic Cubemaps",
-      .tooltip = "OFF = exclude characters from cubemap capture. ON = include characters in cubemap capture.",
-      .labels = {"Off (Exclude)", "On (Include)"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeCharacterCapture",
+        .binding = &shader_injection.dynCube_character_capture,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Character Capture",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "OFF = exclude characters from cubemap capture. ON = include characters in cubemap capture.",
+        .labels = {"Off (Exclude)", "On (Include)"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeForceVanilla", .binding = &shader_injection.dynCube_force_vanilla,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Force Vanilla Cubemaps", .section = "Dynamic Cubemaps",
-      .tooltip = "OFF = use dynamic cubemap for t17. ON = keep vanilla game cubemap for t17 (A/B test). Does not stop dynamic cubemap accumulation.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeForceVanilla",
+        .binding = &shader_injection.dynCube_force_vanilla,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Force Vanilla Cubemaps",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "OFF = use dynamic cubemap for t17. ON = keep vanilla game cubemap for t17 (A/B test). Does not stop dynamic cubemap accumulation.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeForceDynamic", .binding = &shader_injection.dynCube_force_dynamic,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Force Dynamic Cubemaps", .section = "Dynamic Cubemaps",
-      .tooltip = "Debug: render the dynamic cubemap only (skip SSR and vanilla). Precedence: Force Vanilla > Force Dynamic > Force SSR.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeForceDynamic",
+        .binding = &shader_injection.dynCube_force_dynamic,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Force Dynamic Cubemaps",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Debug: render the dynamic cubemap only (skip SSR and vanilla). Precedence: Force Vanilla > Force Dynamic > Force SSR.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeForceSSR", .binding = &shader_injection.dynCube_force_ssr,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Force SSR", .section = "Dynamic Cubemaps",
-      .tooltip = "Debug: render SSR only (skip dynamic and vanilla). Requires SSR On. Precedence: Force Vanilla > Force Dynamic > Force SSR.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeForceSSR",
+        .binding = &shader_injection.dynCube_force_ssr,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Force SSR",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Debug: render SSR only (skip dynamic and vanilla). Requires SSR On. Precedence: Force Vanilla > Force Dynamic > Force SSR.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeLayerMix", .binding = &shader_injection.dynCube_layer_mix,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = -1.f, .label = "Reflection Layer Mix", .section = "Dynamic Cubemaps",
-      .tooltip = "Manual reflection source override. -1 = automatic confidence blend. 0 = SSR only. 1 = Dynamic only. 2 = Vanilla only. Values in between blend adjacent sources.",
-      .min = -1.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeLayerMix",
+        .binding = &shader_injection.dynCube_layer_mix,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = -1.f,
+        .label = "Reflection Layer Mix",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Manual reflection source override. -1 = automatic confidence blend. 0 = SSR only. 1 = Dynamic only. 2 = Vanilla only. Values in between blend adjacent sources.",
+        .min = -1.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeBlur", .binding = &shader_injection.dynCube_blur,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 2.f, .label = "Dynamic Cubemap Blur", .section = "Dynamic Cubemaps",
-      .tooltip = "Artistic mip-offset blur on the dynamic cube sample (uses the existing GGX/HW mip chain, no extra pass). 0 = normal sharpness; fractional values give smooth trilinear control; higher = progressively blurrier. Independent of material roughness.",
-      .min = 0.f, .max = 8.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeBlur",
+        .binding = &shader_injection.dynCube_blur,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 2.f,
+        .label = "Dynamic Cubemap Blur",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Artistic mip-offset blur on the dynamic cube sample (uses the existing GGX/HW mip chain, no extra pass). 0 = normal sharpness; fractional values give smooth trilinear control; higher = progressively blurrier. Independent of material roughness.",
+        .min = 0.f,
+        .max = 8.f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeUpdateInterval", .binding = &shader_injection.dynCube_capture_interval,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 3.f, .label = "Dynamic Cubemap Update Interval", .section = "Dynamic Cubemaps",
-      .tooltip = "Frames between new cubemap captures (1=fastest 2-stage cadence, 2=every 2 frames, 4=every 4 frames, 8=every 8 frames). Capture and filter run on separate frames; the previous completed cube stays visible between updates.",
-      .labels = {"1", "2", "3", "4", "5", "6", "7", "8"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeUpdateInterval",
+        .binding = &shader_injection.dynCube_capture_interval,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 3.f,
+        .label = "Dynamic Cubemap Update Interval",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Frames between new cubemap captures (1=fastest 2-stage cadence, 2=every 2 frames, 4=every 4 frames, 8=every 8 frames). Capture and filter run on separate frames; the previous completed cube stays visible between updates.",
+        .labels = {"1", "2", "3", "4", "5", "6", "7", "8"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeGGX", .binding = &shader_injection.dynCube_ggx,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "GGX Prefilter", .section = "Dynamic Cubemaps",
-      .tooltip = "Phase3: 16-tap Hammersley GGX prefilter for roughness mips. Off = hardware box-filter mips (cheap approx).",
-      .labels = {"HW Mips", "GGX"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeGGX",
+        .binding = &shader_injection.dynCube_ggx,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "GGX Prefilter",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Phase3: 16-tap Hammersley GGX prefilter for roughness mips. Off = hardware box-filter mips (cheap approx).",
+        .labels = {"HW Mips", "GGX"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeDebugLog", .binding = &shader_injection.dynCube_debug_logging,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Debug Logging (1/sec)", .section = "Dynamic Cubemaps",
-      .tooltip = "Emits one log per second to help diagnose which part is broken: resource creation, capture inputs (depth/color/cbv), dispatch success, t17 override, and debug mode.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeDebugLog",
+        .binding = &shader_injection.dynCube_debug_logging,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Debug Logging (1/sec)",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Emits one log per second to help diagnose which part is broken: resource creation, capture inputs (depth/color/cbv), dispatch success, t17 override, and debug mode.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeGpuTimingLog", .binding = &g_dyncube_gpu_timing,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "GPU Timing Log (1/sec)", .section = "Dynamic Cubemaps",
-      .tooltip = "Adds the GPU time of each cubemap step (capture, filter, variant, SSR) to the once-per-second [DynCube] log line: max and average in ms over the last second, with sample and skipped counts. Results are read without waiting for the GPU. Works without Debug Logging and without Gather performance metrics. Off = nothing is timed.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeGpuTimingLog",
+        .binding = &g_dyncube_gpu_timing,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "GPU Timing Log (1/sec)",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Adds the GPU time of each cubemap step (capture, filter, variant, SSR) to the once-per-second [DynCube] log line: max and average in ms over the last second, with sample and skipped counts. Results are read without waiting for the GPU. Works without Debug Logging and without Gather performance metrics. Off = nothing is timed.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeCSDispatchFix", .binding = &g_dyncube_cs_dispatch_fix,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "CS Dispatch Fix", .section = "Dynamic Cubemaps",
-      .tooltip = "Controls compute state cleanup for Dynamic Cubemap and custom SSR dispatches. "
-                 "Off uses the existing compute-slot unbind. "
-                 "Fix 1 restores the previous compute pipeline and descriptor tables. "
-                 "Fix 2 and Fix 3 clear sampler, SRV, texture UAV and buffer UAV slots, "
-                 "then restore the previous pipeline and descriptor tables.",
-      .labels = {"Off", "Fix 1: Restore State", "Fix 2: Null Compute", "Fix 3: Null + Restore"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeCSDispatchFix",
+        .binding = &g_dyncube_cs_dispatch_fix,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "CS Dispatch Fix",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Controls compute state cleanup for Dynamic Cubemap and custom SSR dispatches. "
+                   "Off uses the existing compute-slot unbind. "
+                   "Fix 1 restores the previous compute pipeline and descriptor tables. "
+                   "Fix 2 and Fix 3 clear sampler, SRV, texture UAV and buffer UAV slots, "
+                   "then restore the previous pipeline and descriptor tables.",
+        .labels = {"Off", "Fix 1: Restore State", "Fix 2: Null Compute", "Fix 3: Null + Restore"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomShaderLogging", .binding = &shader_injection.custom_shader_logging,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Custom Shader Log", .section = "Dynamic Cubemaps",
-      .tooltip = "Throttled step log for GTVBAO + Dynamic Cubemaps + SSR dispatches (sizes, inputs, create/destroy). Arm before a resolution/DLSS change repro: the last line marks the crash step.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f || shader_injection.gtvbao_mode > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "CustomShaderLogging",
+        .binding = &shader_injection.custom_shader_logging,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Custom Shader Log",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Throttled step log for GTVBAO + Dynamic Cubemaps + SSR dispatches (sizes, inputs, create/destroy). Arm before a resolution/DLSS change repro: the last line marks the crash step.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f || shader_injection.gtvbao_mode > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeCaptureBoost", .binding = &shader_injection.dynCube_capture_boost,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.66f, .label = "Reflection Brightness", .section = "Dynamic Cubemaps",
-      .tooltip = "Master brightness for SSR and dynamic cubemap reflections. 1.0 = neutral. Does not affect the vanilla fallback.",
-      .min = 0.f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeCaptureBoost",
+        .binding = &shader_injection.dynCube_capture_boost,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.66f,
+        .label = "Reflection Brightness",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Master brightness for SSR and dynamic cubemap reflections. 1.0 = neutral. Does not affect the vanilla fallback.",
+        .min = 0.f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeCaptureSoften", .binding = &shader_injection.dynCube_capture_soften,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.4f, .label = "Capture Soften", .section = "Dynamic Cubemaps",
-      .tooltip = "Softens globally-pushed dynamic reflections (glass etc.) via a dedicated variant cube. Does not affect the lighting resolve or the vanilla fallback.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeCaptureSoften",
+        .binding = &shader_injection.dynCube_capture_soften,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.4f,
+        .label = "Capture Soften",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Softens globally-pushed dynamic reflections (glass etc.) via a dedicated variant cube. Does not affect the lighting resolve or the vanilla fallback.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeGlobalStrength", .binding = &shader_injection.dynCube_global_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.4f, .label = "Global Reflection Strength", .section = "Dynamic Cubemaps",
-      .tooltip = "Scales globally-pushed dynamic reflections (glass etc.) so they don't dominate. 1 = full. Does not affect the lighting resolve or the vanilla fallback.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeGlobalStrength",
+        .binding = &shader_injection.dynCube_global_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.4f,
+        .label = "Global Reflection Strength",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Scales globally-pushed dynamic reflections (glass etc.) so they don't dominate. 1 = full. Does not affect the lighting resolve or the vanilla fallback.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeHistoryBlend", .binding = &shader_injection.dynCube_history_blend,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.75f, .label = "History Blend", .section = "Dynamic Cubemaps",
-      .tooltip = "Temporal blend weight when current and previous samples are compatible. 0.5 = Skyrim-style 50/50.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_history > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeHistoryBlend",
+        .binding = &shader_injection.dynCube_history_blend,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.75f,
+        .label = "History Blend",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Temporal blend weight when current and previous samples are compatible. 0.5 = Skyrim-style 50/50.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_history > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeHistoryPosThreshold", .binding = &shader_injection.dynCube_history_pos_threshold,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "History Pos Threshold", .section = "Dynamic Cubemaps",
-      .tooltip = "World-unit position compatibility threshold. If previous vs current reconstructed position differs more than this, history is replaced. Starting point 0.5; tune after 90-deg and slow-pan tests.",
-      .min = 0.f, .max = 20.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_history > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeHistoryPosThreshold",
+        .binding = &shader_injection.dynCube_history_pos_threshold,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.5f,
+        .label = "History Pos Threshold",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "World-unit position compatibility threshold. If previous vs current reconstructed position differs more than this, history is replaced. Starting point 0.5; tune after 90-deg and slow-pan tests.",
+        .min = 0.f,
+        .max = 20.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_history > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeDebugFace", .binding = &shader_injection.dynCube_debug_face,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Debug Face", .section = "Dynamic Cubemaps",
-      .tooltip = "Face for debug preview when Debug View=1/2/5/6/7/8: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z. Preview samples the capture resource directly.",
-      .labels = {"+X", "-X", "+Y", "-Y", "+Z", "-Z"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && (shader_injection.dynCube_debug == 1.f || shader_injection.dynCube_debug == 2.f || shader_injection.dynCube_debug == 5.f || shader_injection.dynCube_debug == 6.f || shader_injection.dynCube_debug == 7.f || shader_injection.dynCube_debug == 8.f); },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeDebugFace",
+        .binding = &shader_injection.dynCube_debug_face,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Debug Face",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Face for debug preview when Debug View=1/2/5/6/7/8: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z. Preview samples the capture resource directly.",
+        .labels = {"+X", "-X", "+Y", "-Y", "+Z", "-Z"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && (shader_injection.dynCube_debug == 1.f || shader_injection.dynCube_debug == 2.f || shader_injection.dynCube_debug == 5.f || shader_injection.dynCube_debug == 6.f || shader_injection.dynCube_debug == 7.f || shader_injection.dynCube_debug == 8.f); },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeDebugMip", .binding = &shader_injection.dynCube_debug_mip,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Debug Mip", .section = "Dynamic Cubemaps",
-      .tooltip = "Mip level for the GGX filtered cube preview when Debug View=8. 0=sharp history, 7=strongly blurred.",
-      .labels = {"0", "1", "2", "3", "4", "5", "6", "7"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_debug == 8.f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeDebugMip",
+        .binding = &shader_injection.dynCube_debug_mip,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Debug Mip",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Mip level for the GGX filtered cube preview when Debug View=8. 0=sharp history, 7=strongly blurred.",
+        .labels = {"0", "1", "2", "3", "4", "5", "6", "7"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_debug == 8.f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeForceMip", .binding = &shader_injection.dynCube_force_mip,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = -1.f, .label = "Force Cubemap Mip", .section = "Dynamic Cubemaps",
-      .tooltip = "Debug: force the t17 reflection mip. -1 = normal roughness LOD. 0..7 = always sample that mip (verifies the GGX chain reaches the reflection).",
-      .min = -1.f, .max = 7.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeForceMip",
+        .binding = &shader_injection.dynCube_force_mip,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = -1.f,
+        .label = "Force Cubemap Mip",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Debug: force the t17 reflection mip. -1 = normal roughness LOD. 0..7 = always sample that mip (verifies the GGX chain reaches the reflection).",
+        .min = -1.f,
+        .max = 7.f,
+        .format = "%d",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeCoverageFade", .binding = &shader_injection.dynCube_coverage_fade,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Dynamic Cubemap Coverage Fade", .section = "Dynamic Cubemaps",
-      .tooltip = "OFF = hard validity cutoff (current). ON = smooth the dynamic-cubemap validity edge in direction space so coverage boundaries fade into the fallback instead of cutting.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeCoverageFade",
+        .binding = &shader_injection.dynCube_coverage_fade,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Dynamic Cubemap Coverage Fade",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "OFF = hard validity cutoff (current). ON = smooth the dynamic-cubemap validity edge in direction space so coverage boundaries fade into the fallback instead of cutting.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeCoverageWidth", .binding = &shader_injection.dynCube_coverage_width,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Dynamic Cubemap Coverage Fade Width", .section = "Dynamic Cubemaps",
-      .tooltip = "Angular width of the validity smoothing cone in degrees. Controls transition softness only, not the valid boundary. 0 = binary cutoff.",
-      .min = 0.f, .max = 8.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_coverage_fade > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeCoverageWidth",
+        .binding = &shader_injection.dynCube_coverage_width,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Dynamic Cubemap Coverage Fade Width",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Angular width of the validity smoothing cone in degrees. Controls transition softness only, not the valid boundary. 0 = binary cutoff.",
+        .min = 0.f,
+        .max = 8.f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_coverage_fade > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeVerticalOffset", .binding = &shader_injection.dynCube_vertical_offset,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Dynamic Cubemap Vertical Offset (Test)", .section = "Dynamic Cubemaps",
-      .tooltip = "TEST: vertically tilt the dynamic cubemap lookup, in degrees. 0 = no change. Positive slides reflection content down, negative slides it up. Validity and vanilla fallback follow the shifted direction.",
-      .min = -30.f, .max = 30.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeVerticalOffset",
+        .binding = &shader_injection.dynCube_vertical_offset,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "Dynamic Cubemap Vertical Offset (Test)",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "TEST: vertically tilt the dynamic cubemap lookup, in degrees. 0 = no change. Positive slides reflection content down, negative slides it up. Validity and vanilla fallback follow the shifted direction.",
+        .min = -30.f,
+        .max = 30.f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSR", .binding = &shader_injection.dynCube_ssr_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "SSR", .section = "Dynamic Cubemaps",
-      .tooltip = "Simple screen-space SSR ray march (no Hi-Z/temporal). Confidence blend: SSR > Dynamic Cube > Vanilla Cube.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSR",
+        .binding = &shader_injection.dynCube_ssr_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "SSR",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Simple screen-space SSR ray march (no Hi-Z/temporal). Confidence blend: SSR > Dynamic Cube > Vanilla Cube.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRSamples", .binding = &shader_injection.dynCube_ssr_samples,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 16.f, .label = "SSR Sample Count", .section = "Dynamic Cubemaps",
-      .tooltip = "SSR ray-march sample count. Higher = more accurate at higher GPU cost. Old Medium preset = 16.",
-      .min = 4.f, .max = 96.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRSamples",
+        .binding = &shader_injection.dynCube_ssr_samples,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 16.f,
+        .label = "SSR Sample Count",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "SSR ray-march sample count. Higher = more accurate at higher GPU cost. Old Medium preset = 16.",
+        .min = 4.f,
+        .max = 96.f,
+        .format = "%d",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRDistance", .binding = &shader_injection.dynCube_ssr_distance,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 192.f, .label = "SSR Search Distance", .section = "Dynamic Cubemaps",
-      .tooltip = "SSR ray-march search distance in world units. Old Medium preset = 20.",
-      .min = 4.f, .max = 192.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRDistance",
+        .binding = &shader_injection.dynCube_ssr_distance,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 192.f,
+        .label = "SSR Search Distance",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "SSR ray-march search distance in world units. Old Medium preset = 20.",
+        .min = 4.f,
+        .max = 192.f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRBlur", .binding = &shader_injection.dynCube_ssr_blur,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 4.f, .label = "SSR Blur", .section = "Dynamic Cubemaps",
-      .tooltip = "Separable Gaussian blur sigma on the SSR result. 0 = sharp/raw SSR, higher = progressively blurrier.",
-      .min = 0.f, .max = 8.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRBlur",
+        .binding = &shader_injection.dynCube_ssr_blur,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 4.f,
+        .label = "SSR Blur",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Separable Gaussian blur sigma on the SSR result. 0 = sharp/raw SSR, higher = progressively blurrier.",
+        .min = 0.f,
+        .max = 8.f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRSymmetricWeights", .binding = &shader_injection.dynCube_ssr_symmetric_weights,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "SSR Symmetric Blur Weights (Test)", .section = "Dynamic Cubemaps",
-      .tooltip = "TEST A/B: evaluate each blur tap pair with a single shared Gaussian weight. Off = legacy per-tap loop (default, unchanged behavior).",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRSymmetricWeights",
+        .binding = &shader_injection.dynCube_ssr_symmetric_weights,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "SSR Symmetric Blur Weights (Test)",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "TEST A/B: evaluate each blur tap pair with a single shared Gaussian weight. Off = legacy per-tap loop (default, unchanged behavior).",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRDistanceFade", .binding = &shader_injection.dynCube_ssr_distance_fade,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "SSR Distance Fade", .section = "Dynamic Cubemaps",
-      .tooltip = "How fast SSR confidence drops with hit distance. 0 = no falloff, 1 = full falloff at max distance.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRDistanceFade",
+        .binding = &shader_injection.dynCube_ssr_distance_fade,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "SSR Distance Fade",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "How fast SSR confidence drops with hit distance. 0 = no falloff, 1 = full falloff at max distance.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSREdgeFade", .binding = &shader_injection.dynCube_ssr_edge_fade,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.2f, .label = "SSR Edge Fade", .section = "Dynamic Cubemaps",
-      .tooltip = "Screen-edge vignette strength on SSR confidence. 0 = none, 1 = fades over 25% from each edge.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSREdgeFade",
+        .binding = &shader_injection.dynCube_ssr_edge_fade,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.2f,
+        .label = "SSR Edge Fade",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Screen-edge vignette strength on SSR confidence. 0 = none, 1 = fades over 25% from each edge.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRGrazingFade", .binding = &shader_injection.dynCube_ssr_grazing_fade,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "SSR Grazing Fade", .section = "Dynamic Cubemaps",
-      .tooltip = "Reduces SSR confidence at grazing view angles. 0 = none, 1 = aggressive fade.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRGrazingFade",
+        .binding = &shader_injection.dynCube_ssr_grazing_fade,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "SSR Grazing Fade",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Reduces SSR confidence at grazing view angles. 0 = none, 1 = aggressive fade.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRThickness", .binding = &shader_injection.dynCube_ssr_thickness,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "SSR Thickness", .section = "Dynamic Cubemaps",
-      .tooltip = "Depth tolerance: how far behind the surface the ray must be to count as a hit (world units).",
-      .min = 0.01f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRThickness",
+        .binding = &shader_injection.dynCube_ssr_thickness,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.0f,
+        .label = "SSR Thickness",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Depth tolerance: how far behind the surface the ray must be to count as a hit (world units).",
+        .min = 0.01f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRCharOccStrength", .binding = &shader_injection.dynCube_ssr_char_occ_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "SSR Character Occlusion Reduction", .section = "Dynamic Cubemaps",
-      .tooltip = "How much SSR confidence is reduced when the ray hits a character from a horizontal (floor/water) surface. Attacks third-person disocclusion rings; 0 = off. Vertical mirrors (low upness) are unaffected.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRCharOccStrength",
+        .binding = &shader_injection.dynCube_ssr_char_occ_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "SSR Character Occlusion Reduction",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "How much SSR confidence is reduced when the ray hits a character from a horizontal (floor/water) surface. Attacks third-person disocclusion rings; 0 = off. Vertical mirrors (low upness) are unaffected.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRCharOccUpness", .binding = &shader_injection.dynCube_ssr_char_occ_upness,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "SSR Character Occlusion Upness", .section = "Dynamic Cubemaps",
-      .tooltip = "Surface upness threshold where the character-hit confidence reduction begins (smooth �0.25 band). 0 = any up-facing surface, 0.5 = mostly horizontal, 1 = only fully horizontal (floor/water).",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRCharOccUpness",
+        .binding = &shader_injection.dynCube_ssr_char_occ_upness,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "SSR Character Occlusion Upness",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Surface upness threshold where the character-hit confidence reduction begins (smooth �0.25 band). 0 = any up-facing surface, 0.5 = mostly horizontal, 1 = only fully horizontal (floor/water).",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRConfidenceFallback", .binding = &shader_injection.dynCube_ssr_confidence_fallback,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "SSR Confidence Fallback", .section = "Dynamic Cubemaps",
-      .tooltip = "AUTO-mode remap of SSR confidence: 0 = today's weighting; higher values suppress low-confidence SSR sooner so Dynamic Cubemap takes over earlier. Smooth, no hard cutoff; conf = 1 always stays full SSR.",
-      .min = 0.f, .max = 0.9f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRConfidenceFallback",
+        .binding = &shader_injection.dynCube_ssr_confidence_fallback,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "SSR Confidence Fallback",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "AUTO-mode remap of SSR confidence: 0 = today's weighting; higher values suppress low-confidence SSR sooner so Dynamic Cubemap takes over earlier. Smooth, no hard cutoff; conf = 1 always stays full SSR.",
+        .min = 0.f,
+        .max = 0.9f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRReplacement", .binding = &shader_injection.dynCube_ssr_replacement,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "SSR Replacement", .section = "Dynamic Cubemaps",
-      .tooltip = "Replace the Sora (1st/2nd) / Kai water SSR resolve with the DynCube composite (game march + dynamic cubemap, misses decay with no vanilla-cube tint) on water-flagged pixels only. Bed and non-water pixels run verbatim vanilla. Off = fully vanilla SSR chain, nothing touched.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRReplacement",
+        .binding = &shader_injection.dynCube_ssr_replacement,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "SSR Replacement",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Replace the Sora (1st/2nd) / Kai water SSR resolve with the DynCube composite (game march + dynamic cubemap, misses decay with no vanilla-cube tint) on water-flagged pixels only. Bed and non-water pixels run verbatim vanilla. Off = fully vanilla SSR chain, nothing touched.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeGameSSR", .binding = &shader_injection.dynCube_game_ssr,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Game SSR", .section = "Dynamic Cubemaps",
-      .tooltip = "Run the game's own SSR march and feed it to the SSR Replacement composite (game reflection, then dynamic cubemap, misses decay with no vanilla-cube tint). Off skips the march: water receives dynamic cubemap only. Only applies while SSR Replacement is on; otherwise the vanilla chain runs untouched.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_replacement > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeGameSSR",
+        .binding = &shader_injection.dynCube_game_ssr,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Game SSR",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Run the game's own SSR march and feed it to the SSR Replacement composite (game reflection, then dynamic cubemap, misses decay with no vanilla-cube tint). Off skips the march: water receives dynamic cubemap only. Only applies while SSR Replacement is on; otherwise the vanilla chain runs untouched.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_replacement > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRReplacementDebug", .binding = &shader_injection.dynCube_ssr_replacement_debug,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "SSR Replacement Debug", .section = "Dynamic Cubemaps",
-      .tooltip = "Visualize the SSR chain stages fullscreen on lit surfaces (Off, ssr1 input scene color, ssr1 march result, lighting SSR texture, lighting color). For judging what each stage sees.",
-      .labels = {"Off", "SSR1 Input", "SSR2 Input", "Lighting SSR", "Lighting Color"},
-      .min = 0.f, .max = 4.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRReplacementDebug",
+        .binding = &shader_injection.dynCube_ssr_replacement_debug,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "SSR Replacement Debug",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Visualize the SSR chain stages fullscreen on lit surfaces (Off, ssr1 input scene color, ssr1 march result, lighting SSR texture, lighting color). For judging what each stage sees.",
+        .labels = {"Off", "SSR1 Input", "SSR2 Input", "Lighting SSR", "Lighting Color"},
+        .min = 0.f,
+        .max = 4.f,
+        .format = "%d",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // -- Vanilla SSR Improvements (Sora2nd march/denoise correctness, A/B) --
     new renodx::utils::settings::Setting{
-      .key = "DynCubeVanillaSSREnabled", .binding = &shader_injection.dynCube_vanilla_ssr_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Enable Improvements", .section = "Vanilla SSR Improvements",
-      .tooltip = "Improvements to Vanilla SSR denoising.",
-      .labels = {"Off", "On"},
+        .key = "DynCubeVanillaSSREnabled",
+        .binding = &shader_injection.dynCube_vanilla_ssr_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Enable Improvements",
+        .section = "Vanilla SSR Improvements",
+        .tooltip = "Improvements to Vanilla SSR denoising.",
+        .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeVanillaRefineFix", .binding = &shader_injection.dynCube_vanilla_refine_fix,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Refine Backtrack Fix", .section = "Vanilla SSR Improvements",
-      .tooltip = "Fix SSR refinement to bracket the crossing (step back when inside, Kai-style) instead of stepping only forward. Sora2nd ssr1, Sora1st and Kai fused marches. Off restores the verbatim vanilla behavior for A/B.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeVanillaRefineFix",
+        .binding = &shader_injection.dynCube_vanilla_refine_fix,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Refine Backtrack Fix",
+        .section = "Vanilla SSR Improvements",
+        .tooltip = "Fix SSR refinement to bracket the crossing (step back when inside, Kai-style) instead of stepping only forward. Sora2nd ssr1, Sora1st and Kai fused marches. Off restores the verbatim vanilla behavior for A/B.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeVanillaRefineThreshold", .binding = &shader_injection.dynCube_vanilla_refine_threshold,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Refine Hit Threshold", .section = "Vanilla SSR Improvements",
-      .tooltip = "Hit threshold on the refine depth delta (scene depth minus ray depth, view units): hit when delta exceeds this. 0 = any penetration counts (native Kai rule); higher is stricter (fewer, firmer hits). Sora2nd ssr1, Sora1st and Kai fused marches. Only applies while Refine Backtrack Fix is on.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f && shader_injection.dynCube_vanilla_refine_fix > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeVanillaRefineThreshold",
+        .binding = &shader_injection.dynCube_vanilla_refine_threshold,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.5f,
+        .label = "Refine Hit Threshold",
+        .section = "Vanilla SSR Improvements",
+        .tooltip = "Hit threshold on the refine depth delta (scene depth minus ray depth, view units): hit when delta exceeds this. 0 = any penetration counts (native Kai rule); higher is stricter (fewer, firmer hits). Sora2nd ssr1, Sora1st and Kai fused marches. Only applies while Refine Backtrack Fix is on.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f && shader_injection.dynCube_vanilla_refine_fix > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeVanillaHistoryFixed", .binding = &shader_injection.dynCube_vanilla_history_fixed,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Fixed History Blend", .section = "Vanilla SSR Improvements",
-      .tooltip = "On = fixed history weight from the slider below (0.9 = vanilla); Off = motion-adaptive weighting (Kai formula: mostly history when static, mostly current when moving).",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeVanillaHistoryFixed",
+        .binding = &shader_injection.dynCube_vanilla_history_fixed,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Fixed History Blend",
+        .section = "Vanilla SSR Improvements",
+        .tooltip = "On = fixed history weight from the slider below (0.9 = vanilla); Off = motion-adaptive weighting (Kai formula: mostly history when static, mostly current when moving).",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeVanillaHistoryWeight", .binding = &shader_injection.dynCube_vanilla_history_weight,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.9f, .label = "Fixed History Weight", .section = "Vanilla SSR Improvements",
-      .tooltip = "History fraction used when Fixed History Blend is on (0.9 = vanilla). Higher = longer trails but stabler; lower = fresher but noisier.",
-      .min = 0.5f, .max = 0.99f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f && shader_injection.dynCube_vanilla_history_fixed > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeVanillaHistoryWeight",
+        .binding = &shader_injection.dynCube_vanilla_history_weight,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.9f,
+        .label = "Fixed History Weight",
+        .section = "Vanilla SSR Improvements",
+        .tooltip = "History fraction used when Fixed History Blend is on (0.9 = vanilla). Higher = longer trails but stabler; lower = fresher but noisier.",
+        .min = 0.5f,
+        .max = 0.99f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f && shader_injection.dynCube_vanilla_history_fixed > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeVanillaDisocReject", .binding = &shader_injection.dynCube_vanilla_disoc_reject,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Disocclusion Reject", .section = "Vanilla SSR Improvements",
-      .tooltip = "Validate the reprojected history sample against current-frame scene data (UV bounds, motion distance, depth mismatch); on mismatch use the current SSR result instead of stale history.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeVanillaDisocReject",
+        .binding = &shader_injection.dynCube_vanilla_disoc_reject,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Disocclusion Reject",
+        .section = "Vanilla SSR Improvements",
+        .tooltip = "Validate the reprojected history sample against current-frame scene data (UV bounds, motion distance, depth mismatch); on mismatch use the current SSR result instead of stale history.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeVanillaDisocDepth", .binding = &shader_injection.dynCube_vanilla_disoc_depth,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.15f, .label = "Disocclusion Depth Threshold", .section = "Vanilla SSR Improvements",
-      .tooltip = "Reject history when |linear depth at history UV minus linear depth here| exceeds this (view units). 0 = always reject on depth. Only applies while Disocclusion Reject is on.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f && shader_injection.dynCube_vanilla_disoc_reject > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeVanillaDisocDepth",
+        .binding = &shader_injection.dynCube_vanilla_disoc_depth,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.15f,
+        .label = "Disocclusion Depth Threshold",
+        .section = "Vanilla SSR Improvements",
+        .tooltip = "Reject history when |linear depth at history UV minus linear depth here| exceeds this (view units). 0 = always reject on depth. Only applies while Disocclusion Reject is on.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f && shader_injection.dynCube_vanilla_disoc_reject > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeVanillaDisocUV", .binding = &shader_injection.dynCube_vanilla_disoc_uv,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.05f, .label = "Disocclusion Motion Threshold", .section = "Vanilla SSR Improvements",
-      .tooltip = "Reject history when reprojection motion exceeds this (0-1 UV units, ~5% of screen at default). 0 = any motion rejects. Only applies while Disocclusion Reject is on.",
-      .min = 0.f, .max = 0.25f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f && shader_injection.dynCube_vanilla_disoc_reject > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeVanillaDisocUV",
+        .binding = &shader_injection.dynCube_vanilla_disoc_uv,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.05f,
+        .label = "Disocclusion Motion Threshold",
+        .section = "Vanilla SSR Improvements",
+        .tooltip = "Reject history when reprojection motion exceeds this (0-1 UV units, ~5% of screen at default). 0 = any motion rejects. Only applies while Disocclusion Reject is on.",
+        .min = 0.f,
+        .max = 0.25f,
+        .format = "%.3f",
+        .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f && shader_injection.dynCube_vanilla_disoc_reject > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeVanillaISFAST", .binding = &shader_injection.dynCube_vanilla_isfast,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "IS-FAST History Distribution", .section = "Vanilla SSR Improvements",
-      .tooltip = "Blue-noise subpixel distribution of the single history tap (same 128x128x32 volume, frame slice, spatial scale and strength blend as the custom SSR IS-FAST phase; strength 0 = off). Gives TAA/upscalers a temporally distributed signal. Requires IS-FAST noise available: turn on ISFASTMasterEnable and check the IS-FAST debug log for loaded=yes; the effect is temporal stability in motion, not single-frame denoising.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeVanillaISFAST",
+        .binding = &shader_injection.dynCube_vanilla_isfast,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "IS-FAST History Distribution",
+        .section = "Vanilla SSR Improvements",
+        .tooltip = "Blue-noise subpixel distribution of the single history tap (same 128x128x32 volume, frame slice, spatial scale and strength blend as the custom SSR IS-FAST phase; strength 0 = off). Gives TAA/upscalers a temporally distributed signal. Requires IS-FAST noise available: turn on ISFASTMasterEnable and check the IS-FAST debug log for loaded=yes; the effect is temporal stability in motion, not single-frame denoising.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // -- Character Outline (Sora 1st / 2nd) --
     new renodx::utils::settings::Setting{
-      .key = "CharacterOutlineThickness", .binding = &shader_injection.character_outline_thickness,
-      .default_value = 100.f, .label = "Outline Thickness", .section = "Character Outline",
-      .tooltip = "Scales outline sampling radii in Sora 1st / 2nd. 0% disables outlines; 100% preserves the original width. Independent of Outline Intensity.",
-      .min = 0.f, .max = 100.f, .format = "%.1f%%",
-      .parse = [](float value) { return value * 0.01f; },
-      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+        .key = "CharacterOutlineThickness",
+        .binding = &shader_injection.character_outline_thickness,
+        .default_value = 100.f,
+        .label = "Outline Thickness",
+        .section = "Character Outline",
+        .tooltip = "Scales outline sampling radii in Sora 1st / 2nd. 0% disables outlines; 100% preserves the original width. Independent of Outline Intensity.",
+        .min = 0.f,
+        .max = 100.f,
+        .format = "%.1f%%",
+        .parse = [](float value) { return value * 0.01f; },
+        .is_visible = []() { return IsSora1st() || IsSora2nd(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CharOutlineIntensity", .binding = &shader_injection.char_outline_intensity,
-      .default_value = 1.f, .label = "Outline Intensity", .section = "Character Outline",
-      .tooltip = "Scales the character outline blend weight before saturate. 0 = no outline, 1 = vanilla strength.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+        .key = "CharOutlineIntensity",
+        .binding = &shader_injection.char_outline_intensity,
+        .default_value = 1.f,
+        .label = "Outline Intensity",
+        .section = "Character Outline",
+        .tooltip = "Scales the character outline blend weight before saturate. 0 = no outline, 1 = vanilla strength.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_visible = []() { return IsSora1st() || IsSora2nd(); },
     },
     // -- Custom TAA (Sora 1st / 2nd, from-scratch replacement) --
     new renodx::utils::settings::Setting{
-      .key = "CustomTAAEnabled", .binding = &shader_injection.custom_taa_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Enable Custom TAA", .section = "Custom TAA",
-      .tooltip = "Smooths jagged edges and flickering while moving. On = cleaner custom anti-aliasing. Off = the game's original anti-aliasing.",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+        .key = "CustomTAAEnabled",
+        .binding = &shader_injection.custom_taa_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Enable Custom TAA",
+        .section = "Custom TAA",
+        .tooltip = "Smooths jagged edges and flickering while moving. On = cleaner custom anti-aliasing. Off = the game's original anti-aliasing.",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return IsSora1st() || IsSora2nd(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAAHistoryFilter", .binding = &shader_injection.custom_taa_history_filter,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "History Filter", .section = "Custom TAA",
-      .tooltip = "History reconstruction: Bilinear (TAA-0 baseline), Adaptive high-order (edge-gated bicubic), Full bicubic.",
-      .labels = {"Bilinear", "Adaptive", "Full"},
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAAHistoryFilter",
+        .binding = &shader_injection.custom_taa_history_filter,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "History Filter",
+        .section = "Custom TAA",
+        .tooltip = "History reconstruction: Bilinear (TAA-0 baseline), Adaptive high-order (edge-gated bicubic), Full bicubic.",
+        .labels = {"Bilinear", "Adaptive", "Full"},
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAAClipMode", .binding = &shader_injection.custom_taa_clip_mode,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "History Validation", .section = "Custom TAA",
-      .tooltip = "History validation: None (TAA-0/1), RGB AABB baseline (TAA-2), k-DOP polytope clip (TAA-3).",
-      .labels = {"None", "AABB", "k-DOP"},
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAAClipMode",
+        .binding = &shader_injection.custom_taa_clip_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "History Validation",
+        .section = "Custom TAA",
+        .tooltip = "History validation: None (TAA-0/1), RGB AABB baseline (TAA-2), k-DOP polytope clip (TAA-3).",
+        .labels = {"None", "AABB", "k-DOP"},
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAAStaticFeedback", .binding = &shader_injection.custom_taa_static_feedback,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.90f, .label = "Static Feedback", .section = "Custom TAA",
-      .tooltip = "TAA-5 history weight for static pixels: result = lerp(current, history, feedback). High values accumulate many frames on stable pixels.",
-      .min = 0.f, .max = 0.99f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAAStaticFeedback",
+        .binding = &shader_injection.custom_taa_static_feedback,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.90f,
+        .label = "Static Feedback",
+        .section = "Custom TAA",
+        .tooltip = "TAA-5 history weight for static pixels: result = lerp(current, history, feedback). High values accumulate many frames on stable pixels.",
+        .min = 0.f,
+        .max = 0.99f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAADynamicFeedback", .binding = &shader_injection.custom_taa_dynamic_feedback,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Dynamic Feedback", .section = "Custom TAA",
-      .tooltip = "TAA-5 history weight for fast-moving pixels. Lower values cut trailing/temporal softness during motion.",
-      .min = 0.f, .max = 0.99f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAADynamicFeedback",
+        .binding = &shader_injection.custom_taa_dynamic_feedback,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.5f,
+        .label = "Dynamic Feedback",
+        .section = "Custom TAA",
+        .tooltip = "TAA-5 history weight for fast-moving pixels. Lower values cut trailing/temporal softness during motion.",
+        .min = 0.f,
+        .max = 0.99f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAAMotionScale", .binding = &shader_injection.custom_taa_motion_scale,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.66f, .label = "Motion Scale", .section = "Custom TAA",
-      .tooltip = "TAA-5 pixels-to-weight scale: weight = saturate(motionPixels * scale). Motion is in pixels/frame and includes the subpixel jitter delta, so the default is small: ~1px stays near Static, ~4px blends halfway, ~8px reaches Dynamic. Do not change during the first test pass.",
-      .min = 0.f, .max = 2.f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAAMotionScale",
+        .binding = &shader_injection.custom_taa_motion_scale,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.66f,
+        .label = "Motion Scale",
+        .section = "Custom TAA",
+        .tooltip = "TAA-5 pixels-to-weight scale: weight = saturate(motionPixels * scale). Motion is in pixels/frame and includes the subpixel jitter delta, so the default is small: ~1px stays near Static, ~4px blends halfway, ~8px reaches Dynamic. Do not change during the first test pass.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.3f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAASquaredMotionResponse", .binding = &shader_injection.custom_taa_squared_motion_response,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Squared Motion Response", .section = "Custom TAA",
-      .tooltip = "Motion-weight curve A/B: Off = linear (baseline), On = squared (same static/dynamic endpoints, more history at low/moderate motion). Applies to feedback and silhouette rejection together.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAASquaredMotionResponse",
+        .binding = &shader_injection.custom_taa_squared_motion_response,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Squared Motion Response",
+        .section = "Custom TAA",
+        .tooltip = "Motion-weight curve A/B: Off = linear (baseline), On = squared (same static/dynamic endpoints, more history at low/moderate motion). Applies to feedback and silhouette rejection together.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAADetailRestore", .binding = &shader_injection.custom_taa_detail_restore,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.25f, .label = "Detail Restore", .section = "Custom TAA",
-      .tooltip = "Feedback restoration experiment: restores history feedback toward Static on high-relative-detail pixels whose history agrees with current (flat or disagreeing pixels unchanged). 0 = prior behavior exactly; test value 8.0. Requires validation on.",
-      .min = 0.f, .max = 32.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAADetailRestore",
+        .binding = &shader_injection.custom_taa_detail_restore,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.25f,
+        .label = "Detail Restore",
+        .section = "Custom TAA",
+        .tooltip = "Feedback restoration experiment: restores history feedback toward Static on high-relative-detail pixels whose history agrees with current (flat or disagreeing pixels unchanged). 0 = prior behavior exactly; test value 8.0. Requires validation on.",
+        .min = 0.f,
+        .max = 32.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAADetailTarget", .binding = &shader_injection.custom_taa_detail_target,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.99f, .label = "Detail Target", .section = "Custom TAA",
-      .tooltip = "Selective above-static accumulation experiment: high-detail, low-motion, history-agreeing pixels (and silhouette-valid) approach this feedback (~20-frame window at 0.95) without giving that window to the whole image. Equal to Static = off (exact prior behavior); test 0.95 against Static 0.85. Requires validation on.",
-      .min = 0.85f, .max = 0.99f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAADetailTarget",
+        .binding = &shader_injection.custom_taa_detail_target,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.99f,
+        .label = "Detail Target",
+        .section = "Custom TAA",
+        .tooltip = "Selective above-static accumulation experiment: high-detail, low-motion, history-agreeing pixels (and silhouette-valid) approach this feedback (~20-frame window at 0.95) without giving that window to the whole image. Equal to Static = off (exact prior behavior); test 0.95 against Static 0.85. Requires validation on.",
+        .min = 0.85f,
+        .max = 0.99f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAAOvershootSoftness", .binding = &shader_injection.custom_taa_overshoot_softness,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Overshoot Softness", .section = "Custom TAA",
-      .tooltip = "Selective-tolerance experiment (keep epsilon at 0.01 for A/B): history near the k-DOP hull keeps feedback and averages out flicker; history far outside loses feedback and stays responsive. 100 ~= prior behavior (not bit-exact), 1.0 = experiment default, 0.5 = stronger rejection.",
-      .min = 0.25f, .max = 100.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAAOvershootSoftness",
+        .binding = &shader_injection.custom_taa_overshoot_softness,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.0f,
+        .label = "Overshoot Softness",
+        .section = "Custom TAA",
+        .tooltip = "Selective-tolerance experiment (keep epsilon at 0.01 for A/B): history near the k-DOP hull keeps feedback and averages out flicker; history far outside loses feedback and stays responsive. 100 ~= prior behavior (not bit-exact), 1.0 = experiment default, 0.5 = stronger rejection.",
+        .min = 0.25f,
+        .max = 100.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAASilhouetteRejection", .binding = &shader_injection.custom_taa_silhouette_rejection,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Silhouette Rejection", .section = "Custom TAA",
-      .tooltip = "Wrong-surface history experiment: attenuates history feedback where depth discontinuity meets motion (disocc = 1 - motionWeight * saturate(spread * k)). Static detail keeps history regardless of depth edges. 0 = prior behavior exactly.",
-      .min = 0.f, .max = 16.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAASilhouetteRejection",
+        .binding = &shader_injection.custom_taa_silhouette_rejection,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Silhouette Rejection",
+        .section = "Custom TAA",
+        .tooltip = "Wrong-surface history experiment: attenuates history feedback where depth discontinuity meets motion (disocc = 1 - motionWeight * saturate(spread * k)). Static detail keeps history regardless of depth edges. 0 = prior behavior exactly.",
+        .min = 0.f,
+        .max = 16.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAAKDOPAxes", .binding = &shader_injection.custom_taa_kdop_axes,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "k-DOP Axis Count", .section = "Custom TAA",
-      .tooltip = "k-DOP polytope density: 16-DOP General subset (default, first 8 axes of the paper's 32-DOP set), 22-DOP Paper lightweight set, 32-DOP Paper full set. The paper's scene-optimized 16-DOP sets are future experiments.",
-      .labels = {"16-DOP General", "22-DOP Paper", "32-DOP Paper"},
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 1.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAAKDOPAxes",
+        .binding = &shader_injection.custom_taa_kdop_axes,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "k-DOP Axis Count",
+        .section = "Custom TAA",
+        .tooltip = "k-DOP polytope density: 16-DOP General subset (default, first 8 axes of the paper's 32-DOP set), 22-DOP Paper lightweight set, 32-DOP Paper full set. The paper's scene-optimized 16-DOP sets are future experiments.",
+        .labels = {"16-DOP General", "22-DOP Paper", "32-DOP Paper"},
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 1.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAADmin", .binding = &shader_injection.custom_taa_dmin,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.048f, .label = "Adaptive Threshold", .section = "Custom TAA",
-      .tooltip = "Edge D-term gate for adaptive history filtering (paper start point, tune per game). Below this: bilinear; above: full bicubic correction.",
-      .min = 0.f, .max = 0.5f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_history_filter > 0.5f && shader_injection.custom_taa_history_filter < 1.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAADmin",
+        .binding = &shader_injection.custom_taa_dmin,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.048f,
+        .label = "Adaptive Threshold",
+        .section = "Custom TAA",
+        .tooltip = "Edge D-term gate for adaptive history filtering (paper start point, tune per game). Below this: bilinear; above: full bicubic correction.",
+        .min = 0.f,
+        .max = 0.5f,
+        .format = "%.3f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_history_filter > 0.5f && shader_injection.custom_taa_history_filter < 1.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAAKDOPEpsilon", .binding = &shader_injection.custom_taa_kdop_epsilon,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.05f, .label = "k-DOP Epsilon", .section = "Custom TAA",
-      .tooltip = "Slab extent padding for k-DOP clipping (paper default 1e-5). Investigation range: higher values retain more history (reduces shadow jitter but risks stale-history drag on highlights).",
-      .min = 0.f, .max = 0.1f, .format = "%.5f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 1.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAAKDOPEpsilon",
+        .binding = &shader_injection.custom_taa_kdop_epsilon,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.05f,
+        .label = "k-DOP Epsilon",
+        .section = "Custom TAA",
+        .tooltip = "Slab extent padding for k-DOP clipping (paper default 1e-5). Investigation range: higher values retain more history (reduces shadow jitter but risks stale-history drag on highlights).",
+        .min = 0.f,
+        .max = 0.1f,
+        .format = "%.5f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 1.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAADebug", .binding = &shader_injection.custom_taa_debug,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Debug View", .section = "Custom TAA",
-      .tooltip = "Dev only: Normal, History only (is reconstruction working?), Clip factor (is k-DOP rejecting?), Adapt-Bilin x20 (where does adaptive differ from bilinear?), Full-Bilin x20 (where does full bicubic differ?).",
-      .labels = {"Normal", "History", "Clip", "Adapt-Bilin", "Full-Bilin"},
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "CustomTAADebug",
+        .binding = &shader_injection.custom_taa_debug,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Debug View",
+        .section = "Custom TAA",
+        .tooltip = "Dev only: Normal, History only (is reconstruction working?), Clip factor (is k-DOP rejecting?), Adapt-Bilin x20 (where does adaptive differ from bilinear?), Full-Bilin x20 (where does full bicubic differ?).",
+        .labels = {"Normal", "History", "Clip", "Adapt-Bilin", "Full-Bilin"},
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     // -- RCAS post-TAA sharpening (dedicated pass; never feeds TAA history) --
     new renodx::utils::settings::Setting{
-      .key = "RCASEnabled", .binding = &shader_injection.rcas_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Enable RCAS", .section = "Custom TAA",
-      .tooltip = "Turns image sharpening on or off.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
-      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+        .key = "RCASEnabled",
+        .binding = &shader_injection.rcas_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Enable RCAS",
+        .section = "Custom TAA",
+        .tooltip = "Turns image sharpening on or off.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+        .is_visible = []() { return IsSora1st() || IsSora2nd(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "RCASStrength", .binding = &shader_injection.rcas_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.3f, .label = "Sharpening", .section = "Custom TAA",
-      .tooltip = "How crisp the image looks. Higher values give a sharper picture but can cause glowing edges if set too high. 0 turns sharpening off.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f; },
-      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+        .key = "RCASStrength",
+        .binding = &shader_injection.rcas_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.3f,
+        .label = "Sharpening",
+        .section = "Custom TAA",
+        .tooltip = "How crisp the image looks. Higher values give a sharper picture but can cause glowing edges if set too high. 0 turns sharpening off.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f; },
+        .is_visible = []() { return IsSora1st() || IsSora2nd(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "RCASMotionOn", .binding = &shader_injection.rcas_motion_on,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Motion Sharpening", .section = "Custom TAA",
-      .tooltip = "Automatically strengthens sharpening while the camera or objects move, then relaxes it back when the image is still. Off = always use the Sharpening value above.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "RCASMotionOn",
+        .binding = &shader_injection.rcas_motion_on,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Motion Sharpening",
+        .section = "Custom TAA",
+        .tooltip = "Automatically strengthens sharpening while the camera or objects move, then relaxes it back when the image is still. Off = always use the Sharpening value above.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "RCASMotionMultiplier", .binding = &shader_injection.rcas_motion_multiplier,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 4.0f, .label = "Motion Sharpening Multiplier", .section = "Custom TAA",
-      .tooltip = "Scales the Sharpening value during fast movement: motion value = base x multiplier, clamped to Max Motion Sharpening below. Example: Sharpening 0.30 with this at 2.0 means a still image uses 0.30 and fast motion uses 0.60.",
-      .min = 1.f, .max = 10.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "RCASMotionMultiplier",
+        .binding = &shader_injection.rcas_motion_multiplier,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 4.0f,
+        .label = "Motion Sharpening Multiplier",
+        .section = "Custom TAA",
+        .tooltip = "Scales the Sharpening value during fast movement: motion value = base x multiplier, clamped to Max Motion Sharpening below. Example: Sharpening 0.30 with this at 2.0 means a still image uses 0.30 and fast motion uses 0.60.",
+        .min = 1.f,
+        .max = 10.f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "RCASMotionMax", .binding = &shader_injection.rcas_motion_max,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Max Motion Sharpening", .section = "Custom TAA",
-      .tooltip = "Clamps the motion sharpening value from above. May exceed 1 for stronger motion sharpening (watch for ringing/halos at high values). Example: Sharpening 0.30 with 10x multiplier reaches 3.00 but is clamped to this value.",
-      .min = 0.f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "RCASMotionMax",
+        .binding = &shader_injection.rcas_motion_max,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.0f,
+        .label = "Max Motion Sharpening",
+        .section = "Custom TAA",
+        .tooltip = "Clamps the motion sharpening value from above. May exceed 1 for stronger motion sharpening (watch for ringing/halos at high values). Example: Sharpening 0.30 with 10x multiplier reaches 3.00 but is clamped to this value.",
+        .min = 0.f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "RCASMotionThreshold", .binding = &shader_injection.rcas_motion_threshold,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.01f, .label = "Motion Threshold", .section = "Custom TAA",
-      .tooltip = "How much movement is ignored before motion sharpening kicks in. Filters out tiny per-frame jitter so a still camera keeps normal sharpening instead of flickering stronger.",
-      .min = 0.f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "RCASMotionThreshold",
+        .binding = &shader_injection.rcas_motion_threshold,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.01f,
+        .label = "Motion Threshold",
+        .section = "Custom TAA",
+        .tooltip = "How much movement is ignored before motion sharpening kicks in. Filters out tiny per-frame jitter so a still camera keeps normal sharpening instead of flickering stronger.",
+        .min = 0.f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "RCASMotionRange", .binding = &shader_injection.rcas_motion_range,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.25f, .label = "Motion Range", .section = "Custom TAA",
-      .tooltip = "How much more movement it takes to ramp from normal sharpening up to the full motion value. Lower = reaches full strength sooner.",
-      .min = 0.25f, .max = 8.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "RCASMotionRange",
+        .binding = &shader_injection.rcas_motion_range,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.25f,
+        .label = "Motion Range",
+        .section = "Custom TAA",
+        .tooltip = "How much more movement it takes to ramp from normal sharpening up to the full motion value. Lower = reaches full strength sooner.",
+        .min = 0.25f,
+        .max = 8.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "RCASMotionResponse", .binding = &shader_injection.rcas_motion_response,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Motion Response", .section = "Custom TAA",
-      .tooltip = "Shape of the ramp from normal to full motion sharpening. 1.0 = even ramp; higher values stay gentle longer, then climb steeply near full motion.",
-      .min = 0.5f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "RCASMotionResponse",
+        .binding = &shader_injection.rcas_motion_response,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.5f,
+        .label = "Motion Response",
+        .section = "Custom TAA",
+        .tooltip = "Shape of the ramp from normal to full motion sharpening. 1.0 = even ramp; higher values stay gentle longer, then climb steeply near full motion.",
+        .min = 0.5f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "RCASDebug", .binding = &shader_injection.rcas_debug,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "RCAS Debug View", .section = "Custom TAA",
-      .tooltip = "Diagnostic only: Motion Heat shows where motion sharpening engages (green = base strength, yellow = partial, red = full motion target). Toggle back to Normal for image-quality testing (heat frames pollute TAA history while active).",
-      .labels = {"Normal", "Motion Heat"},
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "RCASDebug",
+        .binding = &shader_injection.rcas_debug,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "RCAS Debug View",
+        .section = "Custom TAA",
+        .tooltip = "Diagnostic only: Motion Heat shows where motion sharpening engages (green = base strength, yellow = partial, red = full motion target). Toggle back to Normal for image-quality testing (heat frames pollute TAA history while active).",
+        .labels = {"Normal", "Motion Heat"},
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "RCASDenoise", .binding = &shader_injection.rcas_denoise,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "RCAS Denoise", .section = "Custom TAA",
-      .tooltip = "Reference FSR_RCAS_DENOISE behavior: scales the lobe by the noise term (0.5..1.0), reducing sharpening where local variation looks grain-like. Off = reference default (full sharpening). May also soften legitimate fine detail such as grass/foliage texture.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "RCASDenoise",
+        .binding = &shader_injection.rcas_denoise,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "RCAS Denoise",
+        .section = "Custom TAA",
+        .tooltip = "Reference FSR_RCAS_DENOISE behavior: scales the lobe by the noise term (0.5..1.0), reducing sharpening where local variation looks grain-like. Off = reference default (full sharpening). May also soften legitimate fine detail such as grass/foliage texture.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FXAAEnabled", .binding = &shader_injection.fxaa_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Enable FXAA", .section = "Custom TAA",
-      .tooltip = "Morphological anti-aliasing between TAA and sharpening. Smooths leftover jagged edges the temporal pass misses. Off = exact prior behavior (RCAS reads the TAA output directly). Never feeds TAA history.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "FXAAEnabled",
+        .binding = &shader_injection.fxaa_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Enable FXAA",
+        .section = "Custom TAA",
+        .tooltip = "Morphological anti-aliasing between TAA and sharpening. Smooths leftover jagged edges the temporal pass misses. Off = exact prior behavior (RCAS reads the TAA output directly). Never feeds TAA history.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FXAAQuality", .binding = &shader_injection.fxaa_quality,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "FXAA Quality", .section = "Custom TAA",
-      .tooltip = "Reference FXAA 3.11 quality preset. Standard (12) is the reference default; High (29) searches longer edges at a small extra cost.",
-      .labels = {"Standard", "High"},
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.fxaa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "FXAAQuality",
+        .binding = &shader_injection.fxaa_quality,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "FXAA Quality",
+        .section = "Custom TAA",
+        .tooltip = "Reference FXAA 3.11 quality preset. Standard (12) is the reference default; High (29) searches longer edges at a small extra cost.",
+        .labels = {"Standard", "High"},
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.fxaa_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FXAASubpix", .binding = &shader_injection.fxaa_subpix,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.33f, .label = "FXAA Subpixel", .section = "Custom TAA",
-      .tooltip = "Amount of sub-pixel aliasing removal. Higher softens more (1.00 = softest), lower stays sharper (0.00 = off). Reference default 0.75.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.fxaa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "FXAASubpix",
+        .binding = &shader_injection.fxaa_subpix,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.33f,
+        .label = "FXAA Subpixel",
+        .section = "Custom TAA",
+        .tooltip = "Amount of sub-pixel aliasing removal. Higher softens more (1.00 = softest), lower stays sharper (0.00 = off). Reference default 0.75.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.fxaa_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FXAAEdgeThreshold", .binding = &shader_injection.fxaa_edge_threshold,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.166f, .label = "FXAA Edge Threshold", .section = "Custom TAA",
-      .tooltip = "Minimum local contrast required before FXAA engages. Lower catches more edges but costs more (reference: 0.333 faster, 0.250 low, 0.166 default, 0.125 high, 0.063 overkill).",
-      .min = 0.031f, .max = 0.333f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.fxaa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "FXAAEdgeThreshold",
+        .binding = &shader_injection.fxaa_edge_threshold,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.166f,
+        .label = "FXAA Edge Threshold",
+        .section = "Custom TAA",
+        .tooltip = "Minimum local contrast required before FXAA engages. Lower catches more edges but costs more (reference: 0.333 faster, 0.250 low, 0.166 default, 0.125 high, 0.063 overkill).",
+        .min = 0.031f,
+        .max = 0.333f,
+        .format = "%.3f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.fxaa_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "FXAAEdgeThresholdMin", .binding = &shader_injection.fxaa_edge_threshold_min,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.0625f, .label = "FXAA Edge Threshold Min", .section = "Custom TAA",
-      .tooltip = "Trims FXAA from processing darks. Lower processes more dark detail but costs more (reference: 0.0833 default, 0.0625 high quality, 0.0312 visible limit). 0 = process darks fully.",
-      .min = 0.f, .max = 0.0833f, .format = "%.4f",
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.fxaa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+        .key = "FXAAEdgeThresholdMin",
+        .binding = &shader_injection.fxaa_edge_threshold_min,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.0625f,
+        .label = "FXAA Edge Threshold Min",
+        .section = "Custom TAA",
+        .tooltip = "Trims FXAA from processing darks. Lower processes more dark detail but costs more (reference: 0.0833 default, 0.0625 high quality, 0.0312 visible limit). 0 = process darks fully.",
+        .min = 0.f,
+        .max = 0.0833f,
+        .format = "%.4f",
+        .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.fxaa_enabled > 0.5f; },
+        .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRISFAST", .binding = &shader_injection.dynCube_ssr_isfast_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "SSR IS-FAST Phase", .section = "Dynamic Cubemaps",
-      .tooltip = "Use IS-FAST spatio-temporal blue noise for the SSR ray-march start phase (breaks up stride banding). Off = deterministic hash phase. Requires the master IS-FAST toggle.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f && g_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRISFAST",
+        .binding = &shader_injection.dynCube_ssr_isfast_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "SSR IS-FAST Phase",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Use IS-FAST spatio-temporal blue noise for the SSR ray-march start phase (breaks up stride banding). Off = deterministic hash phase. Requires the master IS-FAST toggle.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f && g_isfast_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRISFASTStrength", .binding = &shader_injection.dynCube_ssr_isfast_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "SSR IS-FAST Strength", .section = "Dynamic Cubemaps",
-      .tooltip = "Blend between the deterministic hash phase (0) and full IS-FAST noise phase (1).",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f && g_isfast_enabled > 0.5f && shader_injection.dynCube_ssr_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRISFASTStrength",
+        .binding = &shader_injection.dynCube_ssr_isfast_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "SSR IS-FAST Strength",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Blend between the deterministic hash phase (0) and full IS-FAST noise phase (1).",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f && g_isfast_enabled > 0.5f && shader_injection.dynCube_ssr_isfast_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRISFASTSpatial", .binding = &shader_injection.dynCube_ssr_isfast_spatial,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "SSR IS-FAST Spatial Scale", .section = "Dynamic Cubemaps",
-      .tooltip = "Scale IS-FAST noise spatial frequency for SSR. <1 zooms in (smoother), >1 adds more detail.",
-      .min = 0.25f, .max = 4.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f && g_isfast_enabled > 0.5f && shader_injection.dynCube_ssr_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRISFASTSpatial",
+        .binding = &shader_injection.dynCube_ssr_isfast_spatial,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "SSR IS-FAST Spatial Scale",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Scale IS-FAST noise spatial frequency for SSR. <1 zooms in (smoother), >1 adds more detail.",
+        .min = 0.25f,
+        .max = 4.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f && g_isfast_enabled > 0.5f && shader_injection.dynCube_ssr_isfast_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRISFASTTemporal", .binding = &shader_injection.dynCube_ssr_isfast_temporal,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "SSR IS-FAST Temporal Speed", .section = "Dynamic Cubemaps",
-      .tooltip = "Animate the IS-FAST noise slice for SSR. 0 = frozen (stable, no shimmer), higher = faster animation.",
-      .min = 0.f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f && g_isfast_enabled > 0.5f && shader_injection.dynCube_ssr_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeSSRISFASTTemporal",
+        .binding = &shader_injection.dynCube_ssr_isfast_temporal,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "SSR IS-FAST Temporal Speed",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Animate the IS-FAST noise slice for SSR. 0 = frozen (stable, no shimmer), higher = faster animation.",
+        .min = 0.f,
+        .max = 5.0f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f && g_isfast_enabled > 0.5f && shader_injection.dynCube_ssr_isfast_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeVanillaBlur", .binding = &shader_injection.dynCube_vanilla_blur,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 2.0f, .label = "Vanilla Cubemap Blur", .section = "Dynamic Cubemaps",
-      .tooltip = "Mip-offset blur on the vanilla cubemap fallback. 0 = original/sharp, higher = progressively blurrier.",
-      .min = 0.f, .max = 8.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .key = "DynCubeVanillaBlur",
+        .binding = &shader_injection.dynCube_vanilla_blur,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 2.0f,
+        .label = "Vanilla Cubemap Blur",
+        .section = "Dynamic Cubemaps",
+        .tooltip = "Mip-offset blur on the vanilla cubemap fallback. 0 = original/sharp, higher = progressively blurrier.",
+        .min = 0.f,
+        .max = 8.f,
+        .format = "%.1f",
+        .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "KaiHeroLightToggle",
@@ -5798,38 +7171,38 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return IsKai(); },
     },
     new renodx::utils::settings::Setting{
-      .value_type = renodx::utils::settings::SettingValueType::BUTTON,
-      .label = "Reset All Settings to Defaults",
-      .section = "Settings",
-      .on_click = []() {
-        for (auto* s : settings) {
-          if (s->binding != nullptr && s->can_reset) {
-            s->value = s->default_value;
-            s->value_as_int = static_cast<int>(s->default_value);
-            s->Write();
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .label = "Reset All Settings to Defaults",
+        .section = "Settings",
+        .on_click = []() {
+          for (auto* s : settings) {
+            if (s->binding != nullptr && s->can_reset) {
+              s->value = s->default_value;
+              s->value_as_int = static_cast<int>(s->default_value);
+              s->Write();
+            }
           }
-        }
-        return true;
-      },
+          return true;
+        },
     },
     new renodx::utils::settings::Setting{
-      .value_type = renodx::utils::settings::SettingValueType::BUTTON,
-      .label = "Patreon",
-      .section = "Info",
-      .on_click = []() {
-        renodx::utils::platform::LaunchURL("https://www.patreon.com/c/Toru77");
-        return false;
-      },
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .label = "Patreon",
+        .section = "Info",
+        .on_click = []() {
+          renodx::utils::platform::LaunchURL("https://www.patreon.com/c/Toru77");
+          return false;
+        },
     },
     new renodx::utils::settings::Setting{
-      .value_type = renodx::utils::settings::SettingValueType::TEXT,
-      .label = "If you like the addon, consider supporting development on Patreon.",
-      .section = "Info",
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "If you like the addon, consider supporting development on Patreon.",
+        .section = "Info",
     },
     new renodx::utils::settings::Setting{
-      .value_type = renodx::utils::settings::SettingValueType::TEXT,
-      .label = "Addon made by Toru.",
-      .section = "Info",
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Addon made by Toru.",
+        .section = "Info",
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
@@ -5897,10 +7270,10 @@ static void OnInitDevice(reshade::api::device* device) {
   device->create_resource(rd, &initial, reshade::api::resource_usage::shader_resource,
                           &d->fallback_texture);
   device->create_resource_view(d->fallback_texture, reshade::api::resource_usage::shader_resource,
-                                reshade::api::resource_view_desc(
-                                    reshade::api::resource_view_type::texture_2d,
-                                    reshade::api::format::r8g8b8a8_unorm, 0, 1, 0, 1),
-                                &d->fallback_srv);
+                               reshade::api::resource_view_desc(
+                                   reshade::api::resource_view_type::texture_2d,
+                                   reshade::api::format::r8g8b8a8_unorm, 0, 1, 0, 1),
+                               &d->fallback_srv);
 
   reshade::log::message(reshade::log::level::info, "[GTVBAO] Device init � fallback SRV created.");
 }
@@ -5932,13 +7305,19 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool resize) {
   if (resize) {
     d->resize_guard_until_frame = d->frame_index + kGTVBAOResizeGuardFrames;
     CSLog("swapchain", "init resize: 4-frame guard armed, depth/ssao/cbv cleared, GTVBAO+DynCube destroyed");
-    d->captured_depth_srv = {}; d->captured_ssao_srv = {};
-    d->captured_ssao_frame = 0u; d->deferred_ssao_srv = {};
-    d->captured_depth_w = 0u; d->captured_depth_h = 0u;
-    d->captured_depth_live = true; d->captured_mrt_live = true;
-    d->captured_color_live = true; d->captured_cbv_live = true;
+    d->captured_depth_srv = {};
+    d->captured_ssao_srv = {};
+    d->captured_ssao_frame = 0u;
+    d->deferred_ssao_srv = {};
+    d->captured_depth_w = 0u;
+    d->captured_depth_h = 0u;
+    d->captured_depth_live = true;
+    d->captured_mrt_live = true;
+    d->captured_color_live = true;
+    d->captured_cbv_live = true;
     d->captured_scene_cbv_view = {};
-    d->captured_scene_cbv = {}; d->captured_scene_cbv_valid = false;
+    d->captured_scene_cbv = {};
+    d->captured_scene_cbv_valid = false;
     d->captured_scene_cbv_frame = UINT64_MAX;
     DestroyGTVBAOResources(sc->get_device(), d);
     DestroyDynCubeResources(sc->get_device(), d);
@@ -5951,13 +7330,19 @@ static void OnDestroySwapchain(reshade::api::swapchain* sc, bool resize) {
   if (!d) return;
   if (resize) {
     CSLog("swapchain", "destroy resize: depth/ssao/cbv cleared, DynCube destroyed");
-    d->captured_depth_srv = {}; d->captured_ssao_srv = {};
-    d->captured_ssao_frame = 0u; d->deferred_ssao_srv = {};
-    d->captured_depth_w = 0u; d->captured_depth_h = 0u;
-    d->captured_depth_live = true; d->captured_mrt_live = true;
-    d->captured_color_live = true; d->captured_cbv_live = true;
+    d->captured_depth_srv = {};
+    d->captured_ssao_srv = {};
+    d->captured_ssao_frame = 0u;
+    d->deferred_ssao_srv = {};
+    d->captured_depth_w = 0u;
+    d->captured_depth_h = 0u;
+    d->captured_depth_live = true;
+    d->captured_mrt_live = true;
+    d->captured_color_live = true;
+    d->captured_cbv_live = true;
     d->captured_scene_cbv_view = {};
-    d->captured_scene_cbv = {}; d->captured_scene_cbv_valid = false;
+    d->captured_scene_cbv = {};
+    d->captured_scene_cbv_valid = false;
     d->captured_scene_cbv_frame = UINT64_MAX;
     d->resources_created = false;
     DestroyDynCubeResources(sc->get_device(), d);
@@ -5988,7 +7373,10 @@ static void DestroyGTVBAODescriptorTables(
     reshade::api::device* device, GTVBAODescriptorTableSet* tables) {
   if (!device || !tables) return;
   for (auto& t : *tables) {
-    if (t.handle) { device->free_descriptor_table(t); t = {}; }
+    if (t.handle) {
+      device->free_descriptor_table(t);
+      t = {};
+    }
   }
 }
 
@@ -6006,27 +7394,190 @@ static bool IsVanillaEnvCubeView(reshade::api::device* device, reshade::api::res
   if (res.handle == 0u) return false;
   auto rdesc = device->get_resource_desc(res);
   return rdesc.type == reshade::api::resource_type::texture_2d
-      && (rdesc.texture.width == 1024u || rdesc.texture.width == 512u)
-      && rdesc.texture.width == rdesc.texture.height;
+         && (rdesc.texture.width == 1024u || rdesc.texture.width == 512u)
+         && rdesc.texture.width == rdesc.texture.height;
 }
 
 // -- Scene CBV helper --
 
 static bool IsSceneCbvCandidateValid(reshade::api::device* device,
-                                      const reshade::api::buffer_range& range) {
+                                     const reshade::api::buffer_range& range) {
   if (!device || range.buffer.handle == 0u) return false;
   auto desc = device->get_resource_desc(range.buffer);
   if (desc.type != reshade::api::resource_type::buffer) return false;
   return desc.buffer.size >= kSceneCbMinimumBytes
-      && desc.buffer.size <= (64u * 1024u)
-      && range.offset + range.size <= desc.buffer.size;
+         && desc.buffer.size <= (64u * 1024u)
+         && range.offset + range.size <= desc.buffer.size;
+}
+
+// Invalidates cached captures when a native buffer is destroyed or its handle is reused.
+static std::atomic<uint32_t> g_scene_cbv_desc_generation{0u};
+
+enum class RtxdiBindingMap { Unrelated,
+                             Mapped,
+                             Unknown };
+
+static RtxdiBindingMap ResolveRtxdiSceneParameter(reshade::api::pipeline_layout layout, uint32_t parameter, uint32_t* binding) {
+  using namespace reshade::api;
+  RtxdiBindingMap result = RtxdiBindingMap::Unknown;
+  const bool found = renodx::utils::pipeline_layout::GetPipelineLayoutData(layout, [&](const auto* data) {
+    if (parameter >= data->params.size()) return;
+    const auto& param = data->params[parameter];
+    result = RtxdiBindingMap::Unrelated;
+    const auto inspect = [&](const descriptor_range& range) {
+      uint32_t mapped = 0u;
+      const auto match = falcom_world::rtxdi::MapSceneDescriptorRange(
+          {.binding = range.binding, .register_index = range.dx_register_index, .register_space = range.dx_register_space, .count = range.count, .array_size = range.array_size, .constant_buffer = range.type == descriptor_type::constant_buffer, .pixel_visible = (static_cast<uint32_t>(range.visibility) & static_cast<uint32_t>(shader_stage::pixel)) != 0u},
+          kLightingSceneCbRegister, &mapped);
+      if (match == falcom_world::rtxdi::SceneRangeMapping::Unsupported) result = RtxdiBindingMap::Unknown;
+      if (match == falcom_world::rtxdi::SceneRangeMapping::Mapped) {
+        if (result != RtxdiBindingMap::Unrelated) {
+          result = RtxdiBindingMap::Unknown;
+        } else {
+          *binding = mapped;
+          result = RtxdiBindingMap::Mapped;
+        }
+      }
+    };
+    switch (param.type) {
+      case pipeline_layout_param_type::push_descriptors: inspect(param.push_descriptors); break;
+      case pipeline_layout_param_type::descriptor_table:
+      case pipeline_layout_param_type::push_descriptors_with_ranges:
+        if (param.descriptor_table.count && !param.descriptor_table.ranges) {
+          result = RtxdiBindingMap::Unknown;
+          break;
+        }
+        for (uint32_t i = 0u; i < param.descriptor_table.count; ++i) inspect(param.descriptor_table.ranges[i]);
+        break;
+      case pipeline_layout_param_type::descriptor_table_with_static_samplers:
+      case pipeline_layout_param_type::push_descriptors_with_static_samplers:
+        if (param.descriptor_table_with_static_samplers.count && !param.descriptor_table_with_static_samplers.ranges) {
+          result = RtxdiBindingMap::Unknown;
+          break;
+        }
+        for (uint32_t i = 0u; i < param.descriptor_table_with_static_samplers.count; ++i) inspect(param.descriptor_table_with_static_samplers.ranges[i]);
+        break;
+      default: break;
+    }
+  });
+  return (found ? result : RtxdiBindingMap::Unknown);
+}
+
+static void TrackRtxdiSceneBinding(DeviceData* data, reshade::api::command_list* cmd_list,
+                                   const reshade::api::buffer_range& range, falcom_world::rtxdi::SceneCaptureSource source) {
+  falcom_world::rtxdi::TrackSceneBinding(&data->rtxdi_scene_range,
+                                         {.buffer = range.buffer.handle, .offset = range.offset, .size = range.size, .frame = data->frame_index, .command = reinterpret_cast<uintptr_t>(cmd_list), .source = source, .live = range.buffer.handle != 0u, .known = range.buffer.handle != 0u});
+}
+
+static void TrackRtxdiPush(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages,
+                           reshade::api::pipeline_layout layout, uint32_t parameter,
+                           const reshade::api::descriptor_table_update& update) {
+  if (!cmd_list || !(static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) return;
+  auto* device = cmd_list->get_device();
+  auto* data = device ? device->get_private_data<DeviceData>() : nullptr;
+  if (!data) return;
+  uint32_t table_binding = 0u;
+  const auto mapped = ResolveRtxdiSceneParameter(layout, parameter, &table_binding);
+  if (mapped == RtxdiBindingMap::Unrelated) return;
+  reshade::api::buffer_range range = {};
+  if (mapped == RtxdiBindingMap::Mapped && update.array_offset == 0u) {
+    uint32_t index = 0u;
+    if (!falcom_world::rtxdi::SceneDescriptorIndex(update.binding, update.count, table_binding, &index)) return;
+    if (update.type == reshade::api::descriptor_type::constant_buffer && update.descriptors) {
+      range = static_cast<const reshade::api::buffer_range*>(update.descriptors)[index];
+    }
+  }
+  TrackRtxdiSceneBinding(data, cmd_list, range, falcom_world::rtxdi::SceneCaptureSource::Push);
+}
+
+static void TrackRtxdiTables(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages,
+                             reshade::api::pipeline_layout layout, uint32_t first, uint32_t count,
+                             const reshade::api::descriptor_table* tables) {
+  if (!cmd_list || !(static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) return;
+  auto* device = cmd_list->get_device();
+  auto* data = device ? device->get_private_data<DeviceData>() : nullptr;
+  if (!data) return;
+  bool relevant = false;
+  bool ambiguous = false;
+  reshade::api::buffer_range selected = {};
+  for (uint32_t i = 0u; i < count; ++i) {
+    if (first > UINT32_MAX - i) {
+      ambiguous = true;
+      break;
+    }
+    uint32_t binding = 0u;
+    const auto mapped = ResolveRtxdiSceneParameter(layout, first + i, &binding);
+    if (mapped == RtxdiBindingMap::Unrelated) continue;
+    if (relevant || mapped == RtxdiBindingMap::Unknown) {
+      ambiguous = true;
+      break;
+    }
+    relevant = true;
+    if (tables && tables[i].handle) {
+      uint32_t offset = 0u;
+      reshade::api::descriptor_heap heap = {};
+      device->get_descriptor_heap_offset(tables[i], binding, 0u, &heap, &offset);
+      auto* metadata = renodx::utils::data::Get<renodx::utils::descriptor::DeviceData>(device);
+      if (metadata && heap.handle) {
+        std::shared_lock lock(metadata->mutex);
+        const auto it = metadata->heaps.find(heap.handle);
+        if (it != metadata->heaps.end() && offset < it->second.size()) selected = it->second[offset].buffer_range;
+      }
+    }
+  }
+  if (ambiguous) {
+    selected = {};
+  }
+  if (relevant || ambiguous) {
+    TrackRtxdiSceneBinding(data, cmd_list, selected, falcom_world::rtxdi::SceneCaptureSource::DescriptorTable);
+  }
+}
+
+static void ResetRtxdiSceneBinding(reshade::api::command_list* cmd_list) {
+  if (!cmd_list) return;
+  auto* device = cmd_list->get_device();
+  auto* data = device ? device->get_private_data<DeviceData>() : nullptr;
+  if (!data) return;
+  falcom_world::rtxdi::ResetSceneBinding(&data->rtxdi_scene_range, reinterpret_cast<uintptr_t>(cmd_list));
+}
+
+static void PromoteRtxdiSceneBinding(reshade::api::command_list* cmd_list) {
+  if (!cmd_list || !falcom_world::rtxdi::SceneRequested()) return;
+  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  if (!shader_state || !IsLightingShader(renodx::utils::shader::GetCurrentPixelShaderHash(shader_state))) return;
+  auto* device = cmd_list->get_device();
+  auto* data = device ? device->get_private_data<DeviceData>() : nullptr;
+  if (!data) return;
+  const uintptr_t command = reinterpret_cast<uintptr_t>(cmd_list);
+  falcom_world::rtxdi::SceneRangeSnapshot binding;
+  {
+    std::shared_lock lock(data->rtxdi_scene_range.mutex);
+    const auto it = data->rtxdi_scene_range.bindings.find(command);
+    if (it != data->rtxdi_scene_range.bindings.end()) binding = it->second;
+  }
+  const uint32_t generation = g_scene_cbv_desc_generation.load(std::memory_order_acquire);
+  uint64_t normalized = 0u;
+  bool valid = falcom_world::rtxdi::CanPromoteSceneBinding(binding, data->frame_index, command, true)
+               && device->get_api() == reshade::api::device_api::d3d11;
+  if (valid) {
+    const auto desc = device->get_resource_desc(reshade::api::resource{binding.buffer});
+    valid = desc.type == reshade::api::resource_type::buffer
+            && falcom_world::rtxdi::NormalizeSceneInputRange(desc.buffer.size, binding.offset, binding.size, &normalized)
+            && falcom_world::rtxdi::ValidateSceneBuffer(reinterpret_cast<ID3D11Buffer*>(binding.buffer), binding.offset, binding.size);  // NOLINT(performance-no-int-to-ptr)
+  }
+  std::unique_lock lock(data->rtxdi_scene_range.mutex);
+  const auto it = data->rtxdi_scene_range.bindings.find(command);
+  if (!valid || generation != g_scene_cbv_desc_generation.load(std::memory_order_acquire)
+      || it == data->rtxdi_scene_range.bindings.end() || it->second.sequence != binding.sequence
+      || it->second.reset_generation != binding.reset_generation || !it->second.live) {
+    data->rtxdi_scene_range.snapshot = {};
+    return;
+  }
+  binding.size = normalized;
+  data->rtxdi_scene_range.snapshot = binding;
 }
 
 // -- Push-descriptors event ? capture lighting inputs (kai pattern) --
-
-// Scene CB (b0) whose size passed the capture check, per thread. g_scene_cbv_desc_generation moves at every
-// destroy_resource (OnDestroyResource), so a reused handle is always checked again.
-static std::atomic<uint32_t> g_scene_cbv_desc_generation{0u};
 
 static void OnPushDescriptorsCapture(
     reshade::api::command_list* cmd_list,
@@ -6037,6 +7588,7 @@ static void OnPushDescriptorsCapture(
   // Whole-hook timer, started before the gate so the calls the gate rejects are timed too.
   const falcom_world::bvh::PoolCpuTimer capture_timer{&falcom_world::bvh::g_perf_gate.block_us[falcom_world::bvh::kPerfBlockCaptureHook]};
   if (!cmd_list) return;
+  TrackRtxdiPush(cmd_list, stages, layout, param_index, update);
   // Fast path: no feature consumes the captured snapshots -> skip ALL capture work.
   // (Fired on every push_descriptors in the frame; without this gate the body below
   //  runs thousands of times per frame even when every addon feature is disabled.)
@@ -6060,6 +7612,7 @@ static void OnPushDescriptorsCapture(
   // Local contact shadows need the lighting captures and VBGI's slots 0-2, 4 and 5 (material index, materials, lamp lists).
   if (shader_injection.gtvbao_mode < 0.5f
       && !falcom_world::rtao::RtaoRequested()
+      && !falcom_world::rtxdi::SceneRequested()
       && !falcom_world::rr::RrRequested()
       && !VbgiRunning()
       && shader_injection.dynCube_enabled < 0.5f
@@ -6077,7 +7630,7 @@ static void OnPushDescriptorsCapture(
   }
   const bool srv = update.type == reshade::api::descriptor_type::texture_shader_resource_view;
   const bool cbv = update.type == reshade::api::descriptor_type::constant_buffer;
-  if (update.count == 0u || (!srv && !cbv)) return;
+  if (update.count == 0u || (!srv && !cbv) || !update.descriptors) return;
   if (cbv && update.binding != kLightingSceneCbRegister) return;
   if (srv && update.binding != kDynCubeRegister && update.binding > ((VbgiRunning() || LocalContactComputeRunning()) ? 16u : 5u)) return;
   renodx::utils::state::CommandListStateCache state_cache;
@@ -6100,7 +7653,7 @@ static void OnPushDescriptorsCapture(
       if (!vanilla_env_view.has_value()) vanilla_env_view = IsVanillaEnvCubeView(device, views[0]);
       return *vanilla_env_view;
     };
-  // Capture depth: t4 (Sora) or t3 (Kai) � ONLY from lighting shader, game-specific binding.
+    // Capture depth: t4 (Sora) or t3 (Kai) � ONLY from lighting shader, game-specific binding.
     uint32_t depthBinding = IsKai() ? kLightingDepthRegisterKai : kLightingDepthRegister;
     if (update.binding == depthBinding && update.count >= 1
         && views[0].handle != 0u) {
@@ -6127,17 +7680,15 @@ static void OnPushDescriptorsCapture(
           if (depth_res.handle != 0u) {
             auto dd = device->get_resource_desc(depth_res);
             reshade::log::message(reshade::log::level::info,
-              (std::string("[GTVBAO] Depth captured from lighting: ") +
-               std::to_string(dd.texture.width) + "x" +
-               std::to_string(dd.texture.height)).c_str());
+                                  (std::string("[GTVBAO] Depth captured from lighting: ") + std::to_string(dd.texture.width) + "x" + std::to_string(dd.texture.height)).c_str());
           }
         }
       }
     }
-  // Capture SSAO: t5 (Sora) or t4 (Kai) — game-specific binding. Hash-gated for
-  // the same reason depth and the MRT normal are: the binding number alone is
-  // not unique, so any other shader pushing an SRV at that slot would otherwise
-  // silently replace the captured AO.
+    // Capture SSAO: t5 (Sora) or t4 (Kai) — game-specific binding. Hash-gated for
+    // the same reason depth and the MRT normal are: the binding number alone is
+    // not unique, so any other shader pushing an SRV at that slot would otherwise
+    // silently replace the captured AO.
     uint32_t ssaoBinding = IsKai() ? kLightingSsaoRegisterKai : kLightingSsaoRegister;
     if (update.binding == ssaoBinding && update.count >= 1
         && views[0].handle != 0u) {
@@ -6173,7 +7724,7 @@ static void OnPushDescriptorsCapture(
           auto info = CSResolveCapture(device, views[0]);
           d->rcas_motion_res = info.res;
           reshade::log::message(reshade::log::level::info,
-            (std::string("[RCAS] motion ") + info.dims).c_str());
+                                (std::string("[RCAS] motion ") + info.dims).c_str());
         }
         d->rcas_motion_srv = views[0];
         d->rcas_motion_live = true;
@@ -6230,9 +7781,9 @@ static void OnPushDescriptorsCapture(
             if (res.handle == 0u) continue;
             const auto desc = device->get_resource_desc(res);
             const bool ok = k == 3
-                ? (desc.type == reshade::api::resource_type::texture_2d && desc.texture.depth_or_layers == 3u)
-                : (desc.type == reshade::api::resource_type::buffer && desc.buffer.size > 0u
-                   && desc.buffer.size % (k == 4 ? 112u : 576u) == 0u);
+                                ? (desc.type == reshade::api::resource_type::texture_2d && desc.texture.depth_or_layers == 3u)
+                                : (desc.type == reshade::api::resource_type::buffer && desc.buffer.size > 0u
+                                   && desc.buffer.size % (k == 4 ? 112u : 576u) == 0u);
             if (!ok) continue;
             d->vbgi_in_srv[k] = views[i];
             d->vbgi_in_res[k] = res.handle;
@@ -6249,12 +7800,18 @@ static void OnPushDescriptorsCapture(
         if (views[i].handle == 0u) continue;
         const uint32_t slot = update.binding + i;
         int k = -1;
-        if (slot == 2u) k = 0;
-        else if (slot == 3u && !kai) k = 1;
-        else if (slot == deferred_slot) k = 2;
-        else if (!kai && slot == shadow_slot) k = 3;
-        else if (!kai && slot == 11u) k = 4;
-        else if (!kai && slot == 12u) k = 5;
+        if (slot == 2u)
+          k = 0;
+        else if (slot == 3u && !kai)
+          k = 1;
+        else if (slot == deferred_slot)
+          k = 2;
+        else if (!kai && slot == shadow_slot)
+          k = 3;
+        else if (!kai && slot == 11u)
+          k = 4;
+        else if (!kai && slot == 12u)
+          k = 5;
         if (k < 0) continue;
         if (!vbgi_hash_gate.has_value()) {
           const uint32_t hash = pixel_hash();
@@ -6354,19 +7911,21 @@ static void OnPushDescriptorsCapture(
         float swapSoften = std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f);
         float swapStrength = std::clamp(shader_injection.dynCube_global_strength, 0.f, 1.f);
         bool serveVariant = !swapIsLighting && d->dyncube_variant_valid
-            && d->dyncube_variant_cube_srv.handle != 0u
-            && (swapSoften > 1e-4f || swapStrength < 1.f - 1e-4f);
+                            && d->dyncube_variant_cube_srv.handle != 0u
+                            && (swapSoften > 1e-4f || swapStrength < 1.f - 1e-4f);
         reshade::api::resource_view t17srv;
         if (swapDbg == 3) {
-          if (!RunDynCubeSolid(cmd_list, d)) t17srv = {};
-          else t17srv = d->dyncube_solid_cube_srv;
+          if (!RunDynCubeSolid(cmd_list, d))
+            t17srv = {};
+          else
+            t17srv = d->dyncube_solid_cube_srv;
         } else if (serveVariant) {
           t17srv = d->dyncube_variant_cube_srv;
         } else {
           // Active completed filtered cube; raw history cube before first filter.
           t17srv = d->dyncube_ggx_valid
-              ? d->dyncube_ggx_out_cube_srv[d->dyncube_ggx_active]
-              : d->dyncube_srv;
+                       ? d->dyncube_ggx_out_cube_srv[d->dyncube_ggx_active]
+                       : d->dyncube_srv;
         }
         // Once the vanilla cube is known, only swap onto that exact resource
         // (extra safety against hijacking unrelated 512/1024 cubes). Before the
@@ -6383,9 +7942,8 @@ static void OnPushDescriptorsCapture(
         if (t17srv.handle && swapAllowed && DynCubeSceneLive(d)) {
           s_dynCubeT17SwapGuard = true;
           cmd_list->push_descriptors(reshade::api::shader_stage::pixel,
-              reshade::api::pipeline_layout{0}, 0,
-              reshade::api::descriptor_table_update{{}, kDynCubeRegister, 0, 1,
-                  reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
+                                     reshade::api::pipeline_layout{0}, 0,
+                                     reshade::api::descriptor_table_update{{}, kDynCubeRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
           s_dynCubeT17SwapGuard = false;
         }
       }
@@ -6395,7 +7953,7 @@ static void OnPushDescriptorsCapture(
     if (update.binding == kLightingSceneCbRegister && update.count >= 1) {
       auto* cbv_views = static_cast<const reshade::api::resource_view*>(update.descriptors);
       if (cbv_views[0].handle != 0u) {
-        reshade::api::resource buf = { cbv_views[0].handle };
+        reshade::api::resource buf = {cbv_views[0].handle};
         thread_local uint64_t s_desc_buffer = 0u;
         thread_local uint64_t s_desc_size = 0u;
         thread_local uint32_t s_desc_generation = 0u;
@@ -6421,7 +7979,7 @@ static void OnPushDescriptorsCapture(
             d->captured_cbv_res = buf.handle;
             d->captured_cbv_dims = std::string("buf:") + std::to_string(buffer_size);
           }
-          d->captured_scene_cbv = { buf, 0, buffer_size };
+          d->captured_scene_cbv = {buf, 0, buffer_size};
           d->captured_scene_cbv_valid = true;
           d->captured_cbv_live = true;
           d->captured_scene_cbv_frame = d->frame_index;
@@ -6431,7 +7989,7 @@ static void OnPushDescriptorsCapture(
     }
   }
   // -- Per-draw gating (only when GTVBAO, SSGI or RTAO is on). --
-  if (shader_injection.gtvbao_mode < 0.5f && !falcom_world::rtao::RtaoRequested() && !VbgiRunning()) return;
+  if (shader_injection.gtvbao_mode < 0.5f && !falcom_world::rtao::RtaoRequested() && !falcom_world::rtxdi::SceneRequested() && !VbgiRunning()) return;
   if (!(static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) return;
 }
 
@@ -6443,8 +8001,9 @@ static void OnBindDescriptorTables(
     reshade::api::pipeline_layout layout,
     uint32_t first, uint32_t count,
     const reshade::api::descriptor_table* tables) {
+  TrackRtxdiTables(cmd_list, stages, layout, first, count, tables);
   // Fast path: GTVBAO and RTAO are the consumers of these captures (depth, scene CBV).
-  if (shader_injection.gtvbao_mode < 0.5f && !falcom_world::rtao::RtaoRequested() && !VbgiRunning()) return;
+  if (shader_injection.gtvbao_mode < 0.5f && !falcom_world::rtao::RtaoRequested() && !falcom_world::rtxdi::SceneRequested() && !VbgiRunning()) return;
   if (!cmd_list || !tables || count == 0u) return;
   auto* device = cmd_list->get_device();
   auto* d = device->get_private_data<DeviceData>();
@@ -6455,8 +8014,7 @@ static void OnBindDescriptorTables(
   if (s_bind_log_count < 5u) {
     s_bind_log_count++;
     reshade::log::message(reshade::log::level::info,
-      (std::string("[GTVBAO] bind_descriptor_tables: first=") +
-      std::to_string(first) + ", count=" + std::to_string(count)).c_str());
+                          (std::string("[GTVBAO] bind_descriptor_tables: first=") + std::to_string(first) + ", count=" + std::to_string(count)).c_str());
   }
 
   // Only capture on pixel-stage draws.
@@ -6482,11 +8040,13 @@ static void OnBindDescriptorTables(
     uint32_t rc = 0u;
     const reshade::api::descriptor_range* rr = nullptr;
     if (param.type == reshade::api::pipeline_layout_param_type::descriptor_table) {
-      rc = param.descriptor_table.count; rr = param.descriptor_table.ranges;
+      rc = param.descriptor_table.count;
+      rr = param.descriptor_table.ranges;
     } else if (param.type == reshade::api::pipeline_layout_param_type::descriptor_table_with_static_samplers) {
       rc = param.descriptor_table_with_static_samplers.count;
       rr = param.descriptor_table_with_static_samplers.ranges;
-    } else continue;
+    } else
+      continue;
     if (!rr || rc == 0u) continue;
 
     for (uint32_t j = 0; j < rc; ++j) {
@@ -6499,7 +8059,8 @@ static void OnBindDescriptorTables(
       auto resolve_tex = [&](uint32_t reg, reshade::api::resource_view* out) {
         if (reg < r.dx_register_index || reg >= r.dx_register_index + r.count) return;
         uint32_t di = reg - r.dx_register_index;
-        uint32_t bo = 0u; reshade::api::descriptor_heap heap = {0u};
+        uint32_t bo = 0u;
+        reshade::api::descriptor_heap heap = {0u};
         device->get_descriptor_heap_offset(table, r.binding, di, &heap, &bo);
         if (!heap.handle) return;
         auto* dd = renodx::utils::data::Get<renodx::utils::descriptor::DeviceData>(device);
@@ -6533,7 +8094,8 @@ static void OnBindDescriptorTables(
         if (kLightingSceneCbRegister < r.dx_register_index
             || kLightingSceneCbRegister >= r.dx_register_index + r.count) continue;
         uint32_t di = kLightingSceneCbRegister - r.dx_register_index;
-        uint32_t bo = 0u; reshade::api::descriptor_heap heap = {0u};
+        uint32_t bo = 0u;
+        reshade::api::descriptor_heap heap = {0u};
         device->get_descriptor_heap_offset(table, r.binding, di, &heap, &bo);
         if (!heap.handle) continue;
         auto* dd = renodx::utils::data::Get<renodx::utils::descriptor::DeviceData>(device);
@@ -6599,8 +8161,7 @@ static void ApplyComputeDispatchFix(
     for (uint32_t i = 0; i < buffer_uav_count; ++i) {
       cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
                                  reshade::api::pipeline_layout{0}, 0,
-                                 reshade::api::descriptor_table_update{{}, i, 0, 1,
-                                     reshade::api::descriptor_type::buffer_unordered_access_view, &null_uav});
+                                 reshade::api::descriptor_table_update{{}, i, 0, 1, reshade::api::descriptor_type::buffer_unordered_access_view, &null_uav});
     }
   }
 
@@ -6664,7 +8225,7 @@ static void CSLog(const char* tag, const std::string& msg, bool warn) {
   }
   s_last[key] = now;
   reshade::log::message(warn ? reshade::log::level::warning : reshade::log::level::info,
-    (std::string("[CustomShader] ") + tag + ": " + msg).c_str());
+                        (std::string("[CustomShader] ") + tag + ": " + msg).c_str());
 }
 
 // 1/sec heartbeat emitter (recency anchor). Gated by the same toggle.
@@ -6679,7 +8240,7 @@ static void CSBeat(const std::string& msg) {
   s_init = true;
   s_last = now;
   reshade::log::message(reshade::log::level::info,
-    (std::string("[CustomShader] beat: ") + msg).c_str());
+                        (std::string("[CustomShader] beat: ") + msg).c_str());
 }
 
 // Scene liveness for transition gating: true while lighting draws are stamping
@@ -6712,7 +8273,10 @@ static CapturedViewInfo CSResolveCapture(reshade::api::device* dev, reshade::api
   CapturedViewInfo info = {0u, "null", 0u, 0u};
   if (!dev || !v.handle) return info;
   auto res = dev->get_resource_from_view(v);
-  if (!res.handle) { info.dims = "dead"; return info; }
+  if (!res.handle) {
+    info.dims = "dead";
+    return info;
+  }
   info.res = res.handle;
   auto desc = dev->get_resource_desc(res);
   if (desc.type == reshade::api::resource_type::buffer) {
@@ -6744,6 +8308,7 @@ static void KillAllTracked(DeviceData* d, uint64_t deadView, uint64_t deadRes) {
   KillTrackedInput(d, d->captured_color_srv, d->captured_color_res, d->captured_color_live, "color", deadView, deadRes);
   KillTrackedInput(d, d->captured_mrt_normal_srv, d->captured_mrt_res, d->captured_mrt_live, "mrt", deadView, deadRes);
   KillTrackedInput(d, d->captured_scene_cbv_view, d->captured_cbv_res, d->captured_cbv_live, "cbv", deadView, deadRes);
+  if (deadRes != 0u) falcom_world::rtxdi::InvalidateSceneBuffer(&d->rtxdi_scene_range, deadRes);
   KillTrackedInput(d, d->deferred_depth_srv, d->deferred_depth_res, d->defDepthLive, "defDepth", deadView, deadRes);
   KillTrackedInput(d, d->deferred_mrt_normal_srv, d->deferred_mrt_res, d->defMrtLive, "defMrt", deadView, deadRes);
   KillTrackedInput(d, d->deferred_scene_cbv_view, d->deferred_cbv_res, d->defCbvLive, "defCbv", deadView, deadRes);
@@ -6797,13 +8362,13 @@ static bool s_watchdogStarted = false;
 static std::atomic<int> s_presentRegion{0};
 static const char* PresentRegionName(int r) {
   switch (r) {
-    case 1: return "entry";
-    case 2: return "resolver";
-    case 3: return "recreate";
-    case 4: return "deferred";
-    case 5: return "DynCube recreate";
-    case 6: return "resource-size resolve";
-    case 7: return "GTVBAO recreate";
+    case 1:  return "entry";
+    case 2:  return "resolver";
+    case 3:  return "recreate";
+    case 4:  return "deferred";
+    case 5:  return "DynCube recreate";
+    case 6:  return "resource-size resolve";
+    case 7:  return "GTVBAO recreate";
     default: return "idle";
   }
 }
@@ -6815,7 +8380,8 @@ static void WatchdogThreadMain() {
   using clock = std::chrono::steady_clock;
   auto now_ms = []() -> uint64_t {
     return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-        clock::now().time_since_epoch()).count();
+               clock::now().time_since_epoch())
+        .count();
   };
   while (!s_watchdogStop.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -6826,14 +8392,14 @@ static void WatchdogThreadMain() {
     const uint64_t gap = (now >= last) ? (now - last) : 0u;
     if (gap > 2500u) {
       const int region = s_presentRegion.load();
-      CSLog("watchdog", std::string("no present for ") + std::to_string(gap / 1000u) +
-        "s (stuck in " + PresentRegionName(region) + "?)", true);
+      CSLog("watchdog", std::string("no present for ") + std::to_string(gap / 1000u) + "s (stuck in " + PresentRegionName(region) + "?)", true);
     }
   }
 }
-static inline uint64_t WatchdogNowMs() {
+inline static uint64_t WatchdogNowMs() {
   return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now().time_since_epoch()).count();
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
 }
 
 // -- Present hook --
@@ -6893,8 +8459,8 @@ static void OnKaiHeroUnmapBuffer(reshade::api::device* device, reshade::api::res
 }
 
 static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchain* sc,
-                       const reshade::api::rect*, const reshade::api::rect*,
-                       uint32_t, const reshade::api::rect*) {
+                      const reshade::api::rect*, const reshade::api::rect*,
+                      uint32_t, const reshade::api::rect*) {
   auto* dev = queue->get_device();
   auto* cl = queue->get_immediate_command_list();
   auto* d = dev->get_private_data<DeviceData>();
@@ -6973,9 +8539,9 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     } else {
       shader_injection.rtao_active = rtao_frame.producing ? 2.f : 1.f;
       if (!rtao_frame.producing) {
-      rtao_frame.frames_without_ao++;
-      rtao_frame.frames_without_ao_by_reason[static_cast<size_t>(rtao_frame.reason)]++;
-    }
+        rtao_frame.frames_without_ao++;
+        rtao_frame.frames_without_ao_by_reason[static_cast<size_t>(rtao_frame.reason)]++;
+      }
     }
     if (rtao_frame.reason != rtao_frame.logged_reason) {
       rtao_frame.logged_reason = rtao_frame.reason;
@@ -6993,15 +8559,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   // 1/sec heartbeat: recency anchor for crashes + transition detector (photo mode,
   // DLSS toggle, loads). Everything else in this log is changes-only, so steady
   // state is this line alone.
-  CSBeat(std::string("frame=") + std::to_string(d->frame_index) +
-    " working=" + std::to_string(d->working_width) + "x" + std::to_string(d->working_height) +
-    " liveDepth=" + (d->captured_depth_srv.handle ? d->captured_depth_dims : "none") +
-    " cbv=" + (d->captured_scene_cbv_valid ? "ok" : "MISS") +
-    " gtvbaoRes=" + (d->resources_created ? "1" : "0") +
-    " cubeRes=" + (d->dyncube_resources_created ? "1" : "0") +
-    " rs=" + std::to_string(d->dyncube_readSet) +
-    " flt=" + std::to_string(d->dyncube_filteredReadSet) +
-    " rej=" + std::to_string(d->dyncube_rejected_captures));
+  CSBeat(std::string("frame=") + std::to_string(d->frame_index) + " working=" + std::to_string(d->working_width) + "x" + std::to_string(d->working_height) + " liveDepth=" + (d->captured_depth_srv.handle ? d->captured_depth_dims : "none") + " cbv=" + (d->captured_scene_cbv_valid ? "ok" : "MISS") + " gtvbaoRes=" + (d->resources_created ? "1" : "0") + " cubeRes=" + (d->dyncube_resources_created ? "1" : "0") + " rs=" + std::to_string(d->dyncube_readSet) + " flt=" + std::to_string(d->dyncube_filteredReadSet) + " rej=" + std::to_string(d->dyncube_rejected_captures));
 
   // DynCube loading wipe (generic, all games): with no fresh lighting t0 for a
   // while, no scene draws are running (loading screen) � arm history
@@ -7033,12 +8591,11 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     d->dyncube_pending_recreate = false;
     if (shader_injection.dynCube_debug_logging > 0.5f && d->dyncube_resources_created) {
       reshade::log::message(reshade::log::level::info,
-        (std::string("[DynCube] disabled: freed ") + std::to_string(d->dyncube_size) + "x" + std::to_string(d->dyncube_size) +
-         " set (~" + std::to_string((long long)(DynCubeEstimatedBytes(d) / (1024ull * 1024ull))) + " MB)").c_str());
+                            (std::string("[DynCube] disabled: freed ") + std::to_string(d->dyncube_size) + "x" + std::to_string(d->dyncube_size) + " set (~" + std::to_string((long long)(DynCubeEstimatedBytes(d) / (1024ull * 1024ull))) + " MB)").c_str());
     }
     DestroyDynCubeResources(dev, d);
   }
-// -- Basic mode startup guard: reset advanced-only settings to defaults if Basic is selected --
+  // -- Basic mode startup guard: reset advanced-only settings to defaults if Basic is selected --
   static bool s_basic_startup_checked = false;
   if (!s_basic_startup_checked) {
     s_basic_startup_checked = true;
@@ -7071,7 +8628,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   if (d->frame_index <= kGTVBAOStartupGuardFrames) {
     if (d->frame_index == kGTVBAOStartupGuardFrames) {
       reshade::log::message(reshade::log::level::info,
-        "[GTVBAO] Startup guard complete � dispatch begins next frame.");
+                            "[GTVBAO] Startup guard complete � dispatch begins next frame.");
     }
     return;
   }
@@ -7093,10 +8650,9 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     CreateDynCubePipelinesIfNeeded(dev, d);
     if (shader_injection.dynCube_debug_logging > 0.5f) {
       reshade::log::message(reshade::log::level::info,
-        (std::string("[DynCube] resized to ") + std::to_string(wantSize)).c_str());
+                            (std::string("[DynCube] resized to ") + std::to_string(wantSize)).c_str());
     }
-    CSLog("dyncube", std::string("cube recreate: want=") + std::to_string(wantSize) +
-      " active=" + std::to_string(d->dyncube_size));
+    CSLog("dyncube", std::string("cube recreate: want=") + std::to_string(wantSize) + " active=" + std::to_string(d->dyncube_size));
     d->dyncube_pending_size = 0u;
     d->dyncube_pending_recreate = false;
   }
@@ -7142,14 +8698,9 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
       d->last_created_game_width = gw;
       d->last_created_game_height = gh;
       d->resources_created = true;
-      CSLog("gtvbao", std::string("resources (re)created: working=") +
-        std::to_string(d->working_width) + "x" + std::to_string(d->working_height) +
-        " depth=" + std::to_string(gw) + "x" + std::to_string(gh));
+      CSLog("gtvbao", std::string("resources (re)created: working=") + std::to_string(d->working_width) + "x" + std::to_string(d->working_height) + " depth=" + std::to_string(gw) + "x" + std::to_string(gh));
       reshade::log::message(reshade::log::level::info,
-        (std::string("[GTVBAO] Resources created: ") +
-         std::to_string(d->working_width) + "x" +
-         std::to_string(d->working_height) + " (depth=" +
-         std::to_string(gw) + "x" + std::to_string(gh) + ")").c_str());
+                            (std::string("[GTVBAO] Resources created: ") + std::to_string(d->working_width) + "x" + std::to_string(d->working_height) + " (depth=" + std::to_string(gw) + "x" + std::to_string(gh) + ")").c_str());
     }
   }
   // Use deferred snapshots from lighting draw (kai-style) � deferred dispatch only.
@@ -7163,18 +8714,21 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   }
   if (!d->deferred_pending || !d->deferred_depth_srv.handle) {
     // DynCube debug face preview � must run even when GTVBAO deferred off
-    if (d->dyncube_resources_created && d->dyncube_srv.handle && shader_injection.dynCube_enabled >0.5f
+    if (d->dyncube_resources_created && d->dyncube_srv.handle && shader_injection.dynCube_enabled > 0.5f
         && (shader_injection.dynCube_debug == 1.f || shader_injection.dynCube_debug == 2.f
             || shader_injection.dynCube_debug == 5.f || shader_injection.dynCube_debug == 6.f
             || shader_injection.dynCube_debug == 7.f || shader_injection.dynCube_debug == 8.f)) {
       int face = (int)std::clamp(shader_injection.dynCube_debug_face, 0.f, 5.f);
-      const uint32_t outSet = d->dyncube_readSet; // validated read set (delayed-validate commit)
+      const uint32_t outSet = d->dyncube_readSet;  // validated read set (delayed-validate commit)
       reshade::api::resource srcTex = d->dyncube_texture;
       uint32_t srcSub = (uint32_t)face;
       uint32_t srcW = 0, srcH = 0;
-      if (shader_injection.dynCube_debug == 5.f) srcTex = d->dyncube_hist[outSet].pos;
-      else if (shader_injection.dynCube_debug == 6.f) srcTex = d->dyncube_hist[outSet].contrib;
-      else if (shader_injection.dynCube_debug == 7.f) srcTex = d->dyncube_charmask;
+      if (shader_injection.dynCube_debug == 5.f)
+        srcTex = d->dyncube_hist[outSet].pos;
+      else if (shader_injection.dynCube_debug == 6.f)
+        srcTex = d->dyncube_hist[outSet].contrib;
+      else if (shader_injection.dynCube_debug == 7.f)
+        srcTex = d->dyncube_charmask;
       else if (shader_injection.dynCube_debug == 8.f) {
         // GGX filtered cube: preview a specific mip of the ACTIVE completed cube.
         srcTex = d->dyncube_ggx_out[d->dyncube_ggx_active];
@@ -7186,11 +8740,11 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
       auto bb = sc->get_back_buffer(0);
       if (bb.handle && srcTex.handle) {
         auto bbDesc = dev->get_resource_desc(bb);
-        uint32_t srcDim = (srcW != 0u) ? srcW : d->dyncube_size; // source box dims (mip-sized for debug 10)
-        uint32_t preview = std::min(d->dyncube_size * 2, 512u);  // display rect constant so mip progression stays visible
+        uint32_t srcDim = (srcW != 0u) ? srcW : d->dyncube_size;  // source box dims (mip-sized for debug 10)
+        uint32_t preview = std::min(d->dyncube_size * 2, 512u);   // display rect constant so mip progression stays visible
         if (preview <= bbDesc.texture.width && preview <= bbDesc.texture.height) {
-          reshade::api::subresource_box srcBox = {0,0,0, srcDim, srcDim, 1};
-          reshade::api::subresource_box dstBox = {0,0,0, preview, preview, 1};
+          reshade::api::subresource_box srcBox = {0, 0, 0, srcDim, srcDim, 1};
+          reshade::api::subresource_box dstBox = {0, 0, 0, preview, preview, 1};
           cl->barrier(srcTex, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_source);
           cl->barrier(bb, reshade::api::resource_usage::present, reshade::api::resource_usage::copy_dest);
           cl->copy_texture_region(srcTex, srcSub, &srcBox, bb, 0, &dstBox, reshade::api::filter_mode::min_mag_mip_point);
@@ -7237,10 +8791,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
 
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info,
-      (std::string("[GTVBAO] Dispatching (frame=") +
-       std::to_string(d->frame_index) + ", res=" +
-       std::to_string(d->working_width) + "x" +
-       std::to_string(d->working_height) + ")").c_str());
+                          (std::string("[GTVBAO] Dispatching (frame=") + std::to_string(d->frame_index) + ", res=" + std::to_string(d->working_width) + "x" + std::to_string(d->working_height) + ")").c_str());
 
   // Save command-list state.
   auto* cs = renodx::utils::state::GetCurrentState(cl);
@@ -7252,8 +8803,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     const std::string liveDepth = d->captured_depth_srv.handle ? d->captured_depth_dims : "none";
     const std::string wantDims = std::to_string(d->working_width) + "x" + std::to_string(d->working_height);
     const bool dimMismatch = (liveDepth != wantDims);
-    CSLog("gtvbao", std::string("invoke working=") + wantDims + " liveDepth=" + liveDepth +
-      " cbv=" + (d->captured_scene_cbv_valid ? "ok" : "MISSING"), dimMismatch || !d->captured_scene_cbv_valid);
+    CSLog("gtvbao", std::string("invoke working=") + wantDims + " liveDepth=" + liveDepth + " cbv=" + (d->captured_scene_cbv_valid ? "ok" : "MISSING"), dimMismatch || !d->captured_scene_cbv_valid);
     ok = RunGTVBAO(cl, d);
     CSLog("gtvbao", std::string("invoke exit") + (ok ? " ok" : " FAILED"), !ok);
   }
@@ -7275,20 +8825,22 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     reshade::log::message(reshade::log::level::warning, "[GTVBAO] Dispatch failed.");
   }
 
-
   // -- DynCube debug face preview � samples capture resources directly (not t17) --
-  if (d->dyncube_resources_created && d->dyncube_srv.handle && shader_injection.dynCube_enabled >0.5f
+  if (d->dyncube_resources_created && d->dyncube_srv.handle && shader_injection.dynCube_enabled > 0.5f
       && (shader_injection.dynCube_debug == 1.f || shader_injection.dynCube_debug == 2.f
           || shader_injection.dynCube_debug == 5.f || shader_injection.dynCube_debug == 6.f
           || shader_injection.dynCube_debug == 7.f || shader_injection.dynCube_debug == 8.f)) {
     int face = (int)std::clamp(shader_injection.dynCube_debug_face, 0.f, 5.f);
-      const uint32_t outSet = d->dyncube_readSet; // validated read set (delayed-validate commit)
-      reshade::api::resource srcTex = d->dyncube_texture;
+    const uint32_t outSet = d->dyncube_readSet;  // validated read set (delayed-validate commit)
+    reshade::api::resource srcTex = d->dyncube_texture;
     uint32_t srcSub = (uint32_t)face;
     uint32_t srcW = 0, srcH = 0;
-    if (shader_injection.dynCube_debug == 5.f) srcTex = d->dyncube_hist[outSet].pos;
-    else if (shader_injection.dynCube_debug == 6.f) srcTex = d->dyncube_hist[outSet].contrib;
-    else if (shader_injection.dynCube_debug == 7.f) srcTex = d->dyncube_charmask;
+    if (shader_injection.dynCube_debug == 5.f)
+      srcTex = d->dyncube_hist[outSet].pos;
+    else if (shader_injection.dynCube_debug == 6.f)
+      srcTex = d->dyncube_hist[outSet].contrib;
+    else if (shader_injection.dynCube_debug == 7.f)
+      srcTex = d->dyncube_charmask;
     else if (shader_injection.dynCube_debug == 8.f) {
       // GGX filtered cube: preview a specific mip of the ACTIVE completed cube.
       srcTex = d->dyncube_ggx_out[d->dyncube_ggx_active];
@@ -7300,11 +8852,11 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     auto bb = sc->get_back_buffer(0);
     if (bb.handle && srcTex.handle) {
       auto bbDesc = dev->get_resource_desc(bb);
-      uint32_t srcDim = (srcW != 0u) ? srcW : d->dyncube_size; // source box dims (mip-sized for debug 10)
-      uint32_t preview = std::min(d->dyncube_size * 2, 512u);  // display rect constant so mip progression stays visible
+      uint32_t srcDim = (srcW != 0u) ? srcW : d->dyncube_size;  // source box dims (mip-sized for debug 10)
+      uint32_t preview = std::min(d->dyncube_size * 2, 512u);   // display rect constant so mip progression stays visible
       if (preview <= bbDesc.texture.width && preview <= bbDesc.texture.height) {
-        reshade::api::subresource_box srcBox = {0,0,0, srcDim, srcDim, 1};
-        reshade::api::subresource_box dstBox = {0,0,0, preview, preview, 1};
+        reshade::api::subresource_box srcBox = {0, 0, 0, srcDim, srcDim, 1};
+        reshade::api::subresource_box dstBox = {0, 0, 0, preview, preview, 1};
         cl->barrier(srcTex, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_source);
         cl->barrier(bb, reshade::api::resource_usage::present, reshade::api::resource_usage::copy_dest);
         cl->copy_texture_region(srcTex, srcSub, &srcBox, bb, 0, &dstBox, reshade::api::filter_mode::min_mag_mip_point);
@@ -7336,8 +8888,8 @@ static bool SoraSSRReplaceActive(reshade::api::command_list* cmd_list) {
   if (!dd) return false;
   if (!dd->captured_vanilla_env_srv.handle) return false;
   reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
-      ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
-      : dd->dyncube_srv;
+                                           ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
+                                           : dd->dyncube_srv;
   if (!t17srv.handle) return false;
   return true;
 }
@@ -7395,16 +8947,14 @@ static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list) {
   auto* dd = dev->get_private_data<DeviceData>();
   if (!dd) return true;
   reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
-      ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
-      : dd->dyncube_srv;
+                                           ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
+                                           : dd->dyncube_srv;
   if (t17srv.handle) {
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel,
         reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
-            {}, kDynCubeRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &t17srv});
+            {}, kDynCubeRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
   }
   if (dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv.handle) {
     auto histPosSrv = dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv;
@@ -7412,32 +8962,28 @@ static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list) {
         reshade::api::shader_stage::pixel,
         reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
-            {}, kDynCubeHistPosRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &histPosSrv});
+            {}, kDynCubeHistPosRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &histPosSrv});
   }
   cmd_list->push_descriptors(
       reshade::api::shader_stage::pixel,
       reshade::api::pipeline_layout{0}, 0,
       reshade::api::descriptor_table_update{
-          {}, kDynCubeVanillaRegister, 0, 1,
-          reshade::api::descriptor_type::texture_shader_resource_view,
-          &dd->captured_vanilla_env_srv});
+          {}, kDynCubeVanillaRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->captured_vanilla_env_srv});
   // t4 mrt normals: prefer the march's own t2 capture (same resource the vanilla
   // march decodes, so gate bits and resolution match by construction); fall back
   // to the lighting capture. First-live-wins: dead views keep game bindings.
   // Unbound Load returns 0, which safely gates out to the vanilla branch.
   reshade::api::resource_view mrtSrv = {};
-  if (dd->captured_ssr_mrt_srv.handle && dd->captured_ssr_mrt_live) mrtSrv = dd->captured_ssr_mrt_srv;
-  else if (dd->captured_mrt_normal_srv.handle && dd->captured_mrt_live) mrtSrv = dd->captured_mrt_normal_srv;
+  if (dd->captured_ssr_mrt_srv.handle && dd->captured_ssr_mrt_live)
+    mrtSrv = dd->captured_ssr_mrt_srv;
+  else if (dd->captured_mrt_normal_srv.handle && dd->captured_mrt_live)
+    mrtSrv = dd->captured_mrt_normal_srv;
   if (mrtSrv.handle) {
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel,
         reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
-            {}, 4u, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &mrtSrv});
+            {}, 4u, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &mrtSrv});
   }
   // Vanilla-ISFAST frame slice (exact frame_index % 64 mirror of the custom
   // march; -1 = noise unusable -> the shader falls back to hash behavior).
@@ -7450,9 +8996,7 @@ static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list) {
           reshade::api::shader_stage::pixel,
           reshade::api::pipeline_layout{0}, 0,
           reshade::api::descriptor_table_update{
-              {}, 5u, 0, 1,
-              reshade::api::descriptor_type::texture_shader_resource_view,
-              &dd->isfast_noise_srv});
+              {}, 5u, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->isfast_noise_srv});
     }
   }
   return true;
@@ -7481,8 +9025,8 @@ static bool Sora1stSSRReplaceActive(reshade::api::command_list* cmd_list) {
   if (!dd) return false;
   if (!dd->captured_vanilla_env_srv.handle) return false;
   reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
-      ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
-      : dd->dyncube_srv;
+                                           ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
+                                           : dd->dyncube_srv;
   if (!t17srv.handle) return false;
   return true;
 }
@@ -7522,16 +9066,14 @@ static bool OnBeforeSora1stSSRDraw(reshade::api::command_list* cmd_list) {
   auto* dd = dev->get_private_data<DeviceData>();
   if (!dd) return true;
   reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
-      ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
-      : dd->dyncube_srv;
+                                           ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
+                                           : dd->dyncube_srv;
   if (t17srv.handle) {
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel,
         reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
-            {}, kDynCubeRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &t17srv});
+            {}, kDynCubeRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
   }
   if (dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv.handle) {
     auto histPosSrv = dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv;
@@ -7539,17 +9081,13 @@ static bool OnBeforeSora1stSSRDraw(reshade::api::command_list* cmd_list) {
         reshade::api::shader_stage::pixel,
         reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
-            {}, kDynCubeHistPosRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &histPosSrv});
+            {}, kDynCubeHistPosRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &histPosSrv});
   }
   cmd_list->push_descriptors(
       reshade::api::shader_stage::pixel,
       reshade::api::pipeline_layout{0}, 0,
       reshade::api::descriptor_table_update{
-          {}, kDynCubeVanillaRegister, 0, 1,
-          reshade::api::descriptor_type::texture_shader_resource_view,
-          &dd->captured_vanilla_env_srv});
+          {}, kDynCubeVanillaRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->captured_vanilla_env_srv});
   // Vanilla-ISFAST frame slice (exact frame_index % 64 mirror of the custom
   // march; -1 = noise unusable -> the shader falls back to hash behavior).
   // IS-FAST noise volume (t5) only when usable; the shader gates sampling on it.
@@ -7561,9 +9099,7 @@ static bool OnBeforeSora1stSSRDraw(reshade::api::command_list* cmd_list) {
           reshade::api::shader_stage::pixel,
           reshade::api::pipeline_layout{0}, 0,
           reshade::api::descriptor_table_update{
-              {}, 5u, 0, 1,
-              reshade::api::descriptor_type::texture_shader_resource_view,
-              &dd->isfast_noise_srv});
+              {}, 5u, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->isfast_noise_srv});
     }
   }
   return true;
@@ -7705,7 +9241,10 @@ static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list) {
               reshade::api::shader_stage::pixel,
               reshade::api::pipeline_layout{0}, 0,
               reshade::api::descriptor_table_update{
-                  {}, 2u, 0, 1,
+                  {},
+                  2u,
+                  0,
+                  1,
                   reshade::api::descriptor_type::texture_shader_resource_view,
                   &srv,
               });
@@ -7730,9 +9269,13 @@ static void DestroyRCASSet(reshade::api::device* dev, DeviceData* d) {
   if (!dev || !d) return;
   auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
   auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
-  dv(d->rcas_temp_srv); dv(d->rcas_temp_uav); dr(d->rcas_temp_texture);
-  dv(d->rcas_hist_srv); dr(d->rcas_hist_texture);
-  d->rcas_w = 0u; d->rcas_h = 0u;
+  dv(d->rcas_temp_srv);
+  dv(d->rcas_temp_uav);
+  dr(d->rcas_temp_texture);
+  dv(d->rcas_hist_srv);
+  dr(d->rcas_hist_texture);
+  d->rcas_w = 0u;
+  d->rcas_h = 0u;
   d->rcas_fmt = reshade::api::format::unknown;
   d->rcas_have_copy = false;
   d->rcas_format_logged = false;
@@ -7742,9 +9285,20 @@ static void DestroyRCASSet(reshade::api::device* dev, DeviceData* d) {
 static void DestroyRCASResources(reshade::api::device* dev, DeviceData* d) {
   if (!dev || !d) return;
   DestroyRCASSet(dev, d);
-  for (auto& t : d->rcas_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
-  if (d->rcas_pipeline.handle) { dev->destroy_pipeline(d->rcas_pipeline); d->rcas_pipeline = {}; }
-  if (d->rcas_layout.handle) { dev->destroy_pipeline_layout(d->rcas_layout); d->rcas_layout = {}; }
+  for (auto& t : d->rcas_tables) {
+    if (t.handle) {
+      dev->free_descriptor_table(t);
+      t = {};
+    }
+  }
+  if (d->rcas_pipeline.handle) {
+    dev->destroy_pipeline(d->rcas_pipeline);
+    d->rcas_pipeline = {};
+  }
+  if (d->rcas_layout.handle) {
+    dev->destroy_pipeline_layout(d->rcas_layout);
+    d->rcas_layout = {};
+  }
   d->rcas_layout_version = 0u;
 }
 
@@ -7773,7 +9327,9 @@ static void CreateRCASResources(reshade::api::device* dev, DeviceData* d,
     DestroyRCASSet(dev, d);
     return;
   }
-  d->rcas_w = w; d->rcas_h = h; d->rcas_fmt = fmt;
+  d->rcas_w = w;
+  d->rcas_h = h;
+  d->rcas_fmt = fmt;
 }
 
 static bool CreateRCASPipelineIfNeeded(reshade::api::device* dev, DeviceData* d) {
@@ -7786,18 +9342,29 @@ static bool CreateRCASPipelineIfNeeded(reshade::api::device* dev, DeviceData* d)
     if (bc.empty() || !lo.handle) return false;
     if (out->handle != 0u) return true;
     reshade::api::shader_desc sd = {};
-    sd.code = bc.data(); sd.code_size = bc.size(); sd.entry_point = "main";
+    sd.code = bc.data();
+    sd.code_size = bc.size();
+    sd.entry_point = "main";
     reshade::api::pipeline_subobject so = {reshade::api::pipeline_subobject_type::compute_shader, 1, &sd};
     return dev->create_pipeline(lo, 1, &so, out);
   };
   if (d->rcas_layout.handle == 0u || d->rcas_layout_version != kRCASLayoutVersion) {
     if (d->rcas_layout.handle) {
-      for (auto& t : d->rcas_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
-      dev->destroy_pipeline_layout(d->rcas_layout); d->rcas_layout = {};
-      if (d->rcas_pipeline.handle) { dev->destroy_pipeline(d->rcas_pipeline); d->rcas_pipeline = {}; }
+      for (auto& t : d->rcas_tables) {
+        if (t.handle) {
+          dev->free_descriptor_table(t);
+          t = {};
+        }
+      }
+      dev->destroy_pipeline_layout(d->rcas_layout);
+      d->rcas_layout = {};
+      if (d->rcas_pipeline.handle) {
+        dev->destroy_pipeline(d->rcas_pipeline);
+        d->rcas_pipeline = {};
+      }
     }
-    DR srv_r = {0,0,0,2,DS::all_compute,1,DT::texture_shader_resource_view};  // t0 unsharpened copy, t1 motion buffer
-    DR uav_r = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 sharpened temp
+    DR srv_r = {0, 0, 0, 2, DS::all_compute, 1, DT::texture_shader_resource_view};   // t0 unsharpened copy, t1 motion buffer
+    DR uav_r = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};  // u0 sharpened temp
     reshade::api::constant_range push_range = {};
     push_range.binding = 0;
     push_range.dx_register_index = 13;
@@ -7805,10 +9372,15 @@ static bool CreateRCASPipelineIfNeeded(reshade::api::device* dev, DeviceData* d)
     push_range.count = 11;  // con, width, height, denoise, motionOn, threshold, range, response, mult, debug, max
     push_range.visibility = DS::all_compute;
     P p0, p1, pPush;
-    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &srv_r;
-    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &uav_r;
-    pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
-    P params[3] = {p0,p1,pPush};
+    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p0.descriptor_table.count = 1;
+    p0.descriptor_table.ranges = &srv_r;
+    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p1.descriptor_table.count = 1;
+    p1.descriptor_table.ranges = &uav_r;
+    pPush.type = reshade::api::pipeline_layout_param_type::push_constants;
+    pPush.push_constants = push_range;
+    P params[3] = {p0, p1, pPush};
     if (!dev->create_pipeline_layout(3, params, &d->rcas_layout)) return false;
     d->rcas_layout_version = kRCASLayoutVersion;
   }
@@ -7840,13 +9412,18 @@ static void DestroyFXAASet(reshade::api::device* dev, DeviceData* d) {
   if (!dev || !d) return;
   auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
   auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
-  dv(d->fxaa_temp_srv); dv(d->fxaa_temp_uav); dr(d->fxaa_temp_texture);
-  dv(d->fxaa_luma_srv); dv(d->fxaa_luma_uav); dr(d->fxaa_luma_texture);
+  dv(d->fxaa_temp_srv);
+  dv(d->fxaa_temp_uav);
+  dr(d->fxaa_temp_texture);
+  dv(d->fxaa_luma_srv);
+  dv(d->fxaa_luma_uav);
+  dr(d->fxaa_luma_texture);
   if (d->fxaa_hist_srv_owned) dv(d->fxaa_hist_srv);
   d->fxaa_hist_srv = {};
   d->fxaa_hist_srv_owned = false;
   d->fxaa_hist_seen = {};
-  d->fxaa_w = 0u; d->fxaa_h = 0u;
+  d->fxaa_w = 0u;
+  d->fxaa_h = 0u;
   d->fxaa_fmt = reshade::api::format::unknown;
   d->fxaa_logged = false;
 }
@@ -7854,11 +9431,28 @@ static void DestroyFXAASet(reshade::api::device* dev, DeviceData* d) {
 static void DestroyFXAAResources(reshade::api::device* dev, DeviceData* d) {
   if (!dev || !d) return;
   DestroyFXAASet(dev, d);
-  for (auto& t : d->fxaa_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
-  if (d->fxaa_luma_pipeline.handle) { dev->destroy_pipeline(d->fxaa_luma_pipeline); d->fxaa_luma_pipeline = {}; }
-  if (d->fxaa_standard_pipeline.handle) { dev->destroy_pipeline(d->fxaa_standard_pipeline); d->fxaa_standard_pipeline = {}; }
-  if (d->fxaa_high_pipeline.handle) { dev->destroy_pipeline(d->fxaa_high_pipeline); d->fxaa_high_pipeline = {}; }
-  if (d->fxaa_layout.handle) { dev->destroy_pipeline_layout(d->fxaa_layout); d->fxaa_layout = {}; }
+  for (auto& t : d->fxaa_tables) {
+    if (t.handle) {
+      dev->free_descriptor_table(t);
+      t = {};
+    }
+  }
+  if (d->fxaa_luma_pipeline.handle) {
+    dev->destroy_pipeline(d->fxaa_luma_pipeline);
+    d->fxaa_luma_pipeline = {};
+  }
+  if (d->fxaa_standard_pipeline.handle) {
+    dev->destroy_pipeline(d->fxaa_standard_pipeline);
+    d->fxaa_standard_pipeline = {};
+  }
+  if (d->fxaa_high_pipeline.handle) {
+    dev->destroy_pipeline(d->fxaa_high_pipeline);
+    d->fxaa_high_pipeline = {};
+  }
+  if (d->fxaa_layout.handle) {
+    dev->destroy_pipeline_layout(d->fxaa_layout);
+    d->fxaa_layout = {};
+  }
   d->fxaa_layout_version = 0u;
 }
 
@@ -7900,7 +9494,9 @@ static void CreateFXAAResources(reshade::api::device* dev, DeviceData* d,
     DestroyFXAASet(dev, d);
     return;
   }
-  d->fxaa_w = w; d->fxaa_h = h; d->fxaa_fmt = fmt;
+  d->fxaa_w = w;
+  d->fxaa_h = h;
+  d->fxaa_fmt = fmt;
   d->fxaa_hist_seen = d->rcas_hist_texture;
 }
 
@@ -7914,20 +9510,37 @@ static bool CreateFXAAPipelineIfNeeded(reshade::api::device* dev, DeviceData* d)
     if (bc.empty() || !lo.handle) return false;
     if (out->handle != 0u) return true;
     reshade::api::shader_desc sd = {};
-    sd.code = bc.data(); sd.code_size = bc.size(); sd.entry_point = "main";
+    sd.code = bc.data();
+    sd.code_size = bc.size();
+    sd.entry_point = "main";
     reshade::api::pipeline_subobject so = {reshade::api::pipeline_subobject_type::compute_shader, 1, &sd};
     return dev->create_pipeline(lo, 1, &so, out);
   };
   if (d->fxaa_layout.handle == 0u || d->fxaa_layout_version != kFXAALayoutVersion) {
     if (d->fxaa_layout.handle) {
-      for (auto& t : d->fxaa_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
-      dev->destroy_pipeline_layout(d->fxaa_layout); d->fxaa_layout = {};
-      if (d->fxaa_luma_pipeline.handle) { dev->destroy_pipeline(d->fxaa_luma_pipeline); d->fxaa_luma_pipeline = {}; }
-      if (d->fxaa_standard_pipeline.handle) { dev->destroy_pipeline(d->fxaa_standard_pipeline); d->fxaa_standard_pipeline = {}; }
-      if (d->fxaa_high_pipeline.handle) { dev->destroy_pipeline(d->fxaa_high_pipeline); d->fxaa_high_pipeline = {}; }
+      for (auto& t : d->fxaa_tables) {
+        if (t.handle) {
+          dev->free_descriptor_table(t);
+          t = {};
+        }
+      }
+      dev->destroy_pipeline_layout(d->fxaa_layout);
+      d->fxaa_layout = {};
+      if (d->fxaa_luma_pipeline.handle) {
+        dev->destroy_pipeline(d->fxaa_luma_pipeline);
+        d->fxaa_luma_pipeline = {};
+      }
+      if (d->fxaa_standard_pipeline.handle) {
+        dev->destroy_pipeline(d->fxaa_standard_pipeline);
+        d->fxaa_standard_pipeline = {};
+      }
+      if (d->fxaa_high_pipeline.handle) {
+        dev->destroy_pipeline(d->fxaa_high_pipeline);
+        d->fxaa_high_pipeline = {};
+      }
     }
-    DR srv_r = {0,0,0,2,DS::all_compute,1,DT::texture_shader_resource_view};  // t0 color copy, t1 luma
-    DR uav_r = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 target
+    DR srv_r = {0, 0, 0, 2, DS::all_compute, 1, DT::texture_shader_resource_view};   // t0 color copy, t1 luma
+    DR uav_r = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};  // u0 target
     reshade::api::constant_range push_range = {};
     push_range.binding = 0;
     push_range.dx_register_index = 13;
@@ -7935,10 +9548,15 @@ static bool CreateFXAAPipelineIfNeeded(reshade::api::device* dev, DeviceData* d)
     push_range.count = 6;  // width, height, subpix, edgeThreshold, edgeThresholdMin, lumaMode
     push_range.visibility = DS::all_compute;
     P p0, p1, pPush;
-    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &srv_r;
-    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &uav_r;
-    pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
-    P params[3] = {p0,p1,pPush};
+    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p0.descriptor_table.count = 1;
+    p0.descriptor_table.ranges = &srv_r;
+    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p1.descriptor_table.count = 1;
+    p1.descriptor_table.ranges = &uav_r;
+    pPush.type = reshade::api::pipeline_layout_param_type::push_constants;
+    pPush.push_constants = push_range;
+    P params[3] = {p0, p1, pPush};
     if (!dev->create_pipeline_layout(3, params, &d->fxaa_layout)) return false;
     d->fxaa_layout_version = kFXAALayoutVersion;
   }
@@ -7972,8 +9590,8 @@ static bool CreateFXAAPipelineIfNeeded(reshade::api::device* dev, DeviceData* d)
   }
 #endif
   return d->fxaa_luma_pipeline.handle != 0u
-      && d->fxaa_standard_pipeline.handle != 0u
-      && d->fxaa_high_pipeline.handle != 0u;
+         && d->fxaa_standard_pipeline.handle != 0u
+         && d->fxaa_high_pipeline.handle != 0u;
 }
 
 // Runs inline on the TAA draw's own command list, immediately after the draw
@@ -8028,9 +9646,10 @@ static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
     }
     if (!d->rcas_format_logged) {
       reshade::log::message(reshade::log::level::info,
-        (std::string("[RCAS] target ") + std::to_string(w) + "x" + std::to_string(h)
-          + " fmt=" + std::to_string((int)fmt)
-          + " work=" + std::to_string((int)RCASLinearFormat(fmt))).c_str());
+                            (std::string("[RCAS] target ") + std::to_string(w) + "x" + std::to_string(h)
+                             + " fmt=" + std::to_string((int)fmt)
+                             + " work=" + std::to_string((int)RCASLinearFormat(fmt)))
+                                .c_str());
       d->rcas_format_logged = true;
     }
   }
@@ -8064,7 +9683,7 @@ static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
       if (d->fxaa_temp_uav.handle && d->fxaa_luma_uav.handle && d->fxaa_hist_srv.handle) {
         using F = reshade::api::format;
         const bool hdr = (fmt == F::r16g16b16a16_float) || (fmt == F::r11g11b10_float)
-            || (fmt == F::r32g32b32a32_float);
+                         || (fmt == F::r32g32b32a32_float);
         float pc[6] = {(float)w, (float)h,
                        std::clamp(shader_injection.fxaa_subpix, 0.f, 1.f),
                        std::clamp(shader_injection.fxaa_edge_threshold, 0.031f, 0.333f),
@@ -8104,9 +9723,10 @@ static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
         fxaa_active = true;
         if (!d->fxaa_logged) {
           reshade::log::message(reshade::log::level::info,
-            (std::string("[FXAA] dispatch groups=") + std::to_string((w + 7u) / 8u) + "x" + std::to_string((h + 7u) / 8u)
-              + " quality=" + (shader_injection.fxaa_quality > 0.5f ? "high" : "standard")
-              + " luma=" + (hdr ? "hdr" : "ldr")).c_str());
+                                (std::string("[FXAA] dispatch groups=") + std::to_string((w + 7u) / 8u) + "x" + std::to_string((h + 7u) / 8u)
+                                 + " quality=" + (shader_injection.fxaa_quality > 0.5f ? "high" : "standard")
+                                 + " luma=" + (hdr ? "hdr" : "ldr"))
+                                    .c_str());
           d->fxaa_logged = true;
         }
       } else if (!d->fxaa_logged) {
@@ -8125,8 +9745,8 @@ static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
   // comes from base x multiplier, so it is 0 there by arithmetic, exactly).
   float effStrength = (shader_injection.rcas_enabled > 0.5f) ? shader_injection.rcas_strength : 0.f;
   bool motionCouldApply = (shader_injection.rcas_enabled > 0.5f)
-      && (shader_injection.rcas_motion_on > 0.5f)
-      && d->rcas_motion_srv.handle && d->rcas_motion_live.load();
+                          && (shader_injection.rcas_motion_on > 0.5f)
+                          && d->rcas_motion_srv.handle && d->rcas_motion_live.load();
   if (effStrength <= 0.0005f && !motionCouldApply) {
     if (!fxaa_active) return;
     // RCAS skipped: publish the FXAA result over the TAA output so downstream
@@ -8165,22 +9785,23 @@ static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
     float s = std::clamp(effStrength, 0.f, 1.f);
     float dn = (shader_injection.rcas_denoise > 0.5f) ? 1.f : 0.f;
     bool motionOk = (shader_injection.rcas_motion_on > 0.5f)
-        && d->rcas_motion_srv.handle && d->rcas_motion_live.load();
+                    && d->rcas_motion_srv.handle && d->rcas_motion_live.load();
     float pc[11] = {s, (float)w, (float)h, dn,
-                   motionOk ? 1.f : 0.f,
-                   std::max(0.f, shader_injection.rcas_motion_threshold),
-                   std::max(0.25f, shader_injection.rcas_motion_range),
-                   std::clamp(shader_injection.rcas_motion_response, 0.5f, 3.f),
-                   std::clamp(shader_injection.rcas_motion_multiplier, 1.f, 10.f),
-                   shader_injection.rcas_debug > 0.5f ? 1.f : 0.f,
-                   std::clamp(shader_injection.rcas_motion_max, 0.f, 3.f)};
+                    motionOk ? 1.f : 0.f,
+                    std::max(0.f, shader_injection.rcas_motion_threshold),
+                    std::max(0.25f, shader_injection.rcas_motion_range),
+                    std::clamp(shader_injection.rcas_motion_response, 0.5f, 3.f),
+                    std::clamp(shader_injection.rcas_motion_multiplier, 1.f, 10.f),
+                    shader_injection.rcas_debug > 0.5f ? 1.f : 0.f,
+                    std::clamp(shader_injection.rcas_motion_max, 0.f, 3.f)};
     cmd_list->push_constants(reshade::api::shader_stage::all_compute, d->rcas_layout, 2, 0, 11, pc);
     if (!d->rcas_dispatch_logged) {
       reshade::log::message(reshade::log::level::info,
-        (std::string("[RCAS] dispatch groups=") + std::to_string((w + 7u) / 8u) + "x" + std::to_string((h + 7u) / 8u)
-          + " con=" + std::to_string(pc[0])
-          + " tables=" + std::to_string(d->rcas_tables[0].handle) + "/" + std::to_string(d->rcas_tables[1].handle)
-          + " src=" + std::to_string(srcRes.handle)).c_str());
+                            (std::string("[RCAS] dispatch groups=") + std::to_string((w + 7u) / 8u) + "x" + std::to_string((h + 7u) / 8u)
+                             + " con=" + std::to_string(pc[0])
+                             + " tables=" + std::to_string(d->rcas_tables[0].handle) + "/" + std::to_string(d->rcas_tables[1].handle)
+                             + " src=" + std::to_string(srcRes.handle))
+                                .c_str());
       d->rcas_dispatch_logged = true;
     }
   }
@@ -8258,26 +9879,28 @@ static void MBMotionRtv4Ensure(reshade::api::device* dev, DeviceData* d) {
     if (!d->mb_rtv4_warned_fmt) {
       d->mb_rtv4_warned_fmt = true;
       const std::string got = isTexture
-          ? (std::to_string(rdesc.texture.width) + "x" + std::to_string(rdesc.texture.height)
-             + " format=" + std::to_string(static_cast<int>(rdesc.texture.format)))
-          : std::string("not a texture_2d");
+                                  ? (std::to_string(rdesc.texture.width) + "x" + std::to_string(rdesc.texture.height)
+                                     + " format=" + std::to_string(static_cast<int>(rdesc.texture.format)))
+                                  : std::string("not a texture_2d");
       reshade::log::message(reshade::log::level::warning,
-          ("[MotionBlur] the first five-target bind's slot 4 is not the motion buffer "
-           "(" + got + "). Expected r16g16_float. Blur is off this frame and the "
-           "capture is retried; this message appears once.").c_str());
+                            ("[MotionBlur] the first five-target bind's slot 4 is not the motion buffer "
+                             "("
+                             + got + "). Expected r16g16_float. Blur is off this frame and the "
+                                     "capture is retried; this message appears once.")
+                                .c_str());
     }
     return;
   }
   dev->create_resource_view(mres, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
-                                       rdesc.texture.format, 0, 1, 0, 1),
-      &d->mb_rtv4_owned_srv);
+                            reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
+                                                             rdesc.texture.format, 0, 1, 0, 1),
+                            &d->mb_rtv4_owned_srv);
   if (d->mb_rtv4_owned_srv.handle == 0u) {
     d->mb_rtv4_res.store(0u, std::memory_order_release);
     reshade::log::message(reshade::log::level::warning,
-        "[MotionBlur] could not create a shader resource view on the RTV4 motion "
-        "resource. Blur is off this frame; it will retry. This is a declared "
-        "limitation, not a fallback to the render target.");
+                          "[MotionBlur] could not create a shader resource view on the RTV4 motion "
+                          "resource. Blur is off this frame; it will retry. This is a declared "
+                          "limitation, not a fallback to the render target.");
   }
 }
 
@@ -8295,10 +9918,12 @@ static reshade::api::resource_view MBMotionInputView(DeviceData* d) {
   if (!d) return {};
   if (MBMotionUseRtv()) {
     return (d->mb_rtv4_live.load() && d->mb_rtv4_owned_srv.handle != 0u)
-             ? d->mb_rtv4_owned_srv : reshade::api::resource_view{};
+               ? d->mb_rtv4_owned_srv
+               : reshade::api::resource_view{};
   }
   return (d->rcas_motion_srv.handle != 0u && d->rcas_motion_live.load())
-           ? d->rcas_motion_srv : reshade::api::resource_view{};
+             ? d->rcas_motion_srv
+             : reshade::api::resource_view{};
 }
 
 // Latest-bound RTV0 tracker for the RCAS stage, plus the motion blur's RTV4
@@ -8391,15 +10016,30 @@ static void DestroyMotionBlurSet(reshade::api::device* dev, DeviceData* d) {
   if (!dev || !d) return;
   auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
   auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
-  dv(d->mb_tilemax_srv); dv(d->mb_tilemax_uav); dr(d->mb_tilemax_texture);
-  dv(d->mb_neighbormax_srv); dv(d->mb_neighbormax_uav); dr(d->mb_neighbormax_texture);
-  dv(d->mb_half_color_srv); dv(d->mb_half_color_uav); dr(d->mb_half_color_texture);
-  dv(d->mb_half_result_srv); dv(d->mb_half_result_uav); dr(d->mb_half_result_texture);
-    dv(d->mb_output_srv); dv(d->mb_output_uav); dr(d->mb_output_texture);
-    dv(d->mb_resolve_srv); dv(d->mb_resolve_uav); dr(d->mb_resolve_texture);
-    d->mb_working_w = 0u; d->mb_working_h = 0u;
-    d->mb_motion_w = 0u; d->mb_motion_h = 0u;
-  d->mb_tiles_x = 0u; d->mb_tiles_y = 0u;
+  dv(d->mb_tilemax_srv);
+  dv(d->mb_tilemax_uav);
+  dr(d->mb_tilemax_texture);
+  dv(d->mb_neighbormax_srv);
+  dv(d->mb_neighbormax_uav);
+  dr(d->mb_neighbormax_texture);
+  dv(d->mb_half_color_srv);
+  dv(d->mb_half_color_uav);
+  dr(d->mb_half_color_texture);
+  dv(d->mb_half_result_srv);
+  dv(d->mb_half_result_uav);
+  dr(d->mb_half_result_texture);
+  dv(d->mb_output_srv);
+  dv(d->mb_output_uav);
+  dr(d->mb_output_texture);
+  dv(d->mb_resolve_srv);
+  dv(d->mb_resolve_uav);
+  dr(d->mb_resolve_texture);
+  d->mb_working_w = 0u;
+  d->mb_working_h = 0u;
+  d->mb_motion_w = 0u;
+  d->mb_motion_h = 0u;
+  d->mb_tiles_x = 0u;
+  d->mb_tiles_y = 0u;
   d->mb_radius_px = 0u;
   d->mb_output_fmt = reshade::api::format::unknown;
   d->mb_halfres = false;
@@ -8418,18 +10058,45 @@ static void DestroyMotionBlurResources(reshade::api::device* dev, DeviceData* d)
   // Full teardown, so the RG16F capability latch is re-probed on the next set.
   d->mb_resolve_narrow_failed = false;
   for (auto& set : d->mb_tables) {
-    for (auto& t : set) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+    for (auto& t : set) {
+      if (t.handle) {
+        dev->free_descriptor_table(t);
+        t = {};
+      }
+    }
     set = {};
   }
-  for (auto& p : d->mb_pipelines) { if (p.handle) { dev->destroy_pipeline(p); p = {}; } }
-  for (auto& l : d->mb_layouts) { if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; } }
-  if (d->mb_noise_fallback_srv.handle) { dev->destroy_resource_view(d->mb_noise_fallback_srv); d->mb_noise_fallback_srv = {}; }
-  if (d->mb_noise_fallback_res.handle) { dev->destroy_resource(d->mb_noise_fallback_res); d->mb_noise_fallback_res = {}; }
-  if (d->mb_point_clamp_sampler.handle) { dev->destroy_sampler(d->mb_point_clamp_sampler); d->mb_point_clamp_sampler = {}; }
+  for (auto& p : d->mb_pipelines) {
+    if (p.handle) {
+      dev->destroy_pipeline(p);
+      p = {};
+    }
+  }
+  for (auto& l : d->mb_layouts) {
+    if (l.handle) {
+      dev->destroy_pipeline_layout(l);
+      l = {};
+    }
+  }
+  if (d->mb_noise_fallback_srv.handle) {
+    dev->destroy_resource_view(d->mb_noise_fallback_srv);
+    d->mb_noise_fallback_srv = {};
+  }
+  if (d->mb_noise_fallback_res.handle) {
+    dev->destroy_resource(d->mb_noise_fallback_res);
+    d->mb_noise_fallback_res = {};
+  }
+  if (d->mb_point_clamp_sampler.handle) {
+    dev->destroy_sampler(d->mb_point_clamp_sampler);
+    d->mb_point_clamp_sampler = {};
+  }
   // Our SRV on the game's motion resource. Not part of mb_layouts/mb_tables: it is
   // a view on a game-owned resource, and those are freed on a set rebuild, not on
   // device teardown.
-  if (d->mb_rtv4_owned_srv.handle) { dev->destroy_resource_view(d->mb_rtv4_owned_srv); d->mb_rtv4_owned_srv = {}; }
+  if (d->mb_rtv4_owned_srv.handle) {
+    dev->destroy_resource_view(d->mb_rtv4_owned_srv);
+    d->mb_rtv4_owned_srv = {};
+  }
   d->mb_rtv4_res.store(0u, std::memory_order_release);
   d->mb_rtv4_owned_dirty.store(false, std::memory_order_release);
 }
@@ -8445,20 +10112,20 @@ static bool EnsureMotionBlurPipelines(reshade::api::device* dev, DeviceData* d) 
   // ShaderInjectData rather than a hand-mapped subset, because the motion blur
   // shaders include shared.h and read the mb_* fields directly � one source of
   // truth, no per-shader re-declaration to drift.
-    // gather binds 6: color, motion, neighbormax, depth, noise, and the GAME
-    // motion alongside the resolved one, which only the two velocity views read
-    // (they return before the tap loop, so it costs nothing in the normal path).
-    static constexpr uint32_t kSrvPerPass[kMotionBlurPassCount] = {1u, 1u, 1u, 6u, 2u, 2u, 2u};
-    static const std::span<const uint8_t> kBytecode[kMotionBlurPassCount] = {
-        __motion_blur_downsample, __motion_blur_tilemax, __motion_blur_neighbormax,
-        __motion_blur_gather, __motion_blur_composite, __motion_blur_resolve,
-        __motion_blur_resolve_wide};
+  // gather binds 6: color, motion, neighbormax, depth, noise, and the GAME
+  // motion alongside the resolved one, which only the two velocity views read
+  // (they return before the tap loop, so it costs nothing in the normal path).
+  static constexpr uint32_t kSrvPerPass[kMotionBlurPassCount] = {1u, 1u, 1u, 6u, 2u, 2u, 2u};
+  static const std::span<const uint8_t> kBytecode[kMotionBlurPassCount] = {
+      __motion_blur_downsample, __motion_blur_tilemax, __motion_blur_neighbormax,
+      __motion_blur_gather, __motion_blur_composite, __motion_blur_resolve,
+      __motion_blur_resolve_wide};
   for (uint32_t pass = 0; pass < kMotionBlurPassCount; ++pass) {
     if (d->mb_layouts[pass].handle == 0u) {
-      DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
-      DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer};
-      DR srv_r     = {0,0,0,kSrvPerPass[pass],DS::all_compute,1,DT::texture_shader_resource_view};
-      DR uav_r     = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view};
+      DR sampler_r = {0, 0, 0, 1, DS::all_compute, 1, DT::sampler};
+      DR cbv_r = {0, 0, 0, 1, DS::all_compute, 1, DT::constant_buffer};
+      DR srv_r = {0, 0, 0, kSrvPerPass[pass], DS::all_compute, 1, DT::texture_shader_resource_view};
+      DR uav_r = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};
       reshade::api::constant_range push_range = {};
       push_range.binding = 0;
       push_range.dx_register_index = 13;
@@ -8467,13 +10134,17 @@ static bool EnsureMotionBlurPipelines(reshade::api::device* dev, DeviceData* d) 
       push_range.visibility = DS::all_compute;
       P param_sampler, param_cbv, param_srv, param_uav, param_constants;
       param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-      param_sampler.descriptor_table.count = 1; param_sampler.descriptor_table.ranges = &sampler_r;
+      param_sampler.descriptor_table.count = 1;
+      param_sampler.descriptor_table.ranges = &sampler_r;
       param_cbv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-      param_cbv.descriptor_table.count = 1; param_cbv.descriptor_table.ranges = &cbv_r;
+      param_cbv.descriptor_table.count = 1;
+      param_cbv.descriptor_table.ranges = &cbv_r;
       param_srv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-      param_srv.descriptor_table.count = 1; param_srv.descriptor_table.ranges = &srv_r;
+      param_srv.descriptor_table.count = 1;
+      param_srv.descriptor_table.ranges = &srv_r;
       param_uav.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-      param_uav.descriptor_table.count = 1; param_uav.descriptor_table.ranges = &uav_r;
+      param_uav.descriptor_table.count = 1;
+      param_uav.descriptor_table.ranges = &uav_r;
       param_constants.type = reshade::api::pipeline_layout_param_type::push_constants;
       param_constants.push_constants = push_range;
       P params[5] = {param_sampler, param_cbv, param_srv, param_uav, param_constants};
@@ -8502,9 +10173,12 @@ static bool EnsureMotionBlurPipelines(reshade::api::device* dev, DeviceData* d) 
         // Wide is the same source with MB_RESOLVE_WIDE defined, so the game
         // variant still has to be picked here as well.
         const bool wide = (pass == kMbResolveWide);
-        if (IsKai())          code = wide ? __motion_blur_resolve_kai_wide : __motion_blur_resolve_kai;
-        else if (IsSora1st()) code = wide ? __motion_blur_resolve_sora1st_wide : __motion_blur_resolve_sora1st;
-        else if (wide)        code = __motion_blur_resolve_wide;
+        if (IsKai())
+          code = wide ? __motion_blur_resolve_kai_wide : __motion_blur_resolve_kai;
+        else if (IsSora1st())
+          code = wide ? __motion_blur_resolve_sora1st_wide : __motion_blur_resolve_sora1st;
+        else if (wide)
+          code = __motion_blur_resolve_wide;
       }
       if (code.empty() || d->mb_layouts[pass].handle == 0u) return false;
       reshade::api::shader_desc sd = {};
@@ -8545,7 +10219,7 @@ static bool EnsureMotionBlurNoiseFallback(reshade::api::device* dev, DeviceData*
   rd.usage = reshade::api::resource_usage::shader_resource;
   if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &d->mb_noise_fallback_res)) return false;
   reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_3d,
-                                       reshade::api::format::r8_unorm, 0, 1, 0, 1);
+                                      reshade::api::format::r8_unorm, 0, 1, 0, 1);
   if (!dev->create_resource_view(d->mb_noise_fallback_res, reshade::api::resource_usage::shader_resource,
                                  vd, &d->mb_noise_fallback_srv)) {
     dev->destroy_resource(d->mb_noise_fallback_res);
@@ -8597,12 +10271,12 @@ static void CreateMotionBlurSet(reshade::api::device* dev, DeviceData* d,
   // accepts the UAV. See the allocation below.
   const auto tileFmt = reshade::api::format::r16g16b16a16_float;
   bool ok =
-     mk(tilesX, tilesY, tileFmt,
-        &d->mb_tilemax_texture, &d->mb_tilemax_srv, &d->mb_tilemax_uav)
-   && mk(tilesX, tilesY, tileFmt,
-        &d->mb_neighbormax_texture, &d->mb_neighbormax_srv, &d->mb_neighbormax_uav)
-   && mk(workingW, workingH, outputFormat,
-         &d->mb_output_texture, &d->mb_output_srv, &d->mb_output_uav);
+      mk(tilesX, tilesY, tileFmt,
+         &d->mb_tilemax_texture, &d->mb_tilemax_srv, &d->mb_tilemax_uav)
+      && mk(tilesX, tilesY, tileFmt,
+            &d->mb_neighbormax_texture, &d->mb_neighbormax_srv, &d->mb_neighbormax_uav)
+      && mk(workingW, workingH, outputFormat,
+            &d->mb_output_texture, &d->mb_output_srv, &d->mb_output_uav);
   // The camera/object split output, at the MOTION texture's resolution (which is
   // not necessarily workingW/H). .xy is the blended velocity every pass above
   // reduces or samples; .zw is camera-only, read by the two camera-term debug
@@ -8627,7 +10301,9 @@ static void CreateMotionBlurSet(reshade::api::device* dev, DeviceData* d,
       // fails, so tear the partial attempt down before overwriting the pointers.
       auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
       auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
-      dv(d->mb_resolve_srv); dv(d->mb_resolve_uav); dr(d->mb_resolve_texture);
+      dv(d->mb_resolve_srv);
+      dv(d->mb_resolve_uav);
+      dr(d->mb_resolve_texture);
       ok = mk(resolveW, resolveH, tileFmt,
               &d->mb_resolve_texture, &d->mb_resolve_srv, &d->mb_resolve_uav);
     }
@@ -8641,16 +10317,19 @@ static void CreateMotionBlurSet(reshade::api::device* dev, DeviceData* d,
   if (ok && halfRes) {
     ok = mk(halfW, halfH, outputFormat,
             &d->mb_half_color_texture, &d->mb_half_color_srv, &d->mb_half_color_uav)
-      && mk(halfW, halfH, outputFormat,
-            &d->mb_half_result_texture, &d->mb_half_result_srv, &d->mb_half_result_uav);
+         && mk(halfW, halfH, outputFormat,
+               &d->mb_half_result_texture, &d->mb_half_result_srv, &d->mb_half_result_uav);
   }
   if (!ok) {
     DestroyMotionBlurSet(dev, d);
     return;
   }
-  d->mb_working_w = workingW; d->mb_working_h = workingH;
-  d->mb_motion_w = motionW; d->mb_motion_h = motionH;
-  d->mb_tiles_x = tilesX; d->mb_tiles_y = tilesY;
+  d->mb_working_w = workingW;
+  d->mb_working_h = workingH;
+  d->mb_motion_w = motionW;
+  d->mb_motion_h = motionH;
+  d->mb_tiles_x = tilesX;
+  d->mb_tiles_y = tilesY;
   d->mb_radius_px = static_cast<uint32_t>(std::max(shader_injection.mb_max_radius_px, 8.f));
   d->mb_output_fmt = outputFormat;
   d->mb_halfres = halfRes;
@@ -8797,8 +10476,9 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
             && MotionBlurLogEnabled()) {
           d->mb_logged_rtv4_dims = true;
           reshade::log::message(reshade::log::level::info,
-              ("[MotionBlur] RTV4 motion " + std::to_string(motionW) + "x"
-               + std::to_string(motionH) + " bound as our own SRV").c_str());
+                                ("[MotionBlur] RTV4 motion " + std::to_string(motionW) + "x"
+                                 + std::to_string(motionH) + " bound as our own SRV")
+                                    .c_str());
         }
       }
     }
@@ -8870,15 +10550,16 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
       const bool motionDiffers = (motionW != workingW) || (motionH != workingH);
       const bool depthDiffers = (depthW != workingW) || (depthH != workingH);
       reshade::log::message(reshade::log::level::info,
-          ("[MotionBlur] buffers: colour " + std::to_string(workingW) + "x" + std::to_string(workingH)
-           + " | motion " + std::to_string(motionW) + "x" + std::to_string(motionH)
-           + " | depth " + std::to_string(depthW) + "x" + std::to_string(depthH)
-           + " | resolve " + (d->mb_resolve_narrow ? "RG16F" : "RGBA16F")
-           + " | source " + MBMotionInputName()
-           + (motionDiffers
-                ? " -- motion differs, gather is using filtered reads"
-                : " -- motion matches, single-tap reads")
-           + (depthDiffers ? " (depth differs, point sampled by design)" : "")).c_str());
+                            ("[MotionBlur] buffers: colour " + std::to_string(workingW) + "x" + std::to_string(workingH)
+                             + " | motion " + std::to_string(motionW) + "x" + std::to_string(motionH)
+                             + " | depth " + std::to_string(depthW) + "x" + std::to_string(depthH)
+                             + " | resolve " + (d->mb_resolve_narrow ? "RG16F" : "RGBA16F")
+                             + " | source " + MBMotionInputName()
+                             + (motionDiffers
+                                    ? " -- motion differs, gather is using filtered reads"
+                                    : " -- motion matches, single-tap reads")
+                             + (depthDiffers ? " (depth differs, point sampled by design)" : ""))
+                                .c_str());
     }
   }
   shader_injection.mb_tiles_x = static_cast<float>(d->mb_tiles_x);
@@ -8904,9 +10585,9 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
     d->mb_last_frame_scale = shader_injection.mb_frame_scale;
     if (MotionBlurLogEnabled()) {
       reshade::log::message(reshade::log::level::info,
-          ("[MotionBlur] frame scale " + std::to_string(shader_injection.mb_frame_scale)
-           + " (reference " + std::to_string(static_cast<int>(
-                  shader_injection.mb_frame_rate_reference)) + " fps)").c_str());
+                            ("[MotionBlur] frame scale " + std::to_string(shader_injection.mb_frame_scale)
+                             + " (reference " + std::to_string(static_cast<int>(shader_injection.mb_frame_rate_reference)) + " fps)")
+                                .c_str());
     }
   }
   return true;
@@ -8932,10 +10613,10 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
   auto apply = [&](uint32_t pass, reshade::api::resource_view* srvs, uint32_t srvCount,
                    reshade::api::resource_view uav) {
     std::array<reshade::api::descriptor_table_update, kGtvbaoDescriptorTableParamCount> u = {{
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->mb_point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,srvCount,reshade::api::descriptor_type::texture_shader_resource_view,srvs},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&uav},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->mb_point_clamp_sampler},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, srvCount, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &uav},
     }};
     for (uint32_t i = 0; i < kGtvbaoDescriptorTableParamCount; ++i) u[i].table = d->mb_tables[pass][i];
     dev->update_descriptor_tables(kGtvbaoDescriptorTableParamCount, u.data());
@@ -8955,7 +10636,7 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
   // are missing the chain silently runs full res instead of dispatching against
   // null descriptors.
   const bool halfRes = d->mb_halfres
-      && d->mb_half_color_uav.handle != 0u && d->mb_half_result_uav.handle != 0u;
+                       && d->mb_half_color_uav.handle != 0u && d->mb_half_result_uav.handle != 0u;
   const uint32_t GW = halfRes ? std::max(1u, (W + 1u) / 2u) : W;  // gather resolution
   const uint32_t GH = halfRes ? std::max(1u, (H + 1u) / 2u) : H;
   reshade::api::resource_view depthSrc =
@@ -8988,9 +10669,9 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
     d->mb_warned_gather_only = false;
     if (MotionBlurLogEnabled()) {
       reshade::log::message(reshade::log::level::info,
-          chain == 0 ? "[MotionBlur] debug chain: Full"
-          : chain == 1 ? "[MotionBlur] debug chain: Prep Only (gather skipped, image untouched)"
-          : "[MotionBlur] debug chain: Gather Only (previous frame's prep)");
+                            chain == 0   ? "[MotionBlur] debug chain: Full"
+                            : chain == 1 ? "[MotionBlur] debug chain: Prep Only (gather skipped, image untouched)"
+                                         : "[MotionBlur] debug chain: Gather Only (previous frame's prep)");
     }
   }
   if (chain == 2 && !gatherOnly && !d->mb_warned_gather_only) {
@@ -9000,8 +10681,8 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
     if (MotionBlurLogEnabled()) {
       d->mb_warned_gather_only = true;
       reshade::log::message(reshade::log::level::warning,
-          "[MotionBlur] Gather Only ran before any prep pass; running the full chain "
-          "for this frame instead of dispatching against unprepared textures.");
+                            "[MotionBlur] Gather Only ran before any prep pass; running the full chain "
+                            "for this frame instead of dispatching against unprepared textures.");
     }
   }
   const bool runPrep = !gatherOnly;
@@ -9040,11 +10721,11 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
     if (!d->mb_logged_resolve_variant && MotionBlurLogEnabled()) {
       d->mb_logged_resolve_variant = true;
       reshade::log::message(reshade::log::level::info,
-          IsKai()
-              ? "[MotionBlur] scene cbuffer variant: kai (prevViewProj c85, motionJitterOffset c93)"
-              : (IsSora1st()
-                  ? "[MotionBlur] scene cbuffer variant: sora1st (prevViewProj c74, jitterDiff c78)"
-                  : "[MotionBlur] scene cbuffer variant: sora2nd (prevViewProj c75, jitterDiff c79)"));
+                            IsKai()
+                                ? "[MotionBlur] scene cbuffer variant: kai (prevViewProj c85, motionJitterOffset c93)"
+                                : (IsSora1st()
+                                       ? "[MotionBlur] scene cbuffer variant: sora1st (prevViewProj c74, jitterDiff c78)"
+                                       : "[MotionBlur] scene cbuffer variant: sora2nd (prevViewProj c75, jitterDiff c79)"));
     }
     // P0: reconstruct .xy = camera-length-scaled motion / .zw = camera only.
     // Runs at the MOTION texture's resolution, not the working resolution, and
@@ -9064,25 +10745,26 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
   const reshade::api::resource_view motionForChain = runResolve ? d->mb_resolve_srv : motionSrc;
 
   if (runPrep) {
-  {  // P1: TileMax over the blended motion, one thread group per tile (paper Section 3)
-    cl->bind_pipeline(AC, d->mb_pipelines[kMbTileMax]);
-    reshade::api::resource_view srvs[1] = {motionForChain};
-    apply(kMbTileMax, srvs, 1, d->mb_tilemax_uav);
-    cl->dispatch(TX, TY, 1u);
-    bar(d->mb_tilemax_texture, UA, SR);
-  }
-  {  // P2: NeighborMax, 3x3 one-ring with Section 4.4 diagonal culling
-    cl->bind_pipeline(AC, d->mb_pipelines[kMbNeighborMax]);
-    reshade::api::resource_view srvs[1] = {d->mb_tilemax_srv};
-    apply(kMbNeighborMax, srvs, 1, d->mb_neighbormax_uav);
-    cl->dispatch((TX + 7u) / 8u, (TY + 7u) / 8u, 1u);
-    bar(d->mb_neighbormax_texture, UA, SR);
-  }
+    {  // P1: TileMax over the blended motion, one thread group per tile (paper Section 3)
+      cl->bind_pipeline(AC, d->mb_pipelines[kMbTileMax]);
+      reshade::api::resource_view srvs[1] = {motionForChain};
+      apply(kMbTileMax, srvs, 1, d->mb_tilemax_uav);
+      cl->dispatch(TX, TY, 1u);
+      bar(d->mb_tilemax_texture, UA, SR);
+    }
+    {  // P2: NeighborMax, 3x3 one-ring with Section 4.4 diagonal culling
+      cl->bind_pipeline(AC, d->mb_pipelines[kMbNeighborMax]);
+      reshade::api::resource_view srvs[1] = {d->mb_tilemax_srv};
+      apply(kMbNeighborMax, srvs, 1, d->mb_neighbormax_uav);
+      cl->dispatch((TX + 7u) / 8u, (TY + 7u) / 8u, 1u);
+      bar(d->mb_neighbormax_texture, UA, SR);
+    }
     d->mb_prep_valid = true;
   }
   if (runGather) {
     reshade::api::resource_view noise = d->isfast_noise_srv.handle != 0u
-        ? d->isfast_noise_srv : d->mb_noise_fallback_srv;
+                                            ? d->isfast_noise_srv
+                                            : d->mb_noise_fallback_srv;
 
     // P4: full-res gather, owns the SHORT-motion tiles. Writes every pixel:
     // blurred where it owns them, untouched source where it does not, so the
@@ -9094,7 +10776,7 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
     cl->bind_pipeline(AC, d->mb_pipelines[kMbGather]);
     shader_injection.mb_gather_side = 0.f;
     reshade::api::resource_view fullSrvs[6] = {colorSrc, motionForChain, d->mb_neighbormax_srv,
-                                                depthSrc, noise, motionSrc};
+                                               depthSrc, noise, motionSrc};
     apply(kMbGather, fullSrvs, 6, d->mb_output_uav);
     cl->dispatch((W + 7u) / 8u, (H + 7u) / 8u, 1u);
 
@@ -9109,7 +10791,7 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
       cl->bind_pipeline(AC, d->mb_pipelines[kMbGather]);
       shader_injection.mb_gather_side = 1.f;
       reshade::api::resource_view halfSrvs[6] = {d->mb_half_color_srv, motionForChain,
-                                                  d->mb_neighbormax_srv, depthSrc, noise, motionSrc};
+                                                 d->mb_neighbormax_srv, depthSrc, noise, motionSrc};
       apply(kMbGather, halfSrvs, 6, d->mb_half_result_uav);
       cl->dispatch((GW + 7u) / 8u, (GH + 7u) / 8u, 1u);
       bar(d->mb_half_result_texture, UA, SR);
@@ -9221,13 +10903,14 @@ static bool OnBeforeTonemapDraw(reshade::api::command_list* cmd_list) {
       std::ostringstream wantHex;
       wantHex << std::hex << (IsKai() ? kKaiTonemapHash : kSoraTonemapHash);
       reshade::log::message(reshade::log::level::warning,
-          ("[MotionBlur] needs the tonemap's t0 view, which has not been captured. "
-           "Pixel hash 0x" + seenHex.str() + ", deploy gate expects 0x"
-           + wantHex.str()
-           + ". A matching hash means no push descriptor was captured for this "
-             "shader, not that the hash is wrong: check the fast-path gate in "
-             "OnPushDescriptorsCapture, and only then suspect descriptor tables.")
-             .c_str());
+                            ("[MotionBlur] needs the tonemap's t0 view, which has not been captured. "
+                             "Pixel hash 0x"
+                             + seenHex.str() + ", deploy gate expects 0x"
+                             + wantHex.str()
+                             + ". A matching hash means no push descriptor was captured for this "
+                               "shader, not that the hash is wrong: check the fast-path gate in "
+                               "OnPushDescriptorsCapture, and only then suspect descriptor tables.")
+                                .c_str());
     }
     return true;
   }
@@ -9248,7 +10931,7 @@ static bool OnBeforeTonemapDraw(reshade::api::command_list* cmd_list) {
     // draw has not run.
     if (d && MBMotionInputView(d).handle == 0u) {
       LogMotionBlurOnce(d, std::string("inactive: ") + MBMotionInputName()
-                                + " motion view not captured this frame");
+                               + " motion view not captured this frame");
     } else {
       LogMotionBlurOnce(d, "inactive: depth or pipelines unavailable");
     }
@@ -9270,16 +10953,15 @@ static bool OnBeforeTonemapDraw(reshade::api::command_list* cmd_list) {
 
   cmd_list->push_descriptors(
       reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
-      reshade::api::descriptor_table_update{{}, 0u, 0, 1,
-          reshade::api::descriptor_type::texture_shader_resource_view, &blurred});
+      reshade::api::descriptor_table_update{{}, 0u, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &blurred});
   // Passing cutscene=true asks "is the mode configured to ever run", which is the
   // right question for a log line, unlike the per-frame gate above.
   const char* mbName = !MotionBlurActive(true) ? "off"
-                     : (shader_injection.mb_mode >= 1.5f ? "always-on" : "cutscene-only");
+                                               : (shader_injection.mb_mode >= 1.5f ? "always-on" : "cutscene-only");
   const char* stage = shader_injection.mb_debug_chain < 0.5f ? "full"
-                     : (shader_injection.mb_debug_chain < 1.5f ? "prep-only" : "gather-only");
+                                                             : (shader_injection.mb_debug_chain < 1.5f ? "prep-only" : "gather-only");
   LogMotionBlurOnce(d, std::string("active: mode=") + mbName
-      + " MB under the game's tonemap, chain=" + stage);
+                           + " MB under the game's tonemap, chain=" + stage);
   return true;
 }
 
@@ -9300,8 +10982,8 @@ static bool KaiSSRReplaceActive(reshade::api::command_list* cmd_list) {
   if (!dd) return false;
   if (!dd->captured_vanilla_env_srv.handle) return false;
   reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
-      ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
-      : dd->dyncube_srv;
+                                           ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
+                                           : dd->dyncube_srv;
   if (!t17srv.handle) return false;
   return true;
 }
@@ -9341,16 +11023,14 @@ static bool OnBeforeKaiSSRDraw(reshade::api::command_list* cmd_list) {
   auto* dd = dev->get_private_data<DeviceData>();
   if (!dd) return true;
   reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
-      ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
-      : dd->dyncube_srv;
+                                           ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
+                                           : dd->dyncube_srv;
   if (t17srv.handle) {
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel,
         reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
-            {}, kDynCubeRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &t17srv});
+            {}, kDynCubeRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
   }
   if (dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv.handle) {
     auto histPosSrv = dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv;
@@ -9358,17 +11038,13 @@ static bool OnBeforeKaiSSRDraw(reshade::api::command_list* cmd_list) {
         reshade::api::shader_stage::pixel,
         reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
-            {}, kDynCubeHistPosRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &histPosSrv});
+            {}, kDynCubeHistPosRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &histPosSrv});
   }
   cmd_list->push_descriptors(
       reshade::api::shader_stage::pixel,
       reshade::api::pipeline_layout{0}, 0,
       reshade::api::descriptor_table_update{
-          {}, kDynCubeVanillaRegister, 0, 1,
-          reshade::api::descriptor_type::texture_shader_resource_view,
-          &dd->captured_vanilla_env_srv});
+          {}, kDynCubeVanillaRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->captured_vanilla_env_srv});
   // Vanilla-ISFAST frame slice (exact frame_index % 64 mirror of the custom
   // march; -1 = noise unusable -> the shader falls back to hash behavior).
   // IS-FAST noise volume (t5) only when usable; the shader gates sampling on it.
@@ -9380,9 +11056,7 @@ static bool OnBeforeKaiSSRDraw(reshade::api::command_list* cmd_list) {
           reshade::api::shader_stage::pixel,
           reshade::api::pipeline_layout{0}, 0,
           reshade::api::descriptor_table_update{
-              {}, 5u, 0, 1,
-              reshade::api::descriptor_type::texture_shader_resource_view,
-              &dd->isfast_noise_srv});
+              {}, 5u, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->isfast_noise_srv});
     }
   }
   return true;
@@ -9487,7 +11161,7 @@ static bool UpdateRtMotion(reshade::api::device* dev, DeviceData* dd, bool tempo
                           " mb_rtv4_res=", mb_rtv4_res, " same resource: RTV4 owned SRV used");
   }
   return dd->mb_rtv4_live.load() && dd->mb_rtv4_owned_srv.handle != 0u
-      && !rf.motion_conflict && rf.motion_dims_ok;
+         && !rf.motion_conflict && rf.motion_dims_ok;
 }
 
 // RTAO round 1 (world/rtao): dispatched inline before DeployShadows so the RTAO
@@ -9500,8 +11174,7 @@ static void PushRtaoAo(reshade::api::command_list* cmd_list, reshade::api::resou
       reshade::api::pipeline_layout{0},
       0,
       reshade::api::descriptor_table_update{
-          {}, kLightingGtvbaoRegister, 0, 1,
-          reshade::api::descriptor_type::texture_shader_resource_view, &ao_srv});
+          {}, kLightingGtvbaoRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &ao_srv});
   shader_injection.rtao_char_intensity = falcom_world::rtao::g_rtao_char_intensity;
   shader_injection.rtao_ao_bound = 1.f;
   shader_injection.rtao_max_darkening = falcom_world::rtao::g_rtao_max_darkening;
@@ -9583,7 +11256,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   in.height = dd->captured_depth_h;
   in.trace_divisor = rtao::RtgiTraceDivisor(rtao::g_rtao_trace_resolution);
   const rtao::NoiseSample noise = rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>(spp),
-                                                         rtao::g_test_freeze_noise > 0.5f);
+                                                        rtao::g_test_freeze_noise > 0.5f);
   const uint32_t rtao_flags = (rtao::g_rtao_discovery > 0.5f ? rtao::kRtaoFlagDiscovery : 0u)
                               | (rtao::g_rtao_foliage_skip > 0.5f ? rtao::kRtaoFlagFoliageSkip : 0u);  // RTAO_FLAG_* (c2.z)
   in.push = {
@@ -9742,8 +11415,7 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
         reshade::api::pipeline_layout{0},
         0,
         reshade::api::descriptor_table_update{
-            {}, kLightingRtlsRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view, &term_srv});
+            {}, kLightingRtlsRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &term_srv});
     shader_injection.rtls_flags = static_cast<float>(
         rtls::kRtlsFlagRequested | rtls::kRtlsFlagBound
         | (rtls::g_rtls_point > 0.5f ? rtls::kRtlsFlagPoint : 0u)
@@ -9773,8 +11445,8 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
     return;
   }
   const uint32_t kinds = ((rtls::g_rtls_point > 0.5f || rtls::g_rtls_env_point > 0.5f) ? rtls::kRtlsKindPoint : 0u)
-      | ((rtls::g_rtls_spot > 0.5f || rtls::g_rtls_env_spot > 0.5f) ? rtls::kRtlsKindSpot : 0u)
-      | (rtls::g_rtls_characters > 0.5f ? rtls::kRtlsKindCharacters : 0u);
+                         | ((rtls::g_rtls_spot > 0.5f || rtls::g_rtls_env_spot > 0.5f) ? rtls::kRtlsKindSpot : 0u)
+                         | (rtls::g_rtls_characters > 0.5f ? rtls::kRtlsKindCharacters : 0u);
   if (kinds == 0u) {
     frame.reason = rtls::Reason::NoKinds;
     return;
@@ -9820,9 +11492,9 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
       .temporal_on = temporal_on,
       .was_on = frame.temporal_last,
       .resized = rd.denoise.history_color.width != 0u
-          && (rd.denoise.history_color.width != (rtls::g_rtls_full_res_denoise > 0.5f ? dd->captured_depth_w : trace_width)
-              || rd.denoise.history_color.height != (rtls::g_rtls_full_res_denoise > 0.5f ? dd->captured_depth_h : trace_height)
-              || rd.denoise.output.width != dd->captured_depth_w || rd.denoise.output.height != dd->captured_depth_h),
+                 && (rd.denoise.history_color.width != (rtls::g_rtls_full_res_denoise > 0.5f ? dd->captured_depth_w : trace_width)
+                     || rd.denoise.history_color.height != (rtls::g_rtls_full_res_denoise > 0.5f ? dd->captured_depth_h : trace_height)
+                     || rd.denoise.output.width != dd->captured_depth_w || rd.denoise.output.height != dd->captured_depth_h),
       .frame = dd->frame_index,
       .last_frame = frame.dispatched_frame,
       .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
@@ -9856,8 +11528,7 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
       .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
       .temporal = temporal_on,
       .spatial = rtls::g_rtls_spatial_enabled > 0.5f,
-      .svgf = {rtls::g_rtls_history_weight, rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection,
-               reset == rtao::ResetReason::None, rtls::g_rtls_svgf_iterations, rtls::g_rtls_svgf_luminance_edge_stop, 1.f, 128.f, rtls::g_rtls_full_res_denoise > 0.5f, rtls::g_rtls_svgf_history_length, rtls::g_rtls_svgf_radius_scale}};
+      .svgf = {rtls::g_rtls_history_weight, rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection, reset == rtao::ResetReason::None, rtls::g_rtls_svgf_iterations, rtls::g_rtls_svgf_luminance_edge_stop, 1.f, 128.f, rtls::g_rtls_full_res_denoise > 0.5f, rtls::g_rtls_svgf_history_length, rtls::g_rtls_svgf_radius_scale}};
   if (rtls::g_rtls_trace_characters > 0.5f) {
     in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
   }
@@ -9883,9 +11554,9 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
   frame.character_objects = in.dynamic.count;
   frame.isfast_used = isfast_used;
   frame.texture_bytes = static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
-      + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
-      + rtgi::RtgiDenoiseTextureBytes(rd.denoise)
-      + sizeof(uint32_t) * rtls::kRtlsStatsCount;
+                        + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
+                        + rtgi::RtgiDenoiseTextureBytes(rd.denoise)
+                        + sizeof(uint32_t) * rtls::kRtlsStatsCount;
   push_rtls();
 }
 
@@ -9953,10 +11624,9 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
         reshade::api::pipeline_layout{0},
         0,
         reshade::api::descriptor_table_update{
-            {}, kLightingRtSunRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view, &term_srv});
+            {}, kLightingRtSunRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &term_srv});
     shader_injection.rtsun_flags = static_cast<float>(rtsun::kRtSunFlagApplied
-        | (rtsun::g_rtsun_receive_characters > 0.5f ? rtsun::kRtSunFlagReceive : 0u));
+                                                      | (rtsun::g_rtsun_receive_characters > 0.5f ? rtsun::kRtSunFlagReceive : 0u));
     shader_injection.rtsun_strength = rtsun::g_rtsun_strength;
     shader_injection.rtsun_max_darkening = rtsun::g_rtsun_max_darkening;
     shader_injection.rtsun_spare = rtsun::g_rtsun_character_intensity;
@@ -9978,8 +11648,8 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
   // while nonzero, and computes its own count only before a frame has been latched.
   const int latched_cascades = falcom_world::g_state.rt_sun_cascades.load(std::memory_order_relaxed);
   frame.cascades_effective = latched_cascades != 0
-      ? latched_cascades
-      : rtsun::RtSunEffectiveCascades(frame.cascades_requested, camera, bvh_data->tlas_region_range);
+                                 ? latched_cascades
+                                 : rtsun::RtSunEffectiveCascades(frame.cascades_requested, camera, bvh_data->tlas_region_range);
   if (frame.cascades_effective == 0) {
     frame.reason = rtsun::Reason::NoCascades;
     return;
@@ -10013,9 +11683,9 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
       .temporal_on = temporal_on,
       .was_on = frame.temporal_last,
       .resized = rd.denoise.history_color.width != 0u
-          && (rd.denoise.history_color.width != (rtsun::g_rtsun_full_res_denoise > 0.5f ? dd->captured_depth_w : trace_width)
-              || rd.denoise.history_color.height != (rtsun::g_rtsun_full_res_denoise > 0.5f ? dd->captured_depth_h : trace_height)
-              || rd.denoise.output.width != dd->captured_depth_w || rd.denoise.output.height != dd->captured_depth_h),
+                 && (rd.denoise.history_color.width != (rtsun::g_rtsun_full_res_denoise > 0.5f ? dd->captured_depth_w : trace_width)
+                     || rd.denoise.history_color.height != (rtsun::g_rtsun_full_res_denoise > 0.5f ? dd->captured_depth_h : trace_height)
+                     || rd.denoise.output.width != dd->captured_depth_w || rd.denoise.output.height != dd->captured_depth_h),
       .frame = dd->frame_index,
       .last_frame = frame.dispatched_frame,
       .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
@@ -10048,8 +11718,7 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
       .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
       .temporal = temporal_on,
       .spatial = rtsun::g_rtsun_spatial_enabled > 0.5f,
-      .svgf = {rtsun::g_rtsun_history_weight, rtsun::g_rtsun_depth_rejection, rtsun::g_rtsun_normal_rejection,
-               reset == rtao::ResetReason::None, rtsun::g_rtsun_svgf_iterations, rtsun::g_rtsun_svgf_luminance_edge_stop, 1.f, 128.f, rtsun::g_rtsun_full_res_denoise > 0.5f, rtsun::g_rtsun_svgf_history_length, rtsun::g_rtsun_svgf_radius_scale},
+      .svgf = {rtsun::g_rtsun_history_weight, rtsun::g_rtsun_depth_rejection, rtsun::g_rtsun_normal_rejection, reset == rtao::ResetReason::None, rtsun::g_rtsun_svgf_iterations, rtsun::g_rtsun_svgf_luminance_edge_stop, 1.f, 128.f, rtsun::g_rtsun_full_res_denoise > 0.5f, rtsun::g_rtsun_svgf_history_length, rtsun::g_rtsun_svgf_radius_scale},
   };
   if (rtsun::g_rtsun_trace_characters > 0.5f) {
     in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
@@ -10073,9 +11742,9 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
   frame.character_objects = in.dynamic.count;
   frame.isfast_used = isfast_used;
   frame.texture_bytes = static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
-      + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
-      + falcom_world::rtgi::RtgiDenoiseTextureBytes(rd.denoise)
-      + sizeof(uint32_t) * rtsun::kRtSunStatsCount;
+                        + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
+                        + falcom_world::rtgi::RtgiDenoiseTextureBytes(rd.denoise)
+                        + sizeof(uint32_t) * rtsun::kRtSunStatsCount;
   push_rtsun();
 }
 
@@ -10132,8 +11801,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
         reshade::api::pipeline_layout{0},
         0,
         reshade::api::descriptor_table_update{
-            {}, kLightingRtgiRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view, &rd.denoise.output.srv[rd.denoise.output_index]});
+            {}, kLightingRtgiRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &rd.denoise.output.srv[rd.denoise.output_index]});
     shader_injection.rtgi_gi_bound = 1.f;
     shader_injection.rtgi_intensity = rtgi::g_rtgi_intensity;
     shader_injection.rtgi_char_intensity = rtgi::g_rtgi_char_intensity;
@@ -10179,9 +11847,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   rtao::TemporalFrame reset_frame = {
       .temporal_on = temporal_on,
       .was_on = frame.temporal_last,
-      .resized = rd.denoise.history_color.width != 0u && (rd.denoise.history_color.width != (rtgi::g_rtgi_full_res_denoise > 0.5f ? dd->captured_depth_w : trace_width)
-              || rd.denoise.history_color.height != (rtgi::g_rtgi_full_res_denoise > 0.5f ? dd->captured_depth_h : trace_height)
-              || rd.denoise.output.width != dd->captured_depth_w || rd.denoise.output.height != dd->captured_depth_h),
+      .resized = rd.denoise.history_color.width != 0u && (rd.denoise.history_color.width != (rtgi::g_rtgi_full_res_denoise > 0.5f ? dd->captured_depth_w : trace_width) || rd.denoise.history_color.height != (rtgi::g_rtgi_full_res_denoise > 0.5f ? dd->captured_depth_h : trace_height) || rd.denoise.output.width != dd->captured_depth_w || rd.denoise.output.height != dd->captured_depth_h),
       .frame = dd->frame_index,
       .last_frame = frame.dispatched_frame,
       .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
@@ -10202,18 +11868,18 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   // (an input is missing). The colour also feeds RTGI Debug 7 in the upsample.
   const bool applied_last = frame.applied_frame != UINT64_MAX && frame.applied_frame + 1u == dd->frame_index;
   const bool color_ok = dd->captured_color_srv.handle != 0u && dd->captured_color_live.load()
-      && dd->captured_color_frame == dd->frame_index;
+                        && dd->captured_color_frame == dd->frame_index;
   const bool subtract = applied_last && color_ok && rd.denoise.output.width == dd->captured_depth_w
-      && rd.denoise.output.height == dd->captured_depth_h;
+                        && rd.denoise.output.height == dd->captured_depth_h;
   const bool radiance_valid = rd.radiance_srv.handle != 0u && rd.radiance_frame != UINT64_MAX
-      && rd.radiance_frame + 1u == dd->frame_index && (!applied_last || subtract);
+                              && rd.radiance_frame + 1u == dd->frame_index && (!applied_last || subtract);
   // The light buffers are copied for a stats request or while a lamp sequence runs (Sora 2nd lighting draw, bound at this draw).
   auto* world_cl = falcom_world::GetWorldCommandListData(cmd_list);
   const bool copy_lights = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr
-      && (rtgi::g_rtgi_stats.requested.load(std::memory_order_relaxed)
-          || rtgi::g_rtgi_stats.sequence_left.load(std::memory_order_relaxed) > 0u);
+                           && (rtgi::g_rtgi_stats.requested.load(std::memory_order_relaxed)
+                               || rtgi::g_rtgi_stats.sequence_left.load(std::memory_order_relaxed) > 0u);
   const bool dynamic_lights = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr
-      && rtgi::g_rtgi_dynamic_lights > 0.5f;
+                              && rtgi::g_rtgi_dynamic_lights > 0.5f;
   const bool lamp_shadows = dynamic_lights && rtgi::g_rtgi_lamp_shadows > 0.5f;
   const bool sora2nd_bindings = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr;
   const float feedback_strength = rtgi::RtgiFeedbackStrengthEffective();
@@ -10239,15 +11905,15 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
           .sampling = {isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed, rtgi::g_rtgi_debug},
           .fade = {fade.start, fade.end,
                    static_cast<float>((radiance_valid ? rtgi::kRtgiFlagRadianceValid : 0u)
-                       | (subtract ? rtgi::kRtgiFlagSubtractPrevious : 0u)
-                       | (rtgi::g_rtgi_sun_casters_only > 0.5f ? rtgi::kRtgiFlagSunCastersOnly : 0u)
-                       | (rtgi::g_rtgi_fallback_no_albedo > 0.5f ? rtgi::kRtgiFlagFallbackNoAlbedo : 0u)
-                       | (dynamic_lights ? rtgi::kRtgiFlagDynamicLights : 0u)
-                       | (rtgi::g_rtgi_game_sun > 0.5f ? rtgi::kRtgiFlagGameSun : 0u)
-                       | (feedback_strength > 0.f ? rtgi::kRtgiFlagFeedback : 0u)
-                       | (extra_rays > 0u ? rtgi::kRtgiFlagRealRays : 0u)
-                       | (lamp_shadows ? rtgi::kRtgiFlagLampShadows : 0u)
-                       | (restir_on ? rtgi::kRtgiFlagRestir : 0u)),
+                                      | (subtract ? rtgi::kRtgiFlagSubtractPrevious : 0u)
+                                      | (rtgi::g_rtgi_sun_casters_only > 0.5f ? rtgi::kRtgiFlagSunCastersOnly : 0u)
+                                      | (rtgi::g_rtgi_fallback_no_albedo > 0.5f ? rtgi::kRtgiFlagFallbackNoAlbedo : 0u)
+                                      | (dynamic_lights ? rtgi::kRtgiFlagDynamicLights : 0u)
+                                      | (rtgi::g_rtgi_game_sun > 0.5f ? rtgi::kRtgiFlagGameSun : 0u)
+                                      | (feedback_strength > 0.f ? rtgi::kRtgiFlagFeedback : 0u)
+                                      | (extra_rays > 0u ? rtgi::kRtgiFlagRealRays : 0u)
+                                      | (lamp_shadows ? rtgi::kRtgiFlagLampShadows : 0u)
+                                      | (restir_on ? rtgi::kRtgiFlagRestir : 0u)),
                    0.f},
           .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
                      bvh_data->tlas_region_size},
@@ -10260,26 +11926,18 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       .debug_mode = static_cast<int>(rtgi::g_rtgi_debug),
       .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
       .temporal = temporal_on,
-      .svgf = {rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
-               reset == rtao::ResetReason::None, rtgi::g_rtgi_svgf_iterations,
-               rtgi::g_rtgi_svgf_luminance_edge_stop, rtgi::g_rtgi_svgf_depth_sigma, rtgi::g_rtgi_svgf_normal_power, rtgi::g_rtgi_full_res_denoise > 0.5f, rtgi::g_rtgi_svgf_history_length, rtgi::g_rtgi_svgf_radius_scale},
+      .svgf = {rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection, reset == rtao::ResetReason::None, rtgi::g_rtgi_svgf_iterations, rtgi::g_rtgi_svgf_luminance_edge_stop, rtgi::g_rtgi_svgf_depth_sigma, rtgi::g_rtgi_svgf_normal_power, rtgi::g_rtgi_full_res_denoise > 0.5f, rtgi::g_rtgi_svgf_history_length, rtgi::g_rtgi_svgf_radius_scale},
       .restir_history_valid = restir_reset == rtao::ResetReason::None,
       .spatial = rtgi::g_rtgi_spatial_enabled > 0.5f,
       .restir_spatial = restir_on && rtgi::g_rtgi_restir_spatial > 0.5f,
       .lights = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightsRegister] : reshade::api::resource{0u},
       .light_indices = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightIndicesRegister] : reshade::api::resource{0u},
-      .lights_view = dynamic_lights ? world_cl->ps_srv_view[rtgi::kLightingLightsRegister]
-                                    : reshade::api::resource_view{0u},
-      .light_indices_view = dynamic_lights ? world_cl->ps_srv_view[rtgi::kLightingLightIndicesRegister]
-                                           : reshade::api::resource_view{0u},
-      .mrt1_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingMrt1Register]
-                                    : reshade::api::resource_view{0u},
-      .shadow_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingShadowRegister]
-                                      : reshade::api::resource_view{0u},
-      .mrt2_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingMrt2Register]
-                                    : reshade::api::resource_view{0u},
-      .deferred_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingDeferredRegister]
-                                        : reshade::api::resource_view{0u},
+      .lights_view = dynamic_lights ? world_cl->ps_srv_view[rtgi::kLightingLightsRegister] : reshade::api::resource_view{0u},
+      .light_indices_view = dynamic_lights ? world_cl->ps_srv_view[rtgi::kLightingLightIndicesRegister] : reshade::api::resource_view{0u},
+      .mrt1_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingMrt1Register] : reshade::api::resource_view{0u},
+      .shadow_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingShadowRegister] : reshade::api::resource_view{0u},
+      .mrt2_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingMrt2Register] : reshade::api::resource_view{0u},
+      .deferred_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingDeferredRegister] : reshade::api::resource_view{0u},
   };
   if (rtgi::g_rtgi_trace_characters > 0.5f) {
     in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
@@ -10321,23 +11979,192 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.radiance_height = rd.radiance_height;
   frame.radiance_format = static_cast<uint32_t>(rd.radiance_format);
   frame.texture_bytes = sizeof(uint32_t) * rtgi::kRtgiStatsCount
-      + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
-      + static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
-      + static_cast<uint64_t>(rd.restir_sample_pos.width) * rd.restir_sample_pos.height * 16u
-      + static_cast<uint64_t>(rd.restir_sample_data.width) * rd.restir_sample_data.height * 16u
-      + static_cast<uint64_t>(rd.restir_raw.width) * rd.restir_raw.height * 8u
-      + static_cast<uint64_t>(rd.restir_res_sample.width) * rd.restir_res_sample.height * 16u * 2u
-      + static_cast<uint64_t>(rd.restir_res_visible.width) * rd.restir_res_visible.height * 16u * 2u
-      + static_cast<uint64_t>(rd.restir_res_data.width) * rd.restir_res_data.height * 16u * 2u
-      + static_cast<uint64_t>(rd.restir_sp_raw.width) * rd.restir_sp_raw.height * 8u
-      + static_cast<uint64_t>(rd.restir_sp_sample.width) * rd.restir_sp_sample.height * 16u
-      + static_cast<uint64_t>(rd.restir_sp_visible.width) * rd.restir_sp_visible.height * 16u
-      + static_cast<uint64_t>(rd.restir_sp_data.width) * rd.restir_sp_data.height * 16u
-      + rtgi::RtgiDenoiseTextureBytes(rd.denoise)
-      + (rd.radiance_texture.handle != 0u
-             ? static_cast<uint64_t>(reshade::api::format_row_pitch(rd.radiance_format, rd.radiance_width)) * rd.radiance_height
-             : 0u);
+                        + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
+                        + static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
+                        + static_cast<uint64_t>(rd.restir_sample_pos.width) * rd.restir_sample_pos.height * 16u
+                        + static_cast<uint64_t>(rd.restir_sample_data.width) * rd.restir_sample_data.height * 16u
+                        + static_cast<uint64_t>(rd.restir_raw.width) * rd.restir_raw.height * 8u
+                        + static_cast<uint64_t>(rd.restir_res_sample.width) * rd.restir_res_sample.height * 16u * 2u
+                        + static_cast<uint64_t>(rd.restir_res_visible.width) * rd.restir_res_visible.height * 16u * 2u
+                        + static_cast<uint64_t>(rd.restir_res_data.width) * rd.restir_res_data.height * 16u * 2u
+                        + static_cast<uint64_t>(rd.restir_sp_raw.width) * rd.restir_sp_raw.height * 8u
+                        + static_cast<uint64_t>(rd.restir_sp_sample.width) * rd.restir_sp_sample.height * 16u
+                        + static_cast<uint64_t>(rd.restir_sp_visible.width) * rd.restir_sp_visible.height * 16u
+                        + static_cast<uint64_t>(rd.restir_sp_data.width) * rd.restir_sp_data.height * 16u
+                        + rtgi::RtgiDenoiseTextureBytes(rd.denoise)
+                        + (rd.radiance_texture.handle != 0u
+                               ? static_cast<uint64_t>(reshade::api::format_row_pitch(rd.radiance_format, rd.radiance_width)) * rd.radiance_height
+                               : 0u);
   push_gi();
+}
+
+static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
+  namespace di = falcom_world::rtxdi;
+  namespace rt12 = falcom_world::rt12;
+  const uint32_t frame = falcom_world::g_state.frame.load();
+  const uint32_t request_mask = di::SceneRequestMask();
+  auto* dev = cmd_list->get_device();
+  auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
+  const uint64_t generation = (rt12::g_rt12 && rt12::g_rt12->device == dev ? rt12::g_rt12->generation : 0u);
+  if (!request_mask) {
+    std::unique_lock lock(di::g_di.mutex);
+    di::g_di.snapshot = {.status = di::DiStatus::Off, .frame = frame};
+  }
+  {
+    std::unique_lock lock(di::g_scene.mutex);
+    auto& state = di::g_scene.snapshot;
+    if (!request_mask) {
+      di::RefreshOffState(&state, frame);
+      return;
+    }
+    if (di::PreserveAttemptForNonImmediate(state, frame, true, dd && cmd_list != dd->immediate_cmd_list)) return;
+    if (!dev || !dd) {
+      state.status = di::SceneStatus::NoDevice;
+      return;
+    }
+    if (cmd_list != dd->immediate_cmd_list) {
+      state.status = di::SceneStatus::DeferredContext;
+      return;
+    }
+    if (di::IsDuplicate(state, frame, generation)) return;
+    state.attempted_frame = frame;
+    state.attempted_generation = generation;
+    state.request_mask = request_mask;
+    state.prepared_frame = UINT32_MAX;
+    state.prepared_slot = -1;
+    state.prepared_fence = 0u;
+    state.prepared_generation = 0u;
+    ++state.attempts;
+  }
+  if (rt12::g_rt12 && rt12::g_rt12->device == dev) rt12::g_rt12->di_transfer.input_frame = UINT32_MAX;
+  {
+    std::unique_lock lock(di::g_input.mutex);
+    di::g_input.snapshot = {};
+    di::g_input.snapshot.status = di::InputStatus::WaitingForScene;
+    di::g_input.snapshot.attempted_frame = frame;
+  }
+  di::SceneStatus status = di::SceneStatus::GeometryNotReady;
+  rt12::SceneTransactionResult result = {};
+  if (!IsSora2nd() || !falcom_world::g_state.supported) {
+    status = di::SceneStatus::Guarded;
+  } else if (!rt12::g_rt12_enabled.load(std::memory_order_relaxed)) {
+    status = di::SceneStatus::DxrOff;
+  } else if (!rt12::g_rt12 || rt12::g_rt12->device != dev) {
+    status = di::SceneStatus::NotCreated;
+  } else if (rt12::g_rt12->unfenced_execution || rt12::g_rt12->stuck) {
+    status = di::SceneStatus::Quarantined;
+  } else if (rt12::g_rt12->failed) {
+    status = di::SceneStatus::Failed;
+  } else if (dd->frame_index < kGTVBAOStartupGuardFrames || dd->frame_index < dd->resize_guard_until_frame || dd->dyncube_loadingWipePending) {
+    status = di::SceneStatus::Guarded;
+  } else if (!dd->captured_scene_cbv_view.handle || !dd->captured_scene_cbv_valid || !dd->captured_cbv_live.load()) {
+    status = di::SceneStatus::MissingSceneInput;
+  } else {
+    result = rt12::PrepareSceneForRtxdi(dev, cmd_list, dd->captured_scene_cbv_view, true);
+    if (result.scene_ready) {
+      status = (result.reused ? di::SceneStatus::Reused : di::SceneStatus::Submitted);
+    } else if (rt12::g_rt12->unfenced_execution || rt12::g_rt12->stuck) {
+      status = di::SceneStatus::Quarantined;
+    } else if (rt12::g_rt12->failed) {
+      status = di::SceneStatus::Failed;
+    } else if (result.reason == rt12::Rt12Reason::Busy) {
+      status = di::SceneStatus::Busy;
+    }
+  }
+  if (result.scene_ready) {
+    ID3D11ShaderResourceView* native_views[13] = {};
+    if (request_mask & 1u) {
+      rt12::g_rt12->ctx11->PSGetShaderResources(0u, 5u, native_views);
+      rt12::g_rt12->ctx11->PSGetShaderResources(6u, 1u, &native_views[6]);
+      rt12::g_rt12->ctx11->PSGetShaderResources(11u, 2u, &native_views[11]);
+    } else {
+      rt12::g_rt12->ctx11->PSGetShaderResources(1u, 1u, &native_views[1]);
+      rt12::g_rt12->ctx11->PSGetShaderResources(4u, 1u, &native_views[4]);
+    }
+    std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>, 13> held_views;
+    for (size_t i = 0u; i < held_views.size(); ++i) held_views[i].Attach(native_views[i]);
+    const auto view = [&](uint32_t index) {
+      return reshade::api::resource_view{reinterpret_cast<uint64_t>(held_views[index].Get())};
+    };
+    rt12::Rt12DiInputResult input_result;
+    rt12::Rt12DiInputViews input_views = {};
+    uint32_t input_width = 0u, input_height = 0u;
+    if (dd->captured_depth_live.load() && dd->captured_mrt_live.load()
+        && view(kLightingDepthRegister).handle == dd->captured_depth_srv.handle
+        && view(kLightingMrtNormalRegister).handle == dd->captured_mrt_normal_srv.handle
+        && di::GetTextureViewExtent(held_views[kLightingDepthRegister].Get(), &input_width, &input_height)) {
+      const bool motion_ready = (request_mask & 1u) != 0u && UpdateRtMotion(dev, dd, true)
+                                && dd->mb_rtv4_frame == dd->frame_index;
+      input_views = {.depth = dd->captured_depth_srv, .normal = dd->captured_mrt_normal_srv, .color = (dd->captured_color_live.load() && dd->captured_color_frame == dd->frame_index && view(0u).handle == dd->captured_color_srv.handle ? dd->captured_color_srv : reshade::api::resource_view{}), .mrt1 = view(falcom_world::rtgi::kLightingMrt1Register), .mrt2 = view(falcom_world::rtgi::kLightingMrt2Register), .motion = motion_ready ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{}, .lights = view(falcom_world::rtgi::kLightingLightsRegister), .tiles = view(falcom_world::rtgi::kLightingLightIndicesRegister), .deferred = view(falcom_world::rtgi::kLightingDeferredRegister), .scene_tracker = &dd->rtxdi_scene_range, .capture_frame = dd->frame_index, .frame = frame, .width = input_width, .height = input_height, .scene_slot = result.slot, .scene_fence = result.fence_b, .local = (request_mask & 1u) != 0u, .sun = falcom_world::rtxdi::SunVisibilityRequested(request_mask)};
+      input_result = rt12::TransferRtxdiInputs(dev, cmd_list, input_views);
+    }
+    {
+      std::unique_lock lock(di::g_input.mutex);
+      auto& input = di::g_input.snapshot;
+      input = {};
+      input.status = input_result.status;
+      input.stage = input_result.stage;
+      input.error = input_result.error;
+      input.attempted_frame = frame;
+      input.ready_frame = (input_result.status == di::InputStatus::Ready ? frame : UINT32_MAX);
+      input.width = input_width;
+      input.height = input_height;
+      input.lights_source = input_result.layout.lights_source;
+      input.lights_copied = input_result.layout.lights_copied;
+      input.lights_truncated = input_result.layout.lights_truncated;
+      input.tiles_source = input_result.layout.tiles_source;
+      input.tiles_copied = input_result.layout.tiles_copied;
+      input.deferred_source = input_result.layout.deferred_source;
+      input.deferred_copied = input_result.layout.deferred_copied;
+      input.owner_generation = generation;
+      input.configuration_generation = rt12::g_rt12->di_transfer.configuration_generation;
+      input.fence = input_result.fence;
+      input.scene_slot = result.slot;
+      input.transfer_slot = input_result.transfer_slot;
+      input.scene_fence = result.fence_b;
+      input.motion_available = input_result.layout.motion_available != 0u;
+      input.carrier_bytes = uint64_t{input.width} * input.height * (20u + (input.motion_available ? 16u : 0u) + ((request_mask & 1u) ? 48u : 0u))
+                            + 1536u + ((request_mask & 1u) ? uint64_t{4096u} * 16u * (RTXDI_INPUT_LIGHT_ROWS + RTXDI_INPUT_TILE_ROWS + RTXDI_INPUT_DEFERRED_ROWS) : 0u);
+      input.record_bytes = uint64_t{input.lights_copied} * RTXDI_INPUT_LIGHT_STRIDE + uint64_t{input.tiles_copied} * RTXDI_INPUT_TILE_STRIDE + uint64_t{input.deferred_copied} * RTXDI_INPUT_DEFERRED_STRIDE + 1536u;
+    }
+    if (request_mask & 1u) {
+      if (input_result.status == di::InputStatus::Ready) {
+        rt12::DispatchRtxdiInitialDi(dev, cmd_list, input_views, input_result);
+      } else {
+        std::unique_lock lock(di::g_di.mutex);
+        di::g_di.snapshot = {.status = di::DiStatus::WaitingInput, .frame = frame, .scene_slot = result.slot};
+      }
+    } else {
+      std::unique_lock lock(di::g_di.mutex);
+      di::g_di.snapshot = {.status = di::DiStatus::Off, .frame = frame};
+    }
+  } else {
+    std::unique_lock lock(di::g_input.mutex);
+    di::g_input.snapshot = {};
+    di::g_input.snapshot.status = di::InputStatus::WaitingForScene;
+    di::g_input.snapshot.attempted_frame = frame;
+    std::unique_lock di_lock(di::g_di.mutex);
+    di::g_di.snapshot = {.status = ((request_mask & 1u) ? di::DiStatus::WaitingInput : di::DiStatus::Off), .frame = frame};
+  }
+  {
+    std::unique_lock lock(di::g_scene.mutex);
+    auto& state = di::g_scene.snapshot;
+    state.status = status;
+    if (result.scene_ready) {
+      state.prepared_frame = result.frame;
+      state.prepared_slot = result.slot;
+      state.prepared_fence = result.fence_b;
+      state.prepared_generation = generation;
+      if (result.reused) {
+        ++state.reuses;
+      }
+    } else {
+      ++state.skips;
+    }
+    if (result.submitted) {
+      ++state.submissions;
+    }
+  }
 }
 
 // DLSS Ray Reconstruction guides (M1): the compute pass at the lighting hook. Runs on the first lighting draw of the frame.
@@ -10354,26 +12181,26 @@ static void RunRrGuidesInline(reshade::api::command_list* cmd_list) {
   const uint32_t frame = falcom_world::g_state.frame.load();
   if (rr::g_rr_guides_attempt_frame.exchange(frame) == frame) return;
   const bool inputs_ready = dd->captured_color_srv.handle != 0u && dd->captured_color_live.load()
-      && dd->captured_color_frame == dd->frame_index
-      && dd->captured_depth_srv.handle != 0u && dd->captured_depth_live.load()
-      && dd->captured_mrt_normal_srv.handle != 0u && dd->captured_mrt_live.load()
-      && dd->captured_scene_cbv_valid
-      && world_cl->ps_srv_view[rtgi::kLightingMrt2Register].handle != 0u
-      && world_cl->ps_srv_view[rtgi::kLightingDeferredRegister].handle != 0u;
+                            && dd->captured_color_frame == dd->frame_index
+                            && dd->captured_depth_srv.handle != 0u && dd->captured_depth_live.load()
+                            && dd->captured_mrt_normal_srv.handle != 0u && dd->captured_mrt_live.load()
+                            && dd->captured_scene_cbv_valid
+                            && world_cl->ps_srv_view[rtgi::kLightingMrt2Register].handle != 0u
+                            && world_cl->ps_srv_view[rtgi::kLightingDeferredRegister].handle != 0u;
   if (!inputs_ready) {
     rr::SetGuideReason(rr::GuideReason::InputsMissing);
     return;
   }
   rr::DispatchGuides(dev, cmd_list, {
-      .color_view = dd->captured_color_srv,
-      .mrt0_view = dd->captured_mrt_normal_srv,
-      .mrt2_view = world_cl->ps_srv_view[rtgi::kLightingMrt2Register],
-      .deferred_view = world_cl->ps_srv_view[rtgi::kLightingDeferredRegister],
-      .depth_view = dd->captured_depth_srv,
-      .scene_cbv_view = dd->captured_scene_cbv_view,
-      .width = dd->captured_depth_w,
-      .height = dd->captured_depth_h,
-  });
+                                        .color_view = dd->captured_color_srv,
+                                        .mrt0_view = dd->captured_mrt_normal_srv,
+                                        .mrt2_view = world_cl->ps_srv_view[rtgi::kLightingMrt2Register],
+                                        .deferred_view = world_cl->ps_srv_view[rtgi::kLightingDeferredRegister],
+                                        .depth_view = dd->captured_depth_srv,
+                                        .scene_cbv_view = dd->captured_scene_cbv_view,
+                                        .width = dd->captured_depth_w,
+                                        .height = dd->captured_depth_h,
+                                    });
 }
 
 // RTGI: copies the lighting output after the draw; the next frame's RTGI trace reads it for on-screen hits.
@@ -10389,6 +12216,7 @@ static void OnDrawnLightingShader(reshade::api::command_list* cmd_list) {
 }
 
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
+  PromoteRtxdiSceneBinding(cmd_list);
   // IMPORTANT: returning false would BYPASS the draw (skip it entirely).
   if (IsKai() && g_kai_hero_light_toggle > 0.5f) {
     auto* context11 = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());  // NOLINT(performance-no-int-to-ptr)
@@ -10416,9 +12244,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               reshade::api::shader_stage::pixel,
               reshade::api::pipeline_layout{0}, 0,
               reshade::api::descriptor_table_update{
-                  {}, 24u, 0, 1,
-                  reshade::api::descriptor_type::texture_shader_resource_view,
-                  &dd->isfast_noise_srv});
+                  {}, 24u, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->isfast_noise_srv});
         }
       }
     }
@@ -10447,7 +12273,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // RT dispatches null most compute slots and rebind their own. Snapshot the game's compute state
   // once here and restore it after RTGI: the engine's volumetric-fog compute reads those bindings.
   std::optional<renodx::utils::state::CommandListSnapshot> game_compute_state;
-  if (falcom_world::rtao::RtaoRequested() || falcom_world::rtls::RtlsRequested() || falcom_world::rtsun::RtSunRequested()
+  if (falcom_world::rtxdi::SceneRequested() || falcom_world::rtao::RtaoRequested() || falcom_world::rtls::RtlsRequested() || falcom_world::rtsun::RtSunRequested()
       || (falcom_world::rr::RrRequested() && falcom_world::rr::g_rr_perf_guides > 0.5f  // TEMP perf test (remove)
           && falcom_world::rr::g_rr_guides_attempt_frame.load() != falcom_world::g_state.frame.load())) {
     game_compute_state = renodx::utils::state::GetSnapshot(cmd_list);
@@ -10463,6 +12289,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
   // RTGI after RTAO: it runs only on a frame where RTAO dispatched.
   RunRtgiInline(cmd_list);
+  PrepareRtxdiSceneInline(cmd_list);
   // DLSS Ray Reconstruction guides: builds the RR guide buffers; the lighting output is not changed.
   RunRrGuidesInline(cmd_list);
   if (game_compute_state) {
@@ -10501,7 +12328,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       dd0->dyncube_phase = DeviceData::DynCubePhase::Capture;
       dd0->dyncube_next_update_frame = 0;
     }
-     dd0->dyncube_was_enabled = dyncube_active;
+    dd0->dyncube_was_enabled = dyncube_active;
   }
   if (!gtvbao_active && !vbgi_active && !dyncube_active) return true;
   if (!cmd_list) return true;
@@ -10554,7 +12381,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         const std::string liveDepth = dd->captured_depth_srv.handle ? dd->captured_depth_dims : "none";
         const std::string wantDims = std::to_string(dd->working_width) + "x" + std::to_string(dd->working_height);
         CSLog("gtvbao", std::string("inline invoke working=") + wantDims + " liveDepth=" + liveDepth,
-          liveDepth != wantDims);
+              liveDepth != wantDims);
         ao_ok = RunGTVBAO(cmd_list, dd);
         CSLog("gtvbao", std::string("inline invoke exit") + (ao_ok ? " ok" : " FAILED"), !ao_ok);
       }
@@ -10591,8 +12418,12 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           reshade::api::pipeline_layout{0},
           0,
           reshade::api::descriptor_table_update{
-              {}, kLightingGtvbaoRegister, 0, 1,
-              reshade::api::descriptor_type::texture_shader_resource_view, &srv,
+              {},
+              kLightingGtvbaoRegister,
+              0,
+              1,
+              reshade::api::descriptor_type::texture_shader_resource_view,
+              &srv,
           });
       shader_injection.gtvbao_dedicated_bound = 1.f;
     }
@@ -10600,50 +12431,55 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
   // -- SSGI push t23 (GI is produced by RunGTVBAO or RunVBGI) --
   if (gtvbao_active || vbgi_active) {
-  shader_injection.gtvbao_vbgi_bound = 0.f;
-  shader_injection.gtvbao_vbgi_debug = 0.f;
+    shader_injection.gtvbao_vbgi_bound = 0.f;
+    shader_injection.gtvbao_vbgi_debug = 0.f;
 
-  // Determine what to push to t23.
-  reshade::api::resource_view push_srv = {};
-  bool do_push = false;
+    // Determine what to push to t23.
+    reshade::api::resource_view push_srv = {};
+    bool do_push = false;
 
-  // Compute debug views 22-35: push the GTVBAO debug UAV output to the lighting shader's t23 slot. VBGI "Final GI"
-  // (mode 30) shows the denoised output instead, so it reflects temporal and spatial filtering.
-  const uint64_t max_age = (g_cpuopt_deferred_dispatch > 0.5f) ? 1u : 0u;
-  bool gi_push = false;
-  if (vbgi_active && ActiveGtvbaoDebugMode() == 30 && VbgiGiFresh(dd, max_age)) {
-    push_srv = dd->vbgi_denoise.output.srv[dd->vbgi_denoise.output_index];
-    do_push = true;
-  } else if (IsGtvbaoComputeDebug(ActiveGtvbaoDebugMode())
-      && dd->gtvbao_debug_frame != UINT64_MAX
-      && (dd->frame_index - dd->gtvbao_debug_frame) <= max_age
-      && dd->gtvbao_debug_mode_written == (float)ActiveGtvbaoDebugMode()) {
-    push_srv = dd->debug_srv;
-    do_push = true;
-  } else if (vbgi_active && !IsGtvbaoComputeDebug(ActiveGtvbaoDebugMode()) && VbgiGiFresh(dd, max_age)) {
-    // VBGI composite: the newest denoised output, bound for the lighting shader's cachedVBGI.
-    push_srv = dd->vbgi_denoise.output.srv[dd->vbgi_denoise.output_index];
-    do_push = true;
-    gi_push = true;
-  }
-
-  if (do_push) {
-    if (!push_srv.handle) push_srv = dd->fallback_srv;
-    if (push_srv.handle) {
-      uint32_t giRegister = IsKai() ? 23u : kLightingVbgiRegister;  // Kai uses t23 for GTVBAO VBGI
-      cmd_list->push_descriptors(
-          reshade::api::shader_stage::pixel,
-          reshade::api::pipeline_layout{0},
-          0,
-          reshade::api::descriptor_table_update{
-              {}, giRegister, 0, 1,
-              reshade::api::descriptor_type::texture_shader_resource_view,
-              &push_srv,
-          });
-      if (gi_push) shader_injection.gtvbao_vbgi_bound = 1.f;
-      else shader_injection.gtvbao_mrt_normal_debug = 1.f;
+    // Compute debug views 22-35: push the GTVBAO debug UAV output to the lighting shader's t23 slot. VBGI "Final GI"
+    // (mode 30) shows the denoised output instead, so it reflects temporal and spatial filtering.
+    const uint64_t max_age = (g_cpuopt_deferred_dispatch > 0.5f) ? 1u : 0u;
+    bool gi_push = false;
+    if (vbgi_active && ActiveGtvbaoDebugMode() == 30 && VbgiGiFresh(dd, max_age)) {
+      push_srv = dd->vbgi_denoise.output.srv[dd->vbgi_denoise.output_index];
+      do_push = true;
+    } else if (IsGtvbaoComputeDebug(ActiveGtvbaoDebugMode())
+               && dd->gtvbao_debug_frame != UINT64_MAX
+               && (dd->frame_index - dd->gtvbao_debug_frame) <= max_age
+               && dd->gtvbao_debug_mode_written == (float)ActiveGtvbaoDebugMode()) {
+      push_srv = dd->debug_srv;
+      do_push = true;
+    } else if (vbgi_active && !IsGtvbaoComputeDebug(ActiveGtvbaoDebugMode()) && VbgiGiFresh(dd, max_age)) {
+      // VBGI composite: the newest denoised output, bound for the lighting shader's cachedVBGI.
+      push_srv = dd->vbgi_denoise.output.srv[dd->vbgi_denoise.output_index];
+      do_push = true;
+      gi_push = true;
     }
-  }
+
+    if (do_push) {
+      if (!push_srv.handle) push_srv = dd->fallback_srv;
+      if (push_srv.handle) {
+        uint32_t giRegister = IsKai() ? 23u : kLightingVbgiRegister;  // Kai uses t23 for GTVBAO VBGI
+        cmd_list->push_descriptors(
+            reshade::api::shader_stage::pixel,
+            reshade::api::pipeline_layout{0},
+            0,
+            reshade::api::descriptor_table_update{
+                {},
+                giRegister,
+                0,
+                1,
+                reshade::api::descriptor_type::texture_shader_resource_view,
+                &push_srv,
+            });
+        if (gi_push)
+          shader_injection.gtvbao_vbgi_bound = 1.f;
+        else
+          shader_injection.gtvbao_mrt_normal_debug = 1.f;
+      }
+    }
   }  // gtvbao_active || vbgi_active (t23 section)
 
   // -- Dynamic Cubemaps (Sora2nd): t17 override � Phase 0A/B + Phase 1/2 standalone --
@@ -10671,8 +12507,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       dd->dyncube_pending_recreate = true;
       if (shader_injection.dynCube_debug_logging > 0.5f) {
         reshade::log::message(reshade::log::level::info,
-          (std::string("[DynCube] resize pending ") + std::to_string(dd->dyncube_size) +
-           " -> " + std::to_string(wantSize)).c_str());
+                              (std::string("[DynCube] resize pending ") + std::to_string(dd->dyncube_size) + " -> " + std::to_string(wantSize)).c_str());
       }
     } else if (!dd->dyncube_solid_pipeline.handle || !dd->dyncube_capture_pipeline.handle) {
       CreateDynCubePipelinesIfNeeded(dev, dd);
@@ -10685,8 +12520,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
       // Execution context for crash tracing (edge-only): photo mode rendering on
       // a deferred list would run all of the below dispatches there.
-      CSLog("ctx", std::string("scheduler on ") +
-        ((dd->immediate_cmd_list != nullptr && dd->immediate_cmd_list == cmd_list) ? "immediate" : "DEFERRED"));
+      CSLog("ctx", std::string("scheduler on ") + ((dd->immediate_cmd_list != nullptr && dd->immediate_cmd_list == cmd_list) ? "immediate" : "DEFERRED"));
 
       // -- Loading wipe: consumes the OnPresent loading signal (this scheduler only
       // ticks on lighting draws, so the stale predicate itself is evaluated there).
@@ -10704,7 +12538,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           if (set.pos_uav.handle) cmd_list->clear_unordered_access_view_float(set.pos_uav, zero4);
           if (set.contrib_uav.handle) cmd_list->clear_unordered_access_view_float(set.contrib_uav, zero1);
         }
-        for (auto& u : dd->dyncube_cam_uav) if (u.handle) cmd_list->clear_unordered_access_view_float(u, zero4);
+        for (auto& u : dd->dyncube_cam_uav)
+          if (u.handle) cmd_list->clear_unordered_access_view_float(u, zero4);
         dd->dyncube_hasValidRead = false;
         dd->dyncube_filteredReadSet = 99u;
         dd->dyncube_ggx_valid = false;
@@ -10716,10 +12551,10 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         dd->dyncube_needs_reset = true;
         dd->dyncube_worldbox_reset_pending = true;
         dd->dyncube_next_update_frame = 0;
-            if (shader_injection.dynCube_debug_logging > 0.5f) {
-              reshade::log::message(reshade::log::level::info, "[DynCube] loading wipe: temporal cache cleared");
-            }
-            CSLog("dyncube", "loading wipe applied");
+        if (shader_injection.dynCube_debug_logging > 0.5f) {
+          reshade::log::message(reshade::log::level::info, "[DynCube] loading wipe: temporal cache cleared");
+        }
+        CSLog("dyncube", "loading wipe applied");
       }
 
       // Delayed-validate commit: consume the staged hasGeom bit BEFORE any new
@@ -10860,10 +12695,10 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         auto now = std::chrono::steady_clock::now();
         if (now - last_log >= std::chrono::seconds(1)) {
           last_log = now;
-          const char* phaseName = (dd->dyncube_phase == DeviceData::DynCubePhase::Capture) ? "Capture"
-                                : (dd->dyncube_phase == DeviceData::DynCubePhase::Filter) ? "Filter"
-                                : (dd->dyncube_phase == DeviceData::DynCubePhase::Variant) ? "Variant"
-                                : "Done";
+          const char* phaseName = (dd->dyncube_phase == DeviceData::DynCubePhase::Capture)   ? "Capture"
+                                  : (dd->dyncube_phase == DeviceData::DynCubePhase::Filter)  ? "Filter"
+                                  : (dd->dyncube_phase == DeviceData::DynCubePhase::Variant) ? "Variant"
+                                                                                             : "Done";
           std::string msg = "[DynCube] ";
           msg += "interval=" + std::to_string(interval);
           msg += " state=" + std::string(phaseName);
@@ -10929,33 +12764,28 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       reshade::api::resource_view histPosSrv = dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv;
       if (histPosSrv.handle) {
         cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
-          reshade::api::descriptor_table_update{{}, kDynCubeHistPosRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view, &histPosSrv});
+                                   reshade::api::descriptor_table_update{{}, kDynCubeHistPosRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &histPosSrv});
       }
     }
     // Bind the game's vanilla cubemap (t30) for the SSR -> Dynamic -> Vanilla fallback.
     if (dd->captured_vanilla_env_srv.handle) {
       cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
-        reshade::api::descriptor_table_update{{}, kDynCubeVanillaRegister, 0, 1,
-          reshade::api::descriptor_type::texture_shader_resource_view, &dd->captured_vanilla_env_srv});
+                                 reshade::api::descriptor_table_update{{}, kDynCubeVanillaRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->captured_vanilla_env_srv});
     }
     // Bind the SSR result (t31 blurred) + raw (t32) � produced once per frame by the scheduler.
     if (shader_injection.dynCube_ssr_enabled > 0.5f && dd->dyncube_ssr_blur_srv.handle) {
       cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
-        reshade::api::descriptor_table_update{{}, kDynCubeSSRRegister, 0, 1,
-          reshade::api::descriptor_type::texture_shader_resource_view, &dd->dyncube_ssr_blur_srv});
+                                 reshade::api::descriptor_table_update{{}, kDynCubeSSRRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->dyncube_ssr_blur_srv});
       if (dd->dyncube_ssr_raw_srv.handle) {
         cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
-          reshade::api::descriptor_table_update{{}, kDynCubeSSRRawRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view, &dd->dyncube_ssr_raw_srv});
+                                   reshade::api::descriptor_table_update{{}, kDynCubeSSRRawRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->dyncube_ssr_raw_srv});
       }
     }
     // Bind the captured vanilla ssr1 march result (t28) for the SSR replacement
     // debug view. Only needed for diagnostics; skipped when never captured or dead.
     if (dd->captured_ssr1_srv.handle && dd->captured_ssr1_live) {
       cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
-        reshade::api::descriptor_table_update{{}, 28u, 0, 1,
-          reshade::api::descriptor_type::texture_shader_resource_view, &dd->captured_ssr1_srv});
+                                 reshade::api::descriptor_table_update{{}, 28u, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->captured_ssr1_srv});
     }
 
     if (dbg == 3) {
@@ -10963,8 +12793,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       // Uses the DEDICATED solid cube so history resources are never touched.
       if (!forceVanilla && RunDynCubeSolid(cmd_list, dd)) {
         cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
-          reshade::api::descriptor_table_update{{}, kDynCubeRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view, &dd->dyncube_solid_cube_srv});
+                                   reshade::api::descriptor_table_update{{}, kDynCubeRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->dyncube_solid_cube_srv});
       }
     } else if (overrideT17 && (dbg != 0 || dd->captured_vanilla_env_srv.handle != 0u)) {
       // Push the ACTIVE completed filtered cube (never a partially-written building cube).
@@ -10972,12 +12801,11 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       // Normal display additionally requires a captured vanilla cube (fallback must
       // exist before dynamic takes over); debug modes override regardless.
       reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
-          ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
-          : dd->dyncube_srv;
+                                               ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
+                                               : dd->dyncube_srv;
       if (t17srv.handle) {
         cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
-          reshade::api::descriptor_table_update{{}, kDynCubeRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
+                                   reshade::api::descriptor_table_update{{}, kDynCubeRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
       }
     }
   } else if (dyncube_active) {
@@ -11002,14 +12830,15 @@ static bool OnBeforeSsaoShaderDraw(reshade::api::command_list* cmd_list) {
 // -- Resource create / destroy --
 
 static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
-                                   uint32_t gw, uint32_t gh) {
+                                  uint32_t gw, uint32_t gh) {
   DestroyGTVBAOResources(dev, d);
   // Always at full resolution.
   uint32_t w = gw;
   uint32_t h = gh;
   if (w < 64u) w = 64u;
   if (h < 64u) h = 64u;
-  d->working_width = w; d->working_height = h;
+  d->working_width = w;
+  d->working_height = h;
 
   {
     reshade::api::sampler_desc sd = {};
@@ -11031,14 +12860,14 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
     rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
     dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &d->depth_mips_texture);
     dev->create_resource_view(d->depth_mips_texture, reshade::api::resource_usage::shader_resource,
-                               reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
-                                                                 reshade::api::format::r32_float, 0, kGTVBAODepthMipLevels, 0, 1),
-                               &d->depth_mips_srv);
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
+                                                               reshade::api::format::r32_float, 0, kGTVBAODepthMipLevels, 0, 1),
+                              &d->depth_mips_srv);
     for (uint32_t m = 0; m < kGTVBAODepthMipLevels; ++m)
       dev->create_resource_view(d->depth_mips_texture, reshade::api::resource_usage::unordered_access,
-                                 reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
-                                                                   reshade::api::format::r32_float, m, 1, 0, 1),
-                                 &d->depth_mips_uavs[m]);
+                                reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
+                                                                 reshade::api::format::r32_float, m, 1, 0, 1),
+                                &d->depth_mips_uavs[m]);
   }
 
   auto mk = [&](uint32_t tw, uint32_t th, reshade::api::format fmt,
@@ -11061,14 +12890,16 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
   const uint32_t div = 1u << res_index;
   const uint32_t aw = (w + div - 1u) / div;
   const uint32_t ah = (h + div - 1u) / div;
-  d->ao_width = aw; d->ao_height = ah;
+  d->ao_width = aw;
+  d->ao_height = ah;
   d->last_created_gtvbao_resolution = std::log2((float)div);
   mk(aw, ah, reshade::api::format::r32_uint, &d->ao_term_a_texture, &d->ao_term_a_srv, &d->ao_term_a_uav);
   // VBGI raw gather target: always allocated; RunVBGI never resizes it.
   const uint32_t vdiv = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex);
   const uint32_t vw = (w + vdiv - 1u) / vdiv;
   const uint32_t vh = (h + vdiv - 1u) / vdiv;
-  d->vbgi_width = vw; d->vbgi_height = vh;
+  d->vbgi_width = vw;
+  d->vbgi_height = vh;
   d->last_created_vbgi_resolution = std::log2((float)vdiv);
   mk(vw, vh, reshade::api::format::r16g16b16a16_float, &d->vbgi_raw_texture, &d->vbgi_raw_srv, &d->vbgi_raw_uav);
   // VBGI radiance chain: r11g11b10_float over the VBGI domain, 5 mips (mip 0 written by the prepass, 1-4 by the box filter).
@@ -11081,17 +12912,17 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
     dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &d->vbgi_radiance_texture);
     dev->create_resource_view(d->vbgi_radiance_texture, reshade::api::resource_usage::shader_resource,
                               reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
-                                                                reshade::api::format::r11g11b10_float, 0, 5, 0, 1),
+                                                               reshade::api::format::r11g11b10_float, 0, 5, 0, 1),
                               &d->vbgi_radiance_srv);
     for (uint32_t m = 0; m < 4; ++m)
       dev->create_resource_view(d->vbgi_radiance_texture, reshade::api::resource_usage::shader_resource,
                                 reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
-                                                                  reshade::api::format::r11g11b10_float, m, 1, 0, 1),
+                                                                 reshade::api::format::r11g11b10_float, m, 1, 0, 1),
                                 &d->vbgi_radiance_mip_srv[m]);
     for (uint32_t m = 0; m < 5; ++m)
       dev->create_resource_view(d->vbgi_radiance_texture, reshade::api::resource_usage::unordered_access,
                                 reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
-                                                                  reshade::api::format::r11g11b10_float, m, 1, 0, 1),
+                                                                 reshade::api::format::r11g11b10_float, m, 1, 0, 1),
                                 &d->vbgi_radiance_mip_uav[m]);
   }
 
@@ -11109,23 +12940,39 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   auto dp = [&](reshade::api::pipeline& p) { if (p.handle) { dev->destroy_pipeline(p); p = {}; } };
   auto dl = [&](reshade::api::pipeline_layout& l) { if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; } };
 
-  dv(d->depth_mips_srv); for (auto& u : d->depth_mips_uavs) dv(u); dr(d->depth_mips_texture);
-  dv(d->ao_term_a_srv); dv(d->ao_term_a_uav); dr(d->ao_term_a_texture);
-  if (d->point_clamp_sampler.handle) { dev->destroy_sampler(d->point_clamp_sampler); d->point_clamp_sampler = {}; }
-  dp(d->prefilter_pipeline); dp(d->main_pipeline);
-  dl(d->prefilter_layout); dl(d->main_layout);
-  dp(d->vbgi_main_pipeline); DestroyGTVBAODescriptorTables(dev, &d->vbgi_main_tables);
-  dv(d->vbgi_raw_srv); dv(d->vbgi_raw_uav); dr(d->vbgi_raw_texture);
+  dv(d->depth_mips_srv);
+  for (auto& u : d->depth_mips_uavs) dv(u);
+  dr(d->depth_mips_texture);
+  dv(d->ao_term_a_srv);
+  dv(d->ao_term_a_uav);
+  dr(d->ao_term_a_texture);
+  if (d->point_clamp_sampler.handle) {
+    dev->destroy_sampler(d->point_clamp_sampler);
+    d->point_clamp_sampler = {};
+  }
+  dp(d->prefilter_pipeline);
+  dp(d->main_pipeline);
+  dl(d->prefilter_layout);
+  dl(d->main_layout);
+  dp(d->vbgi_main_pipeline);
+  DestroyGTVBAODescriptorTables(dev, &d->vbgi_main_tables);
+  dv(d->vbgi_raw_srv);
+  dv(d->vbgi_raw_uav);
+  dr(d->vbgi_raw_texture);
   dl(d->vbgi_main_layout);
-  dp(d->vbgi_radiance_pipeline); dp(d->vbgi_mips_pipeline);
-  dl(d->vbgi_radiance_layout); dl(d->vbgi_mips_layout);
-  DestroyGTVBAODescriptorTables(dev, &d->vbgi_radiance_tables); DestroyGTVBAODescriptorTables(dev, &d->vbgi_mips_tables);
+  dp(d->vbgi_radiance_pipeline);
+  dp(d->vbgi_mips_pipeline);
+  dl(d->vbgi_radiance_layout);
+  dl(d->vbgi_mips_layout);
+  DestroyGTVBAODescriptorTables(dev, &d->vbgi_radiance_tables);
+  DestroyGTVBAODescriptorTables(dev, &d->vbgi_mips_tables);
   dp(d->vbgi_radiance_far_pipeline);
   dl(d->vbgi_radiance_far_layout);
   DestroyGTVBAODescriptorTables(dev, &d->vbgi_radiance_far_tables);
   for (auto& v : d->vbgi_radiance_mip_srv) dv(v);
   for (auto& u : d->vbgi_radiance_mip_uav) dv(u);
-  dv(d->vbgi_radiance_srv); dr(d->vbgi_radiance_texture);
+  dv(d->vbgi_radiance_srv);
+  dr(d->vbgi_radiance_texture);
   falcom_world::rtgi::DestroyRtgiDenoiseSet(dev, &d->vbgi_far_color_denoise);
   d->vbgi_far_color_denoise = {};
   d->vbgi_far_color_last = false;
@@ -11142,8 +12989,11 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   falcom_world::rtgi::DestroyRtgiDenoiseSet(dev, &d->gtvbao_denoise);
   d->gtvbao_denoise = falcom_world::rtgi::RtgiDenoiseSet{};
   falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->gtvbao_svgf_raw);
-  dp(d->vbgi_far_main_pipeline); dp(d->vbgi_far_resolve_pipeline); dp(d->vbgi_far_compose_pipeline);
-  dl(d->vbgi_far_main_layout); dl(d->vbgi_far_layout);
+  dp(d->vbgi_far_main_pipeline);
+  dp(d->vbgi_far_resolve_pipeline);
+  dp(d->vbgi_far_compose_pipeline);
+  dl(d->vbgi_far_main_layout);
+  dl(d->vbgi_far_layout);
   DestroyGTVBAODescriptorTables(dev, &d->vbgi_far_main_tables);
   DestroyGTVBAODescriptorTables(dev, &d->vbgi_far_tables);
   falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_cand_pos);
@@ -11169,13 +13019,25 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   DestroyGTVBAODescriptorTables(dev, &d->main_tables);
   DestroyGTVBAODescriptorTables(dev, &d->foliage_mask_tables);
   // GI resources (now integrated � no separate VBGI pipeline)
-  dv(d->foliage_mask_srv); dv(d->foliage_mask_uav); dr(d->foliage_mask_texture);
-  dp(d->foliage_mask_pipeline); dl(d->foliage_mask_layout);
-  dv(d->debug_srv); dv(d->debug_uav); dr(d->debug_texture);
-  if (d->linear_clamp_sampler.handle) { dev->destroy_sampler(d->linear_clamp_sampler); d->linear_clamp_sampler = {}; }
+  dv(d->foliage_mask_srv);
+  dv(d->foliage_mask_uav);
+  dr(d->foliage_mask_texture);
+  dp(d->foliage_mask_pipeline);
+  dl(d->foliage_mask_layout);
+  dv(d->debug_srv);
+  dv(d->debug_uav);
+  dr(d->debug_texture);
+  if (d->linear_clamp_sampler.handle) {
+    dev->destroy_sampler(d->linear_clamp_sampler);
+    d->linear_clamp_sampler = {};
+  }
   // IS-FAST noise
-  dv(d->isfast_noise_srv); dr(d->isfast_noise_texture);
-  if (d->isfast_sampler.handle) { dev->destroy_sampler(d->isfast_sampler); d->isfast_sampler = {}; }
+  dv(d->isfast_noise_srv);
+  dr(d->isfast_noise_texture);
+  if (d->isfast_sampler.handle) {
+    dev->destroy_sampler(d->isfast_sampler);
+    d->isfast_sampler = {};
+  }
   d->isfast_texture_loaded = false;
   d->isfast_texture_attempted = false;
   // Do NOT clear captured_depth_srv / captured_scene_cbv �
@@ -11218,7 +13080,7 @@ static void CreateShadowsResources(reshade::api::device* dev, DeviceData* d,
     rd.texture = {w, h, 1, 1, reshade::api::format::r8g8b8a8_unorm, 1};
     rd.heap = reshade::api::memory_heap::gpu_only;
     rd.usage = reshade::api::resource_usage::shader_resource
-             | reshade::api::resource_usage::unordered_access;
+               | reshade::api::resource_usage::unordered_access;
     if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, res)) {
       CSLog("shadows", "create_resource failed", true);
       return false;
@@ -11256,9 +13118,15 @@ static void DestroyShadowsResources(reshade::api::device* dev, DeviceData* d) {
   auto dp = [&](reshade::api::pipeline& p) { if (p.handle) { dev->destroy_pipeline(p); p = {}; } };
   auto dl = [&](reshade::api::pipeline_layout& l) { if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; } };
 
-  dv(d->contact_shadow_srv); dv(d->contact_shadow_uav); dr(d->contact_shadow_texture);
-  dv(d->contact_denoise_srv); dv(d->contact_denoise_uav); dr(d->contact_denoise_texture);
-  dv(d->contact_local_srv); dv(d->contact_local_uav); dr(d->contact_local_texture);
+  dv(d->contact_shadow_srv);
+  dv(d->contact_shadow_uav);
+  dr(d->contact_shadow_texture);
+  dv(d->contact_denoise_srv);
+  dv(d->contact_denoise_uav);
+  dr(d->contact_denoise_texture);
+  dv(d->contact_local_srv);
+  dv(d->contact_local_uav);
+  dr(d->contact_local_texture);
   if (d->shadows_point_clamp_sampler.handle) {
     dev->destroy_sampler(d->shadows_point_clamp_sampler);
     d->shadows_point_clamp_sampler = {};
@@ -11294,10 +13162,10 @@ static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData
 
   for (uint32_t pass = 0; pass < kShadowsPassCount; ++pass) {
     if (d->shadows_layouts[pass].handle == 0u) {
-      DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
-      DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer};
-      DR srv_r     = {0,0,0,kShadowsSrvPerPass[pass],DS::all_compute,1,DT::texture_shader_resource_view};
-      DR uav_r     = {0,0,0,kShadowsUavPerPass[pass],DS::all_compute,1,DT::texture_unordered_access_view};
+      DR sampler_r = {0, 0, 0, 1, DS::all_compute, 1, DT::sampler};
+      DR cbv_r = {0, 0, 0, 1, DS::all_compute, 1, DT::constant_buffer};
+      DR srv_r = {0, 0, 0, kShadowsSrvPerPass[pass], DS::all_compute, 1, DT::texture_shader_resource_view};
+      DR uav_r = {0, 0, 0, kShadowsUavPerPass[pass], DS::all_compute, 1, DT::texture_unordered_access_view};
       reshade::api::constant_range push_range = {};
       push_range.binding = 0;
       push_range.dx_register_index = 13;
@@ -11309,13 +13177,17 @@ static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData
       push_range.visibility = DS::all_compute;
       P param_sampler, param_cbv, param_srv, param_uav, param_constants;
       param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-      param_sampler.descriptor_table.count = 1; param_sampler.descriptor_table.ranges = &sampler_r;
+      param_sampler.descriptor_table.count = 1;
+      param_sampler.descriptor_table.ranges = &sampler_r;
       param_cbv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-      param_cbv.descriptor_table.count = 1; param_cbv.descriptor_table.ranges = &cbv_r;
+      param_cbv.descriptor_table.count = 1;
+      param_cbv.descriptor_table.ranges = &cbv_r;
       param_srv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-      param_srv.descriptor_table.count = 1; param_srv.descriptor_table.ranges = &srv_r;
+      param_srv.descriptor_table.count = 1;
+      param_srv.descriptor_table.ranges = &srv_r;
       param_uav.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-      param_uav.descriptor_table.count = 1; param_uav.descriptor_table.ranges = &uav_r;
+      param_uav.descriptor_table.count = 1;
+      param_uav.descriptor_table.ranges = &uav_r;
       param_constants.type = reshade::api::pipeline_layout_param_type::push_constants;
       param_constants.push_constants = push_range;
       P params[5] = {param_sampler, param_cbv, param_srv, param_uav, param_constants};
@@ -11330,7 +13202,9 @@ static bool CreateShadowsPipelinesIfNeeded(reshade::api::device* dev, DeviceData
       const std::span<const uint8_t> code = kBytecode[pass];
       if (code.empty() || d->shadows_layouts[pass].handle == 0u) return false;
       reshade::api::shader_desc sd = {};
-      sd.code = code.data(); sd.code_size = code.size(); sd.entry_point = "main";
+      sd.code = code.data();
+      sd.code_size = code.size();
+      sd.entry_point = "main";
       reshade::api::pipeline_subobject so = {
           reshade::api::pipeline_subobject_type::compute_shader, 1, &sd};
       if (!dev->create_pipeline(d->shadows_layouts[pass], 1, &so, &d->shadows_pipelines[pass])) {
@@ -11358,15 +13232,14 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
     if (d->shadows_log_frame == d->frame_index) return;
     d->shadows_log_frame = d->frame_index;
     reshade::log::message(reshade::log::level::warning,
-        (std::string("[Shadows] blocked: ") + why
-         + " (depth=" + (d->captured_depth_srv.handle ? "ok" : "null")
-         + " mrt=" + (d->captured_mrt_normal_srv.handle ? "ok" : "null")
-         + " cbv=" + (d->captured_scene_cbv_view.handle ? "ok" : "null")
-         + " live=" + std::to_string(d->captured_depth_live.load()
-                                   && d->captured_mrt_live.load()
-                                   && d->captured_cbv_live.load())
-         + " grid=" + std::to_string(d->shadows_w) + "x" + std::to_string(d->shadows_h)
-         + " ready=" + (d->shadows_resources_ready ? "1" : "0")).c_str());
+                          (std::string("[Shadows] blocked: ") + why
+                           + " (depth=" + (d->captured_depth_srv.handle ? "ok" : "null")
+                           + " mrt=" + (d->captured_mrt_normal_srv.handle ? "ok" : "null")
+                           + " cbv=" + (d->captured_scene_cbv_view.handle ? "ok" : "null")
+                           + " live=" + std::to_string(d->captured_depth_live.load() && d->captured_mrt_live.load() && d->captured_cbv_live.load())
+                           + " grid=" + std::to_string(d->shadows_w) + "x" + std::to_string(d->shadows_h)
+                           + " ready=" + (d->shadows_resources_ready ? "1" : "0"))
+                              .c_str());
     CSLog("shadows", std::string("blocked: ") + why);
   };
 
@@ -11390,9 +13263,9 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
   if (isfast_wanted && !isfast_ready && !d->shadows_logged_isfast_missing) {
     d->shadows_logged_isfast_missing = true;
     reshade::log::message(reshade::log::level::warning,
-        "[Shadows] IS-FAST requested but the volume is unavailable: contact "
-        "shadows will run unjittered. Enable the IS-FAST master in the IS-FAST "
-        "section to fix the banding.");
+                          "[Shadows] IS-FAST requested but the volume is unavailable: contact "
+                          "shadows will run unjittered. Enable the IS-FAST master in the IS-FAST "
+                          "section to fix the banding.");
   }
 
   const uint32_t w = std::max(d->shadows_w, 1u);
@@ -11411,7 +13284,8 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
   shader_injection.cs_working_w = static_cast<float>(w);
   shader_injection.cs_working_h = static_cast<float>(h);
   shader_injection.cs_noise_frame = isfast_ready
-      ? static_cast<float>(d->frame_index % 32u) : -1.f;
+                                        ? static_cast<float>(d->frame_index % 32u)
+                                        : -1.f;
 
   const auto CS = reshade::api::shader_stage::all_compute;
   const auto AC = reshade::api::pipeline_stage::all_compute;
@@ -11423,10 +13297,10 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
                       reshade::api::resource out_tex) {
     cl->bind_pipeline(AC, d->shadows_pipelines[pass]);
     reshade::api::descriptor_table_update u[kGtvbaoDescriptorTableParamCount] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->shadows_point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,srv_count,reshade::api::descriptor_type::texture_shader_resource_view,srvs},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&uav},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->shadows_point_clamp_sampler},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, srv_count, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &uav},
     };
     for (uint32_t i = 0; i < kGtvbaoDescriptorTableParamCount; ++i)
       u[i].table = d->shadows_tables[pass][i];
@@ -11480,7 +13354,7 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
     if (!d->shadows_logged_first_dispatch) {
       d->shadows_logged_first_dispatch = true;
       CSLog("shadows", "first dispatch ok at " + std::to_string(w) + "x" + std::to_string(h)
-          + " (isfast=" + (isfast_ready ? "ready" : "missing") + ")");
+                           + " (isfast=" + (isfast_ready ? "ready" : "missing") + ")");
     }
     if (d->shadows_ran_from != fromHook) {
       // Report the first dispatch point once. Kai runs a character lighting pass
@@ -11490,8 +13364,8 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
       // symptom.
       d->shadows_ran_from = fromHook;
       CSLog("shadows", fromHook == 0
-          ? "dispatched from the character lighting pass"
-          : "dispatched from the main lighting pass");
+                           ? "dispatched from the character lighting pass"
+                           : "dispatched from the main lighting pass");
     }
   }
   if (local_due) {
@@ -11521,19 +13395,20 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
         const uint64_t light_bytes = dev->get_resource_desc(dev->get_resource_from_view(d->vbgi_in_srv[4])).buffer.size;
         const uint64_t cell_bytes = dev->get_resource_desc(dev->get_resource_from_view(d->vbgi_in_srv[5])).buffer.size;
         CSLog("shadows", "local first dispatch ok at " + std::to_string(w) + "x" + std::to_string(h)
-            + " (lamps=" + std::to_string(light_bytes / falcom_world::rtgi::kLightParamBytes)
-            + " cells=" + std::to_string(cell_bytes / falcom_world::rtgi::kLightIndexDataBytes)
-            + " material_slot=" + std::to_string(material_k)
-            + " isfast=" + (isfast_ready ? "ready" : "missing") + ")");
+                             + " (lamps=" + std::to_string(light_bytes / falcom_world::rtgi::kLightParamBytes)
+                             + " cells=" + std::to_string(cell_bytes / falcom_world::rtgi::kLightIndexDataBytes)
+                             + " material_slot=" + std::to_string(material_k)
+                             + " isfast=" + (isfast_ready ? "ready" : "missing") + ")");
       }
     } else if (!d->shadows_logged_local_inputs_missing) {
       d->shadows_logged_local_inputs_missing = true;
       std::string why = "[Shadows] local blocked: lighting inputs not captured this frame (";
       for (const uint32_t k : local_inputs) {
         why += " slot" + std::to_string(k) + "="
-               + (d->vbgi_in_srv[k].handle == 0u ? "null"
-                  : !d->vbgi_in_live[k].load() ? "dead"
-                  : d->vbgi_in_frame[k] != d->frame_index ? "stale" : "ok");
+               + (d->vbgi_in_srv[k].handle == 0u          ? "null"
+                  : !d->vbgi_in_live[k].load()            ? "dead"
+                  : d->vbgi_in_frame[k] != d->frame_index ? "stale"
+                                                          : "ok");
       }
       why += " )";
       reshade::log::message(reshade::log::level::warning, why.c_str());
@@ -11548,12 +13423,12 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
 
 static uint32_t DynCubeResolveSize(float v) {
   switch ((int)v) {
-    case 0: return 128u;
-    case 1: return 256u;
-    case 2: return 512u;
-    case 3: return 768u;
-    case 4: return 1024u;
-    case 5: return 1536u;
+    case 0:  return 128u;
+    case 1:  return 256u;
+    case 2:  return 512u;
+    case 3:  return 768u;
+    case 4:  return 1024u;
+    case 5:  return 1536u;
     default: return 2048u;
   }
 }
@@ -11564,66 +13439,155 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
   auto dp = [&](reshade::api::pipeline& p) { if (p.handle) { dev->destroy_pipeline(p); p = {}; } };
   auto dl = [&](reshade::api::pipeline_layout& l) { if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; } };
-  if (d->dyncube_sampler.handle) { dev->destroy_sampler(d->dyncube_sampler); d->dyncube_sampler = {}; }
+  if (d->dyncube_sampler.handle) {
+    dev->destroy_sampler(d->dyncube_sampler);
+    d->dyncube_sampler = {};
+  }
   for (auto& set : d->dyncube_hist) {
-    dv(set.color_cube_srv); dv(set.color_arr_srv); dv(set.color_uav); dr(set.color);
-    dv(set.pos_arr_srv); dv(set.pos_cube_srv); dv(set.pos_uav); dr(set.pos);
-    dv(set.contrib_arr_srv); dv(set.contrib_uav); dr(set.contrib);
+    dv(set.color_cube_srv);
+    dv(set.color_arr_srv);
+    dv(set.color_uav);
+    dr(set.color);
+    dv(set.pos_arr_srv);
+    dv(set.pos_cube_srv);
+    dv(set.pos_uav);
+    dr(set.pos);
+    dv(set.contrib_arr_srv);
+    dv(set.contrib_uav);
+    dr(set.contrib);
   }
   // Aliases are copies of the above handles � zero them (never double-destroy).
   d->dyncube_srv = {};
   d->dyncube_uav = {};
   d->dyncube_texture = {};
   for (uint32_t i = 0; i < 2; ++i) {
-    dv(d->dyncube_cam_srv[i]); dv(d->dyncube_cam_uav[i]); dr(d->dyncube_cam[i]);
+    dv(d->dyncube_cam_srv[i]);
+    dv(d->dyncube_cam_uav[i]);
+    dr(d->dyncube_cam[i]);
   }
   // Character mask
-  dv(d->dyncube_charmask_srv); dv(d->dyncube_charmask_arr_srv); dr(d->dyncube_charmask);
-  if (d->dyncube_charmask_uav.handle) { dev->destroy_resource_view(d->dyncube_charmask_uav); d->dyncube_charmask_uav = {}; }
+  dv(d->dyncube_charmask_srv);
+  dv(d->dyncube_charmask_arr_srv);
+  dr(d->dyncube_charmask);
+  if (d->dyncube_charmask_uav.handle) {
+    dev->destroy_resource_view(d->dyncube_charmask_uav);
+    d->dyncube_charmask_uav = {};
+  }
   // World-fixed parallax bounds (persistent; re-initialized on next create)
-  dv(d->dyncube_worldbox_bounds_srv); dv(d->dyncube_worldbox_bounds_uav); dr(d->dyncube_worldbox_bounds);
-  dv(d->dyncube_faceextents_uav); dr(d->dyncube_faceextents);
+  dv(d->dyncube_worldbox_bounds_srv);
+  dv(d->dyncube_worldbox_bounds_uav);
+  dr(d->dyncube_worldbox_bounds);
+  dv(d->dyncube_faceextents_uav);
+  dr(d->dyncube_faceextents);
   dr(d->dyncube_faceExtStaging);
-  dv(d->dyncube_worldbox_scratch_srv); dv(d->dyncube_worldbox_scratch_uav); dr(d->dyncube_worldbox_scratch);
+  dv(d->dyncube_worldbox_scratch_srv);
+  dv(d->dyncube_worldbox_scratch_uav);
+  dr(d->dyncube_worldbox_scratch);
   d->dyncube_worldbox_scratch_groups = 0u;
-  dp(d->dyncube_worldbox_pipeline); dl(d->dyncube_worldbox_layout);
-  for (auto& t : d->dyncube_worldbox_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+  dp(d->dyncube_worldbox_pipeline);
+  dl(d->dyncube_worldbox_layout);
+  for (auto& t : d->dyncube_worldbox_tables) {
+    if (t.handle) {
+      dev->free_descriptor_table(t);
+      t = {};
+    }
+  }
   d->dyncube_worldbox_layout_version = 0u;
   d->dyncube_worldbox_reset_pending = true;
   // Phase 3 GGX
-  if (d->dyncube_linear_sampler.handle) { dev->destroy_sampler(d->dyncube_linear_sampler); d->dyncube_linear_sampler = {}; }
-  dv(d->dyncube_ggx_in_cube_srv); dr(d->dyncube_ggx_in);
+  if (d->dyncube_linear_sampler.handle) {
+    dev->destroy_sampler(d->dyncube_linear_sampler);
+    d->dyncube_linear_sampler = {};
+  }
+  dv(d->dyncube_ggx_in_cube_srv);
+  dr(d->dyncube_ggx_in);
   for (uint32_t i = 0; i < 2; ++i) {
-    dv(d->dyncube_ggx_out_cube_srv[i]); dr(d->dyncube_ggx_out[i]);
-    for (auto& u : d->dyncube_ggx_out_mip_uav[i]) { if (u.handle) { dev->destroy_resource_view(u); u = {}; } }
+    dv(d->dyncube_ggx_out_cube_srv[i]);
+    dr(d->dyncube_ggx_out[i]);
+    for (auto& u : d->dyncube_ggx_out_mip_uav[i]) {
+      if (u.handle) {
+        dev->destroy_resource_view(u);
+        u = {};
+      }
+    }
   }
   d->dyncube_ggx_valid = false;
   // Global-push variant cube (derived): destroy with the rest, rebuild on demand.
-  dv(d->dyncube_variant_cube_srv); dr(d->dyncube_variant);
-  for (auto& u : d->dyncube_variant_mip_uav) { if (u.handle) { dev->destroy_resource_view(u); u = {}; } }
-  dp(d->dyncube_variant_pipeline); dl(d->dyncube_variant_layout);
-  for (auto& t : d->dyncube_variant_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+  dv(d->dyncube_variant_cube_srv);
+  dr(d->dyncube_variant);
+  for (auto& u : d->dyncube_variant_mip_uav) {
+    if (u.handle) {
+      dev->destroy_resource_view(u);
+      u = {};
+    }
+  }
+  dp(d->dyncube_variant_pipeline);
+  dl(d->dyncube_variant_layout);
+  for (auto& t : d->dyncube_variant_tables) {
+    if (t.handle) {
+      dev->free_descriptor_table(t);
+      t = {};
+    }
+  }
   d->dyncube_variant_valid = false;
   // Dedicated solid-color debug cube
-  dv(d->dyncube_solid_cube_srv); dr(d->dyncube_solid_cube);
-  if (d->dyncube_solid_cube_uav.handle) { dev->destroy_resource_view(d->dyncube_solid_cube_uav); d->dyncube_solid_cube_uav = {}; }
+  dv(d->dyncube_solid_cube_srv);
+  dr(d->dyncube_solid_cube);
+  if (d->dyncube_solid_cube_uav.handle) {
+    dev->destroy_resource_view(d->dyncube_solid_cube_uav);
+    d->dyncube_solid_cube_uav = {};
+  }
   // Simple SSR
-  dv(d->dyncube_ssr_raw_srv); dr(d->dyncube_ssr_raw);
-  if (d->dyncube_ssr_raw_uav.handle) { dev->destroy_resource_view(d->dyncube_ssr_raw_uav); d->dyncube_ssr_raw_uav = {}; }
-  dv(d->dyncube_ssr_blur_h_srv); dr(d->dyncube_ssr_blur_h);
-  if (d->dyncube_ssr_blur_h_uav.handle) { dev->destroy_resource_view(d->dyncube_ssr_blur_h_uav); d->dyncube_ssr_blur_h_uav = {}; }
-  dv(d->dyncube_ssr_blur_srv); dr(d->dyncube_ssr_blur);
-  if (d->dyncube_ssr_blur_uav.handle) { dev->destroy_resource_view(d->dyncube_ssr_blur_uav); d->dyncube_ssr_blur_uav = {}; }
-  dv(d->dyncube_ssr_hitmask_srv); dr(d->dyncube_ssr_hitmask);
-  if (d->dyncube_ssr_hitmask_uav.handle) { dev->destroy_resource_view(d->dyncube_ssr_hitmask_uav); d->dyncube_ssr_hitmask_uav = {}; }
-  dp(d->dyncube_ssr_pipeline); dl(d->dyncube_ssr_layout);
-  for (auto& t : d->dyncube_ssr_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+  dv(d->dyncube_ssr_raw_srv);
+  dr(d->dyncube_ssr_raw);
+  if (d->dyncube_ssr_raw_uav.handle) {
+    dev->destroy_resource_view(d->dyncube_ssr_raw_uav);
+    d->dyncube_ssr_raw_uav = {};
+  }
+  dv(d->dyncube_ssr_blur_h_srv);
+  dr(d->dyncube_ssr_blur_h);
+  if (d->dyncube_ssr_blur_h_uav.handle) {
+    dev->destroy_resource_view(d->dyncube_ssr_blur_h_uav);
+    d->dyncube_ssr_blur_h_uav = {};
+  }
+  dv(d->dyncube_ssr_blur_srv);
+  dr(d->dyncube_ssr_blur);
+  if (d->dyncube_ssr_blur_uav.handle) {
+    dev->destroy_resource_view(d->dyncube_ssr_blur_uav);
+    d->dyncube_ssr_blur_uav = {};
+  }
+  dv(d->dyncube_ssr_hitmask_srv);
+  dr(d->dyncube_ssr_hitmask);
+  if (d->dyncube_ssr_hitmask_uav.handle) {
+    dev->destroy_resource_view(d->dyncube_ssr_hitmask_uav);
+    d->dyncube_ssr_hitmask_uav = {};
+  }
+  dp(d->dyncube_ssr_pipeline);
+  dl(d->dyncube_ssr_layout);
+  for (auto& t : d->dyncube_ssr_tables) {
+    if (t.handle) {
+      dev->free_descriptor_table(t);
+      t = {};
+    }
+  }
   d->dyncube_ssr_layout_version = 0u;
-  dp(d->dyncube_ssr_blur_pipeline); dl(d->dyncube_ssr_blur_layout);
-  for (auto& t : d->dyncube_ssr_blur_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+  dp(d->dyncube_ssr_blur_pipeline);
+  dl(d->dyncube_ssr_blur_layout);
+  for (auto& t : d->dyncube_ssr_blur_tables) {
+    if (t.handle) {
+      dev->free_descriptor_table(t);
+      t = {};
+    }
+  }
   d->dyncube_ssr_blur_layout_version = 0u;
-  dp(d->dyncube_ggx_pipeline); dl(d->dyncube_ggx_layout);
-  for (auto& t : d->dyncube_ggx_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+  dp(d->dyncube_ggx_pipeline);
+  dl(d->dyncube_ggx_layout);
+  for (auto& t : d->dyncube_ggx_tables) {
+    if (t.handle) {
+      dev->free_descriptor_table(t);
+      t = {};
+    }
+  }
   d->dyncube_hist_cur = 0;
   d->dyncube_needs_reset = true;
   d->dyncube_loadingWipeDone = false;
@@ -11651,11 +13615,23 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   d->dyncube_lastCharCapture = -1.f;
   d->dyncube_lastSparkleRejection = -1.f;
   d->dyncube_hasValidRead = false;
-  dp(d->dyncube_capture_pipeline); dp(d->dyncube_solid_pipeline);
-  dl(d->dyncube_capture_layout); dl(d->dyncube_solid_layout);
+  dp(d->dyncube_capture_pipeline);
+  dp(d->dyncube_solid_pipeline);
+  dl(d->dyncube_capture_layout);
+  dl(d->dyncube_solid_layout);
   d->dyncube_capture_layout_version = 0u;
-  for (auto& t : d->dyncube_capture_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
-  for (auto& t : d->dyncube_solid_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+  for (auto& t : d->dyncube_capture_tables) {
+    if (t.handle) {
+      dev->free_descriptor_table(t);
+      t = {};
+    }
+  }
+  for (auto& t : d->dyncube_solid_tables) {
+    if (t.handle) {
+      dev->free_descriptor_table(t);
+      t = {};
+    }
+  }
   d->dyncube_resources_created = false;
   d->dyncube_solid_written = false;
 }
@@ -11705,15 +13681,15 @@ static bool CreateDynCubeVariantResources(reshade::api::device* dev, DeviceData*
     return false;
   }
   dev->create_resource_view(d->dyncube_variant, reshade::api::resource_usage::shader_resource,
-    reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
-                                     reshade::api::format::r16g16b16a16_float, 0, mips, 0, 6),
-    &d->dyncube_variant_cube_srv);
+                            reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
+                                                             reshade::api::format::r16g16b16a16_float, 0, mips, 0, 6),
+                            &d->dyncube_variant_cube_srv);
   // One array UAV per mip: the variant writes every mip directly (no GenerateMips).
   for (uint32_t m = 0; m < mips && m < 8u; ++m) {
     dev->create_resource_view(d->dyncube_variant, reshade::api::resource_usage::unordered_access,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16g16b16a16_float, m, 1, 0, 6),
-      &d->dyncube_variant_mip_uav[m]);
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                                               reshade::api::format::r16g16b16a16_float, m, 1, 0, 6),
+                              &d->dyncube_variant_mip_uav[m]);
   }
   return true;
 }
@@ -11738,13 +13714,13 @@ static bool CreateDynCubeSolidResources(reshade::api::device* dev, DeviceData* d
     return false;
   }
   dev->create_resource_view(d->dyncube_solid_cube, reshade::api::resource_usage::shader_resource,
-    reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
-                                     reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-    &d->dyncube_solid_cube_srv);
+                            reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
+                                                             reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+                            &d->dyncube_solid_cube_srv);
   dev->create_resource_view(d->dyncube_solid_cube, reshade::api::resource_usage::unordered_access,
-    reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                     reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-    &d->dyncube_solid_cube_uav);
+                            reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                                             reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+                            &d->dyncube_solid_cube_uav);
   d->dyncube_solid_written = false;
   return d->dyncube_solid_cube_srv.handle != 0u && d->dyncube_solid_cube_uav.handle != 0u;
 }
@@ -11768,9 +13744,9 @@ static bool CreateDynCubeGGXInResources(reshade::api::device* dev, DeviceData* d
     return false;
   }
   dev->create_resource_view(d->dyncube_ggx_in, reshade::api::resource_usage::shader_resource,
-    reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
-                                     reshade::api::format::r16g16b16a16_float, 0, d->dyncube_mip_count, 0, 6),
-    &d->dyncube_ggx_in_cube_srv);
+                            reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
+                                                             reshade::api::format::r16g16b16a16_float, 0, d->dyncube_mip_count, 0, 6),
+                            &d->dyncube_ggx_in_cube_srv);
   return d->dyncube_ggx_in_cube_srv.handle != 0u;
 }
 
@@ -11811,34 +13787,34 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       return false;
     }
     dev->create_resource_view(d->dyncube_hist[idx].color, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_hist[idx].color_cube_srv);
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
+                                                               reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+                              &d->dyncube_hist[idx].color_cube_srv);
     dev->create_resource_view(d->dyncube_hist[idx].color, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_hist[idx].color_arr_srv);
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                                               reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+                              &d->dyncube_hist[idx].color_arr_srv);
     dev->create_resource_view(d->dyncube_hist[idx].color, reshade::api::resource_usage::unordered_access,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_hist[idx].color_uav);
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                                               reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+                              &d->dyncube_hist[idx].color_uav);
     // Position (RGBA16F, rgb=scaled pos, a=validity) � array SRV/UAV + cube SRV (debug 11/12)
     if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_hist[idx].pos)) {
       if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create history pos");
       return false;
     }
     dev->create_resource_view(d->dyncube_hist[idx].pos, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_hist[idx].pos_arr_srv);
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                                               reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+                              &d->dyncube_hist[idx].pos_arr_srv);
     dev->create_resource_view(d->dyncube_hist[idx].pos, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_hist[idx].pos_cube_srv);
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
+                                                               reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+                              &d->dyncube_hist[idx].pos_cube_srv);
     dev->create_resource_view(d->dyncube_hist[idx].pos, reshade::api::resource_usage::unordered_access,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_hist[idx].pos_uav);
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                                               reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+                              &d->dyncube_hist[idx].pos_uav);
     // Contribution (R16F) � array SRV/UAV only
     reshade::api::resource_desc rc = {};
     rc.type = reshade::api::resource_type::texture_2d;
@@ -11850,13 +13826,13 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       return false;
     }
     dev->create_resource_view(d->dyncube_hist[idx].contrib, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16_float, 0, 1, 0, 6),
-      &d->dyncube_hist[idx].contrib_arr_srv);
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                                               reshade::api::format::r16_float, 0, 1, 0, 6),
+                              &d->dyncube_hist[idx].contrib_arr_srv);
     dev->create_resource_view(d->dyncube_hist[idx].contrib, reshade::api::resource_usage::unordered_access,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16_float, 0, 1, 0, 6),
-      &d->dyncube_hist[idx].contrib_uav);
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                                               reshade::api::format::r16_float, 0, 1, 0, 6),
+                              &d->dyncube_hist[idx].contrib_uav);
     return true;
   };
 
@@ -11913,17 +13889,17 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       return false;
     }
     dev->create_resource_view(d->dyncube_charmask, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_charmask_srv);
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
+                                                               reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+                              &d->dyncube_charmask_srv);
     dev->create_resource_view(d->dyncube_charmask, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_charmask_arr_srv);
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                                               reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+                              &d->dyncube_charmask_arr_srv);
     dev->create_resource_view(d->dyncube_charmask, reshade::api::resource_usage::unordered_access,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_charmask_uav);
+                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                                               reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+                              &d->dyncube_charmask_uav);
   }
 
   // -- World-fixed parallax bounds (Sora2nd v1): persistent, size-independent --
@@ -11931,8 +13907,14 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
     // bounds: 2x float4 [0]=(min,valid) [1]=(max,spare); initialized empty/invalid.
     // Initial upload + in-shader stored-validity check make the first merge safe.
     float initBounds[8] = {
-      3.402823466e+38f, 3.402823466e+38f, 3.402823466e+38f, 0.f,
-      -3.402823466e+38f, -3.402823466e+38f, -3.402823466e+38f, 0.f,
+        3.402823466e+38f,
+        3.402823466e+38f,
+        3.402823466e+38f,
+        0.f,
+        -3.402823466e+38f,
+        -3.402823466e+38f,
+        -3.402823466e+38f,
+        0.f,
     };
     reshade::api::subresource_data initData = {initBounds, sizeof(initBounds), sizeof(initBounds)};
     reshade::api::resource_desc rb = {};
@@ -11949,16 +13931,16 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
     // NOTE: buffer view offset/size are STRUCTURED ELEMENT counts for the D3D11
     // backend (FirstElement/NumElements), not bytes � UINT64_MAX is invalid here.
     if (!dev->create_resource_view(d->dyncube_worldbox_bounds, reshade::api::resource_usage::shader_resource,
-        reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, 2),
-        &d->dyncube_worldbox_bounds_srv)
+                                   reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, 2),
+                                   &d->dyncube_worldbox_bounds_srv)
         || !d->dyncube_worldbox_bounds_srv.handle) {
       if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create world-box bounds SRV");
       DestroyDynCubeResources(dev, d);
       return false;
     }
     if (!dev->create_resource_view(d->dyncube_worldbox_bounds, reshade::api::resource_usage::unordered_access,
-        reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, 2),
-        &d->dyncube_worldbox_bounds_uav)
+                                   reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, 2),
+                                   &d->dyncube_worldbox_bounds_uav)
         || !d->dyncube_worldbox_bounds_uav.handle) {
       if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create world-box bounds UAV");
       DestroyDynCubeResources(dev, d);
@@ -11980,16 +13962,16 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
     }
     const uint64_t scratchElements = scratchEntries * 2u;
     if (!dev->create_resource_view(d->dyncube_worldbox_scratch, reshade::api::resource_usage::shader_resource,
-        reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, scratchElements),
-        &d->dyncube_worldbox_scratch_srv)
+                                   reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, scratchElements),
+                                   &d->dyncube_worldbox_scratch_srv)
         || !d->dyncube_worldbox_scratch_srv.handle) {
       if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create world-box scratch SRV");
       DestroyDynCubeResources(dev, d);
       return false;
     }
     if (!dev->create_resource_view(d->dyncube_worldbox_scratch, reshade::api::resource_usage::unordered_access,
-        reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, scratchElements),
-        &d->dyncube_worldbox_scratch_uav)
+                                   reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, scratchElements),
+                                   &d->dyncube_worldbox_scratch_uav)
         || !d->dyncube_worldbox_scratch_uav.handle) {
       if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create world-box scratch UAV");
       DestroyDynCubeResources(dev, d);
@@ -12011,8 +13993,8 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       return false;
     }
     if (!dev->create_resource_view(d->dyncube_faceextents, reshade::api::resource_usage::unordered_access,
-        reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, 2),
-        &d->dyncube_faceextents_uav)
+                                   reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, 2),
+                                   &d->dyncube_faceextents_uav)
         || !d->dyncube_faceextents_uav.handle) {
       if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create world-box face extents UAV");
       DestroyDynCubeResources(dev, d);
@@ -12068,7 +14050,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
     rdo.texture = {size, size, 6, (uint16_t)mips, reshade::api::format::r16g16b16a16_float, 1};
     rdo.heap = reshade::api::memory_heap::gpu_only;
     rdo.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
-    rdo.flags = reshade::api::resource_flags::cube_compatible | reshade::api::resource_flags::generate_mipmaps; // HW A/B path GenerateMips
+    rdo.flags = reshade::api::resource_flags::cube_compatible | reshade::api::resource_flags::generate_mipmaps;  // HW A/B path GenerateMips
     for (uint32_t i = 0; i < 2; ++i) {
       if (!dev->create_resource(rdo, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_ggx_out[i])) {
         if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create GGX output");
@@ -12076,15 +14058,15 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
         return false;
       }
       dev->create_resource_view(d->dyncube_ggx_out[i], reshade::api::resource_usage::shader_resource,
-        reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
-                                         reshade::api::format::r16g16b16a16_float, 0, mips, 0, 6),
-        &d->dyncube_ggx_out_cube_srv[i]);
+                                reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
+                                                                 reshade::api::format::r16g16b16a16_float, 0, mips, 0, 6),
+                                &d->dyncube_ggx_out_cube_srv[i]);
       // Per-mip array UAVs (mips 1..N-1) for the GGX filter dispatches.
       for (uint32_t m = 1; m < mips; ++m) {
         dev->create_resource_view(d->dyncube_ggx_out[i], reshade::api::resource_usage::unordered_access,
-          reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                           reshade::api::format::r16g16b16a16_float, m, 1, 0, 6),
-          &d->dyncube_ggx_out_mip_uav[i][m]);
+                                  reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                                                   reshade::api::format::r16g16b16a16_float, m, 1, 0, 6),
+                                  &d->dyncube_ggx_out_mip_uav[i][m]);
       }
     }
     d->dyncube_ggx_active = 0;
@@ -12113,9 +14095,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
   d->dyncube_hasValidRead = false;
   if (should_log()) {
     reshade::log::message(reshade::log::level::info,
-      (std::string("[DynCube] Resources created: ") + std::to_string(size) + "x" + std::to_string(size) +
-       "x6, mips=" + std::to_string(d->dyncube_mip_count) +
-       ", ~" + std::to_string((long long)(DynCubeEstimatedBytes(d) / (1024ull * 1024ull))) + " MB").c_str());
+                          (std::string("[DynCube] Resources created: ") + std::to_string(size) + "x" + std::to_string(size) + "x6, mips=" + std::to_string(d->dyncube_mip_count) + ", ~" + std::to_string((long long)(DynCubeEstimatedBytes(d) / (1024ull * 1024ull))) + " MB").c_str());
   }
   return true;
 }
@@ -12135,7 +14115,9 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     if (bc.empty() || !lo.handle) return false;
     if (out->handle != 0u) return true;
     reshade::api::shader_desc sd = {};
-    sd.code = bc.data(); sd.code_size = bc.size(); sd.entry_point = "main";
+    sd.code = bc.data();
+    sd.code_size = bc.size();
+    sd.entry_point = "main";
     reshade::api::pipeline_subobject so = {reshade::api::pipeline_subobject_type::compute_shader, 1, &sd};
     return dev->create_pipeline(lo, 1, &so, out);
   };
@@ -12145,37 +14127,60 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     if (out->handle != 0u && d->dyncube_capture_layout_version == kDynCubeCaptureLayoutVersion) return true;
     if (out->handle != 0u) {
       // Stale layout shape: drop layout, tables, and pipeline so they rebuild below.
-      for (auto& t : d->dyncube_capture_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
-      dev->destroy_pipeline_layout(*out); *out = {};
-      if (d->dyncube_capture_pipeline.handle) { dev->destroy_pipeline(d->dyncube_capture_pipeline); d->dyncube_capture_pipeline = {}; }
+      for (auto& t : d->dyncube_capture_tables) {
+        if (t.handle) {
+          dev->free_descriptor_table(t);
+          t = {};
+        }
+      }
+      dev->destroy_pipeline_layout(*out);
+      *out = {};
+      if (d->dyncube_capture_pipeline.handle) {
+        dev->destroy_pipeline(d->dyncube_capture_pipeline);
+        d->dyncube_capture_pipeline = {};
+      }
     }
-    DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
-    DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer}; // b0 cb_scene only
-    DR srv_r     = {0,0,0,8,DS::all_compute,1,DT::texture_shader_resource_view}; // t0..t7 (depth, color, prevColor, prevPos, prevContrib, camPrev, mrt0, vanilla)
-    DR uav_r     = {0,0,0,5,DS::all_compute,1,DT::texture_unordered_access_view}; // u0..u4 (curColor, curPos, curContrib, camCur, charmask)
-    DR uav_buf_r = {0,5,0,1,DS::all_compute,1,DT::buffer_unordered_access_view}; // u5 (world-box per-group partials)
+    DR sampler_r = {0, 0, 0, 1, DS::all_compute, 1, DT::sampler};
+    DR cbv_r = {0, 0, 0, 1, DS::all_compute, 1, DT::constant_buffer};                   // b0 cb_scene only
+    DR srv_r = {0, 0, 0, 8, DS::all_compute, 1, DT::texture_shader_resource_view};      // t0..t7 (depth, color, prevColor, prevPos, prevContrib, camPrev, mrt0, vanilla)
+    DR uav_r = {0, 0, 0, 5, DS::all_compute, 1, DT::texture_unordered_access_view};     // u0..u4 (curColor, curPos, curContrib, camCur, charmask)
+    DR uav_buf_r = {0, 5, 0, 1, DS::all_compute, 1, DT::buffer_unordered_access_view};  // u5 (world-box per-group partials)
     reshade::api::constant_range push_range = {};
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 14; // boost, blend, posThreshold, posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften, charInvert, sparkleReject, contribThreshold, writeCharmask
+    push_range.count = 14;  // boost, blend, posThreshold, posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften, charInvert, sparkleReject, contribThreshold, writeCharmask
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, p3, p4, pPush;
-    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
-    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &cbv_r;
-    p2.type = reshade::api::pipeline_layout_param_type::descriptor_table; p2.descriptor_table.count = 1; p2.descriptor_table.ranges = &srv_r;
-    p3.type = reshade::api::pipeline_layout_param_type::descriptor_table; p3.descriptor_table.count = 1; p3.descriptor_table.ranges = &uav_r;
-    p4.type = reshade::api::pipeline_layout_param_type::descriptor_table; p4.descriptor_table.count = 1; p4.descriptor_table.ranges = &uav_buf_r;
-    pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
-    P params[6] = {p0,p1,p2,p3,p4,pPush};
+    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p0.descriptor_table.count = 1;
+    p0.descriptor_table.ranges = &sampler_r;
+    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p1.descriptor_table.count = 1;
+    p1.descriptor_table.ranges = &cbv_r;
+    p2.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p2.descriptor_table.count = 1;
+    p2.descriptor_table.ranges = &srv_r;
+    p3.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p3.descriptor_table.count = 1;
+    p3.descriptor_table.ranges = &uav_r;
+    p4.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p4.descriptor_table.count = 1;
+    p4.descriptor_table.ranges = &uav_buf_r;
+    pPush.type = reshade::api::pipeline_layout_param_type::push_constants;
+    pPush.push_constants = push_range;
+    P params[6] = {p0, p1, p2, p3, p4, pPush};
     if (!dev->create_pipeline_layout(6, params, out)) return false;
     d->dyncube_capture_layout_version = kDynCubeCaptureLayoutVersion;
     return true;
   };
   auto make_solid_layout = [&](reshade::api::pipeline_layout* out) -> bool {
     if (out->handle != 0u) return true;
-    DR uav_r = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view};
-    P p0; p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &uav_r;
+    DR uav_r = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};
+    P p0;
+    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p0.descriptor_table.count = 1;
+    p0.descriptor_table.ranges = &uav_r;
     return dev->create_pipeline_layout(1, &p0, out);
   };
 
@@ -12196,11 +14201,11 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   // Prefer generic DynamicCubemapCaptureCS, fallback to legacy dyncube_capture for compat.
   bool haveCapture = false;
   bool haveSolid = false;
-  #ifdef __DynamicCubemapCaptureCS_EMBED_FILE
+#ifdef __DynamicCubemapCaptureCS_EMBED_FILE
   haveCapture = !__DynamicCubemapCaptureCS.empty();
-  #else
+#else
   haveCapture = !__dyncube_capture.empty();
-  #endif
+#endif
   haveSolid = !__dyncube_solid.empty();
   if (!haveCapture && !haveSolid) {
     return true;
@@ -12213,7 +14218,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     last = now;
     return true;
   };
-  #ifdef __DynamicCubemapCaptureCS_EMBED_FILE
+#ifdef __DynamicCubemapCaptureCS_EMBED_FILE
   if (!__DynamicCubemapCaptureCS.empty()) {
     if (!mkcs(__DynamicCubemapCaptureCS, d->dyncube_capture_layout, &d->dyncube_capture_pipeline)) {
       if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] capture pipeline create failed (DynamicCubemapCaptureCS)");
@@ -12224,13 +14229,13 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     // twin was byte-identical and the old fallback branch never executed while both existed.
     if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] capture pipeline create failed (DynamicCubemapCaptureCS)");
   }
-  #else
+#else
   if (!__dyncube_capture.empty()) {
     if (!mkcs(__dyncube_capture, d->dyncube_capture_layout, &d->dyncube_capture_pipeline)) {
       if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] capture pipeline create failed");
     }
   }
-  #endif
+#endif
   if (!__dyncube_solid.empty())
     if (!mkcs(__dyncube_solid, d->dyncube_solid_layout, &d->dyncube_solid_pipeline)) {
       if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] solid pipeline create failed");
@@ -12239,142 +14244,192 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   // -- Phase 3 GGX prefilter pipeline --
   auto make_ggx_layout = [&](reshade::api::pipeline_layout* out) -> bool {
     if (out->handle != 0u) return true;
-    DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
-    DR srv_r     = {0,0,0,1,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 GGX input cube
-    DR uav_r     = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 filtered mip UAV
+    DR sampler_r = {0, 0, 0, 1, DS::all_compute, 1, DT::sampler};
+    DR srv_r = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_shader_resource_view};   // t0 GGX input cube
+    DR uav_r = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};  // u0 filtered mip UAV
     reshade::api::constant_range push_range = {};
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 1; // roughness
+    push_range.count = 1;  // roughness
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, pPush;
-    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
-    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &srv_r;
-    p2.type = reshade::api::pipeline_layout_param_type::descriptor_table; p2.descriptor_table.count = 1; p2.descriptor_table.ranges = &uav_r;
-    pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
-    P params[4] = {p0,p1,p2,pPush};
+    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p0.descriptor_table.count = 1;
+    p0.descriptor_table.ranges = &sampler_r;
+    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p1.descriptor_table.count = 1;
+    p1.descriptor_table.ranges = &srv_r;
+    p2.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p2.descriptor_table.count = 1;
+    p2.descriptor_table.ranges = &uav_r;
+    pPush.type = reshade::api::pipeline_layout_param_type::push_constants;
+    pPush.push_constants = push_range;
+    P params[4] = {p0, p1, p2, pPush};
     return dev->create_pipeline_layout(4, params, out);
   };
   if (!make_ggx_layout(&d->dyncube_ggx_layout)) return false;
   if (!ensure(d->dyncube_ggx_layout, d->dyncube_ggx_tables, 3)) return false;
-  #ifdef __SpecularIrradianceCS_EMBED_FILE
+#ifdef __SpecularIrradianceCS_EMBED_FILE
   if (!__SpecularIrradianceCS.empty()) {
     if (!mkcs(__SpecularIrradianceCS, d->dyncube_ggx_layout, &d->dyncube_ggx_pipeline)) {
       if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] GGX pipeline create failed");
     }
   }
-  #endif
+#endif
 
   // -- Global-push variant pipeline (soften + strength resample) --
   auto make_variant_layout = [&](reshade::api::pipeline_layout* out) -> bool {
     if (out->handle != 0u) return true;
-    DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler}; // s0 trilinear clamp
-    DR srv_r     = {0,0,0,1,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 source cube
-    DR uav_r     = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 variant mip0 array
+    DR sampler_r = {0, 0, 0, 1, DS::all_compute, 1, DT::sampler};                    // s0 trilinear clamp
+    DR srv_r = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_shader_resource_view};   // t0 source cube
+    DR uav_r = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};  // u0 variant mip0 array
     reshade::api::constant_range push_range = {};
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 2; // srcMip, strength
+    push_range.count = 2;  // srcMip, strength
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, pPush;
-    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
-    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &srv_r;
-    p2.type = reshade::api::pipeline_layout_param_type::descriptor_table; p2.descriptor_table.count = 1; p2.descriptor_table.ranges = &uav_r;
-    pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
-    P params[4] = {p0,p1,p2,pPush};
+    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p0.descriptor_table.count = 1;
+    p0.descriptor_table.ranges = &sampler_r;
+    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p1.descriptor_table.count = 1;
+    p1.descriptor_table.ranges = &srv_r;
+    p2.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p2.descriptor_table.count = 1;
+    p2.descriptor_table.ranges = &uav_r;
+    pPush.type = reshade::api::pipeline_layout_param_type::push_constants;
+    pPush.push_constants = push_range;
+    P params[4] = {p0, p1, p2, pPush};
     return dev->create_pipeline_layout(4, params, out);
   };
   if (!make_variant_layout(&d->dyncube_variant_layout)) return false;
   if (!ensure(d->dyncube_variant_layout, d->dyncube_variant_tables, 3)) return false;
-  #ifdef __DynCubeVariantCS_EMBED_FILE
+#ifdef __DynCubeVariantCS_EMBED_FILE
   if (!__DynCubeVariantCS.empty()) {
     if (!mkcs(__DynCubeVariantCS, d->dyncube_variant_layout, &d->dyncube_variant_pipeline)) {
       if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] Variant pipeline create failed");
     }
   }
-  #endif
+#endif
 
   // -- Simple SSR pipeline --
   auto make_ssr_layout = [&](reshade::api::pipeline_layout* out) -> bool {
     if (out->handle != 0u && d->dyncube_ssr_layout_version == kDynCubeSSRLayoutVersion) return true;
     if (out->handle != 0u) {
       // Stale layout shape (e.g. pre-IS-FAST): drop layout, tables, and pipeline so they rebuild below.
-      for (auto& t : d->dyncube_ssr_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
-      dev->destroy_pipeline_layout(*out); *out = {};
-      if (d->dyncube_ssr_pipeline.handle) { dev->destroy_pipeline(d->dyncube_ssr_pipeline); d->dyncube_ssr_pipeline = {}; }
+      for (auto& t : d->dyncube_ssr_tables) {
+        if (t.handle) {
+          dev->free_descriptor_table(t);
+          t = {};
+        }
+      }
+      dev->destroy_pipeline_layout(*out);
+      *out = {};
+      if (d->dyncube_ssr_pipeline.handle) {
+        dev->destroy_pipeline(d->dyncube_ssr_pipeline);
+        d->dyncube_ssr_pipeline = {};
+      }
     }
-    DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
-    DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer}; // b0 cb_scene
-    DR srv_r     = {0,0,0,4,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 color, t1 depth, t2 mrt_normal, t3 IS-FAST noise
-    DR uav_r     = {0,0,0,2,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 ssr_result, u1 per-tile hit mask
+    DR sampler_r = {0, 0, 0, 1, DS::all_compute, 1, DT::sampler};
+    DR cbv_r = {0, 0, 0, 1, DS::all_compute, 1, DT::constant_buffer};                // b0 cb_scene
+    DR srv_r = {0, 0, 0, 4, DS::all_compute, 1, DT::texture_shader_resource_view};   // t0 color, t1 depth, t2 mrt_normal, t3 IS-FAST noise
+    DR uav_r = {0, 0, 0, 2, DS::all_compute, 1, DT::texture_unordered_access_view};  // u0 ssr_result, u1 per-tile hit mask
     reshade::api::constant_range push_range = {};
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 18; // sampleCount, maxDist, thickness, distanceFade, edgeFade, grazingFade, charOccStrength, charOccUpness, isfastEnabled, isfastBound, isfastFrame, isfastStrength, isfastSpatial, isfastTemporal, isfastSeed, charComp, charShift, charInvert
+    push_range.count = 18;  // sampleCount, maxDist, thickness, distanceFade, edgeFade, grazingFade, charOccStrength, charOccUpness, isfastEnabled, isfastBound, isfastFrame, isfastStrength, isfastSpatial, isfastTemporal, isfastSeed, charComp, charShift, charInvert
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, p3, pPush;
-    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
-    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &cbv_r;
-    p2.type = reshade::api::pipeline_layout_param_type::descriptor_table; p2.descriptor_table.count = 1; p2.descriptor_table.ranges = &srv_r;
-    p3.type = reshade::api::pipeline_layout_param_type::descriptor_table; p3.descriptor_table.count = 1; p3.descriptor_table.ranges = &uav_r;
-    pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
-    P params[5] = {p0,p1,p2,p3,pPush};
+    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p0.descriptor_table.count = 1;
+    p0.descriptor_table.ranges = &sampler_r;
+    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p1.descriptor_table.count = 1;
+    p1.descriptor_table.ranges = &cbv_r;
+    p2.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p2.descriptor_table.count = 1;
+    p2.descriptor_table.ranges = &srv_r;
+    p3.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p3.descriptor_table.count = 1;
+    p3.descriptor_table.ranges = &uav_r;
+    pPush.type = reshade::api::pipeline_layout_param_type::push_constants;
+    pPush.push_constants = push_range;
+    P params[5] = {p0, p1, p2, p3, pPush};
     if (!dev->create_pipeline_layout(5, params, out)) return false;
     d->dyncube_ssr_layout_version = kDynCubeSSRLayoutVersion;
     return true;
   };
   if (!make_ssr_layout(&d->dyncube_ssr_layout)) return false;
   if (!ensure(d->dyncube_ssr_layout, d->dyncube_ssr_tables, 4)) return false;
-  #ifdef __FalcomSSRCS_EMBED_FILE
+#ifdef __FalcomSSRCS_EMBED_FILE
   if (!__FalcomSSRCS.empty()) {
     if (!mkcs(__FalcomSSRCS, d->dyncube_ssr_layout, &d->dyncube_ssr_pipeline)) {
       if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] SSR pipeline create failed");
     }
   }
-  #endif
+#endif
 
   // -- SSR separable blur pipeline (H then V) --
   auto make_ssr_blur_layout = [&](reshade::api::pipeline_layout* out) -> bool {
     if (out->handle != 0u && d->dyncube_ssr_blur_layout_version == kDynCubeSSRBlurLayoutVersion) return true;
     if (out->handle != 0u) {
       // Stale layout shape (e.g. pre-depth-bilateral): drop layout, tables, and pipeline so they rebuild below.
-      for (auto& t : d->dyncube_ssr_blur_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
-      dev->destroy_pipeline_layout(*out); *out = {};
-      if (d->dyncube_ssr_blur_pipeline.handle) { dev->destroy_pipeline(d->dyncube_ssr_blur_pipeline); d->dyncube_ssr_blur_pipeline = {}; }
+      for (auto& t : d->dyncube_ssr_blur_tables) {
+        if (t.handle) {
+          dev->free_descriptor_table(t);
+          t = {};
+        }
+      }
+      dev->destroy_pipeline_layout(*out);
+      *out = {};
+      if (d->dyncube_ssr_blur_pipeline.handle) {
+        dev->destroy_pipeline(d->dyncube_ssr_blur_pipeline);
+        d->dyncube_ssr_blur_pipeline = {};
+      }
     }
-    DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
-    DR srv_r     = {0,0,0,3,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 raw/blur_h, t1 captured scene depth, t2 per-tile hit mask
-    DR uav_r     = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 blur_h/blur
-    DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer}; // b0 cb_scene (proj for depth unpack)
+    DR sampler_r = {0, 0, 0, 1, DS::all_compute, 1, DT::sampler};
+    DR srv_r = {0, 0, 0, 3, DS::all_compute, 1, DT::texture_shader_resource_view};   // t0 raw/blur_h, t1 captured scene depth, t2 per-tile hit mask
+    DR uav_r = {0, 0, 0, 1, DS::all_compute, 1, DT::texture_unordered_access_view};  // u0 blur_h/blur
+    DR cbv_r = {0, 0, 0, 1, DS::all_compute, 1, DT::constant_buffer};                // b0 cb_scene (proj for depth unpack)
     reshade::api::constant_range push_range = {};
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 3; // sigma, horizontal, symmetricWeights
+    push_range.count = 3;  // sigma, horizontal, symmetricWeights
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, p3, pPush;
-    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
-    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &srv_r;
-    p2.type = reshade::api::pipeline_layout_param_type::descriptor_table; p2.descriptor_table.count = 1; p2.descriptor_table.ranges = &uav_r;
-    p3.type = reshade::api::pipeline_layout_param_type::descriptor_table; p3.descriptor_table.count = 1; p3.descriptor_table.ranges = &cbv_r;
-    pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
-    P params[5] = {p0,p1,p2,p3,pPush};
+    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p0.descriptor_table.count = 1;
+    p0.descriptor_table.ranges = &sampler_r;
+    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p1.descriptor_table.count = 1;
+    p1.descriptor_table.ranges = &srv_r;
+    p2.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p2.descriptor_table.count = 1;
+    p2.descriptor_table.ranges = &uav_r;
+    p3.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p3.descriptor_table.count = 1;
+    p3.descriptor_table.ranges = &cbv_r;
+    pPush.type = reshade::api::pipeline_layout_param_type::push_constants;
+    pPush.push_constants = push_range;
+    P params[5] = {p0, p1, p2, p3, pPush};
     if (!dev->create_pipeline_layout(5, params, out)) return false;
     d->dyncube_ssr_blur_layout_version = kDynCubeSSRBlurLayoutVersion;
     return true;
   };
   if (!make_ssr_blur_layout(&d->dyncube_ssr_blur_layout)) return false;
   if (!ensure(d->dyncube_ssr_blur_layout, d->dyncube_ssr_blur_tables, 4)) return false;
-  #ifdef __FalcomSSRBlurCS_EMBED_FILE
+#ifdef __FalcomSSRBlurCS_EMBED_FILE
   if (!__FalcomSSRBlurCS.empty()) {
     if (!mkcs(__FalcomSSRBlurCS, d->dyncube_ssr_blur_layout, &d->dyncube_ssr_blur_pipeline)) {
       if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] SSR blur pipeline create failed");
     }
   }
-  #endif
+#endif
 
   // -- World-fixed parallax bounds reduction pipeline --
   // 4 SRVs (pos, contrib, charmask, camCur), 2 UAVs (scratch, bounds), 5 push floats
@@ -12382,36 +14437,50 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     if (out->handle != 0u && d->dyncube_worldbox_layout_version == kDynCubeWorldBoxLayoutVersion) return true;
     if (out->handle != 0u) {
       // Stale layout shape (e.g. pre-contrib-threshold): drop layout, tables, and pipeline so they rebuild below.
-      for (auto& t : d->dyncube_worldbox_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
-      dev->destroy_pipeline_layout(*out); *out = {};
-      if (d->dyncube_worldbox_pipeline.handle) { dev->destroy_pipeline(d->dyncube_worldbox_pipeline); d->dyncube_worldbox_pipeline = {}; }
+      for (auto& t : d->dyncube_worldbox_tables) {
+        if (t.handle) {
+          dev->free_descriptor_table(t);
+          t = {};
+        }
+      }
+      dev->destroy_pipeline_layout(*out);
+      *out = {};
+      if (d->dyncube_worldbox_pipeline.handle) {
+        dev->destroy_pipeline(d->dyncube_worldbox_pipeline);
+        d->dyncube_worldbox_pipeline = {};
+      }
     }
-    DR srv_r     = {0,0,0,4,DS::all_compute,1,DT::texture_shader_resource_view}; // t0..t3 (pos, contrib, charmask, camCur)
-    DR srv_buf_r = {0,0,0,3,DS::all_compute,1,DT::buffer_unordered_access_view}; // u0..u2 (scratch, bounds, faceExt)
+    DR srv_r = {0, 0, 0, 4, DS::all_compute, 1, DT::texture_shader_resource_view};      // t0..t3 (pos, contrib, charmask, camCur)
+    DR srv_buf_r = {0, 0, 0, 3, DS::all_compute, 1, DT::buffer_unordered_access_view};  // u0..u2 (scratch, bounds, faceExt)
     reshade::api::constant_range push_range = {};
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 5; // pass, posScale, reset, scratchCount, contribThreshold
+    push_range.count = 5;  // pass, posScale, reset, scratchCount, contribThreshold
     push_range.visibility = DS::all_compute;
     P p0, p1, pPush;
-    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &srv_r;
-    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &srv_buf_r;
-    pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
-    P params[3] = {p0,p1,pPush};
+    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p0.descriptor_table.count = 1;
+    p0.descriptor_table.ranges = &srv_r;
+    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    p1.descriptor_table.count = 1;
+    p1.descriptor_table.ranges = &srv_buf_r;
+    pPush.type = reshade::api::pipeline_layout_param_type::push_constants;
+    pPush.push_constants = push_range;
+    P params[3] = {p0, p1, pPush};
     if (!dev->create_pipeline_layout(3, params, out)) return false;
     d->dyncube_worldbox_layout_version = kDynCubeWorldBoxLayoutVersion;
     return true;
   };
   if (!make_worldbox_layout(&d->dyncube_worldbox_layout)) return false;
   if (!ensure(d->dyncube_worldbox_layout, d->dyncube_worldbox_tables, 2)) return false;
-  #ifdef __DynCubeBoundsReduceCS_EMBED_FILE
+#ifdef __DynCubeBoundsReduceCS_EMBED_FILE
   if (!__DynCubeBoundsReduceCS.empty()) {
     if (!mkcs(__DynCubeBoundsReduceCS, d->dyncube_worldbox_layout, &d->dyncube_worldbox_pipeline)) {
       if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] World-box pipeline create failed");
     }
   }
-  #endif
+#endif
   return true;
 }
 
@@ -12444,9 +14513,9 @@ class DynCubeComputeDispatchScope final {
 
     ComputeDispatchFixMode mode = ComputeDispatchFixMode::OFF;
     switch (fix) {
-      case 1:  mode = ComputeDispatchFixMode::RESTORE_STATE; break;
+      case 1: mode = ComputeDispatchFixMode::RESTORE_STATE; break;
       case 2:
-      case 3:  mode = ComputeDispatchFixMode::NULL_AND_RESTORE; break;
+      case 3: mode = ComputeDispatchFixMode::NULL_AND_RESTORE; break;
       default:
         UnbindDynCubeComputeState(cmd_list_);
         return;
@@ -12477,7 +14546,7 @@ static bool RunDynCubeSolid(reshade::api::command_list* cl, DeviceData* d) {
   dev->update_descriptor_tables(1, &upd);
   cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_solid_layout, 0, 1, &tbl->at(0));
   uint32_t sz = d->dyncube_size;
-  cl->dispatch((sz + 7)/8, (sz + 7)/8, 6);
+  cl->dispatch((sz + 7) / 8, (sz + 7) / 8, 6);
   cl->barrier(d->dyncube_solid_cube, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   d->dyncube_solid_written = true;
   return true;
@@ -12550,10 +14619,16 @@ static void ConsumeDynCubeStagedValidity(reshade::api::device* dev, DeviceData* 
       for (int i = 0; i < 8; ++i) lastBox[i] = box[i];
       boxLogInit = true;
       const std::string msg =
-        "[DynCube] WorldBox: min=(" + std::to_string(box[0]) + ", " + std::to_string(box[1]) + ", " + std::to_string(box[2]) + ") "
-        "max=(" + std::to_string(box[4]) + ", " + std::to_string(box[5]) + ", " + std::to_string(box[6]) + ") "
-        "size=(" + std::to_string(box[4] - box[0]) + ", " + std::to_string(box[5] - box[1]) + ", " + std::to_string(box[6] - box[2]) + ") "
-        "valid=" + std::to_string((box[3] > 0.5f) ? 1 : 0) + " hasGeom=" + std::to_string((box[7] > 0.5f) ? 1 : 0);
+          "[DynCube] WorldBox: min=(" + std::to_string(box[0]) + ", " + std::to_string(box[1]) + ", " + std::to_string(box[2]) +
+          ") "
+          "max=("
+          + std::to_string(box[4]) + ", " + std::to_string(box[5]) + ", " + std::to_string(box[6]) +
+          ") "
+          "size=("
+          + std::to_string(box[4] - box[0]) + ", " + std::to_string(box[5] - box[1]) + ", " + std::to_string(box[6] - box[2]) +
+          ") "
+          "valid="
+          + std::to_string((box[3] > 0.5f) ? 1 : 0) + " hasGeom=" + std::to_string((box[7] > 0.5f) ? 1 : 0);
       reshade::log::message(reshade::log::level::info, msg.c_str());
     }
   }
@@ -12581,12 +14656,7 @@ static void ConsumeDynCubeStagedValidity(reshade::api::device* dev, DeviceData* 
           return s;
         };
         const std::string msg =
-          std::string("[DynCube] WorldBoxFaces: +X=") + extStr(fx[0], 1u) +
-          " -X=" + extStr(fx[4], 2u) +
-          " +Y=" + extStr(fx[1], 4u) +
-          " -Y=" + extStr(fx[5], 8u) +
-          " +Z=" + extStr(fx[2], 16u) +
-          " -Z=" + extStr(fx[6], 32u);
+            std::string("[DynCube] WorldBoxFaces: +X=") + extStr(fx[0], 1u) + " -X=" + extStr(fx[4], 2u) + " +Y=" + extStr(fx[1], 4u) + " -Y=" + extStr(fx[5], 8u) + " +Z=" + extStr(fx[2], 16u) + " -Z=" + extStr(fx[6], 32u);
         reshade::log::message(reshade::log::level::info, msg.c_str());
       }
     }
@@ -12646,7 +14716,8 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
       if (set.pos_uav.handle) cl->clear_unordered_access_view_float(set.pos_uav, zero4);
       if (set.contrib_uav.handle) cl->clear_unordered_access_view_float(set.contrib_uav, zero1);
     }
-    for (auto& u : d->dyncube_cam_uav) if (u.handle) cl->clear_unordered_access_view_float(u, zero4);
+    for (auto& u : d->dyncube_cam_uav)
+      if (u.handle) cl->clear_unordered_access_view_float(u, zero4);
     d->dyncube_needs_reset = false;
   }
 
@@ -12662,7 +14733,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
       d->dyncube_hist[prev].pos_arr_srv,
       d->dyncube_hist[prev].contrib_arr_srv,
       d->dyncube_cam_srv[prev],
-      d->captured_mrt_normal_srv,  // mrtTexture0 for character mask
+      d->captured_mrt_normal_srv,   // mrtTexture0 for character mask
       d->captured_vanilla_env_srv,  // game vanilla cube (may be null pre-first-capture: reads 0, today's black)
   };
   // Current set as UAVs (u0 curColor, u1 curPos, u2 curContrib, u3 camCur, u4 charmask)
@@ -12719,7 +14790,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   }
 
   uint32_t sz = d->dyncube_size;
-  cl->dispatch((sz + 7)/8, (sz + 7)/8, 6);
+  cl->dispatch((sz + 7) / 8, (sz + 7) / 8, 6);
   ++d->dyncube_capture_dispatches;
 
   // Barrier current history + camera UAVs -> SRV (t17 reads current set, preview + next-frame reads too)
@@ -12755,7 +14826,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   }
   cl->barrier(d->dyncube_charmask, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
 
-  d->dyncube_solid_written = false; // capture ran (aliases still track the validated readSet)
+  d->dyncube_solid_written = false;  // capture ran (aliases still track the validated readSet)
   return true;
 }
 
@@ -12813,7 +14884,7 @@ static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, ui
   {
     const uint32_t chunks = groups / kDynCubeWorldBoxChunkPartials;
     float pc[5] = {2.0f, 0.001f, reset, (float)groups,
-        std::clamp(shader_injection.dynCube_worldbox_contrib, 0.f, 1.f)};
+                   std::clamp(shader_injection.dynCube_worldbox_contrib, 0.f, 1.f)};
     cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_worldbox_layout, 2, 0, 5, pc);
     cl->barrier(d->dyncube_worldbox_scratch, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
     cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
@@ -12879,7 +14950,7 @@ static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool
     if (!dstRes.handle) return false;
     cl->barrier(src, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_source);
     cl->barrier(dstRes, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_dest);
-    reshade::api::subresource_box box = {0,0,0, sz, sz, 1};
+    reshade::api::subresource_box box = {0, 0, 0, sz, sz, 1};
     for (uint32_t f = 0; f < 6; ++f) {
       cl->copy_texture_region(src, f, &box, dstRes, f * mips, &box, reshade::api::filter_mode::min_mag_mip_point);
       ++d->dyncube_face_copies;
@@ -12993,8 +15064,7 @@ static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d) {
   d->dyncube_lastVariantStrength = strength;
   if (shader_injection.dynCube_debug_logging > 0.5f) {
     reshade::log::message(reshade::log::level::info,
-      (std::string("[DynCube] variant built: ") + std::to_string(sz) + "x" + std::to_string(sz) +
-       " srcMip=" + std::to_string(srcMip) + " strength=" + std::to_string(strength)).c_str());
+                          (std::string("[DynCube] variant built: ") + std::to_string(sz) + "x" + std::to_string(sz) + " srcMip=" + std::to_string(srcMip) + " strength=" + std::to_string(strength)).c_str());
   }
   return true;
 }
@@ -13075,8 +15145,7 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
     auto rawRes = dev->get_resource_from_view(d->dyncube_ssr_raw_srv);
     auto rawDesc = (rawRes.handle != 0u) ? dev->get_resource_desc(rawRes) : reshade::api::resource_desc{};
     if (rawDesc.texture.width != w || rawDesc.texture.height != h)
-      CSLog("dyncube", std::string("ssr targets MISMATCH: color=") + std::to_string(w) + "x" + std::to_string(h) +
-        " raw=" + std::to_string(rawDesc.texture.width) + "x" + std::to_string(rawDesc.texture.height), true);
+      CSLog("dyncube", std::string("ssr targets MISMATCH: color=") + std::to_string(w) + "x" + std::to_string(h) + " raw=" + std::to_string(rawDesc.texture.width) + "x" + std::to_string(rawDesc.texture.height), true);
   }
 
   const bool time_ssr = DynCubeGpuTimingOn(cl, d);
@@ -13207,16 +15276,16 @@ constexpr uint32_t kGtvbaoSnapshotIndex[kGtvbaoSnapshotFloats] = {
 
 static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(DeviceData* data, const GtvbaoPassPush& pass = {}) {
   std::array<float, kGtvbaoPushConstantFloats> c = {};
-  c[0]  = shader_injection.gtvbao_quality_level;
-  c[1]  = std::max(0.001f, shader_injection.gtvbao_radius);
-  c[2]  = std::clamp(shader_injection.gtvbao_radius_multiplier, 0.3f, 3.f);
-  c[3]  = std::clamp(shader_injection.gtvbao_final_power, 0.5f, 5.f);
-  c[4]  = std::clamp(shader_injection.gtvbao_sample_distribution, 1.f, 3.f);
-  c[5]  = std::clamp(shader_injection.gtvbao_bitmask_thickness, 0.01f, 2.f);
-  c[6]  = std::clamp(shader_injection.gtvbao_depth_mip_offset, 0.f, 30.f);
-  c[7]  = (float)((data ? data->frame_index : 0u) % 64u);
-  c[8]  = pass.vbgi ? (float)VbgiGtvbaoDebugMode() : (float)GtvbaoDebugMode();
-  c[9]  = pass.final_pass ? 1.f : 0.f;
+  c[0] = shader_injection.gtvbao_quality_level;
+  c[1] = std::max(0.001f, shader_injection.gtvbao_radius);
+  c[2] = std::clamp(shader_injection.gtvbao_radius_multiplier, 0.3f, 3.f);
+  c[3] = std::clamp(shader_injection.gtvbao_final_power, 0.5f, 5.f);
+  c[4] = std::clamp(shader_injection.gtvbao_sample_distribution, 1.f, 3.f);
+  c[5] = std::clamp(shader_injection.gtvbao_bitmask_thickness, 0.01f, 2.f);
+  c[6] = std::clamp(shader_injection.gtvbao_depth_mip_offset, 0.f, 30.f);
+  c[7] = (float)((data ? data->frame_index : 0u) % 64u);
+  c[8] = pass.vbgi ? (float)VbgiGtvbaoDebugMode() : (float)GtvbaoDebugMode();
+  c[9] = pass.final_pass ? 1.f : 0.f;
   // Normal input: use game MRT normals when available, depth fallback otherwise.
   c[10] = g_gtvbao_normal_input_mode;
   c[11] = (data && data->captured_mrt_normal_srv.handle != 0u) ? 1.f : 0.f;
@@ -13227,13 +15296,13 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   c[16] = g_gtvbao_normal_z_preservation;
   c[17] = g_gtvbao_normal_detail_response;
   c[18] = g_gtvbao_normal_max_darkening;
-  c[19] = g_isfast_enabled;                                          // IS-FAST enable (0/1)
-  c[20] = std::clamp(g_isfast_strength, 0.f, 1.f);                   // IS-FAST noise strength
-  c[21] = (data && data->isfast_texture_loaded) ? 1.f : 0.f;         // IS-FAST texture loaded flag
-  c[22] = std::clamp(g_isfast_spatial_scale, 0.25f, 4.f);          // IS-FAST spatial scale
-  c[23] = std::clamp(g_isfast_temporal_speed, 0.f, 5.f);           // IS-FAST temporal speed
-  c[24] = std::clamp(g_isfast_seed_offset, 0.f, 64.f);             // IS-FAST seed offset
-  c[25] = shader_injection.gtvbao_noise_type;    // 0=IS-FAST, 1=IGN, 2=Hilbert
+  c[19] = g_isfast_enabled;                                   // IS-FAST enable (0/1)
+  c[20] = std::clamp(g_isfast_strength, 0.f, 1.f);            // IS-FAST noise strength
+  c[21] = (data && data->isfast_texture_loaded) ? 1.f : 0.f;  // IS-FAST texture loaded flag
+  c[22] = std::clamp(g_isfast_spatial_scale, 0.25f, 4.f);     // IS-FAST spatial scale
+  c[23] = std::clamp(g_isfast_temporal_speed, 0.f, 5.f);      // IS-FAST temporal speed
+  c[24] = std::clamp(g_isfast_seed_offset, 0.f, 64.f);        // IS-FAST seed offset
+  c[25] = shader_injection.gtvbao_noise_type;                 // 0=IS-FAST, 1=IGN, 2=Hilbert
   c[26] = shader_injection.gtvbao_cosine_mode;
   // -- Foliage / prefilter --
   // -- Foliage exclusion --
@@ -13249,7 +15318,7 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   c[34] = static_cast<float>(pass.divisor);
   // �� Low-resolution spatial pipeline (appended; Full path ignores these) ��
   c[35] = std::clamp(std::round(shader_injection.gtvbao_resolution), 0.f, 1.f);
-  c[36] = g_gtvbao_hemisphere_weighting;       // hemisphere weighting 0=Cosine, 1=Uniform
+  c[36] = g_gtvbao_hemisphere_weighting;  // hemisphere weighting 0=Cosine, 1=Uniform
   c[37] = pass.vbgi ? std::clamp(g_vbgi_auto_thickness, 0.f, 1.f)
                     : std::clamp(g_gtvbao_auto_thickness, 0.f, 1.f);
   c[38] = g_gtvbao_history_weight;
@@ -13316,21 +15385,35 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   // When off, force-recreate every call (legacy behavior).
   auto dp = [&](reshade::api::pipeline& p) {
     if (g_cpuopt_ensure_pipelines > 0.5f) return;  // keep existing
-    if (p.handle) { dev->destroy_pipeline(p); p = {}; }
+    if (p.handle) {
+      dev->destroy_pipeline(p);
+      p = {};
+    }
   };
   auto dl = [&](reshade::api::pipeline_layout& l) {
     if (g_cpuopt_ensure_pipelines > 0.5f) return;  // keep existing
-    if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; }
+    if (l.handle) {
+      dev->destroy_pipeline_layout(l);
+      l = {};
+    }
   };
-  dl(d->prefilter_layout); dl(d->main_layout);
-  dp(d->prefilter_pipeline); dp(d->main_pipeline);
+  dl(d->prefilter_layout);
+  dl(d->main_layout);
+  dp(d->prefilter_pipeline);
+  dp(d->main_pipeline);
   dp(d->vbgi_main_pipeline);
-  dp(d->vbgi_radiance_pipeline); dp(d->vbgi_mips_pipeline);
-  dl(d->vbgi_main_layout); dl(d->vbgi_radiance_layout); dl(d->vbgi_mips_layout);
+  dp(d->vbgi_radiance_pipeline);
+  dp(d->vbgi_mips_pipeline);
+  dl(d->vbgi_main_layout);
+  dl(d->vbgi_radiance_layout);
+  dl(d->vbgi_mips_layout);
   dp(d->vbgi_radiance_far_pipeline);
   dl(d->vbgi_radiance_far_layout);
-  dp(d->vbgi_far_main_pipeline); dp(d->vbgi_far_resolve_pipeline); dp(d->vbgi_far_compose_pipeline);
-  dl(d->vbgi_far_main_layout); dl(d->vbgi_far_layout);
+  dp(d->vbgi_far_main_pipeline);
+  dp(d->vbgi_far_resolve_pipeline);
+  dp(d->vbgi_far_compose_pipeline);
+  dl(d->vbgi_far_main_layout);
+  dl(d->vbgi_far_layout);
   dp(d->vbgi_far_temporal_pipeline);
   dp(d->vbgi_far_spatial_pipeline);
   if (g_cpuopt_ensure_pipelines < 0.5f) {
@@ -13348,7 +15431,9 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
                   reshade::api::pipeline_layout lo, reshade::api::pipeline* out) -> bool {
     if (bc.empty() || !lo.handle) return false;
     reshade::api::shader_desc sd = {};
-    sd.code = bc.data(); sd.code_size = bc.size(); sd.entry_point = ep;
+    sd.code = bc.data();
+    sd.code_size = bc.size();
+    sd.entry_point = ep;
     reshade::api::pipeline_subobject so = {reshade::api::pipeline_subobject_type::compute_shader, 1, &sd};
     return dev->create_pipeline(lo, 1, &so, out);
   };
@@ -13364,10 +15449,10 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
                          reshade::api::pipeline_layout* out, uint32_t sampler_count = 1u,
                          uint32_t push_count = kGtvbaoPushConstantFloats) -> bool {
     if (out->handle != 0u) return true;
-    DR sampler_r = {0,0,0,sampler_count,DS::all_compute,1,DT::sampler};
-    DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer};
-    DR srv_r     = {0,0,0,srv_count,DS::all_compute,1,DT::texture_shader_resource_view};
-    DR uav_r     = {0,0,0,uav_count,DS::all_compute,1,DT::texture_unordered_access_view};
+    DR sampler_r = {0, 0, 0, sampler_count, DS::all_compute, 1, DT::sampler};
+    DR cbv_r = {0, 0, 0, 1, DS::all_compute, 1, DT::constant_buffer};
+    DR srv_r = {0, 0, 0, srv_count, DS::all_compute, 1, DT::texture_shader_resource_view};
+    DR uav_r = {0, 0, 0, uav_count, DS::all_compute, 1, DT::texture_unordered_access_view};
     reshade::api::constant_range push_constants_range = {};
     push_constants_range.binding = 0;
     push_constants_range.dx_register_index = 13;
@@ -13376,13 +15461,17 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_constants_range.visibility = DS::all_compute;
     P param_sampler, param_cbv, param_srv, param_uav, param_constants;
     param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_sampler.descriptor_table.count = 1; param_sampler.descriptor_table.ranges = &sampler_r;
+    param_sampler.descriptor_table.count = 1;
+    param_sampler.descriptor_table.ranges = &sampler_r;
     param_cbv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_cbv.descriptor_table.count = 1; param_cbv.descriptor_table.ranges = &cbv_r;
+    param_cbv.descriptor_table.count = 1;
+    param_cbv.descriptor_table.ranges = &cbv_r;
     param_srv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_srv.descriptor_table.count = 1; param_srv.descriptor_table.ranges = &srv_r;
+    param_srv.descriptor_table.count = 1;
+    param_srv.descriptor_table.ranges = &srv_r;
     param_uav.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_uav.descriptor_table.count = 1; param_uav.descriptor_table.ranges = &uav_r;
+    param_uav.descriptor_table.count = 1;
+    param_uav.descriptor_table.ranges = &uav_r;
     param_constants.type = reshade::api::pipeline_layout_param_type::push_constants;
     param_constants.push_constants = push_constants_range;
     P params[5] = {param_sampler, param_cbv, param_srv, param_uav, param_constants};
@@ -13411,7 +15500,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   make_layout(12u, 4u, &d->vbgi_far_layout, 1u, kVbgiFarPushConstantFloats);
   EnsureGTVBAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables);
   if (!d->prefilter_pipeline.handle) mkcs(__gtvbao_prefilter, "main", d->prefilter_layout, &d->prefilter_pipeline);
-  if (!d->main_pipeline.handle)         mkcs(__gtvbao_main, "main", d->main_layout, &d->main_pipeline);
+  if (!d->main_pipeline.handle) mkcs(__gtvbao_main, "main", d->main_layout, &d->main_pipeline);
   if (!d->vbgi_main_pipeline.handle) mkcs(__gtvbao_vbgi_main, "main", d->vbgi_main_layout, &d->vbgi_main_pipeline);
   if (!d->vbgi_radiance_pipeline.handle) mkcs(__vbgi_radiance, "main", d->vbgi_radiance_layout, &d->vbgi_radiance_pipeline);
   if (!d->vbgi_radiance_far_pipeline.handle) mkcs(__vbgi_radiance_far, "main", d->vbgi_radiance_far_layout, &d->vbgi_radiance_far_pipeline);
@@ -13429,23 +15518,28 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
 // -- IS-FAST DDS loader (64�64�64, RG8_UNORM Texture3D) --
 
 #pragma pack(push, 1)
-struct DDS_PIXELFORMAT { uint32_t dwSize, dwFlags, dwFourCC, dwRGBBitCount, dwRBitMask, dwGBitMask, dwBBitMask, dwABitMask; };
+struct DDS_PIXELFORMAT {
+  uint32_t dwSize, dwFlags, dwFourCC, dwRGBBitCount, dwRBitMask, dwGBitMask, dwBBitMask, dwABitMask;
+};
 struct DDS_HEADER {
   uint32_t dwSize, dwFlags, dwHeight, dwWidth, dwPitchOrLinearSize, dwDepth, dwMipMapCount;
   uint32_t dwReserved1[11];
   DDS_PIXELFORMAT ddspf;
   uint32_t dwCaps, dwCaps2, dwCaps3, dwCaps4, dwReserved2;
 };
-struct DDS_HEADER_DXT10 { uint32_t dxgiFormat, resourceDimension, miscFlag, arraySize, miscFlags2; };
+struct DDS_HEADER_DXT10 {
+  uint32_t dxgiFormat, resourceDimension, miscFlag, arraySize, miscFlags2;
+};
 #pragma pack(pop)
 
 static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
   // Diagnostic log every frame when debug logging is on
   if (g_isfast_debug_logging > 0.5f) {
     reshade::log::message(reshade::log::level::info,
-      (std::string("[IS-FAST] Status: attempted=") + (d->isfast_texture_attempted ? "yes" : "no")
-       + ", loaded=" + (d->isfast_texture_loaded ? "yes" : "no")
-       + ", srv=" + (d->isfast_noise_srv.handle ? "valid" : "null")).c_str());
+                          (std::string("[IS-FAST] Status: attempted=") + (d->isfast_texture_attempted ? "yes" : "no")
+                           + ", loaded=" + (d->isfast_texture_loaded ? "yes" : "no")
+                           + ", srv=" + (d->isfast_noise_srv.handle ? "valid" : "null"))
+                              .c_str());
   }
   if (d->isfast_texture_attempted) return d->isfast_texture_loaded;
   d->isfast_texture_attempted = true;
@@ -13457,26 +15551,26 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
 
   if (g_isfast_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info,
-      (std::string("[IS-FAST] Embedded fast_noise_ea.dds bytes: ") + std::to_string(byte_count)).c_str());
+                          (std::string("[IS-FAST] Embedded fast_noise_ea.dds bytes: ") + std::to_string(byte_count)).c_str());
 
   if (byte_count < sizeof(DDS_HEADER) + 4) {
     if (g_isfast_debug_logging > 0.5f)
       reshade::log::message(reshade::log::level::warning,
-        "[IS-FAST] Embedded fast_noise_ea.dds too small � using IGN fallback.");
+                            "[IS-FAST] Embedded fast_noise_ea.dds too small � using IGN fallback.");
     return false;
   }
 
   // Read magic
   uint32_t magic = 0;
   memcpy(&magic, bytes, 4);
-  if (magic != 0x20534444) return false; // "DDS "
+  if (magic != 0x20534444) return false;  // "DDS "
 
   DDS_HEADER hdr = {};
   memcpy(&hdr, bytes + 4, sizeof(hdr));
 
   uint32_t w = hdr.dwWidth, h = hdr.dwHeight, ddsDepth = hdr.dwDepth;
   uint32_t fmt = 0;
-  bool isDX10 = (hdr.ddspf.dwFourCC == 0x30315844); // "DX10"
+  bool isDX10 = (hdr.ddspf.dwFourCC == 0x30315844);  // "DX10"
 
   size_t header_size = 4 + sizeof(hdr);
   if (isDX10) {
@@ -13484,13 +15578,13 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
     if (byte_count < header_size) {
       if (g_isfast_debug_logging > 0.5f)
         reshade::log::message(reshade::log::level::warning,
-          "[IS-FAST] Embedded fast_noise_ea.dds truncated DX10 header � using IGN fallback.");
+                              "[IS-FAST] Embedded fast_noise_ea.dds truncated DX10 header � using IGN fallback.");
       return false;
     }
     DDS_HEADER_DXT10 dx10 = {};
     memcpy(&dx10, bytes + 4 + sizeof(hdr), sizeof(dx10));
     fmt = dx10.dxgiFormat;
-    if (dx10.resourceDimension != 4) return false; // must be Texture3D
+    if (dx10.resourceDimension != 4) return false;  // must be Texture3D
   }
 
   // DXGI_FORMAT_R8G8_UNORM = 49, expected dims: 128�128�32
@@ -13509,7 +15603,7 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
   if (byte_count < header_size + dataSize) {
     if (g_isfast_debug_logging > 0.5f)
       reshade::log::message(reshade::log::level::warning,
-        "[IS-FAST] Embedded fast_noise_ea.dds truncated payload � using IGN fallback.");
+                            "[IS-FAST] Embedded fast_noise_ea.dds truncated payload � using IGN fallback.");
     return false;
   }
   std::vector<uint8_t> data(dataSize);
@@ -13525,20 +15619,20 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
   reshade::api::subresource_data sub = {};
   sub.data = data.data();
   sub.row_pitch = w * 2;
-  sub.slice_pitch = w * 2 * h;       // bytes per 2D slice (row_pitch � height)
+  sub.slice_pitch = w * 2 * h;  // bytes per 2D slice (row_pitch � height)
 
   if (!dev->create_resource(rd, &sub, reshade::api::resource_usage::shader_resource,
                             &d->isfast_noise_texture)) {
     if (g_isfast_debug_logging > 0.5f)
       reshade::log::message(reshade::log::level::warning,
-        "[IS-FAST] Failed to create 3D noise texture � using IGN fallback.");
+                            "[IS-FAST] Failed to create 3D noise texture � using IGN fallback.");
     return false;
   }
 
   dev->create_resource_view(d->isfast_noise_texture, reshade::api::resource_usage::shader_resource,
-    reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_3d,
-                                     reshade::api::format::r8g8_unorm, 0, 1, 0, 1),
-    &d->isfast_noise_srv);
+                            reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_3d,
+                                                             reshade::api::format::r8g8_unorm, 0, 1, 0, 1),
+                            &d->isfast_noise_srv);
 
   // Create point-wrap sampler for IS-FAST noise sampling
   {
@@ -13553,7 +15647,7 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
   d->isfast_texture_loaded = true;
   if (g_isfast_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info,
-      "[IS-FAST] Texture loaded (embedded): 128x128x32 RG8_UNORM � noise source: TEXTURE");
+                          "[IS-FAST] Texture loaded (embedded): 128x128x32 RG8_UNORM � noise source: TEXTURE");
   return true;
 }
 
@@ -13572,7 +15666,10 @@ static void GtvbaoApplyDescriptors(reshade::api::device* dev, reshade::api::comm
                                    uint32_t count,
                                    const reshade::api::descriptor_table_update* updates) {
   std::array<reshade::api::descriptor_table_update, kGtvbaoDescriptorTableParamCount> u = {};
-  for (uint32_t i = 0; i < count; ++i) { u[i] = updates[i]; u[i].table = (*tbl)[i]; }
+  for (uint32_t i = 0; i < count; ++i) {
+    u[i] = updates[i];
+    u[i].table = (*tbl)[i];
+  }
   dev->update_descriptor_tables(count, u.data());
   std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount> b = {};
   for (uint32_t i = 0; i < count; ++i) b[i] = (*tbl)[i];
@@ -13595,10 +15692,10 @@ static void RunGTVBAOSharedPrep(reshade::api::command_list* cl, DeviceData* d) {
     reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 1: updating descriptors...");
   {
     reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&d->captured_depth_srv},
-      {{},0,0,kGTVBAODepthMipLevels,reshade::api::descriptor_type::texture_unordered_access_view,d->depth_mips_uavs.data()},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_clamp_sampler},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->captured_depth_srv},
+        {{}, 0, 0, kGTVBAODepthMipLevels, reshade::api::descriptor_type::texture_unordered_access_view, d->depth_mips_uavs.data()},
     };
     GtvbaoApplyDescriptors(dev, cl, d->prefilter_layout, &d->prefilter_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d);
@@ -13777,7 +15874,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   {
     const bool dbgRead = IsGtvbaoComputeDebug(GtvbaoDebugMode()) && !(GtvbaoDebugMode() == 23 && ready.reproject);
     if (dbgRead)
-      GtvbaoBarrier(cl, d->debug_texture, UA, SR);         // Debug output ready for read
+      GtvbaoBarrier(cl, d->debug_texture, UA, SR);  // Debug output ready for read
   }
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 2 (main) done.");
@@ -13835,8 +15932,8 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
 }
 
 // VBGI radiance prepass (M7.4 step 3): sender radiance and its mip chain, once per frame, from the lighting draw.
-constexpr float kVbgiRadianceClamp = 16.f;  // HDR cap per channel
-constexpr float kVbgiFeedbackMax = 0.9f;  // Multi-Bounce Strength x Intensity limit (RTGI rule)
+constexpr float kVbgiRadianceClamp = 16.f;    // HDR cap per channel
+constexpr float kVbgiFeedbackMax = 0.9f;      // Multi-Bounce Strength x Intensity limit (RTGI rule)
 constexpr float kVbgiFarFeedbackMax = 0.75f;  // Far Multi-Bounce Strength x Intensity limit (M4)
 constexpr float kVbgiFireflyK = 4.0f;         // fed-back luminance limit, x the 8-neighbour mean (M4)
 static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
@@ -13924,13 +16021,12 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
         kai ? d->fallback_srv : d->vbgi_in_srv[3],
         d->vbgi_in_srv[4], d->vbgi_in_srv[5],
         prev_gi_srv, motion_srv,
-        kai ? d->vbgi_in_srv[3] : d->fallback_srv
-    };
+        kai ? d->vbgi_in_srv[3] : d->fallback_srv};
     reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,12,reshade::api::descriptor_type::texture_shader_resource_view,srvs},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->vbgi_radiance_mip_uav[0]},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_clamp_sampler},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, 12, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->vbgi_radiance_mip_uav[0]},
     };
     GtvbaoApplyDescriptors(dev, cl, d->vbgi_radiance_layout, &d->vbgi_radiance_tables, 4, u);
     std::array<float, kGtvbaoPushConstantFloats> pc = {};
@@ -13957,13 +16053,12 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
         d->vbgi_in_srv[4], d->vbgi_in_srv[5],
         prev_gi_srv, motion_srv,
         kai ? d->vbgi_in_srv[3] : d->fallback_srv,
-        prev_far_raw_srv, prev_joint_raw_srv
-    };
+        prev_far_raw_srv, prev_joint_raw_srv};
     reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,14,reshade::api::descriptor_type::texture_shader_resource_view,far_srvs},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->vbgi_radiance_mip_uav[0]},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_clamp_sampler},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, 14, reshade::api::descriptor_type::texture_shader_resource_view, far_srvs},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->vbgi_radiance_mip_uav[0]},
     };
     GtvbaoApplyDescriptors(dev, cl, d->vbgi_radiance_far_layout, &d->vbgi_radiance_far_tables, 4, u);
     std::array<float, kGtvbaoPushConstantFloats> pc = {};
@@ -13987,10 +16082,10 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
     reshade::api::resource_view src = d->vbgi_radiance_mip_srv[m - 1];
     reshade::api::resource_view dst = d->vbgi_radiance_mip_uav[m];
     reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&src},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&dst},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_clamp_sampler},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &src},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &dst},
     };
     GtvbaoApplyDescriptors(dev, cl, d->vbgi_mips_layout, &d->vbgi_mips_tables, 4, u);
     cl->dispatch((std::max(1u, w >> m) + 7u) / 8u, (std::max(1u, h >> m) + 7u) / 8u, 1);
@@ -14070,10 +16165,10 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
                           const std::array<reshade::api::resource_view, 4>& uavs, bool history_valid, uint32_t gw, uint32_t gh) {
     GtvbaoBindPipeline(cl, pso);
     reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,12,reshade::api::descriptor_type::texture_shader_resource_view,srvs.data()},
-      {{},0,0,4,reshade::api::descriptor_type::texture_unordered_access_view,uavs.data()},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_clamp_sampler},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, 12, reshade::api::descriptor_type::texture_shader_resource_view, srvs.data()},
+        {{}, 0, 0, 4, reshade::api::descriptor_type::texture_unordered_access_view, uavs.data()},
     };
     GtvbaoApplyDescriptors(dev, cl, d->vbgi_far_layout, &d->vbgi_far_tables, 4, u);
     const auto pc = BuildVbgiFarPushConstants(d, history_valid);
@@ -14092,17 +16187,15 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
         d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
         d->isfast_noise_srv.handle ? d->isfast_noise_srv : d->fallback_srv,
         d->foliage_mask_srv.handle ? d->foliage_mask_srv : d->fallback_srv,
-        d->vbgi_radiance_srv
-    };
+        d->vbgi_radiance_srv};
     reshade::api::resource_view main_uavs[2] = {
         d->vbgi_raw_uav,
-        vbgi_dbg ? d->debug_uav : d->fallback_uav
-    };
+        vbgi_dbg ? d->debug_uav : d->fallback_uav};
     reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,5,reshade::api::descriptor_type::texture_shader_resource_view,main_srvs},
-      {{},0,0,2,reshade::api::descriptor_type::texture_unordered_access_view,main_uavs},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_clamp_sampler},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, 5, reshade::api::descriptor_type::texture_shader_resource_view, main_srvs},
+        {{}, 0, 0, 2, reshade::api::descriptor_type::texture_unordered_access_view, main_uavs},
     };
     GtvbaoApplyDescriptors(dev, cl, d->vbgi_main_layout, &d->vbgi_main_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, {.vbgi = true});
@@ -14115,18 +16208,16 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
         d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
         d->isfast_noise_srv.handle ? d->isfast_noise_srv : d->fallback_srv,
         d->foliage_mask_srv.handle ? d->foliage_mask_srv : d->fallback_srv,
-        d->vbgi_radiance_srv
-    };
+        d->vbgi_radiance_srv};
     reshade::api::resource_view far_main_uavs[5] = {
         d->vbgi_raw_uav,
         vbgi_dbg ? d->debug_uav : d->fallback_uav,
-        d->vbgi_far_cand_pos.uav[0], d->vbgi_far_cand_rad.uav[0], d->vbgi_far_cand_nrm.uav[0]
-    };
+        d->vbgi_far_cand_pos.uav[0], d->vbgi_far_cand_rad.uav[0], d->vbgi_far_cand_nrm.uav[0]};
     reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,5,reshade::api::descriptor_type::texture_shader_resource_view,far_main_srvs},
-      {{},0,0,5,reshade::api::descriptor_type::texture_unordered_access_view,far_main_uavs},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_clamp_sampler},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, 5, reshade::api::descriptor_type::texture_shader_resource_view, far_main_srvs},
+        {{}, 0, 0, 5, reshade::api::descriptor_type::texture_unordered_access_view, far_main_uavs},
     };
     GtvbaoApplyDescriptors(dev, cl, d->vbgi_far_main_layout, &d->vbgi_far_main_tables, 4, u);
     const auto pc = BuildVbgiFarPushConstants(d, false);
@@ -14242,7 +16333,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     const uint32_t divisor = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex);
     const uint32_t full_w = d->captured_depth_w, full_h = d->captured_depth_h;
     bool denoise_ok = full_w != 0u && full_h != 0u
-        && d->vbgi_width == rtao::RtgiTraceExtent(full_w, divisor) && d->vbgi_height == rtao::RtgiTraceExtent(full_h, divisor);
+                      && d->vbgi_width == rtao::RtgiTraceExtent(full_w, divisor) && d->vbgi_height == rtao::RtgiTraceExtent(full_h, divisor);
     if (!denoise_ok) CSLog("vbgi", "denoise skipped: size mismatch", true);
     if (denoise_ok && !rtgi::EnsureRtgiPipeline(dev, &d->vbgi_denoise.upsample_pipeline, kVbgiUpsamplePipelineDesc)) {
       denoise_ok = false;
@@ -14251,8 +16342,8 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     if (denoise_ok && d->vbgi_stats_buffer.handle == 0u) {
       const uint32_t zeros[rtgi::kRtgiStatsCount] = {};
       denoise_ok = falcom_world::bvh::CreatePoolBuffer(dev, zeros, sizeof(zeros), sizeof(uint32_t),
-          &d->vbgi_stats_buffer, &d->vbgi_stats_uav,
-          reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::copy_source);
+                                                       &d->vbgi_stats_buffer, &d->vbgi_stats_uav,
+                                                       reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::copy_source);
       if (!denoise_ok) CSLog("vbgi", "denoise skipped: stats buffer", true);
     }
     if (denoise_ok) {
@@ -14272,9 +16363,9 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
           .temporal_on = temporal_on,
           .was_on = d->vbgi_temporal_last,
           .resized = d->vbgi_denoise.history_color.width != 0u
-              && (d->vbgi_denoise.history_color.width != (g_vbgi_full_res_denoise > 0.5f ? full_w : d->vbgi_width)
-                  || d->vbgi_denoise.history_color.height != (g_vbgi_full_res_denoise > 0.5f ? full_h : d->vbgi_height)
-                  || d->vbgi_denoise.output.width != full_w || d->vbgi_denoise.output.height != full_h),
+                     && (d->vbgi_denoise.history_color.width != (g_vbgi_full_res_denoise > 0.5f ? full_w : d->vbgi_width)
+                         || d->vbgi_denoise.history_color.height != (g_vbgi_full_res_denoise > 0.5f ? full_h : d->vbgi_height)
+                         || d->vbgi_denoise.output.width != full_w || d->vbgi_denoise.output.height != full_h),
           .frame = d->frame_index,
           .last_frame = d->vbgi_last_frame,
           .guard = d->dyncube_loadingWipePending || d->frame_index < d->resize_guard_until_frame,
@@ -14292,8 +16383,8 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
             .temporal_on = true,
             .was_on = d->vbgi_far_color_last,
             .resized = far_color.history_color.width != 0u
-                && (far_color.history_color.width != d->vbgi_width || far_color.history_color.height != d->vbgi_height
-                    || d->vbgi_far_color_full_width != full_w || d->vbgi_far_color_full_height != full_h),
+                       && (far_color.history_color.width != d->vbgi_width || far_color.history_color.height != d->vbgi_height
+                           || d->vbgi_far_color_full_width != full_w || d->vbgi_far_color_full_height != full_h),
             .frame = d->frame_index,
             .last_frame = d->vbgi_far_color_frame,
             .guard = d->dyncube_loadingWipePending || d->frame_index < d->resize_guard_until_frame,
@@ -14306,25 +16397,30 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
           std::vector<reshade::api::descriptor_table_update> far_nulls;
           if (vbgi_conf) GtvbaoBarrier(cl, d->debug_texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
           rtgi::DispatchRtgiDenoise(dev, cl, &far_color,
-              {.raw_view = d->vbgi_far_raw.srv[0],
-               .depth_view = d->captured_depth_srv,
-               .mrt_normal_view = d->captured_mrt_normal_srv,
-               .scene_cbv_view = d->captured_scene_cbv_view,
-               .motion_view = d->mb_rtv4_owned_srv,
-               .albedo_view = reshade::api::resource_view{0u},
-               .stats_uav = reshade::api::resource_view{0u},
-               .debug_uav = vbgi_conf ? d->debug_uav : reshade::api::resource_view{0u},
-               .debug_texture = d->debug_texture,
-               .trace_width = d->vbgi_width, .trace_height = d->vbgi_height,
-               .full_width = full_w, .full_height = full_h, .divisor = static_cast<float>(divisor),
-               .debug_mode = vbgi_conf ? 5 : 0,
-               .svgf = {g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
-                        far_reset == rtao::ResetReason::None, g_vbgi_svgf_iterations, g_vbgi_svgf_luminance_edge_stop,
-                        g_vbgi_svgf_depth_sigma, g_vbgi_svgf_normal_power, false, g_vbgi_svgf_history_length, g_vbgi_svgf_radius_scale},
-               .luminance_weights = rtgi::kSvgfLuminanceRgb,
-               .upsample_intensity = 1.f, .upsample_char_intensity = 1.f, .upsample_saturation = 1.f,
-               .history_only = true},
-              far_ready, &far_nulls);
+                                    {.raw_view = d->vbgi_far_raw.srv[0],
+                                     .depth_view = d->captured_depth_srv,
+                                     .mrt_normal_view = d->captured_mrt_normal_srv,
+                                     .scene_cbv_view = d->captured_scene_cbv_view,
+                                     .motion_view = d->mb_rtv4_owned_srv,
+                                     .albedo_view = reshade::api::resource_view{0u},
+                                     .stats_uav = reshade::api::resource_view{0u},
+                                     .debug_uav = vbgi_conf ? d->debug_uav : reshade::api::resource_view{0u},
+                                     .debug_texture = d->debug_texture,
+                                     .trace_width = d->vbgi_width,
+                                     .trace_height = d->vbgi_height,
+                                     .full_width = full_w,
+                                     .full_height = full_h,
+                                     .divisor = static_cast<float>(divisor),
+                                     .debug_mode = vbgi_conf ? 5 : 0,
+                                     .svgf = {g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
+                                              far_reset == rtao::ResetReason::None, g_vbgi_svgf_iterations, g_vbgi_svgf_luminance_edge_stop,
+                                              g_vbgi_svgf_depth_sigma, g_vbgi_svgf_normal_power, false, g_vbgi_svgf_history_length, g_vbgi_svgf_radius_scale},
+                                     .luminance_weights = rtgi::kSvgfLuminanceRgb,
+                                     .upsample_intensity = 1.f,
+                                     .upsample_char_intensity = 1.f,
+                                     .upsample_saturation = 1.f,
+                                     .history_only = true},
+                                    far_ready, &far_nulls);
           dev->update_descriptor_tables(static_cast<uint32_t>(far_nulls.size()), far_nulls.data());
           GtvbaoBarrier(cl, d->vbgi_far_joint.texture[0], reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
           dispatch_far(d->vbgi_far_compose_pipeline,
@@ -14446,6 +16542,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnKaiHeroUnmapBuffer);
       reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
+      reshade::register_event<reshade::addon_event::reset_command_list>(ResetRtxdiSceneBinding);
+      reshade::register_event<reshade::addon_event::destroy_command_list>(ResetRtxdiSceneBinding);
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsRCAS);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
@@ -14463,6 +16561,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnKaiHeroUnmapBuffer);
       reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
+      reshade::unregister_event<reshade::addon_event::reset_command_list>(ResetRtxdiSceneBinding);
+      reshade::unregister_event<reshade::addon_event::destroy_command_list>(ResetRtxdiSceneBinding);
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsRCAS);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
@@ -14471,66 +16571,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
   }
   if (fdw_reason == DLL_PROCESS_ATTACH) {
-    falcom_world::AddSvgfRows(&settings, IsAdvancedSettingsMode, IsAdvancedSettingsMode, {.prefix = "Gtvbao",
-                                                                                          .temporal_section = "GTVBAO Temporal Accumulation",
-                                                                                          .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Runs on Sora 1st, Sora 2nd and Kai only; off while Deferred Dispatch is On. Resets on camera cuts, frame gaps and parameter changes.",
-                                                                                          .temporal_enabled = &g_gtvbao_temporal_enabled,
-                                                                                          .full_res_denoise = &g_gtvbao_full_res_denoise,
-                                                                                          .history_weight = &g_gtvbao_history_weight,
-                                                                                          .depth_rejection = &g_gtvbao_depth_rejection,
-                                                                                          .normal_rejection = &g_gtvbao_normal_rejection,
-                                                                                          .spatial_section = "GTVBAO Spatial Filter",
-                                                                                          .spatial_enabled_tooltip = "Denoises the GTVBAO AO with the SVGF a-trous filter (depth, normal and AO edge stops). Off = no filter.",
-                                                                                          .spatial_enabled = &g_gtvbao_svgf_spatial_enabled,
-                                                                                          .iterations = &g_gtvbao_svgf_iterations,
-                                                                                          .luminance_edge_stop = &g_gtvbao_svgf_luminance_edge_stop,
-                                                                                          .depth_sigma = &g_gtvbao_svgf_depth_sigma,
-                                                                                          .normal_power = &g_gtvbao_svgf_normal_power,
-                                                                                          .half_res_iterations = &g_gtvbao_svgf_half_res_iterations,
-                                                                                          .history_length = &g_gtvbao_svgf_history_length,
-                                                                                          .radius_scale = &g_gtvbao_svgf_radius_scale,
-                                                                                          .half_res_radius_scale = &g_gtvbao_svgf_half_res_radius_scale,
-                                                                                          .default_temporal_enabled = 0.f,
-                                                                                          .default_full_res_denoise = 0.f,
-                                                                                          .default_history_weight = 0.8f,
-                                                                                          .default_history_length = 128.f,
-                                                                                          .default_depth_rejection = 0.200f,
-                                                                                          .default_normal_rejection = 0.f,
-                                                                                          .default_spatial_enabled = 1.f,
-                                                                                          .default_iterations = 1.f,
-                                                                                          .default_half_res_iterations = 1.f,
-                                                                                          .default_luminance_edge_stop = 16.f,
-                                                                                          .default_depth_sigma = 0.10f});
-    falcom_world::AddSvgfRows(&settings, []() { return VbgiRowVisible(); }, IsAdvancedSettingsMode, {.prefix = "Vbgi",
-                                                                                                     .temporal_section = "GTVBGI Temporal Accumulation",
-                                                                                                     .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.",
-                                                                                                     .temporal_enabled = &g_vbgi_temporal_enabled,
-                                                                                                     .full_res_denoise = &g_vbgi_full_res_denoise,
-                                                                                                     .temporal_far_only = &g_vbgi_temporal_far_only,
-                                                                                                     .history_weight = &g_vbgi_history_weight,
-                                                                                                     .depth_rejection = &g_vbgi_depth_rejection,
-                                                                                                     .normal_rejection = &g_vbgi_normal_rejection,
-                                                                                                     .spatial_section = "GTVBGI Spatial Filter",
-                                                                                                     .spatial_enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.",
-                                                                                                     .spatial_enabled = &g_vbgi_spatial_enabled,
-                                                                                                     .iterations = &g_vbgi_svgf_iterations,
-                                                                                                     .luminance_edge_stop = &g_vbgi_svgf_luminance_edge_stop,
-                                                                                                     .depth_sigma = &g_vbgi_svgf_depth_sigma,
-                                                                                                     .normal_power = &g_vbgi_svgf_normal_power,
-                                                                                                     .history_length = &g_vbgi_svgf_history_length,
-                                                                                                     .radius_scale = &g_vbgi_svgf_radius_scale,
-                                                                                                     .default_temporal_enabled = 1.f,
-                                                                                                     .default_temporal_far_only = 1.f,
-                                                                                                     .default_history_weight = 0.99f,
-                                                                                                     .default_history_length = 128.f,
-                                                                                                     .default_depth_rejection = 0.2f,
-                                                                                                     .default_normal_rejection = 0.f,
-                                                                                                     .default_spatial_enabled = 1.f,
-                                                                                                     .default_iterations = 5.f,
-                                                                                                     .default_luminance_edge_stop = 16.f,
-                                                                                                     .default_depth_sigma = 8.f,
-                                                                                                     .default_normal_power = 128.f,
-                                                                                                     .default_radius_scale = 4.f});
+    falcom_world::AddSvgfRows(&settings, IsAdvancedSettingsMode, IsAdvancedSettingsMode, {.prefix = "Gtvbao", .temporal_section = "GTVBAO Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Runs on Sora 1st, Sora 2nd and Kai only; off while Deferred Dispatch is On. Resets on camera cuts, frame gaps and parameter changes.", .temporal_enabled = &g_gtvbao_temporal_enabled, .full_res_denoise = &g_gtvbao_full_res_denoise, .history_weight = &g_gtvbao_history_weight, .depth_rejection = &g_gtvbao_depth_rejection, .normal_rejection = &g_gtvbao_normal_rejection, .spatial_section = "GTVBAO Spatial Filter", .spatial_enabled_tooltip = "Denoises the GTVBAO AO with the SVGF a-trous filter (depth, normal and AO edge stops). Off = no filter.", .spatial_enabled = &g_gtvbao_svgf_spatial_enabled, .iterations = &g_gtvbao_svgf_iterations, .luminance_edge_stop = &g_gtvbao_svgf_luminance_edge_stop, .depth_sigma = &g_gtvbao_svgf_depth_sigma, .normal_power = &g_gtvbao_svgf_normal_power, .half_res_iterations = &g_gtvbao_svgf_half_res_iterations, .history_length = &g_gtvbao_svgf_history_length, .radius_scale = &g_gtvbao_svgf_radius_scale, .half_res_radius_scale = &g_gtvbao_svgf_half_res_radius_scale, .default_temporal_enabled = 0.f, .default_full_res_denoise = 0.f, .default_history_weight = 0.8f, .default_history_length = 128.f, .default_depth_rejection = 0.200f, .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 1.f, .default_half_res_iterations = 1.f, .default_luminance_edge_stop = 16.f, .default_depth_sigma = 0.10f});
+    falcom_world::AddSvgfRows(&settings, []() { return VbgiRowVisible(); }, IsAdvancedSettingsMode, {.prefix = "Vbgi", .temporal_section = "GTVBGI Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.", .temporal_enabled = &g_vbgi_temporal_enabled, .full_res_denoise = &g_vbgi_full_res_denoise, .temporal_far_only = &g_vbgi_temporal_far_only, .history_weight = &g_vbgi_history_weight, .depth_rejection = &g_vbgi_depth_rejection, .normal_rejection = &g_vbgi_normal_rejection, .spatial_section = "GTVBGI Spatial Filter", .spatial_enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.", .spatial_enabled = &g_vbgi_spatial_enabled, .iterations = &g_vbgi_svgf_iterations, .luminance_edge_stop = &g_vbgi_svgf_luminance_edge_stop, .depth_sigma = &g_vbgi_svgf_depth_sigma, .normal_power = &g_vbgi_svgf_normal_power, .history_length = &g_vbgi_svgf_history_length, .radius_scale = &g_vbgi_svgf_radius_scale, .default_temporal_enabled = 1.f, .default_temporal_far_only = 1.f, .default_history_weight = 0.99f, .default_history_length = 128.f, .default_depth_rejection = 0.2f, .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f, .default_luminance_edge_stop = 16.f, .default_depth_sigma = 8.f, .default_normal_power = 128.f, .default_radius_scale = 4.f});
     falcom_world::AddSettings(&settings, IsSora2nd(), IsAdvancedSettingsMode);
   }
   falcom_world::Use(fdw_reason, IsSora2nd());
@@ -14547,4 +16589,3 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   }
   return TRUE;
 }
-

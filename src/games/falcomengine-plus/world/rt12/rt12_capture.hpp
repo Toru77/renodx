@@ -55,7 +55,7 @@ struct Rt12GcCheck {
   std::map<std::string, uint64_t> cpu_failed;  // the pool's failure reason of a key with no CPU mesh
   double wait_ms = 0.0;
   std::map<std::array<uint32_t, 6>, std::array<uint64_t, 2>> split;  // vb usage, vb flags, ib usage, ib flags, pos code, index size
-  std::vector<Sample> samples;                                        // up to 8
+  std::vector<Sample> samples;                                       // up to 8
 };
 
 struct Rt12GcSettle {
@@ -102,7 +102,7 @@ struct Rt12GcState {
   reshade::api::descriptor_table srv_table = {0u}, uav_table = {0u};
   reshade::api::pipeline range_pipeline = {0u}, decode_pipeline = {0u};
   bvh::GpuTimer timer;
-  std::vector<bvh::GcJob> readback_jobs[bvh::kGcReadbackSlots];  // range jobs whose results are read once their query is done
+  std::vector<bvh::GcJob> readback_jobs[bvh::kGcReadbackSlots];              // range jobs whose results are read once their query is done
   Microsoft::WRL::ComPtr<ID3D11Query> readback_done[bvh::kGcReadbackSlots];  // event query after each slot's copy
   uint32_t present = 0u;
   // The carrier ring (D10): one shared texture per present slot.
@@ -150,7 +150,7 @@ struct Rt12GcState {
   uint32_t inst_counters[bvh::kGcCounterCount] = {};
   uint32_t inst_current = 0u;  // the half of the set that holds the last present's entries
   uint64_t inst_readback_busy = 0u;
-  uint64_t inst_bytes = 0u;    // D3D11 bytes of the G3 objects (log and world_gc.json)
+  uint64_t inst_bytes = 0u;  // D3D11 bytes of the G3 objects (log and world_gc.json)
   bvh::GcInstanceCompare compare;
   // G4 (D4, D5, D6): the TLAS bound, the settle latch and the material words.
   std::vector<uint32_t> recent_out;
@@ -504,6 +504,7 @@ inline bool CreateGc(reshade::api::device* device, Rt12State& s, Rt12GcState& gc
 // The on-request check (D17): up to kGcCheckMeshes resident meshes, copied back from D3D12 and compared with the CPU
 // pool mesh of the same key, bitwise per triangle. The wait is bounded by kRt12TeardownMs.
 inline void RunGcCheck(Rt12State& s, Rt12GcState& gc) {
+  if (s.unfenced_execution) return;
   using Microsoft::WRL::ComPtr;
   const uint64_t completed = Rt12CompletedValue(s);
   const uint32_t k = gc.gc_next;
@@ -982,7 +983,7 @@ inline void DumpGcJson(const Rt12GcState& gc) {
       case bvh::kGcFormatF32x4: return renodx::utils::scene::FormatToString(reshade::api::format::r32g32b32a32_float);
       case bvh::kGcFormatF16x2: return renodx::utils::scene::FormatToString(reshade::api::format::r16g16_float);
       case bvh::kGcFormatF16x4: return renodx::utils::scene::FormatToString(reshade::api::format::r16g16b16a16_float);
-      default: return std::string("none");
+      default:                  return std::string("none");
     }
   };
   const Rt12GcCheck& check = p.check;
@@ -1180,6 +1181,7 @@ inline void DumpGcJson(const Rt12GcState& gc) {
 // One present of the cache (D14 order: after UpdateLiveBvh, before rt12::OnPresent). Steps 1 to 12 of the G2 plan.
 inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queue* queue) {
 #if defined(_WIN32)
+  if (g_rt12 && g_rt12->unfenced_execution) return;
   using Microsoft::WRL::ComPtr;
   using RU = reshade::api::resource_usage;
   using DS = reshade::api::shader_stage;

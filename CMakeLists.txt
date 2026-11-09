@@ -283,7 +283,28 @@ function(build_shader_target ADDON ADDON_PATH)
           endif()
         endif()
 
-        if(SHADER_HASH)
+        get_target_property(SHADER_INCLUDE_DIRS ${ADDON} RENODX_DXC_INCLUDE_DIRS)
+        if(SHADER_TARGET_MAJOR GREATER_EQUAL 6 AND SHADER_INCLUDE_DIRS)
+          set(SHADER_DXC_INCLUDES)
+          foreach(SHADER_INCLUDE_DIR IN LISTS SHADER_INCLUDE_DIRS)
+            list(APPEND SHADER_DXC_INCLUDES -I "${SHADER_INCLUDE_DIR}")
+          endforeach()
+          if(SHADER_HASH)
+            set(SHADER_OUTPUT_NAME ${SHADER_HASH})
+          else()
+            set(SHADER_OUTPUT_NAME ${SHADER_NAME})
+          endif()
+          set(DEPFILE ${CMAKE_CURRENT_BINARY_DIR}/${ADDON}/${SHADER_OUTPUT_NAME}.d)
+          add_custom_command(
+            OUTPUT ${EMBED_FOLDER}/${SHADER_OUTPUT_NAME}.cso
+            COMMAND ${SHADER_COMPILER} ${FILE} -T ${SHADER_TARGET} ${SHADER_FLAGS} ${SHADER_DXC_INCLUDES} /nologo /O3 /Qstrip_reflect -E main -Fo ${EMBED_FOLDER}/${SHADER_OUTPUT_NAME}.cso
+            COMMAND ${SHADER_COMPILER} ${FILE} -T ${SHADER_TARGET} ${SHADER_FLAGS} ${SHADER_DXC_INCLUDES} /nologo /O3 /Qstrip_reflect -E main -Fo ${EMBED_FOLDER}/${SHADER_OUTPUT_NAME}.cso -MD -MF ${DEPFILE}
+            DEPENDS ${FILE}
+            DEPFILE ${DEPFILE}
+            VERBATIM
+          )
+          list(APPEND SHADER_BINARIES ${EMBED_FOLDER}/${SHADER_OUTPUT_NAME}.cso)
+        elseif(SHADER_HASH)
           # message("Registering: " ${FILE} " => " ${EMBED_FOLDER}/${SHADER_HASH}.cso)
           set(DEPFILE ${CMAKE_CURRENT_BINARY_DIR}/${ADDON}/${SHADER_HASH}.d)
           add_custom_command(
@@ -769,6 +790,9 @@ foreach(FILE ${ADDON_FILES})
   add_compile_options(/bigobj)
   add_compile_definitions(NOMINMAX)
   add_library(${ADDON} MODULE ${FILE})
+  if(EXISTS "${ADDON_PATH}/cmake/addon.cmake")
+    include("${ADDON_PATH}/cmake/addon.cmake")
+  endif()
   build_shader_target(${ADDON} ${ADDON_PATH})
   generate_resource_rc(${ADDON})
   add_dependencies(${ADDON} ${ADDON}-shaders)

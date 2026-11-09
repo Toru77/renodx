@@ -15,8 +15,8 @@
 
 #include <deps/imgui/imgui.h>
 
-#include "world_state.hpp"
 #include "bvh/world_bvh.hpp"
+#include "capture/draw_census.hpp"
 #include "rr/rr_interop.hpp"
 #include "rr/rr_state.hpp"
 #include "rtao/rtao.hpp"
@@ -26,7 +26,7 @@
 #include "rtls/rtls.hpp"
 #include "rtls/rtls_panel.hpp"
 #include "rtsun/rtsun_panel.hpp"
-#include "capture/draw_census.hpp"
+#include "world_state.hpp"
 
 namespace falcom_world {
 
@@ -700,6 +700,67 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "Performance",
       .on_draw = []() {
         bvh::DrawPerformanceTab();
+        return false;
+      },
+      .is_visible = visible,
+  });
+
+  settings->push_back(new Setting{
+      .key = "RtxdiLocalScenePrep",
+      .binding = &rtxdi::g_local_requested,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "RTXDI Local Lighting",
+      .section = "RTXDI",
+      .tooltip = "Samples local point and spot lights into private RTXDI reservoirs. Game output remains unchanged.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "DxrSunScenePrep",
+      .binding = &rtxdi::g_sun_requested,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "DXR Sun Shadows - scene preparation only",
+      .section = "RTXDI",
+      .tooltip = "Prepares geometry for future DXR sun shadows. No shadow output is produced yet.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiScenePrepStatus",
+      .value_type = SettingValueType::CUSTOM,
+      .can_reset = false,
+      .label = "Scene preparation",
+      .section = "RTXDI",
+      .on_draw = []() {
+        rtxdi::SceneSnapshot snapshot;
+        {
+          std::shared_lock lock(rtxdi::g_scene.mutex);
+          snapshot = rtxdi::g_scene.snapshot;
+        }
+        ImGui::Text("Scene status: %s", rtxdi::SceneStatusName(snapshot.status));
+        rtxdi::InputSnapshot input;
+        {
+          std::shared_lock lock(rtxdi::g_input.mutex);
+          input = rtxdi::g_input.snapshot;
+        }
+        ImGui::Text("Input bridge: %s", rtxdi::InputStatusName(input.status));
+        rtxdi::DiSnapshot di;
+        {
+          std::shared_lock lock(rtxdi::g_di.mutex);
+          di = rtxdi::g_di.snapshot;
+        }
+        ImGui::Text("DI pipeline: %s | frame %u | config %llu | scene %d | transfer %d | history %s | temporal %s (%u->%u) | spatial %s (%u->%u) | fence %llu | output %s, not consumed (%ux%u frame %u; B %llu, C %llu) | error 0x%08x",
+                    rtxdi::DiStatusName(di.status), di.frame,
+                    static_cast<unsigned long long>(di.configuration_generation), di.scene_slot, di.transfer_slot,
+                    di.history_valid ? "valid" : "reset", di.temporal_ran ? "ran" : "skipped",
+                    di.temporal_source_index, di.temporal_output_index,
+                    di.spatial_ran ? "ran" : "skipped", di.spatial_source_index, di.spatial_output_index,
+                    static_cast<unsigned long long>(di.fence), di.output_staged ? "staged" : "unavailable",
+                    di.output_width, di.output_height, di.output_frame,
+                    static_cast<unsigned long long>(di.output_fence_b), static_cast<unsigned long long>(di.output_fence_c),
+                    static_cast<unsigned int>(di.error));
         return false;
       },
       .is_visible = visible,

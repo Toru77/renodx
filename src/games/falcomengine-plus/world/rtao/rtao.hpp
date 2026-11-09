@@ -19,44 +19,44 @@
 namespace falcom_world::rtao {
 
 struct RtaoFrameState {
-  Reason reason = Reason::Off;       // why AO is not produced this frame
+  Reason reason = Reason::Off;  // why AO is not produced this frame
   Reason logged_reason = Reason::Off;
-  Reason note = Reason::Off;         // non-fatal note (isfast_unavailable: IGN used)
-  bool producing = false;            // AO written this frame (rtao_active == 2)
+  Reason note = Reason::Off;  // non-fatal note (isfast_unavailable: IGN used)
+  bool producing = false;     // AO written this frame (rtao_active == 2)
   uint64_t dispatched_frame = UINT64_MAX;
-  uint64_t frames_without_ao = 0u;   // RTAO requested but no AO this frame
-  float gpu_ms = -1.f;               // newest completed RTAO dispatch (negative: none yet)
-  float denoise_gpu_ms = -1.f;       // newest completed SVGF chain and upsample (negative: none yet)
-  bool filter_ran = false;           // the SVGF spatial filter ran this frame
-  uint32_t svgf_iterations = 0u;     // a-trous iterations of the newest dispatch
-  bool svgf_stats = false;           // the SVGF counters (stats 20..22) were requested at the newest dispatch
-  uint64_t texture_bytes = 0u;       // trace AO, stats buffer, SVGF raw, history and output
-  bool fade_valid = false;           // fade is computed from the built region
+  uint64_t frames_without_ao = 0u;  // RTAO requested but no AO this frame
+  float gpu_ms = -1.f;              // newest completed RTAO dispatch (negative: none yet)
+  float denoise_gpu_ms = -1.f;      // newest completed SVGF chain and upsample (negative: none yet)
+  bool filter_ran = false;          // the SVGF spatial filter ran this frame
+  uint32_t svgf_iterations = 0u;    // a-trous iterations of the newest dispatch
+  bool svgf_stats = false;          // the SVGF counters (stats 20..22) were requested at the newest dispatch
+  uint64_t texture_bytes = 0u;      // trace AO, stats buffer, SVGF raw, history and output
+  bool fade_valid = false;          // fade is computed from the built region
   Fade fade = {};
   // Round 2 (temporal).
-  bool temporal_ran = false;         // the SVGF temporal reprojection ran this frame
-  bool temporal_last = false;        // Temporal was on in the last frame that ran the reset rule
-  ResetReason reset = ResetReason::Disabled;       // this frame's reset decision (last one kept below)
+  bool temporal_ran = false;                  // the SVGF temporal reprojection ran this frame
+  bool temporal_last = false;                 // Temporal was on in the last frame that ran the reset rule
+  ResetReason reset = ResetReason::Disabled;  // this frame's reset decision (last one kept below)
   ResetReason last_reset = ResetReason::Disabled;
   uint64_t reset_counts[static_cast<size_t>(ResetReason::Count)] = {};
   bool prev_params_valid = false;
   ParameterSnapshot prev_params = {};
-  bool motion_conflict = false;      // sticky for the session: TAA t3 and RTV4 are different resources
+  bool motion_conflict = false;  // sticky for the session: TAA t3 and RTV4 are different resources
   MotionSource motion_source = MotionSource::None;
-  uint64_t rcas_res = 0u;            // TAA t3 resource handle (0 = not captured)
-  uint64_t rtv4_res = 0u;            // RTV4 motion resource handle (0 = not captured)
+  uint64_t rcas_res = 0u;                                   // TAA t3 resource handle (0 = not captured)
+  uint64_t rtv4_res = 0u;                                   // RTV4 motion resource handle (0 = not captured)
   uint64_t frames_without_ao_by_reason[kReasonCount] = {};  // frames without AO, per Reason code (F1)
-  const char* last_parameter_change = "";  // first field that changed on the last Parameters reset (F1)
-  bool motion_dims_ok = true;        // RTV4 size equals the depth size (texel units)
+  const char* last_parameter_change = "";                   // first field that changed on the last Parameters reset (F1)
+  bool motion_dims_ok = true;                               // RTV4 size equals the depth size (texel units)
   uint32_t motion_w = 0u, motion_h = 0u;
   uint32_t depth_w = 0u, depth_h = 0u;
   uint64_t temporal_on_frames = 0u;  // frames with Temporal on (TAA t3 never-captured check)
   ParameterSnapshot captured = {};   // parameters of the last successful dispatch (P0)
   bool captured_isfast_used = false;
-  uint32_t p2b_records = 0u;         // P2b records the newest dispatch traced (fade.w)
-  uint32_t character_objects = 0u;   // character objects the newest dispatch traced (size.z)
-  uint32_t trace_divisor = 1u;       // Trace Resolution of the newest dispatch: block side d (1, 2 or 4)
-  uint32_t trace_width = 0u;         // pass A extent of the newest dispatch (ceil(width / d))
+  uint32_t p2b_records = 0u;        // P2b records the newest dispatch traced (fade.w)
+  uint32_t character_objects = 0u;  // character objects the newest dispatch traced (size.z)
+  uint32_t trace_divisor = 1u;      // Trace Resolution of the newest dispatch: block side d (1, 2 or 4)
+  uint32_t trace_width = 0u;        // pass A extent of the newest dispatch (ceil(width / d))
   uint32_t trace_height = 0u;
 };
 
@@ -80,12 +80,12 @@ struct RtaoDispatchInputs {
   uint32_t height = 0u;
   RtaoPushConstants push = {};
   bvh::DynamicTraceInputs dynamic = {};  // characters (RefitDeformLiveCharacters), count 0 when off
-  uint32_t trace_divisor = 1u;  // Trace Resolution: block side d (1 Full, 2 Half, 4 Quarter)
+  uint32_t trace_divisor = 1u;           // Trace Resolution: block side d (1 Full, 2 Half, 4 Quarter)
   uint32_t scene_characters = 0u;
 };
 
 struct RtaoDispatchResult {
-  bool ok = false;           // pass A dispatched
+  bool ok = false;            // pass A dispatched
   bool pool_reduced = false;  // G5: no AO: the DXR pass fell back while the CPU pool is reduced
   bool dxr_unavailable = false;
 };
@@ -119,6 +119,8 @@ inline void NullComputeSlots(reshade::api::command_list* cmd_list, uint32_t srv_
 #if !defined(FALCOM_WINDOWS_HARNESS)
 }  // namespace falcom_world::rtao
 #include "../rt12/rt12_backend.hpp"
+#include "../rt12/rt12_rtxdi.hpp"
+#include "../rt12/rt12_rtxdi_transfer.hpp"
 namespace falcom_world::rtao {
 #endif
 
@@ -163,8 +165,25 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   const reshade::api::resource_view uavs[kRtaoUavCount] = {
       reshade::api::resource_view{0u}, data.stats_uav, data.trace_uav};
 #if !defined(FALCOM_WINDOWS_HARNESS)
-  const bool dxr_pass_a = rt12::RunRtaoPassA(device, cmd_list, data, push, in.depth_view, in.mrt_normal_view,
-                                             in.isfast_view, in.scene_cbv_view, uavs, trace_w, trace_h, in.scene_characters);
+  const rt12::SceneAoInputs ao = {
+      .push = push,
+      .depth_view = in.depth_view,
+      .mrt_normal_view = in.mrt_normal_view,
+      .isfast_view = in.isfast_view,
+      .uavs = {uavs[0], uavs[1], uavs[2]},
+      .trace_w = trace_w,
+      .trace_h = trace_h,
+  };
+  const bool dxr_pass_a = rt12::RunSceneTransaction(
+                              device, cmd_list,
+                              {.scene_cbv_view = in.scene_cbv_view,
+                               .records = bvh_data->dynamic.instance_count,
+                               .characters = in.scene_characters,
+                               .character_snapshot = bvh::DeformLightingSnapshot(g_state.frame.load()),
+                               .frame = g_state.frame.load(),
+                               .generation = rt12::g_rt12 ? rt12::g_rt12->generation : 0u},
+                              &ao)
+                              .ao_produced;
 #else
   const bool dxr_pass_a = false;
 #endif
@@ -286,7 +305,9 @@ inline std::string BuildRtaoJson(const RtaoJsonInput& in) {
       << ", \"ran\": " << (f.temporal_ran ? "true" : "false")
       << ", \"reset\": \"" << ResetReasonName(f.reset) << "\""
       << ", \"last_reset\": \"" << ResetReasonName(f.last_reset) << "\""
-      << ", \"motion\": \"" << (f.motion_source == MotionSource::Rtv4 ? "rtv4" : f.motion_source == MotionSource::Conflict ? "conflict" : "none") << "\""
+      << ", \"motion\": \"" << (f.motion_source == MotionSource::Rtv4 ? "rtv4" : f.motion_source == MotionSource::Conflict ? "conflict"
+                                                                                                                           : "none")
+      << "\""
       << ", \"rcas_motion_res\": " << f.rcas_res << ", \"mb_rtv4_res\": " << f.rtv4_res
       << ", \"reset_counts\": [";
   for (size_t r = 0; r < static_cast<size_t>(ResetReason::Count); ++r) {

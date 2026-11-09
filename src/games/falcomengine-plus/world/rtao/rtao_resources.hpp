@@ -43,7 +43,7 @@ inline constexpr uint32_t kRtaoStatRegion = 6u;
 inline constexpr uint32_t kRtaoStatInvalidRefs = 7u;
 inline constexpr uint32_t kRtaoStatStackOverflow = 8u;
 inline constexpr uint32_t kRtaoStatScaled = 9u;
-inline constexpr uint32_t kRtaoFlagDiscovery = 1u;    // b12 c2.z bits (RTAO_FLAG_* in world_rtao.cs_5_0.hlsl)
+inline constexpr uint32_t kRtaoFlagDiscovery = 1u;  // b12 c2.z bits (RTAO_FLAG_* in world_rtao.cs_5_0.hlsl)
 inline constexpr uint32_t kRtaoFlagFoliageSkip = 2u;
 
 // b12 for pass A, matching cbuffer cb_rtao in world_rtao.cs_5_0.hlsl (five float4 registers).
@@ -85,6 +85,17 @@ inline std::unordered_map<reshade::api::device*, RtaoDeviceData> g_rtao_devices;
 
 inline RtaoDeviceData& GetRtaoDeviceData(reshade::api::device* device) { return g_rtao_devices[device]; }
 
+inline void DestroyRtaoLayout(reshade::api::device* device, RtaoDeviceData* data) {
+  if (data->srv_table.handle != 0u) device->free_descriptor_table(data->srv_table);
+  if (data->uav_table.handle != 0u) device->free_descriptor_table(data->uav_table);
+  if (data->cbv_table.handle != 0u) device->free_descriptor_table(data->cbv_table);
+  if (data->layout.handle != 0u) device->destroy_pipeline_layout(data->layout);
+  data->srv_table = {0u};
+  data->uav_table = {0u};
+  data->cbv_table = {0u};
+  data->layout = {0u};
+}
+
 inline bool EnsureRtaoLayout(reshade::api::device* device, RtaoDeviceData* data) {
   if (data->layout.handle != 0u && data->cbv_table.handle != 0u && data->srv_table.handle != 0u
       && data->uav_table.handle != 0u) return true;
@@ -118,6 +129,7 @@ inline bool EnsureRtaoLayout(reshade::api::device* device, RtaoDeviceData* data)
   params[3].push_constants = push_range;
   const auto fail = [&](const char* stage) {
     renodx::utils::log::w("[world-rtao] shared layout creation failed: ", stage);
+    DestroyRtaoLayout(device, data);
     data->layout_failed = true;
     return false;
   };
@@ -179,7 +191,7 @@ inline bool CreateRtaoTexture(
   if (!device->create_resource(desc, &initial, reshade::api::resource_usage::shader_resource, texture)) return false;
   const reshade::api::resource_view_desc view(reshade::api::resource_view_type::texture_2d, format, 0, 1, 0, 1);
   return device->create_resource_view(*texture, reshade::api::resource_usage::shader_resource, view, srv)
-      && device->create_resource_view(*texture, reshade::api::resource_usage::unordered_access, view, uav);
+         && device->create_resource_view(*texture, reshade::api::resource_usage::unordered_access, view, uav);
 }
 
 // update_descriptor_tables reads a constant_buffer descriptor as api::buffer_range (3 words), never as a resource_view.
@@ -209,7 +221,6 @@ inline bool EnsureRtaoTraceTarget(reshade::api::device* device, RtaoDeviceData* 
   return true;
 }
 
-
 inline void DestroyRtaoDeviceData(reshade::api::device* device) {
   const auto found = g_rtao_devices.find(device);
   if (found == g_rtao_devices.end()) return;
@@ -218,10 +229,7 @@ inline void DestroyRtaoDeviceData(reshade::api::device* device) {
   bvh::DestroyBuffer(device, &data.stats_uav, &data.stats_buffer);
   bvh::DestroyGpuTimer(&data.timer);
   if (data.pipeline.handle != 0u) device->destroy_pipeline(data.pipeline);
-  if (data.srv_table.handle != 0u) device->free_descriptor_table(data.srv_table);
-  if (data.uav_table.handle != 0u) device->free_descriptor_table(data.uav_table);
-  if (data.cbv_table.handle != 0u) device->free_descriptor_table(data.cbv_table);
-  if (data.layout.handle != 0u) device->destroy_pipeline_layout(data.layout);
+  DestroyRtaoLayout(device, &data);
   g_rtao_devices.erase(found);
 }
 

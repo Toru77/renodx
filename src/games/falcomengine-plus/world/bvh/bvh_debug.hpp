@@ -17,6 +17,8 @@
 
 #include "../../../../utils/data.hpp"
 #include "../../../../utils/render.hpp"
+#include "../rt12/rt12_capture.hpp"
+#include "../rt12/rt12_probe.hpp"
 #include "../rtao/rtao.hpp"
 #include "../rtao/rtao_svgf.hpp"
 #include "../rtgi/rtgi.hpp"
@@ -25,11 +27,9 @@
 #include "../rtsun/rtsun_range.hpp"
 #include "bvh_build.hpp"
 #include "bvh_live.hpp"
-#include "deform_probe.hpp"
 #include "bvh_resources.hpp"
 #include "bvh_trace.hpp"
-#include "../rt12/rt12_probe.hpp"
-#include "../rt12/rt12_capture.hpp"
+#include "deform_probe.hpp"
 
 namespace falcom_world::bvh {
 
@@ -239,17 +239,7 @@ inline void RunBvhDebugPass(
       if (DynamicObjectKey(hit_instance, &key)) deform_key = renodx::utils::log::AsHex(key);
     }
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    g_pool.inspect = PoolInspectRecord{.set = true, .frame = g_state.frame.load(), .hit = hit,
-                                       .instance_id = known ? data->tlas_info[hit_instance].id : 0u,
-                                       .mesh_uid = known ? data->tlas_info[hit_instance].uid : p2b_mesh_uid,
-                                       .hit_kind = hit_kind,
-                                       .deform_key = deform_key,
-                                       .lines = data->inspect.lines,
-                                       .ray_valid = data->inspect.ray_valid,
-                                       .ray_origin = data->inspect.ray_origin,
-                                       .ray_direction = data->inspect.ray_direction,
-                                       .crossing_instances = data->inspect.crossing_instances,
-                                       .candidates = data->inspect.candidates};
+    g_pool.inspect = PoolInspectRecord{.set = true, .frame = g_state.frame.load(), .hit = hit, .instance_id = known ? data->tlas_info[hit_instance].id : 0u, .mesh_uid = known ? data->tlas_info[hit_instance].uid : p2b_mesh_uid, .hit_kind = hit_kind, .deform_key = deform_key, .lines = data->inspect.lines, .ray_valid = data->inspect.ray_valid, .ray_origin = data->inspect.ray_origin, .ray_direction = data->inspect.ray_direction, .crossing_instances = data->inspect.crossing_instances, .candidates = data->inspect.candidates};
   }
 
   BlitDebugTextureToBackbuffer(device, queue, cmd_list, backbuffer, backbuffer_desc.texture.format, data->debug_srv);
@@ -269,10 +259,18 @@ inline void RefreshPoolCaptureRequest() {
 }
 
 inline bool RtBvhDemanded() {
-  return rtao::RtaoRequested() || rtgi::g_rtgi_enabled > 0.5f || rtls::RtlsRequested() || rtsun::RtSunRequested();
+  return rtao::RtaoRequested() || rtgi::g_rtgi_enabled > 0.5f || rtls::RtlsRequested() || rtsun::RtSunRequested() || rtxdi::SceneRequested();
 }
 
 inline void ApplyBvhInputs() {
+  if (!rtxdi::SceneRequested()) {
+    std::unique_lock lock(rtxdi::g_scene.mutex);
+    rtxdi::RefreshOffState(&rtxdi::g_scene.snapshot, g_state.frame.load());
+  }
+  if (!rtxdi::SceneRequested()) {
+    std::unique_lock lock(rtxdi::g_input.mutex);
+    rtxdi::RefreshInputOffState(&rtxdi::g_input.snapshot, g_state.frame.load());
+  }
   const bool demand = RtBvhDemanded();
   const bool scan_setting = g_pool.scan_active_setting > 0.5f;
   const bool diagnostic = scan_setting || g_bvh_debug.mode.load(std::memory_order_relaxed) != 0;
@@ -304,6 +302,7 @@ inline void ApplyBvhInputs() {
                                         .rtao = rtao::RtaoRequested(),
                                         .debug_view = g_bvh_debug.mode.load(std::memory_order_relaxed) != 0,
                                         .pool_scan = scan_setting,
+                                        .rtxdi = rtxdi::SceneRequested() && !rt12::GcOwnsRtao(),
                                         .discovery = rtao::g_rtao_discovery > 0.5f},
                      g_state.frame.load());
   RefreshPoolCaptureRequest();

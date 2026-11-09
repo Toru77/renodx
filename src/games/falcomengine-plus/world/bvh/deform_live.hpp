@@ -62,43 +62,43 @@ inline constexpr uint32_t kDynamicVertexBytes = 12u;
 inline constexpr uint32_t kDynamicMaxObjects = 256u;
 inline constexpr uint32_t kDynamicTopologySlots = 3u;  // read back two presents later
 inline constexpr uint64_t kDynamicTopologySlotBytes = 4ull * 1024ull * 1024ull;
-inline constexpr uint32_t kDynamicMaxDepth = 64u;      // trace stack size and refit levels
+inline constexpr uint32_t kDynamicMaxDepth = 64u;  // trace stack size and refit levels
 inline constexpr uint32_t kDynamicRetireFrames = 600u;
 inline constexpr uint32_t kDynamicWarmupFrames = 600u;  // identities created later than this after the first count as new (diagnostic)
 inline constexpr size_t kDynamicDropoutRing = 64u;      // dropout events kept (world_deform_live.json)
 inline constexpr uint64_t kDynamicResetGarbageBytes = 8ull * 1024ull * 1024ull;
-inline constexpr uint64_t kDynamicArenaMinBytes = 256ull * 1024ull;  // first size of a BLAS arena
-inline constexpr uint32_t kDynamicRefitGroupSize = 64u;  // world_bvh_refit numthreads
-inline constexpr uint32_t kDynamicInstanceFlag = 0x80000000u;  // trace hit.instance of a dynamic object
-inline constexpr uint32_t kDynamicDrawFlag = 0x40000000u;      // trace hit.instance of a P2b record: | its record index
+inline constexpr uint64_t kDynamicArenaMinBytes = 256ull * 1024ull;                     // first size of a BLAS arena
+inline constexpr uint32_t kDynamicRefitGroupSize = 64u;                                 // world_bvh_refit numthreads
+inline constexpr uint32_t kDynamicInstanceFlag = 0x80000000u;                           // trace hit.instance of a dynamic object
+inline constexpr uint32_t kDynamicDrawFlag = 0x40000000u;                               // trace hit.instance of a P2b record: | its record index
 inline constexpr uint32_t kDynamicFlagsMask = kDynamicInstanceFlag | kDynamicDrawFlag;  // the flag bits of trace hit.instance
-inline constexpr uint32_t kDynamicMeshMarker = 0xFFFFFFFEu;    // trace hit.mesh of a dynamic object
+inline constexpr uint32_t kDynamicMeshMarker = 0xFFFFFFFEu;                             // trace hit.mesh of a dynamic object
 
 // Must match DynamicObjectGPU in world_bvh_types.hlsli.
 struct DynamicObjectGPU {
-  uint32_t node_offset = 0u;    // first node in the dynamic node arena
-  uint32_t leaf_offset = 0u;    // first leaf in the dynamic leaf arena
+  uint32_t node_offset = 0u;  // first node in the dynamic node arena
+  uint32_t leaf_offset = 0u;  // first leaf in the dynamic leaf arena
   uint32_t node_count = 0u;
-  uint32_t vertex_base = 0u;    // first captured vertex (float3) of this frame
+  uint32_t vertex_base = 0u;  // first captured vertex (float3) of this frame
   uint32_t triangle_count = 0u;
-  uint32_t refit_offset = 0u;   // node order (deepest level first) in the refit arena
-  uint32_t level_offset = 0u;   // level_count + 1 level starts in the refit arena (relative to refit_offset)
+  uint32_t refit_offset = 0u;  // node order (deepest level first) in the refit arena
+  uint32_t level_offset = 0u;  // level_count + 1 level starts in the refit arena (relative to refit_offset)
   uint32_t level_count = 0u;
 };
 static_assert(sizeof(DynamicObjectGPU) == 32u, "DynamicObjectGPU layout must match world_bvh_types.hlsli");
 
 enum class DynamicSkip : uint8_t {
   None = 0,
-  NotConfirmed,        // the probe has not confirmed this shader's world position (yet)
+  NotConfirmed,  // the probe has not confirmed this shader's world position (yet)
   LightView,
   NotIndexed,
   Topology,
   Deferred,
-  Duplicate,           // the same identity was already captured this frame
+  Duplicate,  // the same identity was already captured this frame
   ArenaFull,
   NoResources,
   ShaderCreateFailed,
-  GameState,           // the game had a GS/HS/DS or SO target bound
+  GameState,  // the game had a GS/HS/DS or SO target bound
   Count,
 };
 
@@ -356,9 +356,9 @@ struct DynamicDropout {
 };
 
 struct DeformLiveStats {
-  uint32_t frame_captures = 0u;   // last present
-  uint32_t frame_objects = 0u;    // traced at the last present
-  uint32_t frame_pending = 0u;    // captured, BLAS not built yet
+  uint32_t frame_captures = 0u;  // last present
+  uint32_t frame_objects = 0u;   // traced at the last present
+  uint32_t frame_pending = 0u;   // captured, BLAS not built yet
   uint64_t frame_vertices = 0u;
   uint64_t captures = 0u;
   uint32_t identities = 0u;
@@ -379,11 +379,11 @@ struct DeformLiveStats {
   uint32_t presents_no_objects = 0u;  // presents without a traced object after one with objects
   uint32_t calls_max_per_frame = 0u;  // UpdateDeformLive calls in one game frame (largest)
   uint32_t new_identities = 0u;
-  uint32_t new_after_warmup = 0u;     // created more than kDynamicWarmupFrames after the first
+  uint32_t new_after_warmup = 0u;  // created more than kDynamicWarmupFrames after the first
   uint32_t resets_with_objects = 0u;
   uint64_t reset_objects_dropped = 0u;  // traced objects dropped by BLAS store resets (compaction keeps them: stays 0)
-  uint32_t compact_failures = 0u;  // store compactions whose new arenas could not be created (retried next present)
-  uint64_t reclaimed_bytes = 0u;   // retired BLAS bytes freed by store compactions
+  uint32_t compact_failures = 0u;       // store compactions whose new arenas could not be created (retried next present)
+  uint64_t reclaimed_bytes = 0u;        // retired BLAS bytes freed by store compactions
   std::string last_failure;
 };
 
@@ -396,14 +396,14 @@ struct DeformLiveState {
   // Per-frame capture arena (vertices are written by stream output).
   reshade::api::resource arena = {0u};
   reshade::api::resource_view arena_srv = {0u};
-  uint64_t arena_used = 0u;  // bytes, this frame
+  uint64_t arena_used = 0u;              // bytes, this frame
   std::vector<DynamicCapture> captures;  // this frame
   std::unordered_set<uint64_t> frame_keys;
   uint32_t capture_frame = 0u;
   std::unordered_map<uint64_t, DynamicCaptureShader> shaders;  // by VS pipeline
   std::vector<uint64_t> retired_so_shaders;
-  std::unordered_map<uint64_t, DynamicIdentity> identities;   // by DeformDrawKey
-  std::unordered_set<uint64_t> retired_keys;  // identities retired since (recreated count)
+  std::unordered_map<uint64_t, DynamicIdentity> identities;  // by DeformDrawKey
+  std::unordered_set<uint64_t> retired_keys;                 // identities retired since (recreated count)
   // Topology readback ring.
   std::array<DynamicTopologySlot, kDynamicTopologySlots> topology;
   uint32_t topology_write = 0u;
@@ -426,19 +426,20 @@ struct DeformLiveState {
   reshade::api::pipeline refit_pipeline = {0u};
   bool refit_failed = false;
   GpuTimer refit_timer;
-  std::atomic_uint64_t cpu_us{0u};  // CPU time of OnDeformCaptureDraw, the draw hook (PoolCpuTimer)
-  std::atomic_uint64_t cpu_frame_us{0u};  // cpu_us of the last frame (moved by SamplePerfPresent)
-  uint32_t log_lines = 0u;          // identity and store reset lines written (kPoolLifecycleLogLines)
-  uint32_t warm_frame = 0u;   // frame of the first identity
-  bool last_objects = false;  // the previous present traced objects
+  std::atomic_uint64_t cpu_us{0u};                                                // CPU time of OnDeformCaptureDraw, the draw hook (PoolCpuTimer)
+  std::atomic_uint64_t cpu_frame_us{0u};                                          // cpu_us of the last frame (moved by SamplePerfPresent)
+  uint32_t log_lines = 0u;                                                        // identity and store reset lines written (kPoolLifecycleLogLines)
+  uint32_t warm_frame = 0u;                                                       // frame of the first identity
+  bool last_objects = false;                                                      // the previous present traced objects
   std::array<uint64_t, static_cast<size_t>(DynamicSkip::Count)> skips_last = {};  // stats.skips at the previous present
-  uint32_t calls_frame = 0u;  // game frame of the last UpdateDeformLive call
+  uint32_t calls_frame = 0u;                                                      // game frame of the last UpdateDeformLive call
   uint32_t calls_in_frame = 0u;
   // Character refit at lighting time (RefitDeformLiveCharacters), once per frame.
-  uint32_t lighting_frame = UINT32_MAX;  // game frame of the last character refit
-  uint32_t lighting_object_count = 0u;   // characters refit for lighting_frame
+  uint64_t lighting_snapshot = 0u;
+  uint32_t lighting_frame = UINT32_MAX;               // game frame of the last character refit
+  uint32_t lighting_object_count = 0u;                // characters refit for lighting_frame
   std::vector<DynamicCharacter> lighting_characters;  // the characters of lighting_frame, in object order
-  std::vector<DynamicDropout> dropouts;  // last kDynamicDropoutRing
+  std::vector<DynamicDropout> dropouts;               // last kDynamicDropoutRing
   DeformLiveStats stats;
 };
 
@@ -691,15 +692,9 @@ inline bool CreateDynamicResources(reshade::api::device* device, DeformLiveState
       reshade::api::resource_desc(kDynamicArenaBytes, memory_heap::gpu_only,
                                   resource_usage::stream_output | resource_usage::shader_resource | resource_usage::copy_source),
       nullptr, resource_usage::shader_resource, &state.arena);
-  ok = ok && device->create_resource_view(
-                 state.arena, resource_usage::shader_resource,
-                 reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::r32_float,
-                                                  0, kDynamicArenaBytes / sizeof(float)),
-                 &state.arena_srv);
+  ok = ok && device->create_resource_view(state.arena, resource_usage::shader_resource, reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::r32_float, 0, kDynamicArenaBytes / sizeof(float)), &state.arena_srv);
   for (DynamicTopologySlot& slot : state.topology) {
-    ok = ok && device->create_resource(
-                   reshade::api::resource_desc(kDynamicTopologySlotBytes, memory_heap::gpu_to_cpu, resource_usage::copy_dest),
-                   nullptr, resource_usage::copy_dest, &slot.staging);
+    ok = ok && device->create_resource(reshade::api::resource_desc(kDynamicTopologySlotBytes, memory_heap::gpu_to_cpu, resource_usage::copy_dest), nullptr, resource_usage::copy_dest, &slot.staging);
     slot.event = g_deform.backend.create_event != nullptr ? g_deform.backend.create_event(device) : 0u;
   }
   DynamicArena objects;
@@ -849,6 +844,7 @@ inline void ReleaseDeformLive(reshade::api::device* device) {
     g_deform_live.captures.clear();
     g_deform_live.frame_keys.clear();
     g_deform_live.object_count = 0u;
+    ++g_deform_live.lighting_snapshot;
     g_deform_live.lighting_frame = UINT32_MAX;
     g_deform_live.lighting_object_count = 0u;
     g_deform_live.object_info.clear();
@@ -1438,6 +1434,7 @@ inline DynamicTraceInputs RefitDeformLiveCharacters(reshade::api::device* device
       inputs.count = g_deform_live.lighting_object_count;
       return inputs;
     }
+    ++g_deform_live.lighting_snapshot;
     g_deform_live.lighting_frame = frame;
     g_deform_live.lighting_object_count = 0u;
     g_deform_live.lighting_characters.clear();
@@ -1471,6 +1468,7 @@ inline DynamicTraceInputs RefitDeformLiveCharacters(reshade::api::device* device
       inputs.count = g_deform_live.lighting_object_count;
       return inputs;
     }
+    ++g_deform_live.lighting_snapshot;
     g_deform_live.lighting_frame = frame;
     g_deform_live.lighting_object_count = 0u;
     g_deform_live.lighting_characters.clear();
@@ -1504,6 +1502,11 @@ inline DynamicTraceInputs RefitDeformLiveCharacters(reshade::api::device* device
   inputs.count = count;
   return inputs;
 #endif
+}
+
+inline uint64_t DeformLightingSnapshot(uint32_t frame) {
+  std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+  return g_deform_live.lighting_frame == frame ? g_deform_live.lighting_snapshot : 0u;
 }
 
 // rt12 (DXR RTAO): the characters RefitDeformLiveCharacters traced for this frame and the arena they live in.

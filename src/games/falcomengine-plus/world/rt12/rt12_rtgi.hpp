@@ -106,6 +106,7 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
   if (!g_rt12_enabled.load(std::memory_order_relaxed)) return RtgiFallback(Rt12RtgiReason::DxrOff);
   if (!g_rt12 || g_rt12->device != device) return RtgiFallback(Rt12RtgiReason::NotCreated);
   Rt12State& s = *g_rt12;
+  if (s.unfenced_execution) return false;
   if (s.stuck) return RtgiFallback(Rt12RtgiReason::Stuck);
   if (s.failed) return RtgiFallback(Rt12RtgiReason::Failed);
   if (reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()) != s.ctx11.Get()) {  // NOLINT(performance-no-int-to-ptr)
@@ -229,12 +230,9 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
   }
 
   // 3. The three D3D11 pipelines.
-  const rtgi::RtgiPipelineDesc pack_desc = {.srv_count = 5u, .uav_count = 6u, .sampler_count = 0u, .push_count = 4u,
-                                            .code = kRt12RtgiPackShader, .name = "rt12 rtgi pack"};
-  const rtgi::RtgiPipelineDesc pack_lights_desc = {.srv_count = 6u, .uav_count = 6u, .sampler_count = 0u, .push_count = 4u,
-                                                   .code = kRt12RtgiPackLightsShader, .name = "rt12 rtgi pack lights"};
-  const rtgi::RtgiPipelineDesc resolve_desc = {.srv_count = 1u, .uav_count = 1u, .sampler_count = 0u, .push_count = 4u,
-                                               .code = kRt12RtgiResolveShader, .name = "rt12 rtgi resolve"};
+  const rtgi::RtgiPipelineDesc pack_desc = {.srv_count = 5u, .uav_count = 6u, .sampler_count = 0u, .push_count = 4u, .code = kRt12RtgiPackShader, .name = "rt12 rtgi pack"};
+  const rtgi::RtgiPipelineDesc pack_lights_desc = {.srv_count = 6u, .uav_count = 6u, .sampler_count = 0u, .push_count = 4u, .code = kRt12RtgiPackLightsShader, .name = "rt12 rtgi pack lights"};
+  const rtgi::RtgiPipelineDesc resolve_desc = {.srv_count = 1u, .uav_count = 1u, .sampler_count = 0u, .push_count = 4u, .code = kRt12RtgiResolveShader, .name = "rt12 rtgi resolve"};
   if (!rtgi::EnsureRtgiPipeline(device, &r.pack, pack_desc) || !rtgi::EnsureRtgiPipeline(device, &r.pack_lights, pack_lights_desc)
       || !rtgi::EnsureRtgiPipeline(device, &r.resolve, resolve_desc)) {
     return RtgiFallback(Rt12RtgiReason::TargetFailed);
@@ -271,8 +269,7 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
       || !EnsureRtgiShared(s, device, r.shared[kRt12RtgiNormal], DXGI_FORMAT_R32G32B32A32_UINT, tw, th)
       || !EnsureRtgiShared(s, device, r.shared[kRt12RtgiRaw], DXGI_FORMAT_R16G16B16A16_FLOAT, tw, th)
       || !EnsureRtgiShared(s, device, r.shared[kRt12RtgiDebug], DXGI_FORMAT_R8G8B8A8_UNORM, fw, fh)
-      || (restir_on && (!EnsureRtgiShared(s, device, r.shared[kRt12RtgiSamplePos], DXGI_FORMAT_R32G32B32A32_FLOAT, tw, th)
-                        || !EnsureRtgiShared(s, device, r.shared[kRt12RtgiSampleData], DXGI_FORMAT_R32G32B32A32_UINT, tw, th)))) {
+      || (restir_on && (!EnsureRtgiShared(s, device, r.shared[kRt12RtgiSamplePos], DXGI_FORMAT_R32G32B32A32_FLOAT, tw, th) || !EnsureRtgiShared(s, device, r.shared[kRt12RtgiSampleData], DXGI_FORMAT_R32G32B32A32_UINT, tw, th)))) {
     return RtgiFallback(Rt12RtgiReason::TargetFailed);
   }
 
@@ -482,7 +479,7 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
       vertex_arena, index_arena, mesh_table, scene.instance_table.Get(), uv_arena, scene.tlas.Get()};
   const std::array<uint64_t, 5> scene_counts = {vertex_count, index_count, mesh_count, s.scene_instance_count, uv_count};
   const std::array<uint64_t, 3> scene_versions = (gc ? std::array<uint64_t, 3>{g_rt12_gc_scene.version, scene.gc_version, 0u}
-                                                    : std::array<uint64_t, 3>{s.scene_key_version, s.scene_key_blas,
+                                                     : std::array<uint64_t, 3>{s.scene_key_version, s.scene_key_blas,
                                                                                s.mesh_store_version});
   if (!slot.rtgi_scene_descriptors_valid || slot.rtgi_scene_resources != scene_resources || slot.rtgi_scene_counts != scene_counts
       || slot.rtgi_scene_versions != scene_versions) {
@@ -537,15 +534,30 @@ inline bool RunRtgiTrace(reshade::api::device* device, reshade::api::command_lis
 
   // Barriers into the read and write states, then the stats clear and the trace.
   const std::vector<ID3D12Resource*> reads = {
-      vertex_arena, index_arena, uv_arena, mesh_table, scene.instance_table.Get(), s.materials.Get(), s.atlas.texture12.Get(), s.noise.texture12.Get(),
-      shared_resource(true, kRt12RtgiDepth), shared_resource(true, kRt12RtgiNormal), shared_resource(radiance_on, kRt12RtgiRadiance),
-      shared_resource(prev_on, kRt12RtgiPrevFinal), shared_resource(albedo_on, kRt12RtgiAlbedo), shared_resource(mrt1_on, kRt12RtgiMrt1),
-      shared_resource(shadow_on, kRt12RtgiShadow), shared_resource(mrt2_on, kRt12RtgiMrt2),
+      vertex_arena,
+      index_arena,
+      uv_arena,
+      mesh_table,
+      scene.instance_table.Get(),
+      s.materials.Get(),
+      s.atlas.texture12.Get(),
+      s.noise.texture12.Get(),
+      shared_resource(true, kRt12RtgiDepth),
+      shared_resource(true, kRt12RtgiNormal),
+      shared_resource(radiance_on, kRt12RtgiRadiance),
+      shared_resource(prev_on, kRt12RtgiPrevFinal),
+      shared_resource(albedo_on, kRt12RtgiAlbedo),
+      shared_resource(mrt1_on, kRt12RtgiMrt1),
+      shared_resource(shadow_on, kRt12RtgiShadow),
+      shared_resource(mrt2_on, kRt12RtgiMrt2),
       dynamic_on ? s.dynamic_vertices.Get() : nullptr,
   };
   const std::vector<ID3D12Resource*> writes = {
-      r.shared[kRt12RtgiStats].texture12.Get(), r.shared[kRt12RtgiRaw].texture12.Get(), shared_resource(debug_on, kRt12RtgiDebug),
-      shared_resource(restir_on, kRt12RtgiSamplePos), shared_resource(restir_on, kRt12RtgiSampleData),
+      r.shared[kRt12RtgiStats].texture12.Get(),
+      r.shared[kRt12RtgiRaw].texture12.Get(),
+      shared_resource(debug_on, kRt12RtgiDebug),
+      shared_resource(restir_on, kRt12RtgiSamplePos),
+      shared_resource(restir_on, kRt12RtgiSampleData),
   };
   barriers.clear();
   for (ID3D12Resource* resource : reads) {

@@ -1,0 +1,36 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+
+#include "Rtxdi/LightSampling/RISBufferSegmentAllocator.h"
+
+namespace rtxdi
+{
+
+RISBufferSegmentAllocator::RISBufferSegmentAllocator() :
+    m_totalSizeInElements(0)
+{
+
+}
+
+uint32_t RISBufferSegmentAllocator::AllocateSegment(uint32_t sizeInElements)
+{
+    uint32_t prevSize = m_totalSizeInElements;
+    m_totalSizeInElements += sizeInElements;
+    return prevSize;
+}
+
+uint32_t RISBufferSegmentAllocator::GetTotalSizeInElements() const
+{
+    return m_totalSizeInElements;
+}
+
+}
