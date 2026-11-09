@@ -1725,7 +1725,8 @@ bool RunHistoryIdentityContracts() {
   using falcom_world::rt12::Rt12NrdHistoryIdentity;
   using falcom_world::rt12::Rt12NrdN1ConfigurationIdentity;
   using falcom_world::rt12::Rt12NrdSubmissionAllowed;
-  if (!Rt12NrdSubmissionAllowed(false) || Rt12NrdSubmissionAllowed(true)) return false;
+  if (!Rt12NrdSubmissionAllowed(false, false, true) || Rt12NrdSubmissionAllowed(true, false, true)
+      || Rt12NrdSubmissionAllowed(false, true, true) || Rt12NrdSubmissionAllowed(false, false, false)) return false;
   std::printf("PASS NRD submissions suppressed while RR owns denoising\n");
   constexpr Rt12NrdHistoryIdentity previous = {4u, 8u, 2u, 19u, 13u, 9u, true};
   constexpr Rt12NrdHistoryIdentity next = {4u, 8u, 2u, 20u, 13u, 9u, true};
@@ -1745,7 +1746,7 @@ bool RunHistoryIdentityContracts() {
   std::printf("PASS NRD history identity/gap/resize/owner/generation/config/device-reset contracts\n");
   const std::array<float, 7u> n1_settings = {1.f, 0.5f, 1.f, 0.75f, 8.f, 0.02f, 0.9f};
   const uint64_t n1_identity = Rt12NrdN1ConfigurationIdentity(1u, n1_settings);
-  const uint64_t nrd_identity = Rt12NrdConfigurationIdentity(4u, 7u, 0u);
+  const uint64_t nrd_identity = Rt12NrdConfigurationIdentity(4u, 7u, 11u, 0u);
   const Rt12NrdDiffusePublicationIdentity publication = {
       .owner_generation = 8u,
       .transfer_configuration = 4u,

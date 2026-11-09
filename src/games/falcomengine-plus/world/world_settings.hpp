@@ -7,6 +7,7 @@
 // is the main workflow; the census panel lists draws per VS family.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <functional>
 #include <string>
@@ -26,6 +27,8 @@
 #include "rtls/rtls.hpp"
 #include "rtls/rtls_panel.hpp"
 #include "rtsun/rtsun_panel.hpp"
+#include "rtxdi/rtxdi_config.hpp"
+#include "rtxdi/rtxdi_state.hpp"
 #include "world_state.hpp"
 
 namespace falcom_world {
@@ -712,10 +715,271 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RTXDI Local Lighting",
       .section = "RTXDI",
-      .tooltip = "Samples local point and spot lights into private RTXDI reservoirs. Game output remains unchanged.",
+      .tooltip = "Samples the captured local lights and can replace their game lighting terms when a validated RTXDI tuple is bound. Unknown or unavailable tuples keep the game's local-light path.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });
+  const auto mark_rtxdi_custom = [](float, float) {
+    if (!rtxdi::g_applying_quality_preset && rtxdi::g_quality_preset < 2.5f) {
+      rtxdi::g_quality_preset = 3.f;
+      renodx::utils::settings::UpdateSetting("RtxdiQualityPreset", 3.f);
+    }
+  };
+  settings->push_back(new Setting{
+      .key = "RtxdiQualityPreset",
+      .binding = &rtxdi::g_quality_preset,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 1.f,
+      .label = "Quality preset",
+      .section = "RTXDI",
+      .tooltip = "Starting RTXDI sampling and spatial reuse values; these presets are not performance claims.",
+      .labels = {"Performance", "Balanced", "Quality", "Custom"},
+      .min = 0.f,
+      .max = 3.f,
+      .on_change_value = [](float, float current) {
+        if (current >= 3.f) return;
+        const uint32_t preset = static_cast<uint32_t>(std::clamp(std::lround(current), 0l, 2l));
+        constexpr uint32_t candidates[] = {4u, 8u, 16u};
+        constexpr uint32_t spatial[] = {2u, 4u, 8u};
+        rtxdi::g_applying_quality_preset = true;
+        rtxdi::g_local_candidates = static_cast<float>(candidates[preset]);
+        rtxdi::g_spatial_samples = static_cast<float>(spatial[preset]);
+        rtxdi::g_spatial_disocclusion = static_cast<float>(spatial[preset]);
+        renodx::utils::settings::UpdateSetting("RtxdiLocalCandidates", rtxdi::g_local_candidates);
+        renodx::utils::settings::UpdateSetting("RtxdiSpatialSamples", rtxdi::g_spatial_samples);
+        renodx::utils::settings::UpdateSetting("RtxdiSpatialDisocclusion", rtxdi::g_spatial_disocclusion);
+        rtxdi::g_applying_quality_preset = false;
+      },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiLocalCandidates",
+      .binding = &rtxdi::g_local_candidates,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 8.f,
+      .label = "Local light candidates",
+      .section = "RTXDI",
+      .min = 1.f,
+      .max = 32.f,
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiTemporalReuse",
+      .binding = &rtxdi::g_temporal_reuse,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Temporal reservoir reuse",
+      .section = "RTXDI",
+      .labels = {"Off", "On"},
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSpatialReuse",
+      .binding = &rtxdi::g_spatial_reuse,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Spatial reservoir reuse",
+      .section = "RTXDI",
+      .labels = {"Off", "On"},
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSpatialSamples",
+      .binding = &rtxdi::g_spatial_samples,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 4.f,
+      .label = "Spatial samples",
+      .section = "RTXDI",
+      .min = 1.f,
+      .max = 16.f,
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSpatialDisocclusion",
+      .binding = &rtxdi::g_spatial_disocclusion,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 4.f,
+      .label = "Spatial disocclusion samples",
+      .section = "RTXDI",
+      .min = 1.f,
+      .max = 16.f,
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSpatialRadius",
+      .binding = &rtxdi::g_spatial_radius,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 4.f,
+      .label = "Spatial radius (pixels)",
+      .section = "RTXDI",
+      .min = 1.f,
+      .max = 32.f,
+      .format = "%.0f",
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiHistoryLength",
+      .binding = &rtxdi::g_history_length,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 20.f,
+      .label = "Reservoir history cap",
+      .section = "RTXDI",
+      .min = 1.f,
+      .max = 32.f,
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiTemporalDepthThreshold",
+      .binding = &rtxdi::g_temporal_depth_threshold,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.1f,
+      .label = "Temporal depth rejection",
+      .section = "RTXDI",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.3f",
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiTemporalNormalThreshold",
+      .binding = &rtxdi::g_temporal_normal_threshold,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.5f,
+      .label = "Temporal normal rejection",
+      .section = "RTXDI",
+      .min = -1.f,
+      .max = 1.f,
+      .format = "%.3f",
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSpatialDepthThreshold",
+      .binding = &rtxdi::g_spatial_depth_threshold,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.05f,
+      .label = "Spatial depth rejection",
+      .section = "RTXDI",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.3f",
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSpatialNormalThreshold",
+      .binding = &rtxdi::g_spatial_normal_threshold,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.9f,
+      .label = "Spatial normal rejection",
+      .section = "RTXDI",
+      .min = -1.f,
+      .max = 1.f,
+      .format = "%.3f",
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiDiffuseDenoiser",
+      .binding = &rtxdi::g_diffuse_denoiser,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 1.f,
+      .label = "Diffuse denoiser",
+      .section = "RTXDI",
+      .tooltip = "RELAX is used when the NRD SDK is available and Ray Reconstruction does not own denoising; otherwise raw lighting stays active.",
+      .labels = {"Raw", "RELAX"},
+      .min = 0.f,
+      .max = 1.f,
+      .is_enabled = [] {
+#if defined(FALCOM_NRD_ENABLED)
+        return true;
+#else
+        return false;
+#endif
+      },
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiRelaxControlsStatus",
+      .value_type = SettingValueType::CUSTOM,
+      .can_reset = false,
+      .label = "Denoiser status",
+      .section = "RTXDI",
+      .on_draw = []() {
+#if defined(FALCOM_NRD_ENABLED)
+        ImGui::Text("NRD SDK: available");
+        ImGui::Text("RTXDI denoiser: %s", (rr::RrRequested() || rr::RrOwnsDenoise()) ? "Disabled by Ray Reconstruction"
+                                                                                     : (rtxdi::g_diffuse_denoiser > 0.5f ? "RELAX selected" : "Raw selected"));
+#else
+        ImGui::Text("NRD SDK: unavailable; diffuse remains raw");
+#endif
+        return false;
+      },
+      .is_visible = visible,
+  });
+#if defined(FALCOM_NRD_ENABLED)
+  settings->push_back(new Setting{
+      .key = "RtxdiRelaxDiffuseHistory",
+      .binding = &rtxdi::g_relax_diffuse_history,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 30.f,
+      .label = "RELAX diffuse history",
+      .section = "RTXDI",
+      .min = 1.f,
+      .max = 128.f,
+      .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiRelaxFastHistory",
+      .binding = &rtxdi::g_relax_fast_history,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 6.f,
+      .label = "RELAX fast history",
+      .section = "RTXDI",
+      .min = 1.f,
+      .max = 32.f,
+      .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiRelaxPrepassRadius",
+      .binding = &rtxdi::g_relax_prepass_radius,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 30.f,
+      .label = "RELAX prepass radius",
+      .section = "RTXDI",
+      .min = 0.f,
+      .max = 64.f,
+      .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiRelaxAtrousIterations",
+      .binding = &rtxdi::g_relax_atrous_iterations,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 5.f,
+      .label = "RELAX a-trous iterations",
+      .section = "RTXDI",
+      .min = 2.f,
+      .max = 8.f,
+      .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+#endif
   settings->push_back(new Setting{
       .key = "DxrSunScenePrep",
       .binding = &rtxdi::g_sun_requested,
@@ -751,12 +1015,15 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           std::shared_lock lock(rtxdi::g_di.mutex);
           di = rtxdi::g_di.snapshot;
         }
-        ImGui::Text("DI pipeline: %s | frame %u | config %llu | scene %d | transfer %d | history %s | temporal %s (%u->%u) | spatial %s (%u->%u) | fence %llu | output staged %s, tuple bound %s, lighting draw with tuple bound %s (%ux%u frame %u; B %llu, C %llu) | error 0x%08x",
+        ImGui::Text("DI pipeline: %s | frame %u | config %llu | settings %llx | scene %d | transfer %d | history %s | temporal %s/%s (%u->%u) | spatial %s/%s (%u->%u), candidates %u, samples %u+%u, cap %u | fence %llu | output staged %s, tuple bound %s, lighting draw with tuple bound %s (%ux%u frame %u; B %llu, C %llu) | error 0x%08x",
                     rtxdi::DiStatusName(di.status), di.frame,
-                    static_cast<unsigned long long>(di.configuration_generation), di.scene_slot, di.transfer_slot,
+                    static_cast<unsigned long long>(di.configuration_generation),
+                    static_cast<unsigned long long>(di.settings_identity), di.scene_slot, di.transfer_slot,
                     di.history_valid ? "valid" : "reset", di.temporal_ran ? "ran" : "skipped",
-                    di.temporal_source_index, di.temporal_output_index,
-                    di.spatial_ran ? "ran" : "skipped", di.spatial_source_index, di.spatial_output_index,
+                    di.temporal_enabled ? "on" : "off", di.temporal_source_index, di.temporal_output_index,
+                    di.spatial_ran ? "ran" : "skipped", di.spatial_enabled ? "on" : "off",
+                    di.spatial_source_index, di.spatial_output_index, di.local_candidates, di.spatial_samples,
+                    di.spatial_disocclusion, di.history_length,
                     static_cast<unsigned long long>(di.fence), di.output_staged ? "yes" : "no",
                     di.output_bound ? "yes" : "no", di.lighting_draw_seen ? "yes" : "no",
                     di.output_width, di.output_height, di.output_frame,
@@ -982,30 +1249,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .format = "%.2f",
       .is_visible = visible,
   });
-  AddSvgfRows(settings, visible, advanced, {.prefix = "Rtao",
-                                            .temporal_section = "Temporal Accumulation",
-                                            .temporal_enabled_tooltip = "Reprojects the previous frame RTAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Resets on camera cuts, frame gaps and parameter changes.",
-                                            .temporal_enabled = &rtao::g_rtao_temporal_enabled,
-                                            .full_res_denoise = &rtao::g_rtao_full_res_denoise,
-                                            .history_weight = &rtao::g_rtao_history_weight,
-                                            .depth_rejection = &rtao::g_rtao_depth_rejection,
-                                            .normal_rejection = &rtao::g_rtao_normal_rejection,
-                                            .spatial_section = "Denoising",
-                                            .spatial_enabled_tooltip = "Denoises the RTAO AO with the SVGF a-trous filter (depth, normal and AO edge stops). Off = no filter.",
-                                            .spatial_enabled = &rtao::g_rtao_spatial_enabled,
-                                            .iterations = &rtao::g_rtao_svgf_iterations,
-                                            .luminance_edge_stop = &rtao::g_rtao_svgf_luminance_edge_stop,
-                                            .depth_sigma = &rtao::g_rtao_svgf_depth_sigma,
-                                            .normal_power = &rtao::g_rtao_svgf_normal_power,
-                                            .history_length = &rtao::g_rtao_svgf_history_length,
-                                            .radius_scale = &rtao::g_rtao_svgf_radius_scale,
-                                            .default_temporal_enabled = 1.f,
-                                            .default_history_weight = 0.8f,
-                                            .default_depth_rejection = 0.2f,
-                                            .default_normal_rejection = 0.f,
-                                            .default_spatial_enabled = 1.f,
-                                            .default_iterations = 5.f,
-                                            .default_luminance_edge_stop = 4.f});
+  AddSvgfRows(settings, visible, advanced, {.prefix = "Rtao", .temporal_section = "Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame RTAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Resets on camera cuts, frame gaps and parameter changes.", .temporal_enabled = &rtao::g_rtao_temporal_enabled, .full_res_denoise = &rtao::g_rtao_full_res_denoise, .history_weight = &rtao::g_rtao_history_weight, .depth_rejection = &rtao::g_rtao_depth_rejection, .normal_rejection = &rtao::g_rtao_normal_rejection, .spatial_section = "Denoising", .spatial_enabled_tooltip = "Denoises the RTAO AO with the SVGF a-trous filter (depth, normal and AO edge stops). Off = no filter.", .spatial_enabled = &rtao::g_rtao_spatial_enabled, .iterations = &rtao::g_rtao_svgf_iterations, .luminance_edge_stop = &rtao::g_rtao_svgf_luminance_edge_stop, .depth_sigma = &rtao::g_rtao_svgf_depth_sigma, .normal_power = &rtao::g_rtao_svgf_normal_power, .history_length = &rtao::g_rtao_svgf_history_length, .radius_scale = &rtao::g_rtao_svgf_radius_scale, .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.2f, .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f, .default_luminance_edge_stop = 4.f});
   settings->push_back(new Setting{
       .key = "RtaoIsfast",
       .binding = &rtao::g_rtao_isfast,
@@ -1377,30 +1621,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_enabled = []() { return rtgi::g_rtgi_dynamic_lights > 0.5f; },
       .is_visible = visible,
   });
-  AddSvgfRows(settings, visible, advanced, {.prefix = "Rtgi",
-                                            .temporal_section = "RTGI Temporal Accumulation",
-                                            .temporal_enabled_tooltip = "Reprojects the previous frame GI with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
-                                            .temporal_enabled = &rtgi::g_rtgi_temporal_enabled,
-                                            .full_res_denoise = &rtgi::g_rtgi_full_res_denoise,
-                                            .history_weight = &rtgi::g_rtgi_history_weight,
-                                            .depth_rejection = &rtgi::g_rtgi_depth_rejection,
-                                            .normal_rejection = &rtgi::g_rtgi_normal_rejection,
-                                            .spatial_section = "RTGI Denoising",
-                                            .spatial_enabled_tooltip = "Denoises the RTGI output at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered GI. Off = no filter.",
-                                            .spatial_enabled = &rtgi::g_rtgi_spatial_enabled,
-                                            .iterations = &rtgi::g_rtgi_svgf_iterations,
-                                            .luminance_edge_stop = &rtgi::g_rtgi_svgf_luminance_edge_stop,
-                                            .depth_sigma = &rtgi::g_rtgi_svgf_depth_sigma,
-                                            .normal_power = &rtgi::g_rtgi_svgf_normal_power,
-                                            .history_length = &rtgi::g_rtgi_svgf_history_length,
-                                            .radius_scale = &rtgi::g_rtgi_svgf_radius_scale,
-                                            .default_temporal_enabled = 1.f,
-                                            .default_history_weight = 0.8f,
-                                            .default_depth_rejection = 0.2f,
-                                            .default_normal_rejection = 0.f,
-                                            .default_spatial_enabled = 1.f,
-                                            .default_iterations = 5.f,
-                                            .default_luminance_edge_stop = 4.f});
+  AddSvgfRows(settings, visible, advanced, {.prefix = "Rtgi", .temporal_section = "RTGI Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame GI with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.", .temporal_enabled = &rtgi::g_rtgi_temporal_enabled, .full_res_denoise = &rtgi::g_rtgi_full_res_denoise, .history_weight = &rtgi::g_rtgi_history_weight, .depth_rejection = &rtgi::g_rtgi_depth_rejection, .normal_rejection = &rtgi::g_rtgi_normal_rejection, .spatial_section = "RTGI Denoising", .spatial_enabled_tooltip = "Denoises the RTGI output at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered GI. Off = no filter.", .spatial_enabled = &rtgi::g_rtgi_spatial_enabled, .iterations = &rtgi::g_rtgi_svgf_iterations, .luminance_edge_stop = &rtgi::g_rtgi_svgf_luminance_edge_stop, .depth_sigma = &rtgi::g_rtgi_svgf_depth_sigma, .normal_power = &rtgi::g_rtgi_svgf_normal_power, .history_length = &rtgi::g_rtgi_svgf_history_length, .radius_scale = &rtgi::g_rtgi_svgf_radius_scale, .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.2f, .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f, .default_luminance_edge_stop = 4.f});
   settings->push_back(new Setting{
       .key = "RtgiFadeStartPct",
       .binding = &rtgi::g_rtgi_fade_start_pct,
@@ -1673,28 +1894,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RT Local Shadows",
       .is_visible = visible,
   });
-  AddSvgfRows(settings, visible, advanced, {.prefix = "Rtls",
-                                            .temporal_section = "RTLS Temporal Accumulation",
-                                            .temporal_enabled_tooltip = "Reprojects the previous frame's RT local shadow term with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
-                                            .temporal_enabled = &rtls::g_rtls_temporal_enabled,
-                                            .full_res_denoise = &rtls::g_rtls_full_res_denoise,
-                                            .history_weight = &rtls::g_rtls_history_weight,
-                                            .depth_rejection = &rtls::g_rtls_depth_rejection,
-                                            .normal_rejection = &rtls::g_rtls_normal_rejection,
-                                            .spatial_section = "RTLS Denoising",
-                                            .spatial_enabled_tooltip = "Denoises the RT local shadow term at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered term. Off = no filter.",
-                                            .spatial_enabled = &rtls::g_rtls_spatial_enabled,
-                                            .iterations = &rtls::g_rtls_svgf_iterations,
-                                            .luminance_edge_stop = &rtls::g_rtls_svgf_luminance_edge_stop,
-                                            .history_length = &rtls::g_rtls_svgf_history_length,
-                                            .radius_scale = &rtls::g_rtls_svgf_radius_scale,
-                                            .default_temporal_enabled = 1.f,
-                                            .default_history_weight = 0.8f,
-                                            .default_depth_rejection = 0.2f,
-                                            .default_normal_rejection = 0.f,
-                                            .default_spatial_enabled = 1.f,
-                                            .default_iterations = 5.f,
-                                            .default_luminance_edge_stop = 4.f});
+  AddSvgfRows(settings, visible, advanced, {.prefix = "Rtls", .temporal_section = "RTLS Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's RT local shadow term with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.", .temporal_enabled = &rtls::g_rtls_temporal_enabled, .full_res_denoise = &rtls::g_rtls_full_res_denoise, .history_weight = &rtls::g_rtls_history_weight, .depth_rejection = &rtls::g_rtls_depth_rejection, .normal_rejection = &rtls::g_rtls_normal_rejection, .spatial_section = "RTLS Denoising", .spatial_enabled_tooltip = "Denoises the RT local shadow term at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered term. Off = no filter.", .spatial_enabled = &rtls::g_rtls_spatial_enabled, .iterations = &rtls::g_rtls_svgf_iterations, .luminance_edge_stop = &rtls::g_rtls_svgf_luminance_edge_stop, .history_length = &rtls::g_rtls_svgf_history_length, .radius_scale = &rtls::g_rtls_svgf_radius_scale, .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.2f, .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f, .default_luminance_edge_stop = 4.f});
   settings->push_back(new Setting{
       .key = "RtlsFadeStartPct",
       .binding = &rtls::g_rtls_fade_start_pct,
@@ -1943,28 +2143,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .labels = {"Full", "Half", "Quarter"},
       .is_visible = visible,
   });
-  AddSvgfRows(settings, visible, advanced, {.prefix = "RtSun",
-                                            .temporal_section = "RT Sun Temporal Accumulation",
-                                            .temporal_enabled_tooltip = "Reprojects the previous frame's RT sun term with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes (Trace Resolution, Cascade Range, samples and the other trace settings).",
-                                            .temporal_enabled = &rtsun::g_rtsun_temporal_enabled,
-                                            .full_res_denoise = &rtsun::g_rtsun_full_res_denoise,
-                                            .history_weight = &rtsun::g_rtsun_history_weight,
-                                            .depth_rejection = &rtsun::g_rtsun_depth_rejection,
-                                            .normal_rejection = &rtsun::g_rtsun_normal_rejection,
-                                            .spatial_section = "RT Sun Denoising",
-                                            .spatial_enabled_tooltip = "Denoises the RT sun term at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered term. Off = no filter.",
-                                            .spatial_enabled = &rtsun::g_rtsun_spatial_enabled,
-                                            .iterations = &rtsun::g_rtsun_svgf_iterations,
-                                            .luminance_edge_stop = &rtsun::g_rtsun_svgf_luminance_edge_stop,
-                                            .history_length = &rtsun::g_rtsun_svgf_history_length,
-                                            .radius_scale = &rtsun::g_rtsun_svgf_radius_scale,
-                                            .default_temporal_enabled = 1.f,
-                                            .default_history_weight = 0.8f,
-                                            .default_depth_rejection = 0.2f,
-                                            .default_normal_rejection = 0.f,
-                                            .default_spatial_enabled = 1.f,
-                                            .default_iterations = 5.f,
-                                            .default_luminance_edge_stop = 4.f});
+  AddSvgfRows(settings, visible, advanced, {.prefix = "RtSun", .temporal_section = "RT Sun Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's RT sun term with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes (Trace Resolution, Cascade Range, samples and the other trace settings).", .temporal_enabled = &rtsun::g_rtsun_temporal_enabled, .full_res_denoise = &rtsun::g_rtsun_full_res_denoise, .history_weight = &rtsun::g_rtsun_history_weight, .depth_rejection = &rtsun::g_rtsun_depth_rejection, .normal_rejection = &rtsun::g_rtsun_normal_rejection, .spatial_section = "RT Sun Denoising", .spatial_enabled_tooltip = "Denoises the RT sun term at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered term. Off = no filter.", .spatial_enabled = &rtsun::g_rtsun_spatial_enabled, .iterations = &rtsun::g_rtsun_svgf_iterations, .luminance_edge_stop = &rtsun::g_rtsun_svgf_luminance_edge_stop, .history_length = &rtsun::g_rtsun_svgf_history_length, .radius_scale = &rtsun::g_rtsun_svgf_radius_scale, .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.2f, .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f, .default_luminance_edge_stop = 4.f});
 }
 
 }  // namespace falcom_world

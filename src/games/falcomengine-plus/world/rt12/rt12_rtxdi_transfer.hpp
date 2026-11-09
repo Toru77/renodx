@@ -20,6 +20,7 @@ struct Rt12DiInputViews {
   uint64_t capture_frame = UINT64_MAX;
   uint32_t frame = UINT32_MAX, width = 0u, height = 0u;
   std::array<float, 7> n1_brdf_config = {};
+  rtxdi::EffectiveRtxdiSettings effective_settings = {};
   int32_t scene_slot = -1;
   uint64_t scene_fence = 0u;
   bool local = false, sun = false;
@@ -513,6 +514,7 @@ inline bool BuildNrdCommonSettings(const rtxdi::CameraCandidate& camera, uint32_
 }
 
 inline bool RecordNrdDenoise(Rt12State& state, Rt12DiTransferSlot& slot, const Rt12DiInputViews& input,
+                             const rtxdi::EffectiveRtxdiSettings& settings,
                              Rt12NrdHistoryIdentity* accepted_history) {
   auto& generation = state.di_transfer.nrd;
   if (generation.Instance() == nullptr || accepted_history == nullptr || input.width == 0u || input.height == 0u
@@ -528,7 +530,8 @@ inline bool RecordNrdDenoise(Rt12State& state, Rt12DiTransferSlot& slot, const R
   nrd::CommonSettings common = {};
   const uint64_t configuration = state.di_transfer.configuration_generation
                                  ^ (uint64_t{slot.n1_configuration_version} << 32u)
-                                 ^ state.di_transfer.nrd.qualification.motion_correction_index;
+                                 ^ state.di_transfer.nrd.qualification.motion_correction_index
+                                 ^ settings.identity;
   uint64_t configuration_hash = configuration ^ 1469598103934665603ull;
   for (float value : input.n1_brdf_config) {
     configuration_hash ^= std::bit_cast<uint32_t>(value);
@@ -546,6 +549,10 @@ inline bool RecordNrdDenoise(Rt12State& state, Rt12DiTransferSlot& slot, const R
   relax.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::OFF;
   relax.minMaterialForDiffuse = 0.0f;
   relax.minMaterialForSpecular = 0.0f;
+  relax.diffuseMaxAccumulatedFrameNum = settings.relax_diffuse_history;
+  relax.diffuseMaxFastAccumulatedFrameNum = settings.relax_fast_history;
+  relax.diffusePrepassBlurRadius = static_cast<float>(settings.relax_prepass_radius);
+  relax.atrousIterationNum = settings.relax_atrous_iterations;
   if (nrd::SetDenoiserSettings(*generation.Instance(), 1u, &relax) != nrd::Result::SUCCESS) return false;
   const nrd::Identifier identifier = 1u;
   const nrd::DispatchDesc* dispatches = nullptr;
@@ -858,7 +865,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       UpdatePanel([](Rt12Panel& p) { p.stuck = true; });
       return result;
     }
-    if (in.local && !EnsureRt12DiResources(s, true, in.width, in.height)) {
+    if (in.local && !EnsureRt12DiResources(s, true, in.width, in.height, in.effective_settings)) {
       result.status = rtxdi::InputStatus::AllocationFailed;
       result.error = E_FAIL;
       return result;
@@ -1542,10 +1549,16 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     return rtxdi::DiStatus::WaitingInput;
   }
   Rt12State& s = *g_rt12;
+  auto& transfer = s.di_transfer;
 #if defined(FALCOM_NRD_ENABLED)
   ProcessNrdProbeReadbacks(s);
+  const bool nrd_requested = Rt12NrdSubmissionAllowed(rr::RrRequested(), rr::RrOwnsDenoise(),
+                                                      in.effective_settings.relax_diffuse);
+  if (!nrd_requested) {
+    transfer.nrd.qualification = {};
+    transfer.nrd.history = {};
+  }
 #endif
-  auto& transfer = s.di_transfer;
   const uint32_t slot_index = static_cast<uint32_t>(input.transfer_slot);
   Rt12DiTransferSlot& slot = transfer.slots[slot_index];
 #if defined(FALCOM_NRD_ENABLED)
@@ -1570,7 +1583,15 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     rtxdi::g_di.snapshot = {.status = status,
                             .frame = in.frame,
                             .configuration_generation = s.di.configuration_generation,
+                            .settings_identity = s.di.settings_identity,
                             .fence = fence,
+                            .local_candidates = in.effective_settings.local_candidates,
+                            .spatial_samples = in.effective_settings.spatial_samples,
+                            .spatial_disocclusion = in.effective_settings.spatial_disocclusion,
+                            .history_length = in.effective_settings.history_length,
+                            .temporal_enabled = in.effective_settings.temporal_enabled,
+                            .spatial_enabled = in.effective_settings.spatial_enabled,
+                            .relax_selected = in.effective_settings.relax_diffuse,
                             .scene_slot = in.scene_slot,
                             .transfer_slot = input.transfer_slot,
                             .spatial_ran = spatial_ran,
@@ -1641,7 +1662,8 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       || reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()) != s.ctx11.Get()) {  // NOLINT(performance-no-int-to-ptr)
     return publish(rtxdi::DiStatus::WaitingInput);
   }
-  if (!s.di.context || !slot.local || slot.width != in.width || slot.height != in.height || !slot.di_allocator
+  if (!s.di.context || s.di.settings_identity != in.effective_settings.identity || !slot.local
+      || slot.width != in.width || slot.height != in.height || !slot.di_allocator
       || !slot.di_descriptors || !slot.light_types || !slot.di_results || !slot.di_frame_upload) {
     return publish(rtxdi::DiStatus::Failed, E_FAIL);
   }
@@ -1687,7 +1709,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   s.di.frame.parameters.lights.localLightBufferRegion = {0u, light_count, 0u, 0u};
   s.di.frame.parameters.lights.infiniteLightBufferRegion = {};
   s.di.frame.parameters.lights.environmentLightParams = {};
-  if (!rtxdi::ValidTemporalSpatialBufferIndices(s.di.frame.parameters.di.bufferIndices)) {
+  if (!rtxdi::ValidDiBufferIndices(s.di.frame.parameters.di.bufferIndices, in.effective_settings)) {
     return publish(rtxdi::DiStatus::Failed, E_FAIL);
   }
   temporal_source_index = s.di.frame.parameters.di.bufferIndices.temporalResamplingInputBufferIndex;
@@ -2004,7 +2026,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   barriers.clear();
   UavBarrier(barriers, s.di.reservoirs.Get());
   transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-  if (history_valid) {
+  if (history_valid && in.effective_settings.temporal_enabled) {
     transfer.di_list->SetPipelineState(transfer.temporal_di_pso.Get());
     transfer.di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
     barriers.clear();
@@ -2039,7 +2061,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
 #if defined(FALCOM_NRD_ENABLED)
   bool camera_candidate_valid = false;
   bool projection_compatible = false;
-  const bool nrd_allowed = Rt12NrdSubmissionAllowed(rr::RrOwnsDenoise());
+  const bool nrd_allowed = nrd_requested;
   if (nrd_allowed && n1_ready && history_valid && previous_slot != nullptr && input.layout.motion_available != 0u
       && slot.nrd.camera.valid && previous_slot->nrd.camera.valid && slot.nrd.camera.capture_frame == in.frame
       && previous_slot->nrd.camera.capture_frame != UINT32_MAX
@@ -2292,7 +2314,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       hitdistance_recorded = false;
     }
     nrd_dispatch_recorded = hitdistance_recorded
-                            && RecordNrdDenoise(s, slot, in, &nrd_accepted_history);
+                            && RecordNrdDenoise(s, slot, in, in.effective_settings, &nrd_accepted_history);
     slot.nrd.diffuse_publication_recorded = false;
 #if defined(__world_rtxdi_nrd_publish_EMBED_FILE)
     if (nrd_dispatch_recorded && slot.nrd.diffuse_output_valid && slot.nrd.hit_validity
@@ -2445,6 +2467,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
         .n1_configuration = Rt12NrdN1ConfigurationIdentity(slot.n1_configuration_version, slot.n1_brdf_config),
         .nrd_configuration = Rt12NrdConfigurationIdentity(transfer.configuration_generation,
                                                           s.di.configuration_generation,
+                                                          in.effective_settings.identity,
                                                           transfer.nrd.qualification.motion_correction_index),
         .producer_fence_b = di_fence,
         .frame = in.frame,
@@ -2456,7 +2479,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     };
   }
 #endif
-  temporal_ran = history_valid;
+  temporal_ran = history_valid && in.effective_settings.temporal_enabled;
   s.di.last_use_fence = di_fence;
   s.di.history_valid = true;
   s.di.history_frame = in.frame;
@@ -2467,7 +2490,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   s.di.history_owner_generation = s.generation;
   s.di.history_configuration_generation = s.di.configuration_generation;
   s.di.context->SetFrameIndex(s.di.context->GetFrameIndex() + 1u);
-  spatial_ran = true;
+  spatial_ran = in.effective_settings.spatial_enabled;
   spatial_source_index = s.di.frame.parameters.di.bufferIndices.spatialResamplingInputBufferIndex;
   spatial_output_index = s.di.frame.parameters.di.bufferIndices.spatialResamplingOutputBufferIndex;
   return publish(light_count == 0u ? rtxdi::DiStatus::ZeroLights : rtxdi::DiStatus::Submitted, 0, di_fence);

@@ -7,6 +7,24 @@ namespace falcom_world::rtxdi {
 
 inline float g_local_requested = 0.f;
 inline float g_sun_requested = 0.f;
+inline float g_quality_preset = 1.f;
+inline float g_local_candidates = 8.f;
+inline float g_temporal_reuse = 1.f;
+inline float g_spatial_reuse = 1.f;
+inline float g_spatial_samples = 4.f;
+inline float g_spatial_disocclusion = 4.f;
+inline float g_spatial_radius = 4.f;
+inline float g_history_length = 20.f;
+inline float g_temporal_depth_threshold = 0.1f;
+inline float g_temporal_normal_threshold = 0.5f;
+inline float g_spatial_depth_threshold = 0.05f;
+inline float g_spatial_normal_threshold = 0.9f;
+inline float g_diffuse_denoiser = 1.f;
+inline float g_relax_diffuse_history = 30.f;
+inline float g_relax_fast_history = 6.f;
+inline float g_relax_prepass_radius = 30.f;
+inline float g_relax_atrous_iterations = 5.f;
+inline bool g_applying_quality_preset = false;
 inline uint32_t SceneRequestMask() { return (g_local_requested > 0.5f ? 1u : 0u) | (g_sun_requested > 0.5f ? 2u : 0u); }
 inline bool SceneRequested() { return SceneRequestMask() != 0u; }
 
@@ -105,7 +123,15 @@ struct DiSnapshot {
   DiStatus status = DiStatus::Off;
   uint32_t frame = UINT32_MAX;
   uint64_t configuration_generation = 0u;
+  uint64_t settings_identity = 0u;
   uint64_t fence = 0u;
+  uint32_t local_candidates = 0u;
+  uint32_t spatial_samples = 0u;
+  uint32_t spatial_disocclusion = 0u;
+  uint32_t history_length = 0u;
+  bool temporal_enabled = false;
+  bool spatial_enabled = false;
+  bool relax_selected = false;
   int32_t scene_slot = -1;
   int32_t transfer_slot = -1;
   bool spatial_ran = false;

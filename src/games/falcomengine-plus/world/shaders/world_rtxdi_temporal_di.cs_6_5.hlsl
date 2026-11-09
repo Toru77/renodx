@@ -1,5 +1,6 @@
 #define RTXDI_ENABLE_PRESAMPLING 0
 #define RTXDI_LIGHT_RESERVOIR_BUFFER g_rtxdi_reservoirs
+#define RTXDI_ALLOWED_BIAS_CORRECTION RTXDI_BIAS_CORRECTION_BASIC
 #define RT12_TLAS_REGISTER t29
 #define RT12_DYNAMIC_VERTICES_REGISTER t30
 
@@ -8,6 +9,9 @@
 #include "world_rtxdi_surface.hlsli"
 #include "../rtxdi/rtxdi_di_layout.h"
 #include <Rtxdi/DI/ReSTIRDIParameters.h>
+#if RTXDI_ALLOWED_BIAS_CORRECTION < RTXDI_BIAS_CORRECTION_BASIC
+#error Temporal RTXDI must compile BASIC bias correction into the pinned SDK pass.
+#endif
 #include <Rtxdi/DI/Reservoir.hlsli>
 #include <Rtxdi/Utils/RandomSamplerState.hlsli>
 

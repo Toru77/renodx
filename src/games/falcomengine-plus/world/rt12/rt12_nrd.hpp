@@ -132,8 +132,9 @@ inline uint64_t Rt12NrdN1ConfigurationIdentity(uint32_t version, const std::arra
 }
 
 inline uint64_t Rt12NrdConfigurationIdentity(uint64_t transfer_configuration, uint64_t di_configuration,
-                                             uint32_t motion_correction_index) {
+                                             uint64_t settings_identity, uint32_t motion_correction_index) {
   uint64_t identity = (transfer_configuration ^ (di_configuration * 0x9e3779b97f4a7c15ull)
+                       ^ (settings_identity * 0xd6e8feb86659fd93ull)
                        ^ (uint64_t{motion_correction_index} << 32u) ^ 1u)
                       ^ 1469598103934665603ull;
   identity *= 1099511628211ull;
@@ -226,8 +227,8 @@ inline bool Rt12NrdCanContinueHistory(const Rt12NrdHistoryIdentity& previous,
          && previous.frame != UINT64_MAX && current.frame == previous.frame + 1u;
 }
 
-inline bool Rt12NrdSubmissionAllowed(bool rr_owns_denoise) {
-  return !rr_owns_denoise;
+inline bool Rt12NrdSubmissionAllowed(bool rr_requested, bool rr_owns_denoise, bool relax_selected) {
+  return relax_selected && !rr_requested && !rr_owns_denoise;
 }
 
 struct Rt12NrdPipelineSet {

@@ -73,6 +73,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   if (any(dispatch_id.xy >= g_dimensions)) return;
   const uint2 pixel = dispatch_id.xy;
   const uint pixel_index = pixel.y * g_dimensions.x + pixel.x;
+  const bool spatial_enabled = (g_frame_flags & RTXDI_FRAME_FLAG_SPATIAL_ENABLED) != 0u;
   RTXDI_DIReservoir reservoir = RTXDI_EmptyDIReservoir();
   RtxdiDiRawResult raw = (RtxdiDiRawResult)0;
   raw.selected_light_index = 0xffffffffu;
@@ -82,25 +83,28 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
 
   RAB_Surface surface = RAB_GetGBufferSurface(int2(pixel), false);
   if (!RAB_IsSurfaceValid(surface)) {
-    RTXDI_StoreDIReservoir(reservoir, g_di.reservoirBufferParams, pixel, g_di.bufferIndices.spatialResamplingOutputBufferIndex);
+    if (spatial_enabled) RTXDI_StoreDIReservoir(reservoir, g_di.reservoirBufferParams, pixel, g_di.bufferIndices.spatialResamplingOutputBufferIndex);
     g_rtxdi_raw[pixel_index] = raw;
     return;
   }
   if (g_light_count == 0u) {
     raw.reason = RTXDI_DI_REASON_ZERO_LIGHTS;
-    RTXDI_StoreDIReservoir(reservoir, g_di.reservoirBufferParams, pixel, g_di.bufferIndices.spatialResamplingOutputBufferIndex);
+    if (spatial_enabled) RTXDI_StoreDIReservoir(reservoir, g_di.reservoirBufferParams, pixel, g_di.bufferIndices.spatialResamplingOutputBufferIndex);
     g_rtxdi_raw[pixel_index] = raw;
     return;
   }
 
-  RTXDI_DIReservoir center = RTXDI_LoadDIReservoir(g_di.reservoirBufferParams, pixel,
-                                                   g_di.bufferIndices.spatialResamplingInputBufferIndex);
-  RTXDI_RandomSamplerState rng = RTXDI_InitRandomSampler(pixel, g_runtime.frameIndex, 2u);
   RAB_LightSample selected_sample = RAB_EmptyLightSample();
-  reservoir = RTXDI_DISpatialResampling(pixel, surface, center, rng, g_runtime, g_di.reservoirBufferParams,
-                                        g_di.bufferIndices.spatialResamplingInputBufferIndex,
-                                        g_di.spatialResamplingParams, selected_sample);
-  RTXDI_StoreDIReservoir(reservoir, g_di.reservoirBufferParams, pixel, g_di.bufferIndices.spatialResamplingOutputBufferIndex);
+  if (spatial_enabled) {
+    RTXDI_DIReservoir center = RTXDI_LoadDIReservoir(g_di.reservoirBufferParams, pixel,
+                                                     g_di.bufferIndices.spatialResamplingInputBufferIndex);
+    RTXDI_RandomSamplerState rng = RTXDI_InitRandomSampler(pixel, g_runtime.frameIndex, 2u);
+    reservoir = RTXDI_DISpatialResampling(pixel, surface, center, rng, g_runtime, g_di.reservoirBufferParams,
+                                          g_di.bufferIndices.spatialResamplingInputBufferIndex,
+                                          g_di.spatialResamplingParams, selected_sample);
+    RTXDI_StoreDIReservoir(reservoir, g_di.reservoirBufferParams, pixel,
+                           g_di.bufferIndices.spatialResamplingOutputBufferIndex);
+  }
   raw.reason = RTXDI_DI_REASON_INVALID_SAMPLE;
   const RTXDI_DIReservoir final_reservoir = RTXDI_LoadDIReservoir(g_di.reservoirBufferParams, pixel,
                                                                  g_di.bufferIndices.shadingInputBufferIndex);

@@ -215,6 +215,7 @@ struct Rt12RtgiState {
 
 struct Rt12DiResources {
   rtxdi::DiConfig config;
+  uint64_t settings_identity = 0u;
   uint64_t owner_generation = 0u;
   uint64_t configuration_generation = 0u;
   std::unique_ptr<::rtxdi::ReSTIRDIContext> context;
@@ -751,7 +752,8 @@ inline void RetireObject(Rt12State& s, uint64_t fence, const Microsoft::WRL::Com
 }
 
 // Unscheduled resource setup; no command list, fence signal, or scene publication occurs here.
-inline bool EnsureRt12DiResources(Rt12State& s, bool local_requested, uint32_t width, uint32_t height) {
+inline bool EnsureRt12DiResources(Rt12State& s, bool local_requested, uint32_t width, uint32_t height,
+                                  const rtxdi::EffectiveRtxdiSettings& settings) {
   if (!local_requested) return true;
   if (s.failed || s.stuck || s.unfenced_execution || !s.device12) return false;
   rtxdi::DiConfig config;
@@ -759,7 +761,8 @@ inline bool EnsureRt12DiResources(Rt12State& s, bool local_requested, uint32_t w
   const bool present = s.di.context || s.di.reservoirs || s.di.neighbors || s.di.neighbor_srv_heap || s.di.owner_generation != 0u || s.di.last_use_fence != 0u;
   const bool complete = s.di.context && s.di.reservoirs && s.di.neighbors && s.di.neighbor_srv_heap;
   const auto action = rtxdi::SelectDiResourceAction(local_requested, s.generation,
-                                                    {.config = s.di.config, .owner_generation = s.di.owner_generation, .configuration_generation = s.di.configuration_generation, .present = present, .complete = complete}, config);
+                                                    {.config = s.di.config, .owner_generation = s.di.owner_generation, .configuration_generation = s.di.configuration_generation, .settings_identity = s.di.settings_identity, .present = present, .complete = complete}, config,
+                                                    settings.identity);
   if (action == rtxdi::DiResourceAction::OwnerMismatch) return false;
   if (action == rtxdi::DiResourceAction::Reuse) return true;
   uint64_t next_generation = 0u;
@@ -767,7 +770,8 @@ inline bool EnsureRt12DiResources(Rt12State& s, bool local_requested, uint32_t w
   try {
     Rt12DiResources candidate;
     candidate.config = config;
-    candidate.context = rtxdi::CreateDiContext(config);
+    candidate.settings_identity = settings.identity;
+    candidate.context = rtxdi::CreateDiContext(config, settings);
     if (!candidate.context) return false;
     const auto sdk_pitch = candidate.context->GetReservoirBufferParameters();
     if (sdk_pitch.reservoirBlockRowPitch != config.row_pitch || sdk_pitch.reservoirArrayPitch != config.array_pitch) return false;

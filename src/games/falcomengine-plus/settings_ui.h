@@ -51,6 +51,7 @@ static const std::unordered_map<std::string_view, std::string_view> kSectionCate
     {"Shadow Maps", "Shadows"},
     {"Shadows", "Shadows"},
     {"Contact Shadows", "Shadows"},
+    {"RTXDI", "Shadows"},
     {"GTVBAO", "Ambient Occlusion"},
     {"GTVBAO Temporal Accumulation", "Ambient Occlusion"},
     {"GTVBAO Spatial Filter", "Ambient Occlusion"},
@@ -110,10 +111,10 @@ enum class FeatureCost : uint8_t {
 static const char* CostName(FeatureCost cost) {
   switch (cost) {
     case FeatureCost::Faster: return "Faster";
-    case FeatureCost::None: return "None";
-    case FeatureCost::Low: return "Low";
+    case FeatureCost::None:   return "None";
+    case FeatureCost::Low:    return "Low";
     case FeatureCost::Medium: return "Medium";
-    case FeatureCost::High: return "High";
+    case FeatureCost::High:   return "High";
   }
   return "None";
 }

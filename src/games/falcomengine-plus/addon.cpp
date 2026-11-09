@@ -12139,7 +12139,7 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
         && di::GetTextureViewExtent(held_views[kLightingDepthRegister].Get(), &input_width, &input_height)) {
       const bool motion_ready = (request_mask & 1u) != 0u && UpdateRtMotion(dev, dd, true)
                                 && dd->mb_rtv4_frame == dd->frame_index;
-      input_views = {.depth = dd->captured_depth_srv, .normal = dd->captured_mrt_normal_srv, .color = (dd->captured_color_live.load() && dd->captured_color_frame == dd->frame_index && view(0u).handle == dd->captured_color_srv.handle ? dd->captured_color_srv : reshade::api::resource_view{}), .mrt1 = view(falcom_world::rtgi::kLightingMrt1Register), .mrt2 = view(falcom_world::rtgi::kLightingMrt2Register), .motion = motion_ready ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{}, .lights = view(falcom_world::rtgi::kLightingLightsRegister), .tiles = view(falcom_world::rtgi::kLightingLightIndicesRegister), .deferred = view(falcom_world::rtgi::kLightingDeferredRegister), .scene_tracker = &dd->rtxdi_scene_range, .capture_frame = dd->frame_index, .frame = frame, .width = input_width, .height = input_height, .n1_brdf_config = {shader_injection.brdf_hammon_diffuse_enabled, shader_injection.brdf_diffuse_strength, shader_injection.brdf_multiscatter_specular_enabled, shader_injection.brdf_specular_strength, shader_injection.brdf_specular_peak_clamp, shader_injection.brdf_roughness_min, shader_injection.brdf_roughness_max}, .scene_slot = result.slot, .scene_fence = result.fence_b, .local = (request_mask & 1u) != 0u, .sun = falcom_world::rtxdi::SunVisibilityRequested(request_mask)};
+      input_views = {.depth = dd->captured_depth_srv, .normal = dd->captured_mrt_normal_srv, .color = (dd->captured_color_live.load() && dd->captured_color_frame == dd->frame_index && view(0u).handle == dd->captured_color_srv.handle ? dd->captured_color_srv : reshade::api::resource_view{}), .mrt1 = view(falcom_world::rtgi::kLightingMrt1Register), .mrt2 = view(falcom_world::rtgi::kLightingMrt2Register), .motion = motion_ready ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{}, .lights = view(falcom_world::rtgi::kLightingLightsRegister), .tiles = view(falcom_world::rtgi::kLightingLightIndicesRegister), .deferred = view(falcom_world::rtgi::kLightingDeferredRegister), .scene_tracker = &dd->rtxdi_scene_range, .capture_frame = dd->frame_index, .frame = frame, .width = input_width, .height = input_height, .n1_brdf_config = {shader_injection.brdf_hammon_diffuse_enabled, shader_injection.brdf_diffuse_strength, shader_injection.brdf_multiscatter_specular_enabled, shader_injection.brdf_specular_strength, shader_injection.brdf_specular_peak_clamp, shader_injection.brdf_roughness_min, shader_injection.brdf_roughness_max}, .effective_settings = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings(), .scene_slot = result.slot, .scene_fence = result.fence_b, .local = (request_mask & 1u) != 0u, .sun = falcom_world::rtxdi::SunVisibilityRequested(request_mask)};
       input_result = rt12::TransferRtxdiInputs(dev, cmd_list, input_views);
     }
     {
@@ -12340,7 +12340,9 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
                                reshade::api::descriptor_table_update{{}, 41u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
   }
 #if defined(FALCOM_NRD_ENABLED)
-  if (still_current && output.nrd_diffuse_staged && !rr::RrOwnsDenoise()) {
+  const auto effective_rtxdi_settings = di::CaptureEffectiveRtxdiSettings();
+  if (still_current && output.nrd_diffuse_staged && !rr::RrRequested() && !rr::RrOwnsDenoise()
+      && effective_rtxdi_settings.relax_diffuse) {
     const std::array<float, 7u> n1_brdf_config = {
         shader_injection.brdf_hammon_diffuse_enabled, shader_injection.brdf_diffuse_strength,
         shader_injection.brdf_multiscatter_specular_enabled, shader_injection.brdf_specular_strength,
@@ -12348,7 +12350,7 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
         shader_injection.brdf_roughness_max};
     const uint64_t n1_identity = rt12::Rt12NrdN1ConfigurationIdentity(RTXDI_N1_CONFIG_VERSION, n1_brdf_config);
     const uint64_t nrd_identity = rt12::Rt12NrdConfigurationIdentity(
-        state.di_transfer.configuration_generation, state.di.configuration_generation,
+        state.di_transfer.configuration_generation, state.di.configuration_generation, effective_rtxdi_settings.identity,
         state.di_transfer.nrd.qualification.motion_correction_index);
     const auto& identity = slot.nrd_diffuse_identity;
     if (input.width == dd->captured_depth_w && input.height == dd->captured_depth_h

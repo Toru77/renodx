@@ -461,38 +461,40 @@ int main() {
   using falcom_world::rtxdi::DiResourceAction;
   using falcom_world::rtxdi::DiResourceIdentity;
   using falcom_world::rtxdi::SelectDiResourceAction;
-  const DiResourceIdentity installed = {.config = config, .owner_generation = 4u, .configuration_generation = 7u, .present = true, .complete = true};
-  if (SelectDiResourceAction(false, 4u, {}, config) != DiResourceAction::Skip
-      || SelectDiResourceAction(true, 4u, {}, config) != DiResourceAction::Create
-      || SelectDiResourceAction(true, 4u, installed, config) != DiResourceAction::Reuse
-      || SelectDiResourceAction(true, 5u, installed, config) != DiResourceAction::OwnerMismatch
-      || SelectDiResourceAction(true, 0u, installed, config) != DiResourceAction::OwnerMismatch) return EXIT_FAILURE;
+  const auto balanced_settings = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings();
+  const DiResourceIdentity installed = {.config = config, .owner_generation = 4u, .configuration_generation = 7u, .settings_identity = balanced_settings.identity, .present = true, .complete = true};
+  if (SelectDiResourceAction(false, 4u, {}, config, balanced_settings.identity) != DiResourceAction::Skip
+      || SelectDiResourceAction(true, 4u, {}, config, balanced_settings.identity) != DiResourceAction::Create
+      || SelectDiResourceAction(true, 4u, installed, config, balanced_settings.identity) != DiResourceAction::Reuse
+      || SelectDiResourceAction(true, 4u, installed, config, balanced_settings.identity + 1u) != DiResourceAction::Create
+      || SelectDiResourceAction(true, 5u, installed, config, balanced_settings.identity) != DiResourceAction::OwnerMismatch
+      || SelectDiResourceAction(true, 0u, installed, config, balanced_settings.identity) != DiResourceAction::OwnerMismatch) return EXIT_FAILURE;
   auto resize_request = config;
   resize_request.width = 1920u;
-  if (SelectDiResourceAction(true, 4u, installed, resize_request) != DiResourceAction::Create) return EXIT_FAILURE;
+  if (SelectDiResourceAction(true, 4u, installed, resize_request, balanced_settings.identity) != DiResourceAction::Create) return EXIT_FAILURE;
   auto incomplete = installed;
   incomplete.complete = false;
-  if (SelectDiResourceAction(true, 4u, incomplete, config) != DiResourceAction::Create
-      || SelectDiResourceAction(true, 5u, incomplete, config) != DiResourceAction::OwnerMismatch) return EXIT_FAILURE;
+  if (SelectDiResourceAction(true, 4u, incomplete, config, balanced_settings.identity) != DiResourceAction::Create
+      || SelectDiResourceAction(true, 5u, incomplete, config, balanced_settings.identity) != DiResourceAction::OwnerMismatch) return EXIT_FAILURE;
   auto uncommitted = installed;
   for (int i = 0; i < 2; ++i) {
-    if (SelectDiResourceAction(true, 4u, uncommitted, resize_request) != DiResourceAction::Create
+    if (SelectDiResourceAction(true, 4u, uncommitted, resize_request, balanced_settings.identity) != DiResourceAction::Create
         || uncommitted.owner_generation != 4u || uncommitted.configuration_generation != 7u) return EXIT_FAILURE;
   }
   uncommitted.configuration_generation = 0u;
-  if (SelectDiResourceAction(true, 4u, uncommitted, config) != DiResourceAction::Create) return EXIT_FAILURE;
+  if (SelectDiResourceAction(true, 4u, uncommitted, config, balanced_settings.identity) != DiResourceAction::Create) return EXIT_FAILURE;
   uint64_t next_generation = 0u;
   if (!falcom_world::rtxdi::NextDiConfigurationGeneration(installed.configuration_generation, &next_generation)
       || next_generation != 8u || installed.owner_generation != 4u || installed.configuration_generation != 7u
       || falcom_world::rtxdi::NextDiConfigurationGeneration(UINT64_MAX, &next_generation)) return EXIT_FAILURE;
-  auto context = falcom_world::rtxdi::CreateDiContext(config);
+  auto context = falcom_world::rtxdi::CreateDiContext(config, balanced_settings);
   if (!context || context->GetStaticParameters().CheckerboardSamplingMode != rtxdi::CheckerboardMode::Off
       || context->GetResamplingMode() != rtxdi::ReSTIRDI_ResamplingMode::TemporalAndSpatial
       || context->GetFrameIndex() != 0u) return EXIT_FAILURE;
   if (!falcom_world::rtxdi::ValidTemporalSpatialBufferIndices(context->GetBufferIndices())) return EXIT_FAILURE;
   const auto parameters = falcom_world::rtxdi::MakeDiFrameParameters(config, *context);
   if (parameters.width != 1280u || parameters.height != 720u || parameters.history_valid != 0u
-      || parameters.flags != RTXDI_FRAME_FLAG_SPATIAL_AFTER_INITIAL
+      || parameters.flags != (RTXDI_FRAME_FLAG_SPATIAL_AFTER_INITIAL | RTXDI_FRAME_FLAG_SPATIAL_ENABLED)
       || parameters.di.initialSamplingParams.numLocalLightSamples != 8u || parameters.di.initialSamplingParams.numInfiniteLightSamples != 0u
       || parameters.di.initialSamplingParams.numEnvironmentSamples != 0u || parameters.di.initialSamplingParams.numBrdfSamples != 0u
       || parameters.di.initialSamplingParams.environmentMapImportanceSampling != 0u || !parameters.di.shadingParams.enableFinalVisibility
@@ -513,6 +515,65 @@ int main() {
       || parameters.di.shadingParams.pad1 || parameters.di.shadingParams.pad2 || parameters.di.shadingParams.pad3
       || parameters.lights.localLightBufferRegion.numLights || parameters.lights.infiniteLightBufferRegion.numLights
       || parameters.lights.environmentLightParams.lightPresent) return EXIT_FAILURE;
+  const float saved_preset = falcom_world::rtxdi::g_quality_preset;
+  const float saved_candidates = falcom_world::rtxdi::g_local_candidates;
+  const float saved_spatial_samples = falcom_world::rtxdi::g_spatial_samples;
+  const float saved_spatial_disocclusion = falcom_world::rtxdi::g_spatial_disocclusion;
+  falcom_world::rtxdi::g_quality_preset = 0.f;
+  auto performance = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings();
+  falcom_world::rtxdi::g_quality_preset = 2.f;
+  auto quality = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings();
+  falcom_world::rtxdi::g_quality_preset = 3.f;
+  falcom_world::rtxdi::g_local_candidates = 900.f;
+  falcom_world::rtxdi::g_spatial_samples = std::numeric_limits<float>::quiet_NaN();
+  falcom_world::rtxdi::g_spatial_disocclusion = -3.f;
+  const auto custom = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings();
+  falcom_world::rtxdi::g_quality_preset = saved_preset;
+  falcom_world::rtxdi::g_local_candidates = saved_candidates;
+  falcom_world::rtxdi::g_spatial_samples = saved_spatial_samples;
+  falcom_world::rtxdi::g_spatial_disocclusion = saved_spatial_disocclusion;
+  if (performance.quality_preset != 0u || performance.local_candidates != 4u || performance.spatial_samples != 2u
+      || performance.spatial_disocclusion != 2u || balanced_settings.quality_preset != 1u
+      || balanced_settings.local_candidates != 8u || balanced_settings.spatial_samples != 4u
+      || balanced_settings.spatial_disocclusion != 4u || quality.local_candidates != 16u || quality.spatial_samples != 8u
+      || quality.spatial_disocclusion != 8u || custom.local_candidates != 32u || custom.spatial_samples != 4u
+      || custom.spatial_disocclusion != 1u || custom.identity == balanced_settings.identity) return EXIT_FAILURE;
+  for (uint32_t mode = 0u; mode < 4u; ++mode) {
+    auto mode_settings = balanced_settings;
+    mode_settings.temporal_enabled = (mode & 1u) != 0u;
+    mode_settings.spatial_enabled = (mode & 2u) != 0u;
+    const auto mode_context = falcom_world::rtxdi::CreateDiContext(config, mode_settings);
+    if (!mode_context) return EXIT_FAILURE;
+    auto* rotating_context = mode_context.get();
+    uint32_t prior_output = rotating_context->GetBufferIndices().temporalResamplingInputBufferIndex;
+    for (uint32_t frame = 0u; frame < 6u; ++frame) {
+      const auto indices = rotating_context->GetBufferIndices();
+      const uint32_t expected_initial = (prior_output + 1u) % rtxdi::c_NumReSTIRDIReservoirBuffers;
+      const uint32_t expected_spatial_output = (expected_initial + 1u) % rtxdi::c_NumReSTIRDIReservoirBuffers;
+      const bool temporal_enabled = mode_settings.temporal_enabled;
+      const bool spatial_enabled = mode_settings.spatial_enabled;
+      if (!falcom_world::rtxdi::ValidDiBufferIndices(indices, mode_settings)
+          || indices.initialSamplingOutputBufferIndex != expected_initial
+          || indices.temporalResamplingInputBufferIndex != prior_output
+          || indices.temporalResamplingOutputBufferIndex != expected_initial
+          || indices.spatialResamplingInputBufferIndex != expected_initial
+          || indices.spatialResamplingOutputBufferIndex != expected_spatial_output
+          || indices.shadingInputBufferIndex != (spatial_enabled ? expected_spatial_output : expected_initial)
+          || (temporal_enabled && indices.temporalResamplingInputBufferIndex == expected_initial)
+          || (spatial_enabled && indices.spatialResamplingOutputBufferIndex == expected_initial)) {
+        std::fprintf(stderr,
+                     "FAIL mode rotation mode=%u frame=%u indices init=%u temporal=%u/%u spatial=%u/%u shade=%u expected=%u/%u prior=%u valid=%u\n",
+                     mode, frame, indices.initialSamplingOutputBufferIndex,
+                     indices.temporalResamplingInputBufferIndex, indices.temporalResamplingOutputBufferIndex,
+                     indices.spatialResamplingInputBufferIndex, indices.spatialResamplingOutputBufferIndex,
+                     indices.shadingInputBufferIndex, expected_initial, expected_spatial_output, prior_output,
+                     static_cast<unsigned>(falcom_world::rtxdi::ValidDiBufferIndices(indices, mode_settings)));
+        return EXIT_FAILURE;
+      }
+      prior_output = indices.shadingInputBufferIndex;
+      rotating_context->SetFrameIndex(rotating_context->GetFrameIndex() + 1u);
+    }
+  }
   RtxdiFrameUpload upload = {};
   upload.parameters = parameters;
   for (const auto byte : upload.padding)
@@ -520,7 +581,7 @@ int main() {
   falcom_world::rtxdi::DiConfig resized;
   if (!falcom_world::rtxdi::CalculateDiConfig(17u, 33u, &resized)
       || resized.array_pitch != 1536u || resized.reservoir_bytes != 110592u
-      || falcom_world::rtxdi::CreateDiContext({}) != nullptr) return EXIT_FAILURE;
+      || falcom_world::rtxdi::CreateDiContext({}, balanced_settings) != nullptr) return EXIT_FAILURE;
   using falcom_world::rtxdi::MakeInputLayout;
   using falcom_world::rtxdi::TextureInputExtent;
   using falcom_world::rtxdi::ValidSceneInputRange;

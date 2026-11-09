@@ -1315,7 +1315,8 @@ int RunRtxdiDxrBridge() {
   di_frame.parameters.di.reservoirBufferParams.reservoirArrayPitch = 256u;
   falcom_world::rtxdi::DiConfig bridge_di_config;
   if (!falcom_world::rtxdi::CalculateDiConfig(3u, 2u, &bridge_di_config)) return 1;
-  auto bridge_di_context = falcom_world::rtxdi::CreateDiContext(bridge_di_config);
+  const auto bridge_settings = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings();
+  auto bridge_di_context = falcom_world::rtxdi::CreateDiContext(bridge_di_config, bridge_settings);
   if (!bridge_di_context) return 1;
   di_frame.parameters = falcom_world::rtxdi::MakeDiFrameParameters(bridge_di_config, *bridge_di_context);
   di_frame.parameters.width = 3u;
@@ -1584,6 +1585,7 @@ int RunRtxdiDxrBridge() {
 
   ID3D12DescriptorHeap* di_heaps[] = {di_heap.Get()};
   std::vector<RTXDI_PackedDIReservoir> prior_spatial_output;
+  std::vector<RTXDI_PackedDIReservoir> prior_reservoir_state;
   UINT prior_spatial_output_index = UINT_MAX;
   UINT baseline_initial_m = 0u;
   bool suppress_di_pass = false;
@@ -1608,13 +1610,26 @@ int RunRtxdiDxrBridge() {
                     bool expect_temporal_merge = false, bool temporal_history_valid = true,
                     bool expect_zero_diffuse = false, float* pixel_zero_target_pdf = nullptr,
                     UINT* pixel_zero_sample_count = nullptr, float* pixel_zero_reservoir_weight = nullptr,
-                    float* pixel_zero_raw_radiance = nullptr, float* pixel_zero_inverse_pdf = nullptr) {
+                    float* pixel_zero_raw_radiance = nullptr, float* pixel_zero_inverse_pdf = nullptr,
+                    bool check_unwritten_arrays = false) {
     if (mask_index >= tlases.size() || local_lights > 4u) return false;
     wait_context = label;
     wait_has_di_dispatch = true;
-    di_frame.parameters.flags = spatial ? RTXDI_FRAME_FLAG_SPATIAL_AFTER_INITIAL : 0u;
+    bridge_di_context->SetResamplingMode(temporal && spatial ? ::rtxdi::ReSTIRDI_ResamplingMode::TemporalAndSpatial
+                                         : temporal          ? ::rtxdi::ReSTIRDI_ResamplingMode::Temporal
+                                         : spatial           ? ::rtxdi::ReSTIRDI_ResamplingMode::Spatial
+                                                             : ::rtxdi::ReSTIRDI_ResamplingMode::None);
+    di_frame.parameters = falcom_world::rtxdi::MakeDiFrameParameters(bridge_di_config, *bridge_di_context);
+    di_frame.parameters.width = 3u;
+    di_frame.parameters.height = 2u;
+    di_frame.parameters.flags = RTXDI_FRAME_FLAG_SPATIAL_AFTER_INITIAL
+                                | (spatial ? RTXDI_FRAME_FLAG_SPATIAL_ENABLED : 0u);
     di_frame.parameters.history_valid = temporal && temporal_history_valid ? 1u : 0u;
     di_frame.parameters.di.bufferIndices = bridge_di_context->GetBufferIndices();
+    auto effective = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings();
+    effective.temporal_enabled = temporal;
+    effective.spatial_enabled = spatial;
+    if (!falcom_world::rtxdi::ValidDiBufferIndices(di_frame.parameters.di.bufferIndices, effective)) return false;
     if (!update_upload(frame_upload.Get(), &di_frame, sizeof(di_frame))) return false;
     tlas_srv.RaytracingAccelerationStructure.Location = tlases[mask_index]->GetGPUVirtualAddress();
     device->CreateShaderResourceView(nullptr, &tlas_srv, di_cpu_at(13u));
@@ -1672,6 +1687,10 @@ int RunRtxdiDxrBridge() {
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     barrier.Transition.pResource = di_types.Get();
     list->ResourceBarrier(1u, &barrier);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.pResource = di_resolved.Get();
+    list->ResourceBarrier(1u, &barrier);
     list->SetComputeRootSignature(di_root.Get());
     list->SetPipelineState(di_pso.Get());
     const UINT params[17] = {3u, 2u, 1u, coverage_valid ? 1u : 0u, local_lights,
@@ -1683,64 +1702,56 @@ int RunRtxdiDxrBridge() {
     list->SetComputeRootConstantBufferView(1u, frame_upload->GetGPUVirtualAddress());
     list->SetComputeRootDescriptorTable(2u, di_heap->GetGPUDescriptorHandleForHeapStart());
     list->Dispatch(1u, 1u, 1u);
-    if (spatial || temporal) {
-      barrier.Transition.pResource = di_resolved.Get();
-      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-      if (spatial) list->ResourceBarrier(1u, &barrier);
-      D3D12_RESOURCE_BARRIER reservoir_uav = {};
-      reservoir_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-      reservoir_uav.UAV.pResource = di_reservoirs.Get();
+    D3D12_RESOURCE_BARRIER reservoir_uav = {};
+    reservoir_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    reservoir_uav.UAV.pResource = di_reservoirs.Get();
+    list->ResourceBarrier(1u, &reservoir_uav);
+    if (temporal) {
+      list->SetPipelineState(di_temporal_pso.Get());
+      list->Dispatch(1u, 1u, 1u);
       list->ResourceBarrier(1u, &reservoir_uav);
-      if (temporal) {
-        list->SetPipelineState(di_temporal_pso.Get());
-        list->Dispatch(1u, 1u, 1u);
-        list->ResourceBarrier(1u, &reservoir_uav);
-      }
-      if (spatial) {
-        list->SetPipelineState(di_spatial_pso.Get());
-        list->Dispatch(1u, 1u, 1u);
-        D3D12_RESOURCE_BARRIER spatial_uav_barriers[2] = {};
-        spatial_uav_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        spatial_uav_barriers[0].UAV.pResource = di_resolved.Get();
-        spatial_uav_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        spatial_uav_barriers[1].UAV.pResource = di_raw.Get();
-        list->ResourceBarrier(2u, spatial_uav_barriers);
-
-        D3D12_RESOURCE_BARRIER n1_transitions[3] = {};
-        const auto set_n1_transition = [&](UINT index, ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
-                                           D3D12_RESOURCE_STATES after) {
-          n1_transitions[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-          n1_transitions[index].Transition.pResource = resource;
-          n1_transitions[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-          n1_transitions[index].Transition.StateBefore = before;
-          n1_transitions[index].Transition.StateAfter = after;
-        };
-        set_n1_transition(0u, n1_diffuse.Get(), D3D12_RESOURCE_STATE_COMMON,
-                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        set_n1_transition(1u, n1_specular.Get(), D3D12_RESOURCE_STATE_COMMON,
-                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        set_n1_transition(2u, n1_status.Get(), D3D12_RESOURCE_STATE_COMMON,
-                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        list->ResourceBarrier(3u, n1_transitions);
-        list->SetPipelineState(n1_reconstruct_pso.Get());
-        const UINT n1_params[8] = {RTXDI_N1_CONFIG_VERSION,
-                                   std::bit_cast<UINT>(n1_test_config[0]), std::bit_cast<UINT>(n1_test_config[1]),
-                                   std::bit_cast<UINT>(n1_test_config[2]), std::bit_cast<UINT>(n1_test_config[3]),
-                                   std::bit_cast<UINT>(n1_test_config[4]), std::bit_cast<UINT>(n1_test_config[5]),
-                                   std::bit_cast<UINT>(n1_test_config[6])};
-        list->SetComputeRoot32BitConstants(3u, 8u, n1_params, 0u);
-        list->Dispatch(1u, 1u, 1u);
-        D3D12_RESOURCE_BARRIER n1_uav_barriers[3] = {};
-        n1_uav_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        n1_uav_barriers[0].UAV.pResource = n1_diffuse.Get();
-        n1_uav_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        n1_uav_barriers[1].UAV.pResource = n1_specular.Get();
-        n1_uav_barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        n1_uav_barriers[2].UAV.pResource = n1_status.Get();
-        list->ResourceBarrier(3u, n1_uav_barriers);
-      }
     }
+    list->SetPipelineState(di_spatial_pso.Get());
+    list->Dispatch(1u, 1u, 1u);
+    D3D12_RESOURCE_BARRIER spatial_uav_barriers[2] = {};
+    spatial_uav_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    spatial_uav_barriers[0].UAV.pResource = di_resolved.Get();
+    spatial_uav_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    spatial_uav_barriers[1].UAV.pResource = di_raw.Get();
+    list->ResourceBarrier(2u, spatial_uav_barriers);
+
+    D3D12_RESOURCE_BARRIER n1_transitions[3] = {};
+    const auto set_n1_transition = [&](UINT index, ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
+                                       D3D12_RESOURCE_STATES after) {
+      n1_transitions[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      n1_transitions[index].Transition.pResource = resource;
+      n1_transitions[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      n1_transitions[index].Transition.StateBefore = before;
+      n1_transitions[index].Transition.StateAfter = after;
+    };
+    set_n1_transition(0u, n1_diffuse.Get(), D3D12_RESOURCE_STATE_COMMON,
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    set_n1_transition(1u, n1_specular.Get(), D3D12_RESOURCE_STATE_COMMON,
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    set_n1_transition(2u, n1_status.Get(), D3D12_RESOURCE_STATE_COMMON,
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->ResourceBarrier(3u, n1_transitions);
+    list->SetPipelineState(n1_reconstruct_pso.Get());
+    const UINT n1_params[8] = {RTXDI_N1_CONFIG_VERSION,
+                               std::bit_cast<UINT>(n1_test_config[0]), std::bit_cast<UINT>(n1_test_config[1]),
+                               std::bit_cast<UINT>(n1_test_config[2]), std::bit_cast<UINT>(n1_test_config[3]),
+                               std::bit_cast<UINT>(n1_test_config[4]), std::bit_cast<UINT>(n1_test_config[5]),
+                               std::bit_cast<UINT>(n1_test_config[6])};
+    list->SetComputeRoot32BitConstants(3u, 8u, n1_params, 0u);
+    list->Dispatch(1u, 1u, 1u);
+    D3D12_RESOURCE_BARRIER n1_uav_barriers[3] = {};
+    n1_uav_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    n1_uav_barriers[0].UAV.pResource = n1_diffuse.Get();
+    n1_uav_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    n1_uav_barriers[1].UAV.pResource = n1_specular.Get();
+    n1_uav_barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    n1_uav_barriers[2].UAV.pResource = n1_status.Get();
+    list->ResourceBarrier(3u, n1_uav_barriers);
     D3D12_RESOURCE_BARRIER barriers[5] = {};
     barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barriers[0].UAV.pResource = di_reservoirs.Get();
@@ -1763,47 +1774,45 @@ int RunRtxdiDxrBridge() {
     list->CopyBufferRegion(di_type_readback.Get(), 0u, di_types.Get(), 0u, sizeof(uint32_t) * lights.size());
     list->CopyBufferRegion(di_reservoir_readback.Get(), 0u, di_reservoirs.Get(), 0u, di_reservoir_bytes);
     list->CopyBufferRegion(di_raw_readback.Get(), 0u, di_raw.Get(), 0u, di_raw_bytes);
-    if (spatial) {
-      transition(3u, di_resolved.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-      list->ResourceBarrier(1u, &barriers[3]);
-      D3D12_TEXTURE_COPY_LOCATION resolved_source = {};
-      resolved_source.pResource = di_resolved.Get();
-      resolved_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-      D3D12_TEXTURE_COPY_LOCATION resolved_destination = {};
-      resolved_destination.pResource = di_resolved_readback.Get();
-      resolved_destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-      resolved_destination.PlacedFootprint = resolved_footprint;
-      list->CopyTextureRegion(&resolved_destination, 0u, 0u, 0u, &resolved_source, nullptr);
-      transition(3u, di_resolved.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-      list->ResourceBarrier(1u, &barriers[3]);
+    transition(3u, di_resolved.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1u, &barriers[3]);
+    D3D12_TEXTURE_COPY_LOCATION resolved_source = {};
+    resolved_source.pResource = di_resolved.Get();
+    resolved_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION resolved_destination = {};
+    resolved_destination.pResource = di_resolved_readback.Get();
+    resolved_destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    resolved_destination.PlacedFootprint = resolved_footprint;
+    list->CopyTextureRegion(&resolved_destination, 0u, 0u, 0u, &resolved_source, nullptr);
+    transition(3u, di_resolved.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    list->ResourceBarrier(1u, &barriers[3]);
 
-      transition(3u, n1_diffuse.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-      transition(4u, n1_specular.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-      list->ResourceBarrier(2u, &barriers[3]);
-      D3D12_TEXTURE_COPY_LOCATION n1_source = {};
-      n1_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-      D3D12_TEXTURE_COPY_LOCATION n1_destination = {};
-      n1_destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-      n1_source.pResource = n1_diffuse.Get();
-      n1_destination.pResource = n1_diffuse_readback.Get();
-      n1_destination.PlacedFootprint = n1_diffuse_footprint;
-      list->CopyTextureRegion(&n1_destination, 0u, 0u, 0u, &n1_source, nullptr);
-      n1_source.pResource = n1_specular.Get();
-      n1_destination.pResource = n1_specular_readback.Get();
-      n1_destination.PlacedFootprint = n1_specular_footprint;
-      list->CopyTextureRegion(&n1_destination, 0u, 0u, 0u, &n1_source, nullptr);
-      transition(3u, n1_status.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-      list->ResourceBarrier(1u, &barriers[3]);
-      n1_source.pResource = n1_status.Get();
-      n1_destination.pResource = n1_status_readback.Get();
-      n1_destination.PlacedFootprint = n1_status_footprint;
-      list->CopyTextureRegion(&n1_destination, 0u, 0u, 0u, &n1_source, nullptr);
-      transition(3u, n1_diffuse.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-      transition(4u, n1_specular.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-      list->ResourceBarrier(2u, &barriers[3]);
-      transition(3u, n1_status.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-      list->ResourceBarrier(1u, &barriers[3]);
-    }
+    transition(3u, n1_diffuse.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transition(4u, n1_specular.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(2u, &barriers[3]);
+    D3D12_TEXTURE_COPY_LOCATION n1_source = {};
+    n1_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION n1_destination = {};
+    n1_destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    n1_source.pResource = n1_diffuse.Get();
+    n1_destination.pResource = n1_diffuse_readback.Get();
+    n1_destination.PlacedFootprint = n1_diffuse_footprint;
+    list->CopyTextureRegion(&n1_destination, 0u, 0u, 0u, &n1_source, nullptr);
+    n1_source.pResource = n1_specular.Get();
+    n1_destination.pResource = n1_specular_readback.Get();
+    n1_destination.PlacedFootprint = n1_specular_footprint;
+    list->CopyTextureRegion(&n1_destination, 0u, 0u, 0u, &n1_source, nullptr);
+    transition(3u, n1_status.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1u, &barriers[3]);
+    n1_source.pResource = n1_status.Get();
+    n1_destination.pResource = n1_status_readback.Get();
+    n1_destination.PlacedFootprint = n1_status_footprint;
+    list->CopyTextureRegion(&n1_destination, 0u, 0u, 0u, &n1_source, nullptr);
+    transition(3u, n1_diffuse.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    transition(4u, n1_specular.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    list->ResourceBarrier(2u, &barriers[3]);
+    transition(3u, n1_status.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    list->ResourceBarrier(1u, &barriers[3]);
     transition(0u, di_types.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     transition(1u, di_reservoirs.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     transition(2u, di_raw.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -1834,15 +1843,16 @@ int RunRtxdiDxrBridge() {
     if (!Check(di_type_readback->Map(0u, nullptr, &types_mapped), "map local types")
         || !Check(di_reservoir_readback->Map(0u, nullptr, &reservoirs_mapped), "map local reservoirs")
         || !Check(di_raw_readback->Map(0u, nullptr, &raw_mapped), "map local raw result")) return false;
-    if (spatial && (!Check(di_resolved_readback->Map(0u, nullptr, &resolved_mapped), "map local resolved output") || !Check(n1_diffuse_readback->Map(0u, nullptr, &n1_diffuse_mapped), "map N1 diffuse") || !Check(n1_specular_readback->Map(0u, nullptr, &n1_specular_mapped), "map N1 specular") || !Check(n1_status_readback->Map(0u, nullptr, &n1_status_mapped), "map N1 status"))) return false;
+    if (!Check(di_resolved_readback->Map(0u, nullptr, &resolved_mapped), "map local resolved output")
+        || !Check(n1_diffuse_readback->Map(0u, nullptr, &n1_diffuse_mapped), "map N1 diffuse")
+        || !Check(n1_specular_readback->Map(0u, nullptr, &n1_specular_mapped), "map N1 specular")
+        || !Check(n1_status_readback->Map(0u, nullptr, &n1_status_mapped), "map N1 status")) return false;
     std::array<uint32_t, 4> read_types = {};
     std::memcpy(read_types.data(), types_mapped, sizeof(read_types));
     const auto* reservoirs = static_cast<const RTXDI_PackedDIReservoir*>(reservoirs_mapped);
     const auto* raw = static_cast<const RtxdiDiRawResult*>(raw_mapped);
     const auto* resolved = static_cast<const uint32_t*>(resolved_mapped);
-    const UINT result_index = spatial    ? di_frame.parameters.di.bufferIndices.spatialResamplingOutputBufferIndex
-                              : temporal ? di_frame.parameters.di.bufferIndices.temporalResamplingOutputBufferIndex
-                                         : di_frame.parameters.di.bufferIndices.initialSamplingOutputBufferIndex;
+    const UINT result_index = di_frame.parameters.di.bufferIndices.shadingInputBufferIndex;
     if (pixel_zero_target_pdf != nullptr) {
       *pixel_zero_target_pdf = reservoirs[result_index * di_array_pitch].targetPdf;
     }
@@ -1863,7 +1873,7 @@ int RunRtxdiDxrBridge() {
     for (UINT y = 0; y < 2u; ++y) {
       for (UINT x = 0; x < 3u; ++x) {
         const UINT pixel = y * 3u + x;
-        if (spatial) {
+        {
           const auto* status_row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(n1_status_mapped)
                                                                      + y * n1_status_footprint.Footprint.RowPitch);
           const auto* diffuse_row = reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(n1_diffuse_mapped)
@@ -1915,8 +1925,10 @@ int RunRtxdiDxrBridge() {
                   && ((diffuse_row[x * 4u + 3u] != 0u) != any_n1_rgb
                       || (n1_character && specular_row[x * 4u + 3u] != 0u)
                       || (!any_n1_rgb && specular_row[x * 4u + 3u] != 0u)))) {
-            std::fprintf(stderr, "FAIL %s N1 pixel=%u raw=%u/%u status=%u expected=%u diffuseA=%u specA=%u\n", label,
-                         pixel, raw[pixel].status, raw[pixel].reason, status_row[x], expected_n1_mask,
+            std::fprintf(stderr, "FAIL %s N1 pixel=%u raw=%u/%u idx=%u type=%u inv=%g flags=%u status=%u expected=%u diffuseA=%u specA=%u\n", label,
+                         pixel, raw[pixel].status, raw[pixel].reason, raw[pixel].selected_light_index,
+                         raw[pixel].selected_light_type, raw[pixel].inverse_pdf, raw[pixel].flags,
+                         status_row[x], expected_n1_mask,
                          diffuse_row[x * 4u + 3u], specular_row[x * 4u + 3u]);
             ok = false;
           }
@@ -1943,7 +1955,7 @@ int RunRtxdiDxrBridge() {
                        raw[pixel].selected_light_index);
           ok = false;
         }
-        if (spatial) {
+        {
           const auto* resolved_pixel = resolved + (y * resolved_footprint.Footprint.RowPitch / sizeof(uint32_t)) + x * 4u;
           if (resolved_pixel[0] != raw[pixel].selected_light_index || resolved_pixel[1] != raw[pixel].selected_light_type
               || resolved_pixel[2] != raw[pixel].status || resolved_pixel[3] != std::bit_cast<uint32_t>(raw[pixel].inverse_pdf)) {
@@ -1995,28 +2007,60 @@ int RunRtxdiDxrBridge() {
                 ok = false;
               }
               if (array_index == result_index) found_selected = true;
+              if (array_index == result_index && raw[pixel].selected_light_index != UINT_MAX
+                  && (!std::isfinite(raw[pixel].inverse_pdf)
+                      || std::abs(raw[pixel].inverse_pdf - reservoir.weight)
+                             > (std::max)(1e-6f, std::abs(reservoir.weight) * 1e-6f))) {
+                std::fprintf(stderr,
+                             "FAIL %s raw/reservoir identity pixel=%u selected=%u/%u type=%u invPdf=%g weight=%g targetPdf=%g\n",
+                             label, pixel, raw[pixel].selected_light_index, selected, raw[pixel].selected_light_type,
+                             raw[pixel].inverse_pdf, reservoir.weight, reservoir.targetPdf);
+                ok = false;
+              }
             } else if (reservoir.lightData != 0u || reservoir.weight != 0.0f || reservoir.targetPdf != 0.0f) {
               std::fprintf(stderr, "FAIL %s nonempty writable array=%u pixel=%u lightData=%08x weight=%f target=%f\n",
                            label, array_index, pixel, reservoir.lightData, reservoir.weight, reservoir.targetPdf);
               ok = false;
             }
-          } else if (array_index == previous_index && !(temporal && !spatial)) {
-            if (preserve_reservoirs) {
-              if (array_index != expected_previous_output_index || prior_spatial_output.empty()) {
-                std::fprintf(stderr, "FAIL %s temporal array=%u does not match prior spatial output=%u\n", label,
-                             array_index, expected_previous_output_index);
-                ok = false;
-              } else if (std::memcmp(&reservoir, &prior_spatial_output[y * 16u + x], sizeof(reservoir)) != 0) {
-                std::fprintf(stderr, "FAIL %s temporal reservoir changed pixel=%u\n", label, pixel);
-                ok = false;
-              }
-            } else {
-              const auto* words = reinterpret_cast<const uint32_t*>(&reservoir);
-              for (UINT word = 0; word < sizeof(reservoir) / sizeof(uint32_t); ++word) {
-                if (words[word] != 0xEFEFEFEFu) {
-                  std::fprintf(stderr, "FAIL %s previous reservoir array=%u pixel=%u changed word=%u value=%08x\n", label,
-                               array_index, pixel, word, words[word]);
+          } else {
+            if (check_unwritten_arrays) {
+              if (preserve_reservoirs) {
+                const size_t prior_pointer = static_cast<size_t>(array_index) * di_array_pitch + y * 16u + x;
+                if (prior_reservoir_state.size() != di_reservoir_elements
+                    || std::memcmp(&reservoir, &prior_reservoir_state[prior_pointer], sizeof(reservoir)) != 0) {
+                  std::fprintf(stderr, "FAIL %s unwritten reservoir array=%u pixel=%u changed\n", label,
+                               array_index, pixel);
                   ok = false;
+                }
+              } else {
+                const auto* words = reinterpret_cast<const uint32_t*>(&reservoir);
+                for (UINT word = 0; word < sizeof(reservoir) / sizeof(uint32_t); ++word) {
+                  if (words[word] != 0xEFEFEFEFu) {
+                    std::fprintf(stderr, "FAIL %s unwritten reservoir sentinel array=%u pixel=%u word=%u value=%08x\n",
+                                 label, array_index, pixel, word, words[word]);
+                    ok = false;
+                  }
+                }
+              }
+            }
+            if (array_index == previous_index) {
+              if (preserve_reservoirs) {
+                if (array_index != expected_previous_output_index || prior_spatial_output.empty()) {
+                  std::fprintf(stderr, "FAIL %s temporal array=%u does not match prior spatial output=%u\n", label,
+                               array_index, expected_previous_output_index);
+                  ok = false;
+                } else if (std::memcmp(&reservoir, &prior_spatial_output[y * 16u + x], sizeof(reservoir)) != 0) {
+                  std::fprintf(stderr, "FAIL %s temporal reservoir changed pixel=%u\n", label, pixel);
+                  ok = false;
+                }
+              } else {
+                const auto* words = reinterpret_cast<const uint32_t*>(&reservoir);
+                for (UINT word = 0; word < sizeof(reservoir) / sizeof(uint32_t); ++word) {
+                  if (words[word] != 0xEFEFEFEFu) {
+                    std::fprintf(stderr, "FAIL %s previous reservoir array=%u pixel=%u changed word=%u value=%08x\n", label,
+                                 array_index, pixel, word, words[word]);
+                    ok = false;
+                  }
                 }
               }
             }
@@ -2060,21 +2104,18 @@ int RunRtxdiDxrBridge() {
         ok = false;
       }
     }
-    if (spatial || temporal) {
-      prior_spatial_output_index = result_index;
-      prior_spatial_output.resize(di_array_pitch);
-      std::memcpy(prior_spatial_output.data(), reservoirs + result_index * di_array_pitch,
-                  di_array_pitch * sizeof(RTXDI_PackedDIReservoir));
-    }
+    prior_spatial_output_index = result_index;
+    prior_spatial_output.resize(di_array_pitch);
+    std::memcpy(prior_spatial_output.data(), reservoirs + result_index * di_array_pitch,
+                di_array_pitch * sizeof(RTXDI_PackedDIReservoir));
+    if (check_unwritten_arrays) prior_reservoir_state.assign(reservoirs, reservoirs + di_reservoir_elements);
     di_type_readback->Unmap(0u, nullptr);
     di_reservoir_readback->Unmap(0u, nullptr);
     di_raw_readback->Unmap(0u, nullptr);
-    if (spatial) {
-      di_resolved_readback->Unmap(0u, nullptr);
-      n1_diffuse_readback->Unmap(0u, nullptr);
-      n1_specular_readback->Unmap(0u, nullptr);
-      n1_status_readback->Unmap(0u, nullptr);
-    }
+    di_resolved_readback->Unmap(0u, nullptr);
+    n1_diffuse_readback->Unmap(0u, nullptr);
+    n1_specular_readback->Unmap(0u, nullptr);
+    n1_status_readback->Unmap(0u, nullptr);
     if (ok && !suppress_di_pass) std::printf("PASS %s\n", label);
     return ok;
   };
@@ -2555,7 +2596,7 @@ int RunRtxdiDxrBridge() {
     if (prior_spatial_output.empty() || prior_spatial_output_index >= 3u) return false;
     auto& reservoir = prior_spatial_output[0];
     reservoir.lightData = 0x80000000u | light_index;
-    reservoir.weight = 1e20f;
+    reservoir.weight = 100.0f;
     reservoir.targetPdf = 1e-5f;
     reservoir.mVisibility = 20u << 18u;
     reservoir.distanceAge = 0u;
@@ -2620,6 +2661,9 @@ int RunRtxdiDxrBridge() {
                  temporal_weight_without_previous_specular, temporal_weight_with_previous_specular);
     return 1;
   }
+  std::printf("PASS RTXDI previous-material normalization M=%u/%u W_noSpec=%.9g W_spec=%.9g\n",
+              temporal_m_without_previous_specular, temporal_m_with_previous_specular,
+              temporal_weight_without_previous_specular, temporal_weight_with_previous_specular);
   temporal_albedo = albedo_pixels;
   if (!update_pixel_texture(albedo_tex.Get(), albedo_upload.Get(), temporal_albedo.data(), 3u * 4u * sizeof(float))
       || !update_pixel_texture(prev_albedo_tex.Get(), prev_albedo_upload.Get(), temporal_albedo.data(),
@@ -2892,6 +2936,52 @@ int RunRtxdiDxrBridge() {
   if (!update_pixel_texture(normal_tex.Get(), normal_upload.Get(), mixed_class_normals.data(), 3u * 16u)
       || !update_pixel_texture(prev_normal_tex.Get(), prev_normal_upload.Get(), environment_normals.data(),
                                3u * 16u)) return 1;
+
+  // Start the four-mode readback matrix from a stable environment receiver,
+  // point-only tile, and matching prior-frame guides.
+  if (!update_pixel_texture(normal_tex.Get(), normal_upload.Get(), environment_normals.data(), 3u * 16u)
+      || !update_pixel_texture(prev_normal_tex.Get(), prev_normal_upload.Get(), environment_normals.data(), 3u * 16u)
+      || !update_pixel_texture(prev_mrt2_tex.Get(), prev_mrt2_upload.Get(), mrt2_pixels.data(),
+                               3u * 4u * sizeof(uint32_t))
+      || !upload_deferred_pair()) return 1;
+  lights[0].color[0] = 8.0f;
+  lights[1].color[1] = 0.0f;
+  if (!update_upload(light_upload.Get(), lights.data(), sizeof(lights))) return 1;
+
+  const std::array<const char*, 4u> resampling_mode_names = {"None", "Temporal", "Spatial", "Both"};
+  if (!update_upload(di_reservoir_upload.Get(), reservoir_sentinel.data(), static_cast<size_t>(di_reservoir_bytes))) return 1;
+  for (UINT mode = 0u; mode < resampling_mode_names.size(); ++mode) {
+    auto mode_settings = bridge_settings;
+    mode_settings.temporal_enabled = (mode & 1u) != 0u;
+    mode_settings.spatial_enabled = (mode & 2u) != 0u;
+    bridge_di_context = falcom_world::rtxdi::CreateDiContext(bridge_di_config, mode_settings);
+    if (!bridge_di_context) return 1;
+    prior_spatial_output.clear();
+    prior_reservoir_state.clear();
+    prior_spatial_output_index = UINT_MAX;
+    baseline_initial_m = 0u;
+    for (UINT frame = 0u; frame < 6u; ++frame) {
+      if (frame != 0u) bridge_di_context->SetFrameIndex(bridge_di_context->GetFrameIndex() + 1u);
+      char mode_label[96] = {};
+      std::snprintf(mode_label, sizeof(mode_label), "RTXDI final resolve mode %s frame %u",
+                    resampling_mode_names[mode], frame);
+      const bool temporal_enabled = mode_settings.temporal_enabled;
+      const bool spatial_enabled = mode_settings.spatial_enabled;
+      const bool history_valid = temporal_enabled && frame != 0u;
+      if (!run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0, mode_label, true, 1u,
+                  spatial_enabled, 0u, false, frame != 0u, temporal_enabled,
+                  temporal_enabled && frame != 0u, history_valid, false, nullptr, nullptr, nullptr, nullptr,
+                  nullptr, true)) return 1;
+      if (temporal_enabled && frame == 0u && !prior_spatial_output.empty()) {
+        baseline_initial_m = (prior_spatial_output[0].mVisibility >> 18u) & 0x3fffu;
+      }
+    }
+    std::printf("PASS RTXDI six-frame GPU mode=%s final-index=%u temporal=%u spatial=%u; final raw/tuple/N1 and unwritten-array guards checked\n",
+                resampling_mode_names[mode], bridge_di_context->GetBufferIndices().shadingInputBufferIndex,
+                static_cast<unsigned>(mode_settings.temporal_enabled),
+                static_cast<unsigned>(mode_settings.spatial_enabled));
+  }
+
   D3D12_RESOURCE_BARRIER raw_guard_barrier = {};
   raw_guard_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
   raw_guard_barrier.Transition.pResource = di_raw.Get();
