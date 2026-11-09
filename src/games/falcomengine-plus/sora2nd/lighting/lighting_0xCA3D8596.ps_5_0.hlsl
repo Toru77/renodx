@@ -31,6 +31,7 @@ struct DeferredParam
 };
 
 #include "../../world/shaders/world_rt_lamps.hlsli"
+#include "../../world/shaders/world_rtxdi_lighting_consumer.hlsli"
 
 cbuffer cb_scene : register(b0)
 {
@@ -169,6 +170,7 @@ Texture2D<float4> shadowTexture : register(t7);
 Texture2D<float4> outlinePrepareTexture : register(t8);
 StructuredBuffer<LightParam> dynamicLights_g : register(t11);
 StructuredBuffer<LightIndexData> lightIndices_g : register(t12);
+Texture2D<uint4> rtxdiResolvedLocal_g : register(t41);
 StructuredBuffer<float4x4> spotShadowMatrices_g : register(t14);
 TextureCube<float4> texEnvMap_g : register(t17);
 TextureCube<float4> dynCubeHistPosTex : register(t29);  // dynamic cube history world pos (.a = capture validity)
@@ -236,6 +238,13 @@ void main(
   uint4 bitmask, uiDest;
   float4 fDest;
   uint width, height, num_levels;
+  uint4 rtxdi_resolved = 0u;
+  RtxdiLightingSelection rtxdi_selection = (RtxdiLightingSelection)0;
+  uint rtxdi_selected_index = 0u;
+  uint rtxdi_selected_type = 0u;
+  uint rtxdi_status = RTXDI_DI_STATUS_EMPTY;
+  float rtxdi_inverse_pdf = 0.0;
+  bool rtxdi_output_valid = false;
   // Captured here because the flag word in r1.z is consumed and overwritten long
   // before either output site, and the environment/character split needs it.
   // Sora reads "bit 3 CLEAR" as the character flag (inverted vs Kai's bit 8).
@@ -825,6 +834,25 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r1.x = mad((int)r3.y, 576, (int)r1.x);
   r1.x = (int)r3.x + (int)r1.x;
   r1.x = min(4607, (uint)r1.x);
+  if (shader_injection_data.rtxdi_local_bound > 0.5f) {
+    uint resolved_width, resolved_height, tile_count, tile_stride, light_count, light_stride;
+    rtxdiResolvedLocal_g.GetDimensions(resolved_width, resolved_height);
+    lightIndices_g.GetDimensions(tile_count, tile_stride);
+    dynamicLights_g.GetDimensions(light_count, light_stride);
+    const uint2 resolved_pixel = (uint2)v0.xy;
+    if (resolved_pixel.x < resolved_width && resolved_pixel.y < resolved_height && (uint)r1.x < tile_count) {
+      rtxdi_resolved = rtxdiResolvedLocal_g.Load(int3(resolved_pixel, 0));
+      rtxdi_selected_index = rtxdi_resolved.x;
+      rtxdi_selected_type = rtxdi_resolved.y;
+      rtxdi_status = rtxdi_resolved.z;
+      rtxdi_inverse_pdf = asfloat(rtxdi_resolved.w);
+      if ((uint)r1.x < tile_count) {
+        const LightIndexData di_tile = lightIndices_g[r1.x];
+        rtxdi_selection = RtxdiResolveLightingSelection(true, rtxdi_resolved, light_count, di_tile);
+        rtxdi_output_valid = rtxdi_selection.valid;
+      }
+    }
+  }
   r13.xyz = lightProbe_g[1].xyz * r8.xxx + lightProbe_g[0].xyz;
   r13.xyz = lightProbe_g[2].xyz * r8.yyy + r13.xyz;
   r13.xyz = lightProbe_g[3].xyz * r8.www + r13.xyz;
@@ -1261,16 +1289,20 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                                          : shader_injection_data.cs_contact_local_env_spot) > 0.5f;
   const float csLocalPointVis = csLocalPointOn ? 1.0 - csLocalShare.x * csLocalStrength : 1.0;
   const float csLocalSpotVis = csLocalSpotOn ? 1.0 - csLocalShare.y * csLocalStrength : 1.0;
+  uint rtxdi_point_loop_count = 0u;
+  uint rtxdi_spot_loop_count = 0u;
+  RtxdiEffectiveLightingLoopCounts(rtxdi_selection, min(lightIndices_g[r1.x].pointLightCount, 63u),
+                                  min(lightIndices_g[r1.x].spotLightCount, 63u), rtxdi_point_loop_count,
+                                  rtxdi_spot_loop_count);
   if (r20.y != 0) {
-    r0.w = lightIndices_g[r1.x].pointLightCount;
-    r0.w = min(63, (uint)r0.w);
+    r0.w = rtxdi_point_loop_count;
     r10.xyz = float3(0,0,0);
     r11.xyz = float3(0,0,0);
     r2.x = 0;
     while (true) {
       r2.w = cmp((uint)r2.x >= (uint)r0.w);
       if (r2.w != 0) break;
-      r2.w = lightIndices_g[r1.x].pointLightIndices[r2.x];
+      r2.w = rtxdi_output_valid ? rtxdi_selected_index : lightIndices_g[r1.x].pointLightIndices[r2.x];
       r12.x = dynamicLights_g[r2.w].pos.x;
       r12.y = dynamicLights_g[r2.w].pos.y;
       r12.z = dynamicLights_g[r2.w].pos.z;
@@ -1297,10 +1329,14 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         r13.x = dynamicLights_g[r2.w].color.x;
         r13.y = dynamicLights_g[r2.w].color.y;
         r13.z = dynamicLights_g[r2.w].color.z;
-        if (rtlsPointVis < 1.0) {
-          r13.xyz *= rtlsPointVis;
+        if (rtxdi_output_valid) {
+          r13.xyz *= rtxdi_inverse_pdf;
+        } else {
+          if (rtlsPointVis < 1.0) {
+            r13.xyz *= rtlsPointVis;
+          }
+          r13.xyz *= csLocalPointVis;
         }
-        r13.xyz *= csLocalPointVis;
         // ── BRDF Point Light ──
         float brdf_rawNdotL_pt = r6.w;
         float3 brdf_H_pt = normalize(brdf_V + r12.xyz);
@@ -1342,8 +1378,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       r2.x = (int)r2.x + 1;
     }
     r11.xyz = r11.xyz * r14.www + r9.xyz;
-    r0.w = lightIndices_g[r1.x].spotLightCount;
-    r0.w = min(63, (uint)r0.w);
+    r0.w = rtxdi_spot_loop_count;
     r12.yw = localShadowResolutionInv_g * float2(1.25,-1.25);
     r12.xz = float2(0,0);
     r13.xyz = r10.xyz;
@@ -1352,7 +1387,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     while (true) {
       r2.w = cmp((uint)r2.x >= (uint)r0.w);
       if (r2.w != 0) break;
-      r2.w = lightIndices_g[r1.x].spotLightIndices[r2.x];
+      r2.w = rtxdi_output_valid ? rtxdi_selected_index : lightIndices_g[r1.x].spotLightIndices[r2.x];
       r16.x = dynamicLights_g[r2.w].pos.x;
       r16.y = dynamicLights_g[r2.w].pos.y;
       r16.z = dynamicLights_g[r2.w].pos.z;
@@ -1391,7 +1426,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r19.x = dynamicLights_g[r2.w].translucency;
           r19.y = dynamicLights_g[r2.w].shadowmapIndex;
           r5.z = cmp((int)r19.y != -1);
-          if (r5.z != 0 && rtlsSpotCover < 1.0) {
+          if (r5.z != 0 && !rtxdi_output_valid && rtlsSpotCover < 1.0) {
             r21.xyzw = spotShadowMatrices_g[r19.y]._m00_m10_m20_m30;
             r23.xyzw = spotShadowMatrices_g[r19.y]._m01_m11_m21_m31;
             r24.xyzw = spotShadowMatrices_g[r19.y]._m02_m12_m22_m32;
@@ -1430,10 +1465,14 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r19.x = dynamicLights_g[r2.w].color.x;
           r19.y = dynamicLights_g[r2.w].color.y;
           r19.z = dynamicLights_g[r2.w].color.z;
-          if (rtlsSpotVis < 1.0) {
-            r19.xyz *= rtlsSpotVis;
+          if (rtxdi_output_valid) {
+            r19.xyz *= rtxdi_inverse_pdf;
+          } else {
+            if (rtlsSpotVis < 1.0) {
+              r19.xyz *= rtlsSpotVis;
+            }
+            r19.xyz *= csLocalSpotVis;
           }
-          r19.xyz *= csLocalSpotVis;
           // ── BRDF Spot Light ──
           float3 brdf_H_sp = normalize(brdf_V + r16.xyz);
           float brdf_NdotH_sp = saturate(dot(brdf_H_sp, r8.xyw));
@@ -1477,13 +1516,12 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     r2.xyw = r15.yzw * r14.www + r11.xyz;
     r3.xyz = r13.xyz * r14.www + r3.xyz;
   } else {
-    r0.w = lightIndices_g[r1.x].pointLightCount;
-    r0.w = min(63, (uint)r0.w);
+    r0.w = rtxdi_point_loop_count;
     r10.xyzw = float4(0,0,0,0);
     while (true) {
       r1.y = cmp((uint)r10.w >= (uint)r0.w);
       if (r1.y != 0) break;
-      r1.y = lightIndices_g[r1.x].pointLightIndices[r10.w];
+      r1.y = rtxdi_output_valid ? rtxdi_selected_index : lightIndices_g[r1.x].pointLightIndices[r10.w];
       r11.x = dynamicLights_g[r1.y].pos.x;
       r11.y = dynamicLights_g[r1.y].pos.y;
       r11.z = dynamicLights_g[r1.y].pos.z;
@@ -1512,10 +1550,14 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         r11.x = dynamicLights_g[r1.y].color.x;
         r11.y = dynamicLights_g[r1.y].color.y;
         r11.z = dynamicLights_g[r1.y].color.z;
-        if (rtlsPointVis < 1.0) {
-          r11.xyz *= rtlsPointVis;
+        if (rtxdi_output_valid) {
+          r11.xyz *= rtxdi_inverse_pdf;
+        } else {
+          if (rtlsPointVis < 1.0) {
+            r11.xyz *= rtlsPointVis;
+          }
+          r11.xyz *= csLocalPointVis;
         }
-        r11.xyz *= csLocalPointVis;
         r11.xyz = r11.xyz * r5.zzz;
         float3 brdf_vanilla_diffuse_pt_env = r11.xyz * r5.yyy;
         if (brdf_use_hammon) {
@@ -1528,15 +1570,14 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       r10.w = (int)r10.w + 1;
     }
     r9.xyz = r10.xyz * r14.www + r9.xyz;
-    r0.w = lightIndices_g[r1.x].spotLightCount;
-    r0.w = min(63, (uint)r0.w);
+    r0.w = rtxdi_spot_loop_count;
     r10.yw = localShadowResolutionInv_g * float2(1.25,-1.25);
     r10.xz = float2(0,0);
     r11.xyzw = float4(0,0,0,0);
     while (true) {
       r1.y = cmp((uint)r11.w >= (uint)r0.w);
       if (r1.y != 0) break;
-      r1.y = lightIndices_g[r1.x].spotLightIndices[r11.w];
+      r1.y = rtxdi_output_valid ? rtxdi_selected_index : lightIndices_g[r1.x].spotLightIndices[r11.w];
       r12.x = dynamicLights_g[r1.y].pos.x;
       r12.y = dynamicLights_g[r1.y].pos.y;
       r12.z = dynamicLights_g[r1.y].pos.z;
@@ -1575,7 +1616,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r13.x = dynamicLights_g[r1.y].translucency;
           r13.y = dynamicLights_g[r1.y].shadowmapIndex;
           r5.z = cmp((int)r13.y != -1);
-          if (r5.z != 0 && rtlsSpotCover < 1.0) {
+          if (r5.z != 0 && !rtxdi_output_valid && rtlsSpotCover < 1.0) {
             r19.xyzw = spotShadowMatrices_g[r13.y]._m00_m10_m20_m30;
             r21.xyzw = spotShadowMatrices_g[r13.y]._m01_m11_m21_m31;
             r23.xyzw = spotShadowMatrices_g[r13.y]._m02_m12_m22_m32;
@@ -1615,10 +1656,14 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r12.x = dynamicLights_g[r1.y].color.x;
           r12.y = dynamicLights_g[r1.y].color.y;
           r12.z = dynamicLights_g[r1.y].color.z;
-          if (rtlsSpotVis < 1.0) {
-            r12.xyz *= rtlsSpotVis;
+          if (rtxdi_output_valid) {
+            r12.xyz *= rtxdi_inverse_pdf;
+          } else {
+            if (rtlsSpotVis < 1.0) {
+              r12.xyz *= rtlsSpotVis;
+            }
+            r12.xyz *= csLocalSpotVis;
           }
-          r12.xyz *= csLocalSpotVis;
           r12.xyz = r12.xyz * r5.yyy;
           float3 brdf_vanilla_diffuse_sp_env = r12.xyz * r5.zzz;
           if (brdf_use_hammon) {

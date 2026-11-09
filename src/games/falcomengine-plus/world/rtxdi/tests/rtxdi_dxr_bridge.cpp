@@ -20,6 +20,7 @@
 #include "../rtxdi_surface_layout.h"
 #include "rtxdi_raw_guard_contract.h"
 #include "rtxdi_surface_contract.h"
+#include "rtxdi_lighting_consumer_contract.h"
 #include "world_rtxdi_classify_lights.h"
 #include "world_rtxdi_initial_di.h"
 #include "world_rtxdi_spatial_di.h"
@@ -98,6 +99,29 @@ struct RtxdiTileData {
 struct DeferredParam {
   uint8_t bytes[RTXDI_INPUT_DEFERRED_STRIDE];
 };
+struct LightingConsumerCase {
+  uint32_t tuple[4];
+  uint32_t light_count;
+  uint32_t bound;
+  uint32_t padding[2];
+  uint32_t original_point_count;
+  uint32_t original_spot_count;
+  float lamp_radiance;
+  float base_color;
+  float dynamic_intensity;
+  float padding2;
+  RtxdiTileData tile;
+};
+struct LightingConsumerResult {
+  uint32_t mode;
+  uint32_t point_count;
+  uint32_t spot_count;
+  float inverse_pdf;
+  float raw_local_term;
+  float shaded_local_term;
+  uint32_t selected_index;
+  uint32_t selected_type;
+};
 static_assert(sizeof(WorldMeshGPU) == 64);
 static_assert(sizeof(WorldInstanceGPU) == 192);
 static_assert(sizeof(AlphaMaterialGPU) == 32);
@@ -106,6 +130,8 @@ static_assert(sizeof(SurfaceResult) == 48);
 static_assert(sizeof(RtxdiLightParam) == RTXDI_INPUT_LIGHT_STRIDE);
 static_assert(sizeof(RtxdiTileData) == RTXDI_INPUT_TILE_STRIDE);
 static_assert(sizeof(DeferredParam) == RTXDI_INPUT_DEFERRED_STRIDE);
+static_assert(sizeof(LightingConsumerCase) == 632u);
+static_assert(sizeof(LightingConsumerResult) == 32u);
 
 bool Check(HRESULT hr, const char* operation) {
   if (FAILED(hr)) std::fprintf(stderr, "FAIL DXR %s: HRESULT 0x%08lx\n", operation, static_cast<unsigned long>(hr));
@@ -2257,6 +2283,165 @@ int RunRtxdiDxrBridge() {
     return 1;
   }
   std::printf("PASS finite-input raw overflow sanitizer writes UNKNOWN and zero diffuse\n");
+
+  constexpr uint32_t lighting_case_count = 8u;
+  std::array<LightingConsumerCase, lighting_case_count> lighting_cases = {};
+  for (LightingConsumerCase& test_case : lighting_cases) {
+    test_case.light_count = 16u;
+    test_case.original_point_count = 2u;
+    test_case.original_spot_count = 2u;
+    test_case.lamp_radiance = 0.75f;
+    test_case.base_color = 0.25f;
+    test_case.dynamic_intensity = 0.5f;
+    test_case.tile.point_count = 2u;
+    test_case.tile.point_indices[0] = 5;
+    test_case.tile.point_indices[1] = 6;
+    test_case.tile.spot_count = 2u;
+    test_case.tile.spot_indices[0] = 7;
+    test_case.tile.spot_indices[1] = 8;
+  }
+  lighting_cases[0].tuple[0] = 5u;
+  lighting_cases[0].tuple[1] = RTXDI_DI_LIGHT_TYPE_POINT;
+  lighting_cases[0].tuple[2] = RTXDI_DI_STATUS_VISIBLE;
+  lighting_cases[0].tuple[3] = std::bit_cast<uint32_t>(2.f);
+  lighting_cases[0].bound = 1u;
+  lighting_cases[0].lamp_radiance = 0.5f;
+  lighting_cases[1].tuple[0] = 7u;
+  lighting_cases[1].tuple[1] = RTXDI_DI_LIGHT_TYPE_SPOT;
+  lighting_cases[1].tuple[2] = RTXDI_DI_STATUS_VISIBLE;
+  lighting_cases[1].tuple[3] = std::bit_cast<uint32_t>(3.f);
+  lighting_cases[1].bound = 1u;
+  lighting_cases[1].lamp_radiance = 0.25f;
+  lighting_cases[2].tuple[0] = 5u;
+  lighting_cases[2].tuple[1] = RTXDI_DI_LIGHT_TYPE_POINT;
+  lighting_cases[2].tuple[2] = RTXDI_DI_STATUS_BLOCKED;
+  lighting_cases[2].tuple[3] = std::bit_cast<uint32_t>(2.f);
+  lighting_cases[2].bound = 1u;
+  lighting_cases[3].tuple[0] = 5u;
+  lighting_cases[3].tuple[1] = RTXDI_DI_LIGHT_TYPE_POINT;
+  lighting_cases[3].tuple[2] = RTXDI_DI_STATUS_UNKNOWN;
+  lighting_cases[3].tuple[3] = std::bit_cast<uint32_t>(2.f);
+  lighting_cases[3].bound = 1u;
+  lighting_cases[4] = lighting_cases[0];
+  lighting_cases[4].tuple[0] = 9u;
+  lighting_cases[5] = lighting_cases[1];
+  lighting_cases[5].bound = 0u;
+  lighting_cases[6] = lighting_cases[3];
+  lighting_cases[6].tuple[2] = RTXDI_DI_STATUS_EMPTY;
+  lighting_cases[6].original_point_count = 0u;
+  lighting_cases[6].original_spot_count = 0u;
+  lighting_cases[7] = lighting_cases[1];
+  lighting_cases[7].tuple[1] = 3u;
+  for (LightingConsumerCase& test_case : lighting_cases) {
+    test_case.padding[0] = 0u;
+    test_case.padding[1] = 0u;
+    test_case.padding2 = 0.f;
+    std::fill(std::begin(test_case.tile.probe_indices), std::end(test_case.tile.probe_indices), -1);
+  }
+
+  ComPtr<ID3D12Resource> lighting_input, lighting_output, lighting_readback;
+  if (!UploadBuffer(device.Get(), lighting_cases.data(), sizeof(lighting_cases), &lighting_input)
+      || !CreateDefaultBuffer(device.Get(), sizeof(LightingConsumerResult) * lighting_case_count,
+                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON,
+                              &lighting_output)) return 1;
+  const auto lighting_readback_desc = BufferDesc(sizeof(LightingConsumerResult) * lighting_case_count);
+  if (!Check(device->CreateCommittedResource(&readback_properties, D3D12_HEAP_FLAG_NONE, &lighting_readback_desc,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&lighting_readback)),
+             "create lighting contract readback")) return 1;
+  D3D12_DESCRIPTOR_RANGE lighting_ranges[2] = {};
+  lighting_ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 0u, 0u, 0u};
+  lighting_ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1u, 0u, 0u, 1u};
+  ComPtr<ID3D12RootSignature> lighting_root;
+  ComPtr<ID3D12PipelineState> lighting_pso;
+  if (!CreateRoot(device.Get(), lighting_ranges, 2u, 1u, &lighting_root)
+      || !CreatePso(device.Get(), lighting_root.Get(), __rtxdi_lighting_consumer_contract, &lighting_pso)) return 1;
+  D3D12_DESCRIPTOR_HEAP_DESC lighting_heap_desc = {};
+  lighting_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  lighting_heap_desc.NumDescriptors = 2u;
+  lighting_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> lighting_heap;
+  if (!Check(device->CreateDescriptorHeap(&lighting_heap_desc, IID_PPV_ARGS(&lighting_heap)),
+             "create lighting contract heap")) return 1;
+  const UINT lighting_increment = device->GetDescriptorHandleIncrementSize(lighting_heap_desc.Type);
+  if (!CreateBufferSrv(device.Get(), lighting_heap.Get(), lighting_increment, 0u, lighting_input.Get(),
+                       lighting_case_count, sizeof(LightingConsumerCase))) return 1;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC lighting_uav = {};
+  lighting_uav.Format = DXGI_FORMAT_UNKNOWN;
+  lighting_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  lighting_uav.Buffer.NumElements = lighting_case_count;
+  lighting_uav.Buffer.StructureByteStride = sizeof(LightingConsumerResult);
+  auto lighting_cpu = lighting_heap->GetCPUDescriptorHandleForHeapStart();
+  lighting_cpu.ptr += lighting_increment;
+  device->CreateUnorderedAccessView(lighting_output.Get(), nullptr, &lighting_uav, lighting_cpu);
+
+  if (!Check(allocator->Reset(), "reset lighting contract allocator")
+      || !Check(base_list->Reset(allocator.Get(), nullptr), "reset lighting contract list")) return 1;
+  ID3D12DescriptorHeap* lighting_heaps[] = {lighting_heap.Get()};
+  list->SetDescriptorHeaps(1u, lighting_heaps);
+  list->SetComputeRootSignature(lighting_root.Get());
+  list->SetPipelineState(lighting_pso.Get());
+  const UINT lighting_case_count_constant = lighting_case_count;
+  list->SetComputeRoot32BitConstants(0u, 1u, &lighting_case_count_constant, 0u);
+  list->SetComputeRootDescriptorTable(1u, lighting_heap->GetGPUDescriptorHandleForHeapStart());
+  D3D12_RESOURCE_BARRIER lighting_barrier = {};
+  lighting_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  lighting_barrier.Transition.pResource = lighting_output.Get();
+  lighting_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  lighting_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+  lighting_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  list->ResourceBarrier(1u, &lighting_barrier);
+  list->Dispatch(1u, 1u, 1u);
+  D3D12_RESOURCE_BARRIER lighting_uav_barrier = {};
+  lighting_uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  lighting_uav_barrier.UAV.pResource = lighting_output.Get();
+  list->ResourceBarrier(1u, &lighting_uav_barrier);
+  lighting_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  lighting_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  list->ResourceBarrier(1u, &lighting_barrier);
+  list->CopyBufferRegion(lighting_readback.Get(), 0u, lighting_output.Get(), 0u,
+                         sizeof(LightingConsumerResult) * lighting_case_count);
+  lighting_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  lighting_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+  list->ResourceBarrier(1u, &lighting_barrier);
+  if (!submit_wait()) {
+    std::fprintf(stderr, "FAIL lighting consumer contract submission/wait\n");
+    return 1;
+  }
+  void* lighting_mapped = nullptr;
+  if (!Check(lighting_readback->Map(0u, nullptr, &lighting_mapped), "map lighting consumer results")) return 1;
+  std::array<LightingConsumerResult, lighting_case_count> lighting_results = {};
+  std::memcpy(lighting_results.data(), lighting_mapped, sizeof(lighting_results));
+  const bool lighting_contract_ok =
+      lighting_results[0].mode == 1u && lighting_results[0].point_count == 1u && lighting_results[0].spot_count == 0u
+      && std::abs(lighting_results[0].raw_local_term - 1.f) < 1e-6f
+      && std::abs(lighting_results[0].shaded_local_term - 0.125f) < 1e-6f
+      && lighting_results[0].selected_index == 5u && lighting_results[0].selected_type == RTXDI_DI_LIGHT_TYPE_POINT
+      && lighting_results[1].mode == 1u && lighting_results[1].point_count == 0u && lighting_results[1].spot_count == 1u
+      && std::abs(lighting_results[1].raw_local_term - 0.75f) < 1e-6f
+      && std::abs(lighting_results[1].shaded_local_term - 0.09375f) < 1e-6f
+      && lighting_results[1].selected_index == 7u && lighting_results[1].selected_type == RTXDI_DI_LIGHT_TYPE_SPOT
+      && lighting_results[2].mode == 2u && lighting_results[2].point_count == 0u && lighting_results[2].spot_count == 0u
+      && lighting_results[2].raw_local_term == 0.f && lighting_results[3].mode == 0u
+      && lighting_results[3].point_count == 2u && lighting_results[3].spot_count == 2u
+      && std::abs(lighting_results[3].shaded_local_term - 0.09375f) < 1e-6f
+      && lighting_results[4].mode == 0u && lighting_results[4].point_count == 2u
+      && lighting_results[4].spot_count == 2u && lighting_results[5].mode == 0u
+      && lighting_results[5].point_count == 2u && lighting_results[5].spot_count == 2u
+      && lighting_results[6].mode == 0u && lighting_results[6].point_count == 0u
+      && lighting_results[6].spot_count == 0u && lighting_results[6].raw_local_term == 0.f
+      && lighting_results[7].mode == 0u && lighting_results[7].point_count == 2u
+      && lighting_results[7].spot_count == 2u;
+  lighting_readback->Unmap(0u, nullptr);
+  if (!lighting_contract_ok) {
+    std::fprintf(stderr, "FAIL lighting consumer GPU contract point=(%u,%u,%g,%g) spot=(%u,%u,%g,%g) fallback=%u/%u blocked=%u\n",
+                 lighting_results[0].point_count, lighting_results[0].spot_count, lighting_results[0].raw_local_term,
+                 lighting_results[0].shaded_local_term, lighting_results[1].point_count, lighting_results[1].spot_count,
+                 lighting_results[1].raw_local_term, lighting_results[1].shaded_local_term,
+                 lighting_results[3].point_count, lighting_results[3].spot_count, lighting_results[2].mode);
+    return 1;
+  }
+  std::printf("PASS production lighting selection helper point/spot/blocked/unknown/unbound/invalid fallback; post-material application once\n");
   if (!ValidateDebugMessages(info_queue.Get())) return 1;
   std::printf("PASS production surface + DXR visibility (3x2, guard sentinel, masks incl. FORCE_OPAQUE, endpoint, coverage, scene/surface invalids, bias, alpha)\n");
   CloseHandle(event);

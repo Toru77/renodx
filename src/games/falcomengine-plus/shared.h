@@ -38,7 +38,7 @@ struct ShaderInjectData {
   // read on `char_shadow_mode >= 0.5f` and not on `== 1`. That engine code is
   // still in the Sora and Kai character/SSAO shaders.
   float char_shadow_mode;
-  float char_shadow_sample_count;   // RETIRED: Bend_SSS, unread
+  float rtxdi_local_bound;                 // 0/1: Sora 2nd t41 holds a matching staged local-DI tuple this lighting draw
   float char_shadow_hard_shadow_samples;   // RETIRED: Bend_SSS, unread
   float char_shadow_fade_out_samples;       // RETIRED: Bend_SSS, unread
   float rtao_debug_show;                    // RTAO: 1 = the lighting shader shows the RTAO texel (t22) as an image (RunRtaoInline); 0 off

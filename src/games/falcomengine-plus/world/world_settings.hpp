@@ -751,13 +751,14 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           std::shared_lock lock(rtxdi::g_di.mutex);
           di = rtxdi::g_di.snapshot;
         }
-        ImGui::Text("DI pipeline: %s | frame %u | config %llu | scene %d | transfer %d | history %s | temporal %s (%u->%u) | spatial %s (%u->%u) | fence %llu | output %s, not consumed (%ux%u frame %u; B %llu, C %llu) | error 0x%08x",
+        ImGui::Text("DI pipeline: %s | frame %u | config %llu | scene %d | transfer %d | history %s | temporal %s (%u->%u) | spatial %s (%u->%u) | fence %llu | output staged %s, tuple bound %s, lighting draw with tuple bound %s (%ux%u frame %u; B %llu, C %llu) | error 0x%08x",
                     rtxdi::DiStatusName(di.status), di.frame,
                     static_cast<unsigned long long>(di.configuration_generation), di.scene_slot, di.transfer_slot,
                     di.history_valid ? "valid" : "reset", di.temporal_ran ? "ran" : "skipped",
                     di.temporal_source_index, di.temporal_output_index,
                     di.spatial_ran ? "ran" : "skipped", di.spatial_source_index, di.spatial_output_index,
-                    static_cast<unsigned long long>(di.fence), di.output_staged ? "staged" : "unavailable",
+                    static_cast<unsigned long long>(di.fence), di.output_staged ? "yes" : "no",
+                    di.output_bound ? "yes" : "no", di.lighting_draw_seen ? "yes" : "no",
                     di.output_width, di.output_height, di.output_frame,
                     static_cast<unsigned long long>(di.output_fence_b), static_cast<unsigned long long>(di.output_fence_c),
                     static_cast<unsigned int>(di.error));

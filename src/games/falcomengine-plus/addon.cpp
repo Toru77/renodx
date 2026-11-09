@@ -73,7 +73,7 @@ ShaderInjectData shader_injection = {
     // the CharShadowMode setting: the contact term owns character shadowing
     // unless the user deliberately turns the engine's own back on.
     .char_shadow_mode = 0.f,
-    .char_shadow_sample_count = 32.f,
+    .rtxdi_local_bound = 0.f,
     .char_shadow_hard_shadow_samples = 4.f,
     .char_shadow_fade_out_samples = 16.f,
     .rtao_debug_show = 0.f,
@@ -12167,6 +12167,90 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
   }
 }
 
+static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceData* dd) {
+  namespace rt12 = falcom_world::rt12;
+  namespace di = falcom_world::rtxdi;
+  shader_injection.rtxdi_local_bound = 0.f;
+  {
+    std::unique_lock lock(di::g_di.mutex);
+    di::g_di.snapshot.output_bound = false;
+    di::g_di.snapshot.output_bound_frame = UINT32_MAX;
+    di::g_di.snapshot.output_bound_transfer_slot = -1;
+    di::g_di.snapshot.output_bound_fence_b = 0u;
+    di::g_di.snapshot.lighting_draw_seen = false;
+  }
+  if (!IsSora2nd() || !cmd_list) return;
+
+  const reshade::api::resource_view empty_view = {};
+  cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                             reshade::api::descriptor_table_update{{}, 41u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+  if (!dd || cmd_list != dd->immediate_cmd_list || di::g_local_requested < 0.5f || !rt12::g_rt12
+      || rt12::g_rt12->device != cmd_list->get_device() || rt12::g_rt12->failed || rt12::g_rt12->stuck
+      || rt12::g_rt12->unfenced_execution) return;
+
+  const uint32_t frame = falcom_world::g_state.frame.load();
+  di::DiSnapshot output;
+  di::InputSnapshot input;
+  di::SceneSnapshot scene;
+  {
+    std::shared_lock lock(di::g_di.mutex);
+    output = di::g_di.snapshot;
+  }
+  {
+    std::shared_lock lock(di::g_input.mutex);
+    input = di::g_input.snapshot;
+  }
+  {
+    std::shared_lock lock(di::g_scene.mutex);
+    scene = di::g_scene.snapshot;
+  }
+  rt12::Rt12State& state = *rt12::g_rt12;
+  if (output.status != di::DiStatus::Submitted || output.frame != frame || !output.output_staged
+      || output.output_transfer_slot < 0 || output.output_transfer_slot >= static_cast<int32_t>(rt12::kRt12Slots)
+      || input.status != di::InputStatus::Ready || input.ready_frame != frame || input.width != dd->captured_depth_w
+      || input.height != dd->captured_depth_h || input.owner_generation != state.generation
+      || input.scene_slot != output.output_scene_slot || input.transfer_slot != output.output_transfer_slot
+      || input.configuration_generation != state.di_transfer.configuration_generation
+      || scene.prepared_frame != frame || scene.prepared_slot != output.output_scene_slot
+      || scene.prepared_generation != state.generation || input.scene_fence != scene.prepared_fence
+      || output.output_owner_generation != state.generation || output.output_configuration_generation == 0u
+      || output.output_configuration_generation != state.di.configuration_generation
+      || output.output_width != dd->captured_depth_w
+      || output.output_height != dd->captured_depth_h || output.output_fence_b == 0u
+      || output.fence != output.output_fence_b) return;
+
+  rt12::Rt12DiTransferSlot& slot = state.di_transfer.slots[static_cast<uint32_t>(output.output_transfer_slot)];
+  if (!slot.output_staged || slot.output_frame != frame || slot.output_owner_generation != output.output_owner_generation
+      || slot.output_configuration_generation != output.output_configuration_generation
+      || slot.output_scene_slot != output.output_scene_slot || slot.output_transfer_slot != output.output_transfer_slot
+      || slot.output_width != output.output_width || slot.output_height != output.output_height
+      || slot.output_b_fence != output.output_fence_b || !slot.di_resolved.srv11.handle
+      || !rt12::ValidateDiTexture(slot.di_resolved.srv11, output.output_width, output.output_height,
+                                  rt12::Rt12DiTextureKind::Uint4)) return;
+
+  cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                             reshade::api::descriptor_table_update{{}, 41u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.di_resolved.srv11});
+  shader_injection.rtxdi_local_bound = 1.f;
+  bool still_current = false;
+  {
+    std::unique_lock lock(di::g_di.mutex);
+    still_current = di::g_di.snapshot.output_frame == frame
+                    && di::g_di.snapshot.output_transfer_slot == output.output_transfer_slot
+                    && di::g_di.snapshot.output_fence_b == output.output_fence_b;
+    if (still_current) {
+      di::g_di.snapshot.output_bound = true;
+      di::g_di.snapshot.output_bound_frame = frame;
+      di::g_di.snapshot.output_bound_transfer_slot = output.output_transfer_slot;
+      di::g_di.snapshot.output_bound_fence_b = output.output_fence_b;
+    }
+  }
+  if (!still_current) {
+    shader_injection.rtxdi_local_bound = 0.f;
+    cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                               reshade::api::descriptor_table_update{{}, 41u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+  }
+}
+
 // DLSS Ray Reconstruction guides (M1): the compute pass at the lighting hook. Runs on the first lighting draw of the frame.
 static void RunRrGuidesInline(reshade::api::command_list* cmd_list) {
   if (falcom_world::rr::g_rr_perf_guides < 0.5f) return;  // TEMP perf test (remove)
@@ -12208,6 +12292,15 @@ static void OnDrawnLightingShader(reshade::api::command_list* cmd_list) {
   auto* dev = cmd_list->get_device();
   auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
   if (dd == nullptr || cmd_list != dd->immediate_cmd_list) return;
+  if (IsSora2nd()) {
+    std::unique_lock lock(falcom_world::rtxdi::g_di.mutex);
+    auto& output = falcom_world::rtxdi::g_di.snapshot;
+    falcom_world::rtxdi::RecordDiLightingDrawSeen(&output.output_bound, &output.output_bound_frame,
+                                                  &output.output_bound_transfer_slot, &output.output_bound_fence_b,
+                                                  &output.lighting_draw_seen, falcom_world::g_state.frame.load(),
+                                                  output.output_frame, output.output_transfer_slot,
+                                                  output.output_fence_b);
+  }
   const auto& frame = falcom_world::rtgi::g_rtgi_frame;
   if (!frame.producing || frame.dispatched_frame != dd->frame_index) return;
   auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
@@ -12290,6 +12383,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // RTGI after RTAO: it runs only on a frame where RTAO dispatched.
   RunRtgiInline(cmd_list);
   PrepareRtxdiSceneInline(cmd_list);
+  auto* lighting_device = cmd_list ? cmd_list->get_device() : nullptr;
+  BindRtxdiLocalOutput(cmd_list, lighting_device ? lighting_device->get_private_data<DeviceData>() : nullptr);
   // DLSS Ray Reconstruction guides: builds the RR guide buffers; the lighting output is not changed.
   RunRrGuidesInline(cmd_list);
   if (game_compute_state) {

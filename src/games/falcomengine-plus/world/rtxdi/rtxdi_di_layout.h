@@ -1,7 +1,10 @@
-#pragma once
+#ifndef FALCOM_WORLD_RTXDI_DI_LAYOUT_H_
+#define FALCOM_WORLD_RTXDI_DI_LAYOUT_H_
 
 #define RTXDI_FRAME_FLAG_SPATIAL_AFTER_INITIAL 1u
 
+#define RTXDI_DI_LIGHT_TYPE_POINT       1u
+#define RTXDI_DI_LIGHT_TYPE_SPOT        2u
 #define RTXDI_DI_STATUS_EMPTY           0u
 #define RTXDI_DI_STATUS_VISIBLE         1u
 #define RTXDI_DI_STATUS_BLOCKED         2u
@@ -63,3 +66,5 @@ RtxdiDiRawResult RtxdiDiMakeVisibleRawResult(float3 diffuse_radiance, float dist
   return result;
 }
 #endif
+
+#endif  // FALCOM_WORLD_RTXDI_DI_LAYOUT_H_

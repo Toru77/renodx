@@ -120,7 +120,11 @@ struct DiSnapshot {
   uint64_t output_fence_b = 0u, output_fence_c = 0u;
   int32_t output_scene_slot = -1, output_transfer_slot = -1;
   bool output_staged = false;
-  bool output_consumed = false;
+  bool output_bound = false;
+  uint32_t output_bound_frame = UINT32_MAX;
+  int32_t output_bound_transfer_slot = -1;
+  uint64_t output_bound_fence_b = 0u;
+  bool lighting_draw_seen = false;
   int32_t error = 0;
 };
 struct DiState {

@@ -1,6 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+
+#include "rtxdi_di_layout.h"
 
 namespace falcom_world::rtxdi {
 
@@ -56,6 +60,30 @@ enum class DiOutputGate { Ready,
                           StaleIdentity,
                           ConfigurationMismatch };
 
+inline bool ValidDiResolvedTuple(uint32_t status, uint32_t type, uint32_t light_index, uint32_t light_count,
+                                 float inverse_pdf) {
+  return (status == RTXDI_DI_STATUS_VISIBLE || status == RTXDI_DI_STATUS_BLOCKED)
+         && (type == RTXDI_DI_LIGHT_TYPE_POINT || type == RTXDI_DI_LIGHT_TYPE_SPOT) && light_index < light_count && std::isfinite(inverse_pdf)
+         && inverse_pdf > 0.f;
+}
+
+inline bool DiTileContainsLight(const int32_t* indices, uint32_t count, uint32_t light_index) {
+  if (!indices) return false;
+  const uint32_t capped_count = (std::min)(count, 63u);
+  for (uint32_t i = 0u; i < capped_count; ++i) {
+    if (indices[i] >= 0 && static_cast<uint32_t>(indices[i]) == light_index) return true;
+  }
+  return false;
+}
+
+inline bool ValidDiResolvedMembership(uint32_t type, uint32_t light_index, const int32_t* point_indices,
+                                      uint32_t point_count, const int32_t* spot_indices, uint32_t spot_count) {
+  const bool in_point_list = DiTileContainsLight(point_indices, point_count, light_index);
+  const bool in_spot_list = DiTileContainsLight(spot_indices, spot_count, light_index);
+  return type == RTXDI_DI_LIGHT_TYPE_POINT ? (in_point_list && !in_spot_list)
+                                           : type == RTXDI_DI_LIGHT_TYPE_SPOT && (in_spot_list && !in_point_list);
+}
+
 struct DiOutputIdentity {
   uint32_t requested_frame = UINT32_MAX, output_frame = UINT32_MAX;
   uint64_t requested_owner_generation = 0u, output_owner_generation = 0u;
@@ -88,6 +116,29 @@ inline DiOutputGate CheckDiOutputIdentity(const DiOutputIdentity& output) {
 
 inline bool CanReuseDiOutput(bool staged, uint64_t consumer_fence_c, uint64_t completed_fence_c) {
   return !staged || (consumer_fence_c != 0u && completed_fence_c != UINT64_MAX && completed_fence_c >= consumer_fence_c);
+}
+
+inline bool IsCurrentDiLightingDrawBinding(bool output_bound, uint32_t bound_frame, int32_t bound_slot,
+                                           uint64_t bound_fence, uint32_t current_frame, uint32_t output_frame,
+                                           int32_t output_slot, uint64_t output_fence) {
+  return output_bound && bound_frame == current_frame && bound_frame == output_frame && bound_slot >= 0
+         && bound_slot == output_slot && bound_fence != 0u && bound_fence == output_fence;
+}
+
+inline bool RecordDiLightingDrawSeen(bool* output_bound, uint32_t* bound_frame, int32_t* bound_slot,
+                                     uint64_t* bound_fence, bool* lighting_draw_seen, uint32_t current_frame,
+                                     uint32_t output_frame, int32_t output_slot, uint64_t output_fence) {
+  if (!output_bound || !bound_frame || !bound_slot || !bound_fence || !lighting_draw_seen) return false;
+  const bool matching_binding = IsCurrentDiLightingDrawBinding(*output_bound, *bound_frame, *bound_slot, *bound_fence,
+                                                               current_frame, output_frame, output_slot, output_fence);
+  *lighting_draw_seen = matching_binding;
+  if (!matching_binding) {
+    *output_bound = false;
+    *bound_frame = UINT32_MAX;
+    *bound_slot = -1;
+    *bound_fence = 0u;
+  }
+  return matching_binding;
 }
 
 struct DiHistoryIdentity {

@@ -450,6 +450,14 @@ inline void DisableMirror() {
 // A failure that ends the DXR path for the session (switch OFF and ON again recreates it).
 inline void FailSession(Rt12State& s, Rt12Reason reason, const char* stage, HRESULT hr = E_FAIL) {
   s.failed = true;
+  {
+    std::unique_lock lock(rtxdi::g_di.mutex);
+    rtxdi::g_di.snapshot.output_bound = false;
+    rtxdi::g_di.snapshot.output_bound_frame = UINT32_MAX;
+    rtxdi::g_di.snapshot.output_bound_transfer_slot = -1;
+    rtxdi::g_di.snapshot.output_bound_fence_b = 0u;
+    rtxdi::g_di.snapshot.lighting_draw_seen = false;
+  }
   DisableMirror();
   renodx::utils::log::w("[world-rt12] failed at ", stage, " hr=", renodx::utils::log::AsHex(static_cast<uint32_t>(hr)));
   UpdatePanel([reason, stage, hr](Rt12Panel& p) {
@@ -878,6 +886,14 @@ inline bool WaitRt12Fence(Rt12State& s, uint64_t value, uint32_t ms) {
 // Stops the DXR path. A stuck scene is leaked on purpose (the GPU may still touch it).
 inline void TeardownRt12(const char* why) {
   if (!g_rt12) return;
+  {
+    std::unique_lock lock(rtxdi::g_di.mutex);
+    rtxdi::g_di.snapshot.output_bound = false;
+    rtxdi::g_di.snapshot.output_bound_frame = UINT32_MAX;
+    rtxdi::g_di.snapshot.output_bound_transfer_slot = -1;
+    rtxdi::g_di.snapshot.output_bound_fence_b = 0u;
+    rtxdi::g_di.snapshot.lighting_draw_seen = false;
+  }
   g_rt12_gc_scene = {};
   {
     std::lock_guard lock(g_rt12_mirror.mutex);

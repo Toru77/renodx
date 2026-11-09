@@ -144,6 +144,9 @@ int main() {
   using falcom_world::rtxdi::DiSignalDisposition;
   using falcom_world::rtxdi::DiSubmissionGate;
   using falcom_world::rtxdi::DiSubmissionIdentity;
+  using falcom_world::rtxdi::DiTileContainsLight;
+  using falcom_world::rtxdi::ValidDiResolvedMembership;
+  using falcom_world::rtxdi::ValidDiResolvedTuple;
   const DiSubmissionIdentity di_identity = {.requested_frame = 8u,
                                             .transfer_frame = 8u,
                                             .requested_generation = 3u,
@@ -238,6 +241,65 @@ int main() {
       || CanReuseDiOutput(true, 0u, 100u) || CanReuseDiOutput(true, 27u, 26u)
       || CanReuseDiOutput(true, 27u, std::numeric_limits<uint64_t>::max())
       || !CanReuseDiOutput(true, 27u, 27u) || !CanReuseDiOutput(false, 0u, 0u)) return EXIT_FAILURE;
+
+  bool output_bound = true;
+  bool lighting_draw_seen = false;
+  uint32_t bound_frame = 41u;
+  int32_t bound_slot = 1;
+  uint64_t bound_fence = 22u;
+  if (!output_bound || lighting_draw_seen) return EXIT_FAILURE;
+  falcom_world::rtxdi::RecordDiLightingDrawSeen(&output_bound, &bound_frame, &bound_slot, &bound_fence,
+                                                &lighting_draw_seen, 41u, 41u, 1, 22u);
+  if (!output_bound || !lighting_draw_seen) return EXIT_FAILURE;
+  // Callback evidence is independent of per-pixel tuple acceptance, including character-only or all-invalid draws.
+  bool character_only_bound = true, character_only_seen = false;
+  uint32_t character_only_frame = 41u;
+  int32_t character_only_slot = 1;
+  uint64_t character_only_fence = 22u;
+  bool all_invalid_bound = true, all_invalid_seen = false;
+  uint32_t all_invalid_frame = 41u;
+  int32_t all_invalid_slot = 1;
+  uint64_t all_invalid_fence = 22u;
+  bool stale_frame_bound = true, stale_frame_seen = false;
+  uint32_t stale_frame_id = 41u;
+  int32_t stale_frame_slot = 1;
+  uint64_t stale_frame_fence = 22u;
+  bool stale_slot_bound = true, stale_slot_seen = false;
+  uint32_t stale_slot_frame = 41u;
+  int32_t stale_slot_id = 1;
+  uint64_t stale_slot_fence = 22u;
+  falcom_world::rtxdi::RecordDiLightingDrawSeen(&character_only_bound, &character_only_frame, &character_only_slot,
+                                                &character_only_fence, &character_only_seen, 41u, 41u, 1, 22u);
+  falcom_world::rtxdi::RecordDiLightingDrawSeen(&all_invalid_bound, &all_invalid_frame, &all_invalid_slot,
+                                                &all_invalid_fence, &all_invalid_seen, 41u, 41u, 1, 22u);
+  falcom_world::rtxdi::RecordDiLightingDrawSeen(&stale_frame_bound, &stale_frame_id, &stale_frame_slot,
+                                                &stale_frame_fence, &stale_frame_seen, 42u, 41u, 1, 22u);
+  falcom_world::rtxdi::RecordDiLightingDrawSeen(&stale_slot_bound, &stale_slot_frame, &stale_slot_id,
+                                                &stale_slot_fence, &stale_slot_seen, 41u, 41u, 2, 22u);
+  if (!character_only_bound || !character_only_seen || !all_invalid_bound || !all_invalid_seen || stale_frame_bound
+      || stale_frame_seen || stale_slot_bound || stale_slot_seen) return EXIT_FAILURE;
+
+  const std::array<int32_t, 64> di_point_indices = [] {
+    std::array<int32_t, 64> indices = {};
+    indices.fill(-1);
+    indices[0] = 7;
+    indices[62] = 19;
+    indices[63] = 23;
+    return indices;
+  }();
+  const std::array<int32_t, 2> di_spot_indices = {11, 19};
+  if (!ValidDiResolvedTuple(RTXDI_DI_STATUS_VISIBLE, 1u, 7u, 24u, 0.5f)
+      || !ValidDiResolvedTuple(RTXDI_DI_STATUS_BLOCKED, 2u, 11u, 24u, 1.f)
+      || ValidDiResolvedTuple(RTXDI_DI_STATUS_UNKNOWN, 1u, 7u, 24u, 0.5f)
+      || ValidDiResolvedTuple(RTXDI_DI_STATUS_VISIBLE, 3u, 7u, 24u, 0.5f)
+      || ValidDiResolvedTuple(RTXDI_DI_STATUS_VISIBLE, 1u, 24u, 24u, 0.5f)
+      || ValidDiResolvedTuple(RTXDI_DI_STATUS_VISIBLE, 1u, 7u, 24u, 0.f)
+      || ValidDiResolvedTuple(RTXDI_DI_STATUS_VISIBLE, 1u, 7u, 24u, std::numeric_limits<float>::infinity())
+      || !ValidDiResolvedMembership(1u, 7u, di_point_indices.data(), 63u, di_spot_indices.data(), 2u)
+      || !DiTileContainsLight(di_point_indices.data(), 64u, 19u)
+      || DiTileContainsLight(di_point_indices.data(), 63u, 23u)
+      || ValidDiResolvedMembership(1u, 19u, di_point_indices.data(), 64u, di_spot_indices.data(), 2u)
+      || !ValidDiResolvedMembership(2u, 11u, di_point_indices.data(), 64u, di_spot_indices.data(), 2u)) return EXIT_FAILURE;
 
   using falcom_world::AlphaUvRangeStatus;
   using falcom_world::rtxdi::CanReuseScene;

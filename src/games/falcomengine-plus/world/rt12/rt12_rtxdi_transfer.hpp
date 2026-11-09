@@ -800,7 +800,11 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                             .output_scene_slot = slot.output_scene_slot,
                             .output_transfer_slot = slot.output_transfer_slot,
                             .output_staged = slot.output_staged,
-                            .output_consumed = false,
+                            .output_bound = false,
+                            .output_bound_frame = UINT32_MAX,
+                            .output_bound_transfer_slot = -1,
+                            .output_bound_fence_b = 0u,
+                            .lighting_draw_seen = false,
                             .error = error};
     return status;
   };
