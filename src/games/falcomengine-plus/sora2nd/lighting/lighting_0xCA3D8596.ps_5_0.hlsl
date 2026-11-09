@@ -691,7 +691,52 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     // RT Local Shadows on characters (world/rtls): add the game's point and spot lamp light (charaColor) times RTLS
     // visibility and the RT coverage, so it fades out with the RT range. Flag clear: charColor unchanged.
     const uint rtlsCharFlags = (uint)shader_injection_data.rtls_flags;
-    if ((rtlsCharFlags & (RTLS_FLAG_BOUND | RTLS_FLAG_CHARACTER)) == (RTLS_FLAG_BOUND | RTLS_FLAG_CHARACTER)) {
+    bool rtxdiCharResolved = false;
+    if (shader_injection_data.rtxdi_local_bound > 0.5f) {
+      uint resolvedWidth, resolvedHeight, tileCount, tileStride, lightCount, lightStride;
+      rtxdiResolvedLocal_g.GetDimensions(resolvedWidth, resolvedHeight);
+      lightIndices_g.GetDimensions(tileCount, tileStride);
+      dynamicLights_g.GetDimensions(lightCount, lightStride);
+      const uint2 pixel = (uint2)v0.xy;
+      const float2 tilePosition = lightTileSizeInv_g.xy * v0.xy;
+      if (all(isfinite(tilePosition)) && all(lightTileSizeInv_g.xy > 0.0)
+          && pixel.x < resolvedWidth && pixel.y < resolvedHeight
+          && tilePosition.x >= 0.0 && tilePosition.y >= 0.0 && tilePosition.x < 32.0 && tilePosition.y < 18.0) {
+        const uint2 tile = (uint2)tilePosition;
+        const uint tileBase = tile.x + (tile.y << 5u);
+        if (tileBase < tileCount) {
+          const float tileDepthInv = lightIndices_g[tileBase].tileDepthInv;
+          if (isfinite(tileDepthInv) && tileDepthInv >= 0.0 && isfinite(r1.w) && -r1.w > 0.0) {
+            const float depthSliceValue = tileDepthInv * -r1.w;
+            if (isfinite(depthSliceValue)) {
+              const uint depthSlice = (uint)clamp(depthSliceValue, 0.0, 7.0);
+              const uint tileCell = min(4607u, depthSlice * 576u + tileBase);
+              if (tileCell < tileCount) {
+                const uint4 resolvedTuple = rtxdiResolvedLocal_g.Load(int3(pixel, 0));
+                const LightIndexData tileData = lightIndices_g[tileCell];
+                const RtxdiLightingSelection selection =
+                    RtxdiResolveLightingSelection(true, resolvedTuple, lightCount, tileData);
+                if (selection.valid) {
+                  if (selection.status == RTXDI_DI_STATUS_BLOCKED) {
+                    rtxdiCharResolved = true;
+                  } else {
+                    const LightParam lamp = dynamicLights_g[selection.index];
+                    const RtxdiCharacterLightResult characterLight =
+                        RtxdiEvaluateCharacterLight(selection, lamp, r4.xyz, DecodeFalcomMrtNormalAsGame((uint2)r1.xy));
+                    if (characterLight.resolved) {
+                      charColor += r0.xyz * characterLight.diffuse;
+                      rtxdiCharResolved = true;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if (!rtxdiCharResolved
+        && (rtlsCharFlags & (RTLS_FLAG_BOUND | RTLS_FLAG_CHARACTER)) == (RTLS_FLAG_BOUND | RTLS_FLAG_CHARACTER)) {
       const float3 rtlsCharTerm = rtlsTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;
       if (rtlsCharTerm.z > 0.0) {
         const float rtlsCharPointVis = rtlsCharTerm.z
@@ -699,12 +744,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         const float rtlsCharSpotVis = rtlsCharTerm.z
             - min(rtlsCharTerm.y * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening * rtlsCharTerm.z);
         const float3 rtlsCharN = DecodeFalcomMrtNormalAsGame((uint2)r1.xy);
-        // Tile cell as the environment path computes it (lines 829-840): screen tile, then depth slice from r1.w.
+        // Tile cell and depth slice match the environment path; the pixel branch above also bounds-checks these indices.
         const uint2 rtlsTile = (uint2)(lightTileSizeInv_g.xy * v0.xy);
         const uint rtlsRow = rtlsTile.y << 5;
         const uint rtlsSlice = (uint)clamp(lightIndices_g[rtlsTile.x + rtlsRow].tileDepthInv * -r1.w, 0.0, 7.0);
         const uint rtlsCell = min(4607u, rtlsSlice * 576u + rtlsRow + rtlsTile.x);
-        // One loop over the point list, then the spot list (the environment loops' formulas).
         const uint rtlsPoints = (rtlsCharFlags & RTLS_FLAG_POINT) != 0u ? min(63u, lightIndices_g[rtlsCell].pointLightCount) : 0u;
         const uint rtlsSpots = (rtlsCharFlags & RTLS_FLAG_SPOT) != 0u ? min(63u, lightIndices_g[rtlsCell].spotLightCount) : 0u;
         float3 rtlsLamp = float3(0, 0, 0);

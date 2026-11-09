@@ -86,13 +86,27 @@ bool RtxdiTileContainsLight(uint tile_cell, uint light_index, uint type, bool pr
 
 RAB_Surface RtxdiMakeRABSurface(RtxdiSurfaceResult surface, uint2 pixel, bool previous) {
   RAB_Surface result = RAB_EmptySurface();
-  if ((surface.flags & RTXDI_SURFACE_FLAG_VALID) == 0u
-      || (previous ? g_prev_deferred_count : g_deferred_count) == 0u) return result;
+  if ((surface.flags & RTXDI_SURFACE_FLAG_VALID) == 0u) return result;
+  const bool character = (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u;
+  result.world_position = surface.world_position;
+  result.shading_normal = surface.shading_normal;
+  result.view_direction = surface.view_direction;
+  result.linear_view_depth = surface.linear_view_depth;
+  result.flags = surface.flags;
+  result.material = character ? 0x80000000u : 0u;
+  result.pixel = pixel;
+  result.previous = previous ? 1u : 0u;
+  result.tile_valid = RtxdiGetLightTileCell(pixel, surface.linear_view_depth, previous, result.tile_cell) ? 1u : 0u;
+  if (character) return result;
+
+  if ((previous ? g_prev_deferred_count : g_deferred_count) == 0u) return RAB_EmptySurface();
   uint material_count, material_stride;
   if (previous) g_rtxdi_prev_deferred.GetDimensions(material_count, material_stride);
   else g_rtxdi_deferred.GetDimensions(material_count, material_stride);
   const uint material_index = (previous ? g_rtxdi_prev_mrt2.Load(int3(pixel, 0)).x : g_rtxdi_mrt2.Load(int3(pixel, 0)).x);
-  if (material_index >= (previous ? g_prev_deferred_count : g_deferred_count) || material_index >= material_count) return result;
+  if (material_index >= (previous ? g_prev_deferred_count : g_deferred_count) || material_index >= material_count) {
+    return RAB_EmptySurface();
+  }
   GameDeferredParam deferred;
   if (previous) deferred = g_rtxdi_prev_deferred[material_index];
   else deferred = g_rtxdi_deferred[material_index];
@@ -100,18 +114,10 @@ RAB_Surface RtxdiMakeRABSurface(RtxdiSurfaceResult surface, uint2 pixel, bool pr
   const float gloss_x = (packed_gloss & 31u) / 31.0;
   const float gloss_y = ((packed_gloss >> 5u) & 31u) / 31.0;
   const float material_glossiness = lerp(lerp(deferred.mid.x, deferred.mid.y, gloss_x), deferred.mid.z, gloss_y);
-  if (!all(isfinite(deferred.mid.xyz)) || !isfinite(material_glossiness)) return result;
-  result.world_position = surface.world_position;
-  result.shading_normal = surface.shading_normal;
-  result.view_direction = surface.view_direction;
-  result.linear_view_depth = surface.linear_view_depth;
+  if (!all(isfinite(deferred.mid.xyz)) || !isfinite(material_glossiness)) return RAB_EmptySurface();
   result.material_glossiness = material_glossiness;
-  result.flags = surface.flags;
-  result.material = material_index | (((surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u) ? 0x80000000u : 0u);
-  result.pixel = pixel;
-  result.previous = previous ? 1u : 0u;
+  result.material = material_index;
   result.has_local_specular = (asuint(deferred.tail[3].z) & 2u) != 0u ? 1u : 0u;
-  result.tile_valid = RtxdiGetLightTileCell(pixel, surface.linear_view_depth, previous, result.tile_cell) ? 1u : 0u;
   return result;
 }
 
@@ -202,7 +208,8 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
   const bool character = (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u;
   const float3 lamp_color = character ? info.lamp.charaColor : info.lamp.color;
   const float3 radiance = max(lamp_color, 0.0) * (attenuation * spot);
-  if (!isfinite(attenuation) || !isfinite(spot) || !isfinite(cosine) || !all(isfinite(radiance))) return sample;
+  if (!all(isfinite(lamp_color)) || !isfinite(attenuation) || !isfinite(spot) || !isfinite(cosine)
+      || !all(isfinite(radiance))) return sample;
   sample.position = info.lamp.pos;
   sample.direction = direction;
   sample.distance = distance;

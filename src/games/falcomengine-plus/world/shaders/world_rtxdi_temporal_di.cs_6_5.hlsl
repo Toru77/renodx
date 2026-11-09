@@ -101,6 +101,46 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     return;
   }
 
+  // The pinned DI temporal pass tests depth and normal but has no material
+  // similarity setting. Mirror its 9-trial search with a copied RNG, and reject
+  // before the SDK call if its first acceptable history surface has a different
+  // material/class. Leave the real RNG untouched so the SDK repeats the same
+  // jitter and candidate sequence.
+  RTXDI_RandomSamplerState probe_rng = RTXDI_InitRandomSampler(pixel, g_runtime.frameIndex, 3u);
+  float2 probe_motion = motion_xy;
+  if (!g_di.temporalResamplingParams.enablePermutationSampling) {
+    probe_motion += float2(RTXDI_GetNextRandom(probe_rng), RTXDI_GetNextRandom(probe_rng)) - 0.5;
+  }
+  const int2 probe_prev_pos = int2(round(float2(pixel) + probe_motion));
+  const float radius = g_runtime.activeCheckerboardField == 0u ? 4.0 : 8.0;
+  int2 probe_candidate_pixel = int2(-1, -1);
+  for (int i = 0; i < 9; ++i) {
+    int2 offset = int2(0, 0);
+    if (i > 0) {
+      offset.x = int((RTXDI_GetNextRandom(probe_rng) - 0.5) * radius);
+      offset.y = int((RTXDI_GetNextRandom(probe_rng) - 0.5) * radius);
+    }
+    int2 candidate_pixel = probe_prev_pos + offset;
+    if (g_di.temporalResamplingParams.enablePermutationSampling && i == 0) {
+      RTXDI_ApplyPermutationSampling(candidate_pixel, g_di.temporalResamplingParams.uniformRandomNumber);
+    }
+    RTXDI_ActivateCheckerboardPixel(candidate_pixel, true, g_runtime.activeCheckerboardField);
+    const RAB_Surface previous_surface = RAB_GetGBufferSurface(candidate_pixel, true);
+    if (!RAB_IsSurfaceValid(previous_surface)
+        || !RTXDI_IsValidNeighbor(RAB_GetSurfaceNormal(surface), RAB_GetSurfaceNormal(previous_surface),
+                                  previous_depth, RAB_GetSurfaceLinearDepth(previous_surface),
+                                  g_di.temporalResamplingParams.normalThreshold,
+                                  g_di.temporalResamplingParams.depthThreshold)) continue;
+
+    probe_candidate_pixel = candidate_pixel;
+    if (!RAB_AreMaterialsSimilar(RAB_GetMaterial(surface), RAB_GetMaterial(previous_surface))) {
+      RTXDI_StoreDIReservoir(current, g_di.reservoirBufferParams, pixel,
+                             g_di.bufferIndices.temporalResamplingOutputBufferIndex);
+      return;
+    }
+    break;
+  }
+
   RTXDI_RandomSamplerState rng = RTXDI_InitRandomSampler(pixel, g_runtime.frameIndex, 3u);
   RAB_LightSample selected = RAB_EmptyLightSample();
   int2 temporal_sample_pixel = int2(-1, -1);
@@ -108,6 +148,12 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
       pixel, surface, current, rng, g_runtime, g_di.reservoirBufferParams,
       float3(motion_xy, depth_delta), g_di.bufferIndices.temporalResamplingInputBufferIndex,
       g_di.temporalResamplingParams, temporal_sample_pixel, selected);
+  if (all(temporal_sample_pixel >= 0) && all(probe_candidate_pixel >= 0)
+      && any(temporal_sample_pixel != probe_candidate_pixel)) {
+    RTXDI_StoreDIReservoir(current, g_di.reservoirBufferParams, pixel,
+                           g_di.bufferIndices.temporalResamplingOutputBufferIndex);
+    return;
+  }
   RTXDI_StoreDIReservoir(temporal, g_di.reservoirBufferParams, pixel,
                          g_di.bufferIndices.temporalResamplingOutputBufferIndex);
 }

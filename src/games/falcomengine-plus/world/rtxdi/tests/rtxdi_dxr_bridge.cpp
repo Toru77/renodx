@@ -18,9 +18,9 @@
 #include "../rtxdi_frame_parameters.h"
 #include "../rtxdi_input_layout.h"
 #include "../rtxdi_surface_layout.h"
+#include "rtxdi_lighting_consumer_contract.h"
 #include "rtxdi_raw_guard_contract.h"
 #include "rtxdi_surface_contract.h"
-#include "rtxdi_lighting_consumer_contract.h"
 #include "world_rtxdi_classify_lights.h"
 #include "world_rtxdi_initial_di.h"
 #include "world_rtxdi_spatial_di.h"
@@ -129,6 +129,9 @@ struct LightingConsumerResult {
   float environment_sun_visibility;
   float character_sun_multiplier;
   uint32_t padding;
+  uint32_t character_mode;
+  uint32_t character_type;
+  float character_term;
 };
 static_assert(sizeof(WorldMeshGPU) == 64);
 static_assert(sizeof(WorldInstanceGPU) == 192);
@@ -139,7 +142,7 @@ static_assert(sizeof(RtxdiLightParam) == RTXDI_INPUT_LIGHT_STRIDE);
 static_assert(sizeof(RtxdiTileData) == RTXDI_INPUT_TILE_STRIDE);
 static_assert(sizeof(DeferredParam) == RTXDI_INPUT_DEFERRED_STRIDE);
 static_assert(sizeof(LightingConsumerCase) == 648u);
-static_assert(sizeof(LightingConsumerResult) == 48u);
+static_assert(sizeof(LightingConsumerResult) == 60u);
 
 bool Check(HRESULT hr, const char* operation) {
   if (FAILED(hr)) std::fprintf(stderr, "FAIL DXR %s: HRESULT 0x%08lx\n", operation, static_cast<unsigned long>(hr));
@@ -1684,7 +1687,7 @@ int RunRtxdiDxrBridge() {
         }
         if (!compatibility_only && expected_light_index >= 0
             && (raw[pixel].selected_light_index != static_cast<UINT>(expected_light_index)
-                || raw[pixel].selected_light_type != (expected_light_index == 1 ? 2u : 1u)
+                || raw[pixel].selected_light_type != read_types[static_cast<size_t>(expected_light_index)]
                 || !std::isfinite(raw[pixel].inverse_pdf) || raw[pixel].inverse_pdf <= 0.0f)) {
           std::fprintf(stderr, "FAIL %s raw sample metadata pixel=%u index=%u type=%u inv_pdf=%g\n", label, pixel,
                        raw[pixel].selected_light_index, raw[pixel].selected_light_type, raw[pixel].inverse_pdf);
@@ -2360,6 +2363,84 @@ int RunRtxdiDxrBridge() {
   if (!run_di(4u, 4u, true, RTXDI_DI_STATUS_EMPTY, RTXDI_DI_REASON_INVALID_SURFACE, -1,
               "RTXDI invalid receiver empty reservoirs", false, 1u, true)) return 1;
 
+  depths.fill(0.5f);
+  auto environment_normals = normal_pixels;
+  for (UINT i = 0u; i < 6u; ++i) environment_normals[i * 4u + 3u] = 8u;
+  auto character_normals = environment_normals;
+  for (UINT i = 0u; i < 6u; ++i) character_normals[i * 4u + 3u] = 0u;
+  lights[0].color[0] = 0.0f;
+  lights[0].chara_color[0] = 4.0f;
+  lights[0].chara_color[1] = 1.0f;
+  if (!update_pixel_texture(depth_tex.Get(), depth_upload.Get(), depths.data(), 3u * sizeof(float))
+      || !update_pixel_texture(normal_tex.Get(), normal_upload.Get(), character_normals.data(), 3u * 16u)
+      || !update_pixel_texture(prev_normal_tex.Get(), prev_normal_upload.Get(), environment_normals.data(), 3u * 16u)
+      || !update_upload(light_upload.Get(), lights.data(), sizeof(lights))) return 1;
+  float character_target_pdf = 0.0f;
+  float character_raw_diffuse = 0.0f;
+  float character_inverse_pdf = 0.0f;
+  if (!run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+              "RTXDI character surface accepts no deferred material and samples charaColor", true, 0u, false, 0u,
+              false, false, false, false, true, false, &character_target_pdf, nullptr, nullptr,
+              &character_raw_diffuse, &character_inverse_pdf)
+      || !std::isfinite(character_target_pdf) || character_target_pdf <= 0.0f
+      || !std::isfinite(character_raw_diffuse) || character_raw_diffuse <= 0.0f
+      || !std::isfinite(character_inverse_pdf) || character_inverse_pdf <= 0.0f) {
+    std::fprintf(stderr, "FAIL character no-material DI target=%g raw=%g inversePdf=%g\n", character_target_pdf,
+                 character_raw_diffuse, character_inverse_pdf);
+    return 1;
+  }
+  std::printf("PASS RTXDI character DI accepts zero deferred rows and uses charaColor with no specular proposal\n");
+  if (!run_di(0u, 1u, true, RTXDI_DI_STATUS_BLOCKED, RTXDI_DI_REASON_NONE, 0,
+              "RTXDI character DI opaque blocker", false, 0u, false)
+      || !run_di(4u, 1u, false, RTXDI_DI_STATUS_UNKNOWN, RTXDI_DI_REASON_TRUNCATED, 0,
+                 "RTXDI character DI incomplete coverage", false, 0u, false)) return 1;
+
+  const auto saved_point_tile_records = tile_records;
+  for (auto& tile_record : tile_records) {
+    tile_record.point_count = 0u;
+    tile_record.spot_count = 0u;
+    std::fill(std::begin(tile_record.spot_indices), std::end(tile_record.spot_indices), -1);
+  }
+  tile_records[0].spot_indices[0] = 0;
+  tile_records[0].spot_count = 1u;
+  if (!update_upload(tile_upload.Get(), tile_records.data(), tile_records.size() * sizeof(RtxdiTileData))
+      || !run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+                 "RTXDI character spot uses charaColor", false, 0u, false)) return 1;
+  tile_records = saved_point_tile_records;
+  lights[0].color[0] = 8.0f;
+  if (!update_upload(tile_upload.Get(), tile_records.data(), tile_records.size() * sizeof(RtxdiTileData))
+      || !update_upload(light_upload.Get(), lights.data(), sizeof(lights))) return 1;
+
+  auto mixed_class_normals = environment_normals;
+  mixed_class_normals[3u] = 0u;
+  if (!update_pixel_texture(normal_tex.Get(), normal_upload.Get(), mixed_class_normals.data(), 3u * 16u)) return 1;
+  UINT mixed_class_spatial_m = 0u;
+  if (!run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+              "RTXDI spatial resampling rejects character/environment class mismatch", false, 1u, true, 1u,
+              false, false, false, false, true, false, nullptr, &mixed_class_spatial_m)
+      || mixed_class_spatial_m != 1u) return 1;
+  UINT mixed_class_temporal_m = 0u;
+  prepare_temporal_frame();
+  const bool mixed_class_temporal_ok = seed_temporal_history_light(0u)
+                                       && run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+                                                 "RTXDI temporal resampling rejects character/environment class mismatch",
+                                                 false, 1u, false, 0u, false, true, true, false, true, false, nullptr,
+                                                 &mixed_class_temporal_m);
+  if (!mixed_class_temporal_ok || mixed_class_temporal_m != 1u) return 1;
+  const auto reverse_class_normals = character_normals;
+  if (!update_pixel_texture(normal_tex.Get(), normal_upload.Get(), environment_normals.data(), 3u * 16u)
+      || !update_pixel_texture(prev_normal_tex.Get(), prev_normal_upload.Get(), reverse_class_normals.data(),
+                               3u * 16u)) return 1;
+  UINT reverse_class_temporal_m = 0u;
+  prepare_temporal_frame();
+  if (!seed_temporal_history_light(0u)
+      || !run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+                 "RTXDI temporal rejects character in jittered previous candidate neighborhood", false, 1u,
+                 false, 0u, false, true, true, false, true, false, nullptr, &reverse_class_temporal_m)
+      || reverse_class_temporal_m != 1u) return 1;
+  if (!update_pixel_texture(normal_tex.Get(), normal_upload.Get(), mixed_class_normals.data(), 3u * 16u)
+      || !update_pixel_texture(prev_normal_tex.Get(), prev_normal_upload.Get(), environment_normals.data(),
+                               3u * 16u)) return 1;
   D3D12_RESOURCE_BARRIER raw_guard_barrier = {};
   raw_guard_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
   raw_guard_barrier.Transition.pResource = di_raw.Get();
@@ -2410,7 +2491,7 @@ int RunRtxdiDxrBridge() {
   }
   std::printf("PASS finite-input raw overflow sanitizer writes UNKNOWN and zero diffuse\n");
 
-  constexpr uint32_t lighting_case_count = 8u;
+  constexpr uint32_t lighting_case_count = 9u;
   std::array<LightingConsumerCase, lighting_case_count> lighting_cases = {};
   for (LightingConsumerCase& test_case : lighting_cases) {
     test_case.light_count = 16u;
@@ -2458,6 +2539,7 @@ int RunRtxdiDxrBridge() {
   lighting_cases[6].original_spot_count = 0u;
   lighting_cases[7] = lighting_cases[1];
   lighting_cases[7].tuple[1] = 3u;
+  lighting_cases[8] = lighting_cases[3];
   lighting_cases[0].sun_bound = 1u;
   lighting_cases[0].sun_status = RTXDI_SUN_STATUS_VISIBLE;
   lighting_cases[1].sun_bound = 1u;
@@ -2477,6 +2559,7 @@ int RunRtxdiDxrBridge() {
     test_case.padding2 = 0.f;
     std::fill(std::begin(test_case.tile.probe_indices), std::end(test_case.tile.probe_indices), -1);
   }
+  for (UINT i = 0u; i < 8u; ++i) lighting_cases[i].padding[0] = 1u;
 
   ComPtr<ID3D12Resource> lighting_input, lighting_output, lighting_readback;
   if (!UploadBuffer(device.Get(), lighting_cases.data(), sizeof(lighting_cases), &lighting_input)
@@ -2580,8 +2663,18 @@ int RunRtxdiDxrBridge() {
       && lighting_results[3].sun_known == 0u && lighting_results[3].environment_sun_visibility == 0.65f
       && lighting_results[3].character_sun_multiplier == 1.f
       && lighting_results[4].sun_known == 0u && lighting_results[4].environment_sun_visibility == 0.2f;
+  const bool character_contract_ok =
+      lighting_results[0].character_mode == 1u && lighting_results[0].character_type == RTXDI_DI_LIGHT_TYPE_POINT
+      && std::abs(lighting_results[0].character_term - 0.375f) < 1e-6f
+      && lighting_results[1].character_mode == 1u && lighting_results[1].character_type == RTXDI_DI_LIGHT_TYPE_SPOT
+      && std::abs(lighting_results[1].character_term - 0.5625f) < 1e-6f
+      && lighting_results[2].character_mode == 2u && lighting_results[2].character_term == 0.f
+      && lighting_results[3].character_mode == 3u && std::abs(lighting_results[3].character_term - 0.25f) < 1e-6f
+      && lighting_results[4].character_mode == 3u && lighting_results[5].character_mode == 3u
+      && lighting_results[6].character_mode == 3u && lighting_results[7].character_mode == 3u
+      && lighting_results[8].character_mode == 0u && lighting_results[8].character_term == 0.f;
   lighting_readback->Unmap(0u, nullptr);
-  if (!lighting_contract_ok) {
+  if (!lighting_contract_ok || !character_contract_ok) {
     std::fprintf(stderr, "FAIL lighting consumer GPU contract point=(%u,%u,%g,%g) spot=(%u,%u,%g,%g) fallback=%u/%u blocked=%u\n",
                  lighting_results[0].point_count, lighting_results[0].spot_count, lighting_results[0].raw_local_term,
                  lighting_results[0].shaded_local_term, lighting_results[1].point_count, lighting_results[1].spot_count,
@@ -2590,6 +2683,7 @@ int RunRtxdiDxrBridge() {
     return 1;
   }
   std::printf("PASS production lighting selection helper point/spot/blocked/unknown/unbound/invalid fallback; post-material application once\n");
+  std::printf("PASS character local DI point/spot charaColor, blocked suppression, unknown/empty/invalid RTLS fallback without double-add\n");
   std::printf("PASS RTXDI sun consumer helper visible/blocked/unknown/unbound/malformed; CSM and character fallback preserved\n");
   if (!ValidateDebugMessages(info_queue.Get())) return 1;
   std::printf("PASS production surface + DXR visibility (3x2, guard sentinel, masks incl. FORCE_OPAQUE, endpoint, coverage, scene/surface invalids, bias, alpha)\n");

@@ -34,6 +34,9 @@ struct LightingConsumerResult
   float environment_sun_visibility;
   float character_sun_multiplier;
   uint padding;
+  uint character_mode;
+  uint character_type;
+  float character_term;
 };
 
 StructuredBuffer<LightingConsumerCase> g_cases : register(t0);
@@ -64,6 +67,20 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
                                               ? input.lamp_radiance
                                               : 0.0;
 
+  LightParam character_lamp = (LightParam)0;
+  character_lamp.pos = float3(0.0, 0.0, 1.0);
+  character_lamp.radius = 4.0;
+  character_lamp.radiusInv = 0.25;
+  character_lamp.charaColor = input.base_color;
+  character_lamp.attenuation = 1.0;
+  character_lamp.vec = float3(0.0, 0.0, 1.0);
+  character_lamp.spotAngleInv = 1.0;
+  character_lamp.attenuationAngle = 1.0;
+  character_lamp.translucency = 0.0;
+  const RtxdiCharacterLightResult character_selection =
+      RtxdiEvaluateCharacterLight(selection, character_lamp, float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 1.0));
+  const bool character_fallback = !character_selection.resolved && input.padding[0] != 0u;
+
   LightingConsumerResult result;
   result.mode = visible ? 1u : blocked ? 2u : 0u;
   result.point_count = point_count;
@@ -78,5 +95,14 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
   result.environment_sun_visibility = sun_selection.known ? sun_selection.visibility : input.csm_visibility;
   result.character_sun_multiplier = sun_selection.known ? sun_selection.visibility : 1.0;
   result.padding = 0u;
+  result.character_mode = character_selection.resolved
+                              ? (selection.status == RTXDI_DI_STATUS_VISIBLE ? 1u : 2u)
+                              : character_fallback ? 3u : 0u;
+  result.character_type = character_selection.resolved && selection.status == RTXDI_DI_STATUS_VISIBLE
+                              ? selection.type
+                              : 0u;
+  result.character_term = character_selection.resolved ? character_selection.diffuse.x
+                            : character_fallback ? input.base_color
+                                                 : 0.0;
   g_results[index] = result;
 }

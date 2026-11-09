@@ -19,6 +19,12 @@ struct RtxdiSunLightingSelection
   float visibility;
 };
 
+struct RtxdiCharacterLightResult
+{
+  bool resolved;
+  float3 diffuse;
+};
+
 RtxdiSunLightingSelection RtxdiResolveSunLightingSelection(bool bound, uint status)
 {
   RtxdiSunLightingSelection result = (RtxdiSunLightingSelection)0;
@@ -57,6 +63,46 @@ RtxdiLightingSelection RtxdiResolveLightingSelection(bool bound, uint4 tuple, ui
   }
   result.valid = result.type == RTXDI_DI_LIGHT_TYPE_POINT ? (in_point_list && !in_spot_list)
                                                            : (in_spot_list && !in_point_list);
+  return result;
+}
+
+RtxdiCharacterLightResult RtxdiEvaluateCharacterLight(RtxdiLightingSelection selection, LightParam lamp,
+                                                       float3 world_position, float3 normal)
+{
+  RtxdiCharacterLightResult result = (RtxdiCharacterLightResult)0;
+  if (!selection.valid) return result;
+  if ((selection.status != RTXDI_DI_STATUS_VISIBLE && selection.status != RTXDI_DI_STATUS_BLOCKED)
+      || !all(isfinite(float4(world_position, 1.0))) || !all(isfinite(float4(normal, 0.0)))
+      || !all(isfinite(float4(lamp.pos, lamp.radius))) || !all(isfinite(float4(lamp.charaColor, lamp.radiusInv)))
+      || !all(isfinite(float4(lamp.vec, lamp.spotAngleInv))) || !isfinite(lamp.attenuation)
+      || !isfinite(lamp.attenuationAngle) || !isfinite(lamp.translucency)
+      || lamp.radius <= 0.0 || lamp.radiusInv <= 0.0
+      || (selection.type == RTXDI_DI_LIGHT_TYPE_SPOT
+          && (lamp.spotAngleInv <= 0.0 || lamp.attenuationAngle < 0.0 || dot(lamp.vec, lamp.vec) <= 1e-12)))
+  {
+    return result;
+  }
+  if (selection.status == RTXDI_DI_STATUS_BLOCKED)
+  {
+    result.resolved = true;
+    return result;
+  }
+
+  const float3 to_lamp = lamp.pos - world_position;
+  const float distance_squared = dot(to_lamp, to_lamp);
+  if (!all(isfinite(to_lamp)) || !isfinite(distance_squared) || distance_squared <= 1e-12) return result;
+  const float3 light_direction = to_lamp * rsqrt(distance_squared);
+  const float attenuation = LampDistanceAttenuation(lamp, to_lamp);
+  const float cone = selection.type == RTXDI_DI_LIGHT_TYPE_SPOT ? LampSpotCone(lamp, light_direction) : 1.0;
+  const float lit = max(lamp.translucency, dot(normal, light_direction));
+  const float3 diffuse = lamp.charaColor * (attenuation * cone * lit * selection.inverse_pdf);
+  if (!all(isfinite(light_direction)) || !isfinite(attenuation) || !isfinite(cone) || !isfinite(lit)
+      || !all(isfinite(diffuse)))
+  {
+    return result;
+  }
+  result.resolved = true;
+  result.diffuse = diffuse;
   return result;
 }
 
