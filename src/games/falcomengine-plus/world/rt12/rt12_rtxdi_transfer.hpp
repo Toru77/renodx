@@ -1360,7 +1360,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       }
       D3D12_DESCRIPTOR_HEAP_DESC heap = {};
       heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-      heap.NumDescriptors = 39u;
+      heap.NumDescriptors = 40u;
       heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
       if (ok) {
         allocation_error = s.device12->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&candidate.descriptors));
@@ -2270,8 +2270,10 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
         case rtxdi::DiStatus::WaitingInput: reason = rtxdi::DiagnosticReason::MissingInput; break;
         case rtxdi::DiStatus::ZeroLights:   reason = rtxdi::DiagnosticReason::MissingInput; break;
         case rtxdi::DiStatus::Busy:         reason = rtxdi::DiagnosticReason::Busy; break;
-        case rtxdi::DiStatus::Failed:       reason = error == E_INVALIDARG ? rtxdi::DiagnosticReason::ConfigurationMismatch
-                                                                     : rtxdi::DiagnosticReason::SubmitFailed; break;
+        case rtxdi::DiStatus::Failed:
+          reason = error == E_INVALIDARG ? rtxdi::DiagnosticReason::ConfigurationMismatch
+                                         : rtxdi::DiagnosticReason::SubmitFailed;
+          break;
         case rtxdi::DiStatus::Quarantined: reason = rtxdi::DiagnosticReason::Quarantined; break;
       }
       rtxdi::RecordDiagnostic(diagnostics, diagnostic_epoch,
@@ -2392,6 +2394,33 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   s.di.frame.parameters.width = in.width;
   s.di.frame.parameters.height = in.height;
   s.di.frame.parameters.history_valid = history_valid ? 1u : 0u;
+  bool diag_armed = diagnostic_enabled && !slot.diag_pending && in.frame >= transfer.diag_next_frame;
+  if (diag_armed) {
+    if (!transfer.diag_zero) {
+      void* zero_bytes = nullptr;
+      const D3D12_RANGE no_reads = {0u, 0u};
+      if (FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_UPLOAD, RTXDI_DIAG_COUNTER_BYTES,
+                                  D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE, transfer.diag_zero))
+          || FAILED(transfer.diag_zero->Map(0u, &no_reads, &zero_bytes)) || zero_bytes == nullptr) {
+        transfer.diag_zero.Reset();
+      } else {
+        std::memset(zero_bytes, 0, RTXDI_DIAG_COUNTER_BYTES);
+        transfer.diag_zero->Unmap(0u, nullptr);
+      }
+    }
+    if (!slot.diag_counters
+        && FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, RTXDI_DIAG_COUNTER_BYTES,
+                                   D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, slot.diag_counters))) {
+      slot.diag_counters.Reset();
+    }
+    if (!slot.diag_readback
+        && FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_READBACK, RTXDI_DIAG_COUNTER_BYTES,
+                                   D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, slot.diag_readback))) {
+      slot.diag_readback.Reset();
+    }
+    diag_armed = transfer.diag_zero && slot.diag_counters && slot.diag_readback;
+  }
+  if (diag_armed) s.di.frame.parameters.flags |= RTXDI_FRAME_FLAG_DIAGNOSTICS;
   s.di.frame.parameters.lights.localLightBufferRegion = {0u, light_count, 0u, 0u};
   s.di.frame.parameters.lights.infiniteLightBufferRegion = {};
   s.di.frame.parameters.lights.environmentLightParams = {};
@@ -2441,7 +2470,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     transfer.classify_pso = std::move(pso);
   }
   if (!transfer.initial_di_root || !transfer.initial_di_pso || !transfer.temporal_di_pso || !transfer.spatial_di_pso) {
-    D3D12_DESCRIPTOR_RANGE ranges[11] = {};
+    D3D12_DESCRIPTOR_RANGE ranges[12] = {};
     const auto set_range = [&](uint32_t index, D3D12_DESCRIPTOR_RANGE_TYPE type, uint32_t count,
                                uint32_t shader_register, uint32_t offset) {
       ranges[index].RangeType = type;
@@ -2460,6 +2489,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     set_range(8u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2u, 43u, 31u);
     set_range(9u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 45u, 35u);
     set_range(10u, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3u, 3u, 36u);
+    set_range(11u, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1u, 6u, 39u);
     D3D12_ROOT_PARAMETER params[4] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.Num32BitValues = 17u;
@@ -2467,7 +2497,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[1].Descriptor.ShaderRegister = 1u;
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[2].DescriptorTable.NumDescriptorRanges = 11u;
+    params[2].DescriptorTable.NumDescriptorRanges = 12u;
     params[2].DescriptorTable.pDescriptorRanges = ranges;
     params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[3].Constants.Num32BitValues = 8u;
@@ -2647,11 +2677,24 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     write_texture_uav(37u, slot.n1_specular.texture12.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
     write_texture_uav(38u, slot.n1_status.texture12.Get(), DXGI_FORMAT_R32_UINT);
   }
+  D3D12_UNORDERED_ACCESS_VIEW_DESC diag_view = {};
+  diag_view.Format = DXGI_FORMAT_R32_TYPELESS;
+  diag_view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  diag_view.Buffer.NumElements = RTXDI_DIAG_COUNTER_COUNT;
+  diag_view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+  native->CreateUnorderedAccessView(diag_armed ? slot.diag_counters.Get() : nullptr, nullptr, &diag_view, cpu_at(39u));
 
   ID3D12DescriptorHeap* heaps[] = {slot.di_descriptors.Get()};
   transfer.di_list->SetDescriptorHeaps(1u, heaps);
   std::vector<D3D12_RESOURCE_BARRIER> barriers;
   barriers.reserve(32u);
+  if (diag_armed) {
+    Transition(barriers, slot.diag_counters.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    transfer.di_list->CopyBufferRegion(slot.diag_counters.Get(), 0u, transfer.diag_zero.Get(), 0u, RTXDI_DIAG_COUNTER_BYTES);
+    barriers.clear();
+    Transition(barriers, slot.diag_counters.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
   Transition(barriers, slot.tiles_buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   for (ID3D12Resource* resource : {slot.light_types.Get()}) {
     Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3248,7 +3291,14 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
   }
+  if (diag_armed) Transition(barriers, slot.diag_counters.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
   transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  if (diag_armed) {
+    transfer.di_list->CopyBufferRegion(slot.diag_readback.Get(), 0u, slot.diag_counters.Get(), 0u, RTXDI_DIAG_COUNTER_BYTES);
+    barriers.clear();
+    Transition(barriers, slot.diag_counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  }
   if (perf_timing) {
     transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3u);
     transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u, 2u,
@@ -3293,6 +3343,16 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     slot.perf_valid_mask |= 2u;
     if (perf_distance_recorded) slot.perf_valid_mask |= 4u;
     if (perf_nrd_recorded) slot.perf_valid_mask |= 8u;
+  }
+  if (diag_armed) {
+    slot.diag_pending = true;
+    slot.diag_fence = di_fence;
+    slot.diag_frame = in.frame;
+    slot.diag_epoch = diagnostic_epoch;
+    slot.diag_flags = (n1_ready ? RTXDI_DIAG_SAMPLE_N1 : 0u) | (in.effective_settings.spatial_enabled ? RTXDI_DIAG_SAMPLE_SPATIAL : 0u)
+                      | (history_valid && in.effective_settings.temporal_enabled ? RTXDI_DIAG_SAMPLE_TEMPORAL : 0u)
+                      | (history_valid ? RTXDI_DIAG_SAMPLE_HISTORY : 0u);
+    transfer.diag_next_frame = in.frame + 30u;
   }
 #if defined(FALCOM_NRD_ENABLED)
   if (nrd_probe_recorded) {

@@ -7,6 +7,7 @@
 
 #include "world_rt12_trace.hlsli"
 #include "world_rt_lamps.hlsli"
+#include "world_rtxdi_lighting_consumer.hlsli"
 #include "world_rtxdi_surface.hlsli"
 #include "../rtxdi/rtxdi_di_layout.h"
 #include <Rtxdi/DI/ReSTIRDIParameters.h>
@@ -64,9 +65,15 @@ cbuffer RtxdiFrameParameters : register(b1) {
   RTXDI_Parameters g_di;
 };
 
+#include "world_rtxdi_diag.hlsli"
 #include "world_rtxdi_light_bridge.hlsli"
 #include <Rtxdi/DI/SpatialResampling.hlsli>
 #include <Rtxdi/DI/ReservoirStorage.hlsli>
+
+void RtxdiDiagCountEmptyTuple(uint reason_counter) {
+  RtxdiDiagAdd(RTXDI_DIAG_TUPLE_STATUS_BASE + RTXDI_DI_STATUS_EMPTY, 1u);
+  RtxdiDiagAdd(reason_counter, 1u);
+}
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID) {
@@ -82,15 +89,26 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   g_rtxdi_resolved_output[pixel] = uint4(0xffffffffu, 0u, RTXDI_DI_STATUS_EMPTY, 0u);
 
   RAB_Surface surface = RAB_GetGBufferSurface(int2(pixel), false);
-  if (!RAB_IsSurfaceValid(surface)) {
+  const uint surface_reason = g_rtxdi_surface_diag;
+  const bool surface_valid = RAB_IsSurfaceValid(surface);
+  RtxdiDiagAdd(RTXDI_DIAG_SURFACE_PIXELS, 1u);
+  RtxdiDiagAdd(RTXDI_DIAG_SURFACE_VALID, surface_valid);
+  RtxdiDiagAdd(RTXDI_DIAG_SURFACE_CHARACTER, surface_valid && (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u);
+  RtxdiDiagAdd(RTXDI_DIAG_SURFACE_TILE_INVALID, surface_valid && surface.tile_valid == 0u);
+  [unroll]
+  for (uint reason = 1u; reason <= RTXDI_DIAG_SURFACE_REASON_MATERIAL_NONFINITE; ++reason)
+    RtxdiDiagAdd(RTXDI_DIAG_SURFACE_REASON_BASE + reason, !surface_valid && surface_reason == reason);
+  if (!surface_valid) {
     if (spatial_enabled) RTXDI_StoreDIReservoir(reservoir, g_di.reservoirBufferParams, pixel, g_di.bufferIndices.spatialResamplingOutputBufferIndex);
     g_rtxdi_raw[pixel_index] = raw;
+    RtxdiDiagCountEmptyTuple(RTXDI_DIAG_EMPTY_INVALID_SURFACE);
     return;
   }
   if (g_light_count == 0u) {
     raw.reason = RTXDI_DI_REASON_ZERO_LIGHTS;
     if (spatial_enabled) RTXDI_StoreDIReservoir(reservoir, g_di.reservoirBufferParams, pixel, g_di.bufferIndices.spatialResamplingOutputBufferIndex);
     g_rtxdi_raw[pixel_index] = raw;
+    RtxdiDiagCountEmptyTuple(RTXDI_DIAG_EMPTY_ZERO_LIGHTS);
     return;
   }
 
@@ -111,6 +129,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   if (!RTXDI_IsValidDIReservoir(final_reservoir) || !isfinite(final_reservoir.weightSum)
       || final_reservoir.weightSum <= 0.0) {
     g_rtxdi_raw[pixel_index] = raw;
+    RtxdiDiagCountEmptyTuple(RTXDI_DIAG_EMPTY_NO_RESERVOIR);
     return;
   }
   const uint selected_index = RTXDI_GetDIReservoirLightIndex(final_reservoir);
@@ -118,6 +137,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   selected_sample = RAB_SamplePolymorphicLight(selected_info, surface, RTXDI_GetDIReservoirSampleUV(final_reservoir));
   if (selected_sample.valid == 0u) {
     g_rtxdi_raw[pixel_index] = raw;
+    RtxdiDiagCountEmptyTuple(RTXDI_DIAG_EMPTY_SAMPLE_INVALID);
     return;
   }
   const float inverse_pdf = RTXDI_GetDIReservoirInvPdf(final_reservoir);
@@ -125,6 +145,21 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
                                                        g_environment_bias, g_character_bias, g_endpoint_clearance,
                                                        g_region_min, g_region_size, inverse_pdf);
   g_rtxdi_raw[pixel_index] = result;
-  g_rtxdi_resolved_output[pixel] = uint4(result.selected_light_index, result.selected_light_type, result.status,
-                                         asuint(result.inverse_pdf));
+  const uint4 tuple = uint4(result.selected_light_index, result.selected_light_type, result.status, asuint(result.inverse_pdf));
+  g_rtxdi_resolved_output[pixel] = tuple;
+  if ((g_frame_flags & RTXDI_FRAME_FLAG_DIAGNOSTICS) != 0u) {
+    [unroll]
+    for (uint status = RTXDI_DI_STATUS_EMPTY; status <= RTXDI_DI_STATUS_UNKNOWN; ++status)
+      RtxdiDiagAdd(RTXDI_DIAG_TUPLE_STATUS_BASE + status, result.status == status ? 1u : 0u);
+    RtxdiDiagAdd(RTXDI_DIAG_TUPLE_OTHER, result.status > RTXDI_DI_STATUS_UNKNOWN ? 1u : 0u);
+    [unroll]
+    for (uint reason = RTXDI_DI_REASON_NONE; reason <= RTXDI_DI_REASON_TRUNCATED; ++reason)
+      RtxdiDiagAdd(RTXDI_DIAG_UNKNOWN_REASON_BASE + reason,
+                   result.status == RTXDI_DI_STATUS_UNKNOWN && result.reason == reason ? 1u : 0u);
+    const bool tuple_known = result.status == RTXDI_DI_STATUS_VISIBLE || result.status == RTXDI_DI_STATUS_BLOCKED;
+    const bool consumer_valid = tuple_known && surface.tile_valid != 0u
+        && RtxdiResolveLightingSelection(true, tuple, g_light_count, g_rtxdi_tiles[surface.tile_cell]).valid;
+    RtxdiDiagAdd(RTXDI_DIAG_TUPLE_CONSUMER_VALID, consumer_valid ? 1u : 0u);
+    RtxdiDiagAdd(RTXDI_DIAG_TUPLE_CONSUMER_REJECT, tuple_known && !consumer_valid ? 1u : 0u);
+  }
 }

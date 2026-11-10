@@ -1,5 +1,9 @@
 #pragma once
 
+#include "../rtxdi/rtxdi_diag_layout.h"
+
+static uint g_rtxdi_surface_diag = RTXDI_DIAG_SURFACE_REASON_NONE;
+
 struct RAB_Surface {
   float3 world_position;
   float3 shading_normal;
@@ -99,12 +103,16 @@ RAB_Surface RtxdiMakeRABSurface(RtxdiSurfaceResult surface, uint2 pixel, bool pr
   result.tile_valid = RtxdiGetLightTileCell(pixel, surface.linear_view_depth, previous, result.tile_cell) ? 1u : 0u;
   if (character) return result;
 
-  if ((previous ? g_prev_deferred_count : g_deferred_count) == 0u) return RAB_EmptySurface();
+  if ((previous ? g_prev_deferred_count : g_deferred_count) == 0u) {
+    if (!previous) g_rtxdi_surface_diag = RTXDI_DIAG_SURFACE_REASON_NO_DEFERRED;
+    return RAB_EmptySurface();
+  }
   uint material_count, material_stride;
   if (previous) g_rtxdi_prev_deferred.GetDimensions(material_count, material_stride);
   else g_rtxdi_deferred.GetDimensions(material_count, material_stride);
   const uint material_index = (previous ? g_rtxdi_prev_mrt2.Load(int3(pixel, 0)).x : g_rtxdi_mrt2.Load(int3(pixel, 0)).x);
   if (material_index >= (previous ? g_prev_deferred_count : g_deferred_count) || material_index >= material_count) {
+    if (!previous) g_rtxdi_surface_diag = RTXDI_DIAG_SURFACE_REASON_MATERIAL_OOB;
     return RAB_EmptySurface();
   }
   GameDeferredParam deferred;
@@ -114,7 +122,10 @@ RAB_Surface RtxdiMakeRABSurface(RtxdiSurfaceResult surface, uint2 pixel, bool pr
   const float gloss_x = (packed_gloss & 31u) / 31.0;
   const float gloss_y = ((packed_gloss >> 5u) & 31u) / 31.0;
   const float material_glossiness = lerp(lerp(deferred.mid.x, deferred.mid.y, gloss_x), deferred.mid.z, gloss_y);
-  if (!all(isfinite(deferred.mid.xyz)) || !isfinite(material_glossiness)) return RAB_EmptySurface();
+  if (!all(isfinite(deferred.mid.xyz)) || !isfinite(material_glossiness)) {
+    if (!previous) g_rtxdi_surface_diag = RTXDI_DIAG_SURFACE_REASON_MATERIAL_NONFINITE;
+    return RAB_EmptySurface();
+  }
   result.material_glossiness = material_glossiness;
   result.material = material_index;
   result.has_local_specular = (asuint(deferred.tail[3].z) & 2u) != 0u ? 1u : 0u;
@@ -143,6 +154,7 @@ RAB_Surface RAB_GetGBufferSurface(int2 pixel, bool previous) {
   const RtxdiSurfaceResult reconstructed = RtxdiReconstructSurface(
       (previous ? g_rtxdi_prev_depth.Load(int3(pixel_u, 0)) : g_rtxdi_depth.Load(int3(pixel_u, 0))),
       (previous ? g_rtxdi_prev_normal.Load(int3(pixel_u, 0)) : g_rtxdi_normal.Load(int3(pixel_u, 0))), pixel_u, dimensions, scene_rows);
+  if (!previous) g_rtxdi_surface_diag = reconstructed.rejection;
   return RtxdiMakeRABSurface(reconstructed, pixel_u, previous);
 }
 
@@ -155,9 +167,16 @@ RAB_LightInfo RAB_LoadLightInfo(uint light_index, bool previous) {
   uint type_count;
   if (previous) g_rtxdi_prev_light_types.GetDimensions(type_count, stride);
   else g_rtxdi_light_types.GetDimensions(type_count, stride);
+#if defined(RTXDI_DIAG_INITIAL_PASS)
+  RtxdiDiagAdd(RTXDI_DIAG_CAND_TRIED, previous ? 0u : 1u);
+#endif
   if (light_index >= (previous ? g_prev_light_count : g_light_count) || light_index >= light_count || light_index >= type_count) return info;
 
   const uint type = (previous ? g_rtxdi_prev_light_types[light_index] : g_rtxdi_light_types[light_index]);
+#if defined(RTXDI_DIAG_INITIAL_PASS)
+  RtxdiDiagAdd(RTXDI_DIAG_CAND_TYPE_NONE, !previous && type == 0u);
+  RtxdiDiagAdd(RTXDI_DIAG_CAND_TYPE_BOTH, !previous && type == (RTGI_LAMP_TYPE_POINT | RTGI_LAMP_TYPE_SPOT));
+#endif
   if (type != RTGI_LAMP_TYPE_POINT && type != RTGI_LAMP_TYPE_SPOT) return info;
   LightParam lamp;
   if (previous) lamp = g_rtxdi_prev_lights[light_index];
@@ -165,13 +184,26 @@ RAB_LightInfo RAB_LoadLightInfo(uint light_index, bool previous) {
   if (!all(isfinite(float4(lamp.pos, lamp.radius))) || !all(isfinite(float4(lamp.color, lamp.radiusInv)))
       || !all(isfinite(float4(lamp.vec, lamp.spotAngleInv))) || !isfinite(lamp.attenuation)
       || !isfinite(lamp.attenuationAngle) || !isfinite(lamp.specularIntensity) || !isfinite(lamp.specularGlossiness)
-      || !isfinite(lamp.translucency) || lamp.radius <= 0.0 || lamp.radiusInv <= 0.0) return info;
+      || !isfinite(lamp.translucency) || lamp.radius <= 0.0 || lamp.radiusInv <= 0.0) {
+#if defined(RTXDI_DIAG_INITIAL_PASS)
+    RtxdiDiagAdd(RTXDI_DIAG_CAND_LAMP_INVALID, previous ? 0u : 1u);
+#endif
+    return info;
+  }
   if (type == RTGI_LAMP_TYPE_SPOT && (lamp.spotAngleInv <= 0.0 || lamp.attenuationAngle < 0.0
-                                      || dot(lamp.vec, lamp.vec) <= 1e-12)) return info;
+                                      || dot(lamp.vec, lamp.vec) <= 1e-12)) {
+#if defined(RTXDI_DIAG_INITIAL_PASS)
+    RtxdiDiagAdd(RTXDI_DIAG_CAND_LAMP_INVALID, previous ? 0u : 1u);
+#endif
+    return info;
+  }
   info.lamp = lamp;
   info.light_index = light_index;
   info.type = type;
   info.valid = 1u;
+#if defined(RTXDI_DIAG_INITIAL_PASS)
+  RtxdiDiagAdd(RTXDI_DIAG_CAND_INFO_VALID, previous ? 0u : 1u);
+#endif
   return info;
 }
 
@@ -224,6 +256,16 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
 }
 
 float RAB_GetLightSampleTargetPdfForSurface(RAB_LightSample sample, RAB_Surface surface) {
+#if defined(RTXDI_DIAG_INITIAL_PASS)
+  if ((g_frame_flags & RTXDI_FRAME_FLAG_DIAGNOSTICS) != 0u) {
+    const bool diag_sample = sample.valid != 0u && RAB_IsSurfaceValid(surface);
+    const bool diag_tile = diag_sample && surface.tile_valid != 0u;
+    RtxdiDiagAdd(RTXDI_DIAG_CAND_SAMPLE_VALID, diag_sample);
+    RtxdiDiagAdd(RTXDI_DIAG_CAND_TILE_VALID, diag_tile);
+    RtxdiDiagAdd(RTXDI_DIAG_CAND_IN_TILE,
+                 diag_tile && RtxdiTileContainsLight(surface.tile_cell, sample.light_index, sample.type, surface.previous != 0u));
+  }
+#endif
   if (sample.valid == 0u || !RAB_IsSurfaceValid(surface) || surface.tile_valid == 0u
       || !RtxdiTileContainsLight(surface.tile_cell, sample.light_index, sample.type, surface.previous != 0u)) return 0.0;
   const float lit = max(max(0.0, dot(surface.shading_normal, sample.direction)), sample.translucency);
@@ -242,7 +284,11 @@ float RAB_GetLightSampleTargetPdfForSurface(RAB_LightSample sample, RAB_Surface 
     // Preserve proposal support for grazing GGX lobes; this floor is never emitted as raw energy.
     target = max(target, dot(sample.radiance, float3(0.2126, 0.7152, 0.0722)) * sample.specular_intensity * lit * 1e-6);
   }
-  return (isfinite(target) ? max(target, 0.0) : 0.0);
+  const float target_pdf = (isfinite(target) ? max(target, 0.0) : 0.0);
+#if defined(RTXDI_DIAG_INITIAL_PASS)
+  if ((g_frame_flags & RTXDI_FRAME_FLAG_DIAGNOSTICS) != 0u) RtxdiDiagAdd(RTXDI_DIAG_CAND_TARGET_NONZERO, target_pdf > 0.0);
+#endif
+  return target_pdf;
 }
 
 float RAB_LightSampleSolidAnglePdf(RAB_LightSample sample) { return 0.0; }

@@ -302,6 +302,10 @@ struct Rt12DiTransferSlot {
   uint32_t perf_frame = UINT32_MAX, perf_width = 0u, perf_height = 0u;
   uint8_t perf_valid_mask = 0u;
   bool perf_pending = false;
+  Microsoft::WRL::ComPtr<ID3D12Resource> diag_counters, diag_readback;
+  uint64_t diag_epoch = 0u, diag_fence = 0u;
+  uint32_t diag_frame = UINT32_MAX, diag_flags = 0u;
+  bool diag_pending = false;
   uint64_t output_b_fence = 0u, output_c_fence = 0u;
   uint64_t output_owner_generation = 0u, output_configuration_generation = 0u;
   uint64_t sun_configuration_generation = 0u;
@@ -356,6 +360,8 @@ struct Rt12DiTransferState {
   Microsoft::WRL::ComPtr<ID3D12RootSignature> debug_distance_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> debug_distance_pso;
 #endif
+  Microsoft::WRL::ComPtr<ID3D12Resource> diag_zero;
+  uint32_t diag_next_frame = 0u;
   uint64_t owner_generation = 0u, configuration_generation = 0u;
   uint64_t input_fence = 0u, scene_fence = 0u;
   uint32_t next_slot = 0u, input_frame = UINT32_MAX, attempted_frame = UINT32_MAX;
@@ -1867,6 +1873,24 @@ inline void OnPresent(reshade::api::device* device) {
       slot.perf_valid_mask = 0u;
       slot.perf_fence = 0u;
     }
+  }
+  for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {
+    if (!rtxdi::ClaimCompletedGpuTiming(&slot.diag_pending, s.completion_available, slot.diag_fence, completed)) continue;
+    std::array<uint32_t, RTXDI_DIAG_COUNTER_COUNT> counters = {};
+    bool read = false;
+    void* mapped = nullptr;
+    const D3D12_RANGE read_range = {0u, RTXDI_DIAG_COUNTER_BYTES};
+    if (slot.diag_readback && SUCCEEDED(slot.diag_readback->Map(0u, &read_range, &mapped)) && mapped != nullptr) {
+      std::memcpy(counters.data(), mapped, sizeof(counters));
+      const D3D12_RANGE written_range = {0u, 0u};
+      slot.diag_readback->Unmap(0u, &written_range);
+      read = true;
+    }
+    if (read) {
+      rtxdi::RecordDiagnosticGpuCounters(rtxdi::GetDiagnosticState(), slot.diag_epoch, slot.diag_frame, slot.diag_fence,
+                                         slot.diag_flags, counters);
+    }
+    slot.diag_fence = 0u;
   }
   if (s.completion_available && s.completion_pending) {
     const double progress_age_ms = Rt12ProgressAgeMs(s);

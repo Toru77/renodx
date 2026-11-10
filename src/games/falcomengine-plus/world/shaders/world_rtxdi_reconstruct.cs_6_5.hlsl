@@ -53,6 +53,7 @@ cbuffer RtxdiN1FramePrefix : register(b1) {
   uint g_frame_flags;
 };
 
+#include "world_rtxdi_diag.hlsli"
 #include "world_rtxdi_light_bridge.hlsli"
 
 Texture2D<uint4> g_rtxdi_mrt1 : register(t45);
@@ -98,6 +99,8 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
                             && g_n1_roughness_min >= 0.0 && g_n1_roughness_max >= g_n1_roughness_min
                             && g_n1_roughness_min <= 0.5 && g_n1_roughness_max >= 0.5
                             && g_n1_roughness_max <= 1.0;
+  RtxdiDiagAdd(RTXDI_DIAG_N1_PIXELS, 1u);
+  RtxdiDiagAdd(RTXDI_DIAG_N1_CONFIG_INVALID, config_valid ? 0u : 1u);
   float4 diffuse = 0.0;
   float4 specular = 0.0;
   uint status = RTXDI_N1_STATUS_INVALID;
@@ -153,6 +156,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
               g_rtxdi_n1_diffuse[pixel] = diffuse;
               g_rtxdi_n1_specular[pixel] = specular;
               g_rtxdi_n1_status[pixel] = RtxdiN1Status(RTXDI_N1_STATUS_INVALID, false, character);
+              RtxdiDiagAdd(RTXDI_DIAG_N1_STATUS_BASE + RTXDI_N1_STATUS_INVALID, 1u);
               return;
             }
             const float gloss = max(0.001, sample.specular_glossiness * surface.material_glossiness);
@@ -192,6 +196,8 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
             status = RTXDI_N1_STATUS_VISIBLE;
           }
         }
+      } else {
+        RtxdiDiagAdd(RTXDI_DIAG_N1_MEMBERSHIP_REJECT, 1u);
       }
     }
   }
@@ -200,4 +206,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   g_rtxdi_n1_diffuse[pixel] = diffuse;
   g_rtxdi_n1_specular[pixel] = specular;
   g_rtxdi_n1_status[pixel] = RtxdiN1Status(status, known, character);
+  [unroll]
+  for (uint n1_status = RTXDI_N1_STATUS_INVALID; n1_status <= RTXDI_N1_STATUS_EMPTY; ++n1_status)
+    RtxdiDiagAdd(RTXDI_DIAG_N1_STATUS_BASE + n1_status, status == n1_status);
 }

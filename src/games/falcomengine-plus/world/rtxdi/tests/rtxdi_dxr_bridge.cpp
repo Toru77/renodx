@@ -1551,7 +1551,7 @@ int RunRtxdiDxrBridge() {
 
   D3D12_DESCRIPTOR_HEAP_DESC di_heap_desc = {};
   di_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  di_heap_desc.NumDescriptors = 39u;
+  di_heap_desc.NumDescriptors = 40u;
   di_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   ComPtr<ID3D12DescriptorHeap> di_heap;
   if (!Check(device->CreateDescriptorHeap(&di_heap_desc, IID_PPV_ARGS(&di_heap)), "create initial DI heap")) return 1;
@@ -1632,6 +1632,12 @@ int RunRtxdiDxrBridge() {
   create_n1_texture_uav(36u, n1_diffuse.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
   create_n1_texture_uav(37u, n1_specular.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
   create_n1_texture_uav(38u, n1_status.Get(), DXGI_FORMAT_R32_UINT);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC diag_view = {};
+  diag_view.Format = DXGI_FORMAT_R32_TYPELESS;
+  diag_view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  diag_view.Buffer.NumElements = RTXDI_DIAG_COUNTER_COUNT;
+  diag_view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+  device->CreateUnorderedAccessView(nullptr, nullptr, &diag_view, di_cpu_at(39u));
   CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 31u, tile_upload.Get(), RTXDI_INPUT_MAX_TILES, sizeof(RtxdiTileData));
   CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 32u, tile_upload.Get(), RTXDI_INPUT_MAX_TILES, sizeof(RtxdiTileData));
 
@@ -1659,7 +1665,7 @@ int RunRtxdiDxrBridge() {
                 "create classifier root")
       || !CreatePso(device.Get(), classify_root.Get(), __world_rtxdi_classify_lights, &classify_pso)) return 1;
 
-  D3D12_DESCRIPTOR_RANGE di_ranges[11] = {};
+  D3D12_DESCRIPTOR_RANGE di_ranges[12] = {};
   di_ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4u, 0u, 0u, 0u};
   di_ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3u, 14u, 0u, 4u};
   di_ranges[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 6u, 17u, 0u, 7u};
@@ -1671,13 +1677,14 @@ int RunRtxdiDxrBridge() {
   di_ranges[8] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2u, 43u, 0u, 31u};
   di_ranges[9] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 45u, 0u, 35u};
   di_ranges[10] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3u, 3u, 0u, 36u};
+  di_ranges[11] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1u, 6u, 0u, 39u};
   D3D12_ROOT_PARAMETER di_params[4] = {};
   di_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   di_params[0].Constants.Num32BitValues = 17u;
   di_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   di_params[1].Descriptor.ShaderRegister = 1u;
   di_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  di_params[2].DescriptorTable.NumDescriptorRanges = 11u;
+  di_params[2].DescriptorTable.NumDescriptorRanges = 12u;
   di_params[2].DescriptorTable.pDescriptorRanges = di_ranges;
   di_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   di_params[3].Constants.Num32BitValues = 8u;

@@ -1,3 +1,4 @@
+#define RTXDI_DIAG_INITIAL_PASS 1
 #define RTXDI_ENABLE_PRESAMPLING 0
 #define RTXDI_LIGHT_RESERVOIR_BUFFER g_rtxdi_reservoirs
 #define RT12_TLAS_REGISTER t29
@@ -60,6 +61,7 @@ cbuffer RtxdiFrameParameters : register(b1) {
   RTXDI_Parameters g_di;
 };
 
+#include "world_rtxdi_diag.hlsli"
 #include "world_rtxdi_light_bridge.hlsli"
 #include <Rtxdi/DI/InitialSampling.hlsli>
 #include <Rtxdi/DI/ReservoirStorage.hlsli>
@@ -73,6 +75,24 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   if (any(dispatch_id.xy >= g_dimensions)) return;
   const uint2 pixel = dispatch_id.xy;
   const uint pixel_index = pixel.y * g_dimensions.x + pixel.x;
+  if ((g_frame_flags & RTXDI_FRAME_FLAG_DIAGNOSTICS) != 0u) {
+    const bool light_thread = pixel_index < g_light_count;
+    const uint light_type = light_thread ? g_rtxdi_light_types[pixel_index] : 0u;
+    const float light_radius = light_thread ? g_rtxdi_lights[pixel_index].radius : 0.0;
+    const bool radius_positive = light_thread && isfinite(light_radius) && light_radius > 0.0;
+    RtxdiDiagAdd(RTXDI_DIAG_LIGHT_TYPE_NONE, light_thread && light_type == 0u);
+    RtxdiDiagAdd(RTXDI_DIAG_LIGHT_TYPE_POINT, light_thread && light_type == RTGI_LAMP_TYPE_POINT);
+    RtxdiDiagAdd(RTXDI_DIAG_LIGHT_TYPE_SPOT, light_thread && light_type == RTGI_LAMP_TYPE_SPOT);
+    RtxdiDiagAdd(RTXDI_DIAG_LIGHT_TYPE_BOTH, light_thread && light_type == (RTGI_LAMP_TYPE_POINT | RTGI_LAMP_TYPE_SPOT));
+    RtxdiDiagAdd(RTXDI_DIAG_LIGHT_RADIUS_POSITIVE, radius_positive);
+    RtxdiDiagAdd(RTXDI_DIAG_LIGHT_TYPED_RADIUS_POSITIVE, radius_positive && light_type != 0u);
+    const bool tile_thread = pixel_index < g_tile_count;
+    const uint point_refs = tile_thread ? min(g_rtxdi_tiles[pixel_index].pointLightCount, 63u) : 0u;
+    const uint spot_refs = tile_thread ? min(g_rtxdi_tiles[pixel_index].spotLightCount, 63u) : 0u;
+    RtxdiDiagAdd(RTXDI_DIAG_TILE_CELLS_NONEMPTY, point_refs + spot_refs != 0u);
+    RtxdiDiagAdd(RTXDI_DIAG_TILE_POINT_REFS, point_refs);
+    RtxdiDiagAdd(RTXDI_DIAG_TILE_SPOT_REFS, spot_refs);
+  }
   RTXDI_DIReservoir reservoir = RTXDI_EmptyDIReservoir();
   RTXDI_StoreDIReservoir(reservoir, g_di.reservoirBufferParams, pixel, g_di.bufferIndices.initialSamplingOutputBufferIndex);
 
@@ -94,6 +114,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     return;
   }
 
+  RtxdiDiagAdd(RTXDI_DIAG_INITIAL_SURFACES, 1u);
   RTXDI_RandomSamplerState rng = RTXDI_InitRandomSampler(pixel, g_runtime.frameIndex, 0u);
   RTXDI_RandomSamplerState coherent_rng = RTXDI_InitRandomSampler(pixel, g_runtime.frameIndex, 1u);
   RAB_LightSample selected_sample = RAB_EmptyLightSample();
@@ -110,6 +131,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     RtxdiWriteInitialRaw(pixel_index, raw);
     return;
   }
+  RtxdiDiagAdd(RTXDI_DIAG_INITIAL_RESERVOIRS, 1u);
   RTXDI_StoreDIReservoir(reservoir, g_di.reservoirBufferParams, pixel, g_di.bufferIndices.initialSamplingOutputBufferIndex);
   if ((g_frame_flags & RTXDI_FRAME_FLAG_SPATIAL_AFTER_INITIAL) != 0u) return;
   RtxdiWriteInitialRaw(pixel_index,
