@@ -3270,10 +3270,15 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     slot.nrd.diffuse_publication_recorded = false;
     uint8_t publication_reason = 4u;
 #if defined(__world_rtxdi_nrd_publish_EMBED_FILE)
-    publication_reason = 1u;
-    if (nrd_dispatch_recorded && slot.nrd.diffuse_output_valid && slot.nrd.hit_validity
-        && slot.nrd_diffuse_publication.texture12 && slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST)].resource
-        && slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::IN_VIEWZ)].resource) {
+    const bool publication_out_diff = slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST)].resource != nullptr;
+    const bool publication_view_z = slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::IN_VIEWZ)].resource != nullptr;
+    publication_reason = !nrd_dispatch_recorded ? 1u
+                         : !slot.nrd.hit_validity ? 5u
+                         : !slot.nrd_diffuse_publication.texture12 ? 6u
+                         : !publication_out_diff ? 7u
+                         : !publication_view_z ? 8u
+                         : 0u;
+    if (publication_reason == 0u) {
       publication_reason = 2u;
       if (!transfer.nrd_publication_root || !transfer.nrd_publication_pso) {
         Rt12NrdCreateDiffusePublicationPipeline(s.device12.Get(), __world_rtxdi_nrd_publish.data(),
