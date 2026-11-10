@@ -47,10 +47,10 @@ void SetSceneRow(SurfaceSceneRows* rows, uint32_t row, const std::array<float, 4
   std::memcpy((*rows)[row].data(), values.data(), sizeof(values));
 }
 
-std::array<float, 4> TransformRowVector(const std::array<float, 4>& vector, const SurfaceSceneRows& rows, uint32_t first_row) {
+std::array<float, 4> TransformSceneRegisters(const std::array<float, 4>& vector, const SurfaceSceneRows& rows, uint32_t first_row) {
   std::array<float, 4> result = {};
-  for (uint32_t column = 0u; column < 4u; ++column) {
-    for (uint32_t row = 0u; row < 4u; ++row) result[column] += vector[row] * SceneFloat(rows, first_row + row, column);
+  for (uint32_t row = 0u; row < 4u; ++row) {
+    for (uint32_t column = 0u; column < 4u; ++column) result[row] += vector[column] * SceneFloat(rows, first_row + row, column);
   }
   return result;
 }
@@ -83,8 +83,8 @@ TestSurfaceResult ReconstructTestSurface(float raw_depth, const std::array<uint3
 
   const float u = (static_cast<float>(pixel_x) + 0.5f) / static_cast<float>(width);
   const float v = (static_cast<float>(pixel_y) + 0.5f) / static_cast<float>(height);
-  const auto world_h = TransformRowVector({u * 2.f - 1.f, 1.f - v * 2.f, raw_depth, 1.f}, scene_rows,
-                                          RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW);
+  const auto world_h = TransformSceneRegisters({u * 2.f - 1.f, 1.f - v * 2.f, raw_depth, 1.f}, scene_rows,
+                                               RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW);
   if (!std::isfinite(world_h[3]) || std::abs(world_h[3]) <= 1e-8f) return reject(RTXDI_SURFACE_REJECT_HOMOGENEOUS_W);
   if (!std::isfinite(world_h[0]) || !std::isfinite(world_h[1]) || !std::isfinite(world_h[2])) {
     return reject(RTXDI_SURFACE_REJECT_POSITION);
@@ -94,9 +94,9 @@ TestSurfaceResult ReconstructTestSurface(float raw_depth, const std::array<uint3
       || !std::isfinite(result.world_position[2])) return reject(RTXDI_SURFACE_REJECT_POSITION);
 
   const std::array<float, 3> camera = {
-      SceneFloat(scene_rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 3u, 0u),
-      SceneFloat(scene_rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 3u, 1u),
-      SceneFloat(scene_rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 3u, 2u)};
+      SceneFloat(scene_rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 0u, 3u),
+      SceneFloat(scene_rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 1u, 3u),
+      SceneFloat(scene_rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 2u, 3u)};
   std::array<float, 3> to_camera = {};
   float to_camera_length_squared = 0.f;
   for (uint32_t axis = 0u; axis < 3u; ++axis) {
@@ -110,8 +110,8 @@ TestSurfaceResult ReconstructTestSurface(float raw_depth, const std::array<uint3
   if (!std::isfinite(result.view_direction[0]) || !std::isfinite(result.view_direction[1])
       || !std::isfinite(result.view_direction[2])) return reject(RTXDI_SURFACE_REJECT_VIEW_DIRECTION);
 
-  const auto view_position = TransformRowVector({result.world_position[0], result.world_position[1], result.world_position[2], 1.f},
-                                                scene_rows, RTXDI_SURFACE_VIEW_ROW);
+  const auto view_position = TransformSceneRegisters({result.world_position[0], result.world_position[1], result.world_position[2], 1.f},
+                                                     scene_rows, RTXDI_SURFACE_VIEW_ROW);
   result.linear_view_depth = -view_position[2];
   if (!std::isfinite(result.linear_view_depth) || result.linear_view_depth <= 0.f) return reject(RTXDI_SURFACE_REJECT_VIEW_DEPTH);
   result.flags = RTXDI_SURFACE_FLAG_VALID;
@@ -121,15 +121,17 @@ TestSurfaceResult ReconstructTestSurface(float raw_depth, const std::array<uint3
 
 SurfaceSceneRows MakeSurfaceSceneRows() {
   SurfaceSceneRows rows = {};
-  SetSceneRow(&rows, RTXDI_SURFACE_VIEW_ROW + 0u, {0.f, 0.f, -1.f, 0.f});
-  SetSceneRow(&rows, RTXDI_SURFACE_VIEW_ROW + 1u, {0.f, 1.f, 0.f, 0.f});
-  SetSceneRow(&rows, RTXDI_SURFACE_VIEW_ROW + 2u, {1.f, 0.f, 0.f, 0.f});
-  SetSceneRow(&rows, RTXDI_SURFACE_VIEW_ROW + 3u, {-10.f, -2.f, 3.f, 1.f});
-  SetSceneRow(&rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 3u, {3.f, 2.f, 10.f, 1.f});
-  SetSceneRow(&rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 0u, {1.f, 0.f, 0.f, 0.f});
-  SetSceneRow(&rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 1u, {0.f, 1.f, 0.f, 0.f});
-  SetSceneRow(&rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 2u, {0.f, 0.f, -4.f, 0.f});
-  SetSceneRow(&rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 3u, {5.f, 2.f, 5.f, 1.f});
+  SetSceneRow(&rows, RTXDI_SURFACE_VIEW_ROW + 0u, {0.f, 0.f, 1.f, -10.f});
+  SetSceneRow(&rows, RTXDI_SURFACE_VIEW_ROW + 1u, {0.f, 1.f, 0.f, -2.f});
+  SetSceneRow(&rows, RTXDI_SURFACE_VIEW_ROW + 2u, {-1.f, 0.f, 0.f, 3.f});
+  SetSceneRow(&rows, RTXDI_SURFACE_VIEW_ROW + 3u, {0.f, 0.f, 0.f, 1.f});
+  SetSceneRow(&rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 0u, {0.f, 0.f, 0.f, 3.f});
+  SetSceneRow(&rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 1u, {0.f, 0.f, 0.f, 2.f});
+  SetSceneRow(&rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 2u, {0.f, 0.f, 0.f, 10.f});
+  SetSceneRow(&rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 0u, {1.f, 0.f, 0.f, 5.f});
+  SetSceneRow(&rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 1u, {0.f, 1.f, 0.f, 2.f});
+  SetSceneRow(&rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 2u, {0.f, 0.f, -4.f, 5.f});
+  SetSceneRow(&rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 3u, {0.f, 0.f, 0.f, 1.f});
   SetSceneRow(&rows, RTXDI_SURFACE_RESOLUTION_SCALING_ROW, {1.f, 1.f, 0.f, 0.f});
   return rows;
 }
@@ -1207,43 +1209,41 @@ int main() {
   invalid_normal[1] = 65536u;
   if (!expect_surface_rejection(0.5f, invalid_normal, 0u, 0u, 2u, 2u, surface_rows, RTXDI_SURFACE_REJECT_NORMAL)) return EXIT_FAILURE;
   invalid_surface_rows = surface_rows;
-  for (uint32_t row = 0u; row < 4u; ++row) {
-    auto values = std::array<float, 4>{SceneFloat(invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + row, 0u),
-                                       SceneFloat(invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + row, 1u),
-                                       SceneFloat(invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + row, 2u), 0.f};
-    SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + row, values);
-  }
+  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 3u, {0.f, 0.f, 0.f, 0.f});
   if (!expect_surface_rejection(0.5f, negative_z_non_character, 0u, 0u, 2u, 2u, invalid_surface_rows,
                                 RTXDI_SURFACE_REJECT_HOMOGENEOUS_W)) return EXIT_FAILURE;
   invalid_surface_rows = surface_rows;
   SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 3u,
-              {5.f, 2.f, 5.f, std::numeric_limits<float>::quiet_NaN()});
+              {0.f, 0.f, 0.f, std::numeric_limits<float>::quiet_NaN()});
   if (!expect_surface_rejection(0.5f, negative_z_non_character, 0u, 0u, 2u, 2u, invalid_surface_rows,
                                 RTXDI_SURFACE_REJECT_HOMOGENEOUS_W)) return EXIT_FAILURE;
   invalid_surface_rows = surface_rows;
-  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 3u,
-              {std::numeric_limits<float>::infinity(), 2.f, 5.f, 1.f});
+  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 0u,
+              {std::numeric_limits<float>::infinity(), 0.f, 0.f, 5.f});
   if (!expect_surface_rejection(0.5f, negative_z_non_character, 0u, 0u, 2u, 2u, invalid_surface_rows,
                                 RTXDI_SURFACE_REJECT_POSITION)) return EXIT_FAILURE;
   invalid_surface_rows = surface_rows;
-  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 3u, {3e38f, 2.f, 5.f, 1e-7f});
+  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 0u, {3e38f, 0.f, 0.f, 5.f});
+  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 3u, {0.f, 0.f, 0.f, 1e-7f});
   if (!expect_surface_rejection(0.5f, negative_z_non_character, 0u, 0u, 2u, 2u, invalid_surface_rows, RTXDI_SURFACE_REJECT_POSITION)) return EXIT_FAILURE;
   invalid_surface_rows = surface_rows;
-  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 3u,
-              {std::numeric_limits<float>::infinity(), 2.f, 10.f, 1.f});
+  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 0u,
+              {0.f, 0.f, 0.f, std::numeric_limits<float>::infinity()});
   if (!expect_surface_rejection(0.5f, negative_z_non_character, 0u, 0u, 2u, 2u, invalid_surface_rows,
                                 RTXDI_SURFACE_REJECT_VIEW_DIRECTION)) return EXIT_FAILURE;
   invalid_surface_rows = surface_rows;
-  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 3u, {4.5f, 2.5f, 3.f, 1.f});
+  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 0u, {0.f, 0.f, 0.f, 4.5f});
+  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 1u, {0.f, 0.f, 0.f, 2.5f});
+  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_INVERSE_VIEW_ROW + 2u, {0.f, 0.f, 0.f, 3.f});
   if (!expect_surface_rejection(0.5f, negative_z_non_character, 0u, 0u, 2u, 2u, invalid_surface_rows,
                                 RTXDI_SURFACE_REJECT_VIEW_DIRECTION)) return EXIT_FAILURE;
   invalid_surface_rows = surface_rows;
-  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_VIEW_ROW + 3u, {-10.f, -2.f, 5.f, 1.f});
+  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_VIEW_ROW + 2u, {-1.f, 0.f, 0.f, 5.f});
   if (!expect_surface_rejection(0.5f, negative_z_non_character, 0u, 0u, 2u, 2u, invalid_surface_rows,
                                 RTXDI_SURFACE_REJECT_VIEW_DEPTH)) return EXIT_FAILURE;
   invalid_surface_rows = surface_rows;
-  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_VIEW_ROW + 3u,
-              {-10.f, -2.f, std::numeric_limits<float>::infinity(), 1.f});
+  SetSceneRow(&invalid_surface_rows, RTXDI_SURFACE_VIEW_ROW + 2u,
+              {-1.f, 0.f, 0.f, std::numeric_limits<float>::infinity()});
   if (!expect_surface_rejection(0.5f, negative_z_non_character, 0u, 0u, 2u, 2u, invalid_surface_rows,
                                 RTXDI_SURFACE_REJECT_VIEW_DEPTH)) return EXIT_FAILURE;
   for (const auto dimensions : std::array{std::array<uint32_t, 2>{1, 1}, std::array<uint32_t, 2>{17, 33}}) {

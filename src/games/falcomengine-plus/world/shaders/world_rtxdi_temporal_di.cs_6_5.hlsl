@@ -95,7 +95,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
       asfloat(g_rtxdi_prev_scene.Load(int3(RTXDI_SURFACE_VIEW_ROW + 1u, 0, 0))),
       asfloat(g_rtxdi_prev_scene.Load(int3(RTXDI_SURFACE_VIEW_ROW + 2u, 0, 0))),
       asfloat(g_rtxdi_prev_scene.Load(int3(RTXDI_SURFACE_VIEW_ROW + 3u, 0, 0))));
-  const float previous_depth = -mul(float4(surface.world_position, 1.0), previous_view).z;
+  const float previous_depth = -mul(previous_view, float4(surface.world_position, 1.0)).z;
   const float depth_delta = previous_depth - surface.linear_view_depth;
   if (!all(isfinite(previous_view[0])) || !all(isfinite(previous_view[1]))
       || !all(isfinite(previous_view[2])) || !all(isfinite(previous_view[3]))

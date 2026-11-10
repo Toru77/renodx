@@ -38,12 +38,13 @@ RtxdiSurfaceResult RtxdiReconstructSurface(float raw_depth, uint4 mrt0, uint2 pi
 
   const float2 uv = (float2(pixel) + 0.5) / float2(internal_size);
   const float4 clip_position = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, raw_depth, 1.0);
+  // cb_scene matrices are column-major (register r + j is column j): the game's mul(v, M) is mul(M_registers, v) here.
   const float4x4 inverse_view_projection = float4x4(
       asfloat(scene_rows[RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 0u]),
       asfloat(scene_rows[RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 1u]),
       asfloat(scene_rows[RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 2u]),
       asfloat(scene_rows[RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 3u]));
-  const float4 world_h = mul(clip_position, inverse_view_projection);
+  const float4 world_h = mul(inverse_view_projection, clip_position);
   if (!isfinite(world_h.w) || abs(world_h.w) <= 1e-8) {
     return RtxdiRejectSurface(RTXDI_SURFACE_REJECT_HOMOGENEOUS_W);
   }
@@ -55,7 +56,9 @@ RtxdiSurfaceResult RtxdiReconstructSurface(float raw_depth, uint4 mrt0, uint2 pi
                                 asfloat(scene_rows[RTXDI_SURFACE_VIEW_ROW + 1u]),
                                 asfloat(scene_rows[RTXDI_SURFACE_VIEW_ROW + 2u]),
                                 asfloat(scene_rows[RTXDI_SURFACE_VIEW_ROW + 3u]));
-  const float3 camera = asfloat(scene_rows[RTXDI_SURFACE_INVERSE_VIEW_ROW + 3u]).xyz;
+  const float3 camera = float3(asfloat(scene_rows[RTXDI_SURFACE_INVERSE_VIEW_ROW + 0u].w),
+                               asfloat(scene_rows[RTXDI_SURFACE_INVERSE_VIEW_ROW + 1u].w),
+                               asfloat(scene_rows[RTXDI_SURFACE_INVERSE_VIEW_ROW + 2u].w));
   const float3 to_camera = camera - world_position;
   const float to_camera_length_squared = dot(to_camera, to_camera);
   if (!all(isfinite(camera)) || !isfinite(to_camera_length_squared) || to_camera_length_squared <= 1e-12) {
@@ -64,7 +67,7 @@ RtxdiSurfaceResult RtxdiReconstructSurface(float raw_depth, uint4 mrt0, uint2 pi
   const float3 view_direction = to_camera * rsqrt(to_camera_length_squared);
   if (!all(isfinite(view_direction))) return RtxdiRejectSurface(RTXDI_SURFACE_REJECT_VIEW_DIRECTION);
 
-  const float linear_view_depth = -mul(float4(world_position, 1.0), view).z;
+  const float linear_view_depth = -mul(view, float4(world_position, 1.0)).z;
   if (!isfinite(linear_view_depth) || linear_view_depth <= 0.0) {
     return RtxdiRejectSurface(RTXDI_SURFACE_REJECT_VIEW_DEPTH);
   }

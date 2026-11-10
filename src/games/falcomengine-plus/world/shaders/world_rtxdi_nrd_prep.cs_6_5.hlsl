@@ -58,11 +58,11 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
                                                     asfloat(g_scene.Load(int3(21, 0, 0))),
                                                     asfloat(g_scene.Load(int3(22, 0, 0))),
                                                     asfloat(g_scene.Load(int3(23, 0, 0))));
-  const float4 world_h = mul(clip, inverse_view_projection);
+  const float4 world_h = mul(inverse_view_projection, clip);
   const float3 world = world_h.xyz / world_h.w;
   const float4x4 view = float4x4(asfloat(g_scene.Load(int3(0, 0, 0))), asfloat(g_scene.Load(int3(1, 0, 0))),
                                  asfloat(g_scene.Load(int3(2, 0, 0))), asfloat(g_scene.Load(int3(3, 0, 0))));
-  const float viewz = -mul(float4(world, 1.0), view).z;
+  const float viewz = -mul(view, float4(world, 1.0)).z;
   const uint status = g_n1_status.Load(int3(pixel, 0));
   const uint pixel_index = pixel.y * g_dimensions.x + pixel.x;
   const float4 packed = g_n1_diffuse.Load(int3(pixel, 0));

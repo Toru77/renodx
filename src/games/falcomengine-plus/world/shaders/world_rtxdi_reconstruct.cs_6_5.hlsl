@@ -96,9 +96,9 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
                             && g_n1_diffuse_strength >= 0.0 && g_n1_diffuse_strength <= 2.0
                             && g_n1_specular_strength >= 0.0 && g_n1_specular_strength <= 2.0
                             && g_n1_specular_peak >= 0.0 && g_n1_specular_peak <= 16.0
-                            && g_n1_roughness_min >= 0.0 && g_n1_roughness_max >= g_n1_roughness_min
-                            && g_n1_roughness_min <= 0.5 && g_n1_roughness_max >= 0.5
-                            && g_n1_roughness_max <= 1.0;
+                            && g_n1_roughness_min >= 0.0 && g_n1_roughness_min <= 0.8
+                            && g_n1_roughness_max >= 0.2 && g_n1_roughness_max <= 1.0
+                            && g_n1_roughness_max >= g_n1_roughness_min;
   RtxdiDiagAdd(RTXDI_DIAG_N1_PIXELS, 1u);
   RtxdiDiagAdd(RTXDI_DIAG_N1_CONFIG_INVALID, config_valid ? 0u : 1u);
   float4 diffuse = 0.0;

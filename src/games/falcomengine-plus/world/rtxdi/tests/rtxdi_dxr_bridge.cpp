@@ -669,7 +669,7 @@ int RunRtxdiDxrBridge() {
   scene_pixels[RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW * 4 + 0] = std::bit_cast<uint32_t>(0.1f);
   scene_pixels[(RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 1) * 4 + 1] = std::bit_cast<uint32_t>(0.1f);
   scene_pixels[(RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 2) * 4 + 2] = std::bit_cast<uint32_t>(2.f);
-  scene_pixels[(RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 3) * 4 + 2] = std::bit_cast<uint32_t>(-2.f);
+  scene_pixels[(RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + 2) * 4 + 3] = std::bit_cast<uint32_t>(-2.f);
   scene_pixels[RTXDI_SURFACE_SUN_RESERVED_ROW * 4 + 2] = std::bit_cast<uint32_t>(-1.f);
   for (UINT channel = 0u; channel < 3u; ++channel) {
     scene_pixels[(RTXDI_SURFACE_SUN_RESERVED_ROW - 1u) * 4u + channel] = std::bit_cast<uint32_t>(1.f);
@@ -2854,7 +2854,7 @@ int RunRtxdiDxrBridge() {
   wait_context = "restore previous lights";
   if (!update_upload(previous_light_upload.Get(), lights.data(), sizeof(lights))) return 1;
 
-  previous_scene_pixels[(RTXDI_SURFACE_VIEW_ROW + 3u) * 4u + 2u] = std::bit_cast<uint32_t>(-0.5f);
+  previous_scene_pixels[(RTXDI_SURFACE_VIEW_ROW + 2u) * 4u + 3u] = std::bit_cast<uint32_t>(-0.5f);
   wait_context = "upload previous camera depth offset";
   if (!update_pixel_texture(prev_scene_tex.Get(), prev_scene_upload.Get(), previous_scene_pixels.data(),
                             RTXDI_SURFACE_SCENE_ROW_COUNT * 16u)) return 1;
@@ -2862,7 +2862,7 @@ int RunRtxdiDxrBridge() {
   if (!run_di(4u, 4u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
               "RTXDI temporal camera depth change rejects history", true, 1u, true, 0u,
               false, true, true, false)) return 1;
-  previous_scene_pixels[(RTXDI_SURFACE_VIEW_ROW + 3u) * 4u + 2u] = std::bit_cast<uint32_t>(0.0f);
+  previous_scene_pixels[(RTXDI_SURFACE_VIEW_ROW + 2u) * 4u + 3u] = std::bit_cast<uint32_t>(0.0f);
   wait_context = "restore previous camera";
   if (!update_pixel_texture(prev_scene_tex.Get(), prev_scene_upload.Get(), previous_scene_pixels.data(),
                             RTXDI_SURFACE_SCENE_ROW_COUNT * 16u)) return 1;
