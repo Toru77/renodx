@@ -1093,16 +1093,16 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           std::shared_lock lock(rtxdi::g_debug.mutex);
           debug = rtxdi::g_debug.snapshot;
         }
-        const bool bvh_active = bvh::g_bvh_debug.mode.load(std::memory_order_relaxed) != 0;
+        const bool render_observed_bvh_supersession = debug.superseded_by_bvh;
         const auto presentation_owner =
-            ResolveRtxdiDebugPresentationOwner(debug.requested_view, bvh_active);
+            ResolveRtxdiDebugPresentationOwner(debug.requested_view, render_observed_bvh_supersession);
         const char* presentation_label = "lighting image has pixel precedence";
         if (presentation_owner == RtxdiDebugPresentationOwner::Bvh) {
           presentation_label = "superseded by BVH";
         } else if (presentation_owner == RtxdiDebugPresentationOwner::Rtxdi) {
           presentation_label = "RTXDI view has pixel precedence";
         }
-        ImGui::Text("Debug view: requested %u effective %u | source %s reason %u | frame %u | scene %d transfer %d | %ux%u | %s",
+        ImGui::Text("Render-observed debug view: requested %u effective %u | source %s reason %u | frame %u | scene %d transfer %d | %ux%u | %s",
                     debug.requested_view, debug.effective_view, debug.source_ready ? "ready" : "unavailable",
                     debug.rejection_reason, debug.frame, debug.scene_slot, debug.transfer_slot, debug.width,
                     debug.height, presentation_label);
@@ -1159,6 +1159,12 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           debug = rtxdi::g_debug.snapshot;
         }
         if (logging) {
+          const uint32_t live_requested_view = static_cast<uint32_t>(
+              std::clamp(std::isfinite(rtxdi::g_debug_view) ? rtxdi::g_debug_view : 0.f, 0.f,
+                         static_cast<float>(RTXDI_DEBUG_VIEW_SUN_VISIBILITY)));
+          const uint64_t live_world_frame = falcom_world::g_state.frame.load();
+          const bool live_bvh_active = bvh::g_bvh_debug.mode.load(std::memory_order_relaxed) != 0;
+          const uint32_t live_effective_view = ResolveRtxdiDebugEffectiveView(live_requested_view, live_bvh_active);
           rtxdi::DiagnosticSummary summary = {};
           summary.frame = di.frame != UINT32_MAX ? di.frame : input.attempted_frame;
           summary.capture_frame = input.attempted_frame;
@@ -1200,11 +1206,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           summary.input_stage = static_cast<uint32_t>(input.stage);
           summary.di_status = static_cast<uint32_t>(di.status);
           summary.sun_status = static_cast<uint32_t>(sun.status);
-          summary.debug_requested_view = debug.requested_view;
-          summary.debug_effective_view = debug.effective_view;
+          summary.debug_observed_requested_view = debug.requested_view;
+          summary.debug_observed_effective_view = debug.effective_view;
           summary.debug_source_ready = debug.source_ready ? 1u : 0u;
           summary.debug_rejection_reason = debug.rejection_reason;
           summary.debug_observed_frame = debug.frame;
+          summary.debug_live_requested_view = live_requested_view;
+          summary.debug_live_effective_view = live_effective_view;
+          summary.debug_live_frame = live_world_frame;
+          summary.debug_freshness = static_cast<uint32_t>(rtxdi::GetDiagnosticDebugFreshness(
+              live_requested_view, live_effective_view, live_world_frame, debug.requested_view,
+              debug.effective_view, debug.frame));
           summary.debug_width = debug.width;
           summary.debug_height = debug.height;
           summary.debug_scene_slot = debug.scene_slot >= 0 ? static_cast<uint32_t>(debug.scene_slot) : UINT32_MAX;

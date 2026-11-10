@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 
 #include <Rtxdi/DI/ReSTIRDI.h>
 #include <Rtxdi/DI/ReSTIRDIParameters.h>
@@ -155,6 +156,38 @@ int main() {
     return EXIT_FAILURE;
   }
   std::printf("PASS RTXDI shader view precedence: BVH forces OFF, unavailable keeps requested checker, Off/restore\n");
+  using falcom_world::rtxdi::DiagnosticDebugFreshness;
+  using falcom_world::rtxdi::GetDiagnosticDebugFreshness;
+  const float saved_debug_view = falcom_world::rtxdi::g_debug_view;
+  falcom_world::rtxdi::g_debug_view = static_cast<float>(RTXDI_DEBUG_VIEW_SUN_VISIBILITY);
+  const uint32_t live_sun_view = static_cast<uint32_t>(falcom_world::rtxdi::g_debug_view);
+  if (GetDiagnosticDebugFreshness(9u, 9u, 40u, RTXDI_DEBUG_VIEW_OFF, RTXDI_DEBUG_VIEW_OFF, 40u)
+          != DiagnosticDebugFreshness::Pending
+      || GetDiagnosticDebugFreshness(live_sun_view, live_sun_view, 40u, live_sun_view, live_sun_view, 40u)
+             != DiagnosticDebugFreshness::Matched
+      || GetDiagnosticDebugFreshness(live_sun_view, RTXDI_DEBUG_VIEW_OFF, 40u, live_sun_view,
+                                     RTXDI_DEBUG_VIEW_OFF, 40u)
+             != DiagnosticDebugFreshness::Matched
+      || GetDiagnosticDebugFreshness(RTXDI_DEBUG_VIEW_OFF, RTXDI_DEBUG_VIEW_OFF, 40u, live_sun_view,
+                                     live_sun_view, 40u)
+             != DiagnosticDebugFreshness::Pending) {
+    falcom_world::rtxdi::g_debug_view = saved_debug_view;
+    return EXIT_FAILURE;
+  }
+  falcom_world::rtxdi::g_debug_view = static_cast<float>(RTXDI_DEBUG_VIEW_OFF);
+  const uint32_t reloaded_off_view = static_cast<uint32_t>(falcom_world::rtxdi::g_debug_view);
+  if (GetDiagnosticDebugFreshness(reloaded_off_view, reloaded_off_view, 40u, live_sun_view, live_sun_view, 40u)
+          != DiagnosticDebugFreshness::Pending
+      || GetDiagnosticDebugFreshness(reloaded_off_view, reloaded_off_view, 40u, reloaded_off_view,
+                                     reloaded_off_view, 40u)
+             != DiagnosticDebugFreshness::Matched
+      || GetDiagnosticDebugFreshness(live_sun_view, live_sun_view, 40u, 0u, 0u, UINT32_MAX)
+             != DiagnosticDebugFreshness::Unobserved) {
+    falcom_world::rtxdi::g_debug_view = saved_debug_view;
+    return EXIT_FAILURE;
+  }
+  falcom_world::rtxdi::g_debug_view = saved_debug_view;
+  std::printf("PASS RTXDI debug live/render-observed freshness pending/matched/unobserved, BVH supersession, selector reset/reload\n");
   if (ResolveRtxdiDebugPresentationOwner(RTXDI_DEBUG_VIEW_OFF, false)
           != RtxdiDebugPresentationOwner::Lighting
       || ResolveRtxdiDebugPresentationOwner(RTXDI_DEBUG_VIEW_LOCAL_STATUS, false)
@@ -163,10 +196,26 @@ int main() {
              != RtxdiDebugPresentationOwner::Bvh) {
     return EXIT_FAILURE;
   }
-  std::printf("PASS RTXDI debug precedence: BVH > RTXDI > lighting\n");
+  const bool render_observed_bvh_supersession = true;
+  for (const bool live_bvh_active : {false, true}) {
+    const uint32_t live_effective_view =
+        ResolveRtxdiDebugEffectiveView(RTXDI_DEBUG_VIEW_SUN_VISIBILITY, live_bvh_active);
+    if (live_effective_view != (live_bvh_active ? RTXDI_DEBUG_VIEW_OFF : RTXDI_DEBUG_VIEW_SUN_VISIBILITY)
+        || ResolveRtxdiDebugPresentationOwner(RTXDI_DEBUG_VIEW_SUN_VISIBILITY,
+                                              render_observed_bvh_supersession)
+               != RtxdiDebugPresentationOwner::Bvh) {
+      return EXIT_FAILURE;
+    }
+  }
+  if (ResolveRtxdiDebugPresentationOwner(RTXDI_DEBUG_VIEW_SUN_VISIBILITY, false)
+      != RtxdiDebugPresentationOwner::Rtxdi) {
+    return EXIT_FAILURE;
+  }
+  std::printf("PASS RTXDI debug precedence: BVH > RTXDI > lighting; observed owner stays latched until callback\n");
   {
     using namespace falcom_world::rtxdi;
-    DiagnosticState diagnostics;
+    auto diagnostics_owner = std::make_unique<DiagnosticState>();
+    auto& diagnostics = *diagnostics_owner;
     const DiagnosticEvent disabled_event = {.frame = 1u, .stage = DiagnosticStage::InputValidate, .reason = DiagnosticReason::MissingEntry};
     RecordDiagnostic(diagnostics, 0u, disabled_event);
     if (CopyDiagnosticSnapshot(diagnostics).transition_size != 0u) return EXIT_FAILURE;
@@ -202,12 +251,24 @@ int main() {
     if (DiagnosticIdentityToken(diagnostics, first_epoch, 0xfeedu, 0u) != 0u) return EXIT_FAILURE;
     snapshot = CopyDiagnosticSnapshot(diagnostics);
     if (snapshot.identity_size != kDiagnosticIdentityCapacity || snapshot.untracked_identities != 1u) return EXIT_FAILURE;
+    snapshot.latest.debug_live_requested_view = RTXDI_DEBUG_VIEW_SUN_VISIBILITY;
+    snapshot.latest.debug_live_effective_view = RTXDI_DEBUG_VIEW_OFF;
+    snapshot.latest.debug_live_frame = 40u;
+    snapshot.latest.debug_freshness = static_cast<uint32_t>(DiagnosticDebugFreshness::Matched);
+    snapshot.latest.debug_observed_requested_view = RTXDI_DEBUG_VIEW_SUN_VISIBILITY;
+    snapshot.latest.debug_observed_effective_view = RTXDI_DEBUG_VIEW_OFF;
+    snapshot.latest.debug_observed_frame = 40u;
+    snapshot.latest.debug_rejection_reason = 8u;
+    snapshot.latest.debug_superseded_by_bvh = 1u;
     const std::string report = SerializeDiagnosticReport(snapshot);
     if (report.size() > kDiagnosticReportCapacity || report.find("0x1234") != std::string::npos
         || report.find("0xfeed") != std::string::npos || report.find("matching_draw_callbacks=") == std::string::npos
         || report.find("14:NativeB0Mismatch") == std::string::npos
         || report.find("12:SignalC") == std::string::npos
-        || report.find("n1_config=unavailable") == std::string::npos) {
+        || report.find("n1_config=unavailable") == std::string::npos
+        || report.find("debug live_requested=9 live_effective=0 live_frame=40 freshness=2 render_observed_requested=9 render_observed_effective=0 render_observed_frame=40")
+               == std::string::npos
+        || report.find("reason=8") == std::string::npos || report.find("bvh_supersedes=1") == std::string::npos) {
       return EXIT_FAILURE;
     }
     SetDiagnosticCapture(diagnostics, false);
@@ -241,7 +302,8 @@ int main() {
   }
   {
     using namespace falcom_world::rtxdi;
-    DiagnosticState diagnostics;
+    auto diagnostics_owner = std::make_unique<DiagnosticState>();
+    auto& diagnostics = *diagnostics_owner;
     SetDiagnosticCapture(diagnostics, true);
     const uint64_t epoch = DiagnosticCaptureEpoch(diagnostics);
     DiagnosticEvent event = {.frame = 42u,
@@ -272,7 +334,8 @@ int main() {
   }
   {
     using namespace falcom_world::rtxdi;
-    DiagnosticState diagnostics;
+    auto diagnostics_owner = std::make_unique<DiagnosticState>();
+    auto& diagnostics = *diagnostics_owner;
     SetDiagnosticCapture(diagnostics, true);
     const uint64_t epoch = DiagnosticCaptureEpoch(diagnostics);
     DiagnosticEvent event = {.frame = 88u,
@@ -313,7 +376,8 @@ int main() {
   }
   {
     using namespace falcom_world::rtxdi;
-    DiagnosticState diagnostics;
+    auto diagnostics_owner = std::make_unique<DiagnosticState>();
+    auto& diagnostics = *diagnostics_owner;
     SetDiagnosticCapture(diagnostics, true);
     const uint64_t epoch = DiagnosticCaptureEpoch(diagnostics);
     for (const auto operation : {DiagnosticOperation::BindLocal, DiagnosticOperation::BindSun}) {
@@ -360,7 +424,8 @@ int main() {
   }
   {
     using namespace falcom_world::rtxdi;
-    DiagnosticState diagnostics;
+    auto diagnostics_owner = std::make_unique<DiagnosticState>();
+    auto& diagnostics = *diagnostics_owner;
     SetDiagnosticCapture(diagnostics, true);
     const uint64_t epoch = DiagnosticCaptureEpoch(diagnostics);
     RecordDiagnostic(diagnostics, epoch,

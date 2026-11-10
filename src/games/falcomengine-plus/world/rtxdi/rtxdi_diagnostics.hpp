@@ -42,6 +42,24 @@ enum class DiagnosticNrdPolicy : uint32_t { RawSelected,
                                             BackendUnavailable,
                                             RelaxSelected };
 
+enum class DiagnosticDebugFreshness : uint32_t { Unobserved,
+                                                 Pending,
+                                                 Matched };
+
+constexpr DiagnosticDebugFreshness GetDiagnosticDebugFreshness(uint32_t live_requested_view,
+                                                               uint32_t live_effective_view,
+                                                               uint64_t live_frame,
+                                                               uint32_t observed_requested_view,
+                                                               uint32_t observed_effective_view,
+                                                               uint32_t observed_frame) {
+  if (observed_frame == UINT32_MAX) return DiagnosticDebugFreshness::Unobserved;
+  if (live_requested_view != observed_requested_view || live_effective_view != observed_effective_view
+      || live_frame != observed_frame) {
+    return DiagnosticDebugFreshness::Pending;
+  }
+  return DiagnosticDebugFreshness::Matched;
+}
+
 enum class DiagnosticStage : uint16_t {
   None,
   ScenePromotion,
@@ -268,11 +286,15 @@ struct DiagnosticSummary {
   uint32_t devkit_version = 0u;
   uint32_t adapter_vendor = 0u;
   uint32_t adapter_device = 0u;
-  uint32_t debug_requested_view = 0u;
-  uint32_t debug_effective_view = 0u;
+  uint32_t debug_observed_requested_view = 0u;
+  uint32_t debug_observed_effective_view = 0u;
   uint32_t debug_source_ready = 0u;
   uint32_t debug_rejection_reason = 0u;
   uint32_t debug_observed_frame = UINT32_MAX;
+  uint32_t debug_live_requested_view = 0u;
+  uint32_t debug_live_effective_view = 0u;
+  uint64_t debug_live_frame = UINT64_MAX;
+  uint32_t debug_freshness = static_cast<uint32_t>(DiagnosticDebugFreshness::Unobserved);
   uint32_t debug_width = 0u;
   uint32_t debug_height = 0u;
   uint32_t debug_scene_slot = UINT32_MAX;
@@ -532,9 +554,11 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
          summary.nrd_status, summary.nrd_failure_stage, summary.nrd_policy, summary.nrd_output_staged,
          summary.publication_status, summary.binding_status, summary.rr_requested,
          summary.rr_owns_denoise, summary.denoiser_reason);
-  append("debug requested=%u effective=%u source_ready=%u reason=%u frame=%u owner=%llu transfer_config=%llu di_config=%llu n1_config=",
-         summary.debug_requested_view, summary.debug_effective_view, summary.debug_source_ready,
-         summary.debug_rejection_reason, summary.debug_observed_frame,
+  append("debug live_requested=%u live_effective=%u live_frame=%llu freshness=%u render_observed_requested=%u render_observed_effective=%u render_observed_frame=%u source_ready=%u reason=%u owner=%llu transfer_config=%llu di_config=%llu n1_config=",
+         summary.debug_live_requested_view, summary.debug_live_effective_view,
+         static_cast<unsigned long long>(summary.debug_live_frame), summary.debug_freshness,
+         summary.debug_observed_requested_view, summary.debug_observed_effective_view,
+         summary.debug_observed_frame, summary.debug_source_ready, summary.debug_rejection_reason,
          static_cast<unsigned long long>(summary.debug_owner_generation),
          static_cast<unsigned long long>(summary.debug_transfer_configuration),
          static_cast<unsigned long long>(summary.debug_di_configuration));
@@ -546,6 +570,7 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
   append(" scene_slot=%u transfer_slot=%u size=%ux%u bvh_supersedes=%u\n",
          summary.debug_scene_slot, summary.debug_transfer_slot, summary.debug_width, summary.debug_height,
          summary.debug_superseded_by_bvh);
+  append("debug_freshness=0:Unobserved,1:Pending,2:Matched\n");
   append("debug_reason=0:None,1:BackendUnavailable,2:NotProduced,3:NoSdk,4:RrSuppressed,5:WaitingInput,6:StaleIdentity,7:InvalidResource,8:BvhSuperseded,9:ProducerDisabled\n");
   append("fences scene=%llu A=unavailable B_value=%llu C_value=%llu completion_knowledge=unavailable ages scene=%llu input=%llu di=%llu sun=%llu nrd=%llu\n",
          static_cast<unsigned long long>(summary.scene_fence),
