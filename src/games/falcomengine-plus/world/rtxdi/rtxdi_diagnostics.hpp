@@ -11,6 +11,8 @@
 #include <shared_mutex>
 #include <string>
 
+#include "rtxdi_diag_layout.h"
+
 namespace falcom_world::rtxdi {
 
 inline constexpr uint32_t kDiagnosticTransitionCapacity = 64u;
@@ -272,6 +274,16 @@ struct DiagnosticSummary {
   uint32_t nrd_output_staged = 0u;
   uint32_t publication_status = 0u;
   uint32_t binding_status = 0u;
+  uint32_t input_lights_source = 0u;
+  uint32_t input_lights_copied = 0u;
+  uint32_t input_lights_truncated = 0u;
+  uint32_t input_tiles = 0u;
+  uint32_t input_deferred = 0u;
+  uint32_t di_history_valid = 0u;
+  uint32_t di_temporal_enabled = 0u;
+  uint32_t di_temporal_ran = 0u;
+  uint32_t di_spatial_enabled = 0u;
+  uint32_t di_spatial_ran = 0u;
   int32_t last_hresult = 0;
   uint32_t requested_candidates = 0u;
   uint32_t effective_candidates = 0u;
@@ -315,6 +327,11 @@ struct DiagnosticSnapshot {
   std::array<DiagnosticReasonCount, kDiagnosticReasonCapacity> reason_counts = {};
   std::array<DiagnosticIdentity, kDiagnosticIdentityCapacity> identities = {};
   DiagnosticSummary latest = {};
+  std::array<uint32_t, RTXDI_DIAG_COUNTER_COUNT> gpu_counters = {};
+  uint64_t gpu_sample_frame = UINT64_MAX;
+  uint64_t gpu_sample_fence = 0u;
+  uint64_t gpu_samples = 0u;
+  uint32_t gpu_sample_flags = 0u;
   uint64_t transition_count = 0u;
   uint64_t transition_overwritten = 0u;
   uint64_t failure_records_dropped = 0u;
@@ -482,6 +499,20 @@ inline void UpdateDiagnosticSummary(DiagnosticState& state, uint64_t epoch, cons
   state.snapshot.latest.matching_draw_callbacks = matching_draw_callbacks;
 }
 
+inline void RecordDiagnosticGpuCounters(DiagnosticState& state, uint64_t epoch, uint64_t frame, uint64_t fence,
+                                        uint32_t flags,
+                                        const std::array<uint32_t, RTXDI_DIAG_COUNTER_COUNT>& counters) {
+  if (!DiagnosticCaptureEnabled(state) || DiagnosticCaptureEpoch(state) != epoch) return;
+  std::unique_lock lock(state.mutex);
+  if (state.capture_control.load(std::memory_order_acquire) != ((epoch << 1u) | 1u)
+      || state.snapshot.capture_epoch != epoch) return;
+  state.snapshot.gpu_counters = counters;
+  state.snapshot.gpu_sample_frame = frame;
+  state.snapshot.gpu_sample_fence = fence;
+  state.snapshot.gpu_sample_flags = flags;
+  if (state.snapshot.gpu_samples != UINT64_MAX) ++state.snapshot.gpu_samples;
+}
+
 inline uint64_t DiagnosticIdentityToken(DiagnosticState& state, uint64_t epoch, uint64_t identity,
                                         uint64_t destruction_generation) {
   if (identity == 0u || !DiagnosticCaptureEnabled(state) || DiagnosticCaptureEpoch(state) != epoch) return 0u;
@@ -592,6 +623,63 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
          summary.requested_candidates, summary.effective_candidates, summary.requested_spatial_samples,
          summary.effective_spatial_samples, summary.requested_denoiser, summary.effective_denoiser,
          static_cast<unsigned long long>(UINT64_MAX));
+  append("cpu_lights source=%u copied=%u truncated=%u tiles=%u deferred=%u\n",
+         summary.input_lights_source, summary.input_lights_copied, summary.input_lights_truncated,
+         summary.input_tiles, summary.input_deferred);
+  append("cpu_reuse history=%u temporal=%u/%u spatial=%u/%u\n", summary.di_history_valid,
+         summary.di_temporal_ran, summary.di_temporal_enabled, summary.di_spatial_ran, summary.di_spatial_enabled);
+  if (snapshot.gpu_samples == 0u) {
+    append("gpu_sample unavailable\n");
+  } else {
+    const auto& g = snapshot.gpu_counters;
+    const uint32_t flags = snapshot.gpu_sample_flags;
+    append("gpu_sample frame=%llu age=%llu fence=%llu samples=%llu n1=%u spatial=%u temporal=%u history=%u\n",
+           static_cast<unsigned long long>(snapshot.gpu_sample_frame),
+           static_cast<unsigned long long>(summary.frame >= snapshot.gpu_sample_frame ? summary.frame - snapshot.gpu_sample_frame : UINT64_MAX),
+           static_cast<unsigned long long>(snapshot.gpu_sample_fence), static_cast<unsigned long long>(snapshot.gpu_samples),
+           ((flags & RTXDI_DIAG_SAMPLE_N1) != 0u ? 1u : 0u), ((flags & RTXDI_DIAG_SAMPLE_SPATIAL) != 0u ? 1u : 0u),
+           ((flags & RTXDI_DIAG_SAMPLE_TEMPORAL) != 0u ? 1u : 0u), ((flags & RTXDI_DIAG_SAMPLE_HISTORY) != 0u ? 1u : 0u));
+    append("gpu_lights type_none=%u type_point=%u type_spot=%u type_both=%u radius_positive=%u typed_radius_positive=%u tile_cells_nonempty=%u tile_point_refs=%u tile_spot_refs=%u\n",
+           g[RTXDI_DIAG_LIGHT_TYPE_NONE], g[RTXDI_DIAG_LIGHT_TYPE_POINT], g[RTXDI_DIAG_LIGHT_TYPE_SPOT],
+           g[RTXDI_DIAG_LIGHT_TYPE_BOTH], g[RTXDI_DIAG_LIGHT_RADIUS_POSITIVE], g[RTXDI_DIAG_LIGHT_TYPED_RADIUS_POSITIVE],
+           g[RTXDI_DIAG_TILE_CELLS_NONEMPTY], g[RTXDI_DIAG_TILE_POINT_REFS], g[RTXDI_DIAG_TILE_SPOT_REFS]);
+    append("gpu_candidates tried=%u info_valid=%u type_none=%u type_both=%u lamp_invalid=%u sample_valid=%u tile_valid=%u in_tile=%u target_nonzero=%u initial_surfaces=%u initial_reservoirs=%u\n",
+           g[RTXDI_DIAG_CAND_TRIED], g[RTXDI_DIAG_CAND_INFO_VALID], g[RTXDI_DIAG_CAND_TYPE_NONE], g[RTXDI_DIAG_CAND_TYPE_BOTH],
+           g[RTXDI_DIAG_CAND_LAMP_INVALID], g[RTXDI_DIAG_CAND_SAMPLE_VALID], g[RTXDI_DIAG_CAND_TILE_VALID],
+           g[RTXDI_DIAG_CAND_IN_TILE], g[RTXDI_DIAG_CAND_TARGET_NONZERO], g[RTXDI_DIAG_INITIAL_SURFACES],
+           g[RTXDI_DIAG_INITIAL_RESERVOIRS]);
+    append("gpu_surface pixels=%u valid=%u character=%u tile_invalid=%u reject_dimensions=%u reject_pixel=%u reject_scaling=%u reject_depth=%u reject_normal=%u reject_w=%u reject_position=%u reject_view_direction=%u reject_view_depth=%u no_deferred=%u material_oob=%u material_nonfinite=%u\n",
+           g[RTXDI_DIAG_SURFACE_PIXELS], g[RTXDI_DIAG_SURFACE_VALID], g[RTXDI_DIAG_SURFACE_CHARACTER],
+           g[RTXDI_DIAG_SURFACE_TILE_INVALID], g[RTXDI_DIAG_SURFACE_REASON_BASE + 1u],
+           g[RTXDI_DIAG_SURFACE_REASON_BASE + 2u], g[RTXDI_DIAG_SURFACE_REASON_BASE + 3u],
+           g[RTXDI_DIAG_SURFACE_REASON_BASE + 4u], g[RTXDI_DIAG_SURFACE_REASON_BASE + 5u],
+           g[RTXDI_DIAG_SURFACE_REASON_BASE + 6u], g[RTXDI_DIAG_SURFACE_REASON_BASE + 7u],
+           g[RTXDI_DIAG_SURFACE_REASON_BASE + 8u], g[RTXDI_DIAG_SURFACE_REASON_BASE + 9u],
+           g[RTXDI_DIAG_SURFACE_REASON_BASE + RTXDI_DIAG_SURFACE_REASON_NO_DEFERRED],
+           g[RTXDI_DIAG_SURFACE_REASON_BASE + RTXDI_DIAG_SURFACE_REASON_MATERIAL_OOB],
+           g[RTXDI_DIAG_SURFACE_REASON_BASE + RTXDI_DIAG_SURFACE_REASON_MATERIAL_NONFINITE]);
+    append("gpu_tuple empty=%u visible=%u blocked=%u unknown=%u other=%u consumer_valid=%u consumer_reject=%u\n",
+           g[RTXDI_DIAG_TUPLE_STATUS_BASE], g[RTXDI_DIAG_TUPLE_STATUS_BASE + 1u], g[RTXDI_DIAG_TUPLE_STATUS_BASE + 2u],
+           g[RTXDI_DIAG_TUPLE_STATUS_BASE + 3u], g[RTXDI_DIAG_TUPLE_OTHER], g[RTXDI_DIAG_TUPLE_CONSUMER_VALID],
+           g[RTXDI_DIAG_TUPLE_CONSUMER_REJECT]);
+    append("gpu_tuple_empty invalid_surface=%u zero_lights=%u no_reservoir=%u sample_invalid=%u\n",
+           g[RTXDI_DIAG_EMPTY_INVALID_SURFACE], g[RTXDI_DIAG_EMPTY_ZERO_LIGHTS], g[RTXDI_DIAG_EMPTY_NO_RESERVOIR],
+           g[RTXDI_DIAG_EMPTY_SAMPLE_INVALID]);
+    append("gpu_tuple_unknown none=%u invalid_surface=%u zero_lights=%u invalid_scene=%u invalid_sample=%u coverage_miss=%u invalid_alpha=%u truncated=%u\n",
+           g[RTXDI_DIAG_UNKNOWN_REASON_BASE], g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 1u], g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 2u],
+           g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 3u], g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 4u], g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 5u],
+           g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 6u], g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 7u]);
+    append("gpu_n1 pixels=%u config_invalid=%u invalid=%u visible=%u blocked=%u unknown=%u empty=%u membership_reject=%u\n",
+           g[RTXDI_DIAG_N1_PIXELS], g[RTXDI_DIAG_N1_CONFIG_INVALID], g[RTXDI_DIAG_N1_STATUS_BASE],
+           g[RTXDI_DIAG_N1_STATUS_BASE + 1u], g[RTXDI_DIAG_N1_STATUS_BASE + 2u], g[RTXDI_DIAG_N1_STATUS_BASE + 3u],
+           g[RTXDI_DIAG_N1_STATUS_BASE + 4u], g[RTXDI_DIAG_N1_MEMBERSHIP_REJECT]);
+    append("gpu_check pixels=%u tuples=%u candidates=%u\n",
+           (g[RTXDI_DIAG_SURFACE_PIXELS] == summary.width * summary.height ? 1u : 0u),
+           ((g[RTXDI_DIAG_TUPLE_STATUS_BASE] + g[RTXDI_DIAG_TUPLE_STATUS_BASE + 1u] + g[RTXDI_DIAG_TUPLE_STATUS_BASE + 2u]
+             + g[RTXDI_DIAG_TUPLE_STATUS_BASE + 3u] + g[RTXDI_DIAG_TUPLE_OTHER]) == g[RTXDI_DIAG_SURFACE_PIXELS] ? 1u : 0u),
+           (g[RTXDI_DIAG_CAND_TRIED] == g[RTXDI_DIAG_INITIAL_SURFACES] * summary.effective_candidates ? 1u : 0u));
+    append("gpu_legend env: EMPTY=tuple.empty FALLBACK=tuple.unknown INVALID=tuple.other+consumer_reject; character FALLBACK=all except consumer_valid; consumer_valid uses the producer tile cell\n");
+  }
   append("reasons:\n");
   for (uint32_t i = 0u; i < snapshot.reason_size; ++i) {
     const auto& reason = snapshot.reason_counts[i];

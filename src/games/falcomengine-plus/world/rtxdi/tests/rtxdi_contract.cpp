@@ -3,6 +3,7 @@
 #include "../rtxdi_camera_qualification.hpp"
 #include "../rtxdi_config.hpp"
 #include "../rtxdi_debug_layout.h"
+#include "../rtxdi_diag_layout.h"
 #include "../rtxdi_di_contract.h"
 #include "../rtxdi_diagnostics.hpp"
 #include "../rtxdi_input_validation.hpp"
@@ -277,7 +278,19 @@ int main() {
         || report.find("n1_config=unavailable") == std::string::npos
         || report.find("debug live_requested=9 live_effective=0 live_frame=40 freshness=2 render_observed_requested=9 render_observed_effective=0 render_observed_frame=40")
                == std::string::npos
-        || report.find("reason=8") == std::string::npos || report.find("bvh_supersedes=1") == std::string::npos) {
+        || report.find("reason=8") == std::string::npos || report.find("bvh_supersedes=1") == std::string::npos
+        || report.find("cpu_lights source=") == std::string::npos
+        || report.find("gpu_sample unavailable") == std::string::npos) {
+      return EXIT_FAILURE;
+    }
+    snapshot.gpu_samples = 1u;
+    snapshot.gpu_sample_frame = 40u;
+    snapshot.gpu_counters[RTXDI_DIAG_SURFACE_PIXELS] = 4u;
+    snapshot.gpu_counters[RTXDI_DIAG_TUPLE_STATUS_BASE] = 4u;
+    const std::string gpu_report = SerializeDiagnosticReport(snapshot);
+    if (gpu_report.find("gpu_tuple empty=4 visible=0") == std::string::npos
+        || gpu_report.find(" tuples=1") == std::string::npos
+        || gpu_report.find("gpu_sample unavailable") != std::string::npos) {
       return EXIT_FAILURE;
     }
     SetDiagnosticCapture(diagnostics, false);

@@ -1253,6 +1253,16 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           summary.debug_superseded_by_bvh = debug.superseded_by_bvh ? 1u : 0u;
           summary.publication_status = static_cast<uint32_t>(di.output_staged);
           summary.binding_status = static_cast<uint32_t>(di.output_bound);
+          summary.input_lights_source = input.lights_source;
+          summary.input_lights_copied = input.lights_copied;
+          summary.input_lights_truncated = input.lights_truncated;
+          summary.input_tiles = input.tiles_copied;
+          summary.input_deferred = input.deferred_copied;
+          summary.di_history_valid = di.history_valid ? 1u : 0u;
+          summary.di_temporal_enabled = di.temporal_enabled ? 1u : 0u;
+          summary.di_temporal_ran = di.temporal_ran ? 1u : 0u;
+          summary.di_spatial_enabled = di.spatial_enabled ? 1u : 0u;
+          summary.di_spatial_ran = di.spatial_ran ? 1u : 0u;
           summary.rr_requested = rr::RrRequested() ? 1u : 0u;
           summary.rr_owns_denoise = rr::RrOwnsDenoise() ? 1u : 0u;
           summary.last_hresult = input.error != 0 ? input.error : di.error;
