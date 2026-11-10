@@ -226,6 +226,8 @@ RTXDI M9: wind-foliage (INSTANCE_FOLIAGE) hits in the RTXDI sun ray pass Wind Fo
 
 RTXDI M10: blocked final local samples are discarded from the shading reservoir (toggle, default On); the final shadow ray redraws the light-size jitter. Not validated in game.
 
+RTXDI M11: the RTXDI rows are split into the sections RTXDI Local, RTXDI Sun and RTXDI Shared (Shadows category); setting keys and saved values are unchanged. Not validated in game.
+
 ## Reference
 
 ### Code map (`world/`)
