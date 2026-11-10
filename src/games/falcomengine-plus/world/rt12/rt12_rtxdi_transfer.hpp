@@ -1906,7 +1906,8 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                                    std::bit_cast<uint32_t>(sun_disk_tan),
                                    (rtxdi::g_sun_isfast > 0.5f && s.noise_source != 0u) ? 1u : 0u,
                                    in.frame % 32u,
-                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_transmission, 0.f, 0.f, 1.f)), 0u, 0u,
+                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_transmission, 0.f, 0.f, 1.f)),
+                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_wind_transmission, 0.5f, 0.f, 1.f)), 0u,
                                    std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_tint_r, 1.f, 0.f, 1.f)),
                                    std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_tint_g, 1.f, 0.f, 1.f)),
                                    std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_tint_b, 1.f, 0.f, 1.f))};

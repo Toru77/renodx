@@ -126,7 +126,7 @@ struct LightingConsumerCase {
   uint32_t nrd_bound;
   uint32_t expected_class;
   float raw_specular;
-  uint32_t padding4;
+  float sun_wind_transmission;
   uint32_t debug_view;
   uint32_t debug_flags;
   uint32_t debug_status;
@@ -953,7 +953,7 @@ int RunRtxdiDxrBridge() {
   const auto dispatch = [&](UINT mask_index, float max_distance, UINT expected_status, UINT expected_reason,
                             bool coverage_valid, const char* label, float expected_distance = -1.f,
                             bool scene_valid = true, float environment_bias = 0.01f, float character_bias = 0.02f,
-                            float foliage_transmission = 0.f, UINT expected_layers = 0u) {
+                            float foliage_transmission = 0.f, UINT expected_layers = 0u, float wind_transmission = 0.f, UINT expected_wind_layers = 0u) {
     std::fprintf(stderr, "DXR dispatch %s distance=%f\n", label, max_distance);
     tlas_srv.RaytracingAccelerationStructure.Location = tlases[mask_index]->GetGPUVirtualAddress();
     device->CreateShaderResourceView(nullptr, &tlas_srv, tlas_slot_cpu);
@@ -964,7 +964,7 @@ int RunRtxdiDxrBridge() {
     const UINT params[23] = {3, 2, std::bit_cast<UINT>(max_distance), std::bit_cast<UINT>(environment_bias),
                              std::bit_cast<UINT>(character_bias), std::bit_cast<UINT>(-2.f), std::bit_cast<UINT>(-2.f),
                              std::bit_cast<UINT>(-2.f), std::bit_cast<UINT>(4.f), scene_valid ? 1u : 0u,
-                             coverage_valid ? 1u : 0u, 1u, 0u, 0u, 0u, 0u, 0u, std::bit_cast<UINT>(foliage_transmission), 0u, 0u, std::bit_cast<UINT>(1.f), std::bit_cast<UINT>(1.f), std::bit_cast<UINT>(1.f)};
+                             coverage_valid ? 1u : 0u, 1u, 0u, 0u, 0u, 0u, 0u, std::bit_cast<UINT>(foliage_transmission), std::bit_cast<UINT>(wind_transmission), 0u, std::bit_cast<UINT>(1.f), std::bit_cast<UINT>(1.f), std::bit_cast<UINT>(1.f)};
     list->SetComputeRoot32BitConstants(0, 23, params, 0);
     D3D12_RESOURCE_BARRIER output_barrier = {};
     output_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1091,8 +1091,8 @@ int RunRtxdiDxrBridge() {
       const UINT x = i % 3u;
       const UINT y = i / 3u;
       const auto* row = reinterpret_cast<const UINT*>(visibility_bytes + y * visibility_footprint.Footprint.RowPitch);
-      if (row[x] != (expected_status | (expected_layers << RTXDI_SUN_LAYER_SHIFT))) {
-        std::fprintf(stderr, "FAIL %s t42 pixel=%u status=%u expected=%u\n", label, i, row[x], (expected_status | (expected_layers << RTXDI_SUN_LAYER_SHIFT)));
+      if (row[x] != (expected_status | (expected_layers << RTXDI_SUN_LAYER_SHIFT) | (expected_wind_layers << RTXDI_SUN_WIND_LAYER_SHIFT))) {
+        std::fprintf(stderr, "FAIL %s t42 pixel=%u status=%u expected=%u\n", label, i, row[x], (expected_status | (expected_layers << RTXDI_SUN_LAYER_SHIFT) | (expected_wind_layers << RTXDI_SUN_WIND_LAYER_SHIFT)));
         sun_visibility_readback->Unmap(0u, nullptr);
         return false;
       }
@@ -1264,6 +1264,12 @@ int RunRtxdiDxrBridge() {
       || !dispatch(0, 0.6f, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_REASON_NONE, true, "alpha accepted", 0.29f)
       || !dispatch(0, 0.6f, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_REASON_NONE, true, "foliage transmission reveals opaque behind", 0.49f, true, 0.01f, 0.02f, 0.5f, 0u)
       || !dispatch(0, 0.4f, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_REASON_NONE, true, "foliage transmission counts one layer", 0.4f, true, 0.01f, 0.02f, 0.5f, 1u)) return 1;
+  world_instances[0].visibility[2] = 10.f;
+  if (!update_upload(instances.Get(), world_instances.data(), sizeof(world_instances))
+      || !dispatch(0, 0.4f, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_REASON_NONE, true, "wind transmission counts one wind layer", 0.4f, true, 0.01f, 0.02f, 0.f, 0u, 0.5f, 1u)
+      || !dispatch(0, 0.6f, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_REASON_NONE, true, "wind transmission zero blocks", 0.29f, true, 0.01f, 0.02f, 0.f, 0u, 0.f, 0u)) return 1;
+  world_instances[0].visibility[2] = 2.f;
+  if (!update_upload(instances.Get(), world_instances.data(), sizeof(world_instances))) return 1;
   alpha_material.swizzle = 1u;
   if (!update_upload(alpha_materials.Get(), &alpha_material, sizeof(alpha_material))
       || !update_atlas_texel(0u)
@@ -3433,8 +3439,9 @@ int RunRtxdiDxrBridge() {
   lighting_cases[4].sun_status = 17u;
   lighting_cases[4].csm_visibility = 0.2f;
   lighting_cases[53].sun_bound = 1u;
-  lighting_cases[53].sun_status = RTXDI_SUN_STATUS_VISIBLE;
+  lighting_cases[53].sun_status = RTXDI_SUN_STATUS_VISIBLE | (1u << RTXDI_SUN_WIND_LAYER_SHIFT);
   lighting_cases[53].sun_transmission = 0.5f;
+  lighting_cases[53].sun_wind_transmission = 0.25f;
   lighting_cases[54].sun_bound = 1u;
   lighting_cases[54].sun_status = RTXDI_SUN_STATUS_VISIBLE | (2u << RTXDI_SUN_LAYER_SHIFT);
   lighting_cases[54].sun_transmission = 0.5f;
@@ -3559,7 +3566,7 @@ int RunRtxdiDxrBridge() {
       && lighting_results[3].sun_known == 0u && lighting_results[3].environment_sun_visibility == 0.65f
       && lighting_results[3].character_sun_multiplier == 1.f
       && lighting_results[4].sun_known == 0u && lighting_results[4].environment_sun_visibility == 0.2f
-      && lighting_results[53].sun_known == 1u && lighting_results[53].environment_sun_visibility == 1.f
+      && lighting_results[53].sun_known == 1u && std::abs(lighting_results[53].environment_sun_visibility - 0.25f) < 1e-6f
       && lighting_results[54].sun_known == 1u && std::abs(lighting_results[54].environment_sun_visibility - 0.25f) < 1e-6f
       && lighting_results[55].sun_known == 1u && lighting_results[55].environment_sun_visibility == 0.f
       && lighting_results[56].sun_known == 0u && lighting_results[56].environment_sun_visibility == 0.4f

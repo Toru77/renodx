@@ -1541,6 +1541,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtxdiSunWindFoliageTransmission",
+      .binding = &rtxdi::g_sun_wind_transmission,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.5f,
+      .label = "Wind Foliage Transmission",
+      .section = "RTXDI",
+      .tooltip = "Share of sunlight each wind-moved foliage layer lets through, so swaying foliage casts softer shadows. Use Light Size (Sun) for soft edges. 0 = blocks fully (old behaviour).",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiSunFoliageTintR",
       .binding = &rtxdi::g_sun_foliage_tint_r,
       .value_type = SettingValueType::FLOAT,

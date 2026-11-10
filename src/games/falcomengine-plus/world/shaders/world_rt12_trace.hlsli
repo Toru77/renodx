@@ -21,6 +21,8 @@ StructuredBuffer<float4> g_rt12_dynamic_vertices : register(RT12_DYNAMIC_VERTICE
 static uint g_rt12_dynamic_mask = 0u;  // RT12_MASK_DYNAMIC while RTAO traces characters
 static float g_rt12_foliage_transmission = 0.0;
 static uint g_rt12_foliage_layers = 0u;
+static float g_rt12_wind_transmission = 0.0;
+static uint g_rt12_wind_layers = 0u;
 
 WorldTraceHit TraceWorldClosestDxr(float3 origin, float3 direction, float t_min, float t_max, WorldCameraView view,
                                    out WorldTraceCounters counters)
@@ -117,7 +119,7 @@ WorldTraceHit TraceWorldRayDxr(float3 origin, float3 direction, float t_min, flo
     const uint mask = RT12_MASK_OPAQUE_VISIBLE | (skip_foliage ? 0u : RT12_MASK_FOLIAGE_VISIBLE) |
                       (view.hide ? 0u : RT12_MASK_SHADOW_ONLY) | g_rt12_dynamic_mask;
     uint flags = any_hit ? RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH : RAY_FLAG_NONE;
-    if (view.require_flags != 0u) flags |= RAY_FLAG_FORCE_NON_OPAQUE;
+    if (view.require_flags != 0u || g_rt12_wind_transmission > 0.0) flags |= RAY_FLAG_FORCE_NON_OPAQUE;
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = direction;
@@ -148,6 +150,11 @@ WorldTraceHit TraceWorldRayDxr(float3 origin, float3 direction, float t_min, flo
         const uint i1 = g_trace_indices[base + 1u];
         const uint i2 = g_trace_indices[base + 2u];
         if (AlphaCutHit((uint)instance.header.z, mesh.bbox_min.w, i0, i1, i2, query.CandidateTriangleBarycentrics(), counters)) continue;
+        if (g_rt12_wind_transmission > 0.0 && (visibility_flags & INSTANCE_FOLIAGE) != 0u)
+        {
+            ++g_rt12_wind_layers;
+            continue;
+        }
         if (g_rt12_foliage_transmission > 0.0 && instance.header.z != 0.0)
         {
             ++g_rt12_foliage_layers;

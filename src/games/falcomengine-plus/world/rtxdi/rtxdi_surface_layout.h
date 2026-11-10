@@ -44,6 +44,7 @@
 #define RTXDI_SUN_FLAG_UNIT_INVERSE_PDF 4u
 #define RTXDI_SUN_LAYER_SHIFT 8u
 #define RTXDI_SUN_LAYER_MASK 0xFu
+#define RTXDI_SUN_WIND_LAYER_SHIFT 12u
 
 #ifdef __cplusplus
 struct RtxdiSunVisibilityResult {

@@ -17,7 +17,8 @@ struct RtxdiSunResult {
 };
 
 uint RtxdiSunVisibilityWord(RtxdiSunResult r) {
-  return r.status | (((r.flags >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_LAYER_SHIFT);
+  return r.status | (((r.flags >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_LAYER_SHIFT)
+      | (((r.flags >> RTXDI_SUN_WIND_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_WIND_LAYER_SHIFT);
 }
 
 RWStructuredBuffer<RtxdiSunResult> g_rtxdi_sun_results : register(u0);
@@ -39,6 +40,7 @@ cbuffer RtxdiSunParams : register(b0) {
   uint g_noise_mode;
   uint g_noise_slice;
   float g_foliage_transmission;
+  float g_wind_transmission;
   float3 g_foliage_tint;
 };
 
@@ -210,6 +212,8 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   g_rt12_dynamic_mask = RT12_MASK_DYNAMIC;
   g_rt12_foliage_transmission = g_foliage_transmission;
   g_rt12_foliage_layers = 0u;
+  g_rt12_wind_transmission = g_wind_transmission;
+  g_rt12_wind_layers = 0u;
   WorldTraceCounters counters;
   const WorldTraceHit hit = TraceWorldRayDxr(origin, sun_direction, 0.0, coverage_end, true, view, counters);
   result.flags |= (character ? RTXDI_SUN_FLAG_CHARACTER : 0u);
@@ -224,6 +228,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     result.distance = g_max_distance;
     result.reason = RTXDI_SUN_REASON_NONE;
     result.flags |= min(g_rt12_foliage_layers, RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_LAYER_SHIFT;
+    result.flags |= min(g_rt12_wind_layers, RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_WIND_LAYER_SHIFT;
   } else {
     result.reason = RTXDI_SUN_REASON_TRUNCATED;
     result.flags |= RTXDI_SUN_FLAG_TRUNCATED;

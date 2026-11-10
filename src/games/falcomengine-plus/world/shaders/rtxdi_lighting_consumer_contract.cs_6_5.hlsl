@@ -23,7 +23,7 @@ struct LightingConsumerCase
   uint nrd_bound;
   uint expected_class;
   float raw_specular;
-  uint padding4;
+  float sun_wind_transmission;
   uint debug_view;
   uint debug_flags;
   uint debug_status;
@@ -120,7 +120,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
                              * input.base_color * input.dynamic_intensity;
   result.selected_index = visible ? selection.index : 0xffffffffu;
   result.selected_type = visible ? selection.type : 0u;
-  const RtxdiSunLightingSelection sun_selection = RtxdiResolveSunLightingSelection(input.sun_bound != 0u, input.sun_status, input.sun_transmission);
+  const RtxdiSunLightingSelection sun_selection = RtxdiResolveSunLightingSelection(input.sun_bound != 0u, input.sun_status, input.sun_transmission, input.sun_wind_transmission);
   result.sun_known = sun_selection.known ? 1u : 0u;
   result.environment_sun_visibility = sun_selection.known ? sun_selection.visibility : input.csm_visibility;
   result.character_sun_multiplier = sun_selection.known ? sun_selection.visibility : 1.0;
