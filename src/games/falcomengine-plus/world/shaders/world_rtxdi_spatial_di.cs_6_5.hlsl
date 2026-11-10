@@ -161,5 +161,8 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
         && RtxdiResolveLightingSelection(true, tuple, g_light_count, g_rtxdi_tiles[surface.tile_cell]).valid;
     RtxdiDiagAdd(RTXDI_DIAG_TUPLE_CONSUMER_VALID, consumer_valid ? 1u : 0u);
     RtxdiDiagAdd(RTXDI_DIAG_TUPLE_CONSUMER_REJECT, tuple_known && !consumer_valid ? 1u : 0u);
+    RtxdiDiagAdd(RTXDI_DIAG_BLOCKED_NEAR_LAMP,
+                 result.status == RTXDI_DI_STATUS_BLOCKED && isfinite(result.distance)
+                         && selected_sample.distance - result.distance <= RTXDI_DIAG_NEAR_LAMP_METERS ? 1u : 0u);
   }
 }

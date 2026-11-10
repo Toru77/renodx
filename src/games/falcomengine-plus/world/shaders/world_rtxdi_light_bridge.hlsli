@@ -264,6 +264,9 @@ float RAB_GetLightSampleTargetPdfForSurface(RAB_LightSample sample, RAB_Surface 
     RtxdiDiagAdd(RTXDI_DIAG_CAND_TILE_VALID, diag_tile);
     RtxdiDiagAdd(RTXDI_DIAG_CAND_IN_TILE,
                  diag_tile && RtxdiTileContainsLight(surface.tile_cell, sample.light_index, sample.type, surface.previous != 0u));
+    RtxdiDiagAdd(RTXDI_DIAG_CAND_RADIANCE_ZERO,
+                 diag_tile && RtxdiTileContainsLight(surface.tile_cell, sample.light_index, sample.type, surface.previous != 0u)
+                         && all(sample.radiance <= 0.0) ? 1u : 0u);
   }
 #endif
   if (sample.valid == 0u || !RAB_IsSurfaceValid(surface) || surface.tile_valid == 0u

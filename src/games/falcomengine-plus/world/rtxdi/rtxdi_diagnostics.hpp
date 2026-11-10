@@ -643,11 +643,11 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
            g[RTXDI_DIAG_LIGHT_TYPE_NONE], g[RTXDI_DIAG_LIGHT_TYPE_POINT], g[RTXDI_DIAG_LIGHT_TYPE_SPOT],
            g[RTXDI_DIAG_LIGHT_TYPE_BOTH], g[RTXDI_DIAG_LIGHT_RADIUS_POSITIVE], g[RTXDI_DIAG_LIGHT_TYPED_RADIUS_POSITIVE],
            g[RTXDI_DIAG_TILE_CELLS_NONEMPTY], g[RTXDI_DIAG_TILE_POINT_REFS], g[RTXDI_DIAG_TILE_SPOT_REFS]);
-    append("gpu_candidates tried=%u info_valid=%u type_none=%u type_both=%u lamp_invalid=%u sample_valid=%u tile_valid=%u in_tile=%u target_nonzero=%u initial_surfaces=%u initial_reservoirs=%u\n",
+    append("gpu_candidates tried=%u info_valid=%u type_none=%u type_both=%u lamp_invalid=%u sample_valid=%u tile_valid=%u in_tile=%u target_nonzero=%u initial_surfaces=%u initial_reservoirs=%u radiance_zero=%u\n",
            g[RTXDI_DIAG_CAND_TRIED], g[RTXDI_DIAG_CAND_INFO_VALID], g[RTXDI_DIAG_CAND_TYPE_NONE], g[RTXDI_DIAG_CAND_TYPE_BOTH],
            g[RTXDI_DIAG_CAND_LAMP_INVALID], g[RTXDI_DIAG_CAND_SAMPLE_VALID], g[RTXDI_DIAG_CAND_TILE_VALID],
            g[RTXDI_DIAG_CAND_IN_TILE], g[RTXDI_DIAG_CAND_TARGET_NONZERO], g[RTXDI_DIAG_INITIAL_SURFACES],
-           g[RTXDI_DIAG_INITIAL_RESERVOIRS]);
+           g[RTXDI_DIAG_INITIAL_RESERVOIRS], g[RTXDI_DIAG_CAND_RADIANCE_ZERO]);
     append("gpu_surface pixels=%u valid=%u character=%u tile_invalid=%u reject_dimensions=%u reject_pixel=%u reject_scaling=%u reject_depth=%u reject_normal=%u reject_w=%u reject_position=%u reject_view_direction=%u reject_view_depth=%u no_deferred=%u material_oob=%u material_nonfinite=%u\n",
            g[RTXDI_DIAG_SURFACE_PIXELS], g[RTXDI_DIAG_SURFACE_VALID], g[RTXDI_DIAG_SURFACE_CHARACTER],
            g[RTXDI_DIAG_SURFACE_TILE_INVALID], g[RTXDI_DIAG_SURFACE_REASON_BASE + 1u],
@@ -669,6 +669,8 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
            g[RTXDI_DIAG_UNKNOWN_REASON_BASE], g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 1u], g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 2u],
            g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 3u], g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 4u], g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 5u],
            g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 6u], g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 7u]);
+    append("gpu_blocked near_lamp=%u elsewhere=%u\n", g[RTXDI_DIAG_BLOCKED_NEAR_LAMP],
+           g[RTXDI_DIAG_TUPLE_STATUS_BASE + 2u] - g[RTXDI_DIAG_BLOCKED_NEAR_LAMP]);
     append("gpu_n1 pixels=%u config_invalid=%u invalid=%u visible=%u blocked=%u unknown=%u empty=%u membership_reject=%u\n",
            g[RTXDI_DIAG_N1_PIXELS], g[RTXDI_DIAG_N1_CONFIG_INVALID], g[RTXDI_DIAG_N1_STATUS_BASE],
            g[RTXDI_DIAG_N1_STATUS_BASE + 1u], g[RTXDI_DIAG_N1_STATUS_BASE + 2u], g[RTXDI_DIAG_N1_STATUS_BASE + 3u],

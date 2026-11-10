@@ -290,6 +290,8 @@ int main() {
     const std::string gpu_report = SerializeDiagnosticReport(snapshot);
     if (gpu_report.find("gpu_tuple empty=4 visible=0") == std::string::npos
         || gpu_report.find(" tuples=1") == std::string::npos
+        || gpu_report.find("gpu_blocked near_lamp=0 elsewhere=0") == std::string::npos
+        || gpu_report.find("radiance_zero=0") == std::string::npos
         || gpu_report.find("gpu_sample unavailable") != std::string::npos) {
       return EXIT_FAILURE;
     }
