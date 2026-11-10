@@ -34,6 +34,7 @@ StructuredBuffer<LightParam> g_rtxdi_prev_lights : register(t41);
 StructuredBuffer<uint> g_rtxdi_prev_light_types : register(t42);
 StructuredBuffer<LightIndexData> g_rtxdi_tiles : register(t43);
 StructuredBuffer<LightIndexData> g_rtxdi_prev_tiles : register(t44);
+Texture2D<uint4> g_rtxdi_local_noise : register(t61);
 
 RWStructuredBuffer<RTXDI_PackedDIReservoir> g_rtxdi_reservoirs : register(u0);
 RWStructuredBuffer<RtxdiDiRawResult> g_rtxdi_raw : register(u1);
@@ -137,7 +138,16 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   }
   const uint selected_index = RTXDI_GetDIReservoirLightIndex(final_reservoir);
   const RAB_LightInfo selected_info = RAB_LoadLightInfo(selected_index, false);
-  selected_sample = RAB_SamplePolymorphicLight(selected_info, surface, RTXDI_GetDIReservoirSampleUV(final_reservoir));
+  float2 shadow_uv = RTXDI_GetDIReservoirSampleUV(final_reservoir);
+  if (g_local_light_size > 0.0) {
+    if (g_noise_mode != 0u) {
+      shadow_uv = asfloat(g_rtxdi_local_noise.Load(int3(pixel.x % 128u, pixel.y % 128u + 128u * g_noise_slice, 0)).xy);
+    } else {
+      RTXDI_RandomSamplerState shadow_rng = RTXDI_InitRandomSampler(pixel, g_runtime.frameIndex, 4u);
+      shadow_uv = float2(RTXDI_GetNextRandom(shadow_rng), RTXDI_GetNextRandom(shadow_rng));
+    }
+  }
+  selected_sample = RAB_SamplePolymorphicLight(selected_info, surface, shadow_uv);
   if (selected_sample.valid == 0u) {
     g_rtxdi_raw[pixel_index] = raw;
     RtxdiDiagCountEmptyTuple(RTXDI_DIAG_EMPTY_SAMPLE_INVALID);
@@ -150,6 +160,12 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   g_rtxdi_raw[pixel_index] = result;
   const uint4 tuple = uint4(result.selected_light_index, result.selected_light_type, result.status, asuint(result.inverse_pdf));
   g_rtxdi_resolved_output[pixel] = tuple;
+  if ((g_frame_flags & RTXDI_FRAME_FLAG_DISCARD_BLOCKED) != 0u && result.status == RTXDI_DI_STATUS_BLOCKED) {
+    RTXDI_DIReservoir discarded = final_reservoir;
+    discarded.lightData = 0u;
+    discarded.weightSum = 0.0;
+    RTXDI_StoreDIReservoir(discarded, g_di.reservoirBufferParams, pixel, g_di.bufferIndices.shadingInputBufferIndex);
+  }
   if ((g_frame_flags & RTXDI_FRAME_FLAG_DIAGNOSTICS) != 0u) {
     [unroll]
     for (uint status = RTXDI_DI_STATUS_EMPTY; status <= RTXDI_DI_STATUS_UNKNOWN; ++status)

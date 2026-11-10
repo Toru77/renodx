@@ -224,6 +224,8 @@ RTXDI M8: optional gate (default On) multiplies the RTXDI sun character darkenin
 
 RTXDI M9: wind-foliage (INSTANCE_FOLIAGE) hits in the RTXDI sun ray pass Wind Foliage Transmission per layer (visibility bits 12-15). Not validated in game.
 
+RTXDI M10: blocked final local samples are discarded from the shading reservoir (toggle, default On); the final shadow ray redraws the light-size jitter. Not validated in game.
+
 ## Reference
 
 ### Code map (`world/`)

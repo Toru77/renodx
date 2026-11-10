@@ -2451,6 +2451,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     diag_armed = transfer.diag_zero && slot.diag_counters && slot.diag_readback;
   }
   if (diag_armed) s.di.frame.parameters.flags |= RTXDI_FRAME_FLAG_DIAGNOSTICS;
+  if (rtxdi::g_local_discard_blocked > 0.5f) s.di.frame.parameters.flags |= RTXDI_FRAME_FLAG_DISCARD_BLOCKED;
   s.di.frame.parameters.lights.localLightBufferRegion = {0u, light_count, 0u, 0u};
   s.di.frame.parameters.lights.infiniteLightBufferRegion = {};
   s.di.frame.parameters.lights.environmentLightParams = {};

@@ -1617,6 +1617,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtxdiLocalDiscardBlocked",
+      .binding = &rtxdi::g_local_discard_blocked,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Drop Blocked Samples From Reuse (Local)",
+      .section = "RTXDI",
+      .tooltip = "A lamp sample whose final shadow ray is blocked is not reused by later frames. Reduces lamp shadow noise. Off = previous behaviour.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiLocalShadowDarkening",
       .binding = &rtxdi::g_local_shadow_darkening,
       .value_type = SettingValueType::FLOAT,
