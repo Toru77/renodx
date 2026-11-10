@@ -1687,7 +1687,7 @@ int RunRtxdiDxrBridge() {
   di_params[2].DescriptorTable.NumDescriptorRanges = 12u;
   di_params[2].DescriptorTable.pDescriptorRanges = di_ranges;
   di_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  di_params[3].Constants.Num32BitValues = 8u;
+  di_params[3].Constants.Num32BitValues = 10u;
   di_params[3].Constants.ShaderRegister = 12u;
   D3D12_ROOT_SIGNATURE_DESC di_root_desc = {};
   di_root_desc.NumParameters = 4u;
@@ -1885,12 +1885,13 @@ int RunRtxdiDxrBridge() {
                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list->ResourceBarrier(3u, n1_transitions);
     list->SetPipelineState(n1_reconstruct_pso.Get());
-    const UINT n1_params[8] = {RTXDI_N1_CONFIG_VERSION,
-                               std::bit_cast<UINT>(n1_test_config[0]), std::bit_cast<UINT>(n1_test_config[1]),
-                               std::bit_cast<UINT>(n1_test_config[2]), std::bit_cast<UINT>(n1_test_config[3]),
-                               std::bit_cast<UINT>(n1_test_config[4]), std::bit_cast<UINT>(n1_test_config[5]),
-                               std::bit_cast<UINT>(n1_test_config[6])};
-    list->SetComputeRoot32BitConstants(3u, 8u, n1_params, 0u);
+    const UINT n1_params[10] = {RTXDI_N1_CONFIG_VERSION,
+                                std::bit_cast<UINT>(n1_test_config[0]), std::bit_cast<UINT>(n1_test_config[1]),
+                                std::bit_cast<UINT>(n1_test_config[2]), std::bit_cast<UINT>(n1_test_config[3]),
+                                std::bit_cast<UINT>(n1_test_config[4]), std::bit_cast<UINT>(n1_test_config[5]),
+                                std::bit_cast<UINT>(n1_test_config[6]), std::bit_cast<UINT>(0.0f),
+                                std::bit_cast<UINT>(0.0f)};
+    list->SetComputeRoot32BitConstants(3u, 10u, n1_params, 0u);
     list->Dispatch(1u, 1u, 1u);
     D3D12_RESOURCE_BARRIER n1_uav_barriers[3] = {};
     n1_uav_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;

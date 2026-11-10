@@ -70,6 +70,8 @@ cbuffer RtxdiN1ExtraParams : register(b12) {
   float g_n1_specular_peak;
   float g_n1_roughness_min;
   float g_n1_roughness_max;
+  float g_n1_env_keep;
+  float g_n1_char_keep;
 };
 
 uint RtxdiN1Status(uint status, bool known, bool character) {
@@ -98,7 +100,10 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
                             && g_n1_specular_peak >= 0.0 && g_n1_specular_peak <= 16.0
                             && g_n1_roughness_min >= 0.0 && g_n1_roughness_min <= 0.8
                             && g_n1_roughness_max >= 0.2 && g_n1_roughness_max <= 1.0
-                            && g_n1_roughness_max >= g_n1_roughness_min;
+                            && g_n1_roughness_max >= g_n1_roughness_min
+                            && all(isfinite(float2(g_n1_env_keep, g_n1_char_keep)))
+                            && g_n1_env_keep >= 0.0 && g_n1_env_keep <= 1.0
+                            && g_n1_char_keep >= 0.0 && g_n1_char_keep <= 1.0;
   RtxdiDiagAdd(RTXDI_DIAG_N1_PIXELS, 1u);
   RtxdiDiagAdd(RTXDI_DIAG_N1_CONFIG_INVALID, config_valid ? 0u : 1u);
   float4 diffuse = 0.0;
@@ -120,9 +125,12 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
       const RAB_LightInfo light = RAB_LoadLightInfo(raw.selected_light_index, false);
       if (light.valid != 0u && light.type == raw.selected_light_type && surface.tile_valid != 0u
           && RtxdiTileContainsLight(surface.tile_cell, raw.selected_light_index, raw.selected_light_type, false)) {
-        if (raw.status == RTXDI_DI_STATUS_BLOCKED) {
+        const bool blocked = raw.status == RTXDI_DI_STATUS_BLOCKED;
+        const float blocked_keep = character ? g_n1_char_keep : g_n1_env_keep;
+        if (blocked && blocked_keep <= 0.0) {
           status = RTXDI_N1_STATUS_BLOCKED;
         } else {
+          if (blocked) status = RTXDI_N1_STATUS_BLOCKED;
           const RAB_LightSample sample = RAB_SamplePolymorphicLight(light, surface, float2(0.5, 0.5));
           const float3 to_light = sample.position - surface.world_position;
           const float attenuation = LampDistanceAttenuation(light.lamp, to_light);
@@ -155,8 +163,9 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
             if (!all(isfinite(float4(deferred.head[1].xyz, deferred.tail[0].z)))) {
               g_rtxdi_n1_diffuse[pixel] = diffuse;
               g_rtxdi_n1_specular[pixel] = specular;
-              g_rtxdi_n1_status[pixel] = RtxdiN1Status(RTXDI_N1_STATUS_INVALID, false, character);
-              RtxdiDiagAdd(RTXDI_DIAG_N1_STATUS_BASE + RTXDI_N1_STATUS_INVALID, 1u);
+              const uint early_status = blocked ? RTXDI_N1_STATUS_BLOCKED : RTXDI_N1_STATUS_INVALID;
+              g_rtxdi_n1_status[pixel] = RtxdiN1Status(early_status, blocked, character);
+              RtxdiDiagAdd(RTXDI_DIAG_N1_STATUS_BASE + early_status, 1u);
               return;
             }
             const float gloss = max(0.001, sample.specular_glossiness * surface.material_glossiness);
@@ -176,24 +185,25 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
             }
             specular_rgb = lerp(blinn_specular, ggx_specular, g_n1_specular_strength);
           }
-          diffuse_rgb *= raw.inverse_pdf;
-          specular_rgb *= raw.inverse_pdf;
+          const float lobe_scale = raw.inverse_pdf * (blocked ? blocked_keep : 1.0);
+          diffuse_rgb *= lobe_scale;
+          specular_rgb *= lobe_scale;
           const bool positive_sample = sample.valid != 0u && isfinite(sample.distance) && sample.distance > 0.0
                                        && all(isfinite(float4(lamp_color, lamp_attenuation)))
                                        && lamp_attenuation > 0.0;
-          const float diffuse_hit_t = positive_sample && lit > 0.0 && any(lamp_color > 0.0) ? sample.distance : 0.0;
-          const float specular_hit_t = positive_sample && specular_evaluated && lit > 0.0 && any(lamp_color > 0.0)
+          const float diffuse_hit_t = !blocked && positive_sample && lit > 0.0 && any(lamp_color > 0.0) ? sample.distance : 0.0;
+          const float specular_hit_t = !blocked && positive_sample && specular_evaluated && lit > 0.0 && any(lamp_color > 0.0)
                                            ? sample.distance
                                            : 0.0;
           const float4 diffuse_candidate = float4(diffuse_rgb, diffuse_hit_t);
           const float4 specular_candidate = float4(specular_rgb, specular_hit_t);
           if (sample.valid != 0u && isfinite(diffuse_hit_t) && isfinite(specular_hit_t)
-              && ((!positive_sample) || (diffuse_hit_t > 0.0 && diffuse_hit_t <= 65504.0))
-              && ((!specular_evaluated || !positive_sample) || (specular_hit_t > 0.0 && specular_hit_t <= 65504.0))
+              && (blocked || (!positive_sample) || (diffuse_hit_t > 0.0 && diffuse_hit_t <= 65504.0))
+              && (blocked || (!specular_evaluated || !positive_sample) || (specular_hit_t > 0.0 && specular_hit_t <= 65504.0))
               && RtxdiN1FiniteHalf4(diffuse_candidate) && RtxdiN1FiniteHalf4(specular_candidate)) {
             diffuse = diffuse_candidate;
             specular = specular_candidate;
-            status = RTXDI_N1_STATUS_VISIBLE;
+            status = blocked ? RTXDI_N1_STATUS_BLOCKED : RTXDI_N1_STATUS_VISIBLE;
           }
         }
       } else {

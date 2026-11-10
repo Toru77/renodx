@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <bit>
 #include <chrono>
 
@@ -2503,7 +2504,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     params[2].DescriptorTable.NumDescriptorRanges = 12u;
     params[2].DescriptorTable.pDescriptorRanges = ranges;
     params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[3].Constants.Num32BitValues = 8u;
+    params[3].Constants.Num32BitValues = 10u;
     params[3].Constants.ShaderRegister = 12u;
     D3D12_ROOT_SIGNATURE_DESC desc = {};
     desc.NumParameters = 4u;
@@ -2779,7 +2780,10 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     Transition(barriers, slot.n1_status.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
     transfer.di_list->SetPipelineState(transfer.n1_resolve_pso.Get());
-    const uint32_t n1_constants[8] = {
+    const float env_keep = 1.f - rtxdi::FiniteClamped(rtxdi::g_local_shadow_darkening, 1.f, 0.f, 1.f);
+    const float char_keep = 1.f - std::min(rtxdi::FiniteClamped(rtxdi::g_local_character_shadow_darkening, 1.f, 0.f, 1.f),
+                                           rtxdi::FiniteClamped(rtxdi::g_local_character_max_darkening, 1.f, 0.f, 1.f));
+    const uint32_t n1_constants[10] = {
         RTXDI_N1_CONFIG_VERSION,
         std::bit_cast<uint32_t>(in.n1_brdf_config[0]),
         std::bit_cast<uint32_t>(in.n1_brdf_config[1]),
@@ -2788,8 +2792,10 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
         std::bit_cast<uint32_t>(in.n1_brdf_config[4]),
         std::bit_cast<uint32_t>(in.n1_brdf_config[5]),
         std::bit_cast<uint32_t>(in.n1_brdf_config[6]),
+        std::bit_cast<uint32_t>(env_keep),
+        std::bit_cast<uint32_t>(char_keep),
     };
-    transfer.di_list->SetComputeRoot32BitConstants(3u, 8u, n1_constants, 0u);
+    transfer.di_list->SetComputeRoot32BitConstants(3u, 10u, n1_constants, 0u);
     transfer.di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
   }
 #if defined(FALCOM_NRD_ENABLED)
