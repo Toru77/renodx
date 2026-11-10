@@ -2200,6 +2200,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   bool nrd_dispatch_recorded = false;
   bool nrd_history_reset = false;
   Rt12NrdHistoryIdentity nrd_accepted_history = {};
+  rtxdi::NrdGateSnapshot nrd_gate = {};
 #endif
   uint32_t spatial_source_index = UINT32_MAX;
   uint32_t spatial_output_index = UINT32_MAX;
@@ -2254,6 +2255,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                               .nrd_diffuse_frame = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.frame : UINT32_MAX,
                               .nrd_diffuse_transfer_slot = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.transfer_slot : -1,
                               .nrd_diffuse_fence_b = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.producer_fence_b : 0u,
+                              .nrd_gate = nrd_gate,
 #endif
                               .output_bound = false,
                               .output_bound_frame = UINT32_MAX,
@@ -2792,6 +2794,36 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   bool camera_candidate_valid = false;
   bool projection_compatible = false;
   const bool nrd_allowed = nrd_requested;
+  nrd_gate.frame = in.frame;
+  bool gate_open = true;
+  const auto nrd_gate_link = [&](rtxdi::NrdGateLink link, bool pass, uint8_t reason) {
+    if (!gate_open) return false;
+    nrd_gate.status[static_cast<uint32_t>(link)] = pass ? rtxdi::kNrdGatePass : rtxdi::kNrdGateFail;
+    nrd_gate.reason[static_cast<uint32_t>(link)] = pass ? 0u : reason;
+    gate_open = pass;
+    return pass;
+  };
+  nrd_gate_link(rtxdi::NrdGateLink::Requested, in.effective_settings.relax_diffuse, 1u);
+  nrd_gate_link(rtxdi::NrdGateLink::RrFree, !rr::RrRequested() && !rr::RrOwnsDenoise(), rr::RrRequested() ? 1u : 2u);
+  nrd_gate_link(rtxdi::NrdGateLink::N1Ready, n1_ready, !transfer.n1_resolve_pso ? 1u : 2u);
+  nrd_gate_link(rtxdi::NrdGateLink::History, history_valid && previous_slot != nullptr, 1u);
+  nrd_gate_link(rtxdi::NrdGateLink::Motion, input.layout.motion_available != 0u, 1u);
+  if (gate_open) {
+    nrd_gate.previous_capture_frame = previous_slot->nrd.camera.capture_frame;
+    uint8_t previous_frame_reason = 0u;
+    if (!slot.nrd.camera.valid || !previous_slot->nrd.camera.valid) {
+      previous_frame_reason = 1u;
+    } else if (slot.nrd.camera.capture_frame != in.frame || previous_slot->nrd.camera.capture_frame == UINT32_MAX
+               || previous_slot->nrd.camera.capture_frame + 1u != in.frame) {
+      previous_frame_reason = 2u;
+    } else if (slot.nrd.camera.owner_generation != s.generation
+               || previous_slot->nrd.camera.owner_generation != s.generation) {
+      previous_frame_reason = 3u;
+    } else if (previous_slot->di_fence_value == 0u || previous_slot->fence_value == 0u) {
+      previous_frame_reason = 4u;
+    }
+    nrd_gate_link(rtxdi::NrdGateLink::PreviousFrame, previous_frame_reason == 0u, previous_frame_reason);
+  }
   if (nrd_allowed && n1_ready && history_valid && previous_slot != nullptr && input.layout.motion_available != 0u
       && slot.nrd.camera.valid && previous_slot->nrd.camera.valid && slot.nrd.camera.capture_frame == in.frame
       && previous_slot->nrd.camera.capture_frame != UINT32_MAX
@@ -2829,11 +2861,26 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                               transfer.configuration_generation, slot.nrd.camera.resource, in.width, in.height,
                               camera_candidate_valid, false, UINT32_MAX);
   }
+  nrd_gate.camera_passes = transfer.nrd.qualification.consecutive_passes;
+  nrd_gate.camera_correction = transfer.nrd.qualification.motion_correction_index;
+  uint8_t camera_reason = 5u;
+  if (!camera_candidate_valid) {
+    camera_reason = 1u;
+  } else if (!projection_compatible) {
+    camera_reason = 2u;
+  } else if (!transfer.nrd.qualification.qualified) {
+    camera_reason = 3u;
+  } else if (transfer.nrd.qualification.motion_correction_index >= 2u) {
+    camera_reason = 4u;
+  }
+  nrd_gate_link(rtxdi::NrdGateLink::Camera, keep_camera_qualified && transfer.nrd.qualification.motion_correction_index < 2u,
+       camera_reason);
   if (nrd_allowed && n1_ready && keep_camera_qualified
       && transfer.nrd.qualification.motion_correction_index < 2u) {
     Rt12Slot& nrd_scene = s.lighting_slots[static_cast<uint32_t>(in.scene_slot)];
     Rt12NrdSlot& nrd_slot = slot.nrd;
     bool hitdistance_recorded = false;
+    uint8_t hitdistance_reason = 1u;
     if (transfer.nrd_hitdistance_root && transfer.nrd_hitdistance_pso) {
       hitdistance_recorded = true;
     } else {
@@ -2908,6 +2955,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     if (hitdistance_recorded && (!nrd_slot.hit_distance || !nrd_slot.hit_validity || !nrd_slot.hitdistance_descriptors || nrd_slot.hitdistance_width != in.width || nrd_slot.hitdistance_height != in.height)) {
       if (!s.device12 || in.width == 0u || in.height == 0u || uint64_t{in.width} * in.height > UINT32_MAX) {
         hitdistance_recorded = false;
+        hitdistance_reason = 2u;
       } else {
         const uint64_t hitdistance_bytes = uint64_t{in.width} * in.height * sizeof(uint32_t);
         Rt12NrdSlot hitdistance_candidate;
@@ -2924,6 +2972,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
             || FAILED(s.device12->CreateDescriptorHeap(&hitdistance_heap,
                                                        IID_PPV_ARGS(&hitdistance_candidate.hitdistance_descriptors)))) {
           hitdistance_recorded = false;
+          hitdistance_reason = 2u;
         } else {
           nrd_slot.hit_distance = std::move(hitdistance_candidate.hit_distance);
           nrd_slot.hit_validity = std::move(hitdistance_candidate.hit_validity);
@@ -3047,6 +3096,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       }
     } else {
       hitdistance_recorded = false;
+      hitdistance_reason = 3u;
     }
     const uint32_t debug_view = in.effective_debug_view;
     const bool distance_debug_requested = RtxdiDebugDistanceExportRequested(debug_view);
@@ -3213,19 +3263,25 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     if (perf_timing && hitdistance_recorded) {
       transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6u);
     }
+    nrd_gate_link(rtxdi::NrdGateLink::HitDistance, hitdistance_recorded, hitdistance_reason);
     nrd_dispatch_recorded = hitdistance_recorded
                             && RecordNrdDenoise(s, slot, in, in.effective_settings, &nrd_accepted_history);
+    nrd_gate_link(rtxdi::NrdGateLink::Denoise, nrd_dispatch_recorded, 1u);
     slot.nrd.diffuse_publication_recorded = false;
+    uint8_t publication_reason = 4u;
 #if defined(__world_rtxdi_nrd_publish_EMBED_FILE)
+    publication_reason = 1u;
     if (nrd_dispatch_recorded && slot.nrd.diffuse_output_valid && slot.nrd.hit_validity
         && slot.nrd_diffuse_publication.texture12 && slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST)].resource
         && slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::IN_VIEWZ)].resource) {
+      publication_reason = 2u;
       if (!transfer.nrd_publication_root || !transfer.nrd_publication_pso) {
         Rt12NrdCreateDiffusePublicationPipeline(s.device12.Get(), __world_rtxdi_nrd_publish.data(),
                                                 __world_rtxdi_nrd_publish.size(), &transfer.nrd_publication_root,
                                                 &transfer.nrd_publication_pso);
       }
       if (transfer.nrd_publication_root && transfer.nrd_publication_pso) {
+        publication_reason = 3u;
         Rt12NrdTexture status_texture;
         status_texture.resource = slot.n1_status.texture12;
         status_texture.format = DXGI_FORMAT_R32_UINT;
@@ -3258,6 +3314,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       perf_nrd_recorded = true;
     }
 #endif
+    nrd_gate_link(rtxdi::NrdGateLink::Publication, slot.nrd.diffuse_publication_recorded, publication_reason);
     nrd_history_reset = !nrd_dispatch_recorded;
   } else {
     slot.nrd.dispatch_ready = false;
@@ -3419,6 +3476,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   }
   slot.nrd_diffuse_staged = nrd_dispatch_recorded && slot.nrd.diffuse_publication_recorded
                             && slot.nrd_diffuse_publication.srv11.handle != 0u;
+  nrd_gate_link(rtxdi::NrdGateLink::Srv, slot.nrd_diffuse_publication.srv11.handle != 0u, 1u);
   slot.nrd_diffuse_identity = {};
   if (slot.nrd_diffuse_staged) {
     slot.nrd_diffuse_identity = {

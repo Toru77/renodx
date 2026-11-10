@@ -947,6 +947,12 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         }
         ImGui::Text("Private NRD diffuse output staged: %s (frame %u)", di.nrd_diffuse_staged ? "yes" : "no",
                     di.nrd_diffuse_frame);
+        const uint32_t gate_blocked = rtxdi::NrdGateFirstNotPass(di.nrd_gate);
+        const bool gate_failed = gate_blocked < rtxdi::kNrdGateLinkCount && di.nrd_gate.status[gate_blocked] == rtxdi::kNrdGateFail;
+        ImGui::Text("RELAX gate: %s",
+                    gate_blocked == rtxdi::kNrdGateLinkCount ? "none"
+                    : gate_failed                            ? rtxdi::NrdGateLinkName(gate_blocked)
+                                                             : "not_evaluated");
 #else
         ImGui::Text("NRD SDK: not compiled");
         ImGui::Text("RTXDI diffuse policy: %s", !relax_requested ? "Raw selected"
@@ -1289,6 +1295,10 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           summary.nrd_status = nrd_panel.nrd_backend_state;
           summary.nrd_failure_stage = nrd_panel.nrd_failure_stage;
           summary.nrd_output_staged = di.nrd_diffuse_staged ? 1u : 0u;
+          summary.nrd_gate = di.nrd_gate;
+          summary.camera_qualification = (std::min)(di.nrd_gate.camera_passes, 255u)
+                                         | ((std::min)(di.nrd_gate.camera_correction, 255u) << 8u)
+                                         | (uint32_t{di.nrd_gate.reason[static_cast<uint32_t>(rtxdi::NrdGateLink::Camera)]} << 16u);
           if (!summary.requested_denoiser) {
             summary.nrd_policy = static_cast<uint32_t>(rtxdi::DiagnosticNrdPolicy::RawSelected);
           } else if (summary.rr_requested || summary.rr_owns_denoise) {

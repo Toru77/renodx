@@ -183,6 +183,7 @@ struct DiSnapshot {
   uint32_t nrd_diffuse_frame = UINT32_MAX;
   int32_t nrd_diffuse_transfer_slot = -1;
   uint64_t nrd_diffuse_fence_b = 0u;
+  NrdGateSnapshot nrd_gate = {};
 #endif
   bool output_bound = false;
   uint32_t output_bound_frame = UINT32_MAX;

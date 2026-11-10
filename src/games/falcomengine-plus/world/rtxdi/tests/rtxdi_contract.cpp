@@ -498,6 +498,15 @@ int main() {
     if (relax_report.find("nrd_backend=2 nrd_failure_stage=0 nrd_policy=4 nrd_diffuse_staged=1") == std::string::npos
         || relax_report.find("raw local/sun lighting remains independent") == std::string::npos
         || relax_report.find("staged is private producer evidence") == std::string::npos) return EXIT_FAILURE;
+    DiagnosticSummary gate = {};
+    gate.nrd_gate.frame = 7u;
+    for (uint32_t link = 0u; link < static_cast<uint32_t>(NrdGateLink::PreviousFrame); ++link) {
+      gate.nrd_gate.status[link] = kNrdGatePass;
+    }
+    gate.nrd_gate.status[static_cast<uint32_t>(NrdGateLink::PreviousFrame)] = kNrdGateFail;
+    gate.nrd_gate.reason[static_cast<uint32_t>(NrdGateLink::PreviousFrame)] = 2u;
+    const auto gate_report = SerializeDiagnosticReport(DiagnosticSnapshot{.latest = gate});
+    if (gate_report.find("first_fail=previous_frame reason=2") == std::string::npos) return EXIT_FAILURE;
     std::printf("PASS NRD report separates compiled/backend/policy/private staged output and no-SDK fallback\n");
   }
   {

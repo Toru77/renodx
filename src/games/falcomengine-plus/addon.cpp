@@ -12912,8 +12912,14 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
                  frame, state.generation, output.output_transfer_slot, output.output_fence_b);
 #if defined(FALCOM_NRD_ENABLED)
   const auto effective_rtxdi_settings = di::CaptureEffectiveRtxdiSettings();
-  if (still_current && output.nrd_diffuse_staged && !rr::RrRequested() && !rr::RrOwnsDenoise()
-      && effective_rtxdi_settings.relax_diffuse) {
+  uint8_t binding_reason = 0u;
+  if (!still_current) {
+    binding_reason = 1u;
+  } else if (!output.nrd_diffuse_staged || rr::RrRequested() || rr::RrOwnsDenoise()
+             || !effective_rtxdi_settings.relax_diffuse) {
+    binding_reason = 2u;
+  }
+  if (binding_reason == 0u) {
     const std::array<float, 7u> n1_brdf_config = {
         shader_injection.brdf_hammon_diffuse_enabled, shader_injection.brdf_diffuse_strength,
         shader_injection.brdf_multiscatter_specular_enabled, shader_injection.brdf_specular_strength,
@@ -12924,17 +12930,23 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
         state.di_transfer.configuration_generation, state.di.configuration_generation, effective_rtxdi_settings.identity,
         state.di_transfer.nrd.qualification.motion_correction_index);
     const auto& identity = slot.nrd_diffuse_identity;
-    if (input.width == dd->captured_depth_w && input.height == dd->captured_depth_h
-        && rt12::Rt12NrdDiffusePublicationMatches(identity, frame, state.generation,
-                                                  state.di_transfer.configuration_generation,
-                                                  state.di.configuration_generation, n1_identity, nrd_identity,
-                                                  dd->captured_depth_w, dd->captured_depth_h,
-                                                  output.output_scene_slot, output.output_transfer_slot,
-                                                  output.output_fence_b)
-        && slot.nrd_diffuse_staged && slot.nrd.diffuse_output_valid && slot.nrd.diffuse_publication_recorded
-        && slot.output_b_fence == identity.producer_fence_b && slot.nrd_diffuse_publication.srv11.handle
-        && rt12::ValidateDiTexture(slot.nrd_diffuse_publication.srv11, identity.width, identity.height,
-                                   rt12::Rt12DiTextureKind::Float)) {
+    if (input.width != dd->captured_depth_w || input.height != dd->captured_depth_h) {
+      binding_reason = 3u;
+    } else if (!rt12::Rt12NrdDiffusePublicationMatches(identity, frame, state.generation,
+                                                       state.di_transfer.configuration_generation,
+                                                       state.di.configuration_generation, n1_identity, nrd_identity,
+                                                       dd->captured_depth_w, dd->captured_depth_h,
+                                                       output.output_scene_slot, output.output_transfer_slot,
+                                                       output.output_fence_b)) {
+      binding_reason = 4u;
+    } else if (!(slot.nrd_diffuse_staged && slot.nrd.diffuse_output_valid && slot.nrd.diffuse_publication_recorded
+                 && slot.output_b_fence == identity.producer_fence_b && slot.nrd_diffuse_publication.srv11.handle)) {
+      binding_reason = 5u;
+    } else if (!rt12::ValidateDiTexture(slot.nrd_diffuse_publication.srv11, identity.width, identity.height,
+                                        rt12::Rt12DiTextureKind::Float)) {
+      binding_reason = 6u;
+    }
+    if (binding_reason == 0u) {
       cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                                  reshade::api::descriptor_table_update{{}, 43u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.nrd_diffuse_publication.srv11});
       shader_injection.rtxdi_diffuse_bound = 1.f;
@@ -12946,9 +12958,25 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
       if (still_staged) {
         di::g_di.snapshot.nrd_diffuse_bound = true;
       } else {
+        binding_reason = 7u;
         shader_injection.rtxdi_diffuse_bound = 0.f;
         cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                                    reshade::api::descriptor_table_update{{}, 43u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+      }
+    }
+  }
+  {
+    std::unique_lock lock(di::g_di.mutex);
+    auto& nrd_gate = di::g_di.snapshot.nrd_gate;
+    if (nrd_gate.frame == frame && nrd_gate.status[static_cast<uint32_t>(di::NrdGateLink::Srv)] == di::kNrdGatePass) {
+      const auto binding = static_cast<uint32_t>(di::NrdGateLink::Binding);
+      nrd_gate.status[binding] = (binding_reason == 0u ? di::kNrdGatePass : di::kNrdGateFail);
+      nrd_gate.reason[binding] = binding_reason;
+      if (binding_reason == 0u) {
+        const bool diffuse_bound = shader_injection.rtxdi_diffuse_bound > 0.5f;
+        const auto bound = static_cast<uint32_t>(di::NrdGateLink::Bound);
+        nrd_gate.status[bound] = (diffuse_bound ? di::kNrdGatePass : di::kNrdGateFail);
+        nrd_gate.reason[bound] = (diffuse_bound ? 0u : 1u);
       }
     }
   }

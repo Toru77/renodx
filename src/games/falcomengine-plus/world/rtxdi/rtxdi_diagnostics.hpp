@@ -217,6 +217,28 @@ struct DiagnosticIdentity {
   bool occupied = false;
 };
 
+enum class NrdGateLink : uint32_t { Requested, RrFree, N1Ready, History, Motion, PreviousFrame, Camera, HitDistance, Denoise, Publication, Srv, Binding, Bound, Count };
+inline constexpr uint32_t kNrdGateLinkCount = static_cast<uint32_t>(NrdGateLink::Count);
+inline constexpr uint8_t kNrdGatePass = 1u, kNrdGateFail = 2u;
+struct NrdGateSnapshot {
+  uint32_t frame = UINT32_MAX;
+  std::array<uint8_t, kNrdGateLinkCount> status = {};
+  std::array<uint8_t, kNrdGateLinkCount> reason = {};
+  uint32_t camera_passes = 0u, camera_correction = UINT32_MAX, previous_capture_frame = UINT32_MAX;
+};
+inline const char* NrdGateLinkName(uint32_t link) {
+  constexpr const char* names[] = {"requested","rr_free","n1_ready","history","motion","previous_frame","camera","hit_distance","denoise","publication","srv","binding","bound"};
+  return link < kNrdGateLinkCount ? names[link] : "none";
+}
+// Index of the first link that did not pass, or kNrdGateLinkCount when every link passed. Links after a failure
+// are never evaluated, so the first link that did not pass is the failing link.
+inline uint32_t NrdGateFirstNotPass(const NrdGateSnapshot& gate) {
+  for (uint32_t link = 0u; link < kNrdGateLinkCount; ++link) {
+    if (gate.status[link] != kNrdGatePass) return link;
+  }
+  return kNrdGateLinkCount;
+}
+
 struct DiagnosticSummary {
   uint64_t build_id = 0u;
   uint64_t requested_settings = 0u;
@@ -317,6 +339,7 @@ struct DiagnosticSummary {
   uint64_t debug_di_configuration = 0u;
   uint64_t debug_n1_configuration = 0u;
   uint32_t available_mask = 0u;
+  NrdGateSnapshot nrd_gate = {};
 };
 
 struct DiagnosticSnapshot {
@@ -619,10 +642,24 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
          summary.available_mask, summary.last_hresult, summary.runtime_gates, summary.nrd_compiled);
   append("availability bits: frame=0 states=1 input_identity=2 dimensions=3 scene_fence=4 B_fence_value=5 C_fence_value=6 settings=7 rr=8 nrd_status=9; unlisted fields unavailable\n");
   append("nrd_backend=0:NotCompiled,1:NotInitialized,2:Ready,3:Failed; nrd_failure_stage=0:None,1:SDKInstance,2:D3D12Backend; nrd_policy=0:RawSelected,1:RayReconstructionSuppressed,2:NoSdk,3:BackendUnavailable,4:RelaxSelected; RR suppression applies to diffuse denoising, raw local/sun lighting remains independent; staged is private producer evidence, not per-pixel application\n");
-  append("settings candidates=%u/%u spatial=%u/%u denoiser=%u/%u camera=unavailable reset=unavailable age_sentinel=%llu\n",
+  append("settings candidates=%u/%u spatial=%u/%u denoiser=%u/%u camera=0x%08x reset=unavailable age_sentinel=%llu\n",
          summary.requested_candidates, summary.effective_candidates, summary.requested_spatial_samples,
          summary.effective_spatial_samples, summary.requested_denoiser, summary.effective_denoiser,
-         static_cast<unsigned long long>(UINT64_MAX));
+         summary.camera_qualification, static_cast<unsigned long long>(UINT64_MAX));
+  const auto& gate = summary.nrd_gate;
+  const uint32_t gate_blocked = NrdGateFirstNotPass(gate);
+  const bool gate_failed = gate_blocked < kNrdGateLinkCount && gate.status[gate_blocked] == kNrdGateFail;
+  append("relax_gate frame=%u first_fail=%s reason=%u\n", gate.frame,
+         gate_blocked == kNrdGateLinkCount ? "none" : (gate_failed ? NrdGateLinkName(gate_blocked) : "not_evaluated"),
+         gate_failed ? gate.reason[gate_blocked] : 0u);
+  append("relax_gate links");
+  for (uint32_t link = 0u; link < kNrdGateLinkCount; ++link) {
+    append(" %s=%u:%u", NrdGateLinkName(link), uint32_t{gate.status[link]}, uint32_t{gate.reason[link]});
+  }
+  append("\n");
+  append("relax_gate camera passes=%u/4 correction=%u previous_capture_frame=%u\n", gate.camera_passes,
+         gate.camera_correction, gate.previous_capture_frame);
+  append("codes relax_link status=0:NotEvaluated,1:Pass,2:Fail; requested=1:RawSelected; rr_free=1:RrRequested,2:RrOwnsDenoise; n1_ready=1:PipelineMissing,2:ResourcesMissing; history=1:NoPreviousSlot; motion=1:MotionUnavailable; previous_frame=1:CameraInvalid,2:FrameGap,3:GenerationMismatch,4:FenceMissing; camera=1:CandidateInvalid,2:ProjectionChanged,3:Streak,4:CorrectionInvalid,5:IdentityMismatch; hit_distance=1:PipelineMissing,2:ResourceMissing,3:SceneInputsMissing; denoise=1:RecordFailed; publication=1:InputsMissing,2:PipelineMissing,3:RecordFailed,4:NotCompiled; srv=1:NoSrv; binding=1:NotCurrent,2:PolicyChanged,3:SizeMismatch,4:IdentityMismatch,5:SlotStateMismatch,6:InvalidSrv,7:SnapshotChanged; bound=1:NotBound\n");
   append("cpu_lights source=%u copied=%u truncated=%u tiles=%u deferred=%u\n",
          summary.input_lights_source, summary.input_lights_copied, summary.input_lights_truncated,
          summary.input_tiles, summary.input_deferred);
