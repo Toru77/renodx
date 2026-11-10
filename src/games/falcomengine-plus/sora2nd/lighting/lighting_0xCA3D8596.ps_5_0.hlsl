@@ -778,6 +778,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     // visibility and the RT coverage, so it fades out with the RT range. Flag clear: charColor unchanged.
     const uint rtlsCharFlags = (uint)shader_injection_data.rtls_flags;
     bool rtxdiCharResolved = false;
+    bool rtxdiCharTileValid = false;
+    bool rtxdiCharEmpty = false;
     if (shader_injection_data.rtxdi_local_bound > 0.5f) {
       uint resolvedWidth, resolvedHeight, tileCount, tileStride, lightCount, lightStride;
       rtxdiResolvedLocal_g.GetDimensions(resolvedWidth, resolvedHeight);
@@ -798,7 +800,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
               const uint depthSlice = (uint)clamp(depthSliceValue, 0.0, 7.0);
               const uint tileCell = min(4607u, depthSlice * 576u + tileBase);
               if (tileCell < tileCount) {
+                rtxdiCharTileValid = true;
                 const uint4 resolvedTuple = rtxdiResolvedLocal_g.Load(int3(pixel, 0));
+                rtxdiCharEmpty = resolvedTuple.z == RTXDI_DI_STATUS_EMPTY;
                 const LightIndexData tileData = lightIndices_g[tileCell];
                 const RtxdiLightingSelection selection =
                     RtxdiResolveLightingSelection(true, resolvedTuple, lightCount, tileData);
@@ -812,7 +816,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                                                           rtxdiDenoisedDiffuse_g.Load(int3(pixel, 0)), 2u);
                   }
                   if (denoised.valid) {
-                    charColor += r0.xyz * denoised.radiance;
+                    charColor += r0.xyz * denoised.radiance * shader_injection_data.rtxdi_local_character_intensity;
                     rtxdiCharResolved = true;
                     rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FILTERED;
                   } else if (selection.status == RTXDI_DI_STATUS_BLOCKED) {
@@ -822,7 +826,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                       const RtxdiCharacterLightResult characterLight =
                           RtxdiEvaluateCharacterLight(visibleSelection, dynamicLights_g[selection.index], r4.xyz, DecodeFalcomMrtNormalAsGame((uint2)r1.xy));
                       if (characterLight.resolved) {
-                        charColor += r0.xyz * characterLight.diffuse * shader_injection_data.rtxdi_local_character_keep;
+                        charColor += r0.xyz * characterLight.diffuse * shader_injection_data.rtxdi_local_character_keep * shader_injection_data.rtxdi_local_character_intensity;
                       }
                     }
                     rtxdiCharResolved = true;
@@ -832,7 +836,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                     const RtxdiCharacterLightResult characterLight =
                         RtxdiEvaluateCharacterLight(selection, lamp, r4.xyz, DecodeFalcomMrtNormalAsGame((uint2)r1.xy));
                     if (characterLight.resolved) {
-                      charColor += r0.xyz * characterLight.diffuse;
+                      charColor += r0.xyz * characterLight.diffuse * shader_injection_data.rtxdi_local_character_intensity;
                       rtxdiCharResolved = true;
                       rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_RAW;
                     } else {
@@ -846,9 +850,13 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         }
       }
     }
-    if (!rtxdiCharResolved
-        && (rtlsCharFlags & (RTLS_FLAG_BOUND | RTLS_FLAG_CHARACTER)) == (RTLS_FLAG_BOUND | RTLS_FLAG_CHARACTER)) {
-      const float3 rtlsCharTerm = rtlsTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;
+    const bool rtlsCharLamp = !rtxdiCharResolved
+        && (rtlsCharFlags & (RTLS_FLAG_BOUND | RTLS_FLAG_CHARACTER)) == (RTLS_FLAG_BOUND | RTLS_FLAG_CHARACTER);
+    const bool rtxdiCharFallback = !rtxdiCharResolved && !rtlsCharLamp && shader_injection_data.rtxdi_local_bound > 0.5f
+        && shader_injection_data.rtxdi_local_character_fallback > 0.5f && rtxdiCharTileValid && !rtxdiCharEmpty;
+    if (rtlsCharLamp || rtxdiCharFallback) {
+      if (rtxdiCharFallback) rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FALLBACK;
+      const float3 rtlsCharTerm = rtlsCharLamp ? rtlsTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz : float3(0.0, 0.0, 1.0);
       if (rtlsCharTerm.z > 0.0) {
         const float rtlsCharPointVis = rtlsCharTerm.z
             - min(rtlsCharTerm.x * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening * rtlsCharTerm.z);
@@ -860,8 +868,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         const uint rtlsRow = rtlsTile.y << 5;
         const uint rtlsSlice = (uint)clamp(lightIndices_g[rtlsTile.x + rtlsRow].tileDepthInv * -r1.w, 0.0, 7.0);
         const uint rtlsCell = min(4607u, rtlsSlice * 576u + rtlsRow + rtlsTile.x);
-        const uint rtlsPoints = (rtlsCharFlags & RTLS_FLAG_POINT) != 0u ? min(63u, lightIndices_g[rtlsCell].pointLightCount) : 0u;
-        const uint rtlsSpots = (rtlsCharFlags & RTLS_FLAG_SPOT) != 0u ? min(63u, lightIndices_g[rtlsCell].spotLightCount) : 0u;
+        const uint rtlsPoints = (rtxdiCharFallback || (rtlsCharFlags & RTLS_FLAG_POINT) != 0u) ? min(63u, lightIndices_g[rtlsCell].pointLightCount) : 0u;
+        const uint rtlsSpots = (rtxdiCharFallback || (rtlsCharFlags & RTLS_FLAG_SPOT) != 0u) ? min(63u, lightIndices_g[rtlsCell].spotLightCount) : 0u;
         float3 rtlsLamp = float3(0, 0, 0);
         for (uint i = 0u; i < rtlsPoints + rtlsSpots; ++i) {
           const bool spot = i >= rtlsPoints;
@@ -874,7 +882,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           if (att <= 0.0) continue;
           rtlsLamp += lamp.charaColor * (att * max(lamp.translucency, dot(rtlsCharN, lampDir)) * (spot ? rtlsCharSpotVis : rtlsCharPointVis));
         }
-        charColor += r0.xyz * rtlsLamp * shader_injection_data.rtls_char_lamp;
+        charColor += r0.xyz * rtlsLamp * (rtlsCharLamp ? shader_injection_data.rtls_char_lamp : shader_injection_data.rtxdi_local_character_intensity);
       }
     }
     // RTAO on characters, whatever "Allow GTVBAO" says: RTAO replaces GTVBAO, whose character settings do not

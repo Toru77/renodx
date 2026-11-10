@@ -83,8 +83,8 @@ ShaderInjectData shader_injection = {
     .cs_contact_local_light_clearance = 0.2f,
     .rtxdi_local_character_darkening = 1.f,
     .rtxdi_local_character_keep = 1.f,
-    .char_shadow_type = 1.f,
-    .char_shadow_camera_strength = 1.f,
+    .rtxdi_local_character_intensity = 1.f,
+    .rtxdi_local_character_fallback = 1.f,
     .char_shadow_world_strength = 1.f,
     .env_sss_enabled = 1.f,
     .env_sss_strength = 1.0f,
@@ -12893,6 +12893,8 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
   shader_injection.rtxdi_local_darkening = di::FiniteClamped(di::g_local_shadow_darkening, 1.f, 0.f, 1.f);
   shader_injection.rtxdi_local_character_darkening = di::FiniteClamped(di::g_local_character_shadow_darkening, 1.f, 0.f, 1.f);
   shader_injection.rtxdi_local_character_keep = 1.f - std::min(shader_injection.rtxdi_local_character_darkening, di::FiniteClamped(di::g_local_character_max_darkening, 1.f, 0.f, 1.f));
+  shader_injection.rtxdi_local_character_intensity = di::FiniteClamped(di::g_local_character_intensity, 1.f, 0.f, 2.f);
+  shader_injection.rtxdi_local_character_fallback = di::g_local_character_fallback > 0.5f ? 1.f : 0.f;
   bool still_current = false;
   {
     std::unique_lock lock(di::g_di.mutex);

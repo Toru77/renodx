@@ -47,11 +47,9 @@ struct ShaderInjectData {
   float cs_contact_local_light_clearance;   // [0..1] world units; reuses retired rtgi_reserved without moving later fields
   float rtxdi_local_character_darkening;    // RTXDI Local Character Shadow Darkening [0..1] (reuses retired offset 84)
   float rtxdi_local_character_keep;         // RTXDI blocked-lamp light kept on characters [0..1] (reuses retired offset 88)
-  // Shadow type: 0 = Camera, 1 = World, 2 = Combined. RETIRED: Bend_SSS, unread.
-  float char_shadow_type;
-  // Per-pass strengths (0..1). RETIRED: Bend_SSS, unread.
-  float char_shadow_camera_strength;
-  float char_shadow_world_strength;
+  float rtxdi_local_character_intensity;   // RTXDI character lamp light scale [0..2] (reuses retired offset 92)
+  float rtxdi_local_character_fallback;    // 0/1: unresolved RTXDI pixels get unshadowed character lamp light (reuses retired offset 96)
+  float char_shadow_world_strength;        // RETIRED: Bend_SSS, unread
 
   // Environment "Sun SSS" ray-march. RETIRED across the whole mod; unread.
   float env_sss_enabled;

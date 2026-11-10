@@ -1504,6 +1504,30 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtxdiLocalCharacterIntensity",
+      .binding = &rtxdi::g_local_character_intensity,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Character Light Intensity",
+      .section = "RTXDI",
+      .tooltip = "Scales the RTXDI lamp light added to characters, including the fallback.",
+      .min = 0.f,
+      .max = 2.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiLocalCharacterFallback",
+      .binding = &rtxdi::g_local_character_fallback,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Character Lamp Fallback",
+      .section = "RTXDI",
+      .tooltip = "Pixels whose RTXDI result is unknown or invalid get the game's unshadowed lamp light. Off = they get none.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtaoEnabled",
       .binding = &rtao::g_rtao_enabled,
       .value_type = SettingValueType::BOOLEAN,
