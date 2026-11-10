@@ -529,6 +529,120 @@ int main() {
     }
     ctx->CSSetShaderResources(0, 3, null_srvs);
     ctx->CSSetUnorderedAccessViews(0, 3, null_uavs, nullptr);
+    if (local && !zero_lights && width == 13u && height == 9u && scene_rows == 80u) {
+      constexpr UINT kLightElementCount = 1024u;
+      constexpr UINT kLightWordsPerElement = RTXDI_INPUT_LIGHT_STRIDE / sizeof(uint32_t);
+      std::vector<uint32_t> large_lights(kLightElementCount * kLightWordsPerElement);
+      for (UINT i = 0; i < large_lights.size(); ++i) large_lights[i] = 0x51000000u + i;
+      D3D11_BUFFER_DESC large_light_desc = {};
+      large_light_desc.ByteWidth = static_cast<UINT>(large_lights.size() * sizeof(uint32_t));
+      large_light_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      large_light_desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+      large_light_desc.StructureByteStride = RTXDI_INPUT_LIGHT_STRIDE;
+      D3D11_SUBRESOURCE_DATA large_light_data = {.pSysMem = large_lights.data(), .SysMemPitch = 0, .SysMemSlicePitch = 0};
+      ComPtr<ID3D11Buffer> large_light_buffer;
+      if (!check(d11->CreateBuffer(&large_light_desc, &large_light_data, &large_light_buffer),
+                 "create production-sized Lights buffer")) return 1;
+      D3D11_SHADER_RESOURCE_VIEW_DESC buffer_view_desc = {};
+      buffer_view_desc.Format = DXGI_FORMAT_UNKNOWN;
+      buffer_view_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+      buffer_view_desc.Buffer.FirstElement = 1u;
+      buffer_view_desc.Buffer.NumElements = kLightElementCount - 1u;
+      D3D11_SHADER_RESOURCE_VIEW_DESC bufferex_view_desc = {};
+      bufferex_view_desc.Format = DXGI_FORMAT_UNKNOWN;
+      bufferex_view_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+      bufferex_view_desc.BufferEx.FirstElement = buffer_view_desc.Buffer.FirstElement;
+      bufferex_view_desc.BufferEx.NumElements = buffer_view_desc.Buffer.NumElements;
+      bufferex_view_desc.BufferEx.Flags = 0u;
+      std::array<ComPtr<ID3D11ShaderResourceView>, 2> large_light_views;
+      if (!check(d11->CreateShaderResourceView(large_light_buffer.Get(), &buffer_view_desc, &large_light_views[0]),
+                 "create production-sized Lights BUFFER SRV")
+          || !check(d11->CreateShaderResourceView(large_light_buffer.Get(), &bufferex_view_desc, &large_light_views[1]),
+                    "create production-sized Lights BUFFEREX SRV")) return 1;
+      std::array<StructuredInputRange, 2> large_light_ranges = {};
+      for (UINT i = 0; i < large_light_views.size(); ++i) {
+        StructuredViewEvidence evidence = {};
+        if (!ValidateStructuredView(large_light_views[i].Get(), RTXDI_INPUT_LIGHT_STRIDE, &large_light_ranges[i], &evidence)
+            || large_light_ranges[i].buffer_bytes != 114688u || large_light_ranges[i].first_element != 1u
+            || large_light_ranges[i].element_count != 1023u || large_light_ranges[i].stride != 112u
+            || evidence.view_dimension != (i == 0 ? D3D11_SRV_DIMENSION_BUFFER : D3D11_SRV_DIMENSION_BUFFEREX)
+            || evidence.format != DXGI_FORMAT_UNKNOWN || (i == 1 && evidence.bufferex_flags != 0u)) {
+          std::fprintf(stderr, "FAIL production Lights view form=%u dim=%u flags=%u failure=%u bytes=%llu range=%u/%u stride=%u\n",
+                       i, evidence.view_dimension, evidence.bufferex_flags, static_cast<uint32_t>(evidence.failure),
+                       static_cast<unsigned long long>(large_light_ranges[i].buffer_bytes),
+                       large_light_ranges[i].first_element, large_light_ranges[i].element_count, large_light_ranges[i].stride);
+          return 1;
+        }
+      }
+      if (large_light_ranges[0].buffer_bytes != large_light_ranges[1].buffer_bytes
+          || large_light_ranges[0].first_element != large_light_ranges[1].first_element
+          || large_light_ranges[0].element_count != large_light_ranges[1].element_count
+          || large_light_ranges[0].stride != large_light_ranges[1].stride) {
+        std::fprintf(stderr, "FAIL BUFFER and zero-flag BUFFEREX structured ranges differ\n");
+        return 1;
+      }
+      D3D11_TEXTURE2D_DESC packed_desc = {};
+      carriers[6].texture11->GetDesc(&packed_desc);
+      packed_desc.Usage = D3D11_USAGE_STAGING;
+      packed_desc.BindFlags = 0u;
+      packed_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      packed_desc.MiscFlags = 0u;
+      std::array<ComPtr<ID3D11Texture2D>, 2> packed_readbacks;
+      for (auto& readback : packed_readbacks) {
+        if (!check(d11->CreateTexture2D(&packed_desc, nullptr, &readback), "create Lights pack staging texture")) return 1;
+      }
+      UINT light_counts[] = {1u, 0u, 0u, 0u};
+      ID3D11UnorderedAccessView* pack_uavs[] = {carriers[6].uav.Get(), carriers[7].uav.Get(), carriers[8].uav.Get()};
+      for (UINT i = 0; i < large_light_views.size(); ++i) {
+        ID3D11ShaderResourceView* pack_srvs[] = {large_light_views[i].Get(), record_views[1].Get(), record_views[2].Get()};
+        ctx->UpdateSubresource(constants.Get(), 0, nullptr, light_counts, 0, 0);
+        ctx->CSSetShader(pack_records.Get(), nullptr, 0);
+        ctx->CSSetShaderResources(0, 3, pack_srvs);
+        ctx->CSSetUnorderedAccessViews(0, 3, pack_uavs, nullptr);
+        ctx->Dispatch(1u, 1u, 1u);
+        ctx->CSSetShaderResources(0, 3, null_srvs);
+        ctx->CSSetUnorderedAccessViews(0, 3, null_uavs, nullptr);
+        ctx->CopyResource(packed_readbacks[i].Get(), carriers[6].texture11.Get());
+      }
+      ComPtr<ID3D11Query> pack_query;
+      D3D11_QUERY_DESC pack_query_desc = {.Query = D3D11_QUERY_EVENT, .MiscFlags = 0};
+      if (!check(d11->CreateQuery(&pack_query_desc, &pack_query), "create Lights pack query")) return 1;
+      ctx->End(pack_query.Get());
+      ctx->Flush();
+      auto pack_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      while ((hr = ctx->GetData(pack_query.Get(), nullptr, 0, 0)) == S_FALSE
+             && std::chrono::steady_clock::now() < pack_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      if (hr != S_OK) {
+        std::fprintf(stderr, "FAIL Lights pack completion: 0x%08lx\n", static_cast<unsigned long>(hr));
+        return 1;
+      }
+      std::array<std::array<uint32_t, 28>, 2> packed_words = {};
+      for (UINT i = 0; i < packed_readbacks.size(); ++i) {
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (!check(ctx->Map(packed_readbacks[i].Get(), 0u, D3D11_MAP_READ, 0u, &mapped), "map Lights pack readback")) return 1;
+        std::memcpy(packed_words[i].data(), mapped.pData, sizeof(packed_words[i]));
+        ctx->Unmap(packed_readbacks[i].Get(), 0u);
+      }
+      std::array<uint32_t, 28> expected_words = {};
+      std::copy_n(large_lights.data() + kLightWordsPerElement, expected_words.size(), expected_words.data());
+      if (packed_words[0] != packed_words[1] || packed_words[0] != expected_words) {
+        std::fprintf(stderr, "FAIL production pack readback differs for BUFFER vs zero-flag BUFFEREX\n");
+        return 1;
+      }
+      UINT restore_counts[] = {local && !zero_lights ? 1u : 0u, local ? 1u : 0u, local ? 1u : 0u, 0u};
+      ID3D11ShaderResourceView* restore_srvs[] = {record_views[0].Get(), record_views[1].Get(), record_views[2].Get()};
+      ID3D11UnorderedAccessView* restore_uavs[] = {carriers[6].uav.Get(), carriers[7].uav.Get(), carriers[8].uav.Get()};
+      ctx->UpdateSubresource(constants.Get(), 0, nullptr, restore_counts, 0, 0);
+      ctx->CSSetShader(pack_records.Get(), nullptr, 0);
+      ctx->CSSetShaderResources(0, 3, restore_srvs);
+      ctx->CSSetUnorderedAccessViews(0, 3, restore_uavs, nullptr);
+      ctx->Dispatch(1u, 1u, 1u);
+      ctx->CSSetShaderResources(0, 3, null_srvs);
+      ctx->CSSetUnorderedAccessViews(0, 3, null_uavs, nullptr);
+      std::printf("PASS 1024x112 Lights BUFFER/BUFFEREX(flags=0) range and production pack parity\n");
+    }
     D3D11_QUERY_DESC const query_desc = {.Query = D3D11_QUERY_EVENT, .MiscFlags = 0};
     ComPtr<ID3D11Query> query;
     if (!check(d11->CreateQuery(&query_desc, &query), "create D3D11 query")) return 1;

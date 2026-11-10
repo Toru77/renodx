@@ -122,16 +122,29 @@ inline bool ValidateStructuredView(ID3D11ShaderResourceView* view, uint32_t stri
   }
   D3D11_SHADER_RESOURCE_VIEW_DESC srv = {};
   view->GetDesc(&srv);
+  uint32_t first_element = 0u;
+  uint32_t element_count = 0u;
+  bool supported_dimension = false;
+  bool supported_bufferex_flags = true;
+  if (srv.ViewDimension == D3D11_SRV_DIMENSION_BUFFER) {
+    first_element = srv.Buffer.FirstElement;
+    element_count = srv.Buffer.NumElements;
+    supported_dimension = true;
+  } else if (srv.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
+    first_element = srv.BufferEx.FirstElement;
+    element_count = srv.BufferEx.NumElements;
+    supported_dimension = true;
+    supported_bufferex_flags = srv.BufferEx.Flags == 0u;
+  }
   if (evidence != nullptr) {
     evidence->view_dimension = static_cast<uint32_t>(srv.ViewDimension);
     evidence->format = static_cast<uint32_t>(srv.Format);
     evidence->evidence_flags |= 1u;
-    if (srv.ViewDimension == D3D11_SRV_DIMENSION_BUFFER) {
-      evidence->first_element = srv.Buffer.FirstElement;
-      evidence->element_count = srv.Buffer.NumElements;
-    } else if (srv.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
-      evidence->first_element = srv.BufferEx.FirstElement;
-      evidence->element_count = srv.BufferEx.NumElements;
+    if (supported_dimension) {
+      evidence->first_element = first_element;
+      evidence->element_count = element_count;
+    }
+    if (srv.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
       evidence->bufferex_flags = srv.BufferEx.Flags;
       evidence->evidence_flags |= 16u;
     }
@@ -149,9 +162,9 @@ inline bool ValidateStructuredView(ID3D11ShaderResourceView* view, uint32_t stri
       evidence->evidence_flags |= 64u;
     }
   };
-  if (srv.ViewDimension != D3D11_SRV_DIMENSION_BUFFER || srv.Format != DXGI_FORMAT_UNKNOWN) {
+  if (!supported_dimension || !supported_bufferex_flags || srv.Format != DXGI_FORMAT_UNKNOWN) {
     if (evidence != nullptr) {
-      evidence->failure = srv.ViewDimension != D3D11_SRV_DIMENSION_BUFFER
+      evidence->failure = (!supported_dimension || !supported_bufferex_flags)
                               ? DiagnosticStructuredFailure::WrongViewDimension
                               : DiagnosticStructuredFailure::WrongFormat;
       Microsoft::WRL::ComPtr<ID3D11Resource> diagnostic_resource;
@@ -195,7 +208,7 @@ inline bool ValidateStructuredView(ID3D11ShaderResourceView* view, uint32_t stri
     if (evidence != nullptr) evidence->failure = DiagnosticStructuredFailure::MissingStructuredFlag;
     return false;
   }
-  const StructuredInputRange range = {.buffer_bytes = desc.ByteWidth, .first_element = srv.Buffer.FirstElement, .element_count = srv.Buffer.NumElements, .stride = desc.StructureByteStride};
+  const StructuredInputRange range = {.buffer_bytes = desc.ByteWidth, .first_element = first_element, .element_count = element_count, .stride = desc.StructureByteStride};
   const DiagnosticStructuredFailure validation_failure = StructuredInputFailure(range, stride);
   if (evidence != nullptr) {
     evidence->failure = validation_failure;
