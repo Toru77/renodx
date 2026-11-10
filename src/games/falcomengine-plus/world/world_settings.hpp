@@ -1054,10 +1054,10 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = static_cast<float>(RTXDI_SUN_DETAIL_STATUS),
       .label = "RTXDI Sun Detail",
       .section = "RTXDI Shared",
-      .tooltip = "Session only. Status preserves the Sun Visibility view (green = sun reaches the pixel through foliage layers); Reason and Hit distance inspect the matching sun result record.",
-      .labels = {"Status", "Reason", "Hit distance"},
+      .tooltip = "Session only. Status preserves the Sun Visibility view (green = sun reaches the pixel through foliage layers); Reason, Hit distance, Layers and Blocker inspect the matching sun result record.",
+      .labels = {"Status", "Reason", "Hit distance", "Layers", "Blocker"},
       .min = static_cast<float>(RTXDI_SUN_DETAIL_STATUS),
-      .max = static_cast<float>(RTXDI_SUN_DETAIL_HIT_DISTANCE),
+      .max = static_cast<float>(RTXDI_SUN_DETAIL_BLOCKER),
       .is_visible = [visible] {
         return visible() && static_cast<uint32_t>(std::clamp(std::isfinite(rtxdi::g_debug_view)
                                                                  ? rtxdi::g_debug_view
@@ -1154,7 +1154,10 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         if (debug.effective_view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY
             && debug.sun_detail_view != RTXDI_SUN_DETAIL_STATUS) {
           ImGui::Text("Sun detail view: %s | carrier %s",
-                      debug.sun_detail_view == RTXDI_SUN_DETAIL_REASON ? "Reason" : "Hit distance",
+                      debug.sun_detail_view == RTXDI_SUN_DETAIL_REASON         ? "Reason"
+                      : debug.sun_detail_view == RTXDI_SUN_DETAIL_HIT_DISTANCE ? "Hit distance"
+                      : debug.sun_detail_view == RTXDI_SUN_DETAIL_LAYERS       ? "Layers"
+                                                                               : "Blocker",
                       debug.sun_detail_source_ready ? "ready" : "unavailable");
         }
         return false;

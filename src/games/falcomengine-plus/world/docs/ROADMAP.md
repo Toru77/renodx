@@ -230,6 +230,8 @@ RTXDI M11: the RTXDI rows are split into the sections RTXDI Local, RTXDI Sun and
 
 RTXDI M12: the M10 toggle Drop Blocked Samples From Reuse (Local) and the M8 gate Character Shadows Follow Game Shadow (Sun) are removed after in-game tests (thicker lamp shadows and no noise gain; the gate changed no pixel because t7 has no character shadow). Not validated in game.
 
+RTXDI M13: Sun Detail gains Layers (wind and leaf layer counts) and Blocker (foliage, alpha, shadow-only or character blocker) views; the image is unchanged. Not validated in game.
+
 ## Reference
 
 ### Code map (`world/`)

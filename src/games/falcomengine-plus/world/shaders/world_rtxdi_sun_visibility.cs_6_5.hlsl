@@ -223,6 +223,14 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     result.status = RTXDI_SUN_STATUS_BLOCKED;
     result.distance = hit.t;
     result.reason = RTXDI_SUN_REASON_NONE;
+    if ((hit.instance & DYNAMIC_INSTANCE_FLAG) != 0u) {
+      result.flags |= RTXDI_SUN_BLOCKER_CHARACTER;
+    } else {
+      const uint blocker_visibility = (uint)(g_trace_instances[hit.instance].visibility.z + 0.5);
+      result.flags |= ((blocker_visibility & INSTANCE_FOLIAGE) != 0u ? RTXDI_SUN_BLOCKER_FOLIAGE : 0u);
+      result.flags |= ((blocker_visibility & INSTANCE_ALPHA_TESTED) != 0u ? RTXDI_SUN_BLOCKER_ALPHA : 0u);
+      result.flags |= ((blocker_visibility & INSTANCE_CAMERA_VISIBLE) == 0u ? RTXDI_SUN_BLOCKER_SHADOW_ONLY : 0u);
+    }
   } else if (complete_segment) {
     result.status = RTXDI_SUN_STATUS_VISIBLE;
     result.distance = g_max_distance;

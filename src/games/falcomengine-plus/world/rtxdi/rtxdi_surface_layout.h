@@ -46,6 +46,11 @@
 #define RTXDI_SUN_LAYER_MASK 0xFu
 #define RTXDI_SUN_WIND_LAYER_SHIFT 12u
 
+#define RTXDI_SUN_BLOCKER_FOLIAGE     0x10000u
+#define RTXDI_SUN_BLOCKER_ALPHA       0x20000u
+#define RTXDI_SUN_BLOCKER_SHADOW_ONLY 0x40000u
+#define RTXDI_SUN_BLOCKER_CHARACTER   0x80000u
+
 #ifdef __cplusplus
 struct RtxdiSunVisibilityResult {
   uint32_t status;

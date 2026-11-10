@@ -15,6 +15,8 @@
 #define RTXDI_SUN_DETAIL_STATUS       0u
 #define RTXDI_SUN_DETAIL_REASON       1u
 #define RTXDI_SUN_DETAIL_HIT_DISTANCE 2u
+#define RTXDI_SUN_DETAIL_LAYERS       3u
+#define RTXDI_SUN_DETAIL_BLOCKER      4u
 
 #define RTXDI_DEBUG_CONSUMER_UNAVAILABLE 0u
 #define RTXDI_DEBUG_CONSUMER_FILTERED    1u
@@ -73,7 +75,8 @@ constexpr bool RtxdiDebugDistanceExportRequested(uint32_t effective_view) {
 
 constexpr bool RtxdiSunDetailExportRequested(uint32_t effective_view, uint32_t detail_view) {
   return effective_view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY
-         && (detail_view == RTXDI_SUN_DETAIL_REASON || detail_view == RTXDI_SUN_DETAIL_HIT_DISTANCE);
+         && (detail_view == RTXDI_SUN_DETAIL_REASON || detail_view == RTXDI_SUN_DETAIL_HIT_DISTANCE
+             || detail_view == RTXDI_SUN_DETAIL_LAYERS || detail_view == RTXDI_SUN_DETAIL_BLOCKER);
 }
 #endif
 

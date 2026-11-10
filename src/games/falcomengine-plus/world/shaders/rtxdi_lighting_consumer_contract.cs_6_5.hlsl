@@ -140,7 +140,9 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
   result.padding2 = 0u;
   result.debug_color = input.debug_view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY
                                && (input.debug_consumer_decision == RTXDI_SUN_DETAIL_REASON
-                                   || input.debug_consumer_decision == RTXDI_SUN_DETAIL_HIT_DISTANCE)
+                                   || input.debug_consumer_decision == RTXDI_SUN_DETAIL_HIT_DISTANCE
+                                   || input.debug_consumer_decision == RTXDI_SUN_DETAIL_LAYERS
+                                   || input.debug_consumer_decision == RTXDI_SUN_DETAIL_BLOCKER)
                            ? RtxdiDebugSunDetailColor(input.debug_tuple, input.debug_consumer_decision)
                            : RtxdiDebugValueColor(input.debug_view, input.debug_pixel,
       (input.debug_flags & 1u) != 0u, input.debug_status,
