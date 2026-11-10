@@ -53,6 +53,38 @@ float3 RtxdiDebugDistance(float4 carrier, bool magnitude)
   return value.xxx * 0.05;
 }
 
+float3 RtxdiDebugSunReasonColor(uint status, uint reason)
+{
+  if (reason == RTXDI_SUN_REASON_NONE) {
+    if (status == RTXDI_SUN_STATUS_VISIBLE) return float3(1.0, 1.0, 1.0) * 0.05;
+    if (status == RTXDI_SUN_STATUS_BLOCKED) return 0.0;
+    return float3(1.0, 0.8, 0.0) * 0.05;
+  }
+  if (reason == RTXDI_SUN_REASON_INVALID_SURFACE) return float3(1.0, 0.0, 1.0) * 0.05;
+  if (reason == RTXDI_SUN_REASON_INVALID_SCENE) return float3(1.0, 0.4, 0.0) * 0.05;
+  if (reason == RTXDI_SUN_REASON_INVALID_ALPHA) return float3(1.0, 0.1, 0.1) * 0.05;
+  if (reason == RTXDI_SUN_REASON_COVERAGE_MISS) return float3(0.0, 0.4, 1.0) * 0.05;
+  if (reason == RTXDI_SUN_REASON_TRUNCATED) return float3(1.0, 0.8, 0.0) * 0.05;
+  if (reason == RTXDI_SUN_REASON_INVALID_RAY) return float3(0.6, 0.0, 1.0) * 0.05;
+  return float3(1.0, 0.0, 1.0) * 0.05;
+}
+
+float3 RtxdiDebugSunDetailColor(uint4 carrier, uint detail_view)
+{
+  const uint status = carrier.x;
+  const uint reason = carrier.y;
+  const float distance = asfloat(carrier.z);
+  if (status > RTXDI_SUN_STATUS_BLOCKED || reason > RTXDI_SUN_REASON_INVALID_RAY) {
+    return float3(1.0, 0.0, 1.0) * 0.05;
+  }
+  if (detail_view == RTXDI_SUN_DETAIL_REASON) return RtxdiDebugSunReasonColor(status, reason);
+  if (detail_view != RTXDI_SUN_DETAIL_HIT_DISTANCE) return RtxdiDebugSunReasonColor(status, reason);
+  if (status == RTXDI_SUN_STATUS_UNKNOWN) return float3(1.0, 0.8, 0.0) * 0.05;
+  if (reason != RTXDI_SUN_REASON_NONE) return RtxdiDebugSunReasonColor(status, reason);
+  if (!isfinite(distance) || distance < 0.0) return float3(1.0, 0.0, 1.0) * 0.05;
+  return (log2(1.0 + min(distance, 65504.0)) / log2(1.0 + 65504.0)).xxx * 0.05;
+}
+
 float4 RtxdiDebugPackDistance(uint status_word, float distance, uint flags)
 {
   const uint status = status_word & 0x07u;

@@ -25,6 +25,7 @@ inline float g_spatial_normal_threshold = 0.9f;
 inline float g_diffuse_denoiser = 1.f;
 inline float g_debug_logging = 0.f;
 inline float g_debug_view = static_cast<float>(RTXDI_DEBUG_VIEW_OFF);
+inline float g_sun_detail_view = static_cast<float>(RTXDI_SUN_DETAIL_STATUS);
 inline float g_relax_diffuse_history = 30.f;
 inline float g_relax_fast_history = 6.f;
 inline float g_relax_prepass_radius = 30.f;
@@ -36,6 +37,8 @@ inline bool SceneRequested() { return SceneRequestMask() != 0u; }
 struct DebugSnapshot {
   uint32_t requested_view = RTXDI_DEBUG_VIEW_OFF;
   uint32_t effective_view = RTXDI_DEBUG_VIEW_OFF;
+  uint32_t sun_detail_view = RTXDI_SUN_DETAIL_STATUS;
+  bool sun_detail_source_ready = false;
   uint32_t source_status = 0u;
   uint32_t rejection_reason = 0u;
   uint32_t frame = UINT32_MAX;

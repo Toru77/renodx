@@ -212,6 +212,15 @@ int main() {
     return EXIT_FAILURE;
   }
   std::printf("PASS RTXDI debug precedence: BVH > RTXDI > lighting; observed owner stays latched until callback\n");
+  if (RtxdiSunDetailExportRequested(RTXDI_DEBUG_VIEW_SUN_VISIBILITY, RTXDI_SUN_DETAIL_STATUS)
+      || !RtxdiSunDetailExportRequested(RTXDI_DEBUG_VIEW_SUN_VISIBILITY, RTXDI_SUN_DETAIL_REASON)
+      || !RtxdiSunDetailExportRequested(RTXDI_DEBUG_VIEW_SUN_VISIBILITY, RTXDI_SUN_DETAIL_HIT_DISTANCE)
+      || RtxdiSunDetailExportRequested(RTXDI_DEBUG_VIEW_LOCAL_STATUS, RTXDI_SUN_DETAIL_REASON)
+      || RtxdiSunDetailExportRequested(ResolveRtxdiDebugEffectiveView(RTXDI_DEBUG_VIEW_SUN_VISIBILITY, true),
+                                      RTXDI_SUN_DETAIL_HIT_DISTANCE)) {
+    return EXIT_FAILURE;
+  }
+  std::printf("PASS RTXDI sun detail export gate: Status/Off/BVH perform no optional work; Reason/Hit distance only under effective Sun Visibility\n");
   {
     using namespace falcom_world::rtxdi;
     auto diagnostics_owner = std::make_unique<DiagnosticState>();

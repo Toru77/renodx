@@ -31,6 +31,7 @@
 #include "world_rtxdi_reconstruct.h"
 #include "world_rtxdi_spatial_di.h"
 #include "world_rtxdi_sun_visibility.h"
+#include "world_rtxdi_sun_detail.h"
 #include "world_rtxdi_temporal_di.h"
 
 using Microsoft::WRL::ComPtr;
@@ -746,6 +747,13 @@ int RunRtxdiDxrBridge() {
   if (!CreateRoot(device.Get(), sun_ranges, 7, 12, &sun_root)
       || !CreatePso(device.Get(), sun_root.Get(), __world_rtxdi_sun_visibility, &sun_pso)) return 1;
   std::fprintf(stderr, "DXR sun root + PSO ready\n");
+  D3D12_DESCRIPTOR_RANGE sun_detail_ranges[2] = {};
+  sun_detail_ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 0u, 0u, 0u};
+  sun_detail_ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1u, 0u, 0u, 1u};
+  ComPtr<ID3D12RootSignature> sun_detail_root;
+  ComPtr<ID3D12PipelineState> sun_detail_pso;
+  if (!CreateRoot(device.Get(), sun_detail_ranges, 2u, 3u, &sun_detail_root)
+      || !CreatePso(device.Get(), sun_detail_root.Get(), __world_rtxdi_sun_detail, &sun_detail_pso)) return 1;
   D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
   heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
   heap_desc.NumDescriptors = 14;
@@ -756,6 +764,14 @@ int RunRtxdiDxrBridge() {
   heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
   ComPtr<ID3D12DescriptorHeap> sun_cpu_heap;
   if (!Check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&sun_cpu_heap)), "create sun CPU descriptor heap")) return 1;
+  heap_desc.NumDescriptors = 2u;
+  heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> sun_detail_heap;
+  if (!Check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&sun_detail_heap)), "create sun detail descriptor heap")) return 1;
+  heap_desc.NumDescriptors = 1u;
+  heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+  ComPtr<ID3D12DescriptorHeap> sun_detail_cpu_heap;
+  if (!Check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&sun_detail_cpu_heap)), "create sun detail CPU heap")) return 1;
   heap_desc.NumDescriptors = 14;
   heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   std::fprintf(stderr, "DXR sun descriptor heap ready\n");
@@ -805,6 +821,8 @@ int RunRtxdiDxrBridge() {
   ComPtr<ID3D12Resource> sun_readback;
   ComPtr<ID3D12Resource> sun_visibility_output;
   ComPtr<ID3D12Resource> sun_visibility_readback;
+  ComPtr<ID3D12Resource> sun_detail_output;
+  ComPtr<ID3D12Resource> sun_detail_readback;
   constexpr UINT pixel_count = 6;
   constexpr UINT sun_output_count = pixel_count + 1;
   const auto default_properties = Heap(D3D12_HEAP_TYPE_DEFAULT);
@@ -826,6 +844,22 @@ int RunRtxdiDxrBridge() {
   device->GetCopyableFootprints(&sun_visibility_desc, 0u, 1u, 0u, &visibility_footprint, &visibility_rows,
                                 &visibility_row_bytes, &visibility_bytes);
   const auto visibility_readback_desc = BufferDesc(visibility_bytes);
+  D3D12_RESOURCE_DESC sun_detail_desc = {};
+  sun_detail_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  sun_detail_desc.Width = 4u;
+  sun_detail_desc.Height = 2u;
+  sun_detail_desc.DepthOrArraySize = 1u;
+  sun_detail_desc.MipLevels = 1u;
+  sun_detail_desc.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+  sun_detail_desc.SampleDesc.Count = 1u;
+  sun_detail_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  sun_detail_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT sun_detail_footprint = {};
+  UINT sun_detail_rows = 0u;
+  UINT64 sun_detail_row_bytes = 0u, sun_detail_bytes = 0u;
+  device->GetCopyableFootprints(&sun_detail_desc, 0u, 1u, 0u, &sun_detail_footprint, &sun_detail_rows,
+                                &sun_detail_row_bytes, &sun_detail_bytes);
+  const auto sun_detail_readback_desc = BufferDesc(sun_detail_bytes);
   if (!CreateDefaultBuffer(device.Get(), sizeof(SunResult) * sun_output_count, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                            D3D12_RESOURCE_STATE_COMMON, &sun_output)
       || !Check(device->CreateCommittedResource(&readback_properties, D3D12_HEAP_FLAG_NONE,
@@ -839,7 +873,13 @@ int RunRtxdiDxrBridge() {
       || !Check(device->CreateCommittedResource(&readback_properties, D3D12_HEAP_FLAG_NONE,
                                                 &visibility_readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                 IID_PPV_ARGS(&sun_visibility_readback)),
-                "create sun visibility readback")) return 1;
+                "create sun visibility readback")
+      || !CreateTexture(device.Get(), DXGI_FORMAT_R32G32B32A32_UINT, 4u, 2u, 1u,
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &sun_detail_output)
+      || !Check(device->CreateCommittedResource(&readback_properties, D3D12_HEAP_FLAG_NONE,
+                                                &sun_detail_readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&sun_detail_readback)),
+                "create sun detail readback")) return 1;
   std::fprintf(stderr, "DXR sun output/readback ready\n");
   cpu = sun_heap->GetCPUDescriptorHandleForHeapStart();
   cpu.ptr += static_cast<SIZE_T>(12) * descriptor_size;
@@ -856,6 +896,21 @@ int RunRtxdiDxrBridge() {
   device->CreateUnorderedAccessView(sun_visibility_output.Get(), nullptr, &visibility_uav, cpu);
   device->CreateUnorderedAccessView(sun_visibility_output.Get(), nullptr, &visibility_uav,
                                     sun_cpu_heap->GetCPUDescriptorHandleForHeapStart());
+  D3D12_SHADER_RESOURCE_VIEW_DESC detail_source_srv = {};
+  detail_source_srv.Format = DXGI_FORMAT_UNKNOWN;
+  detail_source_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  detail_source_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  detail_source_srv.Buffer.NumElements = pixel_count;
+  detail_source_srv.Buffer.StructureByteStride = sizeof(SunResult);
+  auto detail_cpu = sun_detail_heap->GetCPUDescriptorHandleForHeapStart();
+  device->CreateShaderResourceView(sun_output.Get(), &detail_source_srv, detail_cpu);
+  detail_cpu.ptr += descriptor_size;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC detail_uav = {};
+  detail_uav.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+  detail_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  device->CreateUnorderedAccessView(sun_detail_output.Get(), nullptr, &detail_uav, detail_cpu);
+  device->CreateUnorderedAccessView(sun_detail_output.Get(), nullptr, &detail_uav,
+                                    sun_detail_cpu_heap->GetCPUDescriptorHandleForHeapStart());
   std::array<UINT, sun_output_count * 4> sentinel_words = {};
   sentinel_words.fill(0xDEADBEEFu);
   ComPtr<ID3D12Resource> sentinel_upload;
@@ -873,6 +928,15 @@ int RunRtxdiDxrBridge() {
   output_to_uav.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
   output_to_uav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   list->ResourceBarrier(1, &output_to_uav);
+  output_to_uav.Transition.pResource = sun_detail_output.Get();
+  output_to_uav.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+  list->ResourceBarrier(1, &output_to_uav);
+  const auto detail_gpu = sun_detail_heap->GetGPUDescriptorHandleForHeapStart();
+  auto detail_uav_gpu = detail_gpu;
+  detail_uav_gpu.ptr += descriptor_size;
+  const UINT detail_sentinel[4] = {0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu};
+  list->ClearUnorderedAccessViewUint(detail_uav_gpu, sun_detail_cpu_heap->GetCPUDescriptorHandleForHeapStart(),
+                                    sun_detail_output.Get(), detail_sentinel, 0u, nullptr);
   output_to_uav.Transition.pResource = sun_visibility_output.Get();
   list->ResourceBarrier(1, &output_to_uav);
   const auto dispatch = [&](UINT mask_index, float max_distance, UINT expected_status, UINT expected_reason,
@@ -919,9 +983,38 @@ int RunRtxdiDxrBridge() {
     barrier.Transition.pResource = sun_output.Get();
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    list->ResourceBarrier(1, &barrier);
+    ID3D12DescriptorHeap* detail_heaps[] = {sun_detail_heap.Get()};
+    list->SetDescriptorHeaps(1u, detail_heaps);
+    list->SetComputeRootSignature(sun_detail_root.Get());
+    list->SetPipelineState(sun_detail_pso.Get());
+    const UINT detail_params[3] = {3u, 2u, pixel_count};
+    list->SetComputeRoot32BitConstants(0u, 3u, detail_params, 0u);
+    list->SetComputeRootDescriptorTable(1u, detail_gpu);
+    list->Dispatch(1u, 1u, 1u);
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.UAV.pResource = sun_detail_output.Get();
+    list->ResourceBarrier(1u, &barrier);
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = sun_output.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     list->ResourceBarrier(1, &barrier);
     list->CopyBufferRegion(sun_readback.Get(), 0, sun_output.Get(), 0, sizeof(SunResult) * sun_output_count);
+    barrier.Transition.pResource = sun_detail_output.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1u, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION detail_source = {};
+    detail_source.pResource = sun_detail_output.Get();
+    detail_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION detail_dest = {};
+    detail_dest.pResource = sun_detail_readback.Get();
+    detail_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    detail_dest.PlacedFootprint = sun_detail_footprint;
+    list->CopyTextureRegion(&detail_dest, 0u, 0u, 0u, &detail_source, nullptr);
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = sun_visibility_output.Get();
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -939,6 +1032,8 @@ int RunRtxdiDxrBridge() {
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     list->ResourceBarrier(1, &barrier);
+    barrier.Transition.pResource = sun_detail_output.Get();
+    list->ResourceBarrier(1u, &barrier);
     barrier.Transition.pResource = sun_output.Get();
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -954,8 +1049,10 @@ int RunRtxdiDxrBridge() {
     if (!Check(allocator->Reset(), "reset test allocator") || !Check(base_list->Reset(allocator.Get(), nullptr), "reset test list")) return false;
     void* mapped = nullptr;
     if (!Check(sun_readback->Map(0, nullptr, &mapped), "map sun result")) return false;
-    const auto* results = static_cast<const SunResult*>(mapped);
+    std::array<SunResult, sun_output_count> result_values = {};
+    std::memcpy(result_values.data(), mapped, sizeof(result_values));
     sun_readback->Unmap(0, nullptr);
+    const auto* results = result_values.data();
     void* visibility_mapped = nullptr;
     if (!Check(sun_visibility_readback->Map(0u, nullptr, &visibility_mapped), "map sun visibility status")) return false;
     const auto* visibility_bytes = static_cast<const uint8_t*>(visibility_mapped);
@@ -1005,6 +1102,33 @@ int RunRtxdiDxrBridge() {
         return false;
       }
     }
+    void* detail_mapped = nullptr;
+    if (!Check(sun_detail_readback->Map(0u, nullptr, &detail_mapped), "map sun detail readback")) return false;
+    const auto* detail_bytes = static_cast<const uint8_t*>(detail_mapped);
+    for (UINT i = 0u; i < pixel_count; ++i) {
+      const UINT x = i % 3u;
+      const UINT y = i / 3u;
+      const auto* row = reinterpret_cast<const UINT*>(detail_bytes + y * sun_detail_footprint.Footprint.RowPitch);
+      const UINT offset = x * 4u;
+      if (row[offset] != results[i].status || row[offset + 1u] != results[i].reason
+          || row[offset + 2u] != std::bit_cast<UINT>(results[i].distance) || row[offset + 3u] != results[i].flags) {
+        std::fprintf(stderr, "FAIL %s sun detail tuple mismatch pixel=%u status=%u reason=%u distance=%.5f flags=%u\n",
+                     label, i, row[offset], row[offset + 1u], std::bit_cast<float>(row[offset + 2u]), row[offset + 3u]);
+        sun_detail_readback->Unmap(0u, nullptr);
+        return false;
+      }
+    }
+    for (UINT y = 0u; y < 2u; ++y) {
+      const auto* row = reinterpret_cast<const UINT*>(detail_bytes + y * sun_detail_footprint.Footprint.RowPitch);
+      const UINT offset = 3u * 4u;
+      if (row[offset] != 0xDEADBEEFu || row[offset + 1u] != 0xDEADBEEFu
+          || row[offset + 2u] != 0xDEADBEEFu || row[offset + 3u] != 0xDEADBEEFu) {
+        std::fprintf(stderr, "FAIL %s sun detail guard overwritten row=%u\n", label, y);
+        sun_detail_readback->Unmap(0u, nullptr);
+        return false;
+      }
+    }
+    sun_detail_readback->Unmap(0u, nullptr);
     return true;
   };
 
@@ -3049,7 +3173,8 @@ int RunRtxdiDxrBridge() {
   }
   std::printf("PASS finite-input raw overflow sanitizer writes UNKNOWN and zero diffuse\n");
 
-  constexpr uint32_t lighting_case_count = 42u;
+  constexpr uint32_t lighting_case_count = 53u;
+  std::fprintf(stderr, "DIAG lighting setup start\n");
   std::array<LightingConsumerCase, lighting_case_count> lighting_cases = {};
   for (LightingConsumerCase& test_case : lighting_cases) {
     test_case.light_count = 16u;
@@ -3239,6 +3364,37 @@ int RunRtxdiDxrBridge() {
   lighting_cases[41].pack_status = RTXDI_N1_STATUS_BLOCKED | RTXDI_N1_STATUS_KNOWN_BIT
                                    | RTXDI_N1_STATUS_CHARACTER_BIT;
   lighting_cases[41].pack_flags = 3u;
+  for (uint32_t index = 42u; index < lighting_case_count; ++index) {
+    lighting_cases[index].debug_view = RTXDI_DEBUG_VIEW_SUN_VISIBILITY;
+    lighting_cases[index].debug_consumer_decision = RTXDI_SUN_DETAIL_REASON;
+  }
+  lighting_cases[42].debug_tuple[0] = RTXDI_SUN_STATUS_VISIBLE;
+  lighting_cases[42].debug_tuple[1] = RTXDI_SUN_REASON_NONE;
+  lighting_cases[42].debug_tuple[2] = std::bit_cast<uint32_t>(5.0f);
+  lighting_cases[43].debug_tuple[0] = RTXDI_SUN_STATUS_UNKNOWN;
+  lighting_cases[43].debug_tuple[1] = RTXDI_SUN_REASON_INVALID_SURFACE;
+  lighting_cases[44].debug_tuple[0] = RTXDI_SUN_STATUS_UNKNOWN;
+  lighting_cases[44].debug_tuple[1] = RTXDI_SUN_REASON_INVALID_SCENE;
+  lighting_cases[45].debug_tuple[0] = RTXDI_SUN_STATUS_UNKNOWN;
+  lighting_cases[45].debug_tuple[1] = RTXDI_SUN_REASON_INVALID_ALPHA;
+  lighting_cases[46].debug_tuple[0] = RTXDI_SUN_STATUS_UNKNOWN;
+  lighting_cases[46].debug_tuple[1] = RTXDI_SUN_REASON_COVERAGE_MISS;
+  lighting_cases[47].debug_tuple[0] = RTXDI_SUN_STATUS_UNKNOWN;
+  lighting_cases[47].debug_tuple[1] = RTXDI_SUN_REASON_TRUNCATED;
+  lighting_cases[48].debug_tuple[0] = RTXDI_SUN_STATUS_UNKNOWN;
+  lighting_cases[48].debug_tuple[1] = RTXDI_SUN_REASON_INVALID_RAY;
+  lighting_cases[49] = lighting_cases[43];
+  lighting_cases[49].debug_consumer_decision = RTXDI_SUN_DETAIL_HIT_DISTANCE;
+  lighting_cases[50] = lighting_cases[42];
+  lighting_cases[50].debug_consumer_decision = RTXDI_SUN_DETAIL_HIT_DISTANCE;
+  lighting_cases[50].debug_tuple[2] = std::bit_cast<uint32_t>(3.25f);
+  lighting_cases[51] = lighting_cases[50];
+  lighting_cases[51].debug_tuple[2] = std::bit_cast<uint32_t>(std::numeric_limits<float>::quiet_NaN());
+  lighting_cases[52].debug_view = RTXDI_DEBUG_VIEW_SUN_VISIBILITY;
+  lighting_cases[52].debug_consumer_decision = RTXDI_SUN_DETAIL_HIT_DISTANCE;
+  lighting_cases[52].debug_tuple[0] = RTXDI_SUN_STATUS_BLOCKED;
+  lighting_cases[52].debug_tuple[1] = RTXDI_SUN_REASON_NONE;
+  lighting_cases[52].debug_tuple[2] = std::bit_cast<uint32_t>(0.0f);
   lighting_cases[0].sun_bound = 1u;
   lighting_cases[0].sun_status = RTXDI_SUN_STATUS_VISIBLE;
   lighting_cases[1].sun_bound = 1u;
@@ -3265,6 +3421,7 @@ int RunRtxdiDxrBridge() {
       || !CreateDefaultBuffer(device.Get(), sizeof(LightingConsumerResult) * lighting_case_count,
                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON,
                               &lighting_output)) return 1;
+  std::fprintf(stderr, "DIAG lighting resources ready\n");
   const auto lighting_readback_desc = BufferDesc(sizeof(LightingConsumerResult) * lighting_case_count);
   if (!Check(device->CreateCommittedResource(&readback_properties, D3D12_HEAP_FLAG_NONE, &lighting_readback_desc,
                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
@@ -3277,6 +3434,7 @@ int RunRtxdiDxrBridge() {
   ComPtr<ID3D12PipelineState> lighting_pso;
   if (!CreateRoot(device.Get(), lighting_ranges, 2u, 1u, &lighting_root)
       || !CreatePso(device.Get(), lighting_root.Get(), __rtxdi_lighting_consumer_contract, &lighting_pso)) return 1;
+  std::fprintf(stderr, "DIAG lighting pipeline ready\n");
   D3D12_DESCRIPTOR_HEAP_DESC lighting_heap_desc = {};
   lighting_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
   lighting_heap_desc.NumDescriptors = 2u;
@@ -3405,6 +3563,23 @@ int RunRtxdiDxrBridge() {
       && lighting_results[34].debug_color[2] == 0.f
       && std::abs(lighting_results[35].debug_color[0] - 0.05f) < 1e-6f
       && std::abs(lighting_results[35].debug_color[1] - 0.04f) < 1e-6f
+      && lighting_results[42].debug_color[0] == 0.05f && lighting_results[42].debug_color[1] == 0.05f
+      && lighting_results[42].debug_color[2] == 0.05f
+      && lighting_results[43].debug_color[0] == 0.05f && lighting_results[43].debug_color[1] == 0.0f
+      && lighting_results[43].debug_color[2] == 0.05f
+      && lighting_results[44].debug_color[0] == 0.05f && lighting_results[44].debug_color[1] == 0.02f
+      && lighting_results[45].debug_color[0] == 0.05f && lighting_results[45].debug_color[1] == 0.005f
+      && lighting_results[46].debug_color[1] == 0.02f && lighting_results[46].debug_color[2] == 0.05f
+      && lighting_results[47].debug_color[0] == 0.05f && lighting_results[47].debug_color[1] == 0.04f
+      && lighting_results[48].debug_color[0] == 0.03f && lighting_results[48].debug_color[2] == 0.05f
+      && lighting_results[49].debug_color[0] == 0.05f && lighting_results[49].debug_color[1] == 0.04f
+      && std::abs(lighting_results[50].debug_color[0]
+                  - std::log2(4.25f) / std::log2(65505.0f) * 0.05f) < 1e-6f
+      && lighting_results[50].debug_color[0] == lighting_results[50].debug_color[1]
+      && lighting_results[50].debug_color[1] == lighting_results[50].debug_color[2]
+      && lighting_results[51].debug_color[0] == 0.05f && lighting_results[51].debug_color[2] == 0.05f
+      && lighting_results[52].debug_color[0] == 0.0f && lighting_results[52].debug_color[1] == 0.0f
+      && lighting_results[52].debug_color[2] == 0.0f
       && lighting_results[29].debug_packed_distance[0] == 3.25f
       && lighting_results[29].debug_packed_distance[1] == 1.0f
       && lighting_results[29].debug_packed_distance[3] == 1.0f
@@ -3435,11 +3610,18 @@ int RunRtxdiDxrBridge() {
       && lighting_results[8].character_mode == 0u && lighting_results[8].character_term == 0.f;
   lighting_readback->Unmap(0u, nullptr);
   if (!lighting_contract_ok || !character_contract_ok) {
+    std::fprintf(stderr, "DIAG lighting_ok=%u character_ok=%u\n", lighting_contract_ok ? 1u : 0u,
+                 character_contract_ok ? 1u : 0u);
     std::fprintf(stderr, "FAIL lighting consumer GPU contract point=(%u,%u,%g,%g) spot=(%u,%u,%g,%g) fallback=%u/%u blocked=%u\n",
                  lighting_results[0].point_count, lighting_results[0].spot_count, lighting_results[0].raw_local_term,
                  lighting_results[0].shaded_local_term, lighting_results[1].point_count, lighting_results[1].spot_count,
                  lighting_results[1].raw_local_term, lighting_results[1].shaded_local_term,
                  lighting_results[3].point_count, lighting_results[3].spot_count, lighting_results[2].mode);
+    for (uint32_t i = 42u; i < lighting_case_count; ++i) {
+      std::fprintf(stderr, "DETAIL[%u]=%g,%g,%g,%g\n", i, lighting_results[i].debug_color[0],
+                   lighting_results[i].debug_color[1], lighting_results[i].debug_color[2],
+                   lighting_results[i].debug_color[3]);
+    }
     return 1;
   }
   std::printf("PASS RTXDI debug palette/carrier contract: status/class/type/raw/filtered/distance/sun and unavailable checker\n");

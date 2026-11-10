@@ -138,7 +138,11 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
   result.diffuse_replaced = denoised.valid ? denoised.radiance.x : raw_local_term;
   result.specular_preserved = input.raw_specular;
   result.padding2 = 0u;
-  result.debug_color = RtxdiDebugValueColor(input.debug_view, input.debug_pixel,
+  result.debug_color = input.debug_view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY
+                               && (input.debug_consumer_decision == RTXDI_SUN_DETAIL_REASON
+                                   || input.debug_consumer_decision == RTXDI_SUN_DETAIL_HIT_DISTANCE)
+                           ? RtxdiDebugSunDetailColor(input.debug_tuple, input.debug_consumer_decision)
+                           : RtxdiDebugValueColor(input.debug_view, input.debug_pixel,
       (input.debug_flags & 1u) != 0u, input.debug_status,
       (input.debug_flags & 2u) != 0u, input.debug_value.rgb,
       (input.debug_flags & 4u) != 0u, input.debug_tuple,

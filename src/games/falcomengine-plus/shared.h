@@ -729,7 +729,9 @@ struct ShaderInjectData {
   float rtxdi_debug_view;            // session-only selector; does not affect RTXDI production or history
   float rtxdi_debug_bound;           // 0/1: t44/t45 hold matching N1 raw/status debug sources this draw
   float rtxdi_debug_distance_bound;  // 0/1: t44 is the matching optional N3b distance carrier
-                                     // Size: 444 floats = 1776 bytes. The host declares the range as
+  float rtxdi_sun_detail_view;       // Session-only Status/Reason/Hit distance selector for Sun Visibility view
+  float rtxdi_sun_detail_bound;      // 0/1: t46 holds matching sun reason/distance data this draw
+                                     // Size: 446 floats = 1784 bytes. The host declares the range as
                                      // sizeof(ShaderInjectData) / 4 push values (CreateShadowsPipelinesIfNeeded and RunShadows);
                                      // the next added float starts a new float4, and the host range grows with sizeof automatically.
                                      // Prefer reusing a RETIRED slot.

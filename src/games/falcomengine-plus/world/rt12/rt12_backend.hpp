@@ -253,12 +253,30 @@ struct Rt12DebugDistanceIdentity {
 };
 #endif
 
+struct Rt12SunDetailIdentity {
+  uint32_t source_version = 1u;
+  uint32_t detail_view = RTXDI_SUN_DETAIL_STATUS;
+  uint32_t frame = UINT32_MAX;
+  uint32_t width = 0u, height = 0u;
+  int32_t scene_slot = -1, transfer_slot = -1;
+  uint64_t owner_generation = 0u;
+  uint64_t transfer_configuration = 0u;
+  uint64_t di_configuration = 0u;
+  uint64_t settings_identity = 0u;
+  uint64_t sun_configuration = 0u;
+  uint64_t producer_fence_b = 0u;
+  bool recorded = false;
+  bool staged = false;
+};
+
 // Transfer slots own their carriers until their own B fence completes.
 struct Rt12DiTransferSlot {
   Rt12Shared depth, normal, scene, color, mrt1, mrt2, motion;
   Rt12Shared lights, tiles, deferred;
   Rt12Shared di_resolved;
   Rt12Shared sun_visibility;
+  Rt12Shared sun_detail;
+  Rt12SunDetailIdentity sun_detail_identity = {};
   Rt12Shared n1_diffuse, n1_specular, n1_status;
   Rt12Shared nrd_diffuse_publication;
 #if defined(FALCOM_NRD_ENABLED)
@@ -316,6 +334,8 @@ struct Rt12DiTransferState {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> unpack_pso;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> sun_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> sun_pso;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> sun_detail_root;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> sun_detail_pso;
   Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> di_list;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> classify_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> classify_pso;
@@ -1039,6 +1059,7 @@ inline void TeardownRt12(const char* why) {
              &slot.deferred,
              &slot.di_resolved,
              &slot.sun_visibility,
+             &slot.sun_detail,
              &slot.n1_diffuse,
              &slot.n1_specular,
              &slot.n1_status,

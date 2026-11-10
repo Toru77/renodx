@@ -1037,6 +1037,25 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "",
+      .binding = &rtxdi::g_sun_detail_view,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = static_cast<float>(RTXDI_SUN_DETAIL_STATUS),
+      .label = "RTXDI Sun Detail",
+      .section = "RTXDI",
+      .tooltip = "Session only. Status preserves the Sun Visibility view; Reason and Hit distance inspect the matching sun result record.",
+      .labels = {"Status", "Reason", "Hit distance"},
+      .min = static_cast<float>(RTXDI_SUN_DETAIL_STATUS),
+      .max = static_cast<float>(RTXDI_SUN_DETAIL_HIT_DISTANCE),
+      .is_visible = [visible] {
+        return visible() && static_cast<uint32_t>(std::clamp(std::isfinite(rtxdi::g_debug_view)
+                                                                 ? rtxdi::g_debug_view
+                                                                 : 0.f,
+                                                             0.f, static_cast<float>(RTXDI_DEBUG_VIEW_SUN_VISIBILITY)))
+               == RTXDI_DEBUG_VIEW_SUN_VISIBILITY;
+      },
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiScenePrepStatus",
       .value_type = SettingValueType::CUSTOM,
       .can_reset = false,
@@ -1106,6 +1125,12 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                     debug.requested_view, debug.effective_view, debug.source_ready ? "ready" : "unavailable",
                     debug.rejection_reason, debug.frame, debug.scene_slot, debug.transfer_slot, debug.width,
                     debug.height, presentation_label);
+        if (debug.effective_view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY
+            && debug.sun_detail_view != RTXDI_SUN_DETAIL_STATUS) {
+          ImGui::Text("Sun detail view: %s | carrier %s",
+                      debug.sun_detail_view == RTXDI_SUN_DETAIL_REASON ? "Reason" : "Hit distance",
+                      debug.sun_detail_source_ready ? "ready" : "unavailable");
+        }
         return false;
       },
       .is_visible = visible,

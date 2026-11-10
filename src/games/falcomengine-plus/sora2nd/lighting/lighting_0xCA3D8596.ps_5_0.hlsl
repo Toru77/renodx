@@ -175,6 +175,7 @@ Texture2D<uint> rtxdiSunVisibility_g : register(t42);
 Texture2D<float4> rtxdiDenoisedDiffuse_g : register(t43);
 Texture2D<float4> rtxdiDebugValue_g : register(t44);
 Texture2D<uint> rtxdiDebugStatus_g : register(t45);
+Texture2D<uint4> rtxdiSunDetail_g : register(t46);
 StructuredBuffer<float4x4> spotShadowMatrices_g : register(t14);
 TextureCube<float4> texEnvMap_g : register(t17);
 TextureCube<float4> dynCubeHistPosTex : register(t29);  // dynamic cube history world pos (.a = capture validity)
@@ -285,6 +286,15 @@ float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
     rtxdiSunVisibility_g.GetDimensions(sun_width, sun_height);
     sun_bound = pixel.x < sun_width && pixel.y < sun_height;
     if (sun_bound) sun_status = rtxdiSunVisibility_g.Load(int3(pixel, 0));
+  }
+
+  const uint sun_detail_view = (uint)shader_injection_data.rtxdi_sun_detail_view;
+  if (view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY && sun_detail_view != RTXDI_SUN_DETAIL_STATUS) {
+    if (shader_injection_data.rtxdi_sun_detail_bound <= 0.5f) return RtxdiDebugUnavailable(pixel);
+    uint detail_width, detail_height;
+    rtxdiSunDetail_g.GetDimensions(detail_width, detail_height);
+    if (pixel.x >= detail_width || pixel.y >= detail_height) return RtxdiDebugUnavailable(pixel);
+    return RtxdiDebugSunDetailColor(rtxdiSunDetail_g.Load(int3(pixel, 0)), sun_detail_view);
   }
 
   return RtxdiDebugValueColor(view, pixel, status_bound, status_word,

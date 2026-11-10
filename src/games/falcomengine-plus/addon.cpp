@@ -52,7 +52,7 @@
 
 namespace {
 
-static_assert(sizeof(ShaderInjectData) == 1776u);
+static_assert(sizeof(ShaderInjectData) == 1784u);
 static_assert(alignof(ShaderInjectData) == alignof(float));
 static_assert(offsetof(ShaderInjectData, cs_contact_local_light_clearance) == 80u);
 
@@ -504,6 +504,8 @@ ShaderInjectData shader_injection = {
     .rtxdi_debug_view = 0.f,
     .rtxdi_debug_bound = 0.f,
     .rtxdi_debug_distance_bound = 0.f,
+    .rtxdi_sun_detail_view = static_cast<float>(RTXDI_SUN_DETAIL_STATUS),
+    .rtxdi_sun_detail_bound = 0.f,
     // ShaderInjectData ends on a float4 boundary with no pad field, so every float in the
     // struct needs a default here. See the closing comment in shared.h.
 };
@@ -12332,7 +12334,7 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
                      static_cast<float>(RTXDI_DEBUG_VIEW_SUN_VISIBILITY)));
       const uint32_t effective_debug_view = ResolveRtxdiDebugEffectiveView(
           requested_debug_view, falcom_world::bvh::g_bvh_debug.mode.load(std::memory_order_relaxed) != 0);
-      input_views = {.depth = dd->captured_depth_srv, .normal = dd->captured_mrt_normal_srv, .color = (dd->captured_color_live.load() && dd->captured_color_frame == dd->frame_index && view(0u).handle == dd->captured_color_srv.handle ? dd->captured_color_srv : reshade::api::resource_view{}), .mrt1 = view(falcom_world::rtgi::kLightingMrt1Register), .mrt2 = view(falcom_world::rtgi::kLightingMrt2Register), .motion = motion_ready ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{}, .lights = view(falcom_world::rtgi::kLightingLightsRegister), .tiles = view(falcom_world::rtgi::kLightingLightIndicesRegister), .deferred = view(falcom_world::rtgi::kLightingDeferredRegister), .scene_tracker = &dd->rtxdi_scene_range, .capture_frame = dd->frame_index, .frame = frame, .width = input_width, .height = input_height, .lights_register = falcom_world::rtgi::kLightingLightsRegister, .tiles_register = falcom_world::rtgi::kLightingLightIndicesRegister, .deferred_register = falcom_world::rtgi::kLightingDeferredRegister, .effective_debug_view = effective_debug_view, .n1_brdf_config = {shader_injection.brdf_hammon_diffuse_enabled, shader_injection.brdf_diffuse_strength, shader_injection.brdf_multiscatter_specular_enabled, shader_injection.brdf_specular_strength, shader_injection.brdf_specular_peak_clamp, shader_injection.brdf_roughness_min, shader_injection.brdf_roughness_max}, .effective_settings = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings(), .scene_slot = result.slot, .scene_fence = result.fence_b, .local = (request_mask & 1u) != 0u, .sun = falcom_world::rtxdi::SunVisibilityRequested(request_mask)};
+      input_views = {.depth = dd->captured_depth_srv, .normal = dd->captured_mrt_normal_srv, .color = (dd->captured_color_live.load() && dd->captured_color_frame == dd->frame_index && view(0u).handle == dd->captured_color_srv.handle ? dd->captured_color_srv : reshade::api::resource_view{}), .mrt1 = view(falcom_world::rtgi::kLightingMrt1Register), .mrt2 = view(falcom_world::rtgi::kLightingMrt2Register), .motion = motion_ready ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{}, .lights = view(falcom_world::rtgi::kLightingLightsRegister), .tiles = view(falcom_world::rtgi::kLightingLightIndicesRegister), .deferred = view(falcom_world::rtgi::kLightingDeferredRegister), .scene_tracker = &dd->rtxdi_scene_range, .capture_frame = dd->frame_index, .frame = frame, .width = input_width, .height = input_height, .lights_register = falcom_world::rtgi::kLightingLightsRegister, .tiles_register = falcom_world::rtgi::kLightingLightIndicesRegister, .deferred_register = falcom_world::rtgi::kLightingDeferredRegister, .effective_debug_view = effective_debug_view, .sun_detail_view = static_cast<uint32_t>(std::clamp(std::isfinite(falcom_world::rtxdi::g_sun_detail_view) ? falcom_world::rtxdi::g_sun_detail_view : 0.f, 0.f, static_cast<float>(RTXDI_SUN_DETAIL_HIT_DISTANCE))), .n1_brdf_config = {shader_injection.brdf_hammon_diffuse_enabled, shader_injection.brdf_diffuse_strength, shader_injection.brdf_multiscatter_specular_enabled, shader_injection.brdf_specular_strength, shader_injection.brdf_specular_peak_clamp, shader_injection.brdf_roughness_min, shader_injection.brdf_roughness_max}, .effective_settings = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings(), .scene_slot = result.slot, .scene_fence = result.fence_b, .local = (request_mask & 1u) != 0u, .sun = falcom_world::rtxdi::SunVisibilityRequested(request_mask)};
       input_result = rt12::TransferRtxdiInputs(dev, cmd_list, input_views);
     }
     {
@@ -12483,6 +12485,8 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
   shader_injection.rtxdi_debug_view = static_cast<float>(RTXDI_DEBUG_VIEW_OFF);
   shader_injection.rtxdi_debug_bound = 0.f;
   shader_injection.rtxdi_debug_distance_bound = 0.f;
+  shader_injection.rtxdi_sun_detail_bound = 0.f;
+  shader_injection.rtxdi_sun_detail_view = static_cast<float>(RTXDI_SUN_DETAIL_STATUS);
   const bool local_requested = di::g_local_requested >= 0.5f;
 #if defined(FALCOM_NRD_ENABLED)
   shader_injection.rtxdi_diffuse_bound = 0.f;
@@ -12513,6 +12517,8 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
                              reshade::api::descriptor_table_update{{}, 44u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, 45u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+  cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                             reshade::api::descriptor_table_update{{}, 46u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
 #if defined(FALCOM_NRD_ENABLED)
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, 43u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
@@ -12524,7 +12530,18 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
   const auto debug_presentation_owner =
       ResolveRtxdiDebugPresentationOwner(requested_debug_view, bvh_debug_active);
   debug_snapshot.effective_view = ResolveRtxdiDebugEffectiveView(requested_debug_view, bvh_debug_active);
+  debug_snapshot.sun_detail_view = debug_snapshot.effective_view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY
+                                       ? static_cast<uint32_t>(std::clamp(std::isfinite(di::g_sun_detail_view)
+                                                                              ? di::g_sun_detail_view
+                                                                              : 0.f,
+                                                                          0.f, static_cast<float>(RTXDI_SUN_DETAIL_HIT_DISTANCE)))
+                                       : RTXDI_SUN_DETAIL_STATUS;
   shader_injection.rtxdi_debug_view = static_cast<float>(debug_snapshot.effective_view);
+  shader_injection.rtxdi_sun_detail_view = static_cast<float>(
+      debug_snapshot.effective_view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY
+          ? static_cast<uint32_t>(std::clamp(std::isfinite(di::g_sun_detail_view) ? di::g_sun_detail_view : 0.f, 0.f,
+                                             static_cast<float>(RTXDI_SUN_DETAIL_HIT_DISTANCE)))
+          : RTXDI_SUN_DETAIL_STATUS);
   debug_snapshot.superseded_by_bvh = debug_presentation_owner == RtxdiDebugPresentationOwner::Bvh
                                      && requested_debug_view != RTXDI_DEBUG_VIEW_OFF;
   debug_snapshot.frame = falcom_world::g_state.frame.load();
@@ -12624,6 +12641,25 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
                                       && debug_slot.sun_visibility.srv11.handle
                                       && rt12::ValidateDiTexture(debug_slot.sun_visibility.srv11, debug_snapshot.width,
                                                                  debug_snapshot.height, rt12::Rt12DiTextureKind::Uint);
+        if (debug_snapshot.sun_detail_view != RTXDI_SUN_DETAIL_STATUS) {
+          const auto& detail = debug_slot.sun_detail_identity;
+          debug_snapshot.sun_detail_source_ready = detail.source_version == 1u && detail.staged && detail.recorded
+              && detail.detail_view == debug_snapshot.sun_detail_view && detail.frame == debug_snapshot.frame
+              && detail.owner_generation == debug_snapshot.owner_generation
+              && detail.transfer_configuration == debug_sun.configuration_generation
+              && detail.di_configuration == debug_sun.di_configuration_generation
+              && detail.sun_configuration == debug_sun.configuration_generation
+              && detail.scene_slot == debug_sun.scene_slot && detail.transfer_slot == debug_sun.transfer_slot
+              && detail.width == debug_snapshot.width && detail.height == debug_snapshot.height
+              && detail.producer_fence_b == debug_sun.fence_b
+              && detail.settings_identity == di::CaptureEffectiveRtxdiSettings().identity
+              && debug_slot.sun_detail.srv11.handle
+              && rt12::ValidateDiTexture(debug_slot.sun_detail.srv11, debug_snapshot.width, debug_snapshot.height,
+                                         rt12::Rt12DiTextureKind::Uint4);
+          debug_snapshot.source_ready = debug_snapshot.sun_detail_source_ready;
+        } else {
+          debug_snapshot.sun_detail_source_ready = false;
+        }
         if (!debug_snapshot.source_ready) debug_snapshot.rejection_reason = RTXDI_DEBUG_REASON_INVALID_RESOURCE;
       } else if (debug_input.status != di::InputStatus::Ready || debug_sun.status == di::SunStatus::WaitingInput) {
         debug_snapshot.rejection_reason = RTXDI_DEBUG_REASON_WAITING_INPUT;
@@ -12929,6 +12965,7 @@ static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData*
                           .operation = di::DiagnosticOperation::BindSun});
   };
   shader_injection.rtxdi_sun_bound = 0.f;
+  shader_injection.rtxdi_sun_detail_bound = 0.f;
   const bool sun_requested = di::g_sun_requested >= 0.5f;
   {
     std::unique_lock lock(di::g_sun.mutex);
@@ -12948,6 +12985,8 @@ static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData*
   const reshade::api::resource_view empty_view = {};
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, 42u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+  cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                             reshade::api::descriptor_table_update{{}, 46u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
   if (!sun_requested) {
     record_binding(false, di::DiagnosticReason::None, falcom_world::g_state.frame.load(),
                    rt12::g_rt12 ? rt12::g_rt12->generation : 0u, -1, 0u, false);
@@ -13009,6 +13048,24 @@ static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData*
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, 42u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.sun_visibility.srv11});
   shader_injection.rtxdi_sun_bound = 1.f;
+  const uint32_t sun_detail_view = static_cast<uint32_t>(shader_injection.rtxdi_sun_detail_view);
+  if (sun_detail_view != RTXDI_SUN_DETAIL_STATUS) {
+    const auto& detail = slot.sun_detail_identity;
+    const bool detail_identity_matches = detail.source_version == 1u && detail.staged && detail.recorded
+        && detail.detail_view == sun_detail_view && detail.frame == frame && detail.owner_generation == sun.owner_generation
+        && detail.transfer_configuration == sun.configuration_generation
+        && detail.di_configuration == sun.di_configuration_generation
+        && detail.sun_configuration == sun.configuration_generation && detail.scene_slot == sun.scene_slot
+        && detail.transfer_slot == sun.transfer_slot && detail.width == sun.width && detail.height == sun.height
+        && detail.producer_fence_b == sun.fence_b && detail.settings_identity == di::CaptureEffectiveRtxdiSettings().identity
+        && slot.sun_detail.srv11.handle
+        && rt12::ValidateDiTexture(slot.sun_detail.srv11, sun.width, sun.height, rt12::Rt12DiTextureKind::Uint4);
+    if (detail_identity_matches) {
+      cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                                 reshade::api::descriptor_table_update{{}, 46u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.sun_detail.srv11});
+      shader_injection.rtxdi_sun_detail_bound = 1.f;
+    }
+  }
   bool still_current = false;
   {
     std::unique_lock lock(di::g_sun.mutex);
@@ -13024,8 +13081,11 @@ static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData*
   }
   if (!still_current) {
     shader_injection.rtxdi_sun_bound = 0.f;
+    shader_injection.rtxdi_sun_detail_bound = 0.f;
     cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                                reshade::api::descriptor_table_update{{}, 42u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+    cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                               reshade::api::descriptor_table_update{{}, 46u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
   }
   record_binding(still_current, still_current ? di::DiagnosticReason::None : di::DiagnosticReason::ConfigurationMismatch,
                  frame, state.generation, sun.transfer_slot, sun.fence_b);
