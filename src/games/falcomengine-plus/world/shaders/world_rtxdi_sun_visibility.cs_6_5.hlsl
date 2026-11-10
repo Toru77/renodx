@@ -7,6 +7,7 @@
 Texture2D<float> g_rtxdi_depth : register(t31);
 Texture2D<uint4> g_rtxdi_normal : register(t32);
 Texture2D<uint4> g_rtxdi_scene : register(t33);
+Texture2D<uint4> g_rtxdi_sun_noise : register(t61);
 
 struct RtxdiSunResult {
   uint status;
@@ -30,6 +31,9 @@ cbuffer RtxdiSunParams : register(b0) {
   uint g_frame_index;
   uint g_require_flags;
   uint g_trace_mode;
+  float g_sun_disk_tan;
+  uint g_noise_mode;
+  uint g_noise_slice;
 };
 
 #include "world_rtxdi_sun_adapter.hlsli"
@@ -119,7 +123,21 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     return;
   }
 
-  const float3 sun_direction = selected_sun.direction;
+  float3 sun_direction = selected_sun.direction;
+  if (g_sun_disk_tan > 0.0) {
+    float2 u;
+    if (g_noise_mode != 0u) {
+      u = asfloat(g_rtxdi_sun_noise.Load(int3(pixel.x % 128u, pixel.y % 128u + 128u * g_noise_slice, 0)).xy);
+    } else {
+      u = float2(RTXDI_GetNextRandom(rng), RTXDI_GetNextRandom(rng));
+    }
+    const float3 up = abs(sun_direction.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+    const float3 T = normalize(cross(up, sun_direction));
+    const float3 B = cross(sun_direction, T);
+    const float r = g_sun_disk_tan * sqrt(u.x);
+    const float phi = 6.2831853 * u.y;
+    sun_direction = normalize(sun_direction + (T * cos(phi) + B * sin(phi)) * r);
+  }
   result.flags |= RTXDI_SUN_FLAG_UNIT_INVERSE_PDF;
   const bool character = (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u;
   if (g_trace_mode == RTXDI_SUN_TRACE_RESOLVE) {

@@ -1117,6 +1117,13 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                     sun.output_bound ? "yes" : "no", sun.lighting_draw_seen ? "yes" : "no",
                     static_cast<unsigned long long>(sun.fence_b), static_cast<unsigned long long>(sun.fence_c),
                     static_cast<unsigned int>(sun.error));
+        rt12::Rt12Panel rt12_panel;
+        {
+          std::lock_guard lock(rt12::g_rt12_panel_mutex);
+          rt12_panel = rt12::g_rt12_panel;
+        }
+        ImGui::Text("IS-FAST noise copies: %llu (sun uses it only when IS-FAST is On and Light Size > 0; 0 = SDK random sequence)",
+                    static_cast<unsigned long long>(rt12_panel.noise_copies));
         rtxdi::DebugSnapshot debug;
         {
           std::shared_lock lock(rtxdi::g_debug.mutex);
@@ -1475,6 +1482,30 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .labels = {"Full", "Half"},
       .min = 0.f,
       .max = 1.f,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSunLightSize",
+      .binding = &rtxdi::g_sun_light_size,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.f,
+      .label = "Light Size (Sun, degrees)",
+      .section = "RTXDI",
+      .tooltip = "Angular size of the sun for soft shadows. 0 = a point sun (sharp shadows).",
+      .min = 0.f,
+      .max = 5.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSunIsfast",
+      .binding = &rtxdi::g_sun_isfast,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "IS-FAST Noise (Sun)",
+      .section = "RTXDI",
+      .tooltip = "Uses the blue-noise IS-FAST texture for the sun disk jitter when RTAO has filled it; otherwise the SDK random sequence is used. Only has an effect when Light Size > 0.",
+      .labels = {"Off", "On"},
       .is_visible = visible,
   });
   settings->push_back(new Setting{

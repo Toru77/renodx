@@ -733,8 +733,8 @@ int RunRtxdiDxrBridge() {
   std::fprintf(stderr, "DXR AS build submitted and fence completed\n");
   if (!Check(allocator->Reset(), "reset allocator") || !Check(base_list->Reset(allocator.Get(), nullptr), "reset list")) return 1;
 
-  // Production sun shader root table: t0-t3, t14-t16, t29, t30, t31-t33, u0-u1.
-  D3D12_DESCRIPTOR_RANGE sun_ranges[7] = {};
+  // Production sun shader root table: t0-t3, t14-t16, t29, t30, t31-t33, t61, u0-u1.
+  D3D12_DESCRIPTOR_RANGE sun_ranges[8] = {};
   sun_ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0};
   sun_ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 14, 0, 4};
   sun_ranges[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 29, 0, 7};
@@ -742,9 +742,10 @@ int RunRtxdiDxrBridge() {
   sun_ranges[4] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 31, 0, 9};
   sun_ranges[5] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 12};
   sun_ranges[6] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0, 13};
+  sun_ranges[7] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 61, 0, 16};
   ComPtr<ID3D12RootSignature> sun_root;
   ComPtr<ID3D12PipelineState> sun_pso;
-  if (!CreateRoot(device.Get(), sun_ranges, 7, 14, &sun_root)
+  if (!CreateRoot(device.Get(), sun_ranges, 8, 17, &sun_root)
       || !CreatePso(device.Get(), sun_root.Get(), __world_rtxdi_sun_visibility, &sun_pso)) return 1;
   std::fprintf(stderr, "DXR sun root + PSO ready\n");
   D3D12_DESCRIPTOR_RANGE sun_detail_ranges[2] = {};
@@ -756,7 +757,7 @@ int RunRtxdiDxrBridge() {
       || !CreatePso(device.Get(), sun_detail_root.Get(), __world_rtxdi_sun_detail, &sun_detail_pso)) return 1;
   D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
   heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  heap_desc.NumDescriptors = 14;
+  heap_desc.NumDescriptors = 17;
   heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   ComPtr<ID3D12DescriptorHeap> sun_heap;
   if (!Check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&sun_heap)), "create sun descriptor heap")) return 1;
@@ -896,6 +897,14 @@ int RunRtxdiDxrBridge() {
   device->CreateUnorderedAccessView(sun_visibility_output.Get(), nullptr, &visibility_uav, cpu);
   device->CreateUnorderedAccessView(sun_visibility_output.Get(), nullptr, &visibility_uav,
                                     sun_cpu_heap->GetCPUDescriptorHandleForHeapStart());
+  auto noise_cpu = sun_heap->GetCPUDescriptorHandleForHeapStart();
+  noise_cpu.ptr += static_cast<SIZE_T>(16) * descriptor_size;
+  D3D12_SHADER_RESOURCE_VIEW_DESC noise_srv = {};
+  noise_srv.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+  noise_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  noise_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  noise_srv.Texture2D.MipLevels = 1;
+  device->CreateShaderResourceView(nullptr, &noise_srv, noise_cpu);
   D3D12_SHADER_RESOURCE_VIEW_DESC detail_source_srv = {};
   detail_source_srv.Format = DXGI_FORMAT_UNKNOWN;
   detail_source_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -949,11 +958,11 @@ int RunRtxdiDxrBridge() {
     list->SetComputeRootSignature(sun_root.Get());
     list->SetPipelineState(sun_pso.Get());
     list->SetComputeRootDescriptorTable(1, sun_heap->GetGPUDescriptorHandleForHeapStart());
-    const UINT params[14] = {3, 2, std::bit_cast<UINT>(max_distance), std::bit_cast<UINT>(environment_bias),
+    const UINT params[17] = {3, 2, std::bit_cast<UINT>(max_distance), std::bit_cast<UINT>(environment_bias),
                              std::bit_cast<UINT>(character_bias), std::bit_cast<UINT>(-2.f), std::bit_cast<UINT>(-2.f),
                              std::bit_cast<UINT>(-2.f), std::bit_cast<UINT>(4.f), scene_valid ? 1u : 0u,
-                             coverage_valid ? 1u : 0u, 1u, 0u, 0u};
-    list->SetComputeRoot32BitConstants(0, 14, params, 0);
+                             coverage_valid ? 1u : 0u, 1u, 0u, 0u, 0u, 0u, 0u};
+    list->SetComputeRoot32BitConstants(0, 17, params, 0);
     D3D12_RESOURCE_BARRIER output_barrier = {};
     output_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     output_barrier.Transition.pResource = sun_output.Get();

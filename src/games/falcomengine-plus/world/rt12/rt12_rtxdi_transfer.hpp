@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cmath>
+#include <numbers>
 
 #include "../rr/rr_state.hpp"
 #include "../rtsun/rtsun_state.hpp"
@@ -1544,7 +1546,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       transfer.unpack_pso = std::move(pso);
     }
     if (in.sun && (!transfer.sun_root || !transfer.sun_pso)) {
-      D3D12_DESCRIPTOR_RANGE ranges[7] = {};
+      D3D12_DESCRIPTOR_RANGE ranges[8] = {};
       ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
       ranges[0].NumDescriptors = 4u;
       ranges[0].BaseShaderRegister = 0u;
@@ -1572,11 +1574,15 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       ranges[6].NumDescriptors = 1u;
       ranges[6].BaseShaderRegister = 1u;
       ranges[6].OffsetInDescriptorsFromTableStart = 13u;
+      ranges[7].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      ranges[7].NumDescriptors = 1u;
+      ranges[7].BaseShaderRegister = 61u;
+      ranges[7].OffsetInDescriptorsFromTableStart = 16u;
       D3D12_ROOT_PARAMETER params[2] = {};
       params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-      params[0].Constants.Num32BitValues = 14u;
+      params[0].Constants.Num32BitValues = 17u;
       params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-      params[1].DescriptorTable.NumDescriptorRanges = 7u;
+      params[1].DescriptorTable.NumDescriptorRanges = 8u;
       params[1].DescriptorTable.pDescriptorRanges = ranges;
       D3D12_ROOT_SIGNATURE_DESC root_desc = {};
       root_desc.NumParameters = 2u;
@@ -1854,6 +1860,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       native->CreateShaderResourceView(slot.depth.texture12.Get(), &depth_srv, query_cpu(17u));
       native->CreateShaderResourceView(slot.normal.texture12.Get(), &srv, query_cpu(18u));
       native->CreateShaderResourceView(slot.scene.texture12.Get(), &srv, query_cpu(19u));
+      native->CreateShaderResourceView(s.noise.texture12.Get(), &srv, query_cpu(24u));
       D3D12_UNORDERED_ACCESS_VIEW_DESC result_uav = {};
       result_uav.Format = DXGI_FORMAT_UNKNOWN;
       result_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -1869,7 +1876,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       query_barriers.reserve(16u);
       for (ID3D12Resource* resource : {slot.depth.texture12.Get(), slot.normal.texture12.Get(), vertices, indices,
                                        mesh_table, scene.instance_table.Get(), uv_arena,
-                                       s.atlas.texture12.Get(), s.materials.Get(), dynamic_vertices}) {
+                                       s.atlas.texture12.Get(), s.materials.Get(), dynamic_vertices, s.noise.texture12.Get()}) {
         if (resource) Transition(query_barriers, resource, D3D12_RESOURCE_STATE_COMMON,
                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
       }
@@ -1886,7 +1893,8 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       const float environment_bias = rtxdi::FiniteClamped(rtxdi::g_sun_normal_bias, 0.02f, 0.f, 0.5f);
       const float character_bias = rtxdi::FiniteClamped(rtxdi::g_sun_character_normal_bias, 0.02f, 0.f, 0.5f);
       const bool sun_half = rtxdi::FiniteClamped(rtxdi::g_sun_trace_resolution, 0.f, 0.f, 1.f) > 0.5f;
-      const uint32_t params[14] = {in.width, in.height, std::bit_cast<uint32_t>(maximum_distance),
+      const float sun_disk_tan = std::tan(rtxdi::FiniteClamped(rtxdi::g_sun_light_size, 0.f, 0.f, 5.f) * 0.5f * std::numbers::pi_v<float> / 180.f);
+      const uint32_t params[17] = {in.width, in.height, std::bit_cast<uint32_t>(maximum_distance),
                                    std::bit_cast<uint32_t>(environment_bias), std::bit_cast<uint32_t>(character_bias),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[0]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[1]),
@@ -1894,8 +1902,11 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                                    std::bit_cast<uint32_t>(s.scene_coverage_size),
                                    scene_resources_valid ? 1u : 0u, s.scene_coverage_valid ? 1u : 0u, in.frame,
                                    rtxdi::g_sun_casters_only > 0.5f ? bvh::kInstanceShadowCaster : 0u,
-                                   sun_half ? RTXDI_SUN_TRACE_HALF : RTXDI_SUN_TRACE_FULL};
-      transfer.list->SetComputeRoot32BitConstants(0u, 14u, params, 0u);
+                                   sun_half ? RTXDI_SUN_TRACE_HALF : RTXDI_SUN_TRACE_FULL,
+                                   std::bit_cast<uint32_t>(sun_disk_tan),
+                                   (rtxdi::g_sun_isfast > 0.5f && s.noise_source != 0u) ? 1u : 0u,
+                                   in.frame % 32u};
+      transfer.list->SetComputeRoot32BitConstants(0u, 17u, params, 0u);
       auto query_gpu = slot.descriptors->GetGPUDescriptorHandleForHeapStart();
       query_gpu.ptr += static_cast<UINT64>(8u) * s.descriptor_size;
       transfer.list->SetComputeRootDescriptorTable(1u, query_gpu);
@@ -2006,7 +2017,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       }
       for (ID3D12Resource* resource : {slot.depth.texture12.Get(), slot.normal.texture12.Get(), vertices, indices,
                                        mesh_table, scene.instance_table.Get(), uv_arena,
-                                       s.atlas.texture12.Get(), s.materials.Get(), dynamic_vertices}) {
+                                       s.atlas.texture12.Get(), s.materials.Get(), dynamic_vertices, s.noise.texture12.Get()}) {
         if (resource) Transition(query_barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                  D3D12_RESOURCE_STATE_COMMON);
       }
