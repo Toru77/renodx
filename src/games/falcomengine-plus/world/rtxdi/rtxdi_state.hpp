@@ -40,7 +40,6 @@ inline float g_sun_character_normal_bias = 0.02f;
 inline float g_sun_casters_only = 1.f;
 inline float g_sun_shadow_darkening = 1.f;
 inline float g_sun_character_shadow_darkening = 1.f;
-inline float g_sun_character_csm_gate = 1.f;
 inline float g_sun_trace_resolution = 0.f;
 inline float g_sun_light_size = 0.f;
 inline float g_sun_isfast = 1.f;
@@ -55,7 +54,6 @@ inline float g_local_character_intensity = 1.f;
 inline float g_local_character_fallback = 1.f;
 inline float g_local_light_size = 0.f;
 inline float g_local_isfast = 1.f;
-inline float g_local_discard_blocked = 1.f;
 inline float FiniteClamped(float value, float fallback, float minimum, float maximum) { return std::clamp(std::isfinite(value) ? value : fallback, minimum, maximum); }
 inline bool g_applying_quality_preset = false;
 inline uint32_t SceneRequestMask() { return (g_local_requested > 0.5f ? 1u : 0u) | (g_sun_requested > 0.5f ? 2u : 0u); }

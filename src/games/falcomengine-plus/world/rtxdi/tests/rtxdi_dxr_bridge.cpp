@@ -2169,16 +2169,7 @@ int RunRtxdiDxrBridge() {
               }
             } else if (expected_light_index >= 0) {
               const UINT selected = reservoir.lightData & 0x7FFFFFFFu;
-              const bool discarded_result = (extra_flags & RTXDI_FRAME_FLAG_DISCARD_BLOCKED) != 0u
-                                            && raw[pixel].status == RTXDI_DI_STATUS_BLOCKED
-                                            && array_index == result_index;
-              if (discarded_result) {
-                if (reservoir.lightData != 0u || reservoir.weight != 0.0f) {
-                  std::fprintf(stderr, "FAIL %s discarded array=%u pixel=%u lightData=%08x weight=%g\n", label,
-                               array_index, pixel, reservoir.lightData, reservoir.weight);
-                  ok = false;
-                }
-              } else if ((reservoir.lightData & 0x80000000u) == 0u
+              if ((reservoir.lightData & 0x80000000u) == 0u
                   || (array_index == result_index && selected != static_cast<UINT>(expected_light_index))
                   || !std::isfinite(reservoir.weight) || reservoir.weight <= 0.0f
                   || !std::isfinite(reservoir.targetPdf) || reservoir.targetPdf <= 0.0f) {
@@ -2187,7 +2178,7 @@ int RunRtxdiDxrBridge() {
                 ok = false;
               }
               if (array_index == result_index) found_selected = true;
-              if (!discarded_result && array_index == result_index && raw[pixel].selected_light_index != UINT_MAX
+              if (array_index == result_index && raw[pixel].selected_light_index != UINT_MAX
                   && (!std::isfinite(raw[pixel].inverse_pdf)
                       || std::abs(raw[pixel].inverse_pdf - reservoir.weight)
                              > (std::max)(1e-6f, std::abs(reservoir.weight) * 1e-6f))) {
@@ -2732,22 +2723,6 @@ int RunRtxdiDxrBridge() {
   if (!update_upload(light_upload.Get(), lights.data(), sizeof(lights))) return 1;
   if (!run_di(4u, 4u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
               "RTXDI spatial point sample, SDK-selected output", true, 1u, true, 2u)) return 1;
-  UINT visible_samples_off = 0u;
-  float visible_weight_off = 0.0f;
-  UINT visible_samples_on = 0u;
-  float visible_weight_on = 0.0f;
-  if (!run_di(4u, 4u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
-              "RTXDI spatial visible, discard off", true, 1u, true, 2u, false, false, false, false, true, false,
-              nullptr, &visible_samples_off, &visible_weight_off)
-      || !run_di(4u, 4u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
-                 "RTXDI spatial visible, discard on", true, 1u, true, 2u, false, false, false, false, true, false,
-                 nullptr, &visible_samples_on, &visible_weight_on, nullptr, nullptr, false, RTXDI_FRAME_FLAG_DISCARD_BLOCKED)
-      || visible_weight_on != visible_weight_off || visible_samples_on != visible_samples_off) {
-    std::fprintf(stderr, "FAIL RTXDI visible discard weight off=%g on=%g samples off=%u on=%u\n", visible_weight_off,
-                 visible_weight_on, visible_samples_off, visible_samples_on);
-    return 1;
-  }
-  std::printf("PASS RTXDI visible discard keeps weight %g samples %u\n", visible_weight_on, visible_samples_on);
   for (UINT frame_index = 1u; frame_index <= 2u; ++frame_index) {
     bridge_di_context->SetFrameIndex(frame_index);
     di_frame.parameters = falcom_world::rtxdi::MakeDiFrameParameters(bridge_di_config, *bridge_di_context);
@@ -3030,23 +3005,6 @@ int RunRtxdiDxrBridge() {
   di_frame.parameters.di.initialSamplingParams.localLightSamplingMode = ReSTIRDI_LocalLightSamplingMode::Uniform;
   if (!run_di(0u, 4u, true, RTXDI_DI_STATUS_BLOCKED, RTXDI_DI_REASON_NONE, 1, "RTXDI spot sample, DXR blocker", true,
               1u, true)) return 1;
-  UINT blocker_samples_off = 0u;
-  float blocker_weight_off = 0.0f;
-  UINT blocker_samples_on = 0u;
-  float blocker_weight_on = 0.0f;
-  if (!run_di(0u, 4u, true, RTXDI_DI_STATUS_BLOCKED, RTXDI_DI_REASON_NONE, 1, "RTXDI spot sample, DXR blocker discard off",
-              true, 1u, true, 0u, false, false, false, false, true, false, nullptr, &blocker_samples_off,
-              &blocker_weight_off)
-      || !run_di(0u, 4u, true, RTXDI_DI_STATUS_BLOCKED, RTXDI_DI_REASON_NONE, 1, "RTXDI spot sample, DXR blocker discard on",
-                 true, 1u, true, 0u, false, false, false, false, true, false, nullptr, &blocker_samples_on,
-                 &blocker_weight_on, nullptr, nullptr, false, RTXDI_FRAME_FLAG_DISCARD_BLOCKED)
-      || !(blocker_weight_off > 0.0f) || blocker_weight_on != 0.0f || blocker_samples_on != blocker_samples_off) {
-    std::fprintf(stderr, "FAIL RTXDI blocker discard weight off=%g on=%g samples off=%u on=%u\n", blocker_weight_off,
-                 blocker_weight_on, blocker_samples_off, blocker_samples_on);
-    return 1;
-  }
-  std::printf("PASS RTXDI blocker discard weight %g -> %g samples %u\n", blocker_weight_off, blocker_weight_on,
-              blocker_samples_on);
   mesh.bbox_min[3] = 1.0f;
   world_instances[0].header[2] = 1.0f;
   alpha_material.threshold = 0.5f;

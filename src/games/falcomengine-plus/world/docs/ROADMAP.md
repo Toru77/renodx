@@ -228,6 +228,8 @@ RTXDI M10: blocked final local samples are discarded from the shading reservoir 
 
 RTXDI M11: the RTXDI rows are split into the sections RTXDI Local, RTXDI Sun and RTXDI Shared (Shadows category); setting keys and saved values are unchanged. Not validated in game.
 
+RTXDI M12: the M10 toggle Drop Blocked Samples From Reuse (Local) and the M8 gate Character Shadows Follow Game Shadow (Sun) are removed after in-game tests (thicker lamp shadows and no noise gain; the gate changed no pixel because t7 has no character shadow). Not validated in game.
+
 ## Reference
 
 ### Code map (`world/`)

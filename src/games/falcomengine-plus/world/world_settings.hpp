@@ -1481,17 +1481,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
-      .key = "RtxdiSunCharacterCsmGate",
-      .binding = &rtxdi::g_sun_character_csm_gate,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
-      .label = "Character Shadows Follow Game Shadow (Sun)",
-      .section = "RTXDI Sun",
-      .tooltip = "Characters get RTXDI sun shadow only where the game's own sun shadow also falls on them, so rooms do not darken indoor characters. Off = RTXDI decides alone.",
-      .labels = {"Off", "On"},
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
       .key = "RtxdiSunTraceResolution",
       .binding = &rtxdi::g_sun_trace_resolution,
       .value_type = SettingValueType::INTEGER,
@@ -1614,17 +1603,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .label = "IS-FAST Noise (Local)",
       .section = "RTXDI Local",
       .tooltip = "Uses the blue-noise IS-FAST texture for the local light point jitter when the IS-FAST texture is loaded (IS-FAST master On); otherwise the SDK random sequence is used. Only has an effect when Light Size > 0.",
-      .labels = {"Off", "On"},
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiLocalDiscardBlocked",
-      .binding = &rtxdi::g_local_discard_blocked,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
-      .label = "Drop Blocked Samples From Reuse (Local)",
-      .section = "RTXDI Local",
-      .tooltip = "A lamp sample whose final shadow ray is blocked is not reused by later frames. Reduces lamp shadow noise. Off = previous behaviour.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });

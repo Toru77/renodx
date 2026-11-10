@@ -49,7 +49,7 @@ struct ShaderInjectData {
   float rtxdi_local_character_keep;         // RTXDI blocked-lamp light kept on characters [0..1] (reuses retired offset 88)
   float rtxdi_local_character_intensity;   // RTXDI character lamp light scale [0..2] (reuses retired offset 92)
   float rtxdi_local_character_fallback;    // 0/1: unresolved RTXDI pixels get unshadowed character lamp light (reuses retired offset 96)
-  float rtxdi_sun_character_csm_gate;      // 0/1: RTXDI sun darkens characters only where the game's sun shadow (t7) also shadows them
+  float rtxdi_sun_character_csm_gate;      // RETIRED: unread, kept for the layout (was the RTXDI sun character CSM gate)
 
   // Environment "Sun SSS" ray-march. RETIRED across the whole mod; unread.
   float env_sss_enabled;

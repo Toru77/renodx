@@ -160,12 +160,6 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   g_rtxdi_raw[pixel_index] = result;
   const uint4 tuple = uint4(result.selected_light_index, result.selected_light_type, result.status, asuint(result.inverse_pdf));
   g_rtxdi_resolved_output[pixel] = tuple;
-  if ((g_frame_flags & RTXDI_FRAME_FLAG_DISCARD_BLOCKED) != 0u && result.status == RTXDI_DI_STATUS_BLOCKED) {
-    RTXDI_DIReservoir discarded = final_reservoir;
-    discarded.lightData = 0u;
-    discarded.weightSum = 0.0;
-    RTXDI_StoreDIReservoir(discarded, g_di.reservoirBufferParams, pixel, g_di.bufferIndices.shadingInputBufferIndex);
-  }
   if ((g_frame_flags & RTXDI_FRAME_FLAG_DIAGNOSTICS) != 0u) {
     [unroll]
     for (uint status = RTXDI_DI_STATUS_EMPTY; status <= RTXDI_DI_STATUS_UNKNOWN; ++status)
