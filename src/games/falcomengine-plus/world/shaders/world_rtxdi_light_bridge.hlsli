@@ -28,6 +28,7 @@ struct RAB_LightInfo {
 
 struct RAB_LightSample {
   float3 position;
+  float3 shadow_target;
   float3 direction;
   float distance;
   float3 radiance;
@@ -243,6 +244,15 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
   if (!all(isfinite(lamp_color)) || !isfinite(attenuation) || !isfinite(spot) || !isfinite(cosine)
       || !all(isfinite(radiance))) return sample;
   sample.position = info.lamp.pos;
+  sample.shadow_target = info.lamp.pos;
+  if (g_local_light_size > 0.0) {
+    const float3 up = abs(direction.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+    const float3 T = normalize(cross(up, direction));
+    const float3 B = cross(direction, T);
+    const float r = g_local_light_size * sqrt(uv.x);
+    const float phi = 6.2831853 * uv.y;
+    sample.shadow_target += (T * cos(phi) + B * sin(phi)) * r;
+  }
   sample.direction = direction;
   sample.distance = distance;
   sample.radiance = radiance;
@@ -353,16 +363,21 @@ RtxdiDiRawResult RtxdiTraceLocalLight(RAB_Surface surface, RAB_LightSample sampl
       || !isfinite(endpoint_clearance) || endpoint_clearance < 0.0 || !isfinite(region_size) || region_size <= 0.0) return result;
   const float distance = sqrt(distance_squared);
   const float3 direction = delta / distance;
+  const float3 shadow_delta = sample.shadow_target - surface.world_position;
+  const float shadow_distance_squared = dot(shadow_delta, shadow_delta);
+  if (!all(isfinite(shadow_delta)) || !isfinite(shadow_distance_squared) || shadow_distance_squared <= 1e-12) return result;
+  const float shadow_distance = sqrt(shadow_distance_squared);
+  const float3 shadow_direction = shadow_delta / shadow_distance;
   const bool character = (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u;
   const float bias = character ? character_bias : environment_bias;
   if (!isfinite(bias)) return result;
   const float3 origin = surface.world_position
-                        + surface.shading_normal * (bias * (dot(surface.shading_normal, direction) >= 0.0 ? 1.0 : -1.0));
-  if (distance <= endpoint_clearance) return RtxdiDiMakeVisibleRawResult(sample.radiance * max(max(0.0, dot(surface.shading_normal, direction)), sample.translucency) * inverse_pdf, distance, character ? 1u : 0u, sample.light_index, sample.type, inverse_pdf);
-  const float endpoint = max(distance - endpoint_clearance, 0.0);
+                        + surface.shading_normal * (bias * (dot(surface.shading_normal, shadow_direction) >= 0.0 ? 1.0 : -1.0));
+  if (shadow_distance <= endpoint_clearance) return RtxdiDiMakeVisibleRawResult(sample.radiance * max(max(0.0, dot(surface.shading_normal, direction)), sample.translucency) * inverse_pdf, distance, character ? 1u : 0u, sample.light_index, sample.type, inverse_pdf);
+  const float endpoint = max(shadow_distance - endpoint_clearance, 0.0);
   float coverage_end = 0.0;
   bool complete_segment = false;
-  if (coverage_valid != 0u && !RtxdiDiCoverageEnd(origin, direction, endpoint, region_min, region_size, coverage_end)) {
+  if (coverage_valid != 0u && !RtxdiDiCoverageEnd(origin, shadow_direction, endpoint, region_min, region_size, coverage_end)) {
     result.reason = RTXDI_DI_REASON_COVERAGE_MISS;
     return result;
   }
@@ -375,7 +390,7 @@ RtxdiDiRawResult RtxdiTraceLocalLight(RAB_Surface surface, RAB_LightSample sampl
   view.require_flags = 0u;
   g_rt12_dynamic_mask = RT12_MASK_DYNAMIC;
   WorldTraceCounters counters;
-  const WorldTraceHit hit = TraceWorldRayDxr(origin, direction, 0.0, coverage_end, true, view, counters);
+  const WorldTraceHit hit = TraceWorldRayDxr(origin, shadow_direction, 0.0, coverage_end, true, view, counters);
   if (counters.invalid_refs != 0u) result.reason = RTXDI_DI_REASON_INVALID_ALPHA;
   else if (counters.hits != 0u) {
     result.status = RTXDI_DI_STATUS_BLOCKED;

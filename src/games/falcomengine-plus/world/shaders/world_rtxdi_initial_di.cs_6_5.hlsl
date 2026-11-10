@@ -31,6 +31,7 @@ StructuredBuffer<LightParam> g_rtxdi_prev_lights : register(t41);
 StructuredBuffer<uint> g_rtxdi_prev_light_types : register(t42);
 StructuredBuffer<LightIndexData> g_rtxdi_tiles : register(t43);
 StructuredBuffer<LightIndexData> g_rtxdi_prev_tiles : register(t44);
+Texture2D<uint4> g_rtxdi_local_noise : register(t61);
 
 RWStructuredBuffer<RTXDI_PackedDIReservoir> g_rtxdi_reservoirs : register(u0);
 RWStructuredBuffer<RtxdiDiRawResult> g_rtxdi_raw : register(u1);
@@ -50,6 +51,9 @@ cbuffer RtxdiDiParams : register(b0) {
   uint g_prev_light_count;
   uint g_tile_count;
   uint g_prev_tile_count;
+  float g_local_light_size;
+  uint g_noise_mode;
+  uint g_noise_slice;
 };
 
 cbuffer RtxdiFrameParameters : register(b1) {
@@ -147,7 +151,12 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
           rank += usable ? 1u : 0u;
         }
         const RAB_LightInfo light_info = RAB_LoadLightInfo(light_index, false);
-        const float2 uv = RTXDI_RandomlySelectLocalLightUV(rng);
+        float2 uv;
+        if (g_noise_mode != 0u) {
+          uv = asfloat(g_rtxdi_local_noise.Load(int3(pixel.x % 128u, pixel.y % 128u + 128u * g_noise_slice, 0)).xy);
+        } else {
+          uv = RTXDI_RandomlySelectLocalLightUV(rng);
+        }
         RTXDI_StreamLocalLightAtUVIntoReservoir(rng, mis_data, surface, g_di.initialSamplingParams.brdfCutoff,
                                                 mis_data.localLightMisWeight, light_index, uv, float(usable_count),
                                                 light_info, reservoir, selected_sample);

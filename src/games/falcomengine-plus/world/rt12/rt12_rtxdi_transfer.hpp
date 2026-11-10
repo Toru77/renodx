@@ -2499,7 +2499,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     transfer.classify_pso = std::move(pso);
   }
   if (!transfer.initial_di_root || !transfer.initial_di_pso || !transfer.temporal_di_pso || !transfer.spatial_di_pso) {
-    D3D12_DESCRIPTOR_RANGE ranges[12] = {};
+    D3D12_DESCRIPTOR_RANGE ranges[13] = {};
     const auto set_range = [&](uint32_t index, D3D12_DESCRIPTOR_RANGE_TYPE type, uint32_t count,
                                uint32_t shader_register, uint32_t offset) {
       ranges[index].RangeType = type;
@@ -2519,14 +2519,15 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     set_range(9u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 45u, 35u);
     set_range(10u, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3u, 3u, 36u);
     set_range(11u, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1u, 6u, 39u);
+    set_range(12u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 61u, 21u);
     D3D12_ROOT_PARAMETER params[4] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants.Num32BitValues = 17u;
+    params[0].Constants.Num32BitValues = 20u;
     params[0].Constants.ShaderRegister = 0u;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[1].Descriptor.ShaderRegister = 1u;
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[2].DescriptorTable.NumDescriptorRanges = 12u;
+    params[2].DescriptorTable.NumDescriptorRanges = 13u;
     params[2].DescriptorTable.pDescriptorRanges = ranges;
     params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[3].Constants.Num32BitValues = 10u;
@@ -2712,6 +2713,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   diag_view.Buffer.NumElements = RTXDI_DIAG_COUNTER_COUNT;
   diag_view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
   native->CreateUnorderedAccessView(diag_armed ? slot.diag_counters.Get() : nullptr, nullptr, &diag_view, cpu_at(39u));
+  native->CreateShaderResourceView(s.noise.texture12.Get(), &uint4_texture, cpu_at(21u));
 
   ID3D12DescriptorHeap* heaps[] = {slot.di_descriptors.Get()};
   transfer.di_list->SetDescriptorHeaps(1u, heaps);
@@ -2753,7 +2755,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   for (ID3D12Resource* resource : {vertices, indices, mesh_table, scene.instance_table.Get(), uv_arena, s.atlas.texture12.Get(),
                                    s.materials.Get(), slot.lights_buffer.Get(), slot.light_types.Get(), slot.color.texture12.Get(),
                                    slot.mrt1.texture12.Get(), slot.mrt2.texture12.Get(), slot.deferred_buffer.Get(), dynamic_vertices, slot.depth.texture12.Get(),
-                                   slot.normal.texture12.Get(), slot.scene.texture12.Get(), slot.motion.texture12.Get()}) {
+                                   slot.normal.texture12.Get(), slot.scene.texture12.Get(), slot.motion.texture12.Get(), s.noise.texture12.Get()}) {
     if (resource) Transition(barriers, resource, resource == slot.light_types.Get() ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_COMMON,
                              resource == slot.light_types.Get() ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                                                                 : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -2769,7 +2771,8 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
   transfer.di_list->SetComputeRootSignature(transfer.initial_di_root.Get());
   transfer.di_list->SetPipelineState(transfer.initial_di_pso.Get());
-  const uint32_t sun_params[17] = {in.width, in.height, scene_resources_valid ? 1u : 0u, s.scene_coverage_valid ? 1u : 0u,
+  const float local_light_size = rtxdi::FiniteClamped(rtxdi::g_local_light_size, 0.f, 0.f, 0.5f);
+  const uint32_t sun_params[20] = {in.width, in.height, scene_resources_valid ? 1u : 0u, s.scene_coverage_valid ? 1u : 0u,
                                    light_count,
                                    std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_normal_bias, 0.02f, 0.f, 0.5f)),
                                    std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_character_normal_bias, 0.02f, 0.f, 0.5f)),
@@ -2778,8 +2781,11 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[1]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[2]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_size), input.layout.deferred_copied,
-                                   history_slot.deferred_count, history_slot.light_count, tile_count, history_slot.tile_count};
-  transfer.di_list->SetComputeRoot32BitConstants(0u, 17u, sun_params, 0u);
+                                   history_slot.deferred_count, history_slot.light_count, tile_count, history_slot.tile_count,
+                                   std::bit_cast<uint32_t>(local_light_size),
+                                   (rtxdi::g_local_isfast > 0.5f && s.noise_source != 0u && local_light_size > 0.f) ? 1u : 0u,
+                                   in.frame % 32u};
+  transfer.di_list->SetComputeRoot32BitConstants(0u, 20u, sun_params, 0u);
   transfer.di_list->SetComputeRootConstantBufferView(1u, slot.di_frame_upload->GetGPUVirtualAddress());
   transfer.di_list->SetComputeRootDescriptorTable(2u, slot.di_descriptors->GetGPUDescriptorHandleForHeapStart());
   transfer.di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
@@ -3377,7 +3383,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   for (ID3D12Resource* resource : {vertices, indices, mesh_table, scene.instance_table.Get(), uv_arena, s.atlas.texture12.Get(),
                                    s.materials.Get(), slot.lights_buffer.Get(), slot.light_types.Get(), slot.color.texture12.Get(),
                                    slot.mrt2.texture12.Get(), slot.deferred_buffer.Get(), dynamic_vertices, slot.depth.texture12.Get(),
-                                   slot.normal.texture12.Get(), slot.scene.texture12.Get(), slot.motion.texture12.Get()}) {
+                                   slot.normal.texture12.Get(), slot.scene.texture12.Get(), slot.motion.texture12.Get(), s.noise.texture12.Get()}) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   }
   Transition(barriers, slot.tiles_buffer.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);

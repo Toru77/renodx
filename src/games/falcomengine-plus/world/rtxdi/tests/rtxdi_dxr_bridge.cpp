@@ -1652,6 +1652,7 @@ int RunRtxdiDxrBridge() {
   diag_view.Buffer.NumElements = RTXDI_DIAG_COUNTER_COUNT;
   diag_view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
   device->CreateUnorderedAccessView(nullptr, nullptr, &diag_view, di_cpu_at(39u));
+  device->CreateShaderResourceView(nullptr, &uint4_srv, di_cpu_at(21u));
   CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 31u, tile_upload.Get(), RTXDI_INPUT_MAX_TILES, sizeof(RtxdiTileData));
   CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 32u, tile_upload.Get(), RTXDI_INPUT_MAX_TILES, sizeof(RtxdiTileData));
 
@@ -1679,7 +1680,7 @@ int RunRtxdiDxrBridge() {
                 "create classifier root")
       || !CreatePso(device.Get(), classify_root.Get(), __world_rtxdi_classify_lights, &classify_pso)) return 1;
 
-  D3D12_DESCRIPTOR_RANGE di_ranges[12] = {};
+  D3D12_DESCRIPTOR_RANGE di_ranges[13] = {};
   di_ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4u, 0u, 0u, 0u};
   di_ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3u, 14u, 0u, 4u};
   di_ranges[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 6u, 17u, 0u, 7u};
@@ -1692,13 +1693,14 @@ int RunRtxdiDxrBridge() {
   di_ranges[9] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 45u, 0u, 35u};
   di_ranges[10] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3u, 3u, 0u, 36u};
   di_ranges[11] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1u, 6u, 0u, 39u};
+  di_ranges[12] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 61u, 0u, 21u};
   D3D12_ROOT_PARAMETER di_params[4] = {};
   di_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  di_params[0].Constants.Num32BitValues = 17u;
+  di_params[0].Constants.Num32BitValues = 20u;
   di_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   di_params[1].Descriptor.ShaderRegister = 1u;
   di_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  di_params[2].DescriptorTable.NumDescriptorRanges = 12u;
+  di_params[2].DescriptorTable.NumDescriptorRanges = 13u;
   di_params[2].DescriptorTable.pDescriptorRanges = di_ranges;
   di_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   di_params[3].Constants.Num32BitValues = 10u;
@@ -1855,12 +1857,12 @@ int RunRtxdiDxrBridge() {
     list->ResourceBarrier(1u, &barrier);
     list->SetComputeRootSignature(di_root.Get());
     list->SetPipelineState(di_pso.Get());
-    const UINT params[17] = {3u, 2u, 1u, coverage_valid ? 1u : 0u, local_lights,
+    const UINT params[20] = {3u, 2u, 1u, coverage_valid ? 1u : 0u, local_lights,
                              std::bit_cast<UINT>(0.01f), std::bit_cast<UINT>(0.02f), std::bit_cast<UINT>(0.001f),
                              std::bit_cast<UINT>(-2.0f), std::bit_cast<UINT>(-2.0f), std::bit_cast<UINT>(-2.0f),
                              std::bit_cast<UINT>(4.0f), deferred_count, deferred_count, local_lights,
-                             RTXDI_INPUT_MAX_TILES, RTXDI_INPUT_MAX_TILES};
-    list->SetComputeRoot32BitConstants(0u, 17u, params, 0u);
+                             RTXDI_INPUT_MAX_TILES, RTXDI_INPUT_MAX_TILES, 0u, 0u, 0u};
+    list->SetComputeRoot32BitConstants(0u, 20u, params, 0u);
     list->SetComputeRootConstantBufferView(1u, frame_upload->GetGPUVirtualAddress());
     list->SetComputeRootDescriptorTable(2u, di_heap->GetGPUDescriptorHandleForHeapStart());
     list->Dispatch(1u, 1u, 1u);
