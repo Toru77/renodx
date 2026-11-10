@@ -36,10 +36,14 @@ target_sources(falcomengine-plus PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_prep.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_debug_distance.h")
 
-option(FALCOM_NRD_ENABLED "Enable the private NRD path in falcomengine-plus" OFF)
+option(FALCOM_NRD_ENABLED "Enable the private NRD path in falcomengine-plus" ON)
 set(FALCOM_NRD_SDK_ROOT "" CACHE PATH "Optional NRD 4.17.1 SDK root for the private D3D12 adapter harness")
+if(NOT FALCOM_NRD_SDK_ROOT AND EXISTS "${CMAKE_BINARY_DIR}/nrd-sdk/include/NRD.h")
+  set(FALCOM_NRD_SDK_ROOT "${CMAKE_BINARY_DIR}/nrd-sdk" CACHE PATH "Optional NRD 4.17.1 SDK root for the private D3D12 adapter harness" FORCE)
+endif()
 if(FALCOM_NRD_ENABLED AND NOT FALCOM_NRD_SDK_ROOT)
-  message(FATAL_ERROR "FALCOM_NRD_ENABLED requires FALCOM_NRD_SDK_ROOT")
+  message(WARNING "NRD SDK not found (set FALCOM_NRD_SDK_ROOT or place it in ${CMAKE_BINARY_DIR}/nrd-sdk); building falcomengine-plus without NRD")
+  set(FALCOM_NRD_ENABLED OFF CACHE BOOL "Enable the private NRD path in falcomengine-plus" FORCE)
 endif()
 if(FALCOM_NRD_SDK_ROOT)
   if(NOT EXISTS "${FALCOM_NRD_SDK_ROOT}/include/NRD.h"
