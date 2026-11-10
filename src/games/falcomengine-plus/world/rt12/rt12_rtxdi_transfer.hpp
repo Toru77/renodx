@@ -1574,7 +1574,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       ranges[6].OffsetInDescriptorsFromTableStart = 13u;
       D3D12_ROOT_PARAMETER params[2] = {};
       params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-      params[0].Constants.Num32BitValues = 13u;
+      params[0].Constants.Num32BitValues = 14u;
       params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
       params[1].DescriptorTable.NumDescriptorRanges = 7u;
       params[1].DescriptorTable.pDescriptorRanges = ranges;
@@ -1885,18 +1885,28 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       const float maximum_distance = rtsun::g_rtsun_ray_max;
       const float environment_bias = rtxdi::FiniteClamped(rtxdi::g_sun_normal_bias, 0.02f, 0.f, 0.5f);
       const float character_bias = rtxdi::FiniteClamped(rtxdi::g_sun_character_normal_bias, 0.02f, 0.f, 0.5f);
-      const uint32_t params[13] = {in.width, in.height, std::bit_cast<uint32_t>(maximum_distance),
+      const bool sun_half = rtxdi::FiniteClamped(rtxdi::g_sun_trace_resolution, 0.f, 0.f, 1.f) > 0.5f;
+      const uint32_t params[14] = {in.width, in.height, std::bit_cast<uint32_t>(maximum_distance),
                                    std::bit_cast<uint32_t>(environment_bias), std::bit_cast<uint32_t>(character_bias),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[0]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[1]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[2]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_size),
                                    scene_resources_valid ? 1u : 0u, s.scene_coverage_valid ? 1u : 0u, in.frame,
-                                   rtxdi::g_sun_casters_only > 0.5f ? bvh::kInstanceShadowCaster : 0u};
-      transfer.list->SetComputeRoot32BitConstants(0u, 13u, params, 0u);
+                                   rtxdi::g_sun_casters_only > 0.5f ? bvh::kInstanceShadowCaster : 0u,
+                                   sun_half ? RTXDI_SUN_TRACE_HALF : RTXDI_SUN_TRACE_FULL};
+      transfer.list->SetComputeRoot32BitConstants(0u, 14u, params, 0u);
       auto query_gpu = slot.descriptors->GetGPUDescriptorHandleForHeapStart();
       query_gpu.ptr += static_cast<UINT64>(8u) * s.descriptor_size;
       transfer.list->SetComputeRootDescriptorTable(1u, query_gpu);
+      if (sun_half) {
+        transfer.list->Dispatch(((in.width + 1u) / 2u + 7u) / 8u, ((in.height + 1u) / 2u + 7u) / 8u, 1u);
+        query_barriers.clear();
+        UavBarrier(query_barriers, slot.sun_results.Get());
+        UavBarrier(query_barriers, slot.sun_visibility.texture12.Get());
+        transfer.list->ResourceBarrier(static_cast<UINT>(query_barriers.size()), query_barriers.data());
+        transfer.list->SetComputeRoot32BitConstant(0u, RTXDI_SUN_TRACE_RESOLVE, 13u);
+      }
       transfer.list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
       query_barriers.clear();
       UavBarrier(query_barriers, slot.sun_results.Get());

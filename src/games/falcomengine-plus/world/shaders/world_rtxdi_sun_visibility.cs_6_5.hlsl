@@ -29,6 +29,7 @@ cbuffer RtxdiSunParams : register(b0) {
   uint g_coverage_valid;
   uint g_frame_index;
   uint g_require_flags;
+  uint g_trace_mode;
 };
 
 #include "world_rtxdi_sun_adapter.hlsli"
@@ -50,12 +51,14 @@ bool RtxdiSunCoverageEnd(float3 origin, float3 direction, float max_distance, ou
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID) {
-  if (any(dispatch_id.xy >= g_dimensions)) return;
+  uint2 pixel = dispatch_id.xy;
+  if (g_trace_mode == RTXDI_SUN_TRACE_HALF) pixel *= 2u;
+  if (any(pixel >= g_dimensions)) return;
+  if (g_trace_mode == RTXDI_SUN_TRACE_RESOLVE && all((pixel & 1u) == 0u)) return;
 
   RtxdiSunResult result = (RtxdiSunResult)0;
   result.status = RTXDI_SUN_STATUS_UNKNOWN;
   result.reason = RTXDI_SUN_REASON_INVALID_SURFACE;
-  const uint2 pixel = dispatch_id.xy;
   const uint output_index = pixel.y * g_dimensions.x + pixel.x;
   const uint4 mrt0 = g_rtxdi_normal.Load(int3(pixel, 0));
   uint4 scene_rows[RTXDI_SURFACE_SCENE_ROW_COUNT];
@@ -119,6 +122,38 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   const float3 sun_direction = selected_sun.direction;
   result.flags |= RTXDI_SUN_FLAG_UNIT_INVERSE_PDF;
   const bool character = (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u;
+  if (g_trace_mode == RTXDI_SUN_TRACE_RESOLVE) {
+    const uint2 base = pixel & ~1u;
+    bool found = false;
+    uint source_index = 0u;
+    float best_plane_distance = 0.0;
+    for (uint offset_y = 0u; offset_y < 4u; offset_y += 2u) {
+      for (uint offset_x = 0u; offset_x < 4u; offset_x += 2u) {
+        const uint2 candidate = base + uint2(offset_x, offset_y);
+        if (any(candidate >= g_dimensions)) continue;
+        if ((offset_x != 0u && (pixel.x & 1u) == 0u) || (offset_y != 0u && (pixel.y & 1u) == 0u)) continue;
+        const uint candidate_index = candidate.y * g_dimensions.x + candidate.x;
+        const RtxdiSunResult candidate_result = g_rtxdi_sun_results[candidate_index];
+        if (candidate_result.status != RTXDI_SUN_STATUS_VISIBLE && candidate_result.status != RTXDI_SUN_STATUS_BLOCKED) continue;
+        if (((candidate_result.flags & RTXDI_SUN_FLAG_CHARACTER) != 0u) != character) continue;
+        const RtxdiSurfaceResult candidate_surface = RtxdiReconstructSurface(
+            g_rtxdi_depth.Load(int3(candidate, 0)), g_rtxdi_normal.Load(int3(candidate, 0)), candidate, g_dimensions, scene_rows);
+        if ((candidate_surface.flags & RTXDI_SURFACE_FLAG_VALID) == 0u) continue;
+        const float plane_distance = abs(dot(candidate_surface.world_position - surface.world_position, surface.shading_normal));
+        if (plane_distance > 0.02 * surface.linear_view_depth || dot(candidate_surface.shading_normal, surface.shading_normal) < 0.8) continue;
+        if (!found || plane_distance < best_plane_distance) {
+          found = true;
+          best_plane_distance = plane_distance;
+          source_index = candidate_index;
+        }
+      }
+    }
+    if (found) {
+      g_rtxdi_sun_results[output_index] = g_rtxdi_sun_results[source_index];
+      g_rtxdi_sun_visibility[pixel] = g_rtxdi_sun_results[source_index].status;
+      return;
+    }
+  }
   const float normal_bias = character ? g_character_bias : g_environment_bias;
   if (!isfinite(normal_bias)) {
     result.reason = RTXDI_SUN_REASON_INVALID_RAY;

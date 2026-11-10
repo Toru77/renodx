@@ -29,6 +29,10 @@
 #define RTXDI_N1_STATUS_CHARACTER_BIT 16u
 #define RTXDI_N1_CONFIG_VERSION       1u
 
+#define RTXDI_SUN_TRACE_FULL    0u
+#define RTXDI_SUN_TRACE_HALF    1u
+#define RTXDI_SUN_TRACE_RESOLVE 2u
+
 #ifdef __cplusplus
 #include <cstdint>
 struct RtxdiDiRawResult {

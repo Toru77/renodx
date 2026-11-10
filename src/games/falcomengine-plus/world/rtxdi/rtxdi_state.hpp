@@ -40,6 +40,7 @@ inline float g_sun_character_normal_bias = 0.02f;
 inline float g_sun_casters_only = 1.f;
 inline float g_sun_shadow_darkening = 1.f;
 inline float g_sun_character_shadow_darkening = 1.f;
+inline float g_sun_trace_resolution = 0.f;
 inline float g_local_shadow_darkening = 1.f;
 inline float g_local_character_shadow_darkening = 1.f;
 inline float g_local_character_max_darkening = 1.f;

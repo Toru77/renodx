@@ -1465,6 +1465,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtxdiSunTraceResolution",
+      .binding = &rtxdi::g_sun_trace_resolution,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 0.f,
+      .label = "Trace Resolution (Sun)",
+      .section = "RTXDI",
+      .tooltip = "Traces sun shadows at half resolution and fills the rest from neighbours, with a full-resolution trace at edges. Cheaper; softer details can be lost.",
+      .labels = {"Full", "Half"},
+      .min = 0.f,
+      .max = 1.f,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiLocalShadowDarkening",
       .binding = &rtxdi::g_local_shadow_darkening,
       .value_type = SettingValueType::FLOAT,
