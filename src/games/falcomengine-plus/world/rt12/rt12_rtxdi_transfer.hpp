@@ -2812,8 +2812,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
     transfer.di_list->SetPipelineState(transfer.n1_resolve_pso.Get());
     const float env_keep = 1.f - rtxdi::FiniteClamped(rtxdi::g_local_shadow_darkening, 1.f, 0.f, 1.f);
-    const float char_keep = 1.f - std::min(rtxdi::FiniteClamped(rtxdi::g_local_character_shadow_darkening, 1.f, 0.f, 1.f),
-                                           rtxdi::FiniteClamped(rtxdi::g_local_character_max_darkening, 1.f, 0.f, 1.f));
+    const float char_keep = 1.f - rtxdi::FiniteClamped(rtxdi::g_local_character_shadow_darkening, 1.f, 0.f, 1.f);
     const uint32_t n1_constants[10] = {
         RTXDI_N1_CONFIG_VERSION,
         std::bit_cast<uint32_t>(in.n1_brdf_config[0]),

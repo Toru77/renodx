@@ -218,6 +218,8 @@ ReSTIR GI M3b (Eq. 9 target), implemented, not validated in game: the resampling
 | GPU scene on DXR RTAO G4 (sub-switch, default ON with the cache) | Owner test in Reference: GPU scene on DXR RTAO (G4) | world/rt12/rt12_backend.hpp, world/rt12/rt12_capture.hpp, world/bvh/gpu_capture.hpp, world/shaders/world_gc_*.hlsl* |
 | Reduced CPU pool G5 (switch, default ON, effective with the cache and trace on) | Owner test in Reference: Reduced CPU pool (G5) | world/bvh/gpu_capture.hpp, world/bvh/bvh_pool.hpp, world/bvh/bvh_live.hpp, world/bvh/bvh_debug.hpp, world/rtao/rtao.hpp, addon.cpp |
 
+RTXDI M7: Character Max Darkening (sun, local) is merged into Character Shadow Darkening; the old max values are dropped. Not validated in game.
+
 ## Reference
 
 ### Code map (`world/`)

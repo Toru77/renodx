@@ -137,7 +137,7 @@ struct ShaderInjectData {
   float rtxdi_sun_foliage_tint_g;   // RTXDI Sun Foliage Tint G [0..1] (reuses retired vbgi_adaptive_g)
   float rtxdi_sun_foliage_tint_b;   // RTXDI Sun Foliage Tint B [0..1] (reuses retired vbgi_adaptive_b)
   float rtxdi_sun_foliage_transmission; // RTXDI Sun Foliage Transmission [0..1] (reuses retired vbgi_adaptive_mode)
-  float rtxdi_sun_character_max_darkening; // RTXDI Sun Character Max Darkening [0..1] (reuses retired vbgi_adaptive_luma_strength)
+  float vbgi_adaptive_luma_strength;  // RETIRED: no setting drives it, kept for the layout
   float vbgi_adaptive_luma_blend;   // RETIRED: no setting drives it (was SSGIAdaptiveLumaBlend), kept for the layout
   float vbgi_max_clamp;             // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGIMaxClamp), kept for the layout
   float vbgi_reduce_ao;             // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGIReduceAO), kept for the layout

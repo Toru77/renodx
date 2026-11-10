@@ -149,7 +149,6 @@ ShaderInjectData shader_injection = {
     .rtxdi_sun_foliage_tint_g = 1.f,
     .rtxdi_sun_foliage_tint_b = 1.f,
     .rtxdi_sun_foliage_transmission = 0.f,
-    .rtxdi_sun_character_max_darkening = 1.f,
     .vbgi_adaptive_luma_blend = 0.5f,
     .vbgi_max_clamp = 0.f,
     .vbgi_reduce_ao = 0.f,
@@ -12897,7 +12896,7 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
   shader_injection.rtxdi_local_bound = 1.f;
   shader_injection.rtxdi_local_darkening = di::FiniteClamped(di::g_local_shadow_darkening, 1.f, 0.f, 1.f);
   shader_injection.rtxdi_local_character_darkening = di::FiniteClamped(di::g_local_character_shadow_darkening, 1.f, 0.f, 1.f);
-  shader_injection.rtxdi_local_character_keep = 1.f - std::min(shader_injection.rtxdi_local_character_darkening, di::FiniteClamped(di::g_local_character_max_darkening, 1.f, 0.f, 1.f));
+  shader_injection.rtxdi_local_character_keep = 1.f - shader_injection.rtxdi_local_character_darkening;
   shader_injection.rtxdi_local_character_intensity = di::FiniteClamped(di::g_local_character_intensity, 1.f, 0.f, 2.f);
   shader_injection.rtxdi_local_character_fallback = di::g_local_character_fallback > 0.5f ? 1.f : 0.f;
   bool still_current = false;
@@ -13103,7 +13102,6 @@ static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData*
   shader_injection.rtxdi_sun_foliage_tint_r = di::FiniteClamped(di::g_sun_foliage_tint_r, 1.f, 0.f, 1.f);
   shader_injection.rtxdi_sun_foliage_tint_g = di::FiniteClamped(di::g_sun_foliage_tint_g, 1.f, 0.f, 1.f);
   shader_injection.rtxdi_sun_foliage_tint_b = di::FiniteClamped(di::g_sun_foliage_tint_b, 1.f, 0.f, 1.f);
-  shader_injection.rtxdi_sun_character_max_darkening = di::FiniteClamped(di::g_sun_character_max_darkening, 1.f, 0.f, 1.f);
   const uint32_t sun_detail_view = static_cast<uint32_t>(shader_injection.rtxdi_sun_detail_view);
   if (sun_detail_view != RTXDI_SUN_DETAIL_STATUS) {
     const auto& detail = slot.sun_detail_identity;
