@@ -76,9 +76,9 @@ ShaderInjectData shader_injection = {
     .char_shadow_mode = 0.f,
     .rtxdi_local_bound = 0.f,
     .rtxdi_sun_bound = 0.f,
-    .char_shadow_fade_out_samples = 16.f,
+    .rtxdi_sun_darkening = 1.f,
     .rtao_debug_show = 0.f,
-    .char_shadow_contrast = 9.f,
+    .rtxdi_sun_character_darkening = 1.f,
     .char_shadow_light_screen_fade_start = 0.f,
     .cs_contact_local_light_clearance = 0.2f,
     .char_shadow_min_occluder_depth_scale = 0.f,
@@ -13087,6 +13087,8 @@ static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData*
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, 42u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.sun_visibility.srv11});
   shader_injection.rtxdi_sun_bound = 1.f;
+  shader_injection.rtxdi_sun_darkening = di::FiniteClamped(di::g_sun_shadow_darkening, 1.f, 0.f, 1.f);
+  shader_injection.rtxdi_sun_character_darkening = di::FiniteClamped(di::g_sun_character_shadow_darkening, 1.f, 0.f, 1.f);
   const uint32_t sun_detail_view = static_cast<uint32_t>(shader_injection.rtxdi_sun_detail_view);
   if (sun_detail_view != RTXDI_SUN_DETAIL_STATUS) {
     const auto& detail = slot.sun_detail_identity;
