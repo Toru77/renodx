@@ -1363,6 +1363,82 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
   });
 
   settings->push_back(new Setting{
+      .key = "RtxdiLocalNormalBias",
+      .binding = &rtxdi::g_local_normal_bias,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.02f,
+      .label = "Normal Bias (Local)",
+      .section = "RTXDI Local Shadows",
+      .min = 0.f,
+      .max = 0.5f,
+      .format = "%.4f",
+      .is_visible = visible,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiLocalCharacterNormalBias",
+      .binding = &rtxdi::g_local_character_normal_bias,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.02f,
+      .label = "Character Normal Bias (Local)",
+      .section = "RTXDI Local Shadows",
+      .min = 0.f,
+      .max = 0.5f,
+      .format = "%.3f",
+      .is_visible = visible,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiLocalLightClearance",
+      .binding = &rtxdi::g_local_light_clearance,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.2f,
+      .label = "Light Clearance (Local)",
+      .section = "RTXDI Local Shadows",
+      .tooltip = "Shadow rays stop this far short of the lamp. Inside this distance a lamp is treated as visible.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSunNormalBias",
+      .binding = &rtxdi::g_sun_normal_bias,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.02f,
+      .label = "Normal Bias (Sun)",
+      .section = "RTXDI Sun Shadows",
+      .min = 0.f,
+      .max = 0.5f,
+      .format = "%.3f",
+      .is_visible = visible,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSunCharacterNormalBias",
+      .binding = &rtxdi::g_sun_character_normal_bias,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.02f,
+      .label = "Character Normal Bias (Sun)",
+      .section = "RTXDI Sun Shadows",
+      .min = 0.f,
+      .max = 0.5f,
+      .format = "%.3f",
+      .is_visible = visible,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSunCastersOnly",
+      .binding = &rtxdi::g_sun_casters_only,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Shadow Casters Only",
+      .section = "RTXDI Sun Shadows",
+      .tooltip = "Sun shadows come only from objects the game draws into its shadow maps, matching the game. Off = every object casts.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtaoEnabled",
       .binding = &rtao::g_rtao_enabled,
       .value_type = SettingValueType::BOOLEAN,

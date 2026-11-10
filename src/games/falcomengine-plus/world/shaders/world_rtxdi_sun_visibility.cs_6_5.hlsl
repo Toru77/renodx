@@ -28,6 +28,7 @@ cbuffer RtxdiSunParams : register(b0) {
   uint g_scene_resources_valid;
   uint g_coverage_valid;
   uint g_frame_index;
+  uint g_require_flags;
 };
 
 #include "world_rtxdi_sun_adapter.hlsli"
@@ -146,7 +147,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   view.hide = false;
   view.floor_value = 0.0;
   view.skip_flags = 0u;
-  view.require_flags = 0u;
+  view.require_flags = g_require_flags;
   g_rt12_dynamic_mask = RT12_MASK_DYNAMIC;
   WorldTraceCounters counters;
   const WorldTraceHit hit = TraceWorldRayDxr(origin, sun_direction, 0.0, coverage_end, true, view, counters);

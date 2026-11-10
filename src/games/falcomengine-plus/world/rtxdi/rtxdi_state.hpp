@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <shared_mutex>
 
@@ -30,6 +32,13 @@ inline float g_relax_diffuse_history = 30.f;
 inline float g_relax_fast_history = 6.f;
 inline float g_relax_prepass_radius = 30.f;
 inline float g_relax_atrous_iterations = 5.f;
+inline float g_local_normal_bias = 0.02f;
+inline float g_local_character_normal_bias = 0.02f;
+inline float g_local_light_clearance = 0.2f;
+inline float g_sun_normal_bias = 0.02f;
+inline float g_sun_character_normal_bias = 0.02f;
+inline float g_sun_casters_only = 1.f;
+inline float FiniteClamped(float value, float fallback, float minimum, float maximum) { return std::clamp(std::isfinite(value) ? value : fallback, minimum, maximum); }
 inline bool g_applying_quality_preset = false;
 inline uint32_t SceneRequestMask() { return (g_local_requested > 0.5f ? 1u : 0u) | (g_sun_requested > 0.5f ? 2u : 0u); }
 inline bool SceneRequested() { return SceneRequestMask() != 0u; }

@@ -744,7 +744,7 @@ int RunRtxdiDxrBridge() {
   sun_ranges[6] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0, 13};
   ComPtr<ID3D12RootSignature> sun_root;
   ComPtr<ID3D12PipelineState> sun_pso;
-  if (!CreateRoot(device.Get(), sun_ranges, 7, 12, &sun_root)
+  if (!CreateRoot(device.Get(), sun_ranges, 7, 13, &sun_root)
       || !CreatePso(device.Get(), sun_root.Get(), __world_rtxdi_sun_visibility, &sun_pso)) return 1;
   std::fprintf(stderr, "DXR sun root + PSO ready\n");
   D3D12_DESCRIPTOR_RANGE sun_detail_ranges[2] = {};
@@ -949,11 +949,11 @@ int RunRtxdiDxrBridge() {
     list->SetComputeRootSignature(sun_root.Get());
     list->SetPipelineState(sun_pso.Get());
     list->SetComputeRootDescriptorTable(1, sun_heap->GetGPUDescriptorHandleForHeapStart());
-    const UINT params[12] = {3, 2, std::bit_cast<UINT>(max_distance), std::bit_cast<UINT>(environment_bias),
+    const UINT params[13] = {3, 2, std::bit_cast<UINT>(max_distance), std::bit_cast<UINT>(environment_bias),
                              std::bit_cast<UINT>(character_bias), std::bit_cast<UINT>(-2.f), std::bit_cast<UINT>(-2.f),
                              std::bit_cast<UINT>(-2.f), std::bit_cast<UINT>(4.f), scene_valid ? 1u : 0u,
-                             coverage_valid ? 1u : 0u, 1u};
-    list->SetComputeRoot32BitConstants(0, 12, params, 0);
+                             coverage_valid ? 1u : 0u, 1u, 0u};
+    list->SetComputeRoot32BitConstants(0, 13, params, 0);
     D3D12_RESOURCE_BARRIER output_barrier = {};
     output_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     output_barrier.Transition.pResource = sun_output.Get();

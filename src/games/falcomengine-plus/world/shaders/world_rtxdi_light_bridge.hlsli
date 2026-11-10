@@ -358,6 +358,7 @@ RtxdiDiRawResult RtxdiTraceLocalLight(RAB_Surface surface, RAB_LightSample sampl
   if (!isfinite(bias)) return result;
   const float3 origin = surface.world_position
                         + surface.shading_normal * (bias * (dot(surface.shading_normal, direction) >= 0.0 ? 1.0 : -1.0));
+  if (distance <= endpoint_clearance) return RtxdiDiMakeVisibleRawResult(sample.radiance * max(max(0.0, dot(surface.shading_normal, direction)), sample.translucency) * inverse_pdf, distance, character ? 1u : 0u, sample.light_index, sample.type, inverse_pdf);
   const float endpoint = max(distance - endpoint_clearance, 0.0);
   float coverage_end = 0.0;
   bool complete_segment = false;

@@ -1573,7 +1573,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       ranges[6].OffsetInDescriptorsFromTableStart = 13u;
       D3D12_ROOT_PARAMETER params[2] = {};
       params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-      params[0].Constants.Num32BitValues = 12u;
+      params[0].Constants.Num32BitValues = 13u;
       params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
       params[1].DescriptorTable.NumDescriptorRanges = 7u;
       params[1].DescriptorTable.pDescriptorRanges = ranges;
@@ -1882,16 +1882,17 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       transfer.list->SetComputeRootSignature(transfer.sun_root.Get());
       transfer.list->SetPipelineState(transfer.sun_pso.Get());
       const float maximum_distance = rtsun::g_rtsun_ray_max;
-      const float environment_bias = rtsun::g_rtsun_normal_bias;
-      const float character_bias = rtsun::g_rtsun_character_normal_bias;
-      const uint32_t params[12] = {in.width, in.height, std::bit_cast<uint32_t>(maximum_distance),
+      const float environment_bias = rtxdi::FiniteClamped(rtxdi::g_sun_normal_bias, 0.02f, 0.f, 0.5f);
+      const float character_bias = rtxdi::FiniteClamped(rtxdi::g_sun_character_normal_bias, 0.02f, 0.f, 0.5f);
+      const uint32_t params[13] = {in.width, in.height, std::bit_cast<uint32_t>(maximum_distance),
                                    std::bit_cast<uint32_t>(environment_bias), std::bit_cast<uint32_t>(character_bias),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[0]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[1]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[2]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_size),
-                                   scene_resources_valid ? 1u : 0u, s.scene_coverage_valid ? 1u : 0u, in.frame};
-      transfer.list->SetComputeRoot32BitConstants(0u, 12u, params, 0u);
+                                   scene_resources_valid ? 1u : 0u, s.scene_coverage_valid ? 1u : 0u, in.frame,
+                                   rtxdi::g_sun_casters_only > 0.5f ? bvh::kInstanceShadowCaster : 0u};
+      transfer.list->SetComputeRoot32BitConstants(0u, 13u, params, 0u);
       auto query_gpu = slot.descriptors->GetGPUDescriptorHandleForHeapStart();
       query_gpu.ptr += static_cast<UINT64>(8u) * s.descriptor_size;
       transfer.list->SetComputeRootDescriptorTable(1u, query_gpu);
@@ -2743,9 +2744,10 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   transfer.di_list->SetComputeRootSignature(transfer.initial_di_root.Get());
   transfer.di_list->SetPipelineState(transfer.initial_di_pso.Get());
   const uint32_t sun_params[17] = {in.width, in.height, scene_resources_valid ? 1u : 0u, s.scene_coverage_valid ? 1u : 0u,
-                                   light_count, std::bit_cast<uint32_t>(rtsun::g_rtsun_normal_bias),
-                                   std::bit_cast<uint32_t>(rtsun::g_rtsun_character_normal_bias),
-                                   std::bit_cast<uint32_t>(0.001f),
+                                   light_count,
+                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_normal_bias, 0.02f, 0.f, 0.5f)),
+                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_character_normal_bias, 0.02f, 0.f, 0.5f)),
+                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_light_clearance, 0.2f, 0.f, 1.f)),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[0]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[1]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[2]),
@@ -3057,8 +3059,8 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       const std::array<uint32_t, 12u> hitdistance_constants = {
           in.width, in.height, in.frame, scene_resources_valid ? 1u : 0u,
           s.scene_coverage_valid ? 1u : 0u,
-          std::bit_cast<uint32_t>(rtsun::g_rtsun_normal_bias),
-          std::bit_cast<uint32_t>(rtsun::g_rtsun_character_normal_bias),
+          std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_normal_bias, 0.02f, 0.f, 0.5f)),
+          std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_character_normal_bias, 0.02f, 0.f, 0.5f)),
           std::bit_cast<uint32_t>(65504.0f),
           std::bit_cast<uint32_t>(s.scene_coverage_min[0]),
           std::bit_cast<uint32_t>(s.scene_coverage_min[1]),
