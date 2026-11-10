@@ -264,7 +264,140 @@ int main() {
       if (!check(d11->CreateBuffer(&desc, &data, &buffer), "create structured buffer")
           || !check(d11->CreateShaderResourceView(buffer.Get(), &view, &record_views[i]), "create structured SRV")) return 1;
       StructuredInputRange range;
-      if (!ValidateStructuredView(record_views[i].Get(), strides[i], &range) || range.first_element != 1) return 1;
+      StructuredViewEvidence evidence = {};
+      if (!ValidateStructuredView(record_views[i].Get(), strides[i], &range, &evidence) || range.first_element != 1
+          || evidence.failure != DiagnosticStructuredFailure::None || evidence.expected_stride != strides[i]
+          || evidence.view_dimension != D3D11_SRV_DIMENSION_BUFFER || evidence.format != DXGI_FORMAT_UNKNOWN
+          || evidence.first_element != 1u || evidence.element_count != 1u
+          || (evidence.evidence_flags & 111u) != 111u || evidence.buffer_bytes != strides[i] * 2u
+          || evidence.element_offset != strides[i] || evidence.element_bytes != strides[i]
+          || evidence.structure_stride != strides[i]) {
+        std::fprintf(stderr, "FAIL valid structured SRV evidence i=%u dim=%u fmt=%u flags=0x%x expected=%u actual=%u bytes=%llu first=%u count=%u offset=%llu length=%llu failure=%u\n",
+                     i, evidence.view_dimension, evidence.format, evidence.evidence_flags, evidence.expected_stride,
+                     evidence.structure_stride, static_cast<unsigned long long>(evidence.buffer_bytes),
+                     evidence.first_element, evidence.element_count,
+                     static_cast<unsigned long long>(evidence.element_offset),
+                     static_cast<unsigned long long>(evidence.element_bytes), static_cast<uint32_t>(evidence.failure));
+        return 1;
+      }
+    }
+    {
+      StructuredInputRange invalid_range = {};
+      StructuredViewEvidence evidence = {};
+      D3D11_TEXTURE2D_DESC texture_desc = {};
+      texture_desc.Width = texture_desc.Height = texture_desc.MipLevels = texture_desc.ArraySize = 1u;
+      texture_desc.Format = DXGI_FORMAT_R32_FLOAT;
+      texture_desc.SampleDesc.Count = 1u;
+      texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      ComPtr<ID3D11Texture2D> texture;
+      ComPtr<ID3D11ShaderResourceView> texture_view;
+      if (!check(d11->CreateTexture2D(&texture_desc, nullptr, &texture), "create wrong-dimension resource")
+          || !check(d11->CreateShaderResourceView(texture.Get(), nullptr, &texture_view), "create wrong-dimension SRV")
+          || ValidateStructuredView(texture_view.Get(), RTXDI_INPUT_LIGHT_STRIDE, &invalid_range, &evidence)
+          || evidence.failure != DiagnosticStructuredFailure::WrongViewDimension
+          || evidence.view_dimension != D3D11_SRV_DIMENSION_TEXTURE2D || evidence.format != DXGI_FORMAT_R32_FLOAT
+          || (evidence.evidence_flags & 3u) != 3u || (evidence.evidence_flags & 4u) != 0u) {
+        std::fprintf(stderr, "FAIL structured SRV wrong-dimension evidence\n");
+        return 1;
+      }
+      std::printf("PASS structured SRV wrong dimension evidence includes resource type\n");
+
+      D3D11_BUFFER_DESC raw_desc = {};
+      raw_desc.ByteWidth = 16u;
+      raw_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      raw_desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+      ComPtr<ID3D11Buffer> raw_buffer;
+      D3D11_SHADER_RESOURCE_VIEW_DESC raw_view_desc = {};
+      raw_view_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+      raw_view_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+      raw_view_desc.BufferEx.NumElements = 4u;
+      raw_view_desc.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+      ComPtr<ID3D11ShaderResourceView> raw_view;
+      evidence = {};
+      if (!check(d11->CreateBuffer(&raw_desc, nullptr, &raw_buffer), "create raw SRV buffer")
+          || !check(d11->CreateShaderResourceView(raw_buffer.Get(), &raw_view_desc, &raw_view), "create raw SRV")
+          || ValidateStructuredView(raw_view.Get(), RTXDI_INPUT_LIGHT_STRIDE, &invalid_range, &evidence)
+          || evidence.failure != DiagnosticStructuredFailure::WrongViewDimension
+          || evidence.view_dimension != D3D11_SRV_DIMENSION_BUFFEREX
+          || evidence.bufferex_flags != D3D11_BUFFEREX_SRV_FLAG_RAW || (evidence.evidence_flags & 16u) == 0u
+          || (evidence.evidence_flags & 15u) != 15u || evidence.buffer_bytes != raw_desc.ByteWidth
+          || evidence.misc_flags != raw_desc.MiscFlags) {
+        std::fprintf(stderr, "FAIL structured SRV BUFFEREX flags evidence\n");
+        return 1;
+      }
+      std::printf("PASS structured SRV BUFFEREX raw flag evidence\n");
+
+      D3D11_BUFFER_DESC typed_desc = {};
+      typed_desc.ByteWidth = 16u;
+      typed_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      ComPtr<ID3D11Buffer> typed_buffer;
+      D3D11_SHADER_RESOURCE_VIEW_DESC typed_view_desc = {};
+      typed_view_desc.Format = DXGI_FORMAT_R32_UINT;
+      typed_view_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+      typed_view_desc.Buffer.NumElements = 4u;
+      ComPtr<ID3D11ShaderResourceView> typed_view;
+      if (!check(d11->CreateBuffer(&typed_desc, nullptr, &typed_buffer), "create typed SRV buffer")
+          || !check(d11->CreateShaderResourceView(typed_buffer.Get(), &typed_view_desc, &typed_view), "create typed SRV")
+          || ValidateStructuredView(typed_view.Get(), RTXDI_INPUT_LIGHT_STRIDE, &invalid_range, &evidence)
+          || evidence.failure != DiagnosticStructuredFailure::WrongFormat
+          || evidence.view_dimension != D3D11_SRV_DIMENSION_BUFFER || evidence.format != DXGI_FORMAT_R32_UINT
+          || (evidence.evidence_flags & 15u) != 15u || evidence.buffer_bytes != typed_desc.ByteWidth
+          || evidence.bind_flags != typed_desc.BindFlags || evidence.misc_flags != typed_desc.MiscFlags) {
+        std::fprintf(stderr, "FAIL structured SRV wrong-format evidence\n");
+        return 1;
+      }
+      std::printf("PASS structured SRV wrong format evidence includes buffer descriptor\n");
+
+      evidence = {};
+      if (ValidateStructuredView(record_views[1].Get(), RTXDI_INPUT_LIGHT_STRIDE, &invalid_range, &evidence)
+          || evidence.failure != DiagnosticStructuredFailure::StructureStrideMismatch
+          || evidence.expected_stride != RTXDI_INPUT_LIGHT_STRIDE || evidence.structure_stride != RTXDI_INPUT_TILE_STRIDE
+          || evidence.element_offset != RTXDI_INPUT_LIGHT_STRIDE || evidence.element_bytes != RTXDI_INPUT_LIGHT_STRIDE) {
+        std::fprintf(stderr, "FAIL structured SRV stride evidence\n");
+        return 1;
+      }
+      std::printf("PASS structured SRV stride mismatch evidence\n");
+
+      evidence = {};
+      if (ValidateStructuredView(nullptr, RTXDI_INPUT_LIGHT_STRIDE, &invalid_range, &evidence)
+          || evidence.failure != DiagnosticStructuredFailure::NullArgument || evidence.evidence_flags != 128u) {
+        std::fprintf(stderr, "FAIL structured SRV null-input evidence\n");
+        return 1;
+      }
+      if (ValidStructuredInput({.buffer_bytes = 224u, .first_element = 1u, .element_count = 2u, .stride = 112u}, 112u)
+          || ValidStructuredInput({.buffer_bytes = UINT64_MAX, .first_element = UINT32_MAX, .element_count = UINT32_MAX, .stride = UINT32_MAX}, UINT32_MAX)) {
+        std::fprintf(stderr, "FAIL structured SRV element-bounds contract\n");
+        return 1;
+      }
+      D3D11_BUFFER_DESC bounded_desc = {};
+      bounded_desc.ByteWidth = 224u;
+      bounded_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      bounded_desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+      bounded_desc.StructureByteStride = 112u;
+      ComPtr<ID3D11Buffer> bounded_buffer;
+      D3D11_SHADER_RESOURCE_VIEW_DESC out_of_bounds_desc = {};
+      out_of_bounds_desc.Format = DXGI_FORMAT_UNKNOWN;
+      out_of_bounds_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+      out_of_bounds_desc.Buffer.FirstElement = 1u;
+      out_of_bounds_desc.Buffer.NumElements = 2u;
+      ComPtr<ID3D11ShaderResourceView> out_of_bounds_view;
+      if (!check(d11->CreateBuffer(&bounded_desc, nullptr, &bounded_buffer), "create bounded structured buffer")) return 1;
+      const HRESULT out_of_bounds_create = d11->CreateShaderResourceView(bounded_buffer.Get(), &out_of_bounds_desc,
+                                                                         &out_of_bounds_view);
+      if (SUCCEEDED(out_of_bounds_create)) {
+        evidence = {};
+        if (ValidateStructuredView(out_of_bounds_view.Get(), 112u, &invalid_range, &evidence)
+            || evidence.failure != DiagnosticStructuredFailure::ElementBoundsInvalid
+            || evidence.element_offset != 112u || evidence.element_bytes != 224u
+            || (evidence.evidence_flags & 32u) == 0u || (evidence.evidence_flags & 64u) != 0u) {
+          std::fprintf(stderr, "FAIL structured SRV element-bounds evidence\n");
+          return 1;
+        }
+        std::printf("PASS native structured SRV out-of-bounds descriptor rejected with byte-range evidence\n");
+      } else {
+        std::printf("PASS native D3D11 rejected out-of-bounds SRV creation; pure byte-range contract verified\n");
+      }
+      std::printf("PASS structured SRV invalid bounds, null input and arithmetic overflow guard\n");
     }
     D3D11_BUFFER_DESC constants_desc = {};
     constants_desc.ByteWidth = 32;

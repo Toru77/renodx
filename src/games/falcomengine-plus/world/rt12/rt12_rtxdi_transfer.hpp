@@ -19,6 +19,7 @@ struct Rt12DiInputViews {
   rtxdi::SceneRangeCapture* scene_tracker = nullptr;
   uint64_t capture_frame = UINT64_MAX;
   uint32_t frame = UINT32_MAX, width = 0u, height = 0u;
+  uint32_t lights_register = UINT32_MAX, tiles_register = UINT32_MAX, deferred_register = UINT32_MAX;
   uint32_t effective_debug_view = RTXDI_DEBUG_VIEW_OFF;
   std::array<float, 7> n1_brdf_config = {};
   rtxdi::EffectiveRtxdiSettings effective_settings = {};
@@ -945,6 +946,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
   if (perf_gather) bvh::g_perf_gate.rtxdi_attempts.fetch_add(1u, std::memory_order_relaxed);
   const uint64_t diagnostic_epoch = diagnostic_enabled ? rtxdi::DiagnosticCaptureEpoch(diagnostics) : 0u;
   rtxdi::DiagnosticReason forced_diagnostic_reason = rtxdi::DiagnosticReason::None;
+  rtxdi::StructuredViewEvidence structured_evidence = {};
   const auto finish = [&]() {
     if (perf_gather && bvh::g_perf_gate.gather.load(std::memory_order_relaxed)
         && bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed) == perf_epoch) {
@@ -969,6 +971,29 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       event.validation_code = result.validation_code;
       event.input_status = static_cast<uint16_t>(result.status);
       event.input_stage = static_cast<uint16_t>(result.stage);
+      if ((structured_evidence.evidence_flags & 0x80u) != 0u) {
+        event.identity_tokens[0] = rtxdi::DiagnosticIdentityToken(
+            diagnostics, diagnostic_epoch, structured_evidence.resource_identity, event.owner_generation);
+        event.normalized_size = uint64_t{structured_evidence.expected_stride}
+                                | (uint64_t{structured_evidence.misc_flags} << 32u);
+        switch (result.validation_input) {
+          case rtxdi::DiagnosticInputKind::Lights:   event.required_rows = in.lights_register; break;
+          case rtxdi::DiagnosticInputKind::Tiles:    event.required_rows = in.tiles_register; break;
+          case rtxdi::DiagnosticInputKind::Deferred: event.required_rows = in.deferred_register; break;
+          default:                                   break;
+        }
+        event.flags = structured_evidence.evidence_flags | (static_cast<uint32_t>(structured_evidence.failure) << 16u);
+        event.native_offset_bytes = structured_evidence.view_dimension;
+        event.native_count_bytes = structured_evidence.format;
+        event.first_constant = structured_evidence.first_element;
+        event.constant_count = structured_evidence.element_count;
+        event.copied_rows = structured_evidence.bufferex_flags;
+        event.native_bind_flags = structured_evidence.bind_flags;
+        event.available_rows = structured_evidence.structure_stride;
+        event.buffer_bytes = structured_evidence.buffer_bytes;
+        event.value0 = structured_evidence.element_offset;
+        event.value1 = structured_evidence.element_bytes;
+      }
       switch (result.stage) {
         case rtxdi::InputStage::None:
         case rtxdi::InputStage::Validate: event.stage = rtxdi::DiagnosticStage::InputValidate; break;
@@ -1118,7 +1143,8 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     rtxdi::StructuredInputRange lights = {}, tiles = {}, deferred = {};
     if (in.local && in.lights.handle
         && !rtxdi::ValidateStructuredView(reinterpret_cast<ID3D11ShaderResourceView*>(in.lights.handle),
-                                          RTXDI_INPUT_LIGHT_STRIDE, &lights)) {  // NOLINT(performance-no-int-to-ptr)
+                                          RTXDI_INPUT_LIGHT_STRIDE, &lights,
+                                          diagnostic_enabled ? &structured_evidence : nullptr)) {  // NOLINT(performance-no-int-to-ptr)
       result.validation_input = rtxdi::DiagnosticInputKind::Lights;
       result.validation_code = rtxdi::DiagnosticValidationCode::InvalidStructuredView;
       forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidResource;
@@ -1126,7 +1152,8 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     }
     if (in.local
         && !rtxdi::ValidateStructuredView(reinterpret_cast<ID3D11ShaderResourceView*>(in.tiles.handle),
-                                          RTXDI_INPUT_TILE_STRIDE, &tiles)) {  // NOLINT(performance-no-int-to-ptr)
+                                          RTXDI_INPUT_TILE_STRIDE, &tiles,
+                                          diagnostic_enabled ? &structured_evidence : nullptr)) {  // NOLINT(performance-no-int-to-ptr)
       result.validation_input = rtxdi::DiagnosticInputKind::Tiles;
       result.validation_code = rtxdi::DiagnosticValidationCode::InvalidStructuredView;
       forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidResource;
@@ -1134,12 +1161,14 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     }
     if (in.local
         && !rtxdi::ValidateStructuredView(reinterpret_cast<ID3D11ShaderResourceView*>(in.deferred.handle),
-                                          RTXDI_INPUT_DEFERRED_STRIDE, &deferred)) {  // NOLINT(performance-no-int-to-ptr)
+                                          RTXDI_INPUT_DEFERRED_STRIDE, &deferred,
+                                          diagnostic_enabled ? &structured_evidence : nullptr)) {  // NOLINT(performance-no-int-to-ptr)
       result.validation_input = rtxdi::DiagnosticInputKind::Deferred;
       result.validation_code = rtxdi::DiagnosticValidationCode::InvalidStructuredView;
       forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidResource;
       return finish();
     }
+    structured_evidence = {};
     if (!rtxdi::MakeInputLayout(in.width, in.height, motion_available, in.local, lights.element_count,
                                 tiles.element_count, deferred.element_count, &result.layout)) {
       result.validation_input = rtxdi::DiagnosticInputKind::Layout;

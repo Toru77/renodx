@@ -260,11 +260,19 @@ struct StructuredInputRange {
   uint32_t stride = 0u;
 };
 
-inline bool ValidStructuredInput(const StructuredInputRange& input, uint32_t expected_stride) {
-  if (input.stride != expected_stride || expected_stride == 0u) return false;
+inline DiagnosticStructuredFailure StructuredInputFailure(const StructuredInputRange& input, uint32_t expected_stride) {
+  if (input.stride != expected_stride || expected_stride == 0u) {
+    return DiagnosticStructuredFailure::StructureStrideMismatch;
+  }
   const uint64_t offset = uint64_t{input.first_element} * expected_stride;
   const uint64_t bytes = uint64_t{input.element_count} * expected_stride;
-  return offset <= input.buffer_bytes && bytes <= input.buffer_bytes - offset;
+  return offset <= input.buffer_bytes && bytes <= input.buffer_bytes - offset
+             ? DiagnosticStructuredFailure::None
+             : DiagnosticStructuredFailure::ElementBoundsInvalid;
+}
+
+inline bool ValidStructuredInput(const StructuredInputRange& input, uint32_t expected_stride) {
+  return StructuredInputFailure(input, expected_stride) == DiagnosticStructuredFailure::None;
 }
 
 inline bool NormalizeSceneInputRange(uint64_t buffer_bytes, uint64_t offset, uint64_t range_bytes, uint64_t* normalized_bytes) {

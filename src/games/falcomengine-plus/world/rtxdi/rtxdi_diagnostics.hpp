@@ -127,6 +127,18 @@ enum class DiagnosticValidationCode : uint8_t {
   OptionalFallback,
 };
 
+enum class DiagnosticStructuredFailure : uint16_t {
+  None,
+  NullArgument,
+  WrongViewDimension,
+  WrongFormat,
+  ResourceUnavailable,
+  ResourceNotBuffer,
+  MissingStructuredFlag,
+  StructureStrideMismatch,
+  ElementBoundsInvalid,
+};
+
 struct DiagnosticEvent {
   uint64_t capture_epoch = 0u;
   uint64_t event_sequence = 0u;
@@ -507,6 +519,7 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
   append("codes reason=0:None,1:MissingEntry,2:NonliveBinding,3:UnknownBinding,4:StaleFrame,5:CommandMismatch,6:SequenceMismatch,7:ResetMismatch,8:BufferMismatch,9:OffsetMismatch,10:NormalizedSizeMismatch,11:InvalidResource,12:InvalidRange,13:ContextQueryFailed,14:NativeB0Mismatch,15:MissingInput,16:Busy,17:PipelineCreateFailed,18:ResourceCreateFailed,19:SignalFailed,20:SubmitFailed,21:WaitFailed,22:ConfigurationMismatch,23:Quarantined,24:CallbackObserved\n");
   append("codes operation=0:None,1:Promote,2:Validate,3:Allocate,4:Pack,5:SignalA,6:Execute,7:WaitB,8:Dispatch,9:BindLocal,10:BindSun,11:LightingCallback,12:SignalC,13:Retire\n");
   append("codes input=0:None,1:Depth,2:Normal,3:Color,4:Mrt1,5:Mrt2,6:Motion,7:Lights,8:Tiles,9:Deferred,10:Layout; validation=0:None,1:InvalidTextureView,2:InvalidStructuredView,3:LayoutRejected,4:OptionalFallback\n");
+  append("codes structured_failure=0:None,1:NullArgument,2:WrongViewDimension,3:WrongFormat,4:ResourceUnavailable,5:ResourceNotBuffer,6:MissingStructuredFlag,7:StructureStrideMismatch,8:ElementBoundsInvalid; evidence=1:srv_desc,2:get_resource,4:buffer_type,8:buffer_desc,16:bufferex_flags,32:computed_bounds,64:bounds_valid,128:attempted\n");
   append("codes input_status=0:Off,1:AlreadyAttempted,2:WaitingForScene,3:MissingInput,4:SceneBindingChanged,5:Busy,6:AllocationFailed,7:SubmitFailed,8:Quarantined,9:Ready; input_stage=0:None,1:Validate,2:Allocate,3:Pack,4:SignalA,5:Record,6:Order,7:Submit,8:WaitB,9:Ready; 65535=unavailable\n");
   const auto& summary = snapshot.latest;
   append("summary frame=%llu capture_frame=%llu owner=%llu settings=%llu effective=%llu config=%llu n1=unavailable nrd_config=unavailable size=%ux%u scene_slot=%u transfer_slot=%u\n",
@@ -583,6 +596,22 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
            static_cast<unsigned long long>(event.native_offset_bytes),
            static_cast<unsigned long long>(event.native_count_bytes), event.native_bind_flags,
            event.available_rows, event.required_rows, event.copied_rows);
+    if ((event.flags & 0x80u) != 0u) {
+      append("    structured failure=%u evidence=0x%08x stride=%u source_register=",
+             event.flags >> 16u, event.flags & 0x7fu, static_cast<uint32_t>(event.normalized_size));
+      if (event.required_rows == UINT32_MAX) {
+        append("unavailable");
+      } else {
+        append("t%u", event.required_rows);
+      }
+      append(" dimension=%u format=%u first=%u count=%u bufferex_flags=0x%08x resource_token=%llu bytes=%llu bind=0x%08x misc=0x%08x structure_stride=%u offset=%llu length=%llu\n",
+             static_cast<uint32_t>(event.native_offset_bytes), static_cast<uint32_t>(event.native_count_bytes),
+             event.first_constant, event.constant_count, event.copied_rows,
+             static_cast<unsigned long long>(event.identity_tokens[0]),
+             static_cast<unsigned long long>(event.buffer_bytes), event.native_bind_flags,
+             static_cast<uint32_t>(event.normalized_size >> 32u), event.available_rows,
+             static_cast<unsigned long long>(event.value0), static_cast<unsigned long long>(event.value1));
+    }
   }
   append("recent_transitions oldest_to_newest:\n");
   const uint32_t first = (snapshot.transition_head + snapshot.transitions.size() - snapshot.transition_size)
@@ -605,6 +634,22 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
            static_cast<unsigned long long>(event.native_offset_bytes),
            static_cast<unsigned long long>(event.native_count_bytes), event.native_bind_flags,
            event.available_rows, event.required_rows, event.copied_rows);
+    if ((event.flags & 0x80u) != 0u) {
+      append("    structured failure=%u evidence=0x%08x stride=%u source_register=",
+             event.flags >> 16u, event.flags & 0x7fu, static_cast<uint32_t>(event.normalized_size));
+      if (event.required_rows == UINT32_MAX) {
+        append("unavailable");
+      } else {
+        append("t%u", event.required_rows);
+      }
+      append(" dimension=%u format=%u first=%u count=%u bufferex_flags=0x%08x resource_token=%llu bytes=%llu bind=0x%08x misc=0x%08x structure_stride=%u offset=%llu length=%llu\n",
+             static_cast<uint32_t>(event.native_offset_bytes), static_cast<uint32_t>(event.native_count_bytes),
+             event.first_constant, event.constant_count, event.copied_rows,
+             static_cast<unsigned long long>(event.identity_tokens[0]),
+             static_cast<unsigned long long>(event.buffer_bytes), event.native_bind_flags,
+             static_cast<uint32_t>(event.normalized_size >> 32u), event.available_rows,
+             static_cast<unsigned long long>(event.value0), static_cast<unsigned long long>(event.value1));
+    }
   }
   if (truncated || size >= buffer.size() - 1u) {
     constexpr char summary_text[] = "\n[report truncated at fixed 65536-byte limit]\n";

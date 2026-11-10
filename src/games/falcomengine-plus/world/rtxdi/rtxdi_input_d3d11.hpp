@@ -7,6 +7,7 @@
 #include <d3d11_1.h>
 #include <wrl/client.h>
 
+#include "rtxdi_diagnostics.hpp"
 #include "rtxdi_input_validation.hpp"
 
 namespace falcom_world::rtxdi {
@@ -90,20 +91,120 @@ inline bool ValidateTextureView(ID3D11ShaderResourceView* view, uint32_t width, 
   return ValidTextureInput({.width = desc.Width, .height = desc.Height, .mip_levels = desc.MipLevels, .mip = srv.Texture2D.MostDetailedMip, .samples = desc.SampleDesc.Count, .array_size = desc.ArraySize, .texture_2d_view = true}, width, height);
 }
 
-inline bool ValidateStructuredView(ID3D11ShaderResourceView* view, uint32_t stride, StructuredInputRange* out) {
-  if (view == nullptr || out == nullptr) return false;
+struct StructuredViewEvidence {
+  uint64_t resource_identity = 0u;
+  uint32_t expected_stride = 0u;
+  uint32_t view_dimension = UINT32_MAX;
+  uint32_t format = UINT32_MAX;
+  uint32_t first_element = 0u;
+  uint32_t element_count = 0u;
+  uint32_t bufferex_flags = 0u;
+  uint32_t bind_flags = 0u;
+  uint32_t misc_flags = 0u;
+  uint32_t structure_stride = 0u;
+  uint64_t buffer_bytes = 0u;
+  uint64_t element_offset = 0u;
+  uint64_t element_bytes = 0u;
+  uint32_t evidence_flags = 0u;
+  DiagnosticStructuredFailure failure = DiagnosticStructuredFailure::None;
+};
+
+inline bool ValidateStructuredView(ID3D11ShaderResourceView* view, uint32_t stride, StructuredInputRange* out,
+                                   StructuredViewEvidence* evidence = nullptr) {
+  if (evidence != nullptr) {
+    *evidence = {};
+    evidence->expected_stride = stride;
+    evidence->evidence_flags = 128u;
+  }
+  if (view == nullptr || out == nullptr) {
+    if (evidence != nullptr) evidence->failure = DiagnosticStructuredFailure::NullArgument;
+    return false;
+  }
   D3D11_SHADER_RESOURCE_VIEW_DESC srv = {};
   view->GetDesc(&srv);
-  if (srv.ViewDimension != D3D11_SRV_DIMENSION_BUFFER || srv.Format != DXGI_FORMAT_UNKNOWN) return false;
+  if (evidence != nullptr) {
+    evidence->view_dimension = static_cast<uint32_t>(srv.ViewDimension);
+    evidence->format = static_cast<uint32_t>(srv.Format);
+    evidence->evidence_flags |= 1u;
+    if (srv.ViewDimension == D3D11_SRV_DIMENSION_BUFFER) {
+      evidence->first_element = srv.Buffer.FirstElement;
+      evidence->element_count = srv.Buffer.NumElements;
+    } else if (srv.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
+      evidence->first_element = srv.BufferEx.FirstElement;
+      evidence->element_count = srv.BufferEx.NumElements;
+      evidence->bufferex_flags = srv.BufferEx.Flags;
+      evidence->evidence_flags |= 16u;
+    }
+  }
+  const auto capture_buffer_desc = [&](const D3D11_BUFFER_DESC& desc) {
+    evidence->evidence_flags |= 8u | 32u;
+    evidence->buffer_bytes = desc.ByteWidth;
+    evidence->bind_flags = desc.BindFlags;
+    evidence->misc_flags = desc.MiscFlags;
+    evidence->structure_stride = desc.StructureByteStride;
+    evidence->element_offset = uint64_t{evidence->first_element} * evidence->expected_stride;
+    evidence->element_bytes = uint64_t{evidence->element_count} * evidence->expected_stride;
+    if (evidence->element_offset <= desc.ByteWidth
+        && evidence->element_bytes <= desc.ByteWidth - evidence->element_offset) {
+      evidence->evidence_flags |= 64u;
+    }
+  };
+  if (srv.ViewDimension != D3D11_SRV_DIMENSION_BUFFER || srv.Format != DXGI_FORMAT_UNKNOWN) {
+    if (evidence != nullptr) {
+      evidence->failure = srv.ViewDimension != D3D11_SRV_DIMENSION_BUFFER
+                              ? DiagnosticStructuredFailure::WrongViewDimension
+                              : DiagnosticStructuredFailure::WrongFormat;
+      Microsoft::WRL::ComPtr<ID3D11Resource> diagnostic_resource;
+      view->GetResource(&diagnostic_resource);
+      if (diagnostic_resource != nullptr) {
+        evidence->evidence_flags |= 2u;
+        evidence->resource_identity = reinterpret_cast<uint64_t>(diagnostic_resource.Get());
+        Microsoft::WRL::ComPtr<ID3D11Buffer> diagnostic_buffer;
+        if (SUCCEEDED(diagnostic_resource.As(&diagnostic_buffer))) {
+          evidence->evidence_flags |= 4u;
+          D3D11_BUFFER_DESC diagnostic_desc = {};
+          diagnostic_buffer->GetDesc(&diagnostic_desc);
+          capture_buffer_desc(diagnostic_desc);
+        }
+      }
+    }
+    return false;
+  }
   Microsoft::WRL::ComPtr<ID3D11Resource> resource;
   view->GetResource(&resource);
+  if (evidence != nullptr && resource != nullptr) {
+    evidence->evidence_flags |= 2u;
+    evidence->resource_identity = reinterpret_cast<uint64_t>(resource.Get());
+  }
+  if (!resource) {
+    if (evidence != nullptr) evidence->failure = DiagnosticStructuredFailure::ResourceUnavailable;
+    return false;
+  }
   Microsoft::WRL::ComPtr<ID3D11Buffer> buffer;
-  if (!resource || FAILED(resource.As(&buffer))) return false;
+  if (FAILED(resource.As(&buffer))) {
+    if (evidence != nullptr) evidence->failure = DiagnosticStructuredFailure::ResourceNotBuffer;
+    return false;
+  }
+  if (evidence != nullptr) evidence->evidence_flags |= 4u;
   D3D11_BUFFER_DESC desc = {};
   buffer->GetDesc(&desc);
-  if ((desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) == 0u) return false;
+  if (evidence != nullptr) {
+    capture_buffer_desc(desc);
+  }
+  if ((desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) == 0u) {
+    if (evidence != nullptr) evidence->failure = DiagnosticStructuredFailure::MissingStructuredFlag;
+    return false;
+  }
   const StructuredInputRange range = {.buffer_bytes = desc.ByteWidth, .first_element = srv.Buffer.FirstElement, .element_count = srv.Buffer.NumElements, .stride = desc.StructureByteStride};
-  if (!ValidStructuredInput(range, stride)) return false;
+  const DiagnosticStructuredFailure validation_failure = StructuredInputFailure(range, stride);
+  if (evidence != nullptr) {
+    evidence->failure = validation_failure;
+    if (evidence->element_offset <= desc.ByteWidth
+        && evidence->element_bytes <= desc.ByteWidth - evidence->element_offset) {
+      evidence->evidence_flags |= 64u;
+    }
+  }
+  if (validation_failure != DiagnosticStructuredFailure::None) return false;
   *out = range;
   return true;
 }

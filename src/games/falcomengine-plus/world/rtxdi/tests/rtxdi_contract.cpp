@@ -275,6 +275,47 @@ int main() {
     DiagnosticState diagnostics;
     SetDiagnosticCapture(diagnostics, true);
     const uint64_t epoch = DiagnosticCaptureEpoch(diagnostics);
+    DiagnosticEvent event = {.frame = 88u,
+                             .stage = DiagnosticStage::InputValidate,
+                             .reason = DiagnosticReason::InvalidResource,
+                             .operation = DiagnosticOperation::Validate,
+                             .input_kind = DiagnosticInputKind::Lights,
+                             .validation_code = DiagnosticValidationCode::InvalidStructuredView};
+    event.identity_tokens[0] = DiagnosticIdentityToken(diagnostics, epoch, 0xfedcba9876543210u, 7u);
+    event.normalized_size = uint64_t{112u} | (uint64_t{64u} << 32u);
+    event.required_rows = 11u;
+    event.native_offset_bytes = 1u;
+    event.native_count_bytes = 42u;
+    event.first_constant = 3u;
+    event.constant_count = 2u;
+    event.native_bind_flags = 8u;
+    event.available_rows = 128u;
+    event.flags = 0x80u | 47u
+                  | (static_cast<uint32_t>(DiagnosticStructuredFailure::StructureStrideMismatch) << 16u);
+    event.buffer_bytes = 1024u;
+    event.value0 = 384u;
+    event.value1 = 256u;
+    RecordDiagnostic(diagnostics, epoch, event);
+    event.flags = 0x80u | 47u | (static_cast<uint32_t>(DiagnosticStructuredFailure::ElementBoundsInvalid) << 16u);
+    event.constant_count = 9u;
+    event.value1 = 1152u;
+    RecordDiagnostic(diagnostics, epoch, event);
+    event.frame++;
+    RecordDiagnostic(diagnostics, epoch, event);
+    const auto snapshot = CopyDiagnosticSnapshot(diagnostics);
+    const std::string report = SerializeDiagnosticReport(snapshot);
+    if (snapshot.transition_size != 2u || snapshot.first_failures[0].count != 3u
+        || report.find("structured failure=7 evidence=0x0000002f stride=112 source_register=t11 dimension=1 format=42 first=3 count=2")
+               == std::string::npos
+        || report.find("resource_token=1 bytes=1024 bind=0x00000008 misc=0x00000040 structure_stride=128 offset=384 length=256")
+               == std::string::npos
+        || report.find("fedcba9876543210") != std::string::npos) return EXIT_FAILURE;
+  }
+  {
+    using namespace falcom_world::rtxdi;
+    DiagnosticState diagnostics;
+    SetDiagnosticCapture(diagnostics, true);
+    const uint64_t epoch = DiagnosticCaptureEpoch(diagnostics);
     for (const auto operation : {DiagnosticOperation::BindLocal, DiagnosticOperation::BindSun}) {
       RecordDiagnostic(diagnostics, epoch,
                        {.frame = 8u,
@@ -905,8 +946,19 @@ int main() {
   using falcom_world::rtxdi::ValidStructuredInput;
   if (!ValidStructuredInput({.buffer_bytes = 1120u, .first_element = 3u, .element_count = 7u, .stride = 112u}, 112u)
       || ValidStructuredInput({.buffer_bytes = 1119u, .first_element = 3u, .element_count = 7u, .stride = 112u}, 112u)
+      || ValidStructuredInput({.buffer_bytes = 224u, .first_element = 1u, .element_count = 2u, .stride = 112u}, 112u)
+      || !ValidStructuredInput({.buffer_bytes = 224u, .first_element = 1u, .element_count = 1u, .stride = 112u}, 112u)
       || ValidStructuredInput({.buffer_bytes = 1120u, .first_element = 3u, .element_count = 7u, .stride = 144u}, 112u)
       || ValidStructuredInput({.buffer_bytes = 4096u, .first_element = UINT32_MAX, .element_count = UINT32_MAX, .stride = 112u}, 112u)
+      || falcom_world::rtxdi::StructuredInputFailure(
+             {.buffer_bytes = 224u, .first_element = 1u, .element_count = 2u, .stride = 112u}, 112u)
+             != falcom_world::rtxdi::DiagnosticStructuredFailure::ElementBoundsInvalid
+      || falcom_world::rtxdi::StructuredInputFailure(
+             {.buffer_bytes = 224u, .first_element = 1u, .element_count = 1u, .stride = 144u}, 112u)
+             != falcom_world::rtxdi::DiagnosticStructuredFailure::StructureStrideMismatch
+      || falcom_world::rtxdi::StructuredInputFailure(
+             {.buffer_bytes = 224u, .first_element = 1u, .element_count = 1u, .stride = 112u}, 112u)
+             != falcom_world::rtxdi::DiagnosticStructuredFailure::None
       || !ValidSceneInputRange(2048u, 256u, 1536u) || ValidSceneInputRange(1791u, 256u, 1536u)
       || ValidSceneInputRange(2048u, 256u, 1535u)) return EXIT_FAILURE;
   uint64_t normalized = 0u;
