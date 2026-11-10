@@ -70,6 +70,11 @@ void RtxdiWriteInitialRaw(uint pixel_index, RtxdiDiRawResult result) {
   if ((g_frame_flags & RTXDI_FRAME_FLAG_SPATIAL_AFTER_INITIAL) == 0u) g_rtxdi_raw[pixel_index] = result;
 }
 
+bool RtxdiTileEntryUsable(int listed, bool point_entry) {
+  return listed >= 0 && uint(listed) < g_light_count
+         && g_rtxdi_light_types[uint(listed)] == (point_entry ? RTGI_LAMP_TYPE_POINT : RTGI_LAMP_TYPE_SPOT);
+}
+
 [numthreads(8, 8, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID) {
   if (any(dispatch_id.xy >= g_dimensions)) return;
@@ -116,12 +121,41 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
 
   RtxdiDiagAdd(RTXDI_DIAG_INITIAL_SURFACES, 1u);
   RTXDI_RandomSamplerState rng = RTXDI_InitRandomSampler(pixel, g_runtime.frameIndex, 0u);
-  RTXDI_RandomSamplerState coherent_rng = RTXDI_InitRandomSampler(pixel, g_runtime.frameIndex, 1u);
   RAB_LightSample selected_sample = RAB_EmptyLightSample();
   RTXDI_InitialSamplingMisData mis_data = RTXDI_ComputeInitialSamplingMisData(g_di.initialSamplingParams);
-  RTXDI_LightBufferRegion light_region = {0u, g_light_count, 0u, 0u};
-  reservoir = RTXDI_SampleLocalLights(rng, coherent_rng, surface, g_di.initialSamplingParams, mis_data,
-                                     ReSTIRDI_LocalLightSamplingMode_UNIFORM, light_region, selected_sample);
+  // Candidates come from this pixel's game tile cell: the only lights with a non-zero target.
+  if (surface.tile_valid != 0u && g_di.initialSamplingParams.numLocalLightSamples != 0u) {
+    const LightIndexData tile = g_rtxdi_tiles[surface.tile_cell];
+    const uint point_count = min(tile.pointLightCount, 63u);
+    const uint entry_count = point_count + min(tile.spotLightCount, 63u);
+    uint usable_count = 0u;
+    for (uint entry = 0u; entry < entry_count; ++entry) {
+      const bool point_entry = entry < point_count;
+      const int listed = point_entry ? tile.pointLightIndices[entry] : tile.spotLightIndices[entry - point_count];
+      usable_count += RtxdiTileEntryUsable(listed, point_entry) ? 1u : 0u;
+    }
+    if (usable_count != 0u) {
+      for (uint candidate = 0u; candidate < g_di.initialSamplingParams.numLocalLightSamples; ++candidate) {
+        const uint selected_rank = min(uint(RTXDI_GetNextRandom(rng) * float(usable_count)), usable_count - 1u);
+        uint light_index = g_light_count;
+        uint rank = 0u;
+        for (uint entry = 0u; entry < entry_count; ++entry) {
+          const bool point_entry = entry < point_count;
+          const int listed = point_entry ? tile.pointLightIndices[entry] : tile.spotLightIndices[entry - point_count];
+          const bool usable = RtxdiTileEntryUsable(listed, point_entry);
+          if (usable && rank == selected_rank) light_index = uint(listed);
+          rank += usable ? 1u : 0u;
+        }
+        const RAB_LightInfo light_info = RAB_LoadLightInfo(light_index, false);
+        const float2 uv = RTXDI_RandomlySelectLocalLightUV(rng);
+        RTXDI_StreamLocalLightAtUVIntoReservoir(rng, mis_data, surface, g_di.initialSamplingParams.brdfCutoff,
+                                                mis_data.localLightMisWeight, light_index, uv, float(usable_count),
+                                                light_info, reservoir, selected_sample);
+      }
+      RTXDI_FinalizeResampling(reservoir, 1.0, mis_data.numMisSamples);
+      reservoir.M = 1;
+    }
+  }
   if (!RTXDI_IsValidDIReservoir(reservoir) || selected_sample.valid == 0u
       || !isfinite(reservoir.weightSum) || reservoir.weightSum <= 0.0) {
     RtxdiDiRawResult raw = (RtxdiDiRawResult)0;
