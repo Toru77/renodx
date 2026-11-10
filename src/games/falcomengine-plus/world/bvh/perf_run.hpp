@@ -62,6 +62,8 @@ enum PerfCost : size_t {
   kPerfRtgiRecordCpu,
   kPerfRtlsRecordCpu,
   kPerfRtsunRecordCpu,
+  kPerfRtxdiInputCpu,
+  kPerfRtxdiDiCpu,
   kPerfPresentWorldCpu,
   kPerfPresentBvhCpu,
   kPerfGpuTrace,
@@ -76,6 +78,10 @@ enum PerfCost : size_t {
   kPerfGpuRtlsDenoise,
   kPerfGpuRtsun,
   kPerfGpuRtsunDenoise,
+  kPerfGpuRtxdiInput,
+  kPerfGpuRtxdiLocal,
+  kPerfGpuRtxdiDistance,
+  kPerfGpuRtxdiNrd,
   kPerfRebuildPhase0,
   kPerfRebuildPhase1,
   kPerfRebuildPhase2,
@@ -114,6 +120,8 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"rtgi_record_cpu", true, kPerfDrawTime, false, nullptr},
     {"rtls_record_cpu", true, kPerfDrawTime, false, nullptr},
     {"rtsun_record_cpu", true, kPerfDrawTime, false, nullptr},
+    {"rtxdi_input_cpu", true, kPerfDrawTime, false, nullptr},
+    {"rtxdi_di_cpu", true, kPerfDrawTime, false, nullptr},
     {"present_world_cpu", true, kPerfBracket, false, nullptr},
     {"present_bvh_cpu", true, kPerfBracket, false, nullptr},
     {"gpu_trace", true, kPerfGpu, true, nullptr},
@@ -128,6 +136,10 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"gpu_rtls_denoise", true, kPerfGpu, true, nullptr},
     {"gpu_rtsun", true, kPerfGpu, true, nullptr},
     {"gpu_rtsun_denoise", true, kPerfGpu, true, nullptr},
+    {"gpu_rtxdi_input", true, kPerfGpu, true, nullptr},
+    {"gpu_rtxdi_local", true, kPerfGpu, true, nullptr},
+    {"gpu_rtxdi_distance", true, kPerfSubset, true, "N3b distance subset"},
+    {"gpu_rtxdi_nrd", true, kPerfSubset, true, "NRD prep/RELAX/publication subset"},
     {"rebuild_phase_0", true, kPerfSubset, false, kCachePhaseNames[0]},
     {"rebuild_phase_1", true, kPerfSubset, false, kCachePhaseNames[1]},
     {"rebuild_phase_2", true, kPerfSubset, false, kCachePhaseNames[2]},
@@ -368,6 +380,7 @@ struct PerfTimerSample {
 };
 struct PerfExtraGpu {
   PerfTimerSample rtao, rtao_filter, rtgi, rtgi_denoise, rtls, rtls_denoise, rtsun, rtsun_denoise, deform_refit;
+  PerfTimerSample rtxdi_input, rtxdi_local, rtxdi_distance, rtxdi_nrd;
   double dxr_tlas_ms = 0.0, dxr_records_ms = 0.0, dxr_characters_ms = 0.0, gc_blas_ms = 0.0, dxr_rtgi_ms = 0.0;  // D3D12 timestamp sums (rt12 panels); inside gpu_rtao, so Subset rows
 };
 
@@ -455,7 +468,8 @@ inline PerfTotalsValue PerfTotals(const double* values) {
   // the DynCube t17 swap, so hook_outer over-counts by that nested time when RT passes or DynCube are on. Known limitation.
   const double draw_hook_outer = values[kPerfBlockRow + kPerfBlockDrawHookTotal] - values[kPerfPoolHooks] - values[kPerfDeformHookCpu];
   const double lighting_rt_outer = values[kPerfBlockRow + kPerfBlockLightingRt] - values[kPerfRtaoRecordCpu] - values[kPerfRtgiRecordCpu]
-                                   - values[kPerfRtlsRecordCpu] - values[kPerfRtsunRecordCpu];
+                                   - values[kPerfRtlsRecordCpu] - values[kPerfRtsunRecordCpu] - values[kPerfRtxdiInputCpu]
+                                   - values[kPerfRtxdiDiCpu];
   totals.hook_outer = std::max(0.0, draw_hook_outer) + std::max(0.0, lighting_rt_outer) + values[kPerfBlockRow + kPerfBlockBindHook]
                       + values[kPerfBlockRow + kPerfBlockCaptureHook] + values[kPerfBlockRow + kPerfBlockCbHooks]
                       + values[kPerfBlockRow + kPerfBlockPoolWriteHooks];
@@ -471,7 +485,9 @@ inline PerfTabSample MakePerfSample(const PerfCounters& now, const PerfCounters&
   sample.frame_ms = frame_ms;
   for (size_t i = 0; i < kPerfCostCount; ++i) {
     const double cost = kPerfCostInfo[i].cumulative && now.cost[i] >= prev.cost[i] ? now.cost[i] - prev.cost[i] : now.cost[i];
-    if (kPerfCostInfo[i].role != kPerfGpu) {
+    const bool sampled_gpu = kPerfCostInfo[i].role == kPerfGpu
+                             || (kPerfCostInfo[i].role == kPerfSubset && kPerfCostInfo[i].counted);
+    if (!sampled_gpu) {
       sample.value[i] = cost;
       continue;
     }
@@ -533,6 +549,8 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.cost[kPerfRtgiRecordCpu] = PerfMsOf(g_perf_gate.rtgi_record_us);
   c.cost[kPerfRtlsRecordCpu] = PerfMsOf(g_perf_gate.rtls_record_us);
   c.cost[kPerfRtsunRecordCpu] = PerfMsOf(g_perf_gate.rtsun_record_us);
+  c.cost[kPerfRtxdiInputCpu] = PerfMsOf(g_perf_gate.rtxdi_input_cpu_us);
+  c.cost[kPerfRtxdiDiCpu] = PerfMsOf(g_perf_gate.rtxdi_di_cpu_us);
   c.cost[kPerfPresentWorldCpu] = PerfMsOf(g_perf_gate.present_world_us);
   c.cost[kPerfPresentBvhCpu] = PerfMsOf(g_perf_gate.present_bvh_us);
   c.cost[kPerfGpuTrace] = data->trace_timer.ms_sum;
@@ -559,6 +577,14 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.events[kPerfGpuRtsun] = extra.rtsun.samples;
   c.cost[kPerfGpuRtsunDenoise] = extra.rtsun_denoise.ms_sum;
   c.events[kPerfGpuRtsunDenoise] = extra.rtsun_denoise.samples;
+  c.cost[kPerfGpuRtxdiInput] = extra.rtxdi_input.ms_sum;
+  c.events[kPerfGpuRtxdiInput] = extra.rtxdi_input.samples;
+  c.cost[kPerfGpuRtxdiLocal] = extra.rtxdi_local.ms_sum;
+  c.events[kPerfGpuRtxdiLocal] = extra.rtxdi_local.samples;
+  c.cost[kPerfGpuRtxdiDistance] = extra.rtxdi_distance.ms_sum;
+  c.events[kPerfGpuRtxdiDistance] = extra.rtxdi_distance.samples;
+  c.cost[kPerfGpuRtxdiNrd] = extra.rtxdi_nrd.ms_sum;
+  c.events[kPerfGpuRtxdiNrd] = extra.rtxdi_nrd.samples;
   c.cost[kPerfDxrTlasGpu] = extra.dxr_tlas_ms;
   c.cost[kPerfDxrRecordsGpu] = extra.dxr_records_ms;
   c.cost[kPerfDxrCharactersGpu] = extra.dxr_characters_ms;
@@ -725,7 +751,8 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
     const double total = run.total.cost[i];
     const double events = static_cast<double>(run.total.events[i]);
     out << (i != 0u ? ", " : "") << "\"" << info.name << "\": {";
-    if (info.role == kPerfGpu) {
+    const bool sampled_gpu = info.role == kPerfGpu || (info.role == kPerfSubset && info.counted);
+    if (sampled_gpu) {
       out << "\"basis\": \"" << (run.total.events[i] != 0u ? "measured" : "not measured") << "\", \"avg_per_measured_frame\": ";
       WritePerfValue(&out, events != 0.0 ? total / events : nan, "ms/measured frame");
       out << ", \"max_per_measured_frame\": ";
@@ -734,7 +761,7 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
       WritePerfValue(&out, total, "ms");
       out << ", \"samples\": ";
       WritePerfValue(&out, events, "count");
-      if (events != 0.0) {
+      if (events != 0.0 && info.role == kPerfGpu) {
         gpu_avg_sum += total / events;
         gpu_measured = true;
       }
@@ -829,7 +856,8 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
   double setting_avg[kPerfCostCount];
   for (size_t i = 0; i < kPerfCostCount; ++i) {
     const double events = static_cast<double>(run.total.events[i]);
-    if (kPerfCostInfo[i].role == kPerfGpu) {
+    if (kPerfCostInfo[i].role == kPerfGpu
+        || (kPerfCostInfo[i].role == kPerfSubset && kPerfCostInfo[i].counted)) {
       setting_avg[i] = events != 0.0 ? run.total.cost[i] / events : nan;
     } else {
       setting_avg[i] = run.presents != 0u ? run.total.cost[i] / presents : nan;
@@ -909,6 +937,13 @@ inline void ClearPerfGathered(BvhDeviceData* data) {
   g_perf_gate.rtao_record_us.store(0u);
   g_perf_gate.rtgi_record_us.store(0u);
   g_perf_gate.rtls_record_us.store(0u);
+  g_perf_gate.rtxdi_input_cpu_us.store(0u);
+  g_perf_gate.rtxdi_di_cpu_us.store(0u);
+  g_perf_gate.rtxdi_attempts.store(0u);
+  g_perf_gate.rtxdi_submissions.store(0u);
+  g_perf_gate.rtxdi_rejections.store(0u);
+  g_perf_gate.rtxdi_busy_skips.store(0u);
+  g_perf_gate.rtxdi_timing_skip_events.store(0u);
   g_perf_gate.deform_update_us.store(0u);
   for (std::atomic_uint64_t& us : g_perf_gate.block_us) us.store(0u);
   g_perf_gate.hook_draws.store(0u);
@@ -1208,7 +1243,8 @@ inline void UpdatePerfTab(const PerfCounters& now, double frame_ms = std::numeri
       }
     }
     for (size_t i = 0; i < kPerfCostCount; ++i) {
-      if (kPerfCostInfo[i].role == kPerfGpu && !s.measured[i]) continue;
+      if ((kPerfCostInfo[i].role == kPerfGpu || (kPerfCostInfo[i].role == kPerfSubset && kPerfCostInfo[i].counted))
+          && !s.measured[i]) continue;
       if (counts[i] == 0u) view.now[i] = s.value[i];
       sums[i] += s.value[i];
       counts[i] += 1u;

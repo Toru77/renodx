@@ -41,6 +41,7 @@
 #include "../rtgi/rtgi_resources.hpp"
 #include "../rtgi/rtgi_state.hpp"
 #include "../rtxdi/rtxdi_config.hpp"
+#include "../rtxdi/rtxdi_perf_contract.hpp"
 #include "../rtxdi/rtxdi_state.hpp"
 #include "rt12_mirror.hpp"
 #if defined(FALCOM_NRD_ENABLED)
@@ -268,6 +269,8 @@ struct Rt12DiTransferSlot {
   Microsoft::WRL::ComPtr<ID3D12Resource> light_types, di_results, di_frame_upload;
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> di_allocator;
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> perf_queries;
+  Microsoft::WRL::ComPtr<ID3D12Resource> perf_readback;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> descriptors;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> di_descriptors;
   rtgi::RtgiPipeline pack_inputs, pack_records;
@@ -276,6 +279,11 @@ struct Rt12DiTransferSlot {
   uint64_t fence_value = 0u;
   uint32_t width = 0u, height = 0u;
   uint64_t di_fence_value = 0u;
+  uint64_t perf_gather_epoch = 0u, perf_owner_generation = 0u, perf_transfer_configuration = 0u;
+  uint64_t perf_di_configuration = 0u, perf_settings_identity = 0u, perf_fence = 0u;
+  uint32_t perf_frame = UINT32_MAX, perf_width = 0u, perf_height = 0u;
+  uint8_t perf_valid_mask = 0u;
+  bool perf_pending = false;
   uint64_t output_b_fence = 0u, output_c_fence = 0u;
   uint64_t output_owner_generation = 0u, output_configuration_generation = 0u;
   uint64_t sun_configuration_generation = 0u;
@@ -376,6 +384,11 @@ struct Rt12State {
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> queries;        // kRt12Slots * kRt12Timestamps
   Microsoft::WRL::ComPtr<ID3D12Resource> query_readback;  // kRt12Slots * kRt12Timestamps * 8 bytes
   uint64_t timestamp_frequency = 0u;
+  double rtxdi_gpu_ms_sum[4] = {};
+  uint32_t rtxdi_gpu_samples[4] = {};
+  uint32_t rtxdi_gpu_completed_batches = 0u;
+  uint32_t rtxdi_perf_last_frame = UINT32_MAX;
+  uint64_t rtxdi_perf_epoch = 0u;
   Rt12Arena arenas[3];                                // kRt12Arena*
   Microsoft::WRL::ComPtr<ID3D12Resource> mesh_table;  // DEFAULT, data->mesh_descriptors bytes
   uint64_t mesh_table_bytes = 0u;
@@ -1755,6 +1768,66 @@ inline void OnPresent(reshade::api::device* device) {
   // 2. Stuck detection: no fence progress for kRt12StuckMs with work pending.
   ObserveRt12Completion(s);
   const uint64_t completed = s.completion_value;
+  const bool perf_gather = bvh::g_perf_gate.gather.load(std::memory_order_relaxed);
+  const uint64_t perf_epoch = bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed);
+  if (s.rtxdi_perf_epoch != perf_epoch) {
+    std::fill(std::begin(s.rtxdi_gpu_ms_sum), std::end(s.rtxdi_gpu_ms_sum), 0.0);
+    std::fill(std::begin(s.rtxdi_gpu_samples), std::end(s.rtxdi_gpu_samples), 0u);
+    s.rtxdi_gpu_completed_batches = 0u;
+    s.rtxdi_perf_last_frame = UINT32_MAX;
+    s.rtxdi_perf_epoch = perf_epoch;
+  }
+  if (s.completion_available) {
+    for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {
+      if (!rtxdi::ClaimCompletedGpuTiming(&slot.perf_pending, s.completion_available, slot.perf_fence, completed))
+        continue;
+      const rtxdi::GpuPerfIdentity sample_identity = {slot.perf_gather_epoch, slot.perf_owner_generation,
+                                                      slot.perf_transfer_configuration, slot.perf_di_configuration,
+                                                      slot.perf_settings_identity, slot.perf_fence, slot.perf_frame,
+                                                      slot.perf_width, slot.perf_height, slot.perf_valid_mask};
+      const rtxdi::GpuPerfIdentity current_identity = {perf_epoch, s.generation,
+                                                       s.di_transfer.configuration_generation,
+                                                       s.di.configuration_generation,
+                                                       slot.local ? s.di.settings_identity : slot.perf_settings_identity,
+                                                       slot.perf_fence, slot.perf_frame, slot.width, slot.height,
+                                                       slot.perf_valid_mask};
+      const bool identity_valid = perf_gather && rtxdi::MatchesGpuPerfIdentity(sample_identity, current_identity)
+                                  && s.timestamp_frequency != 0u;
+      if (perf_gather && !identity_valid) {
+        rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.rtxdi_timing_skip_events);
+      }
+      if (identity_valid && slot.perf_readback) {
+        void* mapped = nullptr;
+        const D3D12_RANGE read_range = {0u, 64u};
+        if (SUCCEEDED(slot.perf_readback->Map(0u, &read_range, &mapped)) && mapped != nullptr) {
+          const auto* timestamps = static_cast<const uint64_t*>(mapped);
+          bool any_sample = false;
+          for (uint32_t sample = 0u; sample < 4u; ++sample) {
+            if ((slot.perf_valid_mask & (1u << sample)) == 0u) continue;
+            const uint32_t timestamp = sample * 2u;
+            double milliseconds = 0.0;
+            if (!rtxdi::DecodeGpuTimestampPair(timestamps[timestamp], timestamps[timestamp + 1u],
+                                               s.timestamp_frequency, &milliseconds)
+                || !rtxdi::AccumulateGpuSample(milliseconds, &s.rtxdi_gpu_ms_sum[sample],
+                                               &s.rtxdi_gpu_samples[sample])) {
+              rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.rtxdi_timing_skip_events);
+              continue;
+            }
+            any_sample = true;
+          }
+          if (rtxdi::CountCompletedGpuTimingBatch(any_sample, &s.rtxdi_gpu_completed_batches)) {
+            s.rtxdi_perf_last_frame = slot.perf_frame;
+          }
+          const D3D12_RANGE written_range = {0u, 0u};
+          slot.perf_readback->Unmap(0u, &written_range);
+        } else {
+          rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.rtxdi_timing_skip_events);
+        }
+      }
+      slot.perf_valid_mask = 0u;
+      slot.perf_fence = 0u;
+    }
+  }
   if (s.completion_available && s.completion_pending) {
     const double progress_age_ms = Rt12ProgressAgeMs(s);
     if (progress_age_ms > static_cast<double>(kRt12StuckMs)) {

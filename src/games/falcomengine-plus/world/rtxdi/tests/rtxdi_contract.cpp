@@ -6,6 +6,7 @@
 #include "../rtxdi_di_contract.h"
 #include "../rtxdi_diagnostics.hpp"
 #include "../rtxdi_input_validation.hpp"
+#include "../rtxdi_perf_contract.hpp"
 #include "../rtxdi_state.hpp"
 #include "../rtxdi_surface_layout.h"
 
@@ -1308,5 +1309,74 @@ int main() {
       || ObserveCameraProbe(&qualification, 7u, 1u, 1u, 8u, probe_width, probe_height, true, true, 1u)
       || ObserveCameraProbe(&qualification, 8u, 1u, 1u, 8u, probe_width, probe_height, true, true, 1u)
       || !ObserveCameraProbe(&qualification, 9u, 1u, 1u, 8u, probe_width, probe_height, true, true, 1u)) return EXIT_FAILURE;
+  using namespace falcom_world::rtxdi;
+  if (CanStartGpuTiming(false, 1000000u, false) || CanStartGpuTiming(true, 0u, false)
+      || CanStartGpuTiming(true, 1000000u, true) || !CanStartGpuTiming(true, 1000000u, false)) return EXIT_FAILURE;
+  uint32_t accepted_normal = 0u, accepted_zero_lights = 0u, accepted_wait_failure = 0u, rejected = 0u;
+  if (ShouldCountAcceptedGpuSubmission(true, true, 7u, UINT64_MAX)) ++accepted_normal;
+  if (ShouldCountAcceptedGpuSubmission(true, true, 8u, UINT64_MAX)) ++accepted_zero_lights;
+  if (ShouldCountAcceptedGpuSubmission(true, true, 9u, UINT64_MAX)) ++accepted_wait_failure;
+  if (accepted_normal != 1u || accepted_zero_lights != 1u || accepted_wait_failure != 1u
+      || ShouldCountAcceptedGpuSubmission(true, true, 0u, UINT64_MAX)
+      || ShouldCountAcceptedGpuSubmission(true, true, UINT64_MAX, UINT64_MAX)
+      || ShouldCountAcceptedGpuSubmission(false, true, 10u, UINT64_MAX)
+      || ShouldCountAcceptedGpuSubmission(true, false, 11u, UINT64_MAX)) return EXIT_FAILURE;
+  if (ShouldCountAcceptedGpuSubmission(true, true, 0u, UINT64_MAX)) ++rejected;
+  if (rejected != 0u) return EXIT_FAILURE;  // Preflight rejection has no accepted B and is never status-counted.
+  const uint32_t accepted_producer_b_signals = accepted_normal + accepted_zero_lights;
+  uint32_t completed_batches = 0u;
+  std::array<uint32_t, 4> completed_interval_samples = {};
+  ++completed_interval_samples[0];  // Input interval.
+  ++completed_interval_samples[1];  // DI interval in the same readback batch.
+  if (!CountCompletedGpuTimingBatch(true, &completed_batches)
+      || CountCompletedGpuTimingBatch(false, &completed_batches) || accepted_producer_b_signals != 2u
+      || completed_batches != 1u || completed_interval_samples[0] != 1u || completed_interval_samples[1] != 1u)
+    return EXIT_FAILURE;
+  std::atomic_uint64_t timing_skip_events{0u};
+  RecordGpuTimingSkipEvent(&timing_skip_events);
+  RecordGpuTimingSkipEvent(&timing_skip_events);  // Two invalid intervals in a partially valid batch.
+  if (!CountCompletedGpuTimingBatch(true, &completed_batches) || completed_batches != 2u
+      || timing_skip_events.load(std::memory_order_relaxed) != 2u) return EXIT_FAILURE;
+  for (uint32_t invalid_interval = 0u; invalid_interval < 4u; ++invalid_interval) {
+    RecordGpuTimingSkipEvent(&timing_skip_events);
+  }
+  RecordGpuTimingSkipEvent(&timing_skip_events);  // Stale identity, unavailable frequency, allocation failure.
+  RecordGpuTimingSkipEvent(&timing_skip_events);
+  RecordGpuTimingSkipEvent(&timing_skip_events);
+  if (CountCompletedGpuTimingBatch(false, &completed_batches) || completed_batches != 2u
+      || timing_skip_events.load(std::memory_order_relaxed) != 9u) return EXIT_FAILURE;
+  bool perf_pending = true;
+  if (ClaimCompletedGpuTiming(&perf_pending, false, 7u, 7u)
+      || ClaimCompletedGpuTiming(&perf_pending, true, 8u, 7u) || !perf_pending
+      || !ClaimCompletedGpuTiming(&perf_pending, true, 7u, 7u) || perf_pending
+      || ClaimCompletedGpuTiming(&perf_pending, true, 7u, 7u)) return EXIT_FAILURE;
+  const GpuPerfIdentity perf_identity = {2u, 3u, 4u, 5u, 6u, 7u, 8u, 13u, 9u, 0x0bu};
+  if (!MatchesGpuPerfIdentity(perf_identity, perf_identity)) return EXIT_FAILURE;
+  std::array<GpuPerfIdentity, 10> stale_perf_identities = {};
+  stale_perf_identities.fill(perf_identity);
+  ++stale_perf_identities[0].gather_epoch;
+  ++stale_perf_identities[1].owner_generation;
+  ++stale_perf_identities[2].transfer_configuration;
+  ++stale_perf_identities[3].di_configuration;
+  ++stale_perf_identities[4].settings_identity;
+  ++stale_perf_identities[5].accepted_fence;
+  ++stale_perf_identities[6].frame;
+  ++stale_perf_identities[7].width;
+  ++stale_perf_identities[8].height;
+  stale_perf_identities[9].valid_mask ^= 1u;
+  for (const GpuPerfIdentity& stale : stale_perf_identities) {
+    if (MatchesGpuPerfIdentity(perf_identity, stale)) return EXIT_FAILURE;
+  }
+  double gpu_ms = -1.0;
+  if (!DecodeGpuTimestampPair(100u, 3700u, 1000000u, &gpu_ms) || std::abs(gpu_ms - 3.6) > 1.0e-9
+      || DecodeGpuTimestampPair(1u, 1u, 1000000u, &gpu_ms)
+      || DecodeGpuTimestampPair(2u, 1u, 1000000u, &gpu_ms)
+      || DecodeGpuTimestampPair(1u, 2u, 0u, &gpu_ms)) return EXIT_FAILURE;
+  double gpu_sum = 0.0;
+  uint32_t gpu_samples = 0u;
+  if (!AccumulateGpuSample(1.25, &gpu_sum, &gpu_samples) || !AccumulateGpuSample(0.0, &gpu_sum, &gpu_samples)
+      || AccumulateGpuSample(std::numeric_limits<double>::infinity(), &gpu_sum, &gpu_samples)
+      || std::abs(gpu_sum - 1.25) > 1.0e-9 || gpu_samples != 2u) return EXIT_FAILURE;
+  std::printf("PASS RTXDI performance contracts: producer B signals vs completed batches/interval samples, per-event timing skips, gather gate, completion/poll-once, full identity matrix, timestamp validity, finite accumulation\n");
   return EXIT_SUCCESS;
 }

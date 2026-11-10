@@ -899,15 +899,27 @@ inline bool RecordNrdCameraProbe(Rt12State& state, Rt12DiTransferSlot& current,
 
 inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, reshade::api::command_list* cmd_list,
                                              const Rt12DiInputViews& in) {
+  const bvh::PoolCpuTimer cpu_timer{&bvh::g_perf_gate.rtxdi_input_cpu_us};
   using DS = reshade::api::shader_stage;
   using DT = reshade::api::descriptor_type;
   using Microsoft::WRL::ComPtr;
   Rt12DiInputResult result;
   auto& diagnostics = rtxdi::GetDiagnosticState();
   const bool diagnostic_enabled = rtxdi::DiagnosticCaptureEnabled(diagnostics);
+  const bool perf_gather = bvh::g_perf_gate.gather.load(std::memory_order_relaxed);
+  const uint64_t perf_epoch = perf_gather ? bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed) : 0u;
+  if (perf_gather) bvh::g_perf_gate.rtxdi_attempts.fetch_add(1u, std::memory_order_relaxed);
   const uint64_t diagnostic_epoch = diagnostic_enabled ? rtxdi::DiagnosticCaptureEpoch(diagnostics) : 0u;
   rtxdi::DiagnosticReason forced_diagnostic_reason = rtxdi::DiagnosticReason::None;
   const auto finish = [&]() {
+    if (perf_gather && bvh::g_perf_gate.gather.load(std::memory_order_relaxed)
+        && bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed) == perf_epoch) {
+      if (result.status == rtxdi::InputStatus::Busy) {
+        bvh::g_perf_gate.rtxdi_busy_skips.fetch_add(1u, std::memory_order_relaxed);
+      } else if (result.status != rtxdi::InputStatus::Off && result.status != rtxdi::InputStatus::AlreadyAttempted) {
+        bvh::g_perf_gate.rtxdi_rejections.fetch_add(1u, std::memory_order_relaxed);
+      }
+    }
     if (diagnostic_enabled) {
       rtxdi::DiagnosticEvent event = {};
       event.frame = in.frame;
@@ -1114,6 +1126,10 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                                  slot.output_c_fence, consumer_completed)) {
       result.status = rtxdi::InputStatus::Busy;
       return finish();
+    }
+    bool perf_timing = false;
+    if (perf_gather && slot.perf_pending) {
+      rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.rtxdi_timing_skip_events);
     }
     if (diagnostic_enabled && (slot.output_staged
 #if defined(FALCOM_NRD_ENABLED)
@@ -1359,6 +1375,50 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
         result.error = output_hr;
         return finish();
       }
+    }
+    if (rtxdi::CanStartGpuTiming(perf_gather
+                                     && perf_epoch == bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed),
+                                 s.timestamp_frequency, slot.perf_pending)) {
+      if (!slot.perf_queries || !slot.perf_readback) {
+        D3D12_QUERY_HEAP_DESC query_desc = {};
+        query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        query_desc.Count = 8u;
+        D3D12_HEAP_PROPERTIES readback_heap = {};
+        readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC readback_desc = {};
+        readback_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        readback_desc.Width = 64u;
+        readback_desc.Height = 1u;
+        readback_desc.DepthOrArraySize = 1u;
+        readback_desc.MipLevels = 1u;
+        readback_desc.SampleDesc.Count = 1u;
+        readback_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const HRESULT query_hr = s.device12->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&slot.perf_queries));
+        if (SUCCEEDED(query_hr)) {
+          const HRESULT readback_hr = s.device12->CreateCommittedResource(
+              &readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+              IID_PPV_ARGS(&slot.perf_readback));
+          if (FAILED(readback_hr)) slot.perf_queries.Reset();
+        }
+      }
+      perf_timing = slot.perf_queries && slot.perf_readback;
+      if (perf_timing) {
+        slot.perf_gather_epoch = perf_epoch;
+        slot.perf_owner_generation = s.generation;
+        slot.perf_transfer_configuration = transfer.configuration_generation;
+        slot.perf_di_configuration = s.di.configuration_generation;
+        slot.perf_settings_identity = in.effective_settings.identity;
+        slot.perf_frame = in.frame;
+        slot.perf_width = in.width;
+        slot.perf_height = in.height;
+        slot.perf_valid_mask = 0u;
+        slot.perf_fence = 0u;
+      } else {
+        rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.rtxdi_timing_skip_events);
+      }
+    }
+    if (perf_gather && s.timestamp_frequency == 0u) {
+      rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.rtxdi_timing_skip_events);
     }
     if (!transfer.unpack_root || !transfer.unpack_pso) {
       D3D12_DESCRIPTOR_RANGE ranges[2] = {};
@@ -1617,6 +1677,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       result.error = hr;
       return finish();
     }
+    if (perf_timing) transfer.list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0u);
     ID3D12Device5* native = s.device12.Get();
     const auto cpu_at = [&](uint32_t index) {
       auto handle = slot.descriptors->GetCPUDescriptorHandleForHeapStart();
@@ -1781,6 +1842,11 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       }
     }
     transfer.list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    if (perf_timing) {
+      transfer.list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1u);
+      transfer.list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0u, 2u,
+                                      slot.perf_readback.Get(), 0u);
+    }
     hr = transfer.list->Close();
     if (FAILED(hr)) {
       result.status = rtxdi::InputStatus::SubmitFailed;
@@ -1810,7 +1876,18 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       s.queue12->ExecuteCommandLists(1u, lists);
       b = renodx::utils::gpu_fence::QueueSignal(s.queue12.Get(), s.fence12.get());
       if (b == renodx::utils::gpu_fence::NO_SIGNAL) throw 0;
+      if (rtxdi::ShouldCountAcceptedGpuSubmission(
+              bvh::g_perf_gate.gather.load(std::memory_order_relaxed),
+              bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed) == perf_epoch, b,
+              renodx::utils::gpu_fence::NO_SIGNAL)) {
+        bvh::g_perf_gate.rtxdi_submissions.fetch_add(1u, std::memory_order_relaxed);
+      }
       slot.fence_value = b;
+      if (perf_timing) {
+        slot.perf_pending = true;
+        slot.perf_fence = b;
+        slot.perf_valid_mask = 1u;
+      }
       Rt12Slot& scene = s.lighting_slots[static_cast<uint32_t>(in.scene_slot)];
       scene.fence_value = (std::max)(scene.fence_value, b);
       s.last_signal = b;
@@ -1867,10 +1944,14 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
 
 inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, reshade::api::command_list* cmd_list,
                                               const Rt12DiInputViews& in, const Rt12DiInputResult& input) {
+  const bvh::PoolCpuTimer cpu_timer{&bvh::g_perf_gate.rtxdi_di_cpu_us};
   using Microsoft::WRL::ComPtr;
   auto& diagnostics = rtxdi::GetDiagnosticState();
   const bool diagnostic_enabled = rtxdi::DiagnosticCaptureEnabled(diagnostics);
   const uint64_t diagnostic_epoch = diagnostic_enabled ? rtxdi::DiagnosticCaptureEpoch(diagnostics) : 0u;
+  const bool perf_gather = bvh::g_perf_gate.gather.load(std::memory_order_relaxed);
+  const uint64_t perf_epoch = perf_gather ? bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed) : 0u;
+  if (perf_gather) bvh::g_perf_gate.rtxdi_attempts.fetch_add(1u, std::memory_order_relaxed);
   if (!g_rt12 || g_rt12->device != device || !cmd_list || !in.local || input.status != rtxdi::InputStatus::Ready
       || input.transfer_slot < 0 || input.transfer_slot >= static_cast<int32_t>(kRt12Slots)) {
     if (diagnostic_enabled) {
@@ -1904,6 +1985,14 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
 #endif
   const uint32_t slot_index = static_cast<uint32_t>(input.transfer_slot);
   Rt12DiTransferSlot& slot = transfer.slots[slot_index];
+  const bool perf_timing = bvh::g_perf_gate.gather.load(std::memory_order_relaxed)
+                           && slot.perf_pending
+                           && slot.perf_gather_epoch == bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed)
+                           && slot.perf_owner_generation == s.generation
+                           && slot.perf_frame == in.frame && slot.perf_width == in.width && slot.perf_height == in.height
+                           && slot.perf_settings_identity == in.effective_settings.identity;
+  bool perf_distance_recorded = false;
+  bool perf_nrd_recorded = false;
 #if defined(FALCOM_NRD_ENABLED)
   slot.nrd.dispatch_ready = false;
   slot.nrd.diffuse_output_valid = false;
@@ -1922,6 +2011,14 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   uint32_t temporal_source_index = UINT32_MAX;
   uint32_t temporal_output_index = UINT32_MAX;
   const auto publish = [&](rtxdi::DiStatus status, int32_t error = 0, uint64_t fence = 0u) {
+    if (perf_gather && bvh::g_perf_gate.gather.load(std::memory_order_relaxed)
+        && bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed) == perf_epoch) {
+      if (status == rtxdi::DiStatus::Busy) {
+        bvh::g_perf_gate.rtxdi_busy_skips.fetch_add(1u, std::memory_order_relaxed);
+      } else if (status == rtxdi::DiStatus::Failed || status == rtxdi::DiStatus::Quarantined) {
+        bvh::g_perf_gate.rtxdi_rejections.fetch_add(1u, std::memory_order_relaxed);
+      }
+    }
     {
       std::unique_lock lock(rtxdi::g_di.mutex);
       rtxdi::g_di.snapshot = {.status = status,
@@ -2236,6 +2333,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   HRESULT hr = slot.di_allocator->Reset();
   if (SUCCEEDED(hr)) hr = transfer.di_list->Reset(slot.di_allocator.Get(), transfer.initial_di_pso.Get());
   if (FAILED(hr)) return publish(rtxdi::DiStatus::Failed, hr);
+  if (perf_timing) transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u);
 
   void* frame_bytes = nullptr;
   const D3D12_RANGE no_reads = {0u, 0u};
@@ -2680,6 +2778,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                                             hitdistance_constants.data(), 0u);
       di_list->SetComputeRootDescriptorTable(1u, gpu);
       di_list->SetComputeRootDescriptorTable(2u, {gpu.ptr + static_cast<UINT64>(13u) * descriptor_stride});
+      if (perf_timing) di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4u);
       di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
       hitdistance_barriers = {};
       hitdistance_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -2701,6 +2800,10 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       hitdistance_barriers[1] = hitdistance_barriers[0];
       hitdistance_barriers[1].Transition.pResource = nrd_slot.hit_validity.Get();
       di_list->ResourceBarrier(2u, hitdistance_barriers.data());
+      if (perf_timing) {
+        di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 5u);
+        perf_distance_recorded = true;
+      }
     } else {
       hitdistance_recorded = false;
     }
@@ -2866,6 +2969,9 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       }
 #endif
     }
+    if (perf_timing && hitdistance_recorded) {
+      transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6u);
+    }
     nrd_dispatch_recorded = hitdistance_recorded
                             && RecordNrdDenoise(s, slot, in, in.effective_settings, &nrd_accepted_history);
     slot.nrd.diffuse_publication_recorded = false;
@@ -2906,6 +3012,10 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
             &hit_validity, &publication, in.width, in.height);
       }
     }
+    if (perf_timing && nrd_dispatch_recorded && slot.nrd.diffuse_publication_recorded) {
+      transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 7u);
+      perf_nrd_recorded = true;
+    }
 #endif
     nrd_history_reset = !nrd_dispatch_recorded;
   } else {
@@ -2941,6 +3051,19 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     }
   }
   transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  if (perf_timing) {
+    transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3u);
+    transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u, 2u,
+                                       slot.perf_readback.Get(), 16u);
+    if (perf_distance_recorded) {
+      transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4u, 2u,
+                                         slot.perf_readback.Get(), 32u);
+    }
+    if (perf_nrd_recorded) {
+      transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6u, 2u,
+                                         slot.perf_readback.Get(), 48u);
+    }
+  }
   hr = transfer.di_list->Close();
   if (FAILED(hr)) return publish(rtxdi::DiStatus::Failed, hr);
 
@@ -2951,6 +3074,12 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     s.queue12->ExecuteCommandLists(1u, lists);
     di_fence = renodx::utils::gpu_fence::QueueSignal(s.queue12.Get(), s.fence12.get());
     if (di_fence == renodx::utils::gpu_fence::NO_SIGNAL) throw 0;
+    if (rtxdi::ShouldCountAcceptedGpuSubmission(
+            bvh::g_perf_gate.gather.load(std::memory_order_relaxed),
+            bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed) == perf_epoch, di_fence,
+            renodx::utils::gpu_fence::NO_SIGNAL)) {
+      bvh::g_perf_gate.rtxdi_submissions.fetch_add(1u, std::memory_order_relaxed);
+    }
   } catch (...) {
     transfer.input_frame = UINT32_MAX;
     if (rtxdi::DiPostSubmitSignalDisposition(true, false) == rtxdi::DiSignalDisposition::QuarantineSession) {
@@ -2961,6 +3090,12 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   }
   s.unfenced_execution = false;
   slot.di_fence_value = di_fence;
+  if (perf_timing) {
+    slot.perf_fence = di_fence;
+    slot.perf_valid_mask |= 2u;
+    if (perf_distance_recorded) slot.perf_valid_mask |= 4u;
+    if (perf_nrd_recorded) slot.perf_valid_mask |= 8u;
+  }
 #if defined(FALCOM_NRD_ENABLED)
   if (nrd_probe_recorded) {
     slot.nrd.probe_fence = di_fence;

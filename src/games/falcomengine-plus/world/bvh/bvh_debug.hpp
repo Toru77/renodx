@@ -391,6 +391,21 @@ inline void OnWorldPresentBvh(
       std::lock_guard<std::mutex> lock(rt12::g_rt12_rtgi_panel_mutex);
       extra.dxr_rtgi_ms = rt12::g_rt12_rtgi_panel.gpu_ms_sum;
     }
+    if (rt12::g_rt12 && rt12::g_rt12->device == device) {
+      rt12::Rt12State& rt12_state = *rt12::g_rt12;
+      const uint64_t perf_epoch = g_perf_gate.gather_epoch.load(std::memory_order_relaxed);
+      if (rt12_state.rtxdi_perf_epoch != perf_epoch) {
+        std::fill(std::begin(rt12_state.rtxdi_gpu_ms_sum), std::end(rt12_state.rtxdi_gpu_ms_sum), 0.0);
+        std::fill(std::begin(rt12_state.rtxdi_gpu_samples), std::end(rt12_state.rtxdi_gpu_samples), 0u);
+        rt12_state.rtxdi_gpu_completed_batches = 0u;
+        rt12_state.rtxdi_perf_last_frame = UINT32_MAX;
+        rt12_state.rtxdi_perf_epoch = perf_epoch;
+      }
+      extra.rtxdi_input = {rt12_state.rtxdi_gpu_ms_sum[0], rt12_state.rtxdi_gpu_samples[0]};
+      extra.rtxdi_local = {rt12_state.rtxdi_gpu_ms_sum[1], rt12_state.rtxdi_gpu_samples[1]};
+      extra.rtxdi_distance = {rt12_state.rtxdi_gpu_ms_sum[2], rt12_state.rtxdi_gpu_samples[2]};
+      extra.rtxdi_nrd = {rt12_state.rtxdi_gpu_ms_sum[3], rt12_state.rtxdi_gpu_samples[3]};
+    }
   }
   const auto present_time = SamplePerfPresent(device, extra);
   UpdateLiveBvh(device, queue);

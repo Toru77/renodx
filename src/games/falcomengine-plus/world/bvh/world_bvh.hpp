@@ -277,6 +277,7 @@ inline void DrawPerformanceTab() {
   bool gather = g_perf_gate.gather.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Gather performance metrics", &gather)) {
     g_perf_gate.clear_pending.store(!gather, std::memory_order_relaxed);  // OFF: the next present clears what was gathered
+    g_perf_gate.gather_epoch.fetch_add(1u, std::memory_order_relaxed);
     if (gather) {
       std::lock_guard<std::mutex> lock(g_perf.mutex);
       g_perf.tab = PerfTabState{};
@@ -354,10 +355,66 @@ inline void DrawPerformanceTab() {
     if (ImGui::BeginTable("perf_phases", 5, ImGuiTableFlags_Borders)) {
       header();
       for (size_t i = 0; i < kPerfCostCount; ++i) {
-        if (kPerfCostInfo[i].role == kPerfSubset) row(kPerfCostInfo[i].name, "ms/present", view.now[i], view.avg[i], view.max.row[i], false);
+        if (kPerfCostInfo[i].role == kPerfSubset)
+          row(kPerfCostInfo[i].name, kPerfCostInfo[i].counted ? "ms/measured frame" : "ms/present", view.now[i], view.avg[i], view.max.row[i], false);
       }
       ImGui::EndTable();
     }
+  }
+  if (ImGui::CollapsingHeader("RTXDI timing session")) {
+    const bool relax_requested = rtxdi::g_diffuse_denoiser > 0.5f;
+    const bool rr_suppressed = rr::RrRequested() || rr::RrOwnsDenoise();
+    ImGui::Text("Frame %u; denoiser requested %s, effective %s", g_state.frame.load(std::memory_order_relaxed),
+                relax_requested ? "RELAX diffuse" : "Raw", relax_requested && !rr_suppressed ? "RELAX diffuse" : "Raw");
+    rtxdi::InputSnapshot input_snapshot;
+    {
+      std::shared_lock lock(rtxdi::g_input.mutex);
+      input_snapshot = rtxdi::g_input.snapshot;
+    }
+    rtxdi::DiSnapshot di_snapshot;
+    {
+      std::shared_lock lock(rtxdi::g_di.mutex);
+      di_snapshot = rtxdi::g_di.snapshot;
+    }
+    ImGui::Text("Input %s (frame %u, %ux%u, transfer %d, B=%llu); DI %s (frame %u, transfer %d, B=%llu)",
+                rtxdi::InputStatusName(input_snapshot.status), input_snapshot.ready_frame, input_snapshot.width,
+                input_snapshot.height, input_snapshot.transfer_slot,
+                static_cast<unsigned long long>(input_snapshot.fence), rtxdi::DiStatusName(di_snapshot.status),
+                di_snapshot.frame, di_snapshot.transfer_slot, static_cast<unsigned long long>(di_snapshot.fence));
+    uint32_t pending = 0u;
+    if (rt12::g_rt12) {
+      for (const rt12::Rt12DiTransferSlot& slot : rt12::g_rt12->di_transfer.slots) pending += slot.perf_pending ? 1u : 0u;
+      const uint32_t age = rt12::g_rt12->rtxdi_perf_last_frame != UINT32_MAX
+                               ? g_state.frame.load(std::memory_order_relaxed) - rt12::g_rt12->rtxdi_perf_last_frame
+                               : UINT32_MAX;
+      const uint32_t samples = rt12::g_rt12->rtxdi_gpu_samples[0] + rt12::g_rt12->rtxdi_gpu_samples[1]
+                               + rt12::g_rt12->rtxdi_gpu_samples[2] + rt12::g_rt12->rtxdi_gpu_samples[3];
+      if (rt12::g_rt12->rtxdi_perf_last_frame == UINT32_MAX) {
+        ImGui::Text("GPU timing: completed batches %u, interval samples %u, pending measurement batches %u, last sample --",
+                    rt12::g_rt12->rtxdi_gpu_completed_batches, samples, pending);
+      } else {
+        ImGui::Text("GPU timing: completed batches %u, interval samples %u, pending measurement batches %u, last sample frame %u (age %u)",
+                    rt12::g_rt12->rtxdi_gpu_completed_batches, samples, pending,
+                    rt12::g_rt12->rtxdi_perf_last_frame, age);
+      }
+    } else {
+      ImGui::TextDisabled("GPU timing unavailable (RT12 session not created)");
+    }
+    ImGui::Text("Gather counts: attempts %llu, accepted producer B submissions %llu, rejections %llu, busy skips %llu, timing skip events %llu",
+                static_cast<unsigned long long>(g_perf_gate.rtxdi_attempts.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(g_perf_gate.rtxdi_submissions.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(g_perf_gate.rtxdi_rejections.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(g_perf_gate.rtxdi_busy_skips.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(g_perf_gate.rtxdi_timing_skip_events.load(std::memory_order_relaxed)));
+    ImGui::Text("Callbacks (not pixel-application evidence): local bound %s / lighting draw seen %s",
+                di_snapshot.output_bound ? "yes" : "no", di_snapshot.lighting_draw_seen ? "yes" : "no");
+#if defined(FALCOM_NRD_ENABLED)
+    ImGui::Text("Callbacks (NRD diffuse): bound %s / lighting draw seen %s",
+                di_snapshot.nrd_diffuse_bound ? "yes" : "no",
+                di_snapshot.nrd_diffuse_lighting_draw_seen ? "yes" : "no");
+#else
+    ImGui::TextDisabled("NRD timing unavailable (no NRD SDK build)");
+#endif
   }
   if (ImGui::CollapsingHeader("Largest frame spike of the last 30 presents")) {
     const PerfSpike& spike = view.spike;
@@ -401,7 +458,7 @@ inline void DrawPerformanceTab() {
       ImGui::EndTable();
     }
   }
-  ImGui::TextDisabled("Last %u presents: now = newest present, avg = mean of the window, max = largest of the window (per row; the totals are the largest per-sample totals, so they need not equal the sum of the row maxima). CPU rows are per present; GPU rows are per measured frame (trace, alpha blit, P2b expand, deform refit, RTAO trace, RTAO filter). Unattributed CPU = the two present handlers minus the rows inside them.",
+  ImGui::TextDisabled("Last %u presents: now = newest present, avg = mean of the window, max = largest of the window (per row; the totals are the largest per-sample totals, so they need not equal the sum of the row maxima). CPU rows are per present; GPU rows are per measured frame. RTXDI input/local rows cover D3D12 command-list work only; distance and NRD rows are subsets excluded from gpu_total. D3D11 pack/copy and cross-queue waits are not included, so these are not end-to-end latency. Unattributed CPU = the two present handlers minus the rows inside them.",
                       static_cast<unsigned>(kPerfTabWindow));
   if (ImGui::Button("Performance test (30 s)")) RequestPerfRun(g_diag_label);
   if (ImGui::IsItemHovered()) {

@@ -86,15 +86,23 @@ enum PerfBlock : size_t {
 struct PerfGate {
   std::atomic_bool gather{false};
   std::atomic_bool clear_pending{false};  // set when gather goes OFF: the next present clears what was gathered
+  std::atomic_uint64_t gather_epoch{1u};  // increments on each toggle; pending GPU samples cannot cross sessions
   // The CPU time counters are nanoseconds (PoolCpuTimer); the _us suffix predates the unit.
-  std::atomic_uint64_t present_world_us{0u};  // cumulative CPU time of OnWorldPresent (bracket)
-  std::atomic_uint64_t present_bvh_us{0u};    // cumulative CPU time of OnWorldPresentBvh (bracket)
-  std::atomic_uint64_t alpha_sync_us{0u};     // SyncLiveAlpha CPU time of the last present
-  std::atomic_uint64_t rtao_record_us{0u};    // rtao::Dispatch CPU time (command recording)
-  std::atomic_uint64_t rtgi_record_us{0u};    // rtgi::Dispatch CPU time (command recording)
-  std::atomic_uint64_t rtls_record_us{0u};    // rtls::Dispatch CPU time (command recording)
-  std::atomic_uint64_t rtsun_record_us{0u};   // rtsun::Dispatch CPU time (command recording)
-  std::atomic_uint64_t deform_update_us{0u};  // UpdateDeformLive CPU time of the last present
+  std::atomic_uint64_t present_world_us{0u};    // cumulative CPU time of OnWorldPresent (bracket)
+  std::atomic_uint64_t present_bvh_us{0u};      // cumulative CPU time of OnWorldPresentBvh (bracket)
+  std::atomic_uint64_t alpha_sync_us{0u};       // SyncLiveAlpha CPU time of the last present
+  std::atomic_uint64_t rtao_record_us{0u};      // rtao::Dispatch CPU time (command recording)
+  std::atomic_uint64_t rtgi_record_us{0u};      // rtgi::Dispatch CPU time (command recording)
+  std::atomic_uint64_t rtls_record_us{0u};      // rtls::Dispatch CPU time (command recording)
+  std::atomic_uint64_t rtsun_record_us{0u};     // rtsun::Dispatch CPU time (command recording)
+  std::atomic_uint64_t rtxdi_input_cpu_us{0u};  // RTXDI input validation/allocation/record/submission, nanoseconds
+  std::atomic_uint64_t rtxdi_di_cpu_us{0u};     // RTXDI local-DI validation/record/submission, nanoseconds
+  std::atomic_uint64_t rtxdi_attempts{0u};
+  std::atomic_uint64_t rtxdi_submissions{0u};
+  std::atomic_uint64_t rtxdi_rejections{0u};
+  std::atomic_uint64_t rtxdi_busy_skips{0u};
+  std::atomic_uint64_t rtxdi_timing_skip_events{0u};
+  std::atomic_uint64_t deform_update_us{0u};         // UpdateDeformLive CPU time of the last present
   std::atomic_uint64_t block_us[kPerfBlockCount]{};  // CPU time of each PerfBlock (cumulative nanoseconds; written by PoolCpuTimer or AddPerfBlockMs)
   std::atomic_uint64_t hook_draws{0u};        // draws that reached the pool path of WorldDrawCallback (gather only)
   std::atomic_uint64_t hook_draws_frame{0u};  // hook_draws of the last frame (moved by SamplePerfPresent)
