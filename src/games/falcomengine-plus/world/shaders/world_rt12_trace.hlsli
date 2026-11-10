@@ -19,6 +19,8 @@ RaytracingAccelerationStructure g_rt12_tlas : register(RT12_TLAS_REGISTER);
 #endif
 StructuredBuffer<float4> g_rt12_dynamic_vertices : register(RT12_DYNAMIC_VERTICES_REGISTER);
 static uint g_rt12_dynamic_mask = 0u;  // RT12_MASK_DYNAMIC while RTAO traces characters
+static float g_rt12_foliage_transmission = 0.0;
+static uint g_rt12_foliage_layers = 0u;
 
 WorldTraceHit TraceWorldClosestDxr(float3 origin, float3 direction, float t_min, float t_max, WorldCameraView view,
                                    out WorldTraceCounters counters)
@@ -146,6 +148,11 @@ WorldTraceHit TraceWorldRayDxr(float3 origin, float3 direction, float t_min, flo
         const uint i1 = g_trace_indices[base + 1u];
         const uint i2 = g_trace_indices[base + 2u];
         if (AlphaCutHit((uint)instance.header.z, mesh.bbox_min.w, i0, i1, i2, query.CandidateTriangleBarycentrics(), counters)) continue;
+        if (g_rt12_foliage_transmission > 0.0 && instance.header.z != 0.0)
+        {
+            ++g_rt12_foliage_layers;
+            continue;
+        }
         query.CommitNonOpaqueTriangleHit();
     }
     if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT)

@@ -133,11 +133,11 @@ struct ShaderInjectData {
   float vbgi_multibounce_bounce_fraction; // RETIRED: no setting drives it (was SSGIMultiBounceBounceFraction), kept for the layout
   float vbgi_multibounce_saturation;// RETIRED: no setting drives it (was SSGIMultiBounceSaturation), kept for the layout
   float vbgi_multibounce_max_clamp; // RETIRED: no setting drives it (was SSGIMultiBounceMaxClamp), kept for the layout
-  float vbgi_adaptive_r;            // RETIRED: no setting drives it (was SSGIAdaptiveR), kept for the layout
-  float vbgi_adaptive_g;            // RETIRED: no setting drives it (was SSGIAdaptiveG), kept for the layout
-  float vbgi_adaptive_b;            // RETIRED: no setting drives it (was SSGIAdaptiveB), kept for the layout
-  float vbgi_adaptive_mode;         // RETIRED: no setting drives it (was SSGIAdaptiveMode), kept for the layout
-  float vbgi_adaptive_luma_strength;// RETIRED: no setting drives it (was SSGIAdaptiveLumaStrength), kept for the layout
+  float rtxdi_sun_foliage_tint_r;   // RTXDI Sun Foliage Tint R [0..1] (reuses retired vbgi_adaptive_r)
+  float rtxdi_sun_foliage_tint_g;   // RTXDI Sun Foliage Tint G [0..1] (reuses retired vbgi_adaptive_g)
+  float rtxdi_sun_foliage_tint_b;   // RTXDI Sun Foliage Tint B [0..1] (reuses retired vbgi_adaptive_b)
+  float rtxdi_sun_foliage_transmission; // RTXDI Sun Foliage Transmission [0..1] (reuses retired vbgi_adaptive_mode)
+  float rtxdi_sun_character_max_darkening; // RTXDI Sun Character Max Darkening [0..1] (reuses retired vbgi_adaptive_luma_strength)
   float vbgi_adaptive_luma_blend;   // RETIRED: no setting drives it (was SSGIAdaptiveLumaBlend), kept for the layout
   float vbgi_max_clamp;             // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGIMaxClamp), kept for the layout
   float vbgi_reduce_ao;             // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGIReduceAO), kept for the layout

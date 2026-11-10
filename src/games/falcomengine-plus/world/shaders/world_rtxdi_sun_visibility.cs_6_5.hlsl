@@ -16,6 +16,10 @@ struct RtxdiSunResult {
   uint flags;
 };
 
+uint RtxdiSunVisibilityWord(RtxdiSunResult r) {
+  return r.status | (((r.flags >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_LAYER_SHIFT);
+}
+
 RWStructuredBuffer<RtxdiSunResult> g_rtxdi_sun_results : register(u0);
 RWTexture2D<uint> g_rtxdi_sun_visibility : register(u1);
 
@@ -34,6 +38,8 @@ cbuffer RtxdiSunParams : register(b0) {
   float g_sun_disk_tan;
   uint g_noise_mode;
   uint g_noise_slice;
+  float g_foliage_transmission;
+  float3 g_foliage_tint;
 };
 
 #include "world_rtxdi_sun_adapter.hlsli"
@@ -168,7 +174,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     }
     if (found) {
       g_rtxdi_sun_results[output_index] = g_rtxdi_sun_results[source_index];
-      g_rtxdi_sun_visibility[pixel] = g_rtxdi_sun_results[source_index].status;
+      g_rtxdi_sun_visibility[pixel] = RtxdiSunVisibilityWord(g_rtxdi_sun_results[source_index]);
       return;
     }
   }
@@ -202,6 +208,8 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   view.skip_flags = 0u;
   view.require_flags = g_require_flags;
   g_rt12_dynamic_mask = RT12_MASK_DYNAMIC;
+  g_rt12_foliage_transmission = g_foliage_transmission;
+  g_rt12_foliage_layers = 0u;
   WorldTraceCounters counters;
   const WorldTraceHit hit = TraceWorldRayDxr(origin, sun_direction, 0.0, coverage_end, true, view, counters);
   result.flags |= (character ? RTXDI_SUN_FLAG_CHARACTER : 0u);
@@ -215,10 +223,11 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     result.status = RTXDI_SUN_STATUS_VISIBLE;
     result.distance = g_max_distance;
     result.reason = RTXDI_SUN_REASON_NONE;
+    result.flags |= min(g_rt12_foliage_layers, RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_LAYER_SHIFT;
   } else {
     result.reason = RTXDI_SUN_REASON_TRUNCATED;
     result.flags |= RTXDI_SUN_FLAG_TRUNCATED;
   }
   g_rtxdi_sun_results[output_index] = result;
-  g_rtxdi_sun_visibility[pixel] = result.status;
+  g_rtxdi_sun_visibility[pixel] = RtxdiSunVisibilityWord(result);
 }

@@ -17,6 +17,7 @@ struct RtxdiSunLightingSelection
 {
   bool known;
   float visibility;
+  uint layers;
 };
 
 struct RtxdiCharacterLightResult
@@ -42,11 +43,15 @@ RtxdiDenoisedDiffuseResult RtxdiResolveDenoisedDiffuse(bool bound, RtxdiLighting
   return result;
 }
 
-RtxdiSunLightingSelection RtxdiResolveSunLightingSelection(bool bound, uint status)
+RtxdiSunLightingSelection RtxdiResolveSunLightingSelection(bool bound, uint word, float transmission)
 {
   RtxdiSunLightingSelection result = (RtxdiSunLightingSelection)0;
-  result.known = bound && (status == RTXDI_SUN_STATUS_VISIBLE || status == RTXDI_SUN_STATUS_BLOCKED);
-  result.visibility = status == RTXDI_SUN_STATUS_VISIBLE ? 1.0 : 0.0;
+  const uint status = word & 0xFFu;
+  result.known = bound && (word & ~0xFFFu) == 0u && (status == RTXDI_SUN_STATUS_VISIBLE || status == RTXDI_SUN_STATUS_BLOCKED);
+  result.layers = (word >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK;
+  result.visibility = status == RTXDI_SUN_STATUS_VISIBLE
+                          ? (result.layers == 0u ? 1.0 : pow(saturate(transmission), result.layers))
+                          : 0.0;
   return result;
 }
 

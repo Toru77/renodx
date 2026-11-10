@@ -510,8 +510,10 @@ void main(
         const uint2 sunPixel = (uint2)v0.xy;
         if (sunPixel.x < sunWidth && sunPixel.y < sunHeight) {
           const RtxdiSunLightingSelection sunSelection =
-              RtxdiResolveSunLightingSelection(true, rtxdiSunVisibility_g.Load(int3(sunPixel, 0)));
-          if (sunSelection.known) r3.z *= 1.0 - saturate(shader_injection_data.rtxdi_sun_character_darkening) * (1.0 - sunSelection.visibility);
+              RtxdiResolveSunLightingSelection(true, rtxdiSunVisibility_g.Load(int3(sunPixel, 0)),
+                                               shader_injection_data.rtxdi_sun_foliage_transmission);
+          if (sunSelection.known) r3.z *= 1.0 - min(saturate(shader_injection_data.rtxdi_sun_character_darkening) * (1.0 - sunSelection.visibility),
+                                                    saturate(shader_injection_data.rtxdi_sun_character_max_darkening));
         }
       }
       // RT Sun Shadows on characters (world/rtsun, R4): the RT sun visibility (denoised, t39) scales the toon lerp factor. Needs
@@ -935,6 +937,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r0.w = r3.w * r0.w + 1;
   r3.zw = min(shadowUVClamp_g.xy, v1.xy);
   r3.z = shadowTexture.SampleLevel(samLinear_s, r3.zw, 0).x;
+  uint rtxdiSunLayers = 0u;
   // RT Sun Shadows (world/rtsun, R3b): inside the RT cascade range the RT sun term replaces the CSM visibility here, before
   // every reader of r3.z. Non-character pixels only: the character branch returned above.
   if (shader_injection_data.rtxdi_sun_bound > 0.5f) {
@@ -943,8 +946,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     const uint2 sunPixel = (uint2)v0.xy;
     if (sunPixel.x < sunWidth && sunPixel.y < sunHeight) {
       const RtxdiSunLightingSelection sunSelection =
-          RtxdiResolveSunLightingSelection(true, rtxdiSunVisibility_g.Load(int3(sunPixel, 0)));
+          RtxdiResolveSunLightingSelection(true, rtxdiSunVisibility_g.Load(int3(sunPixel, 0)),
+                                           shader_injection_data.rtxdi_sun_foliage_transmission);
       if (sunSelection.known) r3.z = 1.0 - saturate(shader_injection_data.rtxdi_sun_darkening) * (1.0 - sunSelection.visibility);
+      if (sunSelection.known) rtxdiSunLayers = sunSelection.layers;
     }
   } else if (((uint)shader_injection_data.rtsun_flags & RTSUN_FLAG_APPLIED) != 0u) {
     const float rtsunDarkening = rtsunTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
@@ -1450,6 +1455,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r0.w = r2.x * r9.x;
   r9.xyz = r15.yzw + -r10.xyz;
   r9.xyz = r0.www * r9.xyz + r10.xyz;
+  if (rtxdiSunLayers != 0u) {
+    r9.xyz *= pow(saturate(float3(shader_injection_data.rtxdi_sun_foliage_tint_r, shader_injection_data.rtxdi_sun_foliage_tint_g,
+                                  shader_injection_data.rtxdi_sun_foliage_tint_b)), (float)rtxdiSunLayers);
+  }
   // Sun contact shadows apply HERE, to the sun diffuse and before r13.xyz (ambient)
   // is added, gated on real sun visibility. See FalcomApplyContactToSun: scaling the
   // final colour darkened interiors, and scaling the sun term alone still darkened

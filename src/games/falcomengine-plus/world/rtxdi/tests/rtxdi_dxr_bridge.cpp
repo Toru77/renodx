@@ -121,7 +121,7 @@ struct LightingConsumerCase {
   uint32_t sun_bound;
   uint32_t sun_status;
   float csm_visibility;
-  uint32_t padding3;
+  float sun_transmission;
   float nrd_diffuse[4];
   uint32_t nrd_bound;
   uint32_t expected_class;
@@ -745,7 +745,7 @@ int RunRtxdiDxrBridge() {
   sun_ranges[7] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 61, 0, 16};
   ComPtr<ID3D12RootSignature> sun_root;
   ComPtr<ID3D12PipelineState> sun_pso;
-  if (!CreateRoot(device.Get(), sun_ranges, 8, 17, &sun_root)
+  if (!CreateRoot(device.Get(), sun_ranges, 8, 23, &sun_root)
       || !CreatePso(device.Get(), sun_root.Get(), __world_rtxdi_sun_visibility, &sun_pso)) return 1;
   std::fprintf(stderr, "DXR sun root + PSO ready\n");
   D3D12_DESCRIPTOR_RANGE sun_detail_ranges[2] = {};
@@ -944,13 +944,16 @@ int RunRtxdiDxrBridge() {
   auto detail_uav_gpu = detail_gpu;
   detail_uav_gpu.ptr += descriptor_size;
   const UINT detail_sentinel[4] = {0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu};
+  ID3D12DescriptorHeap* detail_clear_heaps[] = {sun_detail_heap.Get()};
+  list->SetDescriptorHeaps(1u, detail_clear_heaps);
   list->ClearUnorderedAccessViewUint(detail_uav_gpu, sun_detail_cpu_heap->GetCPUDescriptorHandleForHeapStart(),
                                     sun_detail_output.Get(), detail_sentinel, 0u, nullptr);
   output_to_uav.Transition.pResource = sun_visibility_output.Get();
   list->ResourceBarrier(1, &output_to_uav);
   const auto dispatch = [&](UINT mask_index, float max_distance, UINT expected_status, UINT expected_reason,
                             bool coverage_valid, const char* label, float expected_distance = -1.f,
-                            bool scene_valid = true, float environment_bias = 0.01f, float character_bias = 0.02f) {
+                            bool scene_valid = true, float environment_bias = 0.01f, float character_bias = 0.02f,
+                            float foliage_transmission = 0.f, UINT expected_layers = 0u) {
     std::fprintf(stderr, "DXR dispatch %s distance=%f\n", label, max_distance);
     tlas_srv.RaytracingAccelerationStructure.Location = tlases[mask_index]->GetGPUVirtualAddress();
     device->CreateShaderResourceView(nullptr, &tlas_srv, tlas_slot_cpu);
@@ -958,11 +961,11 @@ int RunRtxdiDxrBridge() {
     list->SetComputeRootSignature(sun_root.Get());
     list->SetPipelineState(sun_pso.Get());
     list->SetComputeRootDescriptorTable(1, sun_heap->GetGPUDescriptorHandleForHeapStart());
-    const UINT params[17] = {3, 2, std::bit_cast<UINT>(max_distance), std::bit_cast<UINT>(environment_bias),
+    const UINT params[23] = {3, 2, std::bit_cast<UINT>(max_distance), std::bit_cast<UINT>(environment_bias),
                              std::bit_cast<UINT>(character_bias), std::bit_cast<UINT>(-2.f), std::bit_cast<UINT>(-2.f),
                              std::bit_cast<UINT>(-2.f), std::bit_cast<UINT>(4.f), scene_valid ? 1u : 0u,
-                             coverage_valid ? 1u : 0u, 1u, 0u, 0u, 0u, 0u, 0u};
-    list->SetComputeRoot32BitConstants(0, 17, params, 0);
+                             coverage_valid ? 1u : 0u, 1u, 0u, 0u, 0u, 0u, 0u, std::bit_cast<UINT>(foliage_transmission), 0u, 0u, std::bit_cast<UINT>(1.f), std::bit_cast<UINT>(1.f), std::bit_cast<UINT>(1.f)};
+    list->SetComputeRoot32BitConstants(0, 23, params, 0);
     D3D12_RESOURCE_BARRIER output_barrier = {};
     output_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     output_barrier.Transition.pResource = sun_output.Get();
@@ -1088,8 +1091,8 @@ int RunRtxdiDxrBridge() {
       const UINT x = i % 3u;
       const UINT y = i / 3u;
       const auto* row = reinterpret_cast<const UINT*>(visibility_bytes + y * visibility_footprint.Footprint.RowPitch);
-      if (row[x] != expected_status) {
-        std::fprintf(stderr, "FAIL %s t42 pixel=%u status=%u expected=%u\n", label, i, row[x], expected_status);
+      if (row[x] != (expected_status | (expected_layers << RTXDI_SUN_LAYER_SHIFT))) {
+        std::fprintf(stderr, "FAIL %s t42 pixel=%u status=%u expected=%u\n", label, i, row[x], (expected_status | (expected_layers << RTXDI_SUN_LAYER_SHIFT)));
         sun_visibility_readback->Unmap(0u, nullptr);
         return false;
       }
@@ -1258,7 +1261,9 @@ int RunRtxdiDxrBridge() {
   if (!update_atlas_texel(0u)
       || !dispatch(0, 0.6f, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_REASON_NONE, true, "alpha hole reveals opaque behind", 0.49f)
       || !update_atlas_texel(0xFFFFFFFFu)
-      || !dispatch(0, 0.6f, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_REASON_NONE, true, "alpha accepted", 0.29f)) return 1;
+      || !dispatch(0, 0.6f, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_REASON_NONE, true, "alpha accepted", 0.29f)
+      || !dispatch(0, 0.6f, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_REASON_NONE, true, "foliage transmission reveals opaque behind", 0.49f, true, 0.01f, 0.02f, 0.5f, 0u)
+      || !dispatch(0, 0.4f, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_REASON_NONE, true, "foliage transmission counts one layer", 0.4f, true, 0.01f, 0.02f, 0.5f, 1u)) return 1;
   alpha_material.swizzle = 1u;
   if (!update_upload(alpha_materials.Get(), &alpha_material, sizeof(alpha_material))
       || !update_atlas_texel(0u)
@@ -3190,7 +3195,7 @@ int RunRtxdiDxrBridge() {
   }
   std::printf("PASS finite-input raw overflow sanitizer writes UNKNOWN and zero diffuse\n");
 
-  constexpr uint32_t lighting_case_count = 53u;
+  constexpr uint32_t lighting_case_count = 57u;
   std::fprintf(stderr, "DIAG lighting setup start\n");
   std::array<LightingConsumerCase, lighting_case_count> lighting_cases = {};
   for (LightingConsumerCase& test_case : lighting_cases) {
@@ -3425,6 +3430,19 @@ int RunRtxdiDxrBridge() {
   lighting_cases[4].sun_bound = 1u;
   lighting_cases[4].sun_status = 17u;
   lighting_cases[4].csm_visibility = 0.2f;
+  lighting_cases[53].sun_bound = 1u;
+  lighting_cases[53].sun_status = RTXDI_SUN_STATUS_VISIBLE;
+  lighting_cases[53].sun_transmission = 0.5f;
+  lighting_cases[54].sun_bound = 1u;
+  lighting_cases[54].sun_status = RTXDI_SUN_STATUS_VISIBLE | (2u << RTXDI_SUN_LAYER_SHIFT);
+  lighting_cases[54].sun_transmission = 0.5f;
+  lighting_cases[55].sun_bound = 1u;
+  lighting_cases[55].sun_status = RTXDI_SUN_STATUS_BLOCKED;
+  lighting_cases[55].sun_transmission = 0.5f;
+  lighting_cases[56].sun_bound = 1u;
+  lighting_cases[56].sun_status = 0x80000000u | RTXDI_SUN_STATUS_BLOCKED;
+  lighting_cases[56].sun_transmission = 0.5f;
+  lighting_cases[56].csm_visibility = 0.4f;
   for (LightingConsumerCase& test_case : lighting_cases) {
     test_case.padding[0] = 0u;
     test_case.padding[1] = 0u;
@@ -3539,6 +3557,11 @@ int RunRtxdiDxrBridge() {
       && lighting_results[3].sun_known == 0u && lighting_results[3].environment_sun_visibility == 0.65f
       && lighting_results[3].character_sun_multiplier == 1.f
       && lighting_results[4].sun_known == 0u && lighting_results[4].environment_sun_visibility == 0.2f
+      && lighting_results[53].sun_known == 1u && lighting_results[53].environment_sun_visibility == 1.f
+      && lighting_results[54].sun_known == 1u && std::abs(lighting_results[54].environment_sun_visibility - 0.25f) < 1e-6f
+      && lighting_results[55].sun_known == 1u && lighting_results[55].environment_sun_visibility == 0.f
+      && lighting_results[56].sun_known == 0u && lighting_results[56].environment_sun_visibility == 0.4f
+      && lighting_results[56].character_sun_multiplier == 1.f
       && lighting_results[9].denoised_used == 1u && std::abs(lighting_results[9].diffuse_replaced - 0.125f) < 1e-6f
       && std::abs(lighting_results[9].shaded_local_term - 0.015625f) < 1e-6f
       && lighting_results[9].specular_preserved == 5.0f
@@ -3580,21 +3603,21 @@ int RunRtxdiDxrBridge() {
       && lighting_results[34].debug_color[2] == 0.f
       && std::abs(lighting_results[35].debug_color[0] - 0.05f) < 1e-6f
       && std::abs(lighting_results[35].debug_color[1] - 0.04f) < 1e-6f
-      && lighting_results[42].debug_color[0] == 0.05f && lighting_results[42].debug_color[1] == 0.05f
-      && lighting_results[42].debug_color[2] == 0.05f
-      && lighting_results[43].debug_color[0] == 0.05f && lighting_results[43].debug_color[1] == 0.0f
-      && lighting_results[43].debug_color[2] == 0.05f
-      && lighting_results[44].debug_color[0] == 0.05f && lighting_results[44].debug_color[1] == 0.02f
-      && lighting_results[45].debug_color[0] == 0.05f && lighting_results[45].debug_color[1] == 0.005f
-      && lighting_results[46].debug_color[1] == 0.02f && lighting_results[46].debug_color[2] == 0.05f
-      && lighting_results[47].debug_color[0] == 0.05f && lighting_results[47].debug_color[1] == 0.04f
-      && lighting_results[48].debug_color[0] == 0.03f && lighting_results[48].debug_color[2] == 0.05f
-      && lighting_results[49].debug_color[0] == 0.05f && lighting_results[49].debug_color[1] == 0.04f
+      && std::abs(lighting_results[42].debug_color[0] - 0.05f) < 1e-6f && std::abs(lighting_results[42].debug_color[1] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[42].debug_color[2] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[43].debug_color[0] - 0.05f) < 1e-6f && lighting_results[43].debug_color[1] == 0.0f
+      && std::abs(lighting_results[43].debug_color[2] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[44].debug_color[0] - 0.05f) < 1e-6f && std::abs(lighting_results[44].debug_color[1] - 0.02f) < 1e-6f
+      && std::abs(lighting_results[45].debug_color[0] - 0.05f) < 1e-6f && std::abs(lighting_results[45].debug_color[1] - 0.005f) < 1e-6f
+      && std::abs(lighting_results[46].debug_color[1] - 0.02f) < 1e-6f && std::abs(lighting_results[46].debug_color[2] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[47].debug_color[0] - 0.05f) < 1e-6f && std::abs(lighting_results[47].debug_color[1] - 0.04f) < 1e-6f
+      && std::abs(lighting_results[48].debug_color[0] - 0.03f) < 1e-6f && std::abs(lighting_results[48].debug_color[2] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[49].debug_color[0] - 0.05f) < 1e-6f && std::abs(lighting_results[49].debug_color[1] - 0.04f) < 1e-6f
       && std::abs(lighting_results[50].debug_color[0]
                   - std::log2(4.25f) / std::log2(65505.0f) * 0.05f) < 1e-6f
       && lighting_results[50].debug_color[0] == lighting_results[50].debug_color[1]
       && lighting_results[50].debug_color[1] == lighting_results[50].debug_color[2]
-      && lighting_results[51].debug_color[0] == 0.05f && lighting_results[51].debug_color[2] == 0.05f
+      && std::abs(lighting_results[51].debug_color[0] - 0.05f) < 1e-6f && std::abs(lighting_results[51].debug_color[2] - 0.05f) < 1e-6f
       && lighting_results[52].debug_color[0] == 0.0f && lighting_results[52].debug_color[1] == 0.0f
       && lighting_results[52].debug_color[2] == 0.0f
       && lighting_results[29].debug_packed_distance[0] == 3.25f

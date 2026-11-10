@@ -169,8 +169,9 @@ float3 RtxdiDebugValueColor(uint view, uint2 pixel, bool status_bound, uint stat
   }
   if (view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY) {
     if (!sun_bound) return RtxdiDebugUnavailable(pixel);
-    if (sun_status == RTXDI_SUN_STATUS_VISIBLE) return float3(1.0, 1.0, 1.0) * 0.05;
-    if (sun_status == RTXDI_SUN_STATUS_BLOCKED) return 0.0;
+    if ((sun_status & ~0xFFFu) != 0u) return float3(1.0, 0.8, 0.0) * 0.05;
+    if ((sun_status & 0xFFu) == RTXDI_SUN_STATUS_VISIBLE) return (((sun_status >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) != 0u ? float3(0.0, 1.0, 0.0) : float3(1.0, 1.0, 1.0)) * 0.05;
+    if ((sun_status & 0xFFu) == RTXDI_SUN_STATUS_BLOCKED) return 0.0;
     return float3(1.0, 0.8, 0.0) * 0.05;
   }
   return RtxdiDebugUnavailable(pixel);
