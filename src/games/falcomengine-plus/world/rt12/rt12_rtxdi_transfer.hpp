@@ -19,6 +19,7 @@ struct Rt12DiInputViews {
   rtxdi::SceneRangeCapture* scene_tracker = nullptr;
   uint64_t capture_frame = UINT64_MAX;
   uint32_t frame = UINT32_MAX, width = 0u, height = 0u;
+  uint32_t effective_debug_view = RTXDI_DEBUG_VIEW_OFF;
   std::array<float, 7> n1_brdf_config = {};
   rtxdi::EffectiveRtxdiSettings effective_settings = {};
   int32_t scene_slot = -1;
@@ -1132,6 +1133,9 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                                .operation = rtxdi::DiagnosticOperation::Retire});
     }
     slot.output_staged = false;
+#if defined(FALCOM_NRD_ENABLED)
+    slot.debug_distance_identity = {};
+#endif
 #if defined(FALCOM_NRD_ENABLED)
     slot.nrd_diffuse_staged = false;
     slot.nrd_diffuse_identity = {};
@@ -2700,6 +2704,168 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     } else {
       hitdistance_recorded = false;
     }
+    const uint32_t debug_view = in.effective_debug_view;
+    const bool distance_debug_requested = RtxdiDebugDistanceExportRequested(debug_view);
+    slot.debug_distance_identity.recorded = false;
+    slot.debug_distance_identity.staged = false;
+    slot.debug_distance_identity.requested_view = debug_view;
+    if (distance_debug_requested && hitdistance_recorded && nrd_slot.hit_distance && nrd_slot.hit_validity
+        && slot.n1_status.texture12 && in.width != 0u && in.height != 0u
+        && uint64_t{in.width} * in.height <= UINT32_MAX) {
+#if defined(__world_rtxdi_debug_distance_EMBED_FILE)
+      if (!transfer.debug_distance_root || !transfer.debug_distance_pso) {
+        D3D12_DESCRIPTOR_RANGE debug_ranges[2] = {};
+        debug_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        debug_ranges[0].NumDescriptors = 3u;
+        debug_ranges[0].BaseShaderRegister = 0u;
+        debug_ranges[0].OffsetInDescriptorsFromTableStart = 0u;
+        debug_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        debug_ranges[1].NumDescriptors = 1u;
+        debug_ranges[1].BaseShaderRegister = 0u;
+        debug_ranges[1].OffsetInDescriptorsFromTableStart = 0u;
+        D3D12_ROOT_PARAMETER debug_parameters[3] = {};
+        debug_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        debug_parameters[0].Constants.ShaderRegister = 0u;
+        debug_parameters[0].Constants.Num32BitValues = 3u;
+        debug_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        debug_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        debug_parameters[1].DescriptorTable.NumDescriptorRanges = 1u;
+        debug_parameters[1].DescriptorTable.pDescriptorRanges = &debug_ranges[0];
+        debug_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        debug_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        debug_parameters[2].DescriptorTable.NumDescriptorRanges = 1u;
+        debug_parameters[2].DescriptorTable.pDescriptorRanges = &debug_ranges[1];
+        debug_parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC debug_desc = {};
+        debug_desc.NumParameters = static_cast<UINT>(std::size(debug_parameters));
+        debug_desc.pParameters = debug_parameters;
+        ComPtr<ID3DBlob> debug_blob, debug_errors;
+        ComPtr<ID3D12RootSignature> debug_root;
+        ComPtr<ID3D12PipelineState> debug_pso;
+        HRESULT debug_hr = s.serialize(&debug_desc, D3D_ROOT_SIGNATURE_VERSION_1, &debug_blob, &debug_errors);
+        if (SUCCEEDED(debug_hr)) {
+          debug_hr = s.device12->CreateRootSignature(0u, debug_blob->GetBufferPointer(), debug_blob->GetBufferSize(),
+                                                     IID_PPV_ARGS(&debug_root));
+        }
+        if (SUCCEEDED(debug_hr)) {
+          D3D12_COMPUTE_PIPELINE_STATE_DESC debug_pipeline = {};
+          debug_pipeline.pRootSignature = debug_root.Get();
+          debug_pipeline.CS = {__world_rtxdi_debug_distance.data(), __world_rtxdi_debug_distance.size()};
+          debug_hr = s.device12->CreateComputePipelineState(&debug_pipeline, IID_PPV_ARGS(&debug_pso));
+        }
+        if (SUCCEEDED(debug_hr)) {
+          transfer.debug_distance_root = std::move(debug_root);
+          transfer.debug_distance_pso = std::move(debug_pso);
+        }
+      }
+      if (transfer.debug_distance_root && transfer.debug_distance_pso) {
+        const uint64_t pixel_count = uint64_t{in.width} * in.height;
+        if (!slot.nrd_debug_distance.texture12 || slot.nrd_debug_distance.width != in.width
+            || slot.nrd_debug_distance.height != in.height) {
+          Rt12Shared debug_candidate;
+          const HRESULT debug_texture_hr = CreateRt12Shared(s, device, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                                            in.width, in.height, 1u, true, &debug_candidate);
+          if (SUCCEEDED(debug_texture_hr)) {
+            RetireShared(s, slot.nrd_debug_distance, slot.output_b_fence);
+            slot.nrd_debug_distance = std::move(debug_candidate);
+          }
+        }
+        if (slot.nrd_debug_distance.texture12) {
+          if (!nrd_slot.debug_distance_descriptors || nrd_slot.hitdistance_width != in.width
+              || nrd_slot.hitdistance_height != in.height) {
+            D3D12_DESCRIPTOR_HEAP_DESC debug_heap_desc = {};
+            debug_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            debug_heap_desc.NumDescriptors = 4u;
+            debug_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            ComPtr<ID3D12DescriptorHeap> debug_heap;
+            if (SUCCEEDED(s.device12->CreateDescriptorHeap(&debug_heap_desc, IID_PPV_ARGS(&debug_heap)))) {
+              nrd_slot.debug_distance_descriptors = std::move(debug_heap);
+            }
+          }
+          if (nrd_slot.debug_distance_descriptors) {
+            ID3D12Device* device12 = s.device12.Get();
+            ID3D12GraphicsCommandList* di_list = transfer.di_list.Get();
+            const UINT descriptor_stride = device12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            const D3D12_CPU_DESCRIPTOR_HANDLE cpu = nrd_slot.debug_distance_descriptors->GetCPUDescriptorHandleForHeapStart();
+            const D3D12_GPU_DESCRIPTOR_HANDLE gpu = nrd_slot.debug_distance_descriptors->GetGPUDescriptorHandleForHeapStart();
+            const auto cpu_at = [&](uint32_t index) {
+              return D3D12_CPU_DESCRIPTOR_HANDLE{cpu.ptr + static_cast<SIZE_T>(index) * descriptor_stride};
+            };
+            const D3D12_SHADER_RESOURCE_VIEW_DESC status_srv = Rt12TextureSrv(DXGI_FORMAT_R32_UINT);
+            device12->CreateShaderResourceView(slot.n1_status.texture12.Get(), &status_srv, cpu_at(0u));
+            D3D12_SHADER_RESOURCE_VIEW_DESC hit_srv = {};
+            hit_srv.Format = DXGI_FORMAT_UNKNOWN;
+            hit_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            hit_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            hit_srv.Buffer.NumElements = static_cast<UINT>(pixel_count);
+            hit_srv.Buffer.StructureByteStride = sizeof(float);
+            device12->CreateShaderResourceView(nrd_slot.hit_distance.Get(), &hit_srv, cpu_at(1u));
+            hit_srv.Buffer.StructureByteStride = sizeof(uint32_t);
+            device12->CreateShaderResourceView(nrd_slot.hit_validity.Get(), &hit_srv, cpu_at(2u));
+            D3D12_UNORDERED_ACCESS_VIEW_DESC debug_uav = {};
+            debug_uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            debug_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            device12->CreateUnorderedAccessView(slot.nrd_debug_distance.texture12.Get(), nullptr, &debug_uav, cpu_at(3u));
+
+            std::array<D3D12_RESOURCE_BARRIER, 4u> debug_barriers = {};
+            debug_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            debug_barriers[0].Transition.pResource = slot.n1_status.texture12.Get();
+            debug_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            debug_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            debug_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            for (uint32_t index = 0u; index < 2u; ++index) {
+              D3D12_RESOURCE_BARRIER& barrier = debug_barriers[index + 1u];
+              barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+              barrier.Transition.pResource = index == 0u ? nrd_slot.hit_distance.Get() : nrd_slot.hit_validity.Get();
+              barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+              barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+              barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            }
+            debug_barriers[3].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            debug_barriers[3].Transition.pResource = slot.nrd_debug_distance.texture12.Get();
+            debug_barriers[3].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            debug_barriers[3].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            debug_barriers[3].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            di_list->ResourceBarrier(static_cast<UINT>(debug_barriers.size()), debug_barriers.data());
+            ID3D12DescriptorHeap* debug_heaps[] = {nrd_slot.debug_distance_descriptors.Get()};
+            di_list->SetDescriptorHeaps(1u, debug_heaps);
+            di_list->SetComputeRootSignature(transfer.debug_distance_root.Get());
+            di_list->SetPipelineState(transfer.debug_distance_pso.Get());
+            const std::array<uint32_t, 3u> debug_constants = {in.width, in.height, static_cast<uint32_t>(pixel_count)};
+            di_list->SetComputeRoot32BitConstants(0u, static_cast<UINT>(debug_constants.size()), debug_constants.data(), 0u);
+            di_list->SetComputeRootDescriptorTable(1u, gpu);
+            di_list->SetComputeRootDescriptorTable(2u, {gpu.ptr + static_cast<UINT64>(3u) * descriptor_stride});
+            di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
+            debug_barriers = {};
+            debug_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            debug_barriers[0].UAV.pResource = slot.nrd_debug_distance.texture12.Get();
+            debug_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            debug_barriers[1].Transition.pResource = slot.n1_status.texture12.Get();
+            debug_barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            debug_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            debug_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            for (uint32_t index = 0u; index < 2u; ++index) {
+              D3D12_RESOURCE_BARRIER& barrier = debug_barriers[index + 2u];
+              barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+              barrier.Transition.pResource = index == 0u ? nrd_slot.hit_distance.Get() : nrd_slot.hit_validity.Get();
+              barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+              barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+              barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+            }
+            di_list->ResourceBarrier(static_cast<UINT>(debug_barriers.size()), debug_barriers.data());
+            debug_barriers = {};
+            debug_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            debug_barriers[0].Transition.pResource = slot.nrd_debug_distance.texture12.Get();
+            debug_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            debug_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            debug_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+            di_list->ResourceBarrier(1u, debug_barriers.data());
+            slot.debug_distance_identity.recorded = true;
+          }
+        }
+      }
+#endif
+    }
     nrd_dispatch_recorded = hitdistance_recorded
                             && RecordNrdDenoise(s, slot, in, in.effective_settings, &nrd_accepted_history);
     slot.nrd.diffuse_publication_recorded = false;
@@ -2843,6 +3009,21 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   slot.output_staged = true;
   slot.n1_staged = n1_ready;
 #if defined(FALCOM_NRD_ENABLED)
+  if (slot.debug_distance_identity.recorded) {
+    slot.debug_distance_identity.frame = in.frame;
+    slot.debug_distance_identity.width = in.width;
+    slot.debug_distance_identity.height = in.height;
+    slot.debug_distance_identity.n1_configuration_version = slot.n1_configuration_version;
+    slot.debug_distance_identity.scene_slot = in.scene_slot;
+    slot.debug_distance_identity.transfer_slot = input.transfer_slot;
+    slot.debug_distance_identity.owner_generation = s.generation;
+    slot.debug_distance_identity.transfer_configuration = transfer.configuration_generation;
+    slot.debug_distance_identity.di_configuration = s.di.configuration_generation;
+    slot.debug_distance_identity.settings_identity = in.effective_settings.identity;
+    slot.debug_distance_identity.producer_fence_b = di_fence;
+    slot.debug_distance_identity.n1_brdf_config = slot.n1_brdf_config;
+    slot.debug_distance_identity.staged = true;
+  }
   slot.nrd_diffuse_staged = nrd_dispatch_recorded && slot.nrd.diffuse_publication_recorded
                             && slot.nrd_diffuse_publication.srv11.handle != 0u;
   slot.nrd_diffuse_identity = {};

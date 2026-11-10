@@ -1,4 +1,6 @@
+#include "../../rtxdi/rtxdi_di_layout.h"
 #include "../rt12_nrd.hpp"
+#include "world_rtxdi_debug_distance.h"
 #include "world_rtxdi_nrd_prep.h"
 #include "world_rtxdi_nrd_probe.h"
 #include "world_rtxdi_nrd_publish.h"
@@ -1133,6 +1135,229 @@ bool RunN1PrepRelaxSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12
   return true;
 }
 
+bool RunDebugDistanceExportSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fence* fence,
+                                 ID3D12InfoQueue* info_queue, uint64_t* fence_value) {
+  using namespace falcom_world::rt12;
+  constexpr uint32_t width = 13u, height = 9u, pixel_count = width * height;
+  if (device == nullptr || queue == nullptr || fence == nullptr || info_queue == nullptr || fence_value == nullptr) {
+    return false;
+  }
+  Rt12NrdSlot staging_slot;
+  Rt12NrdTexture status_texture;
+  Rt12NrdTexture output_texture;
+  if (!NrdCreateTexture(device, width, height, DXGI_FORMAT_R32_UINT, false, &status_texture)
+      || !NrdCreateTexture(device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &output_texture)) return false;
+  status_texture.state = D3D12_RESOURCE_STATE_COMMON;
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ComPtr<ID3D12GraphicsCommandList> list;
+  if (!Check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
+             "create debug distance allocator")
+      || !Check(device->CreateCommandList(0u, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                          IID_PPV_ARGS(&list)),
+                "create debug distance list")) return false;
+  std::vector<uint8_t> status_bytes(static_cast<size_t>(pixel_count) * sizeof(uint32_t), 0u);
+  std::vector<float> distances(pixel_count, 0.0f);
+  std::vector<uint32_t> flags(pixel_count, 0u);
+  const std::array<uint32_t, 8u> status_cases = {
+      RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT,
+      RTXDI_N1_STATUS_BLOCKED | RTXDI_N1_STATUS_KNOWN_BIT | RTXDI_N1_STATUS_CHARACTER_BIT,
+      RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT,
+      RTXDI_N1_STATUS_BLOCKED | RTXDI_N1_STATUS_KNOWN_BIT | RTXDI_N1_STATUS_CHARACTER_BIT,
+      RTXDI_N1_STATUS_UNKNOWN,
+      RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT,
+      RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT,
+      RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT,
+  };
+  const std::array<float, 8u> distance_cases = {3.251f, 3.25f, 65504.0f, 65504.0f,
+                                                1.0f, std::numeric_limits<float>::quiet_NaN(), -1.0f, 4.0f};
+  const std::array<uint32_t, 8u> flag_cases = {1u, 3u, 5u, 7u, 1u, 1u, 1u, 3u};
+  for (uint32_t pixel = 0u; pixel < pixel_count; ++pixel) {
+    const uint32_t scenario = pixel % static_cast<uint32_t>(status_cases.size());
+    std::memcpy(status_bytes.data() + static_cast<size_t>(pixel) * sizeof(uint32_t),
+                &status_cases[scenario], sizeof(uint32_t));
+    distances[pixel] = distance_cases[scenario];
+    flags[pixel] = flag_cases[scenario];
+  }
+  if (!NrdUploadTexture(device, list.Get(), &staging_slot, &status_texture, status_bytes)) return false;
+
+  ComPtr<ID3D12Resource> distance_buffer, flag_buffer, output_readback;
+  const uint64_t buffer_bytes = uint64_t{pixel_count} * sizeof(uint32_t);
+  if (!NrdCreateUploadBuffer(device, buffer_bytes, &distance_buffer)
+      || !NrdCreateUploadBuffer(device, buffer_bytes, &flag_buffer)) return false;
+  D3D12_RANGE no_read = {0u, 0u};
+  void* mapped = nullptr;
+  if (!Check(distance_buffer->Map(0u, &no_read, &mapped), "map debug distance input")) return false;
+  std::memcpy(mapped, distances.data(), static_cast<size_t>(pixel_count) * sizeof(float));
+  distance_buffer->Unmap(0u, nullptr);
+  if (!Check(flag_buffer->Map(0u, &no_read, &mapped), "map debug flags input")) return false;
+  std::memcpy(mapped, flags.data(), static_cast<size_t>(pixel_count) * sizeof(uint32_t));
+  flag_buffer->Unmap(0u, nullptr);
+
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  heap_desc.NumDescriptors = 4u;
+  heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> descriptors;
+  if (!Check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&descriptors)), "create debug distance heap")) {
+    return false;
+  }
+  const UINT descriptor_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  const D3D12_CPU_DESCRIPTOR_HANDLE cpu = descriptors->GetCPUDescriptorHandleForHeapStart();
+  const D3D12_GPU_DESCRIPTOR_HANDLE gpu = descriptors->GetGPUDescriptorHandleForHeapStart();
+  const auto cpu_at = [&](uint32_t index) {
+    return D3D12_CPU_DESCRIPTOR_HANDLE{cpu.ptr + static_cast<SIZE_T>(index) * descriptor_stride};
+  };
+  D3D12_SHADER_RESOURCE_VIEW_DESC status_srv = {};
+  status_srv.Format = DXGI_FORMAT_R32_UINT;
+  status_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  status_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  status_srv.Texture2D.MipLevels = 1u;
+  device->CreateShaderResourceView(status_texture.resource.Get(), &status_srv, cpu_at(0u));
+  for (uint32_t index = 0u; index < 2u; ++index) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC buffer_srv = {};
+    buffer_srv.Format = DXGI_FORMAT_UNKNOWN;
+    buffer_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    buffer_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    buffer_srv.Buffer.NumElements = pixel_count;
+    buffer_srv.Buffer.StructureByteStride = sizeof(uint32_t);
+    device->CreateShaderResourceView(index == 0u ? distance_buffer.Get() : flag_buffer.Get(), &buffer_srv,
+                                     cpu_at(index + 1u));
+  }
+  D3D12_UNORDERED_ACCESS_VIEW_DESC output_uav = {};
+  output_uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  output_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  device->CreateUnorderedAccessView(output_texture.resource.Get(), nullptr, &output_uav, cpu_at(3u));
+
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[0].NumDescriptors = 3u;
+  ranges[0].BaseShaderRegister = 0u;
+  ranges[0].OffsetInDescriptorsFromTableStart = 0u;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  ranges[1].NumDescriptors = 1u;
+  ranges[1].BaseShaderRegister = 0u;
+  ranges[1].OffsetInDescriptorsFromTableStart = 0u;
+  D3D12_ROOT_PARAMETER parameters[3] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[0].Constants.ShaderRegister = 0u;
+  parameters[0].Constants.Num32BitValues = 3u;
+  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[1].DescriptorTable.NumDescriptorRanges = 1u;
+  parameters[1].DescriptorTable.pDescriptorRanges = &ranges[0];
+  parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[2].DescriptorTable.NumDescriptorRanges = 1u;
+  parameters[2].DescriptorTable.pDescriptorRanges = &ranges[1];
+  parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = static_cast<UINT>(std::size(parameters));
+  root_desc.pParameters = parameters;
+  ComPtr<ID3DBlob> root_blob, root_errors;
+  if (!Check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &root_blob, &root_errors),
+             "serialize debug distance root")) return false;
+  ComPtr<ID3D12RootSignature> root;
+  if (!Check(device->CreateRootSignature(0u, root_blob->GetBufferPointer(), root_blob->GetBufferSize(),
+                                         IID_PPV_ARGS(&root)),
+             "create debug distance root")) return false;
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc = {};
+  pso_desc.pRootSignature = root.Get();
+  pso_desc.CS = {__world_rtxdi_debug_distance.data(), __world_rtxdi_debug_distance.size()};
+  ComPtr<ID3D12PipelineState> pso;
+  if (!Check(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso)), "create debug distance PSO")) {
+    return false;
+  }
+  const D3D12_RESOURCE_DESC output_desc = output_texture.resource->GetDesc();
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  UINT rows = 0u;
+  UINT64 row_bytes = 0u, total_bytes = 0u;
+  device->GetCopyableFootprints(&output_desc, 0u, 1u, 0u, &footprint, &rows, &row_bytes, &total_bytes);
+  if (!NrdCreateReadbackBuffer(device, total_bytes, &output_readback)) return false;
+
+  std::vector<D3D12_RESOURCE_BARRIER> barriers;
+  NrdTransition(list.Get(), &status_texture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &barriers);
+  if (!barriers.empty()) list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  D3D12_RESOURCE_BARRIER output_transition = {};
+  output_transition.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  output_transition.Transition.pResource = output_texture.resource.Get();
+  output_transition.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  output_transition.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+  output_transition.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  list->ResourceBarrier(1u, &output_transition);
+  ID3D12DescriptorHeap* heaps[] = {descriptors.Get()};
+  list->SetDescriptorHeaps(1u, heaps);
+  list->SetComputeRootSignature(root.Get());
+  list->SetPipelineState(pso.Get());
+  const std::array<uint32_t, 3u> constants = {width, height, pixel_count - 1u};
+  list->SetComputeRoot32BitConstants(0u, static_cast<UINT>(constants.size()), constants.data(), 0u);
+  list->SetComputeRootDescriptorTable(1u, gpu);
+  list->SetComputeRootDescriptorTable(2u, {gpu.ptr + static_cast<UINT64>(3u) * descriptor_stride});
+  list->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
+  D3D12_RESOURCE_BARRIER output_uav_barrier = {};
+  output_uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  output_uav_barrier.UAV.pResource = output_texture.resource.Get();
+  list->ResourceBarrier(1u, &output_uav_barrier);
+  barriers.clear();
+  NrdTransition(list.Get(), &status_texture, D3D12_RESOURCE_STATE_COMMON, &barriers);
+  if (!barriers.empty()) list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  output_transition.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  output_transition.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  list->ResourceBarrier(1u, &output_transition);
+  D3D12_TEXTURE_COPY_LOCATION source = {};
+  source.pResource = output_texture.resource.Get();
+  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_TEXTURE_COPY_LOCATION destination = {};
+  destination.pResource = output_readback.Get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  destination.PlacedFootprint = footprint;
+  list->CopyTextureRegion(&destination, 0u, 0u, 0u, &source, nullptr);
+  output_transition.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  output_transition.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+  list->ResourceBarrier(1u, &output_transition);
+  if (!Check(list->Close(), "close debug distance list")) return false;
+  ID3D12CommandList* lists[] = {list.Get()};
+  queue->ExecuteCommandLists(1u, lists);
+  if (!NrdWaitForFence(queue, fence, ++*fence_value)) return false;
+  void* readback = nullptr;
+  const D3D12_RANGE read_range = {0u, static_cast<SIZE_T>(output_readback->GetDesc().Width)};
+  if (!Check(output_readback->Map(0u, &read_range, &readback), "map debug distance readback")) return false;
+  const uint8_t* bytes = static_cast<const uint8_t*>(readback);
+  bool valid = rows == height && row_bytes >= static_cast<UINT64>(width) * 8u;
+  for (uint32_t y = 0u; y < height && valid; ++y) {
+    const auto* row = reinterpret_cast<const uint16_t*>(bytes + footprint.Offset
+                                                        + static_cast<size_t>(y) * footprint.Footprint.RowPitch);
+    for (uint32_t x = 0u; x < width; ++x) {
+      const uint32_t pixel = y * width + x;
+      const uint32_t scenario = pixel % static_cast<uint32_t>(status_cases.size());
+      const float r = NrdHalfToFloat(row[x * 4u]);
+      const float g = NrdHalfToFloat(row[x * 4u + 1u]);
+      const float b = NrdHalfToFloat(row[x * 4u + 2u]);
+      const float a = NrdHalfToFloat(row[x * 4u + 3u]);
+      const bool expected_valid = pixel < pixel_count - 1u && scenario < 4u;
+      const float expected_r = expected_valid ? (scenario == 0u ? 3.25f : distance_cases[scenario]) : 0.0f;
+      const float expected_g = expected_valid ? static_cast<float>(flag_cases[scenario]) : 0.0f;
+      if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b) || !std::isfinite(a)
+          || std::abs(r - expected_r) > 0.001f || g != expected_g || b != 0.0f || a != 1.0f) {
+        std::fprintf(stderr, "FAIL N4c distance export pixel=%u rgba=(%g,%g,%g,%g) expected=(%g,%g,0,1)\n",
+                     pixel, r, g, b, a, expected_r, expected_g);
+        valid = false;
+        break;
+      }
+    }
+  }
+  const D3D12_RANGE no_write = {0u, 0u};
+  output_readback->Unmap(0u, &no_write);
+  const UINT64 messages = info_queue->GetNumStoredMessagesAllowedByRetrievalFilter();
+  if (!valid || messages != 0u) {
+    std::fprintf(stderr, "FAIL N4c distance export valid=%u InfoQueue=%llu\n", valid ? 1u : 0u,
+                 static_cast<unsigned long long>(messages));
+    return false;
+  }
+  std::printf("PASS N4c distance export shader odd-size readback valid/character/certified-miss/invalid/FP16/bounds (%ux%u), InfoQueue=0\n",
+              width, height);
+  return true;
+}
+
 bool RunCameraProbeSmoke(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12InfoQueue* info_queue) {
   using namespace falcom_world::rt12;
   constexpr uint32_t width = 64u, height = 36u, sample_count = 32u * 18u;
@@ -1618,6 +1843,8 @@ bool RunDispatchDescriptionSmoke() {
     std::fprintf(stderr, "FAIL N1 prep + RELAX diffuse-only chain\n");
     return false;
   }
+  info_queue->ClearStoredMessages();
+  if (!RunDebugDistanceExportSmoke(device.Get(), queue.Get(), fence.Get(), info_queue.Get(), &fence_value)) return false;
   const auto execute_frame = [&](uint32_t width, uint32_t height, uint32_t frame_index,
                                  nrd::AccumulationMode accumulation_mode,
                                  Rt12NrdSlot* frame_slot, Rt12NrdResourcePools* frame_pools) {
@@ -1746,6 +1973,11 @@ bool RunHistoryIdentityContracts() {
   std::printf("PASS NRD history identity/gap/resize/owner/generation/config/device-reset contracts\n");
   const std::array<float, 7u> n1_settings = {1.f, 0.5f, 1.f, 0.75f, 8.f, 0.02f, 0.9f};
   const uint64_t n1_identity = Rt12NrdN1ConfigurationIdentity(1u, n1_settings);
+  const uint32_t candidates_before = 8u;
+  const uint32_t candidates_after = 16u;
+  if (candidates_before == candidates_after
+      || Rt12NrdN1ConfigurationIdentity(1u, n1_settings) != n1_identity
+      || Rt12NrdN1ConfigurationIdentity(2u, n1_settings) == n1_identity) return false;
   const uint64_t nrd_identity = Rt12NrdConfigurationIdentity(4u, 7u, 11u, 0u);
   const Rt12NrdDiffusePublicationIdentity publication = {
       .owner_generation = 8u,
@@ -1793,6 +2025,7 @@ bool RunHistoryIdentityContracts() {
   auto changed_n1_settings = n1_settings;
   changed_n1_settings[3] += 0.01f;
   if (Rt12NrdN1ConfigurationIdentity(1u, changed_n1_settings) == n1_identity) return false;
+  std::printf("PASS N1 identity tracks only N1 version/BRDF; RTXDI sample quality changes remain separate\n");
   std::printf("PASS N3c publication frame/owner/config/N1-BRDF/NRD/size/scene/slot/B-fence acceptance identity\n");
   return true;
 }

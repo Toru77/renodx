@@ -76,6 +76,7 @@ struct Rt12NrdSlot {
   ComPtr<ID3D12DescriptorHeap> prep_descriptors;
   ComPtr<ID3D12DescriptorHeap> publication_descriptors;
   ComPtr<ID3D12Resource> publication_constants;
+  ComPtr<ID3D12DescriptorHeap> debug_distance_descriptors;
   ComPtr<ID3D12DescriptorHeap> hitdistance_descriptors;
   ComPtr<ID3D12Resource> prep_constants;
   ComPtr<ID3D12Resource> prep_diffuse;

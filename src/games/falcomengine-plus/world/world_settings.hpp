@@ -28,6 +28,7 @@
 #include "rtls/rtls_panel.hpp"
 #include "rtsun/rtsun_panel.hpp"
 #include "rtxdi/rtxdi_config.hpp"
+#include "rtxdi/rtxdi_debug_layout.h"
 #include "rtxdi/rtxdi_diagnostics.hpp"
 #include "rtxdi/rtxdi_state.hpp"
 #include "world_state.hpp"
@@ -993,6 +994,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "",
+      .binding = &rtxdi::g_debug_view,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = static_cast<float>(RTXDI_DEBUG_VIEW_OFF),
+      .label = "RTXDI Debug View",
+      .section = "RTXDI",
+      .tooltip = "Session only. Observes current RTXDI signals; unavailable sources use a checker. It does not enable sampling or change lighting settings.",
+      .labels = {"Off", "Local status", "Receiver class", "Selected light/type", "Raw diffuse", "Filtered diffuse", "Distance validity", "Distance magnitude", "Consumer selection", "Sun visibility"},
+      .min = static_cast<float>(RTXDI_DEBUG_VIEW_OFF),
+      .max = static_cast<float>(RTXDI_DEBUG_VIEW_SUN_VISIBILITY),
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiScenePrepStatus",
       .value_type = SettingValueType::CUSTOM,
       .can_reset = false,
@@ -1044,6 +1058,24 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                     sun.output_bound ? "yes" : "no", sun.lighting_draw_seen ? "yes" : "no",
                     static_cast<unsigned long long>(sun.fence_b), static_cast<unsigned long long>(sun.fence_c),
                     static_cast<unsigned int>(sun.error));
+        rtxdi::DebugSnapshot debug;
+        {
+          std::shared_lock lock(rtxdi::g_debug.mutex);
+          debug = rtxdi::g_debug.snapshot;
+        }
+        const bool bvh_active = bvh::g_bvh_debug.mode.load(std::memory_order_relaxed) != 0;
+        const auto presentation_owner =
+            ResolveRtxdiDebugPresentationOwner(debug.requested_view, bvh_active);
+        const char* presentation_label = "lighting image has pixel precedence";
+        if (presentation_owner == RtxdiDebugPresentationOwner::Bvh) {
+          presentation_label = "superseded by BVH";
+        } else if (presentation_owner == RtxdiDebugPresentationOwner::Rtxdi) {
+          presentation_label = "RTXDI view has pixel precedence";
+        }
+        ImGui::Text("Debug view: requested %u effective %u | source %s reason %u | frame %u | scene %d transfer %d | %ux%u | %s",
+                    debug.requested_view, debug.effective_view, debug.source_ready ? "ready" : "unavailable",
+                    debug.rejection_reason, debug.frame, debug.scene_slot, debug.transfer_slot, debug.width,
+                    debug.height, presentation_label);
         return false;
       },
       .is_visible = visible,
@@ -1091,6 +1123,11 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           std::shared_lock lock(rtxdi::g_sun.mutex);
           sun = rtxdi::g_sun.snapshot;
         }
+        rtxdi::DebugSnapshot debug;
+        {
+          std::shared_lock lock(rtxdi::g_debug.mutex);
+          debug = rtxdi::g_debug.snapshot;
+        }
         if (logging) {
           rtxdi::DiagnosticSummary summary = {};
           summary.frame = di.frame != UINT32_MAX ? di.frame : input.attempted_frame;
@@ -1133,6 +1170,20 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           summary.input_stage = static_cast<uint32_t>(input.stage);
           summary.di_status = static_cast<uint32_t>(di.status);
           summary.sun_status = static_cast<uint32_t>(sun.status);
+          summary.debug_requested_view = debug.requested_view;
+          summary.debug_effective_view = debug.effective_view;
+          summary.debug_source_ready = debug.source_ready ? 1u : 0u;
+          summary.debug_rejection_reason = debug.rejection_reason;
+          summary.debug_observed_frame = debug.frame;
+          summary.debug_width = debug.width;
+          summary.debug_height = debug.height;
+          summary.debug_scene_slot = debug.scene_slot >= 0 ? static_cast<uint32_t>(debug.scene_slot) : UINT32_MAX;
+          summary.debug_transfer_slot = debug.transfer_slot >= 0 ? static_cast<uint32_t>(debug.transfer_slot) : UINT32_MAX;
+          summary.debug_owner_generation = debug.owner_generation;
+          summary.debug_transfer_configuration = debug.transfer_configuration;
+          summary.debug_di_configuration = debug.di_configuration;
+          summary.debug_n1_configuration = debug.n1_configuration;
+          summary.debug_superseded_by_bvh = debug.superseded_by_bvh ? 1u : 0u;
           summary.publication_status = static_cast<uint32_t>(di.output_staged);
           summary.binding_status = static_cast<uint32_t>(di.output_bound);
           summary.rr_requested = rr::RrRequested() ? 1u : 0u;

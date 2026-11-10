@@ -173,6 +173,8 @@ StructuredBuffer<LightIndexData> lightIndices_g : register(t12);
 Texture2D<uint4> rtxdiResolvedLocal_g : register(t41);
 Texture2D<uint> rtxdiSunVisibility_g : register(t42);
 Texture2D<float4> rtxdiDenoisedDiffuse_g : register(t43);
+Texture2D<float4> rtxdiDebugValue_g : register(t44);
+Texture2D<uint> rtxdiDebugStatus_g : register(t45);
 StructuredBuffer<float4x4> spotShadowMatrices_g : register(t14);
 TextureCube<float4> texEnvMap_g : register(t17);
 TextureCube<float4> dynCubeHistPosTex : register(t29);  // dynamic cube history world pos (.a = capture validity)
@@ -219,6 +221,7 @@ Texture2D<float4> rtsunTexture : register(t39);
 #define RTLS_FLAG_CHARACTER 64u
 
 #include "../../shared.h"
+#include "../../world/shaders/world_rtxdi_debug.hlsli"
 #include "../../shadows/shadows_common.hlsli"
 #include "../../dyncube/dyncube_sample.hlsli"
 #include "../../dyncube/dyncube_resolve.hlsli"
@@ -227,6 +230,69 @@ Texture2D<float4> rtsunTexture : register(t39);
 
 // 3Dmigoto declarations
 #define cmp -
+
+float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
+{
+  const uint view = (uint)shader_injection_data.rtxdi_debug_view;
+  if (view == RTXDI_DEBUG_VIEW_OFF) return 0.0;
+
+  uint status_width, status_height;
+  uint status_word = RTXDI_N1_STATUS_INVALID;
+  bool status_bound = false;
+  const bool needs_status = view == RTXDI_DEBUG_VIEW_LOCAL_STATUS || view == RTXDI_DEBUG_VIEW_RECEIVER_CLASS
+                            || view == RTXDI_DEBUG_VIEW_RAW_DIFFUSE || view == RTXDI_DEBUG_VIEW_FILTERED_DIFFUSE
+                            || view == RTXDI_DEBUG_VIEW_DISTANCE_VALIDITY
+                            || view == RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE;
+  if (needs_status && shader_injection_data.rtxdi_debug_bound > 0.5f) {
+    rtxdiDebugStatus_g.GetDimensions(status_width, status_height);
+    status_bound = pixel.x < status_width && pixel.y < status_height;
+    if (status_bound) status_word = rtxdiDebugStatus_g.Load(int3(pixel, 0));
+  }
+
+  uint value_width, value_height;
+  float4 value = 0.0;
+  bool value_bound = false;
+  const bool needs_value = view == RTXDI_DEBUG_VIEW_RAW_DIFFUSE || view == RTXDI_DEBUG_VIEW_DISTANCE_VALIDITY
+                           || view == RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE;
+  if (needs_value && shader_injection_data.rtxdi_debug_bound > 0.5f) {
+    rtxdiDebugValue_g.GetDimensions(value_width, value_height);
+    value_bound = pixel.x < value_width && pixel.y < value_height;
+    if (value_bound) value = rtxdiDebugValue_g.Load(int3(pixel, 0));
+  }
+
+  uint tuple_width, tuple_height;
+  uint4 tuple = 0u;
+  bool tuple_bound = false;
+  if (view == RTXDI_DEBUG_VIEW_SELECTED_LIGHT && shader_injection_data.rtxdi_local_bound > 0.5f) {
+    rtxdiResolvedLocal_g.GetDimensions(tuple_width, tuple_height);
+    tuple_bound = pixel.x < tuple_width && pixel.y < tuple_height;
+    if (tuple_bound) tuple = rtxdiResolvedLocal_g.Load(int3(pixel, 0));
+  }
+
+  uint filtered_width, filtered_height;
+  float4 filtered = 0.0;
+  bool filtered_bound = false;
+  if (view == RTXDI_DEBUG_VIEW_FILTERED_DIFFUSE && shader_injection_data.rtxdi_diffuse_bound > 0.5f) {
+    rtxdiDenoisedDiffuse_g.GetDimensions(filtered_width, filtered_height);
+    filtered_bound = pixel.x < filtered_width && pixel.y < filtered_height;
+    if (filtered_bound) filtered = rtxdiDenoisedDiffuse_g.Load(int3(pixel, 0));
+  }
+
+  uint sun_width, sun_height;
+  uint sun_status = RTXDI_SUN_STATUS_UNKNOWN;
+  bool sun_bound = false;
+  if (view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY && shader_injection_data.rtxdi_sun_bound > 0.5f) {
+    rtxdiSunVisibility_g.GetDimensions(sun_width, sun_height);
+    sun_bound = pixel.x < sun_width && pixel.y < sun_height;
+    if (sun_bound) sun_status = rtxdiSunVisibility_g.Load(int3(pixel, 0));
+  }
+
+  return RtxdiDebugValueColor(view, pixel, status_bound, status_word,
+                              value_bound && shader_injection_data.rtxdi_debug_distance_bound <= 0.5f,
+                              value.rgb, tuple_bound, tuple, filtered_bound, filtered,
+                              value_bound && shader_injection_data.rtxdi_debug_distance_bound > 0.5f,
+                              value, sun_bound, sun_status, consumer_decision);
+}
 
 
 void main(
@@ -249,6 +315,7 @@ void main(
   bool rtxdi_output_valid = false;
   float3 rtxdi_nrd_diffuse = 0.0;
   bool rtxdi_nrd_diffuse_valid = false;
+  uint rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FALLBACK;
   // Captured here because the flag word in r1.z is consumed and overwritten long
   // before either output site, and the environment/character split needs it.
   // Sora reads "bit 3 CLEAR" as the character flag (inverted vs Kai's bit 8).
@@ -338,7 +405,9 @@ void main(
     if (mode == 1) {
       // AO Only: gray for visibility
       o0.rgb = float3(ao_sample.x * hdr_scale, ao_sample.x * hdr_scale, ao_sample.x * hdr_scale);
-      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy;
+      if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+      return;
     }
     if (mode == 2) {
       // GTVBAO Raw: uint4.x decoded directly
@@ -348,7 +417,9 @@ void main(
       uint4 raw = gtvbaoTexture.Load(int3(texel, 0));
       float raw_ao = float(raw.x) / 255.0;
       o0.rgb = float3(raw_ao, raw_ao, raw_ao) * hdr_scale;
-      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy;
+      if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+      return;
     }
     if (mode >= 22 && mode <= 38) {
       // GTVBAO compute debug views: the compute pass wrote them into the debug UAV, pushed to t23.
@@ -358,7 +429,9 @@ void main(
       } else {
         o0.rgb = vbgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb * hdr_scale;
       }
-      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy;
+      if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+      return;
     }
   }
   r4.xy = v1.zw * float2(2,-2) + float2(-1,1);
@@ -731,8 +804,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                   if (denoised.valid) {
                     charColor += r0.xyz * denoised.radiance;
                     rtxdiCharResolved = true;
+                    rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FILTERED;
                   } else if (selection.status == RTXDI_DI_STATUS_BLOCKED) {
                     rtxdiCharResolved = true;
+                    rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_BLOCKED;
                   } else {
                     const LightParam lamp = dynamicLights_g[selection.index];
                     const RtxdiCharacterLightResult characterLight =
@@ -740,6 +815,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                     if (characterLight.resolved) {
                       charColor += r0.xyz * characterLight.diffuse;
                       rtxdiCharResolved = true;
+                      rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_RAW;
+                    } else {
+                      rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FALLBACK;
                     }
                   }
                 }
@@ -800,6 +878,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       o0.w = r0.w;
       o1.xyzw = r2.xyzw;
       o2.xy = r3.xy;
+      if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
       return;
     }
     // Early return BEFORE the sun composite at 1177, and charColor is built from
@@ -820,6 +899,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     o0.w = r0.w;
     o1.xyzw = r2.xyzw;
     o2.xy = r3.xy;
+    if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
     return;
   }
   r3.zw = r4.xz * cloudShadowScale_g + cloudShadowOffset_g.xy;
@@ -929,6 +1009,13 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         const LightIndexData di_tile = lightIndices_g[r1.x];
         rtxdi_selection = RtxdiResolveLightingSelection(true, rtxdi_resolved, light_count, di_tile);
         rtxdi_output_valid = rtxdi_selection.valid;
+        if (!rtxdi_output_valid) {
+          rtxdi_debug_consumer = rtxdi_status == RTXDI_DI_STATUS_EMPTY ? RTXDI_DEBUG_CONSUMER_EMPTY
+                                   : rtxdi_status == RTXDI_DI_STATUS_UNKNOWN ? RTXDI_DEBUG_CONSUMER_FALLBACK
+                                                                            : RTXDI_DEBUG_CONSUMER_INVALID;
+        } else if (rtxdi_selection.status == RTXDI_DI_STATUS_BLOCKED) {
+          rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_BLOCKED;
+        }
         if (rtxdi_output_valid && shader_injection_data.rtxdi_diffuse_bound > 0.5f) {
           uint denoised_width, denoised_height;
           rtxdiDenoisedDiffuse_g.GetDimensions(denoised_width, denoised_height);
@@ -938,8 +1025,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                                             rtxdiDenoisedDiffuse_g.Load(int3(resolved_pixel, 0)), 1u);
             rtxdi_nrd_diffuse_valid = denoised.valid;
             rtxdi_nrd_diffuse = denoised.radiance;
+            if (denoised.valid) rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FILTERED;
           }
         }
+        if (rtxdi_output_valid && rtxdi_selection.status == RTXDI_DI_STATUS_VISIBLE
+            && !rtxdi_nrd_diffuse_valid) rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_RAW;
       }
     }
   }
@@ -1297,20 +1387,28 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     int debugMode = (int)shader_injection_data.shadow_penumbra_debug_view;
     if (debugMode == 1) {
       o0.rgb = float3(penumbra, penumbra, penumbra) * kDebugHdrScale;
-      o0.a = 1.0; o1.xyzw = uint4(0, 255 * saturate(0.1 * r16.w), 0, 0); o2.x = 0; o2.y = min(0xffff, (uint)(65.535 * r18.x)); return;
+      o0.a = 1.0; o1.xyzw = uint4(0, 255 * saturate(0.1 * r16.w), 0, 0); o2.x = 0; o2.y = min(0xffff, (uint)(65.535 * r18.x));
+      if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+      return;
     }
     if (debugMode == 2) {
       o0.rgb = tintColor * kDebugHdrScale;
-      o0.a = 1.0; o1.xyzw = uint4(0, 255 * saturate(0.1 * r16.w), 0, 0); o2.x = 0; o2.y = min(0xffff, (uint)(65.535 * r18.x)); return;
+      o0.a = 1.0; o1.xyzw = uint4(0, 255 * saturate(0.1 * r16.w), 0, 0); o2.x = 0; o2.y = min(0xffff, (uint)(65.535 * r18.x));
+      if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+      return;
     }
     if (debugMode == 3) {
       o0.rgb = finalColor * kDebugHdrScale;
-      o0.a = 1.0; o1.xyzw = uint4(0, 255 * saturate(0.1 * r16.w), 0, 0); o2.x = 0; o2.y = min(0xffff, (uint)(65.535 * r18.x)); return;
+      o0.a = 1.0; o1.xyzw = uint4(0, 255 * saturate(0.1 * r16.w), 0, 0); o2.x = 0; o2.y = min(0xffff, (uint)(65.535 * r18.x));
+      if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+      return;
     }
     if (debugMode == 4) {
       // Sun color (lightColor_g from cb_scene c25) applied uniformly
       o0.rgb = lightColor_g.xyz * kDebugHdrScale;
-      o0.a = 1.0; o1.xyzw = uint4(0, 255 * saturate(0.1 * r16.w), 0, 0); o2.x = 0; o2.y = min(0xffff, (uint)(65.535 * r18.x)); return;
+      o0.a = 1.0; o1.xyzw = uint4(0, 255 * saturate(0.1 * r16.w), 0, 0); o2.x = 0; o2.y = min(0xffff, (uint)(65.535 * r18.x));
+      if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+      return;
     }
 
     r15.yzw = finalColor;
@@ -1834,7 +1932,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     o1.xyzw = (uint4)(float4(0, 255, 0, 0) * saturate(0.1 * r0.w));  // native o1
     o2.y = min(0x0000ffff, (uint)(65.535 * r18.x));                  // native o2.y
     o2.x = 0;
-    return;
+      if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+      return;
   }
   // RTGI bounce (see cachedRTGI); no character pixel reaches this site. The VBGI block below never runs while RTGI is
   // bound (RTAO on clears gtvbao_vbgi_bound).
@@ -1890,5 +1989,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   o2.y = min(0x0000ffff, (uint)r0.x);
   o0.w = 1;
   o2.x = 0;
+  if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
   return;
 }

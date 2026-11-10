@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <shared_mutex>
 
+#include "rtxdi_debug_layout.h"
 #include "rtxdi_diagnostics.hpp"
 
 namespace falcom_world::rtxdi {
@@ -23,6 +24,7 @@ inline float g_spatial_depth_threshold = 0.05f;
 inline float g_spatial_normal_threshold = 0.9f;
 inline float g_diffuse_denoiser = 1.f;
 inline float g_debug_logging = 0.f;
+inline float g_debug_view = static_cast<float>(RTXDI_DEBUG_VIEW_OFF);
 inline float g_relax_diffuse_history = 30.f;
 inline float g_relax_fast_history = 6.f;
 inline float g_relax_prepass_radius = 30.f;
@@ -30,6 +32,28 @@ inline float g_relax_atrous_iterations = 5.f;
 inline bool g_applying_quality_preset = false;
 inline uint32_t SceneRequestMask() { return (g_local_requested > 0.5f ? 1u : 0u) | (g_sun_requested > 0.5f ? 2u : 0u); }
 inline bool SceneRequested() { return SceneRequestMask() != 0u; }
+
+struct DebugSnapshot {
+  uint32_t requested_view = RTXDI_DEBUG_VIEW_OFF;
+  uint32_t effective_view = RTXDI_DEBUG_VIEW_OFF;
+  uint32_t source_status = 0u;
+  uint32_t rejection_reason = 0u;
+  uint32_t frame = UINT32_MAX;
+  uint32_t width = 0u, height = 0u;
+  uint64_t owner_generation = 0u;
+  uint64_t transfer_configuration = 0u;
+  uint64_t di_configuration = 0u;
+  uint64_t n1_configuration = 0u;
+  int32_t scene_slot = -1, transfer_slot = -1;
+  bool source_ready = false;
+  bool distance_source = false;
+  bool superseded_by_bvh = false;
+};
+struct DebugState {
+  std::shared_mutex mutex;
+  DebugSnapshot snapshot;
+};
+inline DebugState g_debug;
 
 enum class SceneStatus { Off,
                          DxrOff,
@@ -195,6 +219,14 @@ inline bool MatchesStagedSunIdentity(const SunSnapshot& snapshot, uint32_t frame
          || (snapshot.frame == frame && snapshot.owner_generation == owner_generation
              && snapshot.configuration_generation == configuration_generation
              && snapshot.di_configuration_generation == di_configuration_generation);
+}
+inline bool MatchesStagedSunSlotIdentity(const SunSnapshot& snapshot, uint32_t frame, uint64_t owner_generation,
+                                         uint64_t configuration_generation, uint64_t di_configuration_generation,
+                                         uint64_t slot_configuration_generation) {
+  return MatchesStagedSunIdentity(snapshot, frame, owner_generation, configuration_generation,
+                                  di_configuration_generation)
+         && (snapshot.status != SunStatus::Staged
+             || snapshot.configuration_generation == slot_configuration_generation);
 }
 enum class SunAttemptAction { Off,
                               PreserveDuplicate,

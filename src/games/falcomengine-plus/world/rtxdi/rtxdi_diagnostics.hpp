@@ -235,6 +235,20 @@ struct DiagnosticSummary {
   uint32_t devkit_version = 0u;
   uint32_t adapter_vendor = 0u;
   uint32_t adapter_device = 0u;
+  uint32_t debug_requested_view = 0u;
+  uint32_t debug_effective_view = 0u;
+  uint32_t debug_source_ready = 0u;
+  uint32_t debug_rejection_reason = 0u;
+  uint32_t debug_observed_frame = UINT32_MAX;
+  uint32_t debug_width = 0u;
+  uint32_t debug_height = 0u;
+  uint32_t debug_scene_slot = UINT32_MAX;
+  uint32_t debug_transfer_slot = UINT32_MAX;
+  uint32_t debug_superseded_by_bvh = 0u;
+  uint64_t debug_owner_generation = 0u;
+  uint64_t debug_transfer_configuration = 0u;
+  uint64_t debug_di_configuration = 0u;
+  uint64_t debug_n1_configuration = 0u;
   uint32_t available_mask = 0u;
 };
 
@@ -480,6 +494,21 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
          summary.scene_status, summary.input_status, summary.input_stage, summary.di_status, summary.sun_status,
          summary.publication_status, summary.binding_status, summary.rr_requested,
          summary.rr_owns_denoise, summary.denoiser_reason);
+  append("debug requested=%u effective=%u source_ready=%u reason=%u frame=%u owner=%llu transfer_config=%llu di_config=%llu n1_config=",
+         summary.debug_requested_view, summary.debug_effective_view, summary.debug_source_ready,
+         summary.debug_rejection_reason, summary.debug_observed_frame,
+         static_cast<unsigned long long>(summary.debug_owner_generation),
+         static_cast<unsigned long long>(summary.debug_transfer_configuration),
+         static_cast<unsigned long long>(summary.debug_di_configuration));
+  if (summary.debug_n1_configuration == 0u) {
+    append("unavailable");
+  } else {
+    append("%llu", static_cast<unsigned long long>(summary.debug_n1_configuration));
+  }
+  append(" scene_slot=%u transfer_slot=%u size=%ux%u bvh_supersedes=%u\n",
+         summary.debug_scene_slot, summary.debug_transfer_slot, summary.debug_width, summary.debug_height,
+         summary.debug_superseded_by_bvh);
+  append("debug_reason=0:None,1:BackendUnavailable,2:NotProduced,3:NoSdk,4:RrSuppressed,5:WaitingInput,6:StaleIdentity,7:InvalidResource,8:BvhSuperseded,9:ProducerDisabled\n");
   append("fences scene=%llu A=unavailable B_value=%llu C_value=%llu completion_knowledge=unavailable ages scene=%llu input=%llu di=%llu sun=%llu nrd=%llu\n",
          static_cast<unsigned long long>(summary.scene_fence),
          static_cast<unsigned long long>(summary.input_fence_b), static_cast<unsigned long long>(summary.consumer_fence_c),

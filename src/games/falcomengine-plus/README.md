@@ -34,7 +34,7 @@ RTGI traces diffuse indirect light and composites it into game lighting, with ga
 
 ReSTIR GI reuses weighted lighting samples across pixels and frames to reduce noise; RTXDI provides the SDK resampling structures and algorithms for the direct-light path. The game adapter validates captured surfaces and light identities before consuming a selected sample.
 
-The RTXDI panel's session-only Debug Logging option captures bounded CPU diagnostics that can be copied or cleared from the panel; reports omit scene contents and raw native addresses. The current `SceneBindingChanged` input-bridge rejection remains unresolved and is reported from the existing validation path.
+The RTXDI panel provides session-only debug views over existing local-DI, sun, denoised-diffuse, and qualified distance outputs, plus bounded CPU diagnostics that can be copied or cleared without including scene contents or raw native addresses. BVH debug presentation takes precedence over RTXDI views, which take precedence over legacy overlays. The current `SceneBindingChanged` input-bridge rejection remains unresolved and is reported from the existing validation path.
 
 **Code:** [`world/rtgi`](world/rtgi/), [`world/rtxdi`](world/rtxdi/), [`world/shaders`](world/shaders/).
 **References:** [`reference/restir`](reference/restir/), vendored RTXDI [`README`](world/rtxdi/vendor/rtxdi/README.md) and [`license`](world/rtxdi/vendor/rtxdi/LICENSE.txt).

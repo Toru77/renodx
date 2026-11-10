@@ -231,6 +231,27 @@ struct Rt12DiResources {
   bool history_valid = false;
 };
 
+#if defined(FALCOM_NRD_ENABLED)
+struct Rt12DebugDistanceIdentity {
+  uint32_t source_version = 1u;
+  uint32_t requested_view = RTXDI_DEBUG_VIEW_OFF;
+  uint32_t frame = UINT32_MAX;
+  uint32_t width = 0u;
+  uint32_t height = 0u;
+  uint32_t n1_configuration_version = 0u;
+  int32_t scene_slot = -1;
+  int32_t transfer_slot = -1;
+  uint64_t owner_generation = 0u;
+  uint64_t transfer_configuration = 0u;
+  uint64_t di_configuration = 0u;
+  uint64_t settings_identity = 0u;
+  uint64_t producer_fence_b = 0u;
+  std::array<float, 7u> n1_brdf_config = {};
+  bool recorded = false;
+  bool staged = false;
+};
+#endif
+
 // Transfer slots own their carriers until their own B fence completes.
 struct Rt12DiTransferSlot {
   Rt12Shared depth, normal, scene, color, mrt1, mrt2, motion;
@@ -239,6 +260,10 @@ struct Rt12DiTransferSlot {
   Rt12Shared sun_visibility;
   Rt12Shared n1_diffuse, n1_specular, n1_status;
   Rt12Shared nrd_diffuse_publication;
+#if defined(FALCOM_NRD_ENABLED)
+  Rt12Shared nrd_debug_distance;
+  Rt12DebugDistanceIdentity debug_distance_identity = {};
+#endif
   Microsoft::WRL::ComPtr<ID3D12Resource> scene_buffer, lights_buffer, tiles_buffer, deferred_buffer, sun_results;
   Microsoft::WRL::ComPtr<ID3D12Resource> light_types, di_results, di_frame_upload;
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
@@ -300,6 +325,8 @@ struct Rt12DiTransferState {
 #if defined(FALCOM_NRD_ENABLED)
   Microsoft::WRL::ComPtr<ID3D12RootSignature> nrd_publication_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> nrd_publication_pso;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> debug_distance_root;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> debug_distance_pso;
 #endif
   uint64_t owner_generation = 0u, configuration_generation = 0u;
   uint64_t input_fence = 0u, scene_fence = 0u;

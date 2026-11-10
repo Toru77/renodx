@@ -2,6 +2,7 @@
 #include "../../bvh/alpha_atlas.hpp"
 #include "../rtxdi_camera_qualification.hpp"
 #include "../rtxdi_config.hpp"
+#include "../rtxdi_debug_layout.h"
 #include "../rtxdi_di_contract.h"
 #include "../rtxdi_diagnostics.hpp"
 #include "../rtxdi_input_validation.hpp"
@@ -138,6 +139,30 @@ bool SurfaceIsZero(const TestSurfaceResult& result) {
 }  // namespace
 
 int main() {
+  if (ResolveRtxdiDebugEffectiveView(RTXDI_DEBUG_VIEW_OFF, false) != RTXDI_DEBUG_VIEW_OFF
+      || ResolveRtxdiDebugEffectiveView(RTXDI_DEBUG_VIEW_RAW_DIFFUSE, true) != RTXDI_DEBUG_VIEW_OFF
+      || ResolveRtxdiDebugEffectiveView(RTXDI_DEBUG_VIEW_FILTERED_DIFFUSE, false)
+             != RTXDI_DEBUG_VIEW_FILTERED_DIFFUSE
+      || RtxdiDebugDistanceExportRequested(
+          ResolveRtxdiDebugEffectiveView(RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE, true))
+      || !RtxdiDebugDistanceExportRequested(
+          ResolveRtxdiDebugEffectiveView(RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE, false))
+      || RtxdiDebugDistanceExportRequested(ResolveRtxdiDebugEffectiveView(RTXDI_DEBUG_VIEW_OFF, false))
+      || ResolveRtxdiDebugEffectiveView(RTXDI_DEBUG_VIEW_OFF, true) != RTXDI_DEBUG_VIEW_OFF
+      || ResolveRtxdiDebugEffectiveView(RTXDI_DEBUG_VIEW_LOCAL_STATUS, false)
+             != RTXDI_DEBUG_VIEW_LOCAL_STATUS) {
+    return EXIT_FAILURE;
+  }
+  std::printf("PASS RTXDI shader view precedence: BVH forces OFF, unavailable keeps requested checker, Off/restore\n");
+  if (ResolveRtxdiDebugPresentationOwner(RTXDI_DEBUG_VIEW_OFF, false)
+          != RtxdiDebugPresentationOwner::Lighting
+      || ResolveRtxdiDebugPresentationOwner(RTXDI_DEBUG_VIEW_LOCAL_STATUS, false)
+             != RtxdiDebugPresentationOwner::Rtxdi
+      || ResolveRtxdiDebugPresentationOwner(RTXDI_DEBUG_VIEW_LOCAL_STATUS, true)
+             != RtxdiDebugPresentationOwner::Bvh) {
+    return EXIT_FAILURE;
+  }
+  std::printf("PASS RTXDI debug precedence: BVH > RTXDI > lighting\n");
   {
     using namespace falcom_world::rtxdi;
     DiagnosticState diagnostics;
@@ -180,7 +205,8 @@ int main() {
     if (report.size() > kDiagnosticReportCapacity || report.find("0x1234") != std::string::npos
         || report.find("0xfeed") != std::string::npos || report.find("matching_draw_callbacks=") == std::string::npos
         || report.find("14:NativeB0Mismatch") == std::string::npos
-        || report.find("12:SignalC") == std::string::npos) {
+        || report.find("12:SignalC") == std::string::npos
+        || report.find("n1_config=unavailable") == std::string::npos) {
       return EXIT_FAILURE;
     }
     SetDiagnosticCapture(diagnostics, false);
@@ -550,6 +576,7 @@ int main() {
   using falcom_world::rtxdi::CanReuseScene;
   using falcom_world::rtxdi::IsDuplicate;
   using falcom_world::rtxdi::MatchesStagedSunIdentity;
+  using falcom_world::rtxdi::MatchesStagedSunSlotIdentity;
   using falcom_world::rtxdi::SceneReuseInputs;
   using falcom_world::rtxdi::SceneSnapshot;
   using falcom_world::rtxdi::SunAttemptAction;
@@ -658,6 +685,11 @@ int main() {
       || MatchesStagedSunIdentity(sun_staged, 4u, 4u, 7u, 0u)
       || MatchesStagedSunIdentity(sun_staged, 4u, 3u, 8u, 0u)
       || MatchesStagedSunIdentity(sun_staged, 4u, 3u, 7u, 1u)) return EXIT_FAILURE;
+  if (!MatchesStagedSunSlotIdentity(sun_staged, 4u, 3u, 7u, 0u, 7u)
+      || MatchesStagedSunSlotIdentity(sun_staged, 4u, 3u, 8u, 0u, 7u)
+      || MatchesStagedSunSlotIdentity(sun_staged, 4u, 3u, 7u, 1u, 7u)
+      || MatchesStagedSunSlotIdentity(sun_staged, 4u, 3u, 7u, 0u, 8u)) return EXIT_FAILURE;
+  std::printf("PASS sun consumer identity rejects transfer config, DI config, and slot config mismatches\n");
   TransitionSunAttempt(&sun_staged, 4u, SunAttemptAction::PreserveDuplicate);
   if (sun_staged.status != SunStatus::Staged || sun_staged.frame != 4u || sun_staged.fence_b != 9u
       || sun_staged.transfer_slot != 2) return EXIT_FAILURE;

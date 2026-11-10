@@ -126,6 +126,20 @@ struct LightingConsumerCase {
   uint32_t expected_class;
   float raw_specular;
   uint32_t padding4;
+  uint32_t debug_view;
+  uint32_t debug_flags;
+  uint32_t debug_status;
+  uint32_t debug_consumer_decision;
+  float debug_value[4];
+  uint32_t debug_tuple[4];
+  float debug_filtered[4];
+  uint32_t debug_sun_status;
+  uint32_t debug_pixel[2];
+  uint32_t debug_padding;
+  float pack_distance;
+  uint32_t pack_status;
+  uint32_t pack_flags;
+  uint32_t pack_enabled;
 };
 struct LightingConsumerResult {
   uint32_t mode;
@@ -147,6 +161,9 @@ struct LightingConsumerResult {
   float diffuse_replaced;
   float specular_preserved;
   uint32_t padding2;
+  float debug_color[3];
+  uint32_t padding3;
+  float debug_packed_distance[4];
 };
 static_assert(sizeof(WorldMeshGPU) == 64);
 static_assert(sizeof(WorldInstanceGPU) == 192);
@@ -156,8 +173,8 @@ static_assert(sizeof(SurfaceResult) == 48);
 static_assert(sizeof(RtxdiLightParam) == RTXDI_INPUT_LIGHT_STRIDE);
 static_assert(sizeof(RtxdiTileData) == RTXDI_INPUT_TILE_STRIDE);
 static_assert(sizeof(DeferredParam) == RTXDI_INPUT_DEFERRED_STRIDE);
-static_assert(sizeof(LightingConsumerCase) == 680u);
-static_assert(sizeof(LightingConsumerResult) == 76u);
+static_assert(sizeof(LightingConsumerCase) == 776u);
+static_assert(sizeof(LightingConsumerResult) == 108u);
 
 bool Check(HRESULT hr, const char* operation) {
   if (FAILED(hr)) std::fprintf(stderr, "FAIL DXR %s: HRESULT 0x%08lx\n", operation, static_cast<unsigned long>(hr));
@@ -3032,7 +3049,7 @@ int RunRtxdiDxrBridge() {
   }
   std::printf("PASS finite-input raw overflow sanitizer writes UNKNOWN and zero diffuse\n");
 
-  constexpr uint32_t lighting_case_count = 17u;
+  constexpr uint32_t lighting_case_count = 42u;
   std::array<LightingConsumerCase, lighting_case_count> lighting_cases = {};
   for (LightingConsumerCase& test_case : lighting_cases) {
     test_case.light_count = 16u;
@@ -3122,6 +3139,106 @@ int RunRtxdiDxrBridge() {
   lighting_cases[16].nrd_diffuse[3] = 2.0f;
   lighting_cases[16].nrd_bound = 1u;
   lighting_cases[16].expected_class = 2u;
+  lighting_cases[17].debug_view = RTXDI_DEBUG_VIEW_LOCAL_STATUS;
+  lighting_cases[17].debug_flags = 1u;
+  lighting_cases[17].debug_status = RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT;
+  lighting_cases[18] = lighting_cases[17];
+  lighting_cases[18].debug_status = RTXDI_N1_STATUS_BLOCKED | RTXDI_N1_STATUS_KNOWN_BIT;
+  lighting_cases[19] = lighting_cases[17];
+  lighting_cases[19].debug_status = RTXDI_N1_STATUS_UNKNOWN;
+  lighting_cases[20] = lighting_cases[17];
+  lighting_cases[20].debug_status = RTXDI_N1_STATUS_EMPTY;
+  lighting_cases[21] = lighting_cases[17];
+  lighting_cases[21].debug_status = RTXDI_N1_STATUS_INVALID;
+  lighting_cases[22] = lighting_cases[17];
+  lighting_cases[22].debug_view = RTXDI_DEBUG_VIEW_RECEIVER_CLASS;
+  lighting_cases[22].debug_status = RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT
+                                    | RTXDI_N1_STATUS_CHARACTER_BIT;
+  lighting_cases[23] = lighting_cases[22];
+  lighting_cases[23].debug_status = RTXDI_N1_STATUS_BLOCKED | RTXDI_N1_STATUS_KNOWN_BIT;
+  lighting_cases[24].debug_view = RTXDI_DEBUG_VIEW_SELECTED_LIGHT;
+  lighting_cases[24].debug_flags = 4u;
+  lighting_cases[24].debug_tuple[0] = 5u;
+  lighting_cases[24].debug_tuple[1] = RTXDI_DI_LIGHT_TYPE_POINT;
+  lighting_cases[24].debug_tuple[2] = RTXDI_DI_STATUS_VISIBLE;
+  lighting_cases[24].debug_tuple[3] = std::bit_cast<uint32_t>(1.0f);
+  lighting_cases[25] = lighting_cases[17];
+  lighting_cases[25].debug_view = RTXDI_DEBUG_VIEW_RAW_DIFFUSE;
+  lighting_cases[25].debug_flags = 3u;
+  lighting_cases[26] = lighting_cases[25];
+  lighting_cases[26].debug_flags = 1u;
+  lighting_cases[27] = lighting_cases[17];
+  lighting_cases[27].debug_view = RTXDI_DEBUG_VIEW_FILTERED_DIFFUSE;
+  lighting_cases[27].debug_flags = 9u;
+  lighting_cases[27].debug_filtered[3] = 1.0f;
+  lighting_cases[28] = lighting_cases[27];
+  lighting_cases[28].debug_filtered[3] = 2.0f;
+  lighting_cases[29] = lighting_cases[17];
+  lighting_cases[29].debug_view = RTXDI_DEBUG_VIEW_DISTANCE_VALIDITY;
+  lighting_cases[29].debug_flags = 17u;
+  lighting_cases[29].debug_status = RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT;
+  lighting_cases[29].debug_value[0] = 3.25f;
+  lighting_cases[29].debug_value[1] = 1.0f;
+  lighting_cases[29].debug_value[3] = 1.0f;
+  lighting_cases[30] = lighting_cases[29];
+  lighting_cases[30].debug_view = RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE;
+  lighting_cases[30].debug_value[0] = 65504.0f;
+  lighting_cases[30].debug_value[1] = 5.0f;
+  lighting_cases[31] = lighting_cases[29];
+  lighting_cases[31].debug_value[1] = 0.0f;
+  lighting_cases[32] = lighting_cases[29];
+  lighting_cases[32].debug_status |= RTXDI_N1_STATUS_CHARACTER_BIT;
+  lighting_cases[32].debug_value[1] = 1.0f;
+  lighting_cases[33].debug_view = RTXDI_DEBUG_VIEW_SUN_VISIBILITY;
+  lighting_cases[33].debug_flags = 32u;
+  lighting_cases[33].debug_sun_status = RTXDI_SUN_STATUS_VISIBLE;
+  lighting_cases[34] = lighting_cases[33];
+  lighting_cases[34].debug_sun_status = RTXDI_SUN_STATUS_BLOCKED;
+  lighting_cases[35] = lighting_cases[33];
+  lighting_cases[35].debug_sun_status = RTXDI_SUN_STATUS_UNKNOWN;
+  lighting_cases[29].pack_enabled = 1u;
+  lighting_cases[29].pack_distance = 3.25f;
+  lighting_cases[29].pack_status = RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT;
+  lighting_cases[29].pack_flags = 1u;
+  lighting_cases[30].pack_enabled = 1u;
+  lighting_cases[30].pack_distance = 65504.0f;
+  lighting_cases[30].pack_status = RTXDI_N1_STATUS_BLOCKED | RTXDI_N1_STATUS_KNOWN_BIT;
+  lighting_cases[30].pack_flags = 5u;
+  lighting_cases[31].pack_enabled = 1u;
+  lighting_cases[31].pack_distance = 3.25f;
+  lighting_cases[31].pack_status = RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT;
+  lighting_cases[31].pack_flags = 0u;
+  lighting_cases[32].pack_enabled = 1u;
+  lighting_cases[32].pack_distance = 3.25f;
+  lighting_cases[32].pack_status = RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT
+                                   | RTXDI_N1_STATUS_CHARACTER_BIT;
+  lighting_cases[32].pack_flags = 1u;
+  lighting_cases[36].pack_enabled = 1u;
+  lighting_cases[36].pack_distance = -1.0f;
+  lighting_cases[36].pack_status = RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT;
+  lighting_cases[36].pack_flags = 1u;
+  lighting_cases[37].pack_enabled = 1u;
+  lighting_cases[37].pack_distance = std::numeric_limits<float>::quiet_NaN();
+  lighting_cases[37].pack_status = RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT;
+  lighting_cases[37].pack_flags = 1u;
+  lighting_cases[38].pack_enabled = 1u;
+  lighting_cases[38].pack_distance = 3.25f;
+  lighting_cases[38].pack_status = RTXDI_N1_STATUS_UNKNOWN;
+  lighting_cases[38].pack_flags = 1u;
+  lighting_cases[39].pack_enabled = 1u;
+  lighting_cases[39].pack_distance = 65503.5f;
+  lighting_cases[39].pack_status = RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT;
+  lighting_cases[39].pack_flags = 5u;
+  lighting_cases[40].pack_enabled = 1u;
+  lighting_cases[40].pack_distance = 3.25f;
+  lighting_cases[40].pack_status = RTXDI_N1_STATUS_VISIBLE | RTXDI_N1_STATUS_KNOWN_BIT
+                                   | RTXDI_N1_STATUS_CHARACTER_BIT;
+  lighting_cases[40].pack_flags = 3u;
+  lighting_cases[41].pack_enabled = 1u;
+  lighting_cases[41].pack_distance = 3.25f;
+  lighting_cases[41].pack_status = RTXDI_N1_STATUS_BLOCKED | RTXDI_N1_STATUS_KNOWN_BIT
+                                   | RTXDI_N1_STATUS_CHARACTER_BIT;
+  lighting_cases[41].pack_flags = 3u;
   lighting_cases[0].sun_bound = 1u;
   lighting_cases[0].sun_status = RTXDI_SUN_STATUS_VISIBLE;
   lighting_cases[1].sun_bound = 1u;
@@ -3216,6 +3333,8 @@ int RunRtxdiDxrBridge() {
   if (!Check(lighting_readback->Map(0u, nullptr, &lighting_mapped), "map lighting consumer results")) return 1;
   std::array<LightingConsumerResult, lighting_case_count> lighting_results = {};
   std::memcpy(lighting_results.data(), lighting_mapped, sizeof(lighting_results));
+  const uint32_t selected_debug_hash = 5u * 1664525u + 1013904223u;
+  const float selected_debug_brightness = 0.35f + 0.65f * (static_cast<float>(selected_debug_hash >> 24u) / 255.0f);
   const bool lighting_contract_ok =
       lighting_results[0].mode == 1u && lighting_results[0].point_count == 1u && lighting_results[0].spot_count == 0u
       && std::abs(lighting_results[0].raw_local_term - 1.f) < 1e-6f
@@ -3258,7 +3377,52 @@ int RunRtxdiDxrBridge() {
       && lighting_results[15].mode == 2u && lighting_results[15].denoised_used == 1u
       && std::abs(lighting_results[15].diffuse_replaced - 0.25f) < 1e-6f
       && lighting_results[16].denoised_used == 1u && std::abs(lighting_results[16].diffuse_replaced - 0.625f) < 1e-6f
-      && lighting_results[16].specular_preserved == 0.0f;
+      && lighting_results[16].specular_preserved == 0.0f
+      && std::abs(lighting_results[17].debug_color[0] - 0.005f) < 1e-6f
+      && std::abs(lighting_results[17].debug_color[1] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[18].debug_color[0] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[18].debug_color[1] - 0.005f) < 1e-6f
+      && std::abs(lighting_results[19].debug_color[0] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[19].debug_color[1] - 0.04f) < 1e-6f
+      && std::abs(lighting_results[20].debug_color[2] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[21].debug_color[0] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[22].debug_color[0] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[22].debug_color[1] - 0.02f) < 1e-6f
+      && std::abs(lighting_results[23].debug_color[1] - 0.04f) < 1e-6f
+      && std::abs(lighting_results[24].debug_color[1] - 0.8f * selected_debug_brightness * 0.05f) < 1e-6f
+      && std::abs(lighting_results[24].debug_color[2] - selected_debug_brightness * 0.05f) < 1e-6f
+      && lighting_results[25].debug_color[0] == 0.f && lighting_results[25].debug_color[1] == 0.f
+      && lighting_results[25].debug_color[2] == 0.f
+      && std::abs(lighting_results[26].debug_color[0] - 0.0025f) < 1e-6f
+      && std::abs(lighting_results[27].debug_color[0]) < 1e-6f
+      && std::abs(lighting_results[28].debug_color[0] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[29].debug_color[1] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[30].debug_color[2] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[31].debug_color[0] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[32].debug_color[0] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[33].debug_color[0] - 0.05f) < 1e-6f
+      && lighting_results[34].debug_color[0] == 0.f && lighting_results[34].debug_color[1] == 0.f
+      && lighting_results[34].debug_color[2] == 0.f
+      && std::abs(lighting_results[35].debug_color[0] - 0.05f) < 1e-6f
+      && std::abs(lighting_results[35].debug_color[1] - 0.04f) < 1e-6f
+      && lighting_results[29].debug_packed_distance[0] == 3.25f
+      && lighting_results[29].debug_packed_distance[1] == 1.0f
+      && lighting_results[29].debug_packed_distance[3] == 1.0f
+      && lighting_results[30].debug_packed_distance[0] == 65504.0f
+      && lighting_results[30].debug_packed_distance[1] == 5.0f
+      && lighting_results[30].debug_packed_distance[3] == 1.0f
+      && lighting_results[31].debug_packed_distance[0] == 0.0f
+      && lighting_results[31].debug_packed_distance[1] == 0.0f
+      && lighting_results[31].debug_packed_distance[3] == 1.0f
+      && lighting_results[32].debug_packed_distance[1] == 0.0f
+      && lighting_results[36].debug_packed_distance[0] == 0.0f
+      && lighting_results[37].debug_packed_distance[0] == 0.0f
+      && lighting_results[38].debug_packed_distance[0] == 0.0f
+      && lighting_results[39].debug_packed_distance[0] == 0.0f
+      && lighting_results[40].debug_packed_distance[1] == 3.0f
+      && lighting_results[40].debug_packed_distance[0] == 3.25f
+      && lighting_results[41].debug_packed_distance[1] == 3.0f
+      && lighting_results[41].debug_packed_distance[0] == 3.25f;
   const bool character_contract_ok =
       lighting_results[0].character_mode == 1u && lighting_results[0].character_type == RTXDI_DI_LIGHT_TYPE_POINT
       && std::abs(lighting_results[0].character_term - 0.375f) < 1e-6f
@@ -3278,6 +3442,7 @@ int RunRtxdiDxrBridge() {
                  lighting_results[3].point_count, lighting_results[3].spot_count, lighting_results[2].mode);
     return 1;
   }
+  std::printf("PASS RTXDI debug palette/carrier contract: status/class/type/raw/filtered/distance/sun and unavailable checker\n");
   std::printf("PASS production lighting selection helper point/spot/blocked/unknown/unbound/invalid fallback; post-material application once\n");
   std::printf("PASS character local DI point/spot charaColor, blocked suppression, unknown/empty/invalid RTLS fallback without double-add\n");
   std::printf("PASS RTXDI sun consumer helper visible/blocked/unknown/unbound/malformed; CSM and character fallback preserved\n");

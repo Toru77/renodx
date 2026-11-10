@@ -725,12 +725,15 @@ struct ShaderInjectData {
   float char_cam_debug;
   float rt_sun_cascades;  // 0-4 runtime, session only: sun cascade slices below this index are RT-owned and skipped by Sora 2nd shadow resolve (include/rt_sun_range.hlsli); set in SyncISFASTToShaderInjection
   // Appended runtime gate; preserves all existing injection offsets.
-  float rtxdi_diffuse_bound;  // 0/1: Sora 2nd t43 holds a matching staged RELAX diffuse publication this draw
-                              // Size: 441 floats = 1764 bytes. The host declares the range as
-                              // sizeof(ShaderInjectData) / 4 push values (CreateShadowsPipelinesIfNeeded and RunShadows);
-                              // the next added float starts a new float4, and the host range grows with sizeof automatically.
-                              // Prefer reusing a RETIRED slot.
- };
+  float rtxdi_diffuse_bound;         // 0/1: Sora 2nd t43 holds a matching staged RELAX diffuse publication this draw
+  float rtxdi_debug_view;            // session-only selector; does not affect RTXDI production or history
+  float rtxdi_debug_bound;           // 0/1: t44/t45 hold matching N1 raw/status debug sources this draw
+  float rtxdi_debug_distance_bound;  // 0/1: t44 is the matching optional N3b distance carrier
+                                     // Size: 444 floats = 1776 bytes. The host declares the range as
+                                     // sizeof(ShaderInjectData) / 4 push values (CreateShadowsPipelinesIfNeeded and RunShadows);
+                                     // the next added float starts a new float4, and the host range grows with sizeof automatically.
+                                     // Prefer reusing a RETIRED slot.
+};
 
 #ifndef __cplusplus
 cbuffer shader_injection : register(b13) {

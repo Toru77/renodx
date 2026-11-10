@@ -33,7 +33,8 @@ target_sources(falcom-rtxdi-bridge PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_sampling_contract.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_coverage_contract.h")
 target_sources(falcomengine-plus PRIVATE
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_prep.h")
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_prep.h"
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_debug_distance.h")
 
 option(FALCOM_NRD_ENABLED "Enable the private NRD path in falcomengine-plus" OFF)
 set(FALCOM_NRD_SDK_ROOT "" CACHE PATH "Optional NRD 4.17.1 SDK root for the private D3D12 adapter harness")
@@ -72,7 +73,8 @@ if(FALCOM_NRD_SDK_ROOT)
   target_sources(falcom-nrd-bridge PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_probe.h"
     "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_prep.h"
-    "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_publish.h")
+    "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_publish.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_debug_distance.h")
   if(FALCOM_NRD_ENABLED)
     target_link_libraries(${ADDON} PRIVATE d3d12 falcom-nrd-sdk)
     target_compile_definitions(${ADDON} PRIVATE FALCOM_NRD_ENABLED=1)

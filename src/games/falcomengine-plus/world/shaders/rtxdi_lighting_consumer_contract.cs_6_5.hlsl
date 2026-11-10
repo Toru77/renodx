@@ -1,5 +1,6 @@
 #include "world_rt_lamps.hlsli"
 #include "world_rtxdi_lighting_consumer.hlsli"
+#include "world_rtxdi_debug.hlsli"
 
 struct LightingConsumerCase
 {
@@ -23,6 +24,20 @@ struct LightingConsumerCase
   uint expected_class;
   float raw_specular;
   uint padding4;
+  uint debug_view;
+  uint debug_flags;
+  uint debug_status;
+  uint debug_consumer_decision;
+  float4 debug_value;
+  uint4 debug_tuple;
+  float4 debug_filtered;
+  uint debug_sun_status;
+  uint2 debug_pixel;
+  uint debug_padding;
+  float pack_distance;
+  uint pack_status;
+  uint pack_flags;
+  uint pack_enabled;
 };
 
 struct LightingConsumerResult
@@ -46,6 +61,9 @@ struct LightingConsumerResult
   float diffuse_replaced;
   float specular_preserved;
   uint padding2;
+  float3 debug_color;
+  uint padding3;
+  float4 debug_packed_distance;
 };
 
 StructuredBuffer<LightingConsumerCase> g_cases : register(t0);
@@ -120,5 +138,16 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
   result.diffuse_replaced = denoised.valid ? denoised.radiance.x : raw_local_term;
   result.specular_preserved = input.raw_specular;
   result.padding2 = 0u;
+  result.debug_color = RtxdiDebugValueColor(input.debug_view, input.debug_pixel,
+      (input.debug_flags & 1u) != 0u, input.debug_status,
+      (input.debug_flags & 2u) != 0u, input.debug_value.rgb,
+      (input.debug_flags & 4u) != 0u, input.debug_tuple,
+      (input.debug_flags & 8u) != 0u, input.debug_filtered,
+      (input.debug_flags & 16u) != 0u, input.debug_value,
+      (input.debug_flags & 32u) != 0u, input.debug_sun_status, input.debug_consumer_decision);
+  result.padding3 = 0u;
+  result.debug_packed_distance = input.pack_enabled != 0u
+                                     ? RtxdiDebugPackDistance(input.pack_status, input.pack_distance, input.pack_flags)
+                                     : 0.0;
   g_results[index] = result;
 }
