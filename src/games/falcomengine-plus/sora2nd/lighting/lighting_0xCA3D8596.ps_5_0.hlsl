@@ -816,6 +816,15 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                     rtxdiCharResolved = true;
                     rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FILTERED;
                   } else if (selection.status == RTXDI_DI_STATUS_BLOCKED) {
+                    if (shader_injection_data.rtxdi_local_character_keep < 1.0) {
+                      RtxdiLightingSelection visibleSelection = selection;
+                      visibleSelection.status = RTXDI_DI_STATUS_VISIBLE;
+                      const RtxdiCharacterLightResult characterLight =
+                          RtxdiEvaluateCharacterLight(visibleSelection, dynamicLights_g[selection.index], r4.xyz, DecodeFalcomMrtNormalAsGame((uint2)r1.xy));
+                      if (characterLight.resolved) {
+                        charColor += r0.xyz * characterLight.diffuse * shader_injection_data.rtxdi_local_character_keep;
+                      }
+                    }
                     rtxdiCharResolved = true;
                     rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_BLOCKED;
                   } else {
@@ -1026,6 +1035,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         } else if (rtxdi_selection.status == RTXDI_DI_STATUS_BLOCKED) {
           rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_BLOCKED;
         }
+        if (rtxdi_output_valid && rtxdi_selection.status == RTXDI_DI_STATUS_BLOCKED) rtxdi_inverse_pdf *= 1.0 - saturate(shader_injection_data.rtxdi_local_darkening);
         if (rtxdi_output_valid && shader_injection_data.rtxdi_diffuse_bound > 0.5f) {
           uint denoised_width, denoised_height;
           rtxdiDenoisedDiffuse_g.GetDimensions(denoised_width, denoised_height);
@@ -1492,6 +1502,13 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   RtxdiEffectiveLightingLoopCounts(rtxdi_selection, min(lightIndices_g[r1.x].pointLightCount, 63u),
                                   min(lightIndices_g[r1.x].spotLightCount, 63u), rtxdi_point_loop_count,
                                   rtxdi_spot_loop_count);
+  if (rtxdi_output_valid && rtxdi_selection.status == RTXDI_DI_STATUS_BLOCKED && rtxdi_inverse_pdf > 0.0) {
+    if (rtxdi_selection.type == RTXDI_DI_LIGHT_TYPE_POINT) {
+      rtxdi_point_loop_count = 1u;
+    } else {
+      rtxdi_spot_loop_count = 1u;
+    }
+  }
   if (r20.y != 0) {
     r0.w = rtxdi_point_loop_count;
     r10.xyz = float3(0,0,0);

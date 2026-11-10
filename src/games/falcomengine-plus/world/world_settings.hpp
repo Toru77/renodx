@@ -1465,6 +1465,45 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtxdiLocalShadowDarkening",
+      .binding = &rtxdi::g_local_shadow_darkening,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Shadow Darkening (Local)",
+      .section = "RTXDI",
+      .tooltip = "How dark a blocked RTXDI lamp shadow gets. 1 = full shadow; lower values keep more lamp light in shadow.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiLocalCharacterShadowDarkening",
+      .binding = &rtxdi::g_local_character_shadow_darkening,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Character Shadow Darkening (Local)",
+      .section = "RTXDI",
+      .tooltip = "How dark a character's blocked RTXDI lamp shadow gets. 1 = full shadow.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiLocalCharacterMaxDarkening",
+      .binding = &rtxdi::g_local_character_max_darkening,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Character Max Darkening (Local)",
+      .section = "RTXDI",
+      .tooltip = "Caps how dark an RTXDI lamp shadow can make a character: it keeps at least (1 - value) of that lamp's light. 1 = no cap.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtaoEnabled",
       .binding = &rtao::g_rtao_enabled,
       .value_type = SettingValueType::BOOLEAN,

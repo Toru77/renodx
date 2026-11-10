@@ -43,10 +43,10 @@ struct ShaderInjectData {
   float rtxdi_sun_darkening;                // RTXDI Sun Shadow Darkening [0..1]
   float rtao_debug_show;                    // RTAO: 1 = the lighting shader shows the RTAO texel (t22) as an image (RunRtaoInline); 0 off
   float rtxdi_sun_character_darkening;      // RTXDI Sun Character Shadow Darkening [0..1]
-  float char_shadow_light_screen_fade_start; // RETIRED: Bend_SSS, unread
+  float rtxdi_local_darkening;              // RTXDI Local Shadow Darkening [0..1] (reuses retired offset 76)
   float cs_contact_local_light_clearance;   // [0..1] world units; reuses retired rtgi_reserved without moving later fields
-  float char_shadow_min_occluder_depth_scale; // RETIRED: Bend_SSS, unread
-  float char_shadow_jitter_enabled;          // RETIRED: Bend_SSS, unread
+  float rtxdi_local_character_darkening;    // RTXDI Local Character Shadow Darkening [0..1] (reuses retired offset 84)
+  float rtxdi_local_character_keep;         // RTXDI blocked-lamp light kept on characters [0..1] (reuses retired offset 88)
   // Shadow type: 0 = Camera, 1 = World, 2 = Combined. RETIRED: Bend_SSS, unread.
   float char_shadow_type;
   // Per-pass strengths (0..1). RETIRED: Bend_SSS, unread.

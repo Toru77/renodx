@@ -79,10 +79,10 @@ ShaderInjectData shader_injection = {
     .rtxdi_sun_darkening = 1.f,
     .rtao_debug_show = 0.f,
     .rtxdi_sun_character_darkening = 1.f,
-    .char_shadow_light_screen_fade_start = 0.f,
+    .rtxdi_local_darkening = 1.f,
     .cs_contact_local_light_clearance = 0.2f,
-    .char_shadow_min_occluder_depth_scale = 0.f,
-    .char_shadow_jitter_enabled = 1.f,
+    .rtxdi_local_character_darkening = 1.f,
+    .rtxdi_local_character_keep = 1.f,
     .char_shadow_type = 1.f,
     .char_shadow_camera_strength = 1.f,
     .char_shadow_world_strength = 1.f,
@@ -12890,6 +12890,9 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, 41u, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &slot.di_resolved.srv11});
   shader_injection.rtxdi_local_bound = 1.f;
+  shader_injection.rtxdi_local_darkening = di::FiniteClamped(di::g_local_shadow_darkening, 1.f, 0.f, 1.f);
+  shader_injection.rtxdi_local_character_darkening = di::FiniteClamped(di::g_local_character_shadow_darkening, 1.f, 0.f, 1.f);
+  shader_injection.rtxdi_local_character_keep = 1.f - std::min(shader_injection.rtxdi_local_character_darkening, di::FiniteClamped(di::g_local_character_max_darkening, 1.f, 0.f, 1.f));
   bool still_current = false;
   {
     std::unique_lock lock(di::g_di.mutex);
