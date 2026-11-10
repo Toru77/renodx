@@ -13,6 +13,7 @@
 #include <winnt.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -40,13 +41,17 @@ struct SharedTexture {
 }  // namespace
 
 int main() {
-  for (const auto& test : std::array<std::array<UINT, 4>, 4>{{{{13, 9, 1, 0}}, {{13, 9, 1, 1}}, {{1920, 1080, 0, 1}}, {{1920, 1080, 1, 0}}}}) {
+  // Whole-buffer native bindings are reported as 4096 constants; exercise the
+  // physical 80/81/95/96-row extents through the exact descriptor intersection.
+  for (const auto& test : std::array<std::array<UINT, 5>, 4>{{{{13, 9, 1, 0, 80}}, {{13, 9, 1, 1, 81}}, {{1920, 1080, 0, 1, 95}}, {{1920, 1080, 1, 0, 96}}}}) {
     const UINT width = test[0];
     const UINT height = test[1];
     const bool local = test[2] != 0;
     const bool zero_lights = test[3] != 0;
+    const UINT scene_rows = test[4];
+    const UINT64 descriptor_scene_bytes = scene_rows == 80u || scene_rows == 96u ? UINT64_MAX : uint64_t{scene_rows} * 16u;
     using namespace falcom_world::rtxdi;
-    constexpr UINT offset = 256;
+    constexpr UINT offset = 0;
     RtxdiInputLayout layout = {};
     if (!MakeInputLayout(width, height, false, local, zero_lights ? 0u : 1u, 1u, 1u, &layout)
         || layout.motion_available != 0u) {
@@ -160,25 +165,26 @@ int main() {
       if (!check(d11->CreateTexture2D(&desc, &initial, &texture), "create pixel source")
           || !check(d11->CreateShaderResourceView(texture.Get(), nullptr, &pixels[i]), "create pixel SRV")) return 1;
     }
-    std::vector<uint32_t> scene((offset + 1536) / 4);
+    std::vector<uint32_t> scene((offset + scene_rows * 16u) / 4);
     for (UINT i = 0; i < scene.size(); ++i) scene[i] = 0x12340000u + i;
     D3D11_BUFFER_DESC cb_desc = {};
     cb_desc.ByteWidth = static_cast<UINT>(scene.size() * 4);
     cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     D3D11_SUBRESOURCE_DATA const initial_scene = {.pSysMem = scene.data(), .SysMemPitch = 0, .SysMemSlicePitch = 0};
     ComPtr<ID3D11Buffer> scene_cb;
-    if (!check(d11->CreateBuffer(&cb_desc, &initial_scene, &scene_cb), "create scene CB") || !ValidateSceneBuffer(scene_cb.Get(), offset, 1536)) return 1;
+    if (!check(d11->CreateBuffer(&cb_desc, &initial_scene, &scene_cb), "create scene CB")
+        || !ValidateSceneBuffer(scene_cb.Get(), offset, scene_rows * 16u)) return 1;
     ID3D11Buffer* bound_scene = scene_cb.Get();
-    const UINT first_scene_constant = offset / 16u;
-    const UINT scene_constant_count = 1536u / 16u;
-    ctx1->PSSetConstantBuffers1(0u, 1u, &bound_scene, &first_scene_constant, &scene_constant_count);
+    const UINT first_scene_constant = 0u;
+    const UINT scene_constant_count = 4096u;
+    ctx->PSSetConstantBuffers(0u, 1u, &bound_scene);
     SceneB0BindingEvidence native_scene_evidence = {};
-    if (!ValidateSceneB0Binding(ctx.Get(), scene_cb.Get(), offset, scene_constant_count, &native_scene_evidence)
+    if (!ValidateSceneB0Binding(ctx.Get(), scene_cb.Get(), offset, RTXDI_INPUT_SCENE_REQUIRED_ROWS, &native_scene_evidence)
         || !native_scene_evidence.context_query_available || !native_scene_evidence.buffer_available
         || native_scene_evidence.native_buffer != reinterpret_cast<uint64_t>(scene_cb.Get())
         || native_scene_evidence.first_constant != first_scene_constant
         || native_scene_evidence.constant_count != scene_constant_count || native_scene_evidence.buffer_bytes != cb_desc.ByteWidth
-        || ValidateSceneB0Binding(ctx.Get(), scene_cb.Get(), 0u, scene_constant_count)) {
+        || ValidateSceneB0Binding(ctx.Get(), scene_cb.Get(), 16u, RTXDI_INPUT_SCENE_REQUIRED_ROWS)) {
       std::fprintf(stderr, "FAIL native b0 range evidence offset=%u count=%u bytes=%u\n",
                    native_scene_evidence.first_constant, native_scene_evidence.constant_count,
                    native_scene_evidence.buffer_bytes);
@@ -187,7 +193,47 @@ int main() {
     std::printf("PASS native D3D11 b0 evidence offset=%u constants=%u byte_width=%u\n",
                 native_scene_evidence.first_constant * 16u, native_scene_evidence.constant_count,
                 native_scene_evidence.buffer_bytes);
-    const SceneRangeSnapshot promoted = {.buffer = 1, .offset = offset, .size = 1536, .frame = 4, .command = 1, .live = true, .known = true, .sequence = 1};
+    SceneCopyWindow scene_copy_window = {};
+    if (!MakeSceneCopyWindow(cb_desc.ByteWidth, offset, descriptor_scene_bytes,
+                             native_scene_evidence.first_constant, native_scene_evidence.constant_count,
+                             &scene_copy_window)
+        || scene_copy_window.copied_rows != scene_rows) {
+      std::fprintf(stderr, "FAIL scene copy window rows=%u expected=%u\n", scene_copy_window.copied_rows, scene_rows);
+      return 1;
+    }
+    if (scene_rows == 80u) {
+      D3D11_BUFFER_DESC explicit_desc = {};
+      explicit_desc.ByteWidth = 1536u;
+      explicit_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+      ComPtr<ID3D11Buffer> explicit_cb;
+      if (!check(d11->CreateBuffer(&explicit_desc, nullptr, &explicit_cb), "create explicit-range scene CB")) return 1;
+      ID3D11Buffer* explicit_buffer = explicit_cb.Get();
+      UINT explicit_first = 16u;
+      UINT explicit_count = 80u;
+      ctx1->PSSetConstantBuffers1(0u, 1u, &explicit_buffer, &explicit_first, &explicit_count);
+      SceneB0BindingEvidence explicit_evidence = {};
+      SceneCopyWindow explicit_window = {};
+      if (!ValidateSceneB0Binding(ctx.Get(), explicit_cb.Get(), 256u, 80u, &explicit_evidence)
+          || explicit_evidence.first_constant != 16u || explicit_evidence.constant_count != 80u
+          || explicit_evidence.buffer_bytes != 1536u
+          || !MakeSceneCopyWindow(1536u, 256u, UINT64_MAX, explicit_evidence.first_constant,
+                                  explicit_evidence.constant_count, &explicit_window)
+          || explicit_window.copied_rows != 80u) return 1;
+      explicit_first = 0u;
+      explicit_count = 96u;
+      ctx1->PSSetConstantBuffers1(0u, 1u, &explicit_buffer, &explicit_first, &explicit_count);
+      explicit_evidence = {};
+      explicit_window = {};
+      if (!ValidateSceneB0Binding(ctx.Get(), explicit_cb.Get(), 0u, 80u, &explicit_evidence)
+          || explicit_evidence.first_constant != 0u || explicit_evidence.constant_count != 96u
+          || explicit_evidence.buffer_bytes != 1536u
+          || !MakeSceneCopyWindow(1536u, 0u, UINT64_MAX, explicit_evidence.first_constant,
+                                  explicit_evidence.constant_count, &explicit_window)
+          || explicit_window.copied_rows != 96u) return 1;
+      ctx->PSSetConstantBuffers(0u, 1u, &bound_scene);
+      std::printf("PASS explicit D3D11 b0 ranges first=16/count=80 and first=0/count=96\n");
+    }
+    const SceneRangeSnapshot promoted = {.buffer = 1, .offset = offset, .size = descriptor_scene_bytes, .frame = 4, .normalized_size = uint64_t{scene_rows} * 16u, .command = 1, .native_first_constant = first_scene_constant, .native_constant_count = scene_constant_count, .copied_rows = scene_rows, .live = true, .known = true, .sequence = 1};
     if (CheckPromotedSceneBinding(promoted, promoted, 4, 1, cb_desc.ByteWidth) != SceneBindingStatus::Ready) {
       std::fprintf(stderr, "FAIL valid CBV binding rejected\n");
       return 1;
@@ -221,7 +267,7 @@ int main() {
       if (!ValidateStructuredView(record_views[i].Get(), strides[i], &range) || range.first_element != 1) return 1;
     }
     D3D11_BUFFER_DESC constants_desc = {};
-    constants_desc.ByteWidth = 16;
+    constants_desc.ByteWidth = 32;
     constants_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     ComPtr<ID3D11Buffer> constants;
     if (!check(d11->CreateBuffer(&constants_desc, nullptr, &constants), "create constants")) return 1;
@@ -328,7 +374,7 @@ int main() {
     ctx->CSSetConstantBuffers(12, 1, &constants_ptr);
     ID3D11ShaderResourceView* pixel_srvs[] = {pixels[0].Get(), pixels[1].Get(), pixels[2].Get(), pixels[3].Get(), pixels[4].Get(), nullptr};
     ID3D11UnorderedAccessView* pixel_uavs[] = {carriers[0].uav.Get(), carriers[1].uav.Get(), carriers[2].uav.Get(), carriers[3].uav.Get(), carriers[4].uav.Get(), carriers[5].uav.Get(), nullptr};
-    UINT params[] = {width, height, local ? 1u : 0u, 0};
+    UINT params[] = {width, height, local ? 1u : 0u, 0u, scene_rows};
     ctx->UpdateSubresource(constants.Get(), 0, nullptr, params, 0, 0);
     ctx->CSSetShader(pack_inputs.Get(), nullptr, 0);
     ctx->CSSetShaderResources(0, 6, pixel_srvs);
@@ -429,7 +475,9 @@ int main() {
       if (!check(readback[i]->Map(0, nullptr, &mapped), "map readback")) return 1;
       std::vector<uint32_t> untouched(sizes[i] / 4, sentinel[0]);
       const void* expected = untouched.data();
-      if (i == 0) expected = scene.data() + (offset / 4);
+      std::vector<uint32_t> expected_scene(1536u / 4u, 0u);
+      std::copy_n(scene.data() + (offset / 4u), scene_rows * 4u, expected_scene.data());
+      if (i == 0) expected = expected_scene.data();
       if (i > 0 && local && (i != 1 || !zero_lights)) expected = records[i - 1].data() + (strides[i - 1] / 4);
       const bool match = std::memcmp(mapped, expected, sizes[i]) == 0;
       readback[i]->Unmap(0, nullptr);
@@ -460,7 +508,8 @@ int main() {
       pixel_readback[i]->Unmap(0, nullptr);
       if (!match) return 1;
     }
-    std::printf("PASS %ux%u local=%u zero_lights=%u motion=absent\n", width, height, static_cast<int>(local), static_cast<int>(zero_lights));
+    std::printf("PASS %ux%u local=%u zero_lights=%u scene_rows=%u motion=absent tail=zero\n", width, height,
+                static_cast<int>(local), static_cast<int>(zero_lights), scene_rows);
   }
   return RunRtxdiDxrBridge();
 }

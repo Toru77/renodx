@@ -921,12 +921,38 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .label = "Denoiser status",
       .section = "RTXDI",
       .on_draw = []() {
+        rt12::Rt12Panel nrd_panel;
+        {
+          std::lock_guard lock(rt12::g_rt12_panel_mutex);
+          nrd_panel = rt12::g_rt12_panel;
+        }
+        const bool rr_suppressed = rr::RrRequested() || rr::RrOwnsDenoise();
+        const bool relax_requested = rtxdi::g_diffuse_denoiser > 0.5f;
 #if defined(FALCOM_NRD_ENABLED)
-        ImGui::Text("NRD SDK: available");
-        ImGui::Text("RTXDI denoiser: %s", (rr::RrRequested() || rr::RrOwnsDenoise()) ? "Disabled by Ray Reconstruction"
-                                                                                     : (rtxdi::g_diffuse_denoiser > 0.5f ? "RELAX selected" : "Raw selected"));
+        const char* backend = nrd_panel.nrd_backend_state == 2u   ? "ready"
+                              : nrd_panel.nrd_backend_state == 3u ? "initialization failed"
+                                                                  : "not initialized";
+        const char* policy = !relax_requested ? "Raw selected"
+                             : rr_suppressed  ? "Raw (RELAX suppressed by Ray Reconstruction; local/sun remain)"
+                                              : (nrd_panel.nrd_backend_state == 2u ? "RELAX selected" : "Raw (NRD backend unavailable)");
+        ImGui::Text("NRD SDK: compiled | backend: %s%s", backend,
+                    nrd_panel.nrd_failure_stage == 1u   ? " (SDK/instance)"
+                    : nrd_panel.nrd_failure_stage == 2u ? " (D3D12 backend)"
+                                                        : "");
+        ImGui::Text("RTXDI diffuse policy: %s", policy);
+        rtxdi::DiSnapshot di;
+        {
+          std::shared_lock lock(rtxdi::g_di.mutex);
+          di = rtxdi::g_di.snapshot;
+        }
+        ImGui::Text("Private NRD diffuse output staged: %s (frame %u)", di.nrd_diffuse_staged ? "yes" : "no",
+                    di.nrd_diffuse_frame);
 #else
-        ImGui::Text("NRD SDK: unavailable; diffuse remains raw");
+        ImGui::Text("NRD SDK: not compiled");
+        ImGui::Text("RTXDI diffuse policy: %s", !relax_requested ? "Raw selected"
+                                                                : rr_suppressed ? "Raw (RELAX suppressed by Ray Reconstruction; local/sun remain)"
+                                                                                : "Raw (NRD SDK unavailable)");
+        ImGui::Text("Private NRD diffuse output staged: unavailable");
 #endif
         return false;
       },
@@ -1192,9 +1218,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           summary.binding_status = static_cast<uint32_t>(di.output_bound);
           summary.rr_requested = rr::RrRequested() ? 1u : 0u;
           summary.rr_owns_denoise = rr::RrOwnsDenoise() ? 1u : 0u;
-          summary.denoiser_reason = summary.rr_requested || summary.rr_owns_denoise ? 1u
-                                    : rtxdi::g_diffuse_denoiser > 0.5f              ? 2u
-                                                                                    : 0u;
           summary.last_hresult = input.error != 0 ? input.error : di.error;
           summary.requested_candidates = rtxdi::g_local_candidates > 0.f
                                              ? static_cast<uint32_t>(rtxdi::g_local_candidates)
@@ -1205,12 +1228,42 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                                   : 0u;
           summary.effective_spatial_samples = di.spatial_samples;
           summary.requested_denoiser = rtxdi::g_diffuse_denoiser > 0.5f ? 1u : 0u;
-          summary.effective_denoiser = summary.denoiser_reason == 2u ? 1u : 0u;
+          rt12::Rt12Panel nrd_panel;
+          {
+            std::lock_guard lock(rt12::g_rt12_panel_mutex);
+            nrd_panel = rt12::g_rt12_panel;
+          }
+#if defined(FALCOM_NRD_ENABLED)
+          summary.nrd_compiled = 1u;
+          summary.nrd_status = nrd_panel.nrd_backend_state;
+          summary.nrd_failure_stage = nrd_panel.nrd_failure_stage;
+          summary.nrd_output_staged = di.nrd_diffuse_staged ? 1u : 0u;
+          if (!summary.requested_denoiser) {
+            summary.nrd_policy = static_cast<uint32_t>(rtxdi::DiagnosticNrdPolicy::RawSelected);
+          } else if (summary.rr_requested || summary.rr_owns_denoise) {
+            summary.nrd_policy = static_cast<uint32_t>(rtxdi::DiagnosticNrdPolicy::RayReconstructionSuppressed);
+          } else if (nrd_panel.nrd_backend_state == 2u) {
+            summary.nrd_policy = static_cast<uint32_t>(rtxdi::DiagnosticNrdPolicy::RelaxSelected);
+          } else {
+            summary.nrd_policy = static_cast<uint32_t>(rtxdi::DiagnosticNrdPolicy::BackendUnavailable);
+          }
+          summary.effective_denoiser = summary.nrd_policy == static_cast<uint32_t>(rtxdi::DiagnosticNrdPolicy::RelaxSelected) ? 1u : 0u;
+#else
+          summary.nrd_compiled = 0u;
+          summary.nrd_status = static_cast<uint32_t>(rtxdi::DiagnosticNrdBackend::NotCompiled);
+          summary.nrd_failure_stage = 0u;
+          summary.nrd_policy = !summary.requested_denoiser ? static_cast<uint32_t>(rtxdi::DiagnosticNrdPolicy::RawSelected)
+                              : (summary.rr_requested || summary.rr_owns_denoise) ? static_cast<uint32_t>(rtxdi::DiagnosticNrdPolicy::RayReconstructionSuppressed)
+                                                                                : static_cast<uint32_t>(rtxdi::DiagnosticNrdPolicy::NoSdk);
+          summary.nrd_output_staged = 0u;
+          summary.effective_denoiser = 0u;
+#endif
+          summary.denoiser_reason = summary.nrd_policy;
           summary.runtime_gates = (falcom_world::g_state.supported ? 1u : 0u)
                                   | (rtxdi::g_local_requested > 0.5f ? 2u : 0u)
                                   | (rtxdi::g_sun_requested > 0.5f ? 4u : 0u);
           summary.available_mask = rtxdi::DiagnosticStatesAvailable | rtxdi::DiagnosticSettingsAvailable
-                                   | rtxdi::DiagnosticRrStateAvailable;
+                                   | rtxdi::DiagnosticRrStateAvailable | rtxdi::DiagnosticNrdStatusAvailable;
           if (summary.frame != UINT32_MAX) summary.available_mask |= rtxdi::DiagnosticFrameAvailable;
           if (input.transfer_slot >= 0) summary.available_mask |= rtxdi::DiagnosticInputIdentityAvailable;
           if (input.width != 0u && input.height != 0u) summary.available_mask |= rtxdi::DiagnosticDimensionsAvailable;

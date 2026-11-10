@@ -29,7 +29,18 @@ enum DiagnosticAvailability : uint32_t {
   DiagnosticConsumerFenceCAvailable = 1u << 6u,
   DiagnosticSettingsAvailable = 1u << 7u,
   DiagnosticRrStateAvailable = 1u << 8u,
+  DiagnosticNrdStatusAvailable = 1u << 9u,
 };
+
+enum class DiagnosticNrdBackend : uint32_t { NotCompiled,
+                                             NotInitialized,
+                                             Ready,
+                                             Failed };
+enum class DiagnosticNrdPolicy : uint32_t { RawSelected,
+                                            RayReconstructionSuppressed,
+                                            NoSdk,
+                                            BackendUnavailable,
+                                            RelaxSelected };
 
 enum class DiagnosticStage : uint16_t {
   None,
@@ -130,6 +141,12 @@ struct DiagnosticEvent {
   uint64_t buffer_bytes = 0u;
   uint64_t normalized_size = 0u;
   uint64_t native_buffer_bytes = 0u;
+  uint64_t native_offset_bytes = 0u;
+  uint64_t native_count_bytes = 0u;
+  uint32_t available_rows = 0u;
+  uint32_t required_rows = 0u;
+  uint32_t copied_rows = 0u;
+  uint32_t native_bind_flags = 0u;
   std::array<uint64_t, 4> identity_tokens = {};
   int32_t hresult = 0;
   int32_t scene_slot = -1;
@@ -219,6 +236,10 @@ struct DiagnosticSummary {
   uint32_t di_status = 0u;
   uint32_t sun_status = 0u;
   uint32_t nrd_status = 0u;
+  uint32_t nrd_compiled = 0u;
+  uint32_t nrd_failure_stage = 0u;
+  uint32_t nrd_policy = static_cast<uint32_t>(DiagnosticNrdPolicy::RawSelected);
+  uint32_t nrd_output_staged = 0u;
   uint32_t publication_status = 0u;
   uint32_t binding_status = 0u;
   int32_t last_hresult = 0;
@@ -325,6 +346,9 @@ inline bool SameDiagnosticTransition(const DiagnosticEvent& a, const DiagnosticE
          && a.hresult == b.hresult && a.value0 == b.value0 && a.value1 == b.value1
          && a.buffer_bytes == b.buffer_bytes && a.normalized_size == b.normalized_size
          && a.native_buffer_bytes == b.native_buffer_bytes
+         && a.native_offset_bytes == b.native_offset_bytes && a.native_count_bytes == b.native_count_bytes
+         && a.available_rows == b.available_rows && a.required_rows == b.required_rows
+         && a.copied_rows == b.copied_rows && a.native_bind_flags == b.native_bind_flags
          && a.identity_tokens == b.identity_tokens && a.flags == b.flags
          && a.first_constant == b.first_constant && a.constant_count == b.constant_count
          && a.input_kind == b.input_kind && a.validation_code == b.validation_code
@@ -485,13 +509,14 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
   append("codes input=0:None,1:Depth,2:Normal,3:Color,4:Mrt1,5:Mrt2,6:Motion,7:Lights,8:Tiles,9:Deferred,10:Layout; validation=0:None,1:InvalidTextureView,2:InvalidStructuredView,3:LayoutRejected,4:OptionalFallback\n");
   append("codes input_status=0:Off,1:AlreadyAttempted,2:WaitingForScene,3:MissingInput,4:SceneBindingChanged,5:Busy,6:AllocationFailed,7:SubmitFailed,8:Quarantined,9:Ready; input_stage=0:None,1:Validate,2:Allocate,3:Pack,4:SignalA,5:Record,6:Order,7:Submit,8:WaitB,9:Ready; 65535=unavailable\n");
   const auto& summary = snapshot.latest;
-  append("summary frame=%llu capture_frame=%llu owner=%llu settings=%llu effective=%llu config=%llu n1=unavailable nrd=unavailable size=%ux%u scene_slot=%u transfer_slot=%u\n",
+  append("summary frame=%llu capture_frame=%llu owner=%llu settings=%llu effective=%llu config=%llu n1=unavailable nrd_config=unavailable size=%ux%u scene_slot=%u transfer_slot=%u\n",
          static_cast<unsigned long long>(summary.frame), static_cast<unsigned long long>(summary.capture_frame),
          static_cast<unsigned long long>(summary.owner_generation), static_cast<unsigned long long>(summary.requested_settings),
          static_cast<unsigned long long>(summary.effective_settings), static_cast<unsigned long long>(summary.configuration_generation),
          summary.width, summary.height, summary.scene_slot, summary.transfer_slot);
-  append("states scene=%u input=%u stage=%u di=%u sun=%u nrd=unavailable publication=%u binding=%u rr_requested=%u rr_owner=%u denoiser=%u\n",
+  append("states scene=%u input=%u stage=%u di=%u sun=%u nrd_backend=%u nrd_failure_stage=%u nrd_policy=%u nrd_diffuse_staged=%u publication=%u binding=%u rr_requested=%u rr_owner=%u denoiser=%u\n",
          summary.scene_status, summary.input_status, summary.input_stage, summary.di_status, summary.sun_status,
+         summary.nrd_status, summary.nrd_failure_stage, summary.nrd_policy, summary.nrd_output_staged,
          summary.publication_status, summary.binding_status, summary.rr_requested,
          summary.rr_owns_denoise, summary.denoiser_reason);
   append("debug requested=%u effective=%u source_ready=%u reason=%u frame=%u owner=%llu transfer_config=%llu di_config=%llu n1_config=",
@@ -521,9 +546,10 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
          static_cast<unsigned long long>(summary.current_status_reports_failure),
          static_cast<unsigned long long>(summary.bindings), static_cast<unsigned long long>(summary.matching_draw_callbacks));
   append("current_status_reports_failure is only scene Failed or input SubmitFailed in the latest summary; false does not clear failure history\n");
-  append("resource bytes=unavailable count=unavailable format=unavailable stride=unavailable elements=unavailable shader=unavailable layout=unavailable available=0x%08x hresult=%d gates=0x%08x sdk=unavailable nrd=unavailable api=unavailable dxr=unavailable devkit=unavailable adapter=unavailable\n",
-         summary.available_mask, summary.last_hresult, summary.runtime_gates);
-  append("availability bits: frame=0 states=1 input_identity=2 dimensions=3 scene_fence=4 B_fence_value=5 C_fence_value=6 settings=7 rr=8; unlisted fields unavailable\n");
+  append("resource bytes=unavailable count=unavailable format=unavailable stride=unavailable elements=unavailable shader=unavailable layout=unavailable available=0x%08x hresult=%d gates=0x%08x sdk=unavailable nrd_compiled=%u api=unavailable dxr=unavailable devkit=unavailable adapter=unavailable\n",
+         summary.available_mask, summary.last_hresult, summary.runtime_gates, summary.nrd_compiled);
+  append("availability bits: frame=0 states=1 input_identity=2 dimensions=3 scene_fence=4 B_fence_value=5 C_fence_value=6 settings=7 rr=8 nrd_status=9; unlisted fields unavailable\n");
+  append("nrd_backend=0:NotCompiled,1:NotInitialized,2:Ready,3:Failed; nrd_failure_stage=0:None,1:SDKInstance,2:D3D12Backend; nrd_policy=0:RawSelected,1:RayReconstructionSuppressed,2:NoSdk,3:BackendUnavailable,4:RelaxSelected; RR suppression applies to diffuse denoising, raw local/sun lighting remains independent; staged is private producer evidence, not per-pixel application\n");
   append("settings candidates=%u/%u spatial=%u/%u denoiser=%u/%u camera=unavailable reset=unavailable age_sentinel=%llu\n",
          summary.requested_candidates, summary.effective_candidates, summary.requested_spatial_samples,
          summary.effective_spatial_samples, summary.requested_denoiser, summary.effective_denoiser,
@@ -539,7 +565,7 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
   for (const auto& failure : snapshot.first_failures) {
     if (!failure.occupied) continue;
     const auto& event = failure.first;
-    append("  stage=%u reason=%u op=%u input=%u validation=%u input_status=%u input_stage=%u count=%llu first=%llu latest=%llu owner=%llu frame=%llu capture=%llu hr=%d scene=%d transfer=%d settings=%llu effective=%llu tokens=%llu,%llu,%llu,%llu flags=0x%08x range=%llu,%llu buffer=%llu normalized=%llu native_bytes=%llu native_range=%u,%u\n",
+    append("  stage=%u reason=%u op=%u input=%u validation=%u input_status=%u input_stage=%u count=%llu first=%llu latest=%llu owner=%llu frame=%llu capture=%llu hr=%d scene=%d transfer=%d settings=%llu effective=%llu tokens=%llu,%llu,%llu,%llu flags=0x%08x range=%llu,%llu buffer=%llu normalized=%llu native_bytes=%llu native_range=%u,%u native_window=%llu,%llu bind_flags=0x%08x rows=%u/%u copied=%u\n",
            static_cast<uint32_t>(event.stage), static_cast<uint32_t>(event.reason), static_cast<uint32_t>(event.operation),
            static_cast<uint32_t>(event.input_kind), static_cast<uint32_t>(event.validation_code),
            static_cast<uint32_t>(event.input_status), static_cast<uint32_t>(event.input_stage),
@@ -553,14 +579,17 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
            static_cast<unsigned long long>(event.value0), static_cast<unsigned long long>(event.value1),
            static_cast<unsigned long long>(event.buffer_bytes), static_cast<unsigned long long>(event.normalized_size),
            static_cast<unsigned long long>(event.native_buffer_bytes),
-           event.first_constant, event.constant_count);
+           event.first_constant, event.constant_count,
+           static_cast<unsigned long long>(event.native_offset_bytes),
+           static_cast<unsigned long long>(event.native_count_bytes), event.native_bind_flags,
+           event.available_rows, event.required_rows, event.copied_rows);
   }
   append("recent_transitions oldest_to_newest:\n");
   const uint32_t first = (snapshot.transition_head + snapshot.transitions.size() - snapshot.transition_size)
                          % snapshot.transitions.size();
   for (uint32_t i = 0u; i < snapshot.transition_size; ++i) {
     const auto& event = snapshot.transitions[(first + i) % snapshot.transitions.size()];
-    append("  seq=%llu stage=%u reason=%u op=%u input=%u validation=%u input_status=%u input_stage=%u owner=%llu frame=%llu capture=%llu hr=%d scene=%d transfer=%d fence=%llu tokens=%llu,%llu,%llu,%llu flags=0x%08x range=%llu,%llu buffer=%llu normalized=%llu native_bytes=%llu native_range=%u,%u\n",
+    append("  seq=%llu stage=%u reason=%u op=%u input=%u validation=%u input_status=%u input_stage=%u owner=%llu frame=%llu capture=%llu hr=%d scene=%d transfer=%d fence=%llu tokens=%llu,%llu,%llu,%llu flags=0x%08x range=%llu,%llu buffer=%llu normalized=%llu native_bytes=%llu native_range=%u,%u native_window=%llu,%llu bind_flags=0x%08x rows=%u/%u copied=%u\n",
            static_cast<unsigned long long>(event.event_sequence), static_cast<uint32_t>(event.stage),
            static_cast<uint32_t>(event.reason), static_cast<uint32_t>(event.operation),
            static_cast<uint32_t>(event.input_kind), static_cast<uint32_t>(event.validation_code),
@@ -572,7 +601,10 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
            static_cast<unsigned long long>(event.identity_tokens[3]), event.flags,
            static_cast<unsigned long long>(event.value0), static_cast<unsigned long long>(event.value1),
            static_cast<unsigned long long>(event.buffer_bytes), static_cast<unsigned long long>(event.normalized_size),
-           static_cast<unsigned long long>(event.native_buffer_bytes), event.first_constant, event.constant_count);
+           static_cast<unsigned long long>(event.native_buffer_bytes), event.first_constant, event.constant_count,
+           static_cast<unsigned long long>(event.native_offset_bytes),
+           static_cast<unsigned long long>(event.native_count_bytes), event.native_bind_flags,
+           event.available_rows, event.required_rows, event.copied_rows);
   }
   if (truncated || size >= buffer.size() - 1u) {
     constexpr char summary_text[] = "\n[report truncated at fixed 65536-byte limit]\n";

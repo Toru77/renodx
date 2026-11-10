@@ -16,6 +16,7 @@ struct SceneB0BindingEvidence {
   uint32_t first_constant = 0u;
   uint32_t constant_count = 0u;
   uint32_t buffer_bytes = 0u;
+  uint32_t bind_flags = 0u;
   HRESULT context_query_result = E_POINTER;
   bool context_query_available = false;
   bool buffer_available = false;
@@ -25,7 +26,7 @@ inline bool ValidateSceneB0Binding(ID3D11DeviceContext* context, ID3D11Buffer* e
                                    uint64_t expected_offset, uint32_t minimum_constants,
                                    SceneB0BindingEvidence* evidence = nullptr) {
   if (evidence != nullptr) *evidence = {};
-  if (context == nullptr || expected_buffer == nullptr) return false;
+  if (context == nullptr) return false;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext1> context1;
   const HRESULT query_result = context->QueryInterface(IID_PPV_ARGS(&context1));
   if (evidence != nullptr) {
@@ -45,9 +46,15 @@ inline bool ValidateSceneB0Binding(ID3D11DeviceContext* context, ID3D11Buffer* e
       D3D11_BUFFER_DESC desc = {};
       buffer->GetDesc(&desc);
       evidence->buffer_bytes = desc.ByteWidth;
+      evidence->bind_flags = desc.BindFlags;
     }
   }
-  return buffer.Get() == expected_buffer && uint64_t{first} * 16u == expected_offset && count >= minimum_constants;
+  if (expected_buffer == nullptr || buffer.Get() != expected_buffer || uint64_t{first} * 16u != expected_offset
+      || count < minimum_constants) return false;
+  if (evidence != nullptr) return (evidence->bind_flags & D3D11_BIND_CONSTANT_BUFFER) != 0u;
+  D3D11_BUFFER_DESC desc = {};
+  buffer->GetDesc(&desc);
+  return (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0u;
 }
 
 inline bool GetTextureViewExtent(ID3D11ShaderResourceView* view, uint32_t* width, uint32_t* height) {

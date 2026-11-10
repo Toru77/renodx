@@ -340,7 +340,58 @@ int main() {
   }
   {
     using namespace falcom_world::rtxdi;
-    const SceneRangeSnapshot promoted = {.buffer = 11u, .offset = 256u, .size = 1536u, .frame = 5u, .command = 7u, .live = true, .known = true, .sequence = 8u, .reset_generation = 3u};
+    DiagnosticSummary nrd = {};
+    nrd.available_mask = DiagnosticNrdStatusAvailable;
+    nrd.nrd_compiled = 1u;
+    nrd.nrd_status = static_cast<uint32_t>(DiagnosticNrdBackend::Failed);
+    nrd.nrd_failure_stage = 2u;
+    nrd.nrd_policy = static_cast<uint32_t>(DiagnosticNrdPolicy::BackendUnavailable);
+    nrd.nrd_output_staged = 0u;
+    const auto report = SerializeDiagnosticReport(DiagnosticSnapshot{.latest = nrd});
+    if (report.find("nrd_backend=3 nrd_failure_stage=2 nrd_policy=3 nrd_diffuse_staged=0") == std::string::npos
+        || report.find("nrd_compiled=1") == std::string::npos
+        || report.find("staged is private producer evidence, not per-pixel application") == std::string::npos) return EXIT_FAILURE;
+    nrd.nrd_compiled = 0u;
+    nrd.nrd_status = static_cast<uint32_t>(DiagnosticNrdBackend::NotCompiled);
+    nrd.nrd_failure_stage = 0u;
+    nrd.nrd_policy = static_cast<uint32_t>(DiagnosticNrdPolicy::NoSdk);
+    const auto no_sdk_report = SerializeDiagnosticReport(DiagnosticSnapshot{.latest = nrd});
+    if (no_sdk_report.find("nrd_backend=0 nrd_failure_stage=0 nrd_policy=2 nrd_diffuse_staged=0") == std::string::npos
+        || no_sdk_report.find("nrd_compiled=0") == std::string::npos) return EXIT_FAILURE;
+    nrd.nrd_compiled = 1u;
+    nrd.nrd_status = static_cast<uint32_t>(DiagnosticNrdBackend::Ready);
+    nrd.nrd_policy = static_cast<uint32_t>(DiagnosticNrdPolicy::RelaxSelected);
+    nrd.nrd_output_staged = 1u;
+    const auto relax_report = SerializeDiagnosticReport(DiagnosticSnapshot{.latest = nrd});
+    if (relax_report.find("nrd_backend=2 nrd_failure_stage=0 nrd_policy=4 nrd_diffuse_staged=1") == std::string::npos
+        || relax_report.find("raw local/sun lighting remains independent") == std::string::npos
+        || relax_report.find("staged is private producer evidence") == std::string::npos) return EXIT_FAILURE;
+    std::printf("PASS NRD report separates compiled/backend/policy/private staged output and no-SDK fallback\n");
+  }
+  {
+    using namespace falcom_world::rtxdi;
+    for (const uint32_t rows : {79u, 80u, 81u, 95u, 96u}) {
+      SceneCopyWindow window = {};
+      const bool accepted = MakeSceneCopyWindow(256u + 96u * 16u, 256u, UINT64_MAX, 16u,
+                                                rows, &window);
+      if (accepted != (rows >= RTXDI_INPUT_SCENE_REQUIRED_ROWS) || window.available_rows != rows
+          || window.copied_rows != rows || window.normalized_bytes != 1536u
+          || window.available_bytes != uint64_t{rows} * 16u) return EXIT_FAILURE;
+    }
+    SceneCopyWindow window = {};
+    if (!MakeSceneCopyWindow(512u + 128u * 16u, 512u, 1296u, 32u, 100u, &window)
+        || window.normalized_bytes != 1296u || window.available_bytes != 1296u
+        || window.available_rows != 81u || window.copied_rows != 81u
+        || !MakeSceneCopyWindow(256u + 200u * 16u, 256u, UINT64_MAX, 16u, 128u, &window)
+        || window.normalized_bytes != 3200u || window.available_rows != 128u || window.copied_rows != 96u
+        || MakeSceneCopyWindow(256u + 96u * 16u, 256u, 1281u, 16u, 96u, &window)
+        || MakeSceneCopyWindow(256u + 96u * 16u, 256u, UINT64_MAX, 15u, 96u, &window)
+        || MakeSceneCopyWindow(256u + 96u * 16u, 256u, UINT64_MAX, 16u, 79u, &window)) return EXIT_FAILURE;
+    std::printf("PASS RTXDI scene prefix rows 79/80/81/95/96, sentinel, offset, cap, malformed range\n");
+  }
+  {
+    using namespace falcom_world::rtxdi;
+    const SceneRangeSnapshot promoted = {.buffer = 11u, .offset = 256u, .size = 1536u, .frame = 5u, .normalized_size = 1536u, .command = 7u, .live = true, .known = true, .sequence = 8u, .reset_generation = 3u};
     SceneBindingEvidence evidence;
     if (CheckPromotedSceneBinding(promoted, promoted, 5u, 7u, 4096u, &evidence) != SceneBindingStatus::Ready
         || evidence.reason != DiagnosticReason::None || !evidence.normalized_valid
@@ -387,6 +438,7 @@ int main() {
     malformed_promoted.offset = 1u;
     if (CheckPromotedSceneBinding(malformed_promoted, changed, 5u, 7u, 4096u, &evidence) != SceneBindingStatus::SceneBindingChanged
         || evidence.reason != DiagnosticReason::InvalidRange || evidence.normalized_valid) return EXIT_FAILURE;
+    std::printf("PASS RTXDI promoted native scene range identity and recheck\n");
   }
   using falcom_world::rtxdi::CanReuseDiOutput;
   using falcom_world::rtxdi::CheckDiOutputIdentity;
@@ -903,7 +955,7 @@ int main() {
   falcom_world::rtxdi::SceneRangeCapture guarded;
   falcom_world::rtxdi::TrackSceneBinding(&guarded, {.buffer = 55u, .offset = 256u, .size = UINT64_MAX, .frame = 4u, .command = 9u, .live = true, .known = true});
   auto promoted = guarded.bindings.at(9u);
-  promoted.size = 1792u;
+  promoted.normalized_size = 1792u;
   guarded.snapshot = promoted;
   using falcom_world::rtxdi::CheckPromotedSceneBinding;
   using falcom_world::rtxdi::SceneBindingStatus;
@@ -1197,6 +1249,34 @@ int main() {
   if (ReadSceneCpuMirror(camera_device, camera_buffer, camera_offset, camera_bytes, 6u, 15u,
                          camera_copy.data(), nullptr, nullptr)) return EXIT_FAILURE;
   ResetSceneCpuMirrorsForDevice(camera_device);
+  std::printf("PASS RTXDI 96-row mirror sequence/reset/map contracts\n");
+  {
+    using namespace falcom_world::rtxdi;
+    constexpr uintptr_t prefix_device = 0xA12u;
+    constexpr uint64_t prefix_buffer = 0xB25u;
+    constexpr uint64_t prefix_offset = 256u;
+    constexpr uint64_t prefix_bytes = RTXDI_INPUT_SCENE_REQUIRED_ROWS * 16u;
+    std::array<uint8_t, prefix_bytes> prefix_source = {};
+    std::array<uint8_t, prefix_bytes> prefix_copy = {};
+    for (uint32_t index = 0u; index < prefix_bytes; ++index) prefix_source[index] = static_cast<uint8_t>(index * 29u);
+    RegisterSceneCpuMirrorRange(prefix_device, prefix_buffer, prefix_offset, prefix_bytes, 10u, 20u);
+    SeedSceneCpuMirrorInitial(prefix_device, prefix_buffer, prefix_offset, prefix_bytes, prefix_source.data());
+    if (!ReadSceneCpuMirror(prefix_device, prefix_buffer, prefix_offset, prefix_bytes, 10u, 20u,
+                            prefix_copy.data(), nullptr, nullptr)
+        || prefix_copy != prefix_source) return EXIT_FAILURE;
+    RegisterSceneCpuMirrorRange(prefix_device, prefix_buffer, prefix_offset, prefix_bytes, 11u, 21u);
+    MirrorSceneCpuWrite(prefix_device, prefix_buffer, prefix_source.data(), prefix_offset, 640u, 11u);
+    if (ReadSceneCpuMirror(prefix_device, prefix_buffer, prefix_offset, prefix_bytes, 11u, 21u,
+                           prefix_copy.data(), nullptr, nullptr)) return EXIT_FAILURE;
+    MirrorSceneCpuWrite(prefix_device, prefix_buffer, prefix_source.data() + 640u,
+                        prefix_offset + 640u, prefix_bytes - 640u, 11u);
+    if (!ReadSceneCpuMirror(prefix_device, prefix_buffer, prefix_offset, prefix_bytes, 11u, 21u,
+                            prefix_copy.data(), nullptr, nullptr)
+        || prefix_copy != prefix_source) return EXIT_FAILURE;
+    InvalidateSceneCpuMirror(prefix_device, prefix_buffer);
+    ResetSceneCpuMirrorsForDevice(prefix_device);
+    std::printf("PASS RTXDI 80-row initial seed and partial-write coverage at offset 256\n");
+  }
   using falcom_world::rtxdi::BuildCameraCandidate;
   using falcom_world::rtxdi::CameraCandidate;
   using falcom_world::rtxdi::CameraMatrix;

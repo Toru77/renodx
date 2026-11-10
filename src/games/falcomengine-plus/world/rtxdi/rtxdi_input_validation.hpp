@@ -20,8 +20,10 @@ enum class SceneCaptureSource { None,
                                 DescriptorTable };
 struct SceneRangeSnapshot {
   uint64_t buffer = 0u, offset = 0u, size = 0u, frame = UINT64_MAX;
+  uint64_t normalized_size = 0u;
   uintptr_t command = 0u;
   SceneCaptureSource source = SceneCaptureSource::None;
+  uint32_t native_first_constant = 0u, native_constant_count = 0u, copied_rows = 0u;
   bool live = false;
   bool known = false;
   uint64_t sequence = 0u;
@@ -66,7 +68,8 @@ inline SceneCpuMirror* FindSceneCpuMirror(std::vector<SceneCpuMirror>& mirrors, 
 
 inline void RegisterSceneCpuMirrorRange(uintptr_t device, uint64_t buffer, uint64_t offset, uint64_t size,
                                         uint64_t frame, uint64_t binding_sequence) {
-  if (device == 0u || buffer == 0u || size != RTXDI_SURFACE_SCENE_ROW_COUNT * 16u
+  if (device == 0u || buffer == 0u || size < RTXDI_INPUT_SCENE_REQUIRED_ROWS * 16u
+      || size > RTXDI_INPUT_SCENE_ROWS * 16u || (size % 16u) != 0u
       || offset > UINT64_MAX - size || binding_sequence == 0u) return;
   auto& registry = GetSceneCpuMirrorRegistry();
   std::lock_guard lock(registry.mutex);
@@ -119,7 +122,8 @@ inline void MirrorSceneCpuWriteLocked(SceneCpuMirror* mirror, const void* data, 
 
 inline void SeedSceneCpuMirrorInitial(uintptr_t device, uint64_t buffer, uint64_t offset, uint64_t size,
                                       const void* data) {
-  if (data == nullptr || size != RTXDI_SURFACE_SCENE_ROW_COUNT * 16u || offset > UINT64_MAX - size) return;
+  if (data == nullptr || size < RTXDI_INPUT_SCENE_REQUIRED_ROWS * 16u
+      || size > RTXDI_INPUT_SCENE_ROWS * 16u || (size % 16u) != 0u || offset > UINT64_MAX - size) return;
   auto& registry = GetSceneCpuMirrorRegistry();
   std::lock_guard lock(registry.mutex);
   SceneCpuMirror* mirror = FindSceneCpuMirror(registry.mirrors, device, buffer);
@@ -268,12 +272,42 @@ inline bool NormalizeSceneInputRange(uint64_t buffer_bytes, uint64_t offset, uin
   const uint64_t available = buffer_bytes - offset;
   if (range_bytes == UINT64_MAX) {
     range_bytes = available;
-  } else if ((range_bytes % 256u) != 0u || range_bytes > available) {
+  } else if ((range_bytes % 16u) != 0u || range_bytes > available) {
     return false;
   }
-  if (range_bytes < RTXDI_INPUT_SCENE_ROWS * 16u) return false;
+  if (range_bytes < RTXDI_INPUT_SCENE_REQUIRED_ROWS * 16u) return false;
   *normalized_bytes = range_bytes;
   return true;
+}
+
+struct SceneCopyWindow {
+  uint64_t normalized_bytes = 0u;
+  uint64_t available_bytes = 0u;
+  uint32_t available_rows = 0u;
+  uint32_t copied_rows = 0u;
+};
+
+inline bool MakeSceneCopyWindow(uint64_t buffer_bytes, uint64_t descriptor_offset, uint64_t descriptor_size,
+                                uint32_t native_first_constant, uint32_t native_constant_count,
+                                SceneCopyWindow* window) {
+  if (window == nullptr || uint64_t{native_first_constant} * 16u != descriptor_offset) return false;
+  uint64_t normalized_bytes = 0u;
+  if (!NormalizeSceneInputRange(buffer_bytes, descriptor_offset, descriptor_size, &normalized_bytes)) return false;
+  const uint64_t native_remaining = buffer_bytes - descriptor_offset;
+  // D3D11.1 reports 4096 constants for a whole-buffer binding; use the
+  // resource's physical extent instead of interpreting that sentinel as bytes.
+  const uint64_t native_bytes = native_constant_count == 4096u
+                                    ? native_remaining
+                                    : uint64_t{native_constant_count} * 16u;
+  if (native_bytes > native_remaining) return false;
+  const uint64_t available_bytes = (std::min)(normalized_bytes, native_bytes);
+  const uint32_t available_rows = static_cast<uint32_t>(available_bytes / 16u);
+  const uint32_t copied_rows = (std::min)(available_rows, RTXDI_INPUT_SCENE_ROWS);
+  *window = {.normalized_bytes = normalized_bytes,
+             .available_bytes = available_bytes,
+             .available_rows = available_rows,
+             .copied_rows = copied_rows};
+  return copied_rows >= RTXDI_INPUT_SCENE_REQUIRED_ROWS;
 }
 
 inline bool ValidSceneInputRange(uint64_t buffer_bytes, uint64_t offset, uint64_t range_bytes) {
@@ -320,6 +354,8 @@ struct SceneBindingEvidence {
   SceneRangeSnapshot current = {};
   uint64_t buffer_bytes = 0u;
   uint64_t normalized_size = 0u;
+  uint32_t available_rows = 0u;
+  uint32_t copied_rows = 0u;
   DiagnosticReason reason = DiagnosticReason::None;
   bool normalized_valid = false;
 };
@@ -330,6 +366,8 @@ struct SceneRangeEvidence {
   bool entry_found = false;
   bool resource_desc_valid = false;
   bool resource_buffer = false;
+  uint32_t native_first_constant = 0u;
+  uint32_t native_constant_count = 0u;
 };
 
 // Call with a coherent tracker snapshot, then recheck the native buffer before recording a pack.
@@ -384,7 +422,7 @@ inline SceneBindingStatus CheckPromotedSceneBinding(const SceneRangeSnapshot& pr
     evidence->normalized_valid = true;
     evidence->normalized_size = current_size;
   }
-  if (promoted.size != current_size) {
+  if (promoted.size != current.size || promoted.normalized_size != current_size) {
     if (evidence != nullptr) evidence->reason = DiagnosticReason::NormalizedSizeMismatch;
     return SceneBindingStatus::SceneBindingChanged;
   }

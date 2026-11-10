@@ -465,7 +465,9 @@ struct Rt12Panel {  // copied under g_rt12_panel_mutex for the panel and the JSO
   uint64_t dynamic_vertices = 0u, dynamic_builds = 0u, dynamic_refits = 0u, dynamic_blas_bytes = 0u;
   float dynamic_ms = -1.f, dynamic_ms_sum = 0.f;
   uint32_t dynamic_ms_n = 0u;
-  uint32_t records = 0u;  // P2b records of the last traced frame (13.1c)
+  uint32_t nrd_backend_state = 0u;  // 0 not compiled, 1 not initialized, 2 ready, 3 initialization failed
+  uint32_t nrd_failure_stage = 0u;  // 0 none, 1 SDK/instance, 2 D3D12 backend
+  uint32_t records = 0u;            // P2b records of the last traced frame (13.1c)
   float records_ms = -1.f, records_ms_sum = 0.f;
   uint32_t records_ms_n = 0u;
   uint64_t gc_traced_frames = 0u;
@@ -1057,6 +1059,11 @@ inline void TeardownRt12(const char* why) {
   rtgi::DestroyRtgiPipeline(s.device, s.rtgi.resolve);
   renodx::utils::log::i("[world-rt12] teardown (", why, ")");
   g_rt12.reset();
+#if defined(FALCOM_NRD_ENABLED)
+  UpdatePanel([](Rt12Panel& p) { p.nrd_backend_state = 1u; p.nrd_failure_stage = 0u; });
+#else
+  UpdatePanel([](Rt12Panel& p) { p.nrd_backend_state = 0u; p.nrd_failure_stage = 0u; });
+#endif
 }
 
 inline void DestroyRt12(reshade::api::device* device) {
@@ -1067,6 +1074,11 @@ inline void DestroyRt12(reshade::api::device* device) {
 inline bool CreateRt12(reshade::api::device* device) {
 #if defined(_WIN32)
   using Microsoft::WRL::ComPtr;
+#if defined(FALCOM_NRD_ENABLED)
+  UpdatePanel([](Rt12Panel& p) { p.nrd_backend_state = 1u; p.nrd_failure_stage = 0u; });
+#else
+  UpdatePanel([](Rt12Panel& p) { p.nrd_backend_state = 0u; p.nrd_failure_stage = 0u; });
+#endif
   if (device->get_api() != reshade::api::device_api::d3d11) {
     UpdatePanel([](Rt12Panel& p) { p.reason = Rt12Reason::NotCreated; });
     return false;
@@ -1330,11 +1342,18 @@ inline bool CreateRt12(reshade::api::device* device) {
   }
 
 #if defined(FALCOM_NRD_ENABLED)
-  if (!s.di_transfer.nrd.CreateRelaxDiffuseSpecular()
-      || !s.di_transfer.nrd.CreateD3D12Backend(s.device12.Get(), s.serialize)) {
+  const bool nrd_instance_ready = s.di_transfer.nrd.CreateRelaxDiffuseSpecular();
+  const bool nrd_backend_ready = nrd_instance_ready
+                                 && s.di_transfer.nrd.CreateD3D12Backend(s.device12.Get(), s.serialize);
+  if (!nrd_backend_ready) {
     s.di_transfer.nrd.Reset();
+    UpdatePanel([nrd_instance_ready](Rt12Panel& p) {
+      p.nrd_backend_state = 3u;
+      p.nrd_failure_stage = nrd_instance_ready ? 2u : 1u;
+    });
     renodx::utils::log::w("[world-rt12] NRD 4.17.1 initialization failed; raw RTXDI remains available");
   } else {
+    UpdatePanel([](Rt12Panel& p) { p.nrd_backend_state = 2u; p.nrd_failure_stage = 0u; });
     renodx::utils::log::i("[world-rt12] private NRD 4.17.1 RELAX backend initialized; output consumer remains disabled");
   }
 #endif

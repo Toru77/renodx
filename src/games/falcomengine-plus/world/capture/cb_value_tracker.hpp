@@ -62,15 +62,16 @@ inline CbValueTracker& CbTracker() {
 
 #if defined(FALCOM_NRD_ENABLED)
 inline bool SeedInitialSceneCpuMirror(uintptr_t device, uint64_t buffer, uint64_t offset, uint64_t size) {
-  if (offset != 0u || size != RTXDI_SURFACE_SCENE_ROW_COUNT * 16u) return false;
+  if (size < RTXDI_INPUT_SCENE_REQUIRED_ROWS * 16u || size > RTXDI_INPUT_SCENE_ROWS * 16u
+      || (size % 16u) != 0u || offset > kTrackedCbBytes || size > kTrackedCbBytes - offset) return false;
   std::array<uint8_t, kTrackedCbBytes> initial = {};
   {
     auto& tracker = CbTracker();
     std::lock_guard lock(tracker.mutex);
     const auto found = tracker.buffers.find(buffer);
     if (found == tracker.buffers.end() || found->second.epoch != kCbEpochInit
-        || found->second.size != size || found->second.valid_bytes < size) return false;
-    initial = found->second.bytes;
+        || found->second.size < offset + size || found->second.valid_bytes < offset + size) return false;
+    std::copy_n(found->second.bytes.data() + offset, static_cast<size_t>(size), initial.data());
   }
   rtxdi::SeedSceneCpuMirrorInitial(device, buffer, offset, size, initial.data());
   return true;

@@ -13,11 +13,13 @@ RWTexture2D<uint4> g_out_mrt2 : register(u4);
 RWTexture2D<uint4> g_out_scene : register(u5);
 RWTexture2D<float4> g_out_motion : register(u6);
 cbuffer cb_scene : register(b0) { uint4 g_scene[96]; };
-cbuffer cb_pack : register(b12) { uint4 g_dimensions; };
+cbuffer cb_pack : register(b12) { uint4 g_dimensions; uint g_scene_rows_to_copy; };
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   if (id.x == 0u && id.y == 0u) {
-    [unroll] for (uint row = 0u; row < 96u; ++row) g_out_scene[uint2(row, 0u)] = g_scene[row];
+    [unroll] for (uint row = 0u; row < 96u; ++row) {
+      g_out_scene[uint2(row, 0u)] = row < g_scene_rows_to_copy ? g_scene[row] : uint4(0u, 0u, 0u, 0u);
+    }
   }
   if (id.x >= g_dimensions.x || id.y >= g_dimensions.y) return;
   g_out_depth[id.xy] = g_depth.Load(int3(id.xy, 0)).x;

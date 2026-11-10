@@ -106,6 +106,8 @@ inline bool CurrentDiSceneRange(reshade::api::device* device, reshade::api::comm
     evidence->binding.promoted = promoted;
     evidence->binding.current = binding;
     evidence->expected_buffer = reinterpret_cast<uint64_t>(expected_scene);
+    evidence->native_first_constant = promoted.native_first_constant;
+    evidence->native_constant_count = promoted.native_constant_count;
   }
   if (!promoted.live || !binding.live || promoted.buffer == 0u
       || reinterpret_cast<uint64_t>(expected_scene) != promoted.buffer) {
@@ -130,7 +132,7 @@ inline bool CurrentDiSceneRange(reshade::api::device* device, reshade::api::comm
                                        evidence != nullptr ? &evidence->binding : nullptr)
       != rtxdi::SceneBindingStatus::Ready) return false;
   if (!rtxdi::ValidateSceneBuffer(reinterpret_cast<ID3D11Buffer*>(promoted.buffer), promoted.offset,
-                                  RTXDI_INPUT_SCENE_ROWS * 16u)) {
+                                  binding.size)) {
     if (evidence != nullptr) evidence->binding.reason = rtxdi::DiagnosticReason::InvalidRange;
     return false;
   }  // NOLINT(performance-no-int-to-ptr)
@@ -150,15 +152,18 @@ inline bool CurrentDiSceneRange(reshade::api::device* device, reshade::api::comm
       return false;
     }
   }
-  *range = {reshade::api::resource{promoted.buffer}, promoted.offset, RTXDI_INPUT_SCENE_ROWS * 16u};
+  *range = {reshade::api::resource{promoted.buffer}, promoted.offset, promoted.size};
   return true;
 }
 
 struct DiSceneNativeBindingEvidence {
   uint64_t native_buffer = 0u;
+  uint64_t native_offset_bytes = 0u;
+  uint64_t native_count_bytes = 0u;
   uint32_t first_constant = 0u;
   uint32_t constant_count = 0u;
   uint32_t buffer_bytes = 0u;
+  uint32_t bind_flags = 0u;
   HRESULT context_query_result = E_POINTER;
   bool context_query_available = false;
   bool buffer_available = false;
@@ -188,6 +193,12 @@ inline void RecordDiSceneEvidence(rtxdi::DiagnosticState& diagnostics, uint64_t 
   event.buffer_bytes = scene.binding.buffer_bytes;
   event.normalized_size = scene.binding.normalized_size;
   event.native_buffer_bytes = native.buffer_bytes;
+  event.native_offset_bytes = native.native_offset_bytes;
+  event.native_count_bytes = native.native_count_bytes;
+  event.native_bind_flags = native.bind_flags;
+  event.available_rows = scene.binding.available_rows;
+  event.required_rows = RTXDI_INPUT_SCENE_REQUIRED_ROWS;
+  event.copied_rows = scene.binding.copied_rows;
   event.first_constant = native.first_constant;
   event.constant_count = native.constant_count;
   event.flags = (scene.entry_found ? 1u : 0u) | (scene.resource_desc_valid ? 2u : 0u)
@@ -207,31 +218,54 @@ inline void RecordDiSceneEvidence(rtxdi::DiagnosticState& diagnostics, uint64_t 
 }
 
 inline bool ValidateBoundDiScene(ID3D11DeviceContext* context, const reshade::api::buffer_range& range,
-                                 DiSceneNativeBindingEvidence* evidence = nullptr) {
+                                 rtxdi::SceneRangeEvidence* expected = nullptr,
+                                 DiSceneNativeBindingEvidence* evidence = nullptr,
+                                 rtxdi::SceneCopyWindow* copy_window = nullptr) {
   if (evidence != nullptr) *evidence = {};
   rtxdi::SceneB0BindingEvidence native;
   const bool valid = rtxdi::ValidateSceneB0Binding(
       context, reinterpret_cast<ID3D11Buffer*>(range.buffer.handle), range.offset,
-      RTXDI_INPUT_SCENE_ROWS, evidence != nullptr ? &native : nullptr);  // NOLINT(performance-no-int-to-ptr)
+      RTXDI_INPUT_SCENE_REQUIRED_ROWS, &native);  // NOLINT(performance-no-int-to-ptr)
   if (evidence != nullptr) {
     evidence->native_buffer = native.native_buffer;
     evidence->first_constant = native.first_constant;
     evidence->constant_count = native.constant_count;
     evidence->buffer_bytes = native.buffer_bytes;
+    evidence->bind_flags = native.bind_flags;
+    evidence->native_offset_bytes = uint64_t{native.first_constant} * 16u;
+    evidence->native_count_bytes = native.constant_count == 4096u && evidence->native_offset_bytes <= native.buffer_bytes
+                                       ? native.buffer_bytes - evidence->native_offset_bytes
+                                       : uint64_t{native.constant_count} * 16u;
     evidence->context_query_result = native.context_query_result;
     evidence->context_query_available = native.context_query_available;
     evidence->buffer_available = native.buffer_available;
   }
-  return valid;
+  rtxdi::SceneCopyWindow window = {};
+  const bool extent_matches = expected != nullptr && expected->resource_desc_valid
+                              && expected->binding.buffer_bytes == native.buffer_bytes;
+  const bool window_valid = expected != nullptr
+                            && rtxdi::MakeSceneCopyWindow(native.buffer_bytes, range.offset, range.size,
+                                                          native.first_constant, native.constant_count, &window);
+  if (copy_window != nullptr) *copy_window = window;
+  if (expected != nullptr) {
+    expected->binding.available_rows = window.available_rows;
+    expected->binding.copied_rows = window.copied_rows;
+    if (!extent_matches) expected->binding.reason = rtxdi::DiagnosticReason::InvalidRange;
+  }
+  return valid && extent_matches && expected != nullptr && native.first_constant == expected->native_first_constant
+         && native.constant_count == expected->native_constant_count && window_valid;
 }
 
 #if defined(FALCOM_NRD_ENABLED)
 inline void CaptureNrdCameraRows(uintptr_t device, const Rt12DiInputViews& in,
-                                 const reshade::api::buffer_range& range, uint64_t owner_generation,
+                                 const reshade::api::buffer_range& range, uint32_t copied_rows,
+                                 uint64_t owner_generation,
                                  Rt12NrdCameraCapture* camera) {
   if (camera == nullptr) return;
   *camera = {};
-  if (device == 0u || in.scene_tracker == nullptr || range.size != camera->scene_rows.size()) return;
+  const uint64_t copy_bytes = uint64_t{copied_rows} * 16u;
+  if (device == 0u || in.scene_tracker == nullptr || copied_rows < RTXDI_INPUT_SCENE_REQUIRED_ROWS
+      || copied_rows > RTXDI_INPUT_SCENE_ROWS) return;
   rtxdi::SceneRangeSnapshot promoted;
   {
     std::shared_lock lock(in.scene_tracker->mutex);
@@ -239,9 +273,9 @@ inline void CaptureNrdCameraRows(uintptr_t device, const Rt12DiInputViews& in,
   }
   if (!promoted.live || !promoted.known || promoted.frame != in.capture_frame
       || promoted.buffer != range.buffer.handle || promoted.offset != range.offset
-      || promoted.size != range.size || promoted.sequence == 0u) return;
+      || promoted.size != range.size || promoted.copied_rows != copied_rows || promoted.sequence == 0u) return;
   uint64_t write_sequence = 0u, write_frame = UINT64_MAX;
-  if (!rtxdi::ReadSceneCpuMirror(device, range.buffer.handle, range.offset, range.size, in.capture_frame,
+  if (!rtxdi::ReadSceneCpuMirror(device, range.buffer.handle, range.offset, copy_bytes, in.capture_frame,
                                  promoted.sequence, camera->scene_rows.data(), &write_sequence, &write_frame)) return;
   camera->resource = range.buffer.handle;
   camera->offset = range.offset;
@@ -1026,10 +1060,12 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     rtxdi::SceneRangeEvidence scene_evidence = {};
     DiSceneNativeBindingEvidence native_evidence = {};
     const bool scene_range_valid = CurrentDiSceneRange(device, cmd_list, in, current_scene.Get(), &scene_range,
-                                                       diagnostic_enabled ? &scene_evidence : nullptr);
-    const bool native_range_valid = scene_range_valid
-                                    && ValidateBoundDiScene(s.ctx11.Get(), scene_range,
-                                                            diagnostic_enabled ? &native_evidence : nullptr);
+                                                       &scene_evidence);
+    rtxdi::SceneCopyWindow scene_copy_window = {};
+    const bool native_range_valid = ValidateBoundDiScene(s.ctx11.Get(), scene_range, &scene_evidence,
+                                                         &native_evidence, &scene_copy_window);
+    scene_evidence.binding.available_rows = scene_copy_window.available_rows;
+    scene_evidence.binding.copied_rows = scene_copy_window.copied_rows;
     if (!scene_range_valid || !native_range_valid) {
       result.status = rtxdi::InputStatus::SceneBindingChanged;
       if (diagnostic_enabled) {
@@ -1304,7 +1340,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       }
 #if defined(__world_rtxdi_pack_inputs_EMBED_FILE) && defined(__world_rtxdi_pack_records_EMBED_FILE)
       if (ok) {
-        ok = rtgi::EnsureRtgiPipeline(device, &candidate.pack_inputs, {.srv_count = 6u, .uav_count = 7u, .sampler_count = 0u, .push_count = 4u, .code = __world_rtxdi_pack_inputs, .name = "rtxdi input pack"});
+        ok = rtgi::EnsureRtgiPipeline(device, &candidate.pack_inputs, {.srv_count = 6u, .uav_count = 7u, .sampler_count = 0u, .push_count = 5u, .code = __world_rtxdi_pack_inputs, .name = "rtxdi input pack"});
       }
       if (ok && in.local) {
         ok = rtgi::EnsureRtgiPipeline(device, &candidate.pack_records, {.srv_count = 3u, .uav_count = 3u, .sampler_count = 0u, .push_count = 4u, .code = __world_rtxdi_pack_records, .name = "rtxdi record pack"});
@@ -1554,11 +1590,12 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     rtxdi::SceneRangeEvidence allocation_scene_evidence = {};
     DiSceneNativeBindingEvidence allocation_native_evidence = {};
     const bool allocation_scene_valid = CurrentDiSceneRange(
-        device, cmd_list, in, current_scene.Get(), &scene_range,
-        diagnostic_enabled ? &allocation_scene_evidence : nullptr);
-    const bool allocation_native_valid = allocation_scene_valid
-                                         && ValidateBoundDiScene(s.ctx11.Get(), scene_range,
-                                                                 diagnostic_enabled ? &allocation_native_evidence : nullptr);
+        device, cmd_list, in, current_scene.Get(), &scene_range, &allocation_scene_evidence);
+    rtxdi::SceneCopyWindow allocation_copy_window = {};
+    const bool allocation_native_valid = ValidateBoundDiScene(s.ctx11.Get(), scene_range, &allocation_scene_evidence,
+                                                              &allocation_native_evidence, &allocation_copy_window);
+    allocation_scene_evidence.binding.available_rows = allocation_copy_window.available_rows;
+    allocation_scene_evidence.binding.copied_rows = allocation_copy_window.copied_rows;
     if (!allocation_scene_valid || !allocation_native_valid) {
       result.status = rtxdi::InputStatus::SceneBindingChanged;
       if (diagnostic_enabled) {
@@ -1574,7 +1611,8 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                             allocation_scene_evidence, allocation_native_evidence, true);
     }
 #if defined(FALCOM_NRD_ENABLED)
-    CaptureNrdCameraRows(reinterpret_cast<uintptr_t>(device), in, scene_range, s.generation, &slot.nrd.camera);
+    CaptureNrdCameraRows(reinterpret_cast<uintptr_t>(device), in, scene_range, allocation_copy_window.copied_rows,
+                         s.generation, &slot.nrd.camera);
 #endif
     const reshade::api::resource_view retained[9] = {
         in.depth, in.normal, in.local ? in.color : reshade::api::resource_view{},
@@ -1612,8 +1650,9 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     const reshade::api::resource_view pixels[6] = {retained[0], retained[1], retained[2], retained[3], retained[4], retained[5]};
     const reshade::api::resource_view packed[7] = {slot.depth.uav11, slot.normal.uav11, slot.color.uav11, slot.mrt1.uav11, slot.mrt2.uav11, slot.scene.uav11, slot.motion.uav11};
     bind(slot.pack_inputs, 6u, pixels, 7u, packed);
-    const uint32_t pixel_params[4] = {in.width, in.height, in.local ? 1u : 0u, motion_available ? 1u : 0u};
-    cmd_list->push_constants(DS::all_compute, slot.pack_inputs.layout, 3u, 0u, 4u, pixel_params);
+    const uint32_t pixel_params[5] = {in.width, in.height, in.local ? 1u : 0u, motion_available ? 1u : 0u,
+                                      allocation_copy_window.copied_rows};
+    cmd_list->push_constants(DS::all_compute, slot.pack_inputs.layout, 3u, 0u, 5u, pixel_params);
     cmd_list->dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
     rtao::NullComputeSlots(cmd_list, 6u, 7u, 0u);
     clear_tables(slot.pack_inputs, 6u, 7u);
@@ -1648,11 +1687,12 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     rtxdi::SceneRangeEvidence signal_scene_evidence = {};
     DiSceneNativeBindingEvidence signal_native_evidence = {};
     const bool signal_scene_valid = CurrentDiSceneRange(
-        device, cmd_list, in, slot.source_scene.Get(), &scene_range,
-        diagnostic_enabled ? &signal_scene_evidence : nullptr);
-    const bool signal_native_valid = signal_scene_valid
-                                     && ValidateBoundDiScene(s.ctx11.Get(), scene_range,
-                                                             diagnostic_enabled ? &signal_native_evidence : nullptr);
+        device, cmd_list, in, slot.source_scene.Get(), &scene_range, &signal_scene_evidence);
+    rtxdi::SceneCopyWindow signal_copy_window = {};
+    const bool signal_native_valid = ValidateBoundDiScene(s.ctx11.Get(), scene_range, &signal_scene_evidence,
+                                                          &signal_native_evidence, &signal_copy_window);
+    signal_scene_evidence.binding.available_rows = signal_copy_window.available_rows;
+    signal_scene_evidence.binding.copied_rows = signal_copy_window.copied_rows;
     if (!signal_scene_valid || !signal_native_valid) {
       result.status = rtxdi::InputStatus::SceneBindingChanged;
       if (diagnostic_enabled) {
@@ -2145,10 +2185,12 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   rtxdi::SceneRangeEvidence scene_evidence = {};
   DiSceneNativeBindingEvidence native_evidence = {};
   const bool scene_range_valid = CurrentDiSceneRange(device, cmd_list, in, current_scene.Get(), &scene_range,
-                                                     diagnostic_enabled ? &scene_evidence : nullptr);
-  const bool native_range_valid = scene_range_valid
-                                  && ValidateBoundDiScene(s.ctx11.Get(), scene_range,
-                                                          diagnostic_enabled ? &native_evidence : nullptr);
+                                                     &scene_evidence);
+  rtxdi::SceneCopyWindow scene_copy_window = {};
+  const bool native_range_valid = ValidateBoundDiScene(s.ctx11.Get(), scene_range, &scene_evidence,
+                                                       &native_evidence, &scene_copy_window);
+  scene_evidence.binding.available_rows = scene_copy_window.available_rows;
+  scene_evidence.binding.copied_rows = scene_copy_window.copied_rows;
   if (!scene_range_valid || !native_range_valid) {
     if (diagnostic_enabled) {
       RecordDiSceneEvidence(diagnostics, diagnostic_epoch, rtxdi::DiagnosticStage::DiPreflight,

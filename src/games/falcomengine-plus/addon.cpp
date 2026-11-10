@@ -7593,6 +7593,9 @@ static void PromoteRtxdiSceneBinding(reshade::api::command_list* cmd_list) {
   }
   const uint32_t generation = g_scene_cbv_desc_generation.load(std::memory_order_acquire);
   uint64_t normalized = 0u;
+  uint64_t descriptor_buffer_bytes = 0u;
+  falcom_world::rtxdi::SceneB0BindingEvidence native_evidence = {};
+  falcom_world::rtxdi::SceneCopyWindow copy_window = {};
   di::DiagnosticReason reason = di::DiagnosticReason::None;
   bool valid = di::CanPromoteSceneBinding(binding, data->frame_index, command, true);
   if (!valid) {
@@ -7608,6 +7611,7 @@ static void PromoteRtxdiSceneBinding(reshade::api::command_list* cmd_list) {
   }
   if (valid) {
     const auto desc = device->get_resource_desc(reshade::api::resource{binding.buffer});
+    descriptor_buffer_bytes = desc.buffer.size;
     if (desc.type != reshade::api::resource_type::buffer) {
       valid = false;
       reason = di::DiagnosticReason::InvalidResource;
@@ -7618,6 +7622,22 @@ static void PromoteRtxdiSceneBinding(reshade::api::command_list* cmd_list) {
       valid = false;
       reason = di::DiagnosticReason::InvalidRange;
     }  // NOLINT(performance-no-int-to-ptr)
+  }
+  if (valid) {
+    const bool native_valid = di::ValidateSceneB0Binding(
+        reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()),
+        reinterpret_cast<ID3D11Buffer*>(binding.buffer), binding.offset,
+        RTXDI_INPUT_SCENE_REQUIRED_ROWS, &native_evidence);  // NOLINT(performance-no-int-to-ptr)
+    const bool window_valid = di::MakeSceneCopyWindow(native_evidence.buffer_bytes, binding.offset, binding.size,
+                                                      native_evidence.first_constant, native_evidence.constant_count,
+                                                      &copy_window);
+    if (!native_valid || !window_valid || native_evidence.buffer_bytes != descriptor_buffer_bytes) {
+      valid = false;
+      reason = native_evidence.context_query_available
+                   ? (native_evidence.buffer_bytes == descriptor_buffer_bytes ? di::DiagnosticReason::NativeB0Mismatch
+                                                                              : di::DiagnosticReason::InvalidRange)
+                   : di::DiagnosticReason::ContextQueryFailed;
+    }
   }
   {
     std::unique_lock lock(data->rtxdi_scene_range.mutex);
@@ -7644,7 +7664,10 @@ static void PromoteRtxdiSceneBinding(reshade::api::command_list* cmd_list) {
     }
     if (!valid) data->rtxdi_scene_range.snapshot = {};
     if (valid) {
-      binding.size = normalized;
+      binding.normalized_size = normalized;
+      binding.native_first_constant = native_evidence.first_constant;
+      binding.native_constant_count = native_evidence.constant_count;
+      binding.copied_rows = copy_window.copied_rows;
       data->rtxdi_scene_range.snapshot = binding;
     }
   }
@@ -7656,12 +7679,26 @@ static void PromoteRtxdiSceneBinding(reshade::api::command_list* cmd_list) {
     event.value0 = binding.offset;
     event.value1 = binding.size;
     event.normalized_size = normalized;
+    event.native_buffer_bytes = native_evidence.buffer_bytes;
+    event.native_offset_bytes = uint64_t{native_evidence.first_constant} * 16u;
+    event.native_count_bytes = native_evidence.constant_count == 4096u
+                                       && event.native_offset_bytes <= native_evidence.buffer_bytes
+                                   ? native_evidence.buffer_bytes - event.native_offset_bytes
+                                   : uint64_t{native_evidence.constant_count} * 16u;
+    event.first_constant = native_evidence.first_constant;
+    event.constant_count = native_evidence.constant_count;
+    event.native_bind_flags = native_evidence.bind_flags;
+    event.available_rows = copy_window.available_rows;
+    event.required_rows = RTXDI_INPUT_SCENE_REQUIRED_ROWS;
+    event.copied_rows = copy_window.copied_rows;
     event.scene_slot = -1;
     event.stage = di::DiagnosticStage::ScenePromotion;
     event.reason = reason;
     event.operation = di::DiagnosticOperation::Promote;
     event.flags = (entry_found ? 1u : 0u) | (binding.known ? 2u : 0u) | (binding.live ? 4u : 0u)
-                  | (normalized != 0u ? 8u : 0u) | (valid ? 16u : 0u);
+                  | (normalized != 0u ? 8u : 0u) | (valid ? 16u : 0u)
+                  | (native_evidence.context_query_available ? 32u : 0u)
+                  | (native_evidence.buffer_available ? 64u : 0u);
     event.identity_tokens[0] = di::DiagnosticIdentityToken(diagnostics, diagnostic_epoch, command,
                                                            binding.reset_generation);
     event.identity_tokens[1] = di::DiagnosticIdentityToken(diagnostics, diagnostic_epoch, binding.buffer,
@@ -7672,10 +7709,11 @@ static void PromoteRtxdiSceneBinding(reshade::api::command_list* cmd_list) {
   }
 #if defined(FALCOM_NRD_ENABLED)
   if (valid) {
+    const uint64_t mirrored_bytes = uint64_t{copy_window.copied_rows} * 16u;
     di::RegisterSceneCpuMirrorRange(reinterpret_cast<uintptr_t>(device), binding.buffer,
-                                    binding.offset, binding.size, binding.frame, binding.sequence);
+                                    binding.offset, mirrored_bytes, binding.frame, binding.sequence);
     falcom_world::SeedInitialSceneCpuMirror(reinterpret_cast<uintptr_t>(device), binding.buffer,
-                                            binding.offset, binding.size);
+                                            binding.offset, mirrored_bytes);
   }
 #endif
 }
