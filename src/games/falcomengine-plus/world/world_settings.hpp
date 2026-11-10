@@ -763,6 +763,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RTXDI",
       .min = 1.f,
       .max = 32.f,
+      .format = "%d",
       .on_change_value = mark_rtxdi_custom,
       .is_visible = visible,
   });
@@ -797,6 +798,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RTXDI",
       .min = 1.f,
       .max = 16.f,
+      .format = "%d",
       .on_change_value = mark_rtxdi_custom,
       .is_visible = visible,
   });
@@ -809,6 +811,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RTXDI",
       .min = 1.f,
       .max = 16.f,
+      .format = "%d",
       .on_change_value = mark_rtxdi_custom,
       .is_visible = visible,
   });
@@ -834,6 +837,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RTXDI",
       .min = 1.f,
       .max = 32.f,
+      .format = "%d",
       .on_change_value = mark_rtxdi_custom,
       .is_visible = visible,
   });
