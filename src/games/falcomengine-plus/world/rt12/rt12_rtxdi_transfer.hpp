@@ -2271,7 +2271,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
         case rtxdi::DiStatus::ZeroLights:   reason = rtxdi::DiagnosticReason::MissingInput; break;
         case rtxdi::DiStatus::Busy:         reason = rtxdi::DiagnosticReason::Busy; break;
         case rtxdi::DiStatus::Failed:       reason = error == E_INVALIDARG ? rtxdi::DiagnosticReason::ConfigurationMismatch
-                                                                     : rtxdi::DiagnosticReason::SubmitFailed;
+                                                                     : rtxdi::DiagnosticReason::SubmitFailed; break;
         case rtxdi::DiStatus::Quarantined: reason = rtxdi::DiagnosticReason::Quarantined; break;
       }
       rtxdi::RecordDiagnostic(diagnostics, diagnostic_epoch,
@@ -2313,7 +2313,8 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       .local_requested = in.local,
       .input_ready = input.status == rtxdi::InputStatus::Ready,
       .transfer_available = slot.fence_value == input.fence,
-      .reservoir_available = rtxdi::TransferSlotAvailable(s.di.last_use_fence, Rt12CompletedValue(s)),
+      // Same-queue ordering and the reservoir UAV/transition barriers guard reuse, so presence is enough here.
+      .reservoir_available = s.di.reservoirs != nullptr,
   });
   if (gate != rtxdi::DiSubmissionGate::Ready) {
     const rtxdi::DiStatus status = (gate == rtxdi::DiSubmissionGate::Busy                    ? rtxdi::DiStatus::Busy

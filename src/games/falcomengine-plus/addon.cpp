@@ -12468,9 +12468,16 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
                                   uint64_t owner_generation, int32_t transfer_slot, uint64_t fence,
                                   bool requested = true) {
     if (!diagnostic_enabled) return;
+    uint64_t effective_identity = 0u;
+    {
+      std::shared_lock lock(di::g_di.mutex);
+      effective_identity = di::g_di.snapshot.settings_identity;
+    }
     di::RecordDiagnostic(diagnostics, diagnostic_epoch,
                          {.owner_generation = owner_generation,
                           .frame = frame,
+                          .settings_identity = di::CaptureEffectiveRtxdiSettings().identity,
+                          .effective_identity = effective_identity,
                           .fence = fence,
                           .transfer_slot = transfer_slot,
                           .flags = (bound ? 1u : 0u) | (requested ? 4u : 0u),
@@ -12845,8 +12852,12 @@ static void BindRtxdiLocalOutput(reshade::api::command_list* cmd_list, DeviceDat
     scene = di::g_scene.snapshot;
   }
   rt12::Rt12State& state = *rt12::g_rt12;
-  if (output.status != di::DiStatus::Submitted || output.frame != frame || !output.output_staged
-      || output.output_transfer_slot < 0 || output.output_transfer_slot >= static_cast<int32_t>(rt12::kRt12Slots)
+  if (output.status != di::DiStatus::Submitted || output.frame != frame || !output.output_staged) {
+    record_binding(false, di::DiagnosticReason::StaleFrame, frame, state.generation,
+                   output.output_transfer_slot, output.output_fence_b);
+    return;
+  }
+  if (output.output_transfer_slot < 0 || output.output_transfer_slot >= static_cast<int32_t>(rt12::kRt12Slots)
       || input.status != di::InputStatus::Ready || input.ready_frame != frame || input.width != dd->captured_depth_w
       || input.height != dd->captured_depth_h || input.owner_generation != state.generation
       || input.scene_slot != output.output_scene_slot || input.transfer_slot != output.output_transfer_slot
