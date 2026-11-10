@@ -837,6 +837,9 @@ int main() {
   scene.gc_version = 7u;
   scene.scene_gc_version = 7u;
   if (!CanReuseScene(scene)) return EXIT_FAILURE;
+  scene.noise_pending = true;
+  if (CanReuseScene(scene)) return EXIT_FAILURE;
+  scene.noise_pending = false;
   scene.scene_gc_version = 8u;
   if (CanReuseScene(scene)) return EXIT_FAILURE;
   const SceneSnapshot attempted = {.attempted_frame = 4u, .attempted_generation = 3u};

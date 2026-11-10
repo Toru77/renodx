@@ -330,6 +330,7 @@ inline bool PreserveAttemptForNonImmediate(const SceneSnapshot& state, uint32_t 
 }
 struct SceneReuseInputs {
   bool healthy = false, slot_valid = false, tlas_valid = false, gc = false, scene_gc = false;
+  bool noise_pending = false;
   uint32_t frame = 0u, scene_frame = UINT32_MAX, records = 0u, scene_records = 0u, characters = 0u, scene_characters = 0u;
   uint64_t generation = 0u, scene_generation = 0u, snapshot = 0u, scene_snapshot = 0u, gc_version = 0u, scene_gc_version = 0u;
 };
@@ -337,7 +338,7 @@ inline bool CanReuseScene(const SceneReuseInputs& in) {
   return in.healthy && in.slot_valid && in.tlas_valid && in.frame == in.scene_frame && in.generation == in.scene_generation
          && in.gc == in.scene_gc && (!in.gc || (in.gc_version != 0u && in.gc_version == in.scene_gc_version))
          && in.records == in.scene_records && in.characters == in.scene_characters
-         && in.snapshot != 0u && in.snapshot == in.scene_snapshot;
+         && in.snapshot != 0u && in.snapshot == in.scene_snapshot && !in.noise_pending;
 }
 inline const char* SceneStatusName(SceneStatus status) {
   switch (status) {

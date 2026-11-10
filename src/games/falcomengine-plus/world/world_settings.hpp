@@ -1124,15 +1124,14 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         }
         ImGui::Text("IS-FAST noise copies: %llu (sun uses it only when IS-FAST is On and Light Size > 0; 0 = SDK random sequence)",
                     static_cast<unsigned long long>(rt12_panel.noise_copies));
-        const char* local_isfast_state = "on";
-        if (rtxdi::g_local_light_size <= 0.f) {
-          local_isfast_state = "off: Light Size 0";
-        } else if (rtxdi::g_local_isfast <= 0.5f) {
-          local_isfast_state = "off";
-        } else if (rt12_panel.noise_copies == 0u) {
-          local_isfast_state = "off: RTAO noise not filled";
-        }
-        ImGui::Text("Local IS-FAST: %s", local_isfast_state);
+        const auto isfast_state = [&rt12_panel](float light_size, float isfast) -> const char* {
+          if (light_size <= 0.f) return "off: Light Size 0";
+          if (isfast <= 0.5f) return "off";
+          if (rt12_panel.noise_copies == 0u) return "off: noise not copied (IS-FAST master Off or texture not loaded)";
+          return "on";
+        };
+        ImGui::Text("Sun IS-FAST: %s", isfast_state(rtxdi::g_sun_light_size, rtxdi::g_sun_isfast));
+        ImGui::Text("Local IS-FAST: %s", isfast_state(rtxdi::g_local_light_size, rtxdi::g_local_isfast));
         rtxdi::DebugSnapshot debug;
         {
           std::shared_lock lock(rtxdi::g_debug.mutex);
@@ -1513,7 +1512,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 1.f,
       .label = "IS-FAST Noise (Sun)",
       .section = "RTXDI",
-      .tooltip = "Uses the blue-noise IS-FAST texture for the sun disk jitter when RTAO has filled it; otherwise the SDK random sequence is used. Only has an effect when Light Size > 0.",
+      .tooltip = "Uses the blue-noise IS-FAST texture for the sun disk jitter when the IS-FAST texture is loaded (IS-FAST master On); otherwise the SDK random sequence is used. Only has an effect when Light Size > 0.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });
@@ -1602,7 +1601,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 1.f,
       .label = "IS-FAST Noise (Local)",
       .section = "RTXDI",
-      .tooltip = "Uses the blue-noise IS-FAST texture for the local light point jitter when RTAO has filled it; otherwise the SDK random sequence is used. Only has an effect when Light Size > 0.",
+      .tooltip = "Uses the blue-noise IS-FAST texture for the local light point jitter when the IS-FAST texture is loaded (IS-FAST master On); otherwise the SDK random sequence is used. Only has an effect when Light Size > 0.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });

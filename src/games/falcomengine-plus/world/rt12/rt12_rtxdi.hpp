@@ -8,7 +8,8 @@ namespace falcom_world::rt12 {
 
 // Prepares the shared scene for a future RTXDI consumer; no lighting work is scheduled here.
 inline SceneTransactionResult PrepareSceneForRtxdi(reshade::api::device* device, reshade::api::command_list* cmd_list,
-                                                   reshade::api::resource_view scene_cbv_view, bool trace_characters) {
+                                                   reshade::api::resource_view scene_cbv_view, bool trace_characters,
+                                                   reshade::api::resource_view isfast_view) {
   if (!g_rt12_enabled.load(std::memory_order_relaxed) || !g_rt12 || g_rt12->device != device
       || g_rt12->failed || g_rt12->stuck || g_rt12->unfenced_execution || cmd_list == nullptr || scene_cbv_view.handle == 0u) return {};
   if (reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()) != g_rt12->ctx11.Get()) return {};  // NOLINT(performance-no-int-to-ptr)
@@ -33,6 +34,7 @@ inline SceneTransactionResult PrepareSceneForRtxdi(reshade::api::device* device,
                             .tlas_valid = slot_valid && s.lighting_slots[s.scene_slot].tlas != nullptr,
                             .gc = gc,
                             .scene_gc = s.scene_gc,
+                            .noise_pending = isfast_view.handle != 0u && isfast_view.handle != s.noise_source,
                             .frame = frame,
                             .scene_frame = s.scene_frame,
                             .records = records,
@@ -52,7 +54,7 @@ inline SceneTransactionResult PrepareSceneForRtxdi(reshade::api::device* device,
     return {.scene_ready = true, .reused = true, .frame = frame, .slot = s.scene_slot, .fence_b = s.scene_fence};
   }
   return RunSceneTransaction(device, cmd_list,
-                             {.scene_cbv_view = scene_cbv_view, .records = records, .characters = characters, .character_snapshot = snapshot, .use_gpu_cache = gc, .frame = frame, .generation = s.generation}, nullptr);
+                             {.scene_cbv_view = scene_cbv_view, .records = records, .characters = characters, .character_snapshot = snapshot, .use_gpu_cache = gc, .frame = frame, .generation = s.generation, .isfast_view = isfast_view}, nullptr);
 }
 
 }  // namespace falcom_world::rt12

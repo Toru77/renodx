@@ -933,7 +933,7 @@ inline HRESULT CreateRt12Shared(Rt12State& state, reshade::api::device* device, 
 }
 
 // D3D11 compute pipelines of the pass A helpers (pack, noise, resolve), on RTAO's pipeline layout.
-inline bool CreateRt12Pipelines(reshade::api::device* device, reshade::api::pipeline_layout layout, Rt12State& s, bool trace_ao) {
+inline bool CreateRt12Pipelines(reshade::api::device* device, reshade::api::pipeline_layout layout, Rt12State& s, bool trace_ao, bool noise) {
   const auto make = [&](auto& code, reshade::api::pipeline* out) {
     reshade::api::shader_desc shader = {};
     shader.code = code.data();
@@ -949,7 +949,7 @@ inline bool CreateRt12Pipelines(reshade::api::device* device, reshade::api::pipe
     return false;
 #endif
   }
-  if (trace_ao && s.noise_pipeline.handle == 0u) {
+  if ((trace_ao || noise) && s.noise_pipeline.handle == 0u) {
 #if defined(__world_rt12_noise_EMBED_FILE)
     if (!make(__world_rt12_noise, &s.noise_pipeline)) return false;
 #else
@@ -2132,6 +2132,7 @@ struct SceneTransactionInputs {
   bool use_gpu_cache = true;
   uint32_t frame = 0u;
   uint64_t generation = 0u;
+  reshade::api::resource_view isfast_view = {0u};  // RTXDI: IS-FAST view copied into s.noise when no RTAO pass does
 };
 
 struct SceneAoInputs {
@@ -2255,7 +2256,8 @@ inline SceneTransactionResult RunSceneTransaction(reshade::api::device* device, 
       return fallback(Rt12Reason::TargetFailed);
     }
   }
-  if (!CreateRt12Pipelines(device, rd.layout, s, trace_ao)) return fallback(Rt12Reason::TargetFailed);
+  const reshade::api::resource_view isfast_view = (trace_ao ? ao->isfast_view : inputs.isfast_view);
+  if (!CreateRt12Pipelines(device, rd.layout, s, trace_ao, isfast_view.handle != 0u)) return fallback(Rt12Reason::TargetFailed);
   if (!characters.empty()) {
     if (s.carrier.texture12 == nullptr
         && FAILED(CreateRt12Shared(s, device, DXGI_FORMAT_R32G32B32A32_UINT, kRt12CarrierWidth, kRt12CarrierHeight, 1u, true,
@@ -2350,14 +2352,14 @@ inline SceneTransactionResult RunSceneTransaction(reshade::api::device* device, 
 
   const auto passes_start = bvh::PerfNow();
   // 10. D3D11 noise copy (once per IS-FAST source).
-  if (trace_ao && ao->isfast_view.handle != 0u && ao->isfast_view.handle != s.noise_source) {
+  if (isfast_view.handle != 0u && isfast_view.handle != s.noise_source) {
     reshade::api::resource_view srvs[rtao::kRtaoSrvCount] = {};
-    srvs[18] = ao->isfast_view;
+    srvs[18] = isfast_view;
     const reshade::api::resource_view uav_views[rtao::kRtaoUavCount] = {s.noise.uav11};
     bind_pass(s.noise_pipeline, srvs, uav_views);
     cmd_list->dispatch(16u, 512u, 1u);
     rtao::NullComputeSlots(cmd_list, rtao::kRtaoSrvCount, rtao::kRtaoUavCount, 0u);
-    s.noise_source = ao->isfast_view.handle;
+    s.noise_source = isfast_view.handle;
     UpdatePanel([](Rt12Panel& p) { p.noise_copies += 1u; });
   }
 

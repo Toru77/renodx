@@ -12294,7 +12294,12 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
   } else if (!dd->captured_scene_cbv_view.handle || !dd->captured_scene_cbv_valid || !dd->captured_cbv_live.load()) {
     status = di::SceneStatus::MissingSceneInput;
   } else {
-    result = rt12::PrepareSceneForRtxdi(dev, cmd_list, dd->captured_scene_cbv_view, true);
+    const bool rtxdi_isfast_wanted = g_isfast_enabled > 0.5f
+        && (((request_mask & 2u) != 0u && di::g_sun_isfast > 0.5f && di::g_sun_light_size > 0.f)
+            || ((request_mask & 1u) != 0u && di::g_local_isfast > 0.5f && di::g_local_light_size > 0.f));
+    if (rtxdi_isfast_wanted) LoadISFASTNoiseTexture(dev, dd);
+    result = rt12::PrepareSceneForRtxdi(dev, cmd_list, dd->captured_scene_cbv_view, true,
+                                        rtxdi_isfast_wanted ? dd->isfast_noise_srv : reshade::api::resource_view{0u});
     if (result.scene_ready) {
       status = (result.reused ? di::SceneStatus::Reused : di::SceneStatus::Submitted);
     } else if (rt12::g_rt12->unfenced_execution || rt12::g_rt12->stuck) {
