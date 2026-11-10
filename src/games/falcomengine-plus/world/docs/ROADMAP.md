@@ -220,6 +220,8 @@ ReSTIR GI M3b (Eq. 9 target), implemented, not validated in game: the resampling
 
 RTXDI M7: Character Max Darkening (sun, local) is merged into Character Shadow Darkening; the old max values are dropped. Not validated in game.
 
+RTXDI M8: optional gate (default On) multiplies the RTXDI sun character darkening by 1 - the game's t7 sun visibility. Not validated in game.
+
 ## Reference
 
 ### Code map (`world/`)

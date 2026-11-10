@@ -1480,6 +1480,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtxdiSunCharacterCsmGate",
+      .binding = &rtxdi::g_sun_character_csm_gate,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Character Shadows Follow Game Shadow (Sun)",
+      .section = "RTXDI",
+      .tooltip = "Characters get RTXDI sun shadow only where the game's own sun shadow also falls on them, so rooms do not darken indoor characters. Off = RTXDI decides alone.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiSunTraceResolution",
       .binding = &rtxdi::g_sun_trace_resolution,
       .value_type = SettingValueType::INTEGER,

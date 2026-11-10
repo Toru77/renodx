@@ -85,7 +85,7 @@ ShaderInjectData shader_injection = {
     .rtxdi_local_character_keep = 1.f,
     .rtxdi_local_character_intensity = 1.f,
     .rtxdi_local_character_fallback = 1.f,
-    .char_shadow_world_strength = 1.f,
+    .rtxdi_sun_character_csm_gate = 1.f,
     .env_sss_enabled = 1.f,
     .env_sss_strength = 1.0f,
     .env_sss_sample_count = 24.f,
@@ -13098,6 +13098,7 @@ static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData*
   shader_injection.rtxdi_sun_bound = 1.f;
   shader_injection.rtxdi_sun_darkening = di::FiniteClamped(di::g_sun_shadow_darkening, 1.f, 0.f, 1.f);
   shader_injection.rtxdi_sun_character_darkening = di::FiniteClamped(di::g_sun_character_shadow_darkening, 1.f, 0.f, 1.f);
+  shader_injection.rtxdi_sun_character_csm_gate = di::g_sun_character_csm_gate > 0.5f ? 1.f : 0.f;
   shader_injection.rtxdi_sun_foliage_transmission = di::FiniteClamped(di::g_sun_foliage_transmission, 0.f, 0.f, 1.f);
   shader_injection.rtxdi_sun_foliage_tint_r = di::FiniteClamped(di::g_sun_foliage_tint_r, 1.f, 0.f, 1.f);
   shader_injection.rtxdi_sun_foliage_tint_g = di::FiniteClamped(di::g_sun_foliage_tint_g, 1.f, 0.f, 1.f);

@@ -512,7 +512,12 @@ void main(
           const RtxdiSunLightingSelection sunSelection =
               RtxdiResolveSunLightingSelection(true, rtxdiSunVisibility_g.Load(int3(sunPixel, 0)),
                                                shader_injection_data.rtxdi_sun_foliage_transmission);
-          if (sunSelection.known) r3.z *= 1.0 - saturate(shader_injection_data.rtxdi_sun_character_darkening) * (1.0 - sunSelection.visibility);
+          if (sunSelection.known) {
+            float sunCharacterDarkening = saturate(shader_injection_data.rtxdi_sun_character_darkening);
+            if (shader_injection_data.rtxdi_sun_character_csm_gate > 0.5f)
+              sunCharacterDarkening *= 1.0 - saturate(shadowTexture.SampleLevel(samLinear_s, min(shadowUVClamp_g.xy, v1.xy), 0).x);
+            r3.z *= 1.0 - sunCharacterDarkening * (1.0 - sunSelection.visibility);
+          }
         }
       }
       // RT Sun Shadows on characters (world/rtsun, R4): the RT sun visibility (denoised, t39) scales the toon lerp factor. Needs
