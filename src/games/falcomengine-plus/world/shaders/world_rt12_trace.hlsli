@@ -23,6 +23,11 @@ static float g_rt12_foliage_transmission = 0.0;
 static uint g_rt12_foliage_layers = 0u;
 static float g_rt12_wind_transmission = 0.0;
 static uint g_rt12_wind_layers = 0u;
+static uint g_rt12_wind_slot_object[4];
+static float g_rt12_wind_slot_near[4];
+static float g_rt12_wind_slot_far[4];
+static float g_rt12_wind_softening = 0.0;
+static uint g_rt12_wind_occlusion = 0u;
 
 WorldTraceHit TraceWorldClosestDxr(float3 origin, float3 direction, float t_min, float t_max, WorldCameraView view,
                                    out WorldTraceCounters counters)
@@ -152,7 +157,25 @@ WorldTraceHit TraceWorldRayDxr(float3 origin, float3 direction, float t_min, flo
         if (AlphaCutHit((uint)instance.header.z, mesh.bbox_min.w, i0, i1, i2, query.CandidateTriangleBarycentrics(), counters)) continue;
         if (g_rt12_wind_transmission > 0.0 && (visibility_flags & INSTANCE_FOLIAGE) != 0u)
         {
-            ++g_rt12_wind_layers;
+            const uint wind_object = query.CandidateInstanceID();
+            const float hit_t = query.CandidateTriangleRayT();
+            uint wind_slot = 0u;
+            while (wind_slot < g_rt12_wind_layers && g_rt12_wind_slot_object[wind_slot] != wind_object)
+            {
+                ++wind_slot;
+            }
+            if (wind_slot < g_rt12_wind_layers)
+            {
+                g_rt12_wind_slot_near[wind_slot] = min(g_rt12_wind_slot_near[wind_slot], hit_t);
+                g_rt12_wind_slot_far[wind_slot] = max(g_rt12_wind_slot_far[wind_slot], hit_t);
+            }
+            else if (g_rt12_wind_layers < 4u)
+            {
+                g_rt12_wind_slot_object[wind_slot] = wind_object;
+                g_rt12_wind_slot_near[wind_slot] = hit_t;
+                g_rt12_wind_slot_far[wind_slot] = hit_t;
+                ++g_rt12_wind_layers;
+            }
             continue;
         }
         if (g_rt12_foliage_transmission > 0.0 && instance.header.z != 0.0)
@@ -162,6 +185,15 @@ WorldTraceHit TraceWorldRayDxr(float3 origin, float3 direction, float t_min, flo
         }
         query.CommitNonOpaqueTriangleHit();
     }
+    float wind_product = 1.0;
+    for (uint wind_slot_index = 0u; wind_slot_index < g_rt12_wind_layers; ++wind_slot_index)
+    {
+        const float span = g_rt12_wind_slot_far[wind_slot_index] - g_rt12_wind_slot_near[wind_slot_index];
+        const float factor = ((span <= 0.0 || g_rt12_wind_softening <= 0.0) ? g_rt12_wind_transmission
+                              : lerp(1.0, g_rt12_wind_transmission, saturate(span / g_rt12_wind_softening)));
+        wind_product *= factor;
+    }
+    g_rt12_wind_occlusion = (uint)min(round((1.0 - wind_product) * 255.0), 255.0);
     if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
     {
         counters.misses = 1u;

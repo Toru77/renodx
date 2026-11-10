@@ -81,7 +81,7 @@ float3 RtxdiDebugSunDetailColor(uint4 carrier, uint detail_view)
   if (detail_view == RTXDI_SUN_DETAIL_LAYERS) {
     if (status == RTXDI_SUN_STATUS_VISIBLE && reason == RTXDI_SUN_REASON_NONE) {
       if (((carrier.w >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) != 0u) return float3(0.0, 1.0, 0.0) * 0.05;
-      if (((carrier.w >> RTXDI_SUN_WIND_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) != 0u) return float3(0.0, 1.0, 1.0) * 0.05;
+      if (((carrier.w >> RTXDI_SUN_WIND_OCCLUSION_SHIFT) & RTXDI_SUN_WIND_OCCLUSION_MASK) != 0u) return float3(0.0, 1.0, 1.0) * 0.05;
     }
     if (status == RTXDI_SUN_STATUS_BLOCKED && reason == RTXDI_SUN_REASON_NONE) return 0.0;
     return RtxdiDebugSunReasonColor(status, reason);
@@ -187,7 +187,7 @@ float3 RtxdiDebugValueColor(uint view, uint2 pixel, bool status_bound, uint stat
   }
   if (view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY) {
     if (!sun_bound) return RtxdiDebugUnavailable(pixel);
-    if ((sun_status & ~0xFFFFu) != 0u) return float3(1.0, 0.8, 0.0) * 0.05;
+    if ((sun_status & ~0xFFFFFFu) != 0u) return float3(1.0, 0.8, 0.0) * 0.05;
     if ((sun_status & 0xFFu) == RTXDI_SUN_STATUS_VISIBLE) return (((sun_status >> RTXDI_SUN_LAYER_SHIFT) & 0xFFu) != 0u ? float3(0.0, 1.0, 0.0) : float3(1.0, 1.0, 1.0)) * 0.05;
     if ((sun_status & 0xFFu) == RTXDI_SUN_STATUS_BLOCKED) return 0.0;
     return float3(1.0, 0.8, 0.0) * 0.05;

@@ -18,7 +18,9 @@ struct RtxdiSunResult {
 
 uint RtxdiSunVisibilityWord(RtxdiSunResult r) {
   return r.status | (((r.flags >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_LAYER_SHIFT)
-      | (((r.flags >> RTXDI_SUN_WIND_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_WIND_LAYER_SHIFT);
+      | (r.status == RTXDI_SUN_STATUS_VISIBLE
+             ? (((r.flags >> RTXDI_SUN_WIND_OCCLUSION_SHIFT) & RTXDI_SUN_WIND_OCCLUSION_MASK) << RTXDI_SUN_WIND_OCCLUSION_SHIFT)
+             : 0u);
 }
 
 RWStructuredBuffer<RtxdiSunResult> g_rtxdi_sun_results : register(u0);
@@ -42,6 +44,7 @@ cbuffer RtxdiSunParams : register(b0) {
   float g_foliage_transmission;
   float g_wind_transmission;
   float3 g_foliage_tint;
+  float g_wind_softening;
 };
 
 #include "world_rtxdi_sun_adapter.hlsli"
@@ -213,6 +216,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   g_rt12_foliage_transmission = g_foliage_transmission;
   g_rt12_foliage_layers = 0u;
   g_rt12_wind_transmission = g_wind_transmission;
+  g_rt12_wind_softening = g_wind_softening;
   g_rt12_wind_layers = 0u;
   WorldTraceCounters counters;
   const WorldTraceHit hit = TraceWorldRayDxr(origin, sun_direction, 0.0, coverage_end, true, view, counters);
@@ -236,7 +240,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     result.distance = g_max_distance;
     result.reason = RTXDI_SUN_REASON_NONE;
     result.flags |= min(g_rt12_foliage_layers, RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_LAYER_SHIFT;
-    result.flags |= min(g_rt12_wind_layers, RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_WIND_LAYER_SHIFT;
+    result.flags |= min(g_rt12_wind_occlusion, RTXDI_SUN_WIND_OCCLUSION_MASK) << RTXDI_SUN_WIND_OCCLUSION_SHIFT;
   } else {
     result.reason = RTXDI_SUN_REASON_TRUNCATED;
     result.flags |= RTXDI_SUN_FLAG_TRUNCATED;

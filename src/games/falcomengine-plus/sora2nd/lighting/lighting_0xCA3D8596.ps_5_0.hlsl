@@ -511,8 +511,7 @@ void main(
         if (sunPixel.x < sunWidth && sunPixel.y < sunHeight) {
           const RtxdiSunLightingSelection sunSelection =
               RtxdiResolveSunLightingSelection(true, rtxdiSunVisibility_g.Load(int3(sunPixel, 0)),
-                                               shader_injection_data.rtxdi_sun_foliage_transmission,
-                                               shader_injection_data.rtxdi_sun_wind_transmission);
+                                               shader_injection_data.rtxdi_sun_foliage_transmission);
           if (sunSelection.known) r3.z *= 1.0 - saturate(shader_injection_data.rtxdi_sun_character_darkening) * (1.0 - sunSelection.visibility);
         }
       }
@@ -947,8 +946,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     if (sunPixel.x < sunWidth && sunPixel.y < sunHeight) {
       const RtxdiSunLightingSelection sunSelection =
           RtxdiResolveSunLightingSelection(true, rtxdiSunVisibility_g.Load(int3(sunPixel, 0)),
-                                           shader_injection_data.rtxdi_sun_foliage_transmission,
-                                           shader_injection_data.rtxdi_sun_wind_transmission);
+                                           shader_injection_data.rtxdi_sun_foliage_transmission);
       if (sunSelection.known) r3.z = 1.0 - saturate(shader_injection_data.rtxdi_sun_darkening) * (1.0 - sunSelection.visibility);
       if (sunSelection.known) rtxdiSunLayers = sunSelection.layers;
     }

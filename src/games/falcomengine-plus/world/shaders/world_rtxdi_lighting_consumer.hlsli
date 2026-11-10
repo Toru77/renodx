@@ -43,16 +43,15 @@ RtxdiDenoisedDiffuseResult RtxdiResolveDenoisedDiffuse(bool bound, RtxdiLighting
   return result;
 }
 
-RtxdiSunLightingSelection RtxdiResolveSunLightingSelection(bool bound, uint word, float transmission, float wind_transmission)
+RtxdiSunLightingSelection RtxdiResolveSunLightingSelection(bool bound, uint word, float transmission)
 {
   RtxdiSunLightingSelection result = (RtxdiSunLightingSelection)0;
   const uint status = word & 0xFFu;
-  result.known = bound && (word & ~0xFFFFu) == 0u && (status == RTXDI_SUN_STATUS_VISIBLE || status == RTXDI_SUN_STATUS_BLOCKED);
+  result.known = bound && (word & ~0xFFFFFFu) == 0u && (status == RTXDI_SUN_STATUS_VISIBLE || status == RTXDI_SUN_STATUS_BLOCKED);
   result.layers = (word >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK;
-  const uint wind_layers = (word >> RTXDI_SUN_WIND_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK;
+  const uint occ = (word >> RTXDI_SUN_WIND_OCCLUSION_SHIFT) & RTXDI_SUN_WIND_OCCLUSION_MASK;
   result.visibility = status == RTXDI_SUN_STATUS_VISIBLE
-                          ? (result.layers == 0u ? 1.0 : pow(saturate(transmission), result.layers))
-                              * (wind_layers == 0u ? 1.0 : pow(saturate(wind_transmission), wind_layers))
+                          ? (result.layers == 0u ? 1.0 : pow(saturate(transmission), result.layers)) * (1.0 - occ / 255.0)
                           : 0.0;
   return result;
 }

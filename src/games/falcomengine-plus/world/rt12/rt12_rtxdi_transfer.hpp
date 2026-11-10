@@ -1580,7 +1580,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       ranges[7].OffsetInDescriptorsFromTableStart = 16u;
       D3D12_ROOT_PARAMETER params[2] = {};
       params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-      params[0].Constants.Num32BitValues = 23u;
+      params[0].Constants.Num32BitValues = 24u;
       params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
       params[1].DescriptorTable.NumDescriptorRanges = 8u;
       params[1].DescriptorTable.pDescriptorRanges = ranges;
@@ -1894,7 +1894,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       const float character_bias = rtxdi::FiniteClamped(rtxdi::g_sun_character_normal_bias, 0.02f, 0.f, 0.5f);
       const bool sun_half = rtxdi::FiniteClamped(rtxdi::g_sun_trace_resolution, 0.f, 0.f, 1.f) > 0.5f;
       const float sun_disk_tan = std::tan(rtxdi::FiniteClamped(rtxdi::g_sun_light_size, 0.f, 0.f, 5.f) * 0.5f * std::numbers::pi_v<float> / 180.f);
-      const uint32_t params[23] = {in.width, in.height, std::bit_cast<uint32_t>(maximum_distance),
+      const uint32_t params[24] = {in.width, in.height, std::bit_cast<uint32_t>(maximum_distance),
                                    std::bit_cast<uint32_t>(environment_bias), std::bit_cast<uint32_t>(character_bias),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[0]),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[1]),
@@ -1910,8 +1910,9 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                                    std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_wind_transmission, 0.5f, 0.f, 1.f)), 0u,
                                    std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_tint_r, 1.f, 0.f, 1.f)),
                                    std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_tint_g, 1.f, 0.f, 1.f)),
-                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_tint_b, 1.f, 0.f, 1.f))};
-      transfer.list->SetComputeRoot32BitConstants(0u, 23u, params, 0u);
+                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_tint_b, 1.f, 0.f, 1.f)),
+                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_wind_softening, 0.5f, 0.f, 4.f))};
+      transfer.list->SetComputeRoot32BitConstants(0u, 24u, params, 0u);
       auto query_gpu = slot.descriptors->GetGPUDescriptorHandleForHeapStart();
       query_gpu.ptr += static_cast<UINT64>(8u) * s.descriptor_size;
       transfer.list->SetComputeRootDescriptorTable(1u, query_gpu);

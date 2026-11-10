@@ -1540,9 +1540,22 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.5f,
       .label = "Wind Foliage Transmission",
       .section = "RTXDI Sun",
-      .tooltip = "Share of sunlight each wind-moved foliage layer lets through, so swaying foliage casts softer shadows. Use Light Size (Sun) for soft edges. 0 = blocks fully (old behaviour).",
+      .tooltip = "Share of sunlight each wind-moved foliage object (opaque or alpha-tested) lets through, so swaying foliage casts softer shadows. Use Light Size (Sun) for soft edges. 0 = blocks fully (old behaviour).",
       .min = 0.f,
       .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSunWindFoliageSoftening",
+      .binding = &rtxdi::g_sun_wind_softening,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.5f,
+      .label = "Wind Foliage Softening (Sun, m)",
+      .section = "RTXDI Sun",
+      .tooltip = "Length in metres over which a wind-moved foliage object softens its shadow edge. 0 = hard per-object shadow. Use with Wind Foliage Transmission.",
+      .min = 0.f,
+      .max = 4.f,
       .format = "%.2f",
       .is_visible = visible,
   });
