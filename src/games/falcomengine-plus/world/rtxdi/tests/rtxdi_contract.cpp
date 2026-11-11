@@ -904,6 +904,21 @@ int main() {
   sun_staged = {.status = SunStatus::Staged, .frame = 4u, .owner_generation = 3u, .configuration_generation = 7u, .fence_b = 9u, .transfer_slot = 2};
   TransitionSunAttempt(&sun_staged, 4u, SunAttemptAction::Invalidate);
   if (sun_staged.status == SunStatus::Staged || sun_staged.fence_b != 0u) return EXIT_FAILURE;
+  const float saved_sun_accumulation = falcom_world::rtxdi::g_sun_accumulation;
+  const float saved_sun_light_size = falcom_world::rtxdi::g_sun_light_size;
+  falcom_world::rtxdi::g_sun_accumulation = 1.f;
+  falcom_world::rtxdi::g_sun_light_size = 0.f;
+  const bool accumulation_at_zero_size = falcom_world::rtxdi::SunAccumulationRequested();
+  falcom_world::rtxdi::g_sun_light_size = 1.f;
+  const bool accumulation_at_size_one = falcom_world::rtxdi::SunAccumulationRequested();
+  falcom_world::rtxdi::g_sun_light_size = std::numeric_limits<float>::quiet_NaN();
+  const bool accumulation_at_nan_size = falcom_world::rtxdi::SunAccumulationRequested();
+  falcom_world::rtxdi::g_sun_accumulation = 0.f;
+  falcom_world::rtxdi::g_sun_light_size = 1.f;
+  const bool accumulation_off = falcom_world::rtxdi::SunAccumulationRequested();
+  falcom_world::rtxdi::g_sun_accumulation = saved_sun_accumulation;
+  falcom_world::rtxdi::g_sun_light_size = saved_sun_light_size;
+  if (accumulation_at_zero_size || !accumulation_at_size_one || accumulation_at_nan_size || accumulation_off) return EXIT_FAILURE;
   falcom_world::rtxdi::DiConfig config;
   if (falcom_world::rtxdi::CalculateDiConfig(0u, 1u, &config)
       || falcom_world::rtxdi::CalculateDiConfig(UINT32_MAX, 1u, &config)

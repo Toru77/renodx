@@ -283,7 +283,7 @@ struct Rt12DiTransferSlot {
   Rt12Shared nrd_debug_distance;
   Rt12DebugDistanceIdentity debug_distance_identity = {};
 #endif
-  Microsoft::WRL::ComPtr<ID3D12Resource> scene_buffer, lights_buffer, tiles_buffer, deferred_buffer, sun_results;
+  Microsoft::WRL::ComPtr<ID3D12Resource> scene_buffer, lights_buffer, tiles_buffer, deferred_buffer, sun_results, sun_history;
   Microsoft::WRL::ComPtr<ID3D12Resource> light_types, di_results, di_frame_upload;
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> di_allocator;
@@ -319,6 +319,8 @@ struct Rt12DiTransferSlot {
   uint32_t light_count = 0u, tile_count = 0u, deferred_count = 0u;
   bool local = false;
   bool sun = false;
+  bool sun_accumulated = false;
+  bool sun_history_used = false;
   bool motion_available = false;
   bool output_staged = false;
 #if defined(FALCOM_NRD_ENABLED)
@@ -340,6 +342,8 @@ struct Rt12DiTransferState {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> sun_pso;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> sun_detail_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> sun_detail_pso;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> sun_accumulate_root;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> sun_accumulate_pso;
   Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> di_list;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> classify_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> classify_pso;
@@ -368,6 +372,9 @@ struct Rt12DiTransferState {
   uint64_t attempted_generation = 0u;
   int32_t scene_slot = -1;
   int32_t input_slot = -1;
+  uint32_t sun_history_frame = UINT32_MAX, sun_history_width = 0u, sun_history_height = 0u;
+  int32_t sun_history_transfer_slot = -1;
+  uint64_t sun_history_owner_generation = 0u, sun_history_configuration_generation = 0u;
 #if defined(FALCOM_NRD_ENABLED)
   Rt12NrdGeneration nrd;
 #endif

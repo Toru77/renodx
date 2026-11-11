@@ -32,6 +32,7 @@
 #include "world_rtxdi_spatial_di.h"
 #include "world_rtxdi_sun_visibility.h"
 #include "world_rtxdi_sun_detail.h"
+#include "world_rtxdi_sun_accumulate.h"
 #include "world_rtxdi_temporal_di.h"
 
 using Microsoft::WRL::ComPtr;
@@ -1295,6 +1296,263 @@ int RunRtxdiDxrBridge() {
                    "invalid sun direction metadata")) return 1;
   scene_pixels = valid_sun_scene;
   if (!update_pixel_texture(scene_tex.Get(), scene_upload.Get(), scene_pixels.data(), RTXDI_SURFACE_SCENE_ROW_COUNT * 16u)) return 1;
+
+  // Sun temporal accumulation (M17): a 4x2 plane run through the production accumulate shader for frames A-F.
+  {
+    constexpr UINT acc_width = 4u, acc_height = 2u, acc_count = acc_width * acc_height;
+    D3D12_DESCRIPTOR_RANGE acc_ranges[2] = {};
+    acc_ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 8u, 0u, 0u, 0u};
+    acc_ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3u, 0u, 0u, 8u};
+    ComPtr<ID3D12RootSignature> acc_root;
+    ComPtr<ID3D12PipelineState> acc_pso;
+    if (!CreateRoot(device.Get(), acc_ranges, 2u, 5u, &acc_root)
+        || !CreatePso(device.Get(), acc_root.Get(), __world_rtxdi_sun_accumulate, &acc_pso)) return 1;
+
+    std::array<float, acc_count> acc_depths = {};
+    acc_depths.fill(0.5f);
+    std::array<uint32_t, acc_count * 4> acc_normal_pixels = {};
+    for (UINT i = 0; i < acc_count; ++i) acc_normal_pixels[i * 4 + 3] = 8u;
+    const std::array<float, acc_count * 4> acc_motion = {};
+    ComPtr<ID3D12Resource> acc_depth_tex, acc_depth_upload, acc_prev_depth_tex, acc_prev_depth_upload;
+    ComPtr<ID3D12Resource> acc_normal_tex, acc_normal_upload, acc_motion_tex, acc_motion_upload;
+    if (!CreateTextureUpload(device.Get(), list.Get(), DXGI_FORMAT_R32_FLOAT, acc_width, acc_height, acc_depths.data(),
+                             acc_width * sizeof(float), &acc_depth_tex, &acc_depth_upload)
+        || !CreateTextureUpload(device.Get(), list.Get(), DXGI_FORMAT_R32_FLOAT, acc_width, acc_height, acc_depths.data(),
+                                acc_width * sizeof(float), &acc_prev_depth_tex, &acc_prev_depth_upload)
+        || !CreateTextureUpload(device.Get(), list.Get(), DXGI_FORMAT_R32G32B32A32_UINT, acc_width, acc_height,
+                                acc_normal_pixels.data(), acc_width * 16u, &acc_normal_tex, &acc_normal_upload)
+        || !CreateTextureUpload(device.Get(), list.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, acc_width, acc_height,
+                                acc_motion.data(), acc_width * 16u, &acc_motion_tex, &acc_motion_upload)) return 1;
+
+    D3D12_DESCRIPTOR_HEAP_DESC acc_heap_desc = {};
+    acc_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    acc_heap_desc.NumDescriptors = 11u;
+    acc_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    ComPtr<ID3D12DescriptorHeap> acc_heap;
+    if (!Check(device->CreateDescriptorHeap(&acc_heap_desc, IID_PPV_ARGS(&acc_heap)), "create sun accumulation heap")) return 1;
+    acc_heap_desc.NumDescriptors = 1u;
+    acc_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    ComPtr<ID3D12DescriptorHeap> acc_cpu_heap;
+    if (!Check(device->CreateDescriptorHeap(&acc_heap_desc, IID_PPV_ARGS(&acc_cpu_heap)), "create sun accumulation CPU heap")) return 1;
+    const UINT acc_increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const auto acc_cpu = [&](UINT index) {
+      auto handle = acc_heap->GetCPUDescriptorHandleForHeapStart();
+      handle.ptr += static_cast<SIZE_T>(index) * acc_increment;
+      return handle;
+    };
+    const auto acc_gpu = [&](UINT index) {
+      auto handle = acc_heap->GetGPUDescriptorHandleForHeapStart();
+      handle.ptr += static_cast<UINT64>(index) * acc_increment;
+      return handle;
+    };
+    D3D12_SHADER_RESOURCE_VIEW_DESC acc_motion_srv = {};
+    acc_motion_srv.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    acc_motion_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    acc_motion_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    acc_motion_srv.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(acc_depth_tex.Get(), &depth_srv, acc_cpu(0));
+    device->CreateShaderResourceView(acc_normal_tex.Get(), &uint4_srv, acc_cpu(1));
+    device->CreateShaderResourceView(scene_tex.Get(), &uint4_srv, acc_cpu(2));
+    device->CreateShaderResourceView(acc_motion_tex.Get(), &acc_motion_srv, acc_cpu(3));
+    device->CreateShaderResourceView(acc_prev_depth_tex.Get(), &depth_srv, acc_cpu(4));
+    device->CreateShaderResourceView(acc_normal_tex.Get(), &uint4_srv, acc_cpu(5));
+    device->CreateShaderResourceView(scene_tex.Get(), &uint4_srv, acc_cpu(6));
+
+    std::array<SunResult, acc_count> acc_frame = {};
+    ComPtr<ID3D12Resource> acc_results, acc_results_upload, acc_visibility, acc_readback;
+    std::array<ComPtr<ID3D12Resource>, 2> acc_history;
+    if (!CreateDefaultBuffer(device.Get(), sizeof(SunResult) * acc_count, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                             D3D12_RESOURCE_STATE_COMMON, &acc_results)
+        || !UploadBuffer(device.Get(), acc_frame.data(), sizeof(SunResult) * acc_count, &acc_results_upload)
+        || !CreateTexture(device.Get(), DXGI_FORMAT_R32_UINT, acc_width, acc_height, 1u, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_COMMON, &acc_visibility)
+        || !CreateTexture(device.Get(), DXGI_FORMAT_R16G16_FLOAT, acc_width, acc_height, 1u, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_COMMON, &acc_history[0])
+        || !CreateTexture(device.Get(), DXGI_FORMAT_R16G16_FLOAT, acc_width, acc_height, 1u, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_COMMON, &acc_history[1])) return 1;
+    const D3D12_RESOURCE_DESC acc_visibility_desc = acc_visibility->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT acc_footprint = {};
+    UINT acc_rows = 0u;
+    UINT64 acc_row_bytes = 0u, acc_total = 0u;
+    device->GetCopyableFootprints(&acc_visibility_desc, 0u, 1u, 0u, &acc_footprint, &acc_rows, &acc_row_bytes, &acc_total);
+    const auto acc_readback_desc = BufferDesc(acc_total);
+    if (!Check(device->CreateCommittedResource(&readback_properties, D3D12_HEAP_FLAG_NONE, &acc_readback_desc,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&acc_readback)),
+               "create sun accumulation readback")) return 1;
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC acc_result_uav = result_uav;
+    acc_result_uav.Buffer.NumElements = acc_count;
+    device->CreateUnorderedAccessView(acc_results.Get(), nullptr, &acc_result_uav, acc_cpu(8));
+    device->CreateUnorderedAccessView(acc_visibility.Get(), nullptr, &visibility_uav, acc_cpu(9));
+    device->CreateUnorderedAccessView(acc_visibility.Get(), nullptr, &visibility_uav, acc_cpu_heap->GetCPUDescriptorHandleForHeapStart());
+
+    const auto acc_transition = [](std::vector<D3D12_RESOURCE_BARRIER>& barriers, ID3D12Resource* resource,
+                                   D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+      D3D12_RESOURCE_BARRIER barrier = {};
+      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barrier.Transition.pResource = resource;
+      barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      barrier.Transition.StateBefore = before;
+      barrier.Transition.StateAfter = after;
+      barriers.push_back(barrier);
+    };
+    UINT acc_write = 0u;
+    const auto acc_accumulate = [&](bool history_valid, std::array<UINT, acc_count>* words) {
+      const UINT acc_read = 1u - acc_write;
+      D3D12_SHADER_RESOURCE_VIEW_DESC acc_history_srv = {};
+      acc_history_srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+      acc_history_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      acc_history_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      acc_history_srv.Texture2D.MipLevels = 1;
+      device->CreateShaderResourceView(history_valid ? acc_history[acc_read].Get() : nullptr, &acc_history_srv, acc_cpu(7));
+      D3D12_UNORDERED_ACCESS_VIEW_DESC acc_history_uav = {};
+      acc_history_uav.Format = DXGI_FORMAT_R16G16_FLOAT;
+      acc_history_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+      device->CreateUnorderedAccessView(acc_history[acc_write].Get(), nullptr, &acc_history_uav, acc_cpu(10));
+
+      void* mapped_frame = nullptr;
+      if (!Check(acc_results_upload->Map(0u, nullptr, &mapped_frame), "map sun accumulation frame")) return false;
+      std::memcpy(mapped_frame, acc_frame.data(), sizeof(SunResult) * acc_count);
+      acc_results_upload->Unmap(0u, nullptr);
+
+      std::vector<D3D12_RESOURCE_BARRIER> barriers;
+      acc_transition(barriers, acc_results.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+      list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+      list->CopyBufferRegion(acc_results.Get(), 0u, acc_results_upload.Get(), 0u, sizeof(SunResult) * acc_count);
+      barriers.clear();
+      acc_transition(barriers, acc_results.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      acc_transition(barriers, acc_visibility.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      acc_transition(barriers, acc_history[acc_write].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      if (history_valid) {
+        acc_transition(barriers, acc_history[acc_read].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      }
+      list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+
+      ID3D12DescriptorHeap* acc_heaps[] = {acc_heap.Get()};
+      list->SetDescriptorHeaps(1u, acc_heaps);
+      list->SetComputeRootSignature(acc_root.Get());
+      list->SetPipelineState(acc_pso.Get());
+      list->SetComputeRootDescriptorTable(1u, acc_gpu(0));
+      const UINT prefill[4] = {RTXDI_SUN_STATUS_VISIBLE | (1u << RTXDI_SUN_LAYER_SHIFT), 0u, 0u, 0u};
+      list->ClearUnorderedAccessViewUint(acc_gpu(9), acc_cpu_heap->GetCPUDescriptorHandleForHeapStart(),
+                                         acc_visibility.Get(), prefill, 0u, nullptr);
+      D3D12_RESOURCE_BARRIER uav_barrier = {};
+      uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+      uav_barrier.UAV.pResource = acc_visibility.Get();
+      list->ResourceBarrier(1u, &uav_barrier);
+      const UINT acc_params[5] = {acc_width, acc_height, history_valid ? 1u : 0u, 8u, std::bit_cast<UINT>(0.5f)};
+      list->SetComputeRoot32BitConstants(0u, 5u, acc_params, 0u);
+      list->Dispatch(1u, 1u, 1u);
+      list->ResourceBarrier(1u, &uav_barrier);
+
+      barriers.clear();
+      acc_transition(barriers, acc_visibility.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      acc_transition(barriers, acc_results.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+      acc_transition(barriers, acc_history[acc_write].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+      if (history_valid) {
+        acc_transition(barriers, acc_history[acc_read].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+      }
+      list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+      D3D12_TEXTURE_COPY_LOCATION acc_source = {};
+      acc_source.pResource = acc_visibility.Get();
+      acc_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      D3D12_TEXTURE_COPY_LOCATION acc_dest = {};
+      acc_dest.pResource = acc_readback.Get();
+      acc_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      acc_dest.PlacedFootprint = acc_footprint;
+      list->CopyTextureRegion(&acc_dest, 0u, 0u, 0u, &acc_source, nullptr);
+      barriers.clear();
+      acc_transition(barriers, acc_visibility.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+      list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+      if (!submit_wait()) return false;
+      if (!Check(allocator->Reset(), "reset sun accumulation allocator")
+          || !Check(base_list->Reset(allocator.Get(), nullptr), "reset sun accumulation list")) return false;
+
+      void* mapped = nullptr;
+      if (!Check(acc_readback->Map(0u, nullptr, &mapped), "map sun accumulation readback")) return false;
+      const auto* bytes = static_cast<const uint8_t*>(mapped);
+      for (UINT y = 0u; y < acc_height; ++y) {
+        for (UINT x = 0u; x < acc_width; ++x) {
+          UINT word = 0u;
+          std::memcpy(&word, bytes + acc_footprint.Offset + static_cast<size_t>(y) * acc_footprint.Footprint.RowPitch + x * sizeof(UINT),
+                      sizeof(UINT));
+          (*words)[y * acc_width + x] = word;
+        }
+      }
+      acc_readback->Unmap(0u, nullptr);
+      acc_write = acc_read;
+      return true;
+    };
+    const auto acc_check = [](const char* label, const std::array<UINT, acc_count>& words,
+                              const std::array<UINT, acc_count>& expected) {
+      for (UINT i = 0u; i < acc_count; ++i) {
+        const int word_occlusion = static_cast<int>((words[i] >> RTXDI_SUN_WIND_OCCLUSION_SHIFT) & 0xFFu);
+        const int expected_occlusion = static_cast<int>((expected[i] >> RTXDI_SUN_WIND_OCCLUSION_SHIFT) & 0xFFu);
+        if ((words[i] & 0xFF00FFFFu) != (expected[i] & 0xFF00FFFFu) || std::abs(word_occlusion - expected_occlusion) > 1) {
+          std::fprintf(stderr, "FAIL sun accumulation %s pixel=%u word=0x%08x expected=0x%08x\n", label, i, words[i], expected[i]);
+          return false;
+        }
+      }
+      std::fprintf(stderr, "PASS sun accumulation %s\n", label);
+      return true;
+    };
+    const UINT acc_raw = RTXDI_SUN_STATUS_VISIBLE | (1u << RTXDI_SUN_LAYER_SHIFT);
+    const auto acc_filtered = [](UINT occlusion) {
+      return RTXDI_SUN_STATUS_FILTERED | (1u << RTXDI_SUN_LAYER_SHIFT) | (occlusion << RTXDI_SUN_WIND_OCCLUSION_SHIFT);
+    };
+    const auto acc_set_statuses = [&](const std::array<UINT, acc_count>& statuses) {
+      for (UINT i = 0u; i < acc_count; ++i) acc_frame[i] = {statuses[i], 0.6f, RTXDI_SUN_REASON_NONE, 0u};
+    };
+    std::array<UINT, acc_count> words = {};
+    std::array<UINT, acc_count> expected = {};
+
+    // A: first frame keeps the raw word.
+    acc_set_statuses({RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE,
+                      RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE});
+    if (!acc_accumulate(false, &words)) return 1;
+    expected.fill(acc_raw);
+    if (!acc_check("A first frame", words, expected)) return 1;
+
+    // B: two-frame mean; row 0 BLOCKED, row 1 VISIBLE.
+    acc_set_statuses({RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_STATUS_BLOCKED,
+                      RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE});
+    if (!acc_accumulate(true, &words)) return 1;
+    for (UINT i = 0u; i < acc_count; ++i) expected[i] = acc_filtered(i < 4u ? 128u : 0u);
+    if (!acc_check("B two-frame mean", words, expected)) return 1;
+
+    // C: three-frame mean; row 0 VISIBLE, row 1 BLOCKED.
+    acc_set_statuses({RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE,
+                      RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_STATUS_BLOCKED});
+    if (!acc_accumulate(true, &words)) return 1;
+    expected.fill(acc_filtered(85u));
+    if (!acc_check("C three-frame mean", words, expected)) return 1;
+
+    // D: neighbourhood clamp; all BLOCKED.
+    acc_set_statuses({RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_STATUS_BLOCKED,
+                      RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_STATUS_BLOCKED, RTXDI_SUN_STATUS_BLOCKED});
+    if (!acc_accumulate(true, &words)) return 1;
+    expected.fill(acc_filtered(255u));
+    if (!acc_check("D neighbourhood clamp", words, expected)) return 1;
+
+    // E: disocclusion at pixel 0 and UNKNOWN at pixel 1 reset their history.
+    acc_depths[0] = 0.9f;
+    if (!update_pixel_texture(acc_depth_tex.Get(), acc_depth_upload.Get(), acc_depths.data(), acc_width * sizeof(float))) return 1;
+    acc_set_statuses({RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_UNKNOWN, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE,
+                      RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE});
+    acc_frame[1].reason = RTXDI_SUN_REASON_TRUNCATED;
+    if (!acc_accumulate(true, &words)) return 1;
+    for (UINT i = 0u; i < acc_count; ++i) expected[i] = (i < 2u) ? acc_raw : acc_filtered(0u);
+    if (!acc_check("E disocclusion and UNKNOWN reset", words, expected)) return 1;
+
+    // F: reset pixels restart; pixel 0 keeps the length 1 history from E, pixel 1 has none.
+    acc_frame[1].reason = RTXDI_SUN_REASON_NONE;
+    if (!update_pixel_texture(acc_prev_depth_tex.Get(), acc_prev_depth_upload.Get(), acc_depths.data(), acc_width * sizeof(float))) return 1;
+    acc_set_statuses({RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE,
+                      RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE, RTXDI_SUN_STATUS_VISIBLE});
+    if (!acc_accumulate(true, &words)) return 1;
+    for (UINT i = 0u; i < acc_count; ++i) expected[i] = (i == 1u) ? acc_raw : acc_filtered(0u);
+    if (!acc_check("F reset pixels restart", words, expected)) return 1;
+  }
 
   // Surface contract shader uses the same production reconstruction include with the exact t0-t2/u0 layout.
   D3D12_DESCRIPTOR_RANGE surface_ranges[2] = {};
@@ -3204,7 +3462,7 @@ int RunRtxdiDxrBridge() {
   }
   std::printf("PASS finite-input raw overflow sanitizer writes UNKNOWN and zero diffuse\n");
 
-  constexpr uint32_t lighting_case_count = 57u;
+  constexpr uint32_t lighting_case_count = 60u;
   std::fprintf(stderr, "DIAG lighting setup start\n");
   std::array<LightingConsumerCase, lighting_case_count> lighting_cases = {};
   for (LightingConsumerCase& test_case : lighting_cases) {
@@ -3452,6 +3710,14 @@ int RunRtxdiDxrBridge() {
   lighting_cases[56].sun_status = 0x80000000u | RTXDI_SUN_STATUS_BLOCKED;
   lighting_cases[56].sun_transmission = 0.5f;
   lighting_cases[56].csm_visibility = 0.4f;
+  lighting_cases[57].sun_bound = 1u;
+  lighting_cases[57].sun_status = RTXDI_SUN_STATUS_FILTERED | (1u << RTXDI_SUN_LAYER_SHIFT) | (64u << RTXDI_SUN_WIND_OCCLUSION_SHIFT);
+  lighting_cases[57].sun_transmission = 0.5f;
+  lighting_cases[58].sun_bound = 1u;
+  lighting_cases[58].sun_status = 0x01000000u | RTXDI_SUN_STATUS_FILTERED;
+  lighting_cases[58].csm_visibility = 0.3f;
+  lighting_cases[59] = lighting_cases[33];
+  lighting_cases[59].debug_sun_status = RTXDI_SUN_STATUS_FILTERED | (128u << RTXDI_SUN_WIND_OCCLUSION_SHIFT);
   for (LightingConsumerCase& test_case : lighting_cases) {
     test_case.padding[0] = 0u;
     test_case.padding[1] = 0u;
@@ -3571,6 +3837,13 @@ int RunRtxdiDxrBridge() {
       && lighting_results[55].sun_known == 1u && lighting_results[55].environment_sun_visibility == 0.f
       && lighting_results[56].sun_known == 0u && lighting_results[56].environment_sun_visibility == 0.4f
       && lighting_results[56].character_sun_multiplier == 1.f
+      && lighting_results[57].sun_known == 1u
+      && std::abs(lighting_results[57].environment_sun_visibility - (1.f - 64.f / 255.f)) < 1e-6f
+      && std::abs(lighting_results[57].character_sun_multiplier - (1.f - 64.f / 255.f)) < 1e-6f
+      && lighting_results[58].sun_known == 0u && lighting_results[58].environment_sun_visibility == 0.3f
+      && std::abs(lighting_results[59].debug_color[0] - (1.f - 128.f / 255.f) * 0.05f) < 1e-6f
+      && std::abs(lighting_results[59].debug_color[1] - (1.f - 128.f / 255.f) * 0.05f) < 1e-6f
+      && std::abs(lighting_results[59].debug_color[2] - (1.f - 128.f / 255.f) * 0.05f) < 1e-6f
       && lighting_results[9].denoised_used == 1u && std::abs(lighting_results[9].diffuse_replaced - 0.125f) < 1e-6f
       && std::abs(lighting_results[9].shaded_local_term - 0.015625f) < 1e-6f
       && lighting_results[9].specular_preserved == 5.0f

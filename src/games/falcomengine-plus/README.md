@@ -40,7 +40,9 @@ RTXDI shadow darkening scales how dark blocked lamp and sun shadows get on the e
 
 RTXDI sun visibility can be traced at half resolution, with a resolve pass that fills the other pixels from neighbours and falls back to full-resolution traces at edges. RTXDI sun and lamp shadows can sample a disk-shaped light for soft penumbras, using the shared IS-FAST noise, which the RTXDI scene pass copies itself when RTAO does not; on characters, lamp and sun shadow rays can also start from a point shifted with the disk sample so close self-shadows from arms, hair and clothing get soft edges. Sun shadows can also let tinted sunlight through alpha-tested leaf layers, and a share of sunlight through each wind-moved foliage object (opaque or alpha-tested) so moving foliage casts softer shadows.
 
-**Code:** [`world/rtgi`](world/rtgi/), [`world/rtxdi`](world/rtxdi/), [`world/shaders`](world/shaders/), [`world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl`](world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl), [`world_settings.hpp`](world/world_settings.hpp), [`lighting_0xCA3D8596.ps_5_0.hlsl`](sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl).
+RTXDI sun shadows with Light Size above 0 are averaged over recent frames, reprojected with motion vectors, history-tested against the previous depth and normal and clamped to the 3x3 neighbourhood, so soft penumbras are less noisy; at Light Size 0 nothing changes.
+
+**Code:** [`world/rtgi`](world/rtgi/), [`world/rtxdi`](world/rtxdi/), [`world/shaders`](world/shaders/), [`world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl`](world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl), [world/shaders/world_rtxdi_sun_accumulate.cs_6_5.hlsl](world/shaders/world_rtxdi_sun_accumulate.cs_6_5.hlsl), [`world_settings.hpp`](world/world_settings.hpp), [`lighting_0xCA3D8596.ps_5_0.hlsl`](sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl).
 **References:** [`reference/restir`](reference/restir/), vendored RTXDI [`README`](world/rtxdi/vendor/rtxdi/README.md) and [`license`](world/rtxdi/vendor/rtxdi/LICENSE.txt).
 
 #### NRD RELAX adapter

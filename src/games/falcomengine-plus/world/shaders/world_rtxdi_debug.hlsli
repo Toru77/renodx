@@ -189,6 +189,10 @@ float3 RtxdiDebugValueColor(uint view, uint2 pixel, bool status_bound, uint stat
     if (!sun_bound) return RtxdiDebugUnavailable(pixel);
     if ((sun_status & ~0xFFFFFFu) != 0u) return float3(1.0, 0.8, 0.0) * 0.05;
     if ((sun_status & 0xFFu) == RTXDI_SUN_STATUS_VISIBLE) return (((sun_status >> RTXDI_SUN_LAYER_SHIFT) & 0xFFu) != 0u ? float3(0.0, 1.0, 0.0) : float3(1.0, 1.0, 1.0)) * 0.05;
+    if ((sun_status & 0xFFu) == RTXDI_SUN_STATUS_FILTERED) {
+      const float filtered_visibility = 1.0 - ((sun_status >> RTXDI_SUN_WIND_OCCLUSION_SHIFT) & RTXDI_SUN_WIND_OCCLUSION_MASK) / 255.0;
+      return (((sun_status >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) != 0u ? float3(0.0, 1.0, 0.0) : float3(1.0, 1.0, 1.0)) * filtered_visibility * 0.05;
+    }
     if ((sun_status & 0xFFu) == RTXDI_SUN_STATUS_BLOCKED) return 0.0;
     return float3(1.0, 0.8, 0.0) * 0.05;
   }

@@ -12329,7 +12329,7 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
         && view(kLightingDepthRegister).handle == dd->captured_depth_srv.handle
         && view(kLightingMrtNormalRegister).handle == dd->captured_mrt_normal_srv.handle
         && di::GetTextureViewExtent(held_views[kLightingDepthRegister].Get(), &input_width, &input_height)) {
-      const bool motion_ready = (request_mask & 1u) != 0u && UpdateRtMotion(dev, dd, true)
+      const bool motion_ready = ((request_mask & 1u) != 0u || (di::SunVisibilityRequested(request_mask) && di::SunAccumulationRequested())) && UpdateRtMotion(dev, dd, true)
                                 && dd->mb_rtv4_frame == dd->frame_index;
       const uint32_t requested_debug_view = static_cast<uint32_t>(
           std::clamp(std::isfinite(di::g_debug_view) ? di::g_debug_view : 0.f, 0.f,
@@ -12395,6 +12395,8 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
           sun.fence_b = slot.output_b_fence;
           sun.scene_slot = slot.output_scene_slot;
           sun.transfer_slot = slot.output_transfer_slot;
+          sun.accumulated = slot.sun_accumulated;
+          sun.accumulation_history = slot.sun_history_used;
         } else {
           sun.status = di::SunStatus::Failed;
           sun.error = E_FAIL;

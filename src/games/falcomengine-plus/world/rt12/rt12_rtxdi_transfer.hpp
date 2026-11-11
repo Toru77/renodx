@@ -1448,6 +1448,30 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
         return finish();
       }
     }
+    if (in.sun && rtxdi::SunAccumulationRequested() && !slot.sun_history) {
+      D3D12_RESOURCE_DESC history_desc = {};
+      history_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      history_desc.Width = in.width;
+      history_desc.Height = in.height;
+      history_desc.DepthOrArraySize = 1u;
+      history_desc.MipLevels = 1u;
+      history_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+      history_desc.SampleDesc.Count = 1u;
+      history_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+      history_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+      D3D12_HEAP_PROPERTIES history_heap = {};
+      history_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+      history_heap.CreationNodeMask = 1u;
+      history_heap.VisibleNodeMask = 1u;
+      const HRESULT history_hr = s.device12->CreateCommittedResource(&history_heap, D3D12_HEAP_FLAG_NONE, &history_desc,
+                                                                    D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                    IID_PPV_ARGS(&slot.sun_history));
+      if (FAILED(history_hr)) {
+        result.status = rtxdi::InputStatus::AllocationFailed;
+        result.error = history_hr;
+        return finish();
+      }
+    }
     const bool sun_detail_requested = in.sun
                                       && RtxdiSunDetailExportRequested(in.effective_debug_view, in.sun_detail_view);
     if (sun_detail_requested && (!slot.sun_detail.texture12 || slot.sun_detail.width != in.width
@@ -1611,6 +1635,50 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       }
       transfer.sun_root = std::move(root);
       transfer.sun_pso = std::move(pso);
+    }
+    if (in.sun && (!transfer.sun_accumulate_root || !transfer.sun_accumulate_pso)) {
+      D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+      ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      ranges[0].NumDescriptors = 8u;
+      ranges[0].BaseShaderRegister = 0u;
+      ranges[0].OffsetInDescriptorsFromTableStart = 0u;
+      ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+      ranges[1].NumDescriptors = 3u;
+      ranges[1].BaseShaderRegister = 0u;
+      ranges[1].OffsetInDescriptorsFromTableStart = 8u;
+      D3D12_ROOT_PARAMETER params[2] = {};
+      params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+      params[0].Constants.Num32BitValues = 5u;
+      params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      params[1].DescriptorTable.NumDescriptorRanges = 2u;
+      params[1].DescriptorTable.pDescriptorRanges = ranges;
+      D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+      root_desc.NumParameters = 2u;
+      root_desc.pParameters = params;
+      ComPtr<ID3DBlob> blob, error;
+      ComPtr<ID3D12RootSignature> root;
+      ComPtr<ID3D12PipelineState> pso;
+      HRESULT hr = s.serialize(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
+      if (SUCCEEDED(hr)) {
+        hr = s.device12->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root));
+      }
+#if defined(__world_rtxdi_sun_accumulate_EMBED_FILE)
+      if (SUCCEEDED(hr)) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+        desc.pRootSignature = root.Get();
+        desc.CS = {__world_rtxdi_sun_accumulate.data(), __world_rtxdi_sun_accumulate.size()};
+        hr = s.device12->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso));
+      }
+#else
+      hr = E_FAIL;
+#endif
+      if (FAILED(hr)) {
+        result.status = rtxdi::InputStatus::AllocationFailed;
+        result.error = hr;
+        return finish();
+      }
+      transfer.sun_accumulate_root = std::move(root);
+      transfer.sun_accumulate_pso = std::move(pso);
     }
     if (!transfer.list) {
       ComPtr<ID3D12GraphicsCommandList4> list;
@@ -1810,6 +1878,8 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     const uint32_t texels = (std::max)({96u, counts[0] * 7u, counts[1] * 36u, counts[2] * 9u});
     transfer.list->Dispatch((texels + 63u) / 64u, 1u, 1u);
     bool sun_detail_recorded = false;
+    bool sun_accumulated = false;
+    bool sun_history_used = false;
     if (in.sun) {
       Rt12Slot& scene = s.lighting_slots[static_cast<uint32_t>(in.scene_slot)];
       const bool gc = s.scene_gc;
@@ -1894,6 +1964,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       const float character_bias = rtxdi::FiniteClamped(rtxdi::g_sun_character_normal_bias, 0.02f, 0.f, 0.5f);
       const bool sun_half = rtxdi::FiniteClamped(rtxdi::g_sun_trace_resolution, 0.f, 0.f, 1.f) > 0.5f;
       const float sun_disk_tan = std::tan(rtxdi::FiniteClamped(rtxdi::g_sun_light_size, 0.f, 0.f, 5.f) * 0.5f * std::numbers::pi_v<float> / 180.f);
+      const float foliage_transmission = rtxdi::FiniteClamped(rtxdi::g_sun_foliage_transmission, 0.f, 0.f, 1.f);
       const uint32_t params[25] = {in.width, in.height, std::bit_cast<uint32_t>(maximum_distance),
                                    std::bit_cast<uint32_t>(environment_bias), std::bit_cast<uint32_t>(character_bias),
                                    std::bit_cast<uint32_t>(s.scene_coverage_min[0]),
@@ -1906,7 +1977,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                                    std::bit_cast<uint32_t>(sun_disk_tan),
                                    (rtxdi::g_sun_isfast > 0.5f && s.noise_source != 0u) ? 1u : 0u,
                                    in.frame % 32u,
-                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_transmission, 0.f, 0.f, 1.f)),
+                                   std::bit_cast<uint32_t>(foliage_transmission),
                                    std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_wind_transmission, 0.5f, 0.f, 1.f)), 0u,
                                    std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_tint_r, 1.f, 0.f, 1.f)),
                                    std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_tint_g, 1.f, 0.f, 1.f)),
@@ -1929,6 +2000,81 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       query_barriers.clear();
       UavBarrier(query_barriers, slot.sun_results.Get());
       UavBarrier(query_barriers, slot.sun_visibility.texture12.Get());
+      if (motion_available && slot.sun_history && rtxdi::SunAccumulationRequested()) {
+        transfer.list->ResourceBarrier(static_cast<UINT>(query_barriers.size()), query_barriers.data());
+        query_barriers.clear();
+        Rt12DiTransferSlot* history_slot = nullptr;
+        if (transfer.sun_history_transfer_slot >= 0 && transfer.sun_history_transfer_slot < static_cast<int32_t>(kRt12Slots)) {
+          Rt12DiTransferSlot& candidate = transfer.slots[static_cast<uint32_t>(transfer.sun_history_transfer_slot)];
+          const bool previous_inputs = candidate.sun && candidate.sun_history && candidate.width == in.width
+                                       && candidate.height == in.height && candidate.depth.texture12
+                                       && candidate.normal.texture12 && candidate.scene.texture12;
+          if (rtxdi::ValidDiHistoryIdentity({.previous_frame = transfer.sun_history_frame,
+                                             .current_frame = in.frame,
+                                             .previous_width = transfer.sun_history_width,
+                                             .previous_height = transfer.sun_history_height,
+                                             .current_width = in.width,
+                                             .current_height = in.height,
+                                             .previous_transfer_slot = transfer.sun_history_transfer_slot,
+                                             .current_transfer_slot = static_cast<int32_t>(k),
+                                             .previous_owner_generation = transfer.sun_history_owner_generation,
+                                             .current_owner_generation = s.generation,
+                                             .previous_configuration_generation = transfer.sun_history_configuration_generation,
+                                             .current_configuration_generation = transfer.configuration_generation,
+                                             .motion_available = true,
+                                             .previous_inputs_available = previous_inputs})) {
+            history_slot = &candidate;
+          }
+        }
+        const Rt12DiTransferSlot& history_inputs = (history_slot != nullptr ? *history_slot : slot);
+        const D3D12_SHADER_RESOURCE_VIEW_DESC motion_srv = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_FLOAT);
+        const D3D12_SHADER_RESOURCE_VIEW_DESC history_srv = Rt12TextureSrv(DXGI_FORMAT_R16G16_FLOAT);
+        const D3D12_UNORDERED_ACCESS_VIEW_DESC history_uav = Rt12TextureUav(DXGI_FORMAT_R16G16_FLOAT);
+        native->CreateShaderResourceView(slot.depth.texture12.Get(), &depth_srv, query_cpu(25u));
+        native->CreateShaderResourceView(slot.normal.texture12.Get(), &srv, query_cpu(26u));
+        native->CreateShaderResourceView(slot.scene.texture12.Get(), &srv, query_cpu(27u));
+        native->CreateShaderResourceView(slot.motion.texture12.Get(), &motion_srv, query_cpu(28u));
+        native->CreateShaderResourceView(history_inputs.depth.texture12.Get(), &depth_srv, query_cpu(29u));
+        native->CreateShaderResourceView(history_inputs.normal.texture12.Get(), &srv, query_cpu(30u));
+        native->CreateShaderResourceView(history_inputs.scene.texture12.Get(), &srv, query_cpu(31u));
+        native->CreateShaderResourceView(history_slot != nullptr ? history_slot->sun_history.Get() : nullptr, &history_srv, query_cpu(32u));
+        native->CreateUnorderedAccessView(slot.sun_results.Get(), nullptr, &result_uav, query_cpu(33u));
+        native->CreateUnorderedAccessView(slot.sun_visibility.texture12.Get(), nullptr, &visibility_uav, query_cpu(34u));
+        native->CreateUnorderedAccessView(slot.sun_history.Get(), nullptr, &history_uav, query_cpu(35u));
+        std::vector<D3D12_RESOURCE_BARRIER> accumulate_barriers;
+        Transition(accumulate_barriers, slot.motion.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Transition(accumulate_barriers, slot.sun_history.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (history_slot != nullptr) {
+          for (ID3D12Resource* resource : {history_slot->depth.texture12.Get(), history_slot->normal.texture12.Get(),
+                                           history_slot->scene.texture12.Get(), history_slot->sun_history.Get()}) {
+            Transition(accumulate_barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          }
+        }
+        transfer.list->ResourceBarrier(static_cast<UINT>(accumulate_barriers.size()), accumulate_barriers.data());
+        transfer.list->SetComputeRootSignature(transfer.sun_accumulate_root.Get());
+        transfer.list->SetPipelineState(transfer.sun_accumulate_pso.Get());
+        const uint32_t accumulate_params[5] = {in.width, in.height, history_slot != nullptr ? 1u : 0u,
+                                               static_cast<uint32_t>(std::lround(rtxdi::FiniteClamped(rtxdi::g_sun_accumulation_frames, 8.f, 2.f, 32.f))),
+                                               std::bit_cast<uint32_t>(foliage_transmission)};
+        transfer.list->SetComputeRoot32BitConstants(0u, 5u, accumulate_params, 0u);
+        auto accumulate_gpu = slot.descriptors->GetGPUDescriptorHandleForHeapStart();
+        accumulate_gpu.ptr += static_cast<UINT64>(25u) * s.descriptor_size;
+        transfer.list->SetComputeRootDescriptorTable(1u, accumulate_gpu);
+        transfer.list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
+        accumulate_barriers.clear();
+        Transition(accumulate_barriers, slot.motion.texture12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Transition(accumulate_barriers, slot.sun_history.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        if (history_slot != nullptr) {
+          for (ID3D12Resource* resource : {history_slot->depth.texture12.Get(), history_slot->normal.texture12.Get(),
+                                           history_slot->scene.texture12.Get(), history_slot->sun_history.Get()}) {
+            Transition(accumulate_barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+          }
+        }
+        transfer.list->ResourceBarrier(static_cast<UINT>(accumulate_barriers.size()), accumulate_barriers.data());
+        UavBarrier(query_barriers, slot.sun_visibility.texture12.Get());
+        sun_accumulated = true;
+        sun_history_used = history_slot != nullptr;
+      }
       if (sun_detail_requested && slot.sun_detail.texture12) {
 #if defined(__world_rtxdi_sun_detail_EMBED_FILE)
         if (!transfer.sun_detail_root || !transfer.sun_detail_pso) {
@@ -2124,6 +2270,18 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
         slot.output_scene_slot = in.scene_slot;
         slot.output_transfer_slot = static_cast<int32_t>(k);
         slot.output_staged = true;
+        slot.sun_accumulated = sun_accumulated;
+        slot.sun_history_used = sun_history_used;
+        if (sun_accumulated) {
+          transfer.sun_history_frame = in.frame;
+          transfer.sun_history_width = in.width;
+          transfer.sun_history_height = in.height;
+          transfer.sun_history_transfer_slot = static_cast<int32_t>(k);
+          transfer.sun_history_owner_generation = s.generation;
+          transfer.sun_history_configuration_generation = transfer.configuration_generation;
+        } else {
+          transfer.sun_history_transfer_slot = -1;
+        }
         if (sun_detail_recorded) {
           slot.sun_detail_identity = {.source_version = 1u,
                                       .detail_view = in.sun_detail_view,

@@ -30,6 +30,7 @@
 #define RTXDI_SUN_STATUS_UNKNOWN 0u
 #define RTXDI_SUN_STATUS_VISIBLE 1u
 #define RTXDI_SUN_STATUS_BLOCKED 2u
+#define RTXDI_SUN_STATUS_FILTERED 3u
 
 #define RTXDI_SUN_REASON_NONE             0u
 #define RTXDI_SUN_REASON_INVALID_SURFACE  1u
@@ -59,4 +60,14 @@ struct RtxdiSunVisibilityResult {
   uint32_t reason;
   uint32_t flags;
 };
+#endif
+
+#ifndef __cplusplus
+#ifndef RTXDI_SUN_VISIBLE_FRACTION_DEFINED
+#define RTXDI_SUN_VISIBLE_FRACTION_DEFINED
+// Sunlight share of a VISIBLE sun word: each leaf layer passes Foliage Transmission, then the wind occlusion (0-255) is removed.
+float RtxdiSunVisibleFraction(uint layers, uint wind_occlusion, float transmission) {
+  return (layers == 0u ? 1.0 : pow(saturate(transmission), layers)) * (1.0 - wind_occlusion / 255.0);
+}
+#endif
 #endif

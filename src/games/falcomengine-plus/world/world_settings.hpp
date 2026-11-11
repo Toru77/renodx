@@ -1109,13 +1109,14 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           std::shared_lock lock(rtxdi::g_sun.mutex);
           sun = rtxdi::g_sun.snapshot;
         }
-        ImGui::Text("Sun visibility: %s | frame %u | owner %llu | config %llu (DI %llu) | scene %d | transfer %d | %ux%u | t42 bound %s | lighting draw seen %s | B %llu | C %llu | error 0x%08x",
+        ImGui::Text("Sun visibility: %s | frame %u | owner %llu | config %llu (DI %llu) | scene %d | transfer %d | %ux%u | t42 bound %s | lighting draw seen %s | accumulate %s (history %s) | B %llu | C %llu | error 0x%08x",
                     rtxdi::SunStatusName(sun.status), sun.frame,
                     static_cast<unsigned long long>(sun.owner_generation),
                     static_cast<unsigned long long>(sun.configuration_generation),
                     static_cast<unsigned long long>(sun.di_configuration_generation), sun.scene_slot, sun.transfer_slot,
                     sun.width, sun.height,
                     sun.output_bound ? "yes" : "no", sun.lighting_draw_seen ? "yes" : "no",
+                    sun.accumulated ? "yes" : "no", sun.accumulation_history ? "yes" : "no",
                     static_cast<unsigned long long>(sun.fence_b), static_cast<unsigned long long>(sun.fence_c),
                     static_cast<unsigned int>(sun.error));
         rt12::Rt12Panel rt12_panel;
@@ -1518,6 +1519,31 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RTXDI Sun",
       .tooltip = "Uses the blue-noise IS-FAST texture for the sun disk jitter when the IS-FAST texture is loaded (IS-FAST master On); otherwise the SDK random sequence is used. Only has an effect when Light Size > 0.",
       .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSunAccumulation",
+      .binding = &rtxdi::g_sun_accumulation,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Temporal Accumulation (Sun)",
+      .section = "RTXDI Sun",
+      .tooltip = "Averages the sun shadow over recent frames, reprojected with motion vectors, so soft edges from Light Size (Sun) are less noisy. Only has an effect when Light Size > 0; at 0 the sun shadow is unchanged.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSunAccumulationFrames",
+      .binding = &rtxdi::g_sun_accumulation_frames,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 8.f,
+      .label = "Accumulation Frames (Sun)",
+      .section = "RTXDI Sun",
+      .tooltip = "How many frames the sun shadow average spans. Higher is smoother; moving shadows lag more.",
+      .min = 2.f,
+      .max = 32.f,
+      .format = "%d",
+      .is_enabled = [] { return rtxdi::g_sun_accumulation > 0.5f; },
       .is_visible = visible,
   });
   settings->push_back(new Setting{
