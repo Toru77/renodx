@@ -366,8 +366,8 @@ RtxdiDiRawResult RtxdiTraceLocalLight(RAB_Surface surface, RAB_LightSample sampl
   const float3 shadow_delta = sample.shadow_target - surface.world_position;
   const float shadow_distance_squared = dot(shadow_delta, shadow_delta);
   if (!all(isfinite(shadow_delta)) || !isfinite(shadow_distance_squared) || shadow_distance_squared <= 1e-12) return result;
-  const float shadow_distance = sqrt(shadow_distance_squared);
-  const float3 shadow_direction = shadow_delta / shadow_distance;
+  float shadow_distance = sqrt(shadow_distance_squared);
+  float3 shadow_direction = shadow_delta / shadow_distance;
   const bool character = (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u;
   const float bias = character ? character_bias : environment_bias;
   if (!isfinite(bias)) return result;
@@ -378,6 +378,11 @@ RtxdiDiRawResult RtxdiTraceLocalLight(RAB_Surface surface, RAB_LightSample sampl
     float3 lateral = (sample.shadow_target - sample.position) * min(g_character_self_softening / shadow_distance, 1.0);
     lateral -= outward * min(dot(lateral, outward), 0.0);
     origin += lateral;
+    const float3 shifted_delta = sample.shadow_target - (surface.world_position + lateral);
+    const float shifted_distance_squared = dot(shifted_delta, shifted_delta);
+    if (!all(isfinite(shifted_delta)) || !isfinite(shifted_distance_squared) || shifted_distance_squared <= 1e-12) return result;
+    shadow_distance = sqrt(shifted_distance_squared);
+    shadow_direction = shifted_delta / shadow_distance;
   }
   if (shadow_distance <= endpoint_clearance) return RtxdiDiMakeVisibleRawResult(sample.radiance * max(max(0.0, dot(surface.shading_normal, direction)), sample.translucency) * inverse_pdf, distance, character ? 1u : 0u, sample.light_index, sample.type, inverse_pdf);
   const float endpoint = max(shadow_distance - endpoint_clearance, 0.0);
