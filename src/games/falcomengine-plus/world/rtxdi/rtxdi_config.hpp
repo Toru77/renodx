@@ -20,6 +20,7 @@ inline constexpr uint32_t kNeighborCount = 8192u;
 inline constexpr uint64_t kNeighborBytes = uint64_t{kNeighborCount} * 2u;
 static_assert((kNeighborCount & (kNeighborCount - 1u)) == 0u);
 static_assert(kNeighborBytes == 16384u);
+inline constexpr uint32_t kSpatialTargetHistoryLength = 2u;
 
 struct DiConfig {
   uint32_t width = 0u, height = 0u;
@@ -33,7 +34,7 @@ struct EffectiveRtxdiSettings {
   bool temporal_enabled = true;
   bool spatial_enabled = true;
   uint32_t spatial_samples = 4u;
-  uint32_t spatial_disocclusion = 4u;
+  uint32_t spatial_disocclusion = 8u;
   float spatial_radius = 4.0f;
   uint32_t history_length = 20u;
   float temporal_depth_threshold = 0.1f;
@@ -60,7 +61,7 @@ inline EffectiveRtxdiSettings CaptureEffectiveRtxdiSettings() {
   effective.temporal_enabled = g_temporal_reuse > 0.5f;
   effective.spatial_enabled = g_spatial_reuse > 0.5f;
   effective.spatial_samples = integer_setting(g_spatial_samples, 4.0f, 1l, 16l);
-  effective.spatial_disocclusion = integer_setting(g_spatial_disocclusion, 4.0f, 1l, 16l);
+  effective.spatial_disocclusion = integer_setting(g_spatial_disocclusion, 8.0f, 1l, 16l);
   effective.spatial_radius = std::clamp(std::isfinite(g_spatial_radius) ? g_spatial_radius : 4.0f, 1.0f, 32.0f);
   effective.history_length = integer_setting(g_history_length, 20.0f, 1l, 32l);
   effective.temporal_depth_threshold = std::clamp(std::isfinite(g_temporal_depth_threshold) ? g_temporal_depth_threshold : 0.1f, 0.0f, 1.0f);
@@ -78,10 +79,11 @@ inline EffectiveRtxdiSettings CaptureEffectiveRtxdiSettings() {
   if (effective.quality_preset != 3u) {
     constexpr uint32_t candidates[] = {4u, 8u, 16u};
     constexpr uint32_t spatial[] = {2u, 4u, 8u};
+    constexpr uint32_t disocclusion[] = {4u, 8u, 16u};
     const uint32_t preset = (std::min)(effective.quality_preset, 2u);
     effective.local_candidates = candidates[preset];
     effective.spatial_samples = spatial[preset];
-    effective.spatial_disocclusion = spatial[preset];
+    effective.spatial_disocclusion = disocclusion[preset];
   }
   uint64_t hash = 1469598103934665603ull;
   const auto add = [&hash](uint32_t value) {
@@ -222,7 +224,7 @@ inline std::unique_ptr<::rtxdi::ReSTIRDIContext> CreateDiContext(const DiConfig&
   spatial.biasCorrectionMode = ReSTIRDI_SpatialBiasCorrectionMode::Basic;
   spatial.depthThreshold = settings.spatial_depth_threshold;
   spatial.normalThreshold = settings.spatial_normal_threshold;
-  spatial.targetHistoryLength = 1u;
+  spatial.targetHistoryLength = (settings.temporal_enabled ? kSpatialTargetHistoryLength : 0u);
   spatial.enableMaterialSimilarityTest = 1u;
   spatial.discountNaiveSamples = 0u;
   context->SetSpatialResamplingParameters(spatial);

@@ -244,6 +244,8 @@ RTXDI M17: Temporal Accumulation (Sun) (default On) and Accumulation Frames (Sun
 
 RTXDI M18: Boiling Filter (Local) (default On) and Boiling Filter Strength (Local) (default 0.2, the SDK values): the temporal DI pass runs RTXDI_BoilingFilter over 8x8 groups before storing; all threads reach the filter, and out-of-bounds threads carry an empty reservoir. Not validated in game.
 
+RTXDI M19: Spatial disocclusion samples work as in the SDK: targetHistoryLength is 2 with temporal reuse (0 without), so pixels whose temporal reuse found no history (M = 1) take max(disocclusion, spatial samples) neighbours; default 8, presets 4/8/16. Not validated in game.
+
 ## Reference
 
 ### Code map (`world/`)

@@ -743,10 +743,11 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         const uint32_t preset = static_cast<uint32_t>(std::clamp(std::lround(current), 0l, 2l));
         constexpr uint32_t candidates[] = {4u, 8u, 16u};
         constexpr uint32_t spatial[] = {2u, 4u, 8u};
+        constexpr uint32_t disocclusion[] = {4u, 8u, 16u};
         rtxdi::g_applying_quality_preset = true;
         rtxdi::g_local_candidates = static_cast<float>(candidates[preset]);
         rtxdi::g_spatial_samples = static_cast<float>(spatial[preset]);
-        rtxdi::g_spatial_disocclusion = static_cast<float>(spatial[preset]);
+        rtxdi::g_spatial_disocclusion = static_cast<float>(disocclusion[preset]);
         renodx::utils::settings::UpdateSetting("RtxdiLocalCandidates", rtxdi::g_local_candidates);
         renodx::utils::settings::UpdateSetting("RtxdiSpatialSamples", rtxdi::g_spatial_samples);
         renodx::utils::settings::UpdateSetting("RtxdiSpatialDisocclusion", rtxdi::g_spatial_disocclusion);
@@ -806,9 +807,10 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .key = "RtxdiSpatialDisocclusion",
       .binding = &rtxdi::g_spatial_disocclusion,
       .value_type = SettingValueType::INTEGER,
-      .default_value = 4.f,
+      .default_value = 8.f,
       .label = "Spatial disocclusion samples",
       .section = "RTXDI Local",
+      .tooltip = "Neighbour samples spatial reuse takes for pixels without temporal history (new or disoccluded areas), as in the RTXDI SDK. Needs Temporal reservoir reuse On; no effect when not above Spatial samples.",
       .min = 1.f,
       .max = 16.f,
       .format = "%d",

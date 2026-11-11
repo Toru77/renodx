@@ -976,7 +976,8 @@ int main() {
       || parameters.di.boilingFilterParams.pad1 || parameters.di.boilingFilterParams.pad2
       || parameters.di.spatialResamplingParams.pad1 || parameters.di.spatialResamplingParams.pad2 || parameters.di.spatialResamplingParams.pad3
       || parameters.di.spatialResamplingParams.numSamples != 4u
-      || parameters.di.spatialResamplingParams.numDisocclusionBoostSamples != 4u
+      || parameters.di.spatialResamplingParams.numDisocclusionBoostSamples != 8u
+      || parameters.di.spatialResamplingParams.targetHistoryLength != falcom_world::rtxdi::kSpatialTargetHistoryLength
       || parameters.di.spatialResamplingParams.samplingRadius != 4.0f
       || parameters.di.spatialResamplingParams.biasCorrectionMode != ReSTIRDI_SpatialBiasCorrectionMode::Basic
       || parameters.di.spatialResamplingParams.discountNaiveSamples != 0u
@@ -1002,10 +1003,10 @@ int main() {
   falcom_world::rtxdi::g_spatial_samples = saved_spatial_samples;
   falcom_world::rtxdi::g_spatial_disocclusion = saved_spatial_disocclusion;
   if (performance.quality_preset != 0u || performance.local_candidates != 4u || performance.spatial_samples != 2u
-      || performance.spatial_disocclusion != 2u || balanced_settings.quality_preset != 1u
+      || performance.spatial_disocclusion != 4u || balanced_settings.quality_preset != 1u
       || balanced_settings.local_candidates != 8u || balanced_settings.spatial_samples != 4u
-      || balanced_settings.spatial_disocclusion != 4u || quality.local_candidates != 16u || quality.spatial_samples != 8u
-      || quality.spatial_disocclusion != 8u || custom.local_candidates != 32u || custom.spatial_samples != 4u
+      || balanced_settings.spatial_disocclusion != 8u || quality.local_candidates != 16u || quality.spatial_samples != 8u
+      || quality.spatial_disocclusion != 16u || custom.local_candidates != 32u || custom.spatial_samples != 4u
       || custom.spatial_disocclusion != 1u || custom.identity == balanced_settings.identity) return EXIT_FAILURE;
   const float saved_boiling = falcom_world::rtxdi::g_boiling_filter;
   const float saved_boiling_strength = falcom_world::rtxdi::g_boiling_filter_strength;
@@ -1025,6 +1026,7 @@ int main() {
     mode_settings.spatial_enabled = (mode & 2u) != 0u;
     const auto mode_context = falcom_world::rtxdi::CreateDiContext(config, mode_settings);
     if (!mode_context) return EXIT_FAILURE;
+    if (mode_context->GetSpatialResamplingParameters().targetHistoryLength != (mode_settings.temporal_enabled ? falcom_world::rtxdi::kSpatialTargetHistoryLength : 0u)) return EXIT_FAILURE;
     auto* rotating_context = mode_context.get();
     uint32_t prior_output = rotating_context->GetBufferIndices().temporalResamplingInputBufferIndex;
     for (uint32_t frame = 0u; frame < 6u; ++frame) {

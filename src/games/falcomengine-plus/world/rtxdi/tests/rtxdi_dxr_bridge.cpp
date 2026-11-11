@@ -2048,6 +2048,9 @@ int RunRtxdiDxrBridge() {
                                          : temporal          ? ::rtxdi::ReSTIRDI_ResamplingMode::Temporal
                                          : spatial           ? ::rtxdi::ReSTIRDI_ResamplingMode::Spatial
                                                              : ::rtxdi::ReSTIRDI_ResamplingMode::None);
+    auto run_spatial_parameters = bridge_di_context->GetSpatialResamplingParameters();
+    run_spatial_parameters.targetHistoryLength = (temporal ? falcom_world::rtxdi::kSpatialTargetHistoryLength : 0u);
+    bridge_di_context->SetSpatialResamplingParameters(run_spatial_parameters);
     di_frame.parameters = falcom_world::rtxdi::MakeDiFrameParameters(bridge_di_config, *bridge_di_context);
     di_frame.parameters.width = 3u;
     di_frame.parameters.height = 2u;
