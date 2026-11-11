@@ -33,3 +33,9 @@ Do not write the final user-facing summary yourself. The lead agent writes it af
 
 - Your plan is a file under `C:\Users\Toru\.claude\plans\renodx\`, given to you as a path and a section name. Read only that section. Never store plan files in the repository.
 - Grep first, then read only the line ranges the plan cites.
+
+## Hand-off checklist (every hand-off must include all of these)
+
+- **Plan file path and section**: for example `C:\Users\Toru\.claude\plans\renodx\<name>.md`, section `M18`. Never paste the plan text.
+- **Commit range**: the base commit and the commit to review or build on, for example `git diff <base>..<commit>`.
+- **Rules**: this agent's definition file path, and the repository rules that apply (CRLF, no `git add -A`, stage named files only, no single-use helpers, no changes outside the listed files).

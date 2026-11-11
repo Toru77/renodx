@@ -53,3 +53,9 @@ Finish every response with the plan or amendment and a line `HANDOFF: implemente
 2. **Plans live outside the repo, as files.** You are read-only, so return the full plan text in your reply. The lead saves it to `C:\Users\Toru\.claude\plans\renodx\<name>.md`, never inside the repository. Hand-offs name the file path and the section (for example `M17`), not pasted plan text.
 4. **Opus only for plan-level changes.** Use this agent for: the initial plan, changes to a milestone's goal or scope, files shared between milestones, default-look rules, and acceptance criteria. Routine decisions go to sub-planner (Sonnet). Implementation goes to implementer-writer (Haiku). Review goes to reviewer (Haiku).
 5. **Bounded reads.** Grep first. Read only the cited line ranges, and read a whole file only when the change needs it. Do not open large files in full.
+
+## Hand-off checklist (every hand-off must include all of these)
+
+- **Plan file path and section**: for example `C:\Users\Toru\.claude\plans\renodx\<name>.md`, section `M18`. Never paste the plan text.
+- **Commit range**: the base commit and the commit to review or build on, for example `git diff <base>..<commit>`.
+- **Rules**: this agent's definition file path, and the repository rules that apply (CRLF, no `git add -A`, stage named files only, no single-use helpers, no changes outside the listed files).

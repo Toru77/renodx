@@ -40,3 +40,9 @@ If you find none, finish with `NO DEVIATIONS:` and list the plan steps and crite
 
 - Your plan is a file under `C:\Users\Toru\.claude\plans\renodx\`, given to you as a path and a section name. Read only that section.
 - Review the diff for the named commit range. Grep first, and read only the cited line ranges of surrounding code.
+
+## Hand-off checklist (every hand-off must include all of these)
+
+- **Plan file path and section**: for example `C:\Users\Toru\.claude\plans\renodx\<name>.md`, section `M18`. Never paste the plan text.
+- **Commit range**: the base commit and the commit to review or build on, for example `git diff <base>..<commit>`.
+- **Rules**: this agent's definition file path, and the repository rules that apply (CRLF, no `git add -A`, stage named files only, no single-use helpers, no changes outside the listed files).

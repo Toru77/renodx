@@ -35,3 +35,9 @@ Finish with `HANDOFF: implementer-writer` when the implementer continues, or `HA
 - Read the plan by its file path and section (under `C:\Users\Toru\.claude\plans\renodx\`, never in the repository). Do not ask for the whole plan to be pasted.
 - Grep first. Read only the cited line ranges of code, and avoid opening large files in full.
 - Decide routine questions yourself. Escalate to master-planner only when the goal, scope, shared files, default-look rule, or acceptance criteria would change.
+
+## Hand-off checklist (every hand-off must include all of these)
+
+- **Plan file path and section**: for example `C:\Users\Toru\.claude\plans\renodx\<name>.md`, section `M18`. Never paste the plan text.
+- **Commit range**: the base commit and the commit to review or build on, for example `git diff <base>..<commit>`.
+- **Rules**: this agent's definition file path, and the repository rules that apply (CRLF, no `git add -A`, stage named files only, no single-use helpers, no changes outside the listed files).
