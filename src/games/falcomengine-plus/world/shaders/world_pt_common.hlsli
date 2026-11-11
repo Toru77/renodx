@@ -33,6 +33,7 @@ RWTexture2D<float4> g_pt_output : register(u0);
 RWStructuredBuffer<uint64_t> g_pt_sharc_hash : register(u1);
 RWStructuredBuffer<SharcAccumulationData> g_pt_sharc_accumulation : register(u2);
 RWStructuredBuffer<SharcPackedData> g_pt_sharc_resolved : register(u3);
+RWStructuredBuffer<uint> g_pt_counters : register(u6);  // GPU diagnostics: 0 exact G-buffer, 1 cache hit, 2 grey miss (PtHitMaterial)
 cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (40 dwords)
   uint2 g_size; uint g_frame; uint g_samples; uint g_max_bounces; uint g_roulette; uint g_roulette_min_bounce;
   uint g_lamp_count; uint g_sun_casters_only; uint g_dynamic_on; float g_ray_max; float g_env_bias; float g_char_bias;
@@ -174,6 +175,7 @@ uint4 PtReadMaterial(uint index) {
   const uint base = index * 4u;
   return uint4(g_pt_material_values[base], g_pt_material_values[base + 1u], g_pt_material_values[base + 2u], g_pt_material_values[base + 3u]);
 }
+void PtCount(uint index) { uint previous; InterlockedAdd(g_pt_counters[index], 1u, previous); }
 // The material at a bounce hit: the G-buffer when the hit is the visible surface on screen, else the cache, else grey 0.5.
 PtMaterial PtHitMaterial(float3 position, float3 nh) {
   PtMaterial m;
@@ -189,6 +191,7 @@ PtMaterial PtHitMaterial(float3 position, float3 nh) {
       const float4 world_h = mul(g_pt_inv_view_proj, float4(center.x * 2.0 - 1.0, 1.0 - center.y * 2.0, depth, 1.0));
       if (depth > 0.0 && depth <= 1.0 && abs(world_h.w) > 1e-8
           && length(world_h.xyz / world_h.w - position) <= 0.05 + 0.02 * length(position - g_sharc_camera)) {
+        PtCount(0u);
         return PtGBufferMaterial(pixel);
       }
     }
@@ -196,8 +199,10 @@ PtMaterial PtHitMaterial(float3 position, float3 nh) {
   uint64_t key;
   const uint index = HashGridFindEntry(PtMaterialData(), PtCachePosition(position, nh), nh, PtMaterialGrid(), key);
   if (index != HASH_GRID_INVALID_CACHE_INDEX && ((PtReadMaterial(index).w >> 24) & 1u) != 0u) {
+    PtCount(1u);
     return PtUnpackMaterial(PtReadMaterial(index));
   }
+  PtCount(2u);
   return m;
 }
 // A bounce hit's cache data (OpenRemix pathtrace.comp:1097-1124): placed slightly above the surface, toward the ray.

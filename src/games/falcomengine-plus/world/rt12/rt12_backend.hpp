@@ -381,8 +381,9 @@ struct Rt12DiTransferState {
 };
 
 // Path-traced diffuse GI (world/pt): its own submission slots, list, root signature, PSO, descriptors and outputs.
-inline constexpr uint32_t kRt12PtDescriptors = 24u;
+inline constexpr uint32_t kRt12PtDescriptors = 25u;
 inline constexpr uint32_t kRt12PtConstants = 40u;
+inline constexpr uint32_t kRt12PtCounters = 5u;  // GPU material-cache counters (uint32 each), world_pt_common.hlsli g_pt_counters
 struct Rt12PtState {
   bool created = false;
   Rt12Slot slots[kRt12Slots];
@@ -411,6 +412,12 @@ struct Rt12PtState {
   bool material_clear = true;
   uint32_t material_last_frame = UINT32_MAX, material_episode = UINT32_MAX, material_cell_scale = 0u, material_reset_seen = 0u;
   bool sharc_material_on = false;  // material cache state SHARC was trained with
+  // GPU counters (diagnostics): per slot a DEFAULT buffer, cleared from counter_zero each trace and copied to its READBACK
+  // buffer after it; mapped only once that submission's fence is complete (never waited on).
+  Microsoft::WRL::ComPtr<ID3D12Resource> counters[kRt12Slots], counter_readback[kRt12Slots], counter_zero;
+  uint64_t counter_fence[kRt12Slots] = {};
+  uint32_t counter_frame[kRt12Slots] = {};
+  bool counter_pending[kRt12Slots] = {};
 };
 
 struct Rt12State {

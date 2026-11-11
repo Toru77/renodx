@@ -1,7 +1,9 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include "../world_state.hpp"
 #include <deps/imgui/imgui.h>
 namespace falcom_world::pt {
 inline float g_pt_enabled = 0.f;
@@ -52,12 +54,44 @@ struct PtPanel {
   uint32_t mat_capacity_log2 = 0u, mat_rate = 0u;
   uint64_t mat_clears = 0u;
   const char* mat_clear_reason = "none";
+  uint32_t gpu_exact = 0u, gpu_hits = 0u, gpu_misses = 0u, gpu_lock_drops = 0u, gpu_writes = 0u;
+  uint64_t gpu_frame = 0u;
+  bool gpu_available = false;
   uint32_t lamps = 0u, width = 0u, height = 0u;
 };
 inline std::mutex g_pt_panel_mutex;
 inline PtPanel g_pt_panel;
+inline constexpr uint32_t kPtEventCapacity = 64u;
+inline constexpr size_t kPtEventTextMax = 160u;
+struct PtEvent {
+  uint64_t frame = 0u;
+  std::string text;
+};
+inline std::mutex g_pt_event_mutex;  // lock order: g_pt_panel_mutex, then g_pt_event_mutex
+inline PtEvent g_pt_events[kPtEventCapacity];
+inline uint32_t g_pt_event_next = 0u, g_pt_event_size = 0u;
+inline uint64_t g_pt_event_overwritten = 0u;
+inline std::atomic<uint64_t> g_pt_capture_state{0};  // bit 0: enabled; upper bits: epoch, +2 per change
+inline float g_pt_debug_logging = 0.f;  // Settings binding only; render thread reads g_pt_capture_state
+inline void RecordPtEvent(uint64_t frame, const std::string& text, uint64_t capture_state) {
+  std::lock_guard lock(g_pt_event_mutex);
+  if ((capture_state & 1u) == 0u || capture_state != g_pt_capture_state.load()) return;
+  if (g_pt_event_size == kPtEventCapacity) {
+    ++g_pt_event_overwritten;
+  } else {
+    ++g_pt_event_size;
+  }
+  PtEvent& slot = g_pt_events[g_pt_event_next];
+  slot.frame = frame;
+  slot.text = text.substr(0u, kPtEventTextMax);
+  g_pt_event_next = (g_pt_event_next + 1u) % kPtEventCapacity;
+}
 inline void SetPtReason(PtReason r) {
   std::lock_guard lock(g_pt_panel_mutex);
+  const uint64_t capture_state = g_pt_capture_state.load();
+  if (g_pt_panel.reason != r && (capture_state & 1u) != 0u) {
+    RecordPtEvent(g_state.frame.load(std::memory_order_relaxed), PtReasonName(r), capture_state);
+  }
   g_pt_panel.reason = r;
   ++g_pt_panel.frames[static_cast<uint32_t>(r)];
 }
@@ -74,5 +108,15 @@ inline void DrawPtPanel() {
               p.sharc_clear_reason);
   ImGui::Text("Material cache: %s  capacity 2^%u  write 1/%u px  clears %llu (last: %s)", p.mat_on ? "on" : "off",
               p.mat_capacity_log2, p.mat_rate * p.mat_rate, static_cast<unsigned long long>(p.mat_clears), p.mat_clear_reason);
+  if (p.gpu_available) {
+    const uint32_t now = static_cast<uint32_t>(falcom_world::g_state.frame.load());
+    const uint32_t gpu = static_cast<uint32_t>(p.gpu_frame);
+    const uint32_t age = now - gpu;
+    ImGui::Text("GPU material lookups, frame %llu (age %u): exact %u, hits %u, grey misses %u; writes %u, lock drops %u",
+                static_cast<unsigned long long>(p.gpu_frame), age,
+                p.gpu_exact, p.gpu_hits, p.gpu_misses, p.gpu_writes, p.gpu_lock_drops);
+  } else {
+    ImGui::Text("GPU counters: unavailable");
+  }
 }
 }  // namespace falcom_world::pt

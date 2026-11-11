@@ -12,6 +12,7 @@
 #include "../rt12/rt12_backend.hpp"
 #include "../rt12/rt12_rtxdi_transfer.hpp"
 #include "pt_state.hpp"
+#include "pt_diagnostics.hpp"
 namespace falcom_world::rt12 {
 inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, reshade::api::command_list* cmd_list,
                                               int32_t transfer_slot, bool lamps) {
@@ -38,6 +39,11 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   Rt12DiTransferSlot& input = s.di_transfer.slots[static_cast<uint32_t>(transfer_slot)];
   Rt12Slot& scene = s.lighting_slots[static_cast<uint32_t>(s.scene_slot)];
   const auto fail = [&s, &fallback](const char* stage, HRESULT hr) {
+    const uint64_t capture_state = pt::g_pt_capture_state.load();
+    if ((capture_state & 1u) != 0u) {
+      pt::RecordPtEvent(g_state.frame.load(std::memory_order_relaxed),
+                        std::string(stage) + " hr " + std::to_string(static_cast<uint32_t>(hr)), capture_state);
+    }
     FailSession(s, Rt12Reason::CreateFailed, stage, hr);
     return fallback(pt::PtReason::Failed);
   };
@@ -75,8 +81,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (FAILED(hr)) return fail("pt list", hr);
     hr = r.list->Close();
     if (FAILED(hr)) return fail("pt close", hr);
-    // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u5, descriptor order 0..23.
-    const UINT counts[8] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 2u};
+    // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u6, descriptor order 0..24.
+    const UINT counts[8] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 3u};
     const UINT bases[8] = {0u, 14u, 29u, 30u, 31u, 0u, 36u, 4u};
     const UINT offsets[8] = {0u, 4u, 7u, 8u, 9u, 14u, 18u, 22u};
     D3D12_DESCRIPTOR_RANGE ranges[8] = {};
@@ -124,7 +130,49 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = s.device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&r.heap));
     if (FAILED(hr)) return fail("pt heap", hr);
+    for (uint32_t i = 0u; i < kRt12Slots; ++i) {
+      hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, kRt12PtCounters * sizeof(uint32_t), D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, r.counters[i]);
+      if (FAILED(hr)) return fail("pt counters", hr);
+      hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_READBACK, kRt12PtCounters * sizeof(uint32_t), D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_FLAG_NONE, r.counter_readback[i]);
+      if (FAILED(hr)) return fail("pt counter readback", hr);
+    }
+    hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_UPLOAD, kRt12PtCounters * sizeof(uint32_t), D3D12_RESOURCE_STATE_GENERIC_READ,
+                          D3D12_RESOURCE_FLAG_NONE, r.counter_zero);
+    if (FAILED(hr)) return fail("pt counter zero", hr);
+    void* zeros = nullptr;
+    hr = r.counter_zero->Map(0u, nullptr, &zeros);
+    if (FAILED(hr)) return fail("pt counter zero map", hr);
+    std::fill_n(static_cast<uint32_t*>(zeros), kRt12PtCounters, 0u);
+    r.counter_zero->Unmap(0u, nullptr);
     r.created = true;
+  }
+  // 2b. GPU counters: a slot's counters are read once its submission's fence is complete. Never waits.
+  const uint64_t completed = Rt12CompletedValue(s);
+  for (uint32_t i = 0u; i < kRt12Slots; ++i) {
+    if (!r.counter_pending[i] || r.counter_fence[i] > completed) continue;
+    void* mapped = nullptr;
+    if (FAILED(r.counter_readback[i]->Map(0u, nullptr, &mapped))) continue;
+    if (mapped != nullptr) {
+      const auto* values = static_cast<const uint32_t*>(mapped);
+      {
+        std::lock_guard lock(pt::g_pt_panel_mutex);
+        const uint32_t stored = static_cast<uint32_t>(pt::g_pt_panel.gpu_frame);
+        const bool newer = static_cast<int32_t>(r.counter_frame[i] - stored) >= 0;
+        if (!pt::g_pt_panel.gpu_available || newer) {
+          pt::g_pt_panel.gpu_exact = values[0];
+          pt::g_pt_panel.gpu_hits = values[1];
+          pt::g_pt_panel.gpu_misses = values[2];
+          pt::g_pt_panel.gpu_lock_drops = values[3];
+          pt::g_pt_panel.gpu_writes = values[4];
+          pt::g_pt_panel.gpu_frame = static_cast<uint32_t>(r.counter_frame[i]);
+          pt::g_pt_panel.gpu_available = true;
+        }
+      }
+      r.counter_pending[i] = false;
+    }
+    r.counter_readback[i]->Unmap(0u, nullptr);
   }
   // 3. Slot wait: this slot's previous submission must be complete (a timeout is stuck).
   const uint32_t k = r.next;
@@ -140,7 +188,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     }
     if (!done) {
       s.stuck = true;
-      renodx::utils::log::w("[world-rt12] pt stuck: fence at ", Rt12CompletedValue(s), ", slot submitted ", pt_slot.fence_value);
+      pt::PtLogWarn("[world-rt12] pt stuck: fence at " + std::to_string(Rt12CompletedValue(s)) + ", slot submitted "
+                    + std::to_string(pt_slot.fence_value));
       DisableMirror();
       return fallback(pt::PtReason::Stuck);
     }
@@ -192,7 +241,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     } else {
       r.sharc_hash.Reset(); r.sharc_accumulation.Reset(); r.sharc_resolved.Reset();
       r.sharc_failed_capacity = sharc_capacity_wanted;
-      renodx::utils::log::w("[world-rt12] pt sharc buffers failed at capacity ", sharc_capacity_wanted, "; SHARC off");
+      pt::PtLogWarn("[world-rt12] pt sharc buffers failed at capacity " + std::to_string(sharc_capacity_wanted) + "; SHARC off");
       sharc_on = false;
     }
   }
@@ -282,7 +331,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       r.material_keys.Reset();
       r.material_values.Reset();
       r.material_failed_capacity = mat_capacity_wanted;
-      renodx::utils::log::w("[world-rt12] pt material buffers failed at capacity ", mat_capacity_wanted, "; material cache off");
+      pt::PtLogWarn("[world-rt12] pt material buffers failed at capacity " + std::to_string(mat_capacity_wanted) + "; material cache off");
       mat_on = false;
     }
   }
@@ -402,6 +451,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   };
   set_material_uav(22u, mat_on ? r.material_keys.Get() : nullptr, 8u, mat_on ? r.material_capacity : 1u);
   set_material_uav(23u, mat_on ? r.material_values.Get() : nullptr, 4u, mat_on ? r.material_capacity * 4u : 1u);
+  set_material_uav(24u, r.counters[k].Get(), 4u, kRt12PtCounters);
   ID3D12Resource* const material_buffers[] = {mat_on ? r.material_keys.Get() : nullptr, mat_on ? r.material_values.Get() : nullptr};
   ID3D12Resource* const material_reads[] = {mat_on ? input.color.texture12.Get() : nullptr, mat_on ? input.mrt1.texture12.Get() : nullptr,
                                             mat_on ? input.mrt2.texture12.Get() : nullptr, deferred};
@@ -427,6 +477,11 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   for (ID3D12Resource* resource : material_buffers) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   }
+  Transition(barriers, r.counters[k].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+  list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  list->CopyBufferRegion(r.counters[k].Get(), 0u, r.counter_zero.Get(), 0u, kRt12PtCounters * sizeof(uint32_t));
+  barriers.clear();
+  Transition(barriers, r.counters[k].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
   uint32_t params[kRt12PtConstants] = {
       w, h, frame,
@@ -528,6 +583,13 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   for (ID3D12Resource* resource : reads) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   }
+  Transition(barriers, r.counters[k].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  if (!r.counter_pending[k]) {
+    list->CopyBufferRegion(r.counter_readback[k].Get(), 0u, r.counters[k].Get(), 0u, kRt12PtCounters * sizeof(uint32_t));
+  }
+  barriers.clear();
+  Transition(barriers, r.counters[k].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
   if (FAILED(list->Close())) return submit_fail(Rt12Reason::SubmitFailed, "pt close");
   // 7. Submission: wait for A and the previous D3D12 work, execute, signal B.
@@ -563,6 +625,11 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   s.unfenced_execution = false;
   pt_slot.fence_value = b;
+  if (!r.counter_pending[k]) {
+    r.counter_fence[k] = b;
+    r.counter_frame[k] = frame;
+    r.counter_pending[k] = true;
+  }
   scene.fence_value = (std::max)(scene.fence_value, b);
   input.fence_value = (std::max)(input.fence_value, b);
   for (size_t i = retired_begin; i < s.retired.size(); ++i) s.retired[i].fence_value = b;
@@ -579,10 +646,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   if (!waited) return submit_fail(Rt12Reason::SubmitFailed, "pt d3d11 wait on fence B");
   RecordRt12WaitB(s, b, GpuEvidenceSource::Pt);
   // 9. Panel.
+  pt::SetPtReason(pt::PtReason::Tracing);
   {
     std::lock_guard lock(pt::g_pt_panel_mutex);
-    pt::g_pt_panel.reason = pt::PtReason::Tracing;
-    ++pt::g_pt_panel.frames[static_cast<uint32_t>(pt::PtReason::Tracing)];
     pt::g_pt_panel.lamps = lamps_on ? input.light_count : 0u;
     pt::g_pt_panel.width = w;
     pt::g_pt_panel.height = h;

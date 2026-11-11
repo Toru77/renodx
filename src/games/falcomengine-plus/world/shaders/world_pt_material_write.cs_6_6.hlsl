@@ -26,7 +26,10 @@ void main(uint3 id : SV_DispatchThreadID) {
   const uint base = index * 4u;
   uint previous;
   InterlockedOr(g_pt_material_values[base + 3u], 0x80000000u, previous);
-  if ((previous & 0x80000000u) != 0u) return;
+  if ((previous & 0x80000000u) != 0u) {
+    PtCount(3u);
+    return;
+  }
   DeviceMemoryBarrier();
   const uint4 old = uint4(g_pt_material_values[base], g_pt_material_values[base + 1u],
                           g_pt_material_values[base + 2u], previous);
@@ -45,4 +48,5 @@ void main(uint3 id : SV_DispatchThreadID) {
   DeviceMemoryBarrier();
   uint ignored;
   InterlockedExchange(g_pt_material_values[base + 3u], packed.w, ignored);
+  PtCount(4u);
 }

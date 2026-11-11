@@ -18,6 +18,7 @@
 
 #include "bvh/world_bvh.hpp"
 #include "capture/draw_census.hpp"
+#include "pt/pt_diagnostics.hpp"
 #include "pt/pt_state.hpp"
 #include "rr/rr_interop.hpp"
 #include "rr/rr_state.hpp"
@@ -2028,6 +2029,46 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .label = "Path Tracing status",
       .section = "Path Tracing",
       .on_draw = []() { pt::DrawPtPanel(); return false; },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtDebugLogging",
+      .binding = &pt::g_pt_debug_logging,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Debug Logging",
+      .section = "Path Tracing",
+      .tooltip = "Off: path tracer messages go to ReShade.log. On: they are kept in a bounded in-memory capture instead, and Copy Report includes them. Shared backend failure messages (FailSession) still go to ReShade.log.",
+      .labels = {"Off", "On"},
+      .on_change_value = [](float, float current) { pt::SetPtDiagnosticCapture(current > 0.5f); },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtDebugReport",
+      .value_type = SettingValueType::CUSTOM,
+      .can_reset = false,
+      .label = "Path Tracing report",
+      .section = "Path Tracing",
+      .on_draw = []() {
+        pt::SyncPtDiagnosticCapture(pt::g_pt_debug_logging > 0.5f);
+        static bool report_copied = false;
+        uint64_t overwritten = 0u;
+        {
+          std::lock_guard lock(pt::g_pt_event_mutex);
+          overwritten = pt::g_pt_event_overwritten;
+        }
+        ImGui::Text("Capture: %s, overwritten %llu", pt::PtDiagnosticCaptureEnabled() ? "on" : "off",
+                    static_cast<unsigned long long>(overwritten));
+        if (ImGui::Button("Copy Report")) {
+          ImGui::SetClipboardText(pt::SerializePtReport().c_str());
+          report_copied = true;
+        }
+        if (report_copied) {
+          ImGui::SameLine();
+          ImGui::Text("Report copied");
+        }
+        return false;
+      },
       .is_visible = visible,
   });
   settings->push_back(new Setting{
