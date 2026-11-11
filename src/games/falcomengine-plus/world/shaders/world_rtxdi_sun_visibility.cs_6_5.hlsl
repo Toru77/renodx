@@ -45,6 +45,7 @@ cbuffer RtxdiSunParams : register(b0) {
   float g_wind_transmission;
   float3 g_foliage_tint;
   float g_wind_softening;
+  float g_character_self_softening;
 };
 
 #include "world_rtxdi_sun_adapter.hlsli"
@@ -138,6 +139,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   const float3 up = abs(sun_direction.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
   const float3 T = normalize(cross(up, sun_direction));
   const float3 B = cross(sun_direction, T);
+  float3 sun_jitter = 0.0;
   if (g_sun_disk_tan > 0.0) {
     float2 u;
     if (g_noise_mode != 0u) {
@@ -148,6 +150,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     const float r = g_sun_disk_tan * sqrt(u.x);
     const float phi = 6.2831853 * u.y;
     sun_direction = normalize(sun_direction + (T * cos(phi) + B * sin(phi)) * r);
+    sun_jitter = (T * cos(phi) + B * sin(phi)) * r;
   }
   result.flags |= RTXDI_SUN_FLAG_UNIT_INVERSE_PDF;
   const bool character = (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u;
@@ -191,7 +194,13 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     return;
   }
   const float bias_sign = (dot(surface.shading_normal, sun_direction) >= 0.0 ? 1.0 : -1.0);
-  const float3 origin = surface.world_position + surface.shading_normal * (normal_bias * bias_sign);
+  float3 origin = surface.world_position + surface.shading_normal * (normal_bias * bias_sign);
+  if (character && g_character_self_softening > 0.0) {
+    const float3 outward = surface.shading_normal * bias_sign;
+    float3 lateral = sun_jitter * g_character_self_softening;
+    lateral -= outward * min(dot(lateral, outward), 0.0);
+    origin += lateral;
+  }
   float coverage_end = 0.0;
   bool complete_segment = false;
   if (g_coverage_valid != 0u && !RtxdiSunCoverageEnd(origin, sun_direction, g_max_distance, coverage_end)) {

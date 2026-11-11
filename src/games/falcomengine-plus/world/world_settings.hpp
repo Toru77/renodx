@@ -1521,6 +1521,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtxdiSunCharacterSelfSoftening",
+      .binding = &rtxdi::g_sun_character_self_softening,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.f,
+      .label = "Character Self-Shadow Softening (Sun, m)",
+      .section = "RTXDI Sun",
+      .tooltip = "Softens sun shadows on characters as if the blocker were this many metres from the skin, so arm, hair and clothing shadows get soft edges. Scales with Light Size (Sun); no effect at Light Size 0. 0 = off.",
+      .min = 0.f,
+      .max = 10.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiSunFoliageTransmission",
       .binding = &rtxdi::g_sun_foliage_transmission,
       .value_type = SettingValueType::FLOAT,

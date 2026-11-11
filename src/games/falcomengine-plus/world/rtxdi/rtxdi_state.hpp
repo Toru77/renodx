@@ -46,6 +46,7 @@ inline float g_sun_isfast = 1.f;
 inline float g_sun_foliage_transmission = 0.f;
 inline float g_sun_wind_transmission = 0.5f;
 inline float g_sun_wind_softening = 0.5f;
+inline float g_sun_character_self_softening = 0.f;
 inline float g_sun_foliage_tint_r = 1.f;
 inline float g_sun_foliage_tint_g = 1.f;
 inline float g_sun_foliage_tint_b = 1.f;
