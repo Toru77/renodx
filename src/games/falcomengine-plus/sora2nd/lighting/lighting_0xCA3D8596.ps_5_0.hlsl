@@ -821,7 +821,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                     rtxdiCharResolved = true;
                     rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FILTERED;
                   } else if (selection.status == RTXDI_DI_STATUS_BLOCKED) {
-                    if (shader_injection_data.rtxdi_local_character_keep < 1.0) {
+                    if (shader_injection_data.rtxdi_local_character_keep > 0.0) {
                       RtxdiLightingSelection visibleSelection = selection;
                       visibleSelection.status = RTXDI_DI_STATUS_VISIBLE;
                       const RtxdiCharacterLightResult characterLight =
