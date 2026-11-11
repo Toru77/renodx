@@ -8,9 +8,9 @@ Falcom Engine+ is RenoDX's game-specific graphics addon for Falcom-engine games.
 
 #### Path-traced diffuse GI
 
-Sora 2nd path-traces diffuse indirect lighting using the captured world, the game sun and RTXDI Local lamps, and the game ambient probe for sky light. It needs RTXDI Local (scene transfer and lamps) and works with RTXDI Sun off; sun light at path vertices comes from scene constants and the path tracer's own shadow rays.
+Sora 2nd path-traces diffuse indirect lighting using the captured world, the game sun and RTXDI Local lamps, and the game ambient probe for sky light. It needs RTXDI Local (scene transfer and lamps) and works with RTXDI Sun off; sun light at path vertices comes from scene constants and the path tracer's own shadow rays. SHARC (NVIDIA's radiance cache, world/sharc/vendor) ends paths early on cached light; it clears on map changes, loading screens and large sun changes.
 
-**Code:** [world/pt](world/pt/), [world/shaders/world_pt_diffuse.cs_6_6.hlsl](world/shaders/world_pt_diffuse.cs_6_6.hlsl).
+**Code:** [world/pt](world/pt/), [world/shaders/world_pt_diffuse.cs_6_6.hlsl](world/shaders/world_pt_diffuse.cs_6_6.hlsl), [world/shaders/world_pt_sharc_update.cs_6_6.hlsl](world/shaders/world_pt_sharc_update.cs_6_6.hlsl), [world/shaders/world_pt_sharc_resolve.cs_6_6.hlsl](world/shaders/world_pt_sharc_resolve.cs_6_6.hlsl).
 **Reference:** Open Remix `pathtrace.comp`.
 
 #### World capture and scene construction

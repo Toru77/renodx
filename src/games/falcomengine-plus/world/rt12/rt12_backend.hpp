@@ -381,8 +381,8 @@ struct Rt12DiTransferState {
 };
 
 // Path-traced diffuse GI (world/pt): its own submission slots, list, root signature, PSO, descriptors and outputs.
-inline constexpr uint32_t kRt12PtDescriptors = 15u;
-inline constexpr uint32_t kRt12PtConstants = 16u;
+inline constexpr uint32_t kRt12PtDescriptors = 18u;
+inline constexpr uint32_t kRt12PtConstants = 32u;
 struct Rt12PtState {
   bool created = false;
   Rt12Slot slots[kRt12Slots];
@@ -392,6 +392,18 @@ struct Rt12PtState {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;  // shader visible, kRt12Slots * kRt12PtDescriptors
   Rt12Shared output[kRt12Slots];                      // RGBA16F, depth size; the lighting draw reads srv11 at t47
+  // SHARC (M2): update and resolve PSOs (the trace PSO's root signature), the three cache buffers (DEFAULT, rest state COMMON)
+  // and the clear-trigger state (OpenRemix sharc.cpp:368-475).
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> sharc_update_pso, sharc_resolve_pso;
+  Microsoft::WRL::ComPtr<ID3D12Resource> sharc_hash, sharc_accumulation, sharc_resolved;
+  uint32_t sharc_capacity = 0u;         // entries of the buffers; 0 = none
+  uint32_t sharc_failed_capacity = 0u;  // capacity whose allocation failed (not retried until the setting changes)
+  bool sharc_clear = true;
+  uint32_t sharc_last_frame = UINT32_MAX, sharc_episode = UINT32_MAX, sharc_scene_scale = 0u, sharc_bounces = 0u;
+  uint32_t sharc_reset_seen = 0u, sharc_responsive_frames = 0u;
+  float sharc_light[6] = {};  // normalized sun direction, sun colour of the last frame
+  bool sharc_light_valid = false;
+  float sharc_prev_camera[3] = {};
 };
 
 struct Rt12State {

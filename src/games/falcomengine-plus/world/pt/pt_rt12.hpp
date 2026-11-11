@@ -3,6 +3,8 @@
 // slot (depth, MRT0, scene rows, lamps) and the scene TLAS; writes one RGBA16F output per PT slot for the lighting draw (t47).
 #include <algorithm>
 #include <bit>
+#include <cmath>
+#include <memory>
 #include <vector>
 #include "../debug/crash_log.hpp"
 #include "../rtao/rtao.hpp"  // include order only: defines rtao::NullComputeSlots, which rt12_backend.hpp and rt12_rtxdi_transfer.hpp call; M1 uses no RTAO behaviour (moves to a neutral header in M6)
@@ -72,8 +74,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (FAILED(hr)) return fail("pt list", hr);
     hr = r.list->Close();
     if (FAILED(hr)) return fail("pt close", hr);
-    // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0, in descriptor order 0..14.
-    const UINT counts[6] = {4u, 3u, 1u, 1u, 5u, 1u};
+    // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3, in descriptor order 0..17.
+    const UINT counts[6] = {4u, 3u, 1u, 1u, 5u, 4u};
     const UINT bases[6] = {0u, 14u, 29u, 30u, 31u, 0u};
     const UINT offsets[6] = {0u, 4u, 7u, 8u, 9u, 14u};
     D3D12_DESCRIPTOR_RANGE ranges[6] = {};
@@ -97,12 +99,18 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (FAILED(hr)) return fail("pt root serialize", hr);
     hr = s.device12->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&r.root));
     if (FAILED(hr)) return fail("pt root", hr);
-#if defined(__world_pt_diffuse_EMBED_FILE)
+#if defined(__world_pt_diffuse_EMBED_FILE) && defined(__world_pt_sharc_update_EMBED_FILE) && defined(__world_pt_sharc_resolve_EMBED_FILE)
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc = {};
     pso_desc.pRootSignature = r.root.Get();
     pso_desc.CS = {__world_pt_diffuse.data(), __world_pt_diffuse.size()};
     hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.pso));
     if (FAILED(hr)) return fail("pt pso", hr);
+    pso_desc.CS = {__world_pt_sharc_update.data(), __world_pt_sharc_update.size()};
+    hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.sharc_update_pso));
+    if (FAILED(hr)) return fail("pt sharc update pso", hr);
+    pso_desc.CS = {__world_pt_sharc_resolve.data(), __world_pt_sharc_resolve.size()};
+    hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.sharc_resolve_pso));
+    if (FAILED(hr)) return fail("pt sharc resolve pso", hr);
 #else
     return fail("pt shader not embedded", E_FAIL);
 #endif
@@ -145,6 +153,108 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       return fallback(pt::PtReason::TargetFailed);
     }
   }
+  // 4b. SHARC (M2): clear triggers, buffers, update grid and resolve window (OpenRemix sharc.cpp:311-475).
+  const uint32_t sharc_capacity_wanted = 1u << std::clamp(static_cast<uint32_t>(pt::g_pt_sharc_capacity_log2), 16u, 22u);
+  if (r.sharc_failed_capacity != 0u && r.sharc_failed_capacity != sharc_capacity_wanted) {
+    r.sharc_failed_capacity = 0u;
+  }
+  bool sharc_on = pt::g_pt_sharc_enabled > 0.5f && r.sharc_failed_capacity != sharc_capacity_wanted;
+  float camera[3] = {};
+  float light[6] = {};
+  bool has_sun = false;
+  {
+    std::lock_guard lock(g_state.mutex);
+    const CameraSnapshot& c = g_state.camera;
+    if (c.valid) { camera[0] = c.view_inv[3]; camera[1] = c.view_inv[7]; camera[2] = c.view_inv[11]; }
+    has_sun = c.valid && c.has_sun;
+    if (has_sun) { std::copy_n(c.light_direction, 3, light); std::copy_n(c.light_color, 3, light + 3); }
+  }
+  uint32_t episode = 0u;
+  { std::lock_guard lock(bvh::g_pool.mutex); episode = bvh::g_pool.episode_serial; }
+  const char* clear_reason = nullptr;
+  if (sharc_on && r.sharc_capacity != sharc_capacity_wanted) {
+    RetireObject(s, s.last_signal, r.sharc_hash);
+    RetireObject(s, s.last_signal, r.sharc_accumulation);
+    RetireObject(s, s.last_signal, r.sharc_resolved);
+    r.sharc_hash.Reset(); r.sharc_accumulation.Reset(); r.sharc_resolved.Reset(); r.sharc_capacity = 0u;
+    const auto make = [&](uint64_t stride, ComPtr<ID3D12Resource>* out) {
+      return CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, uint64_t{sharc_capacity_wanted} * stride,
+                              D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, *out);
+    };
+    if (SUCCEEDED(make(8u, std::addressof(r.sharc_hash))) && SUCCEEDED(make(pt::kPtSharcAccumulationStride, std::addressof(r.sharc_accumulation)))
+        && SUCCEEDED(make(pt::kPtSharcResolvedStride, std::addressof(r.sharc_resolved)))) {
+      r.sharc_capacity = sharc_capacity_wanted;
+      clear_reason = "allocated";
+    } else {
+      r.sharc_hash.Reset(); r.sharc_accumulation.Reset(); r.sharc_resolved.Reset();
+      r.sharc_failed_capacity = sharc_capacity_wanted;
+      renodx::utils::log::w("[world-rt12] pt sharc buffers failed at capacity ", sharc_capacity_wanted, "; SHARC off");
+      sharc_on = false;
+    }
+  }
+  const uint32_t sharc_scale = std::clamp(static_cast<uint32_t>(pt::g_pt_sharc_scene_scale), 1u, 200u);
+  const uint32_t sharc_bounces = std::clamp(static_cast<uint32_t>(pt::g_pt_max_bounces), 1u, 16u);
+  uint32_t sharc_ds = std::clamp(static_cast<uint32_t>(pt::g_pt_sharc_downscale), 1u, 16u);
+  while (sharc_ds < 16u && uint64_t{(w + sharc_ds - 1u) / sharc_ds} * ((h + sharc_ds - 1u) / sharc_ds) > pt::kPtSharcMaxUpdatePaths) ++sharc_ds;
+  uint32_t sharc_window = 0u;
+  if (sharc_on) {
+    if (r.sharc_last_frame == UINT32_MAX || frame - r.sharc_last_frame > pt::kPtSharcGapFrames) {
+      if (!clear_reason) {
+        clear_reason = "gap";
+      }
+    }
+    if (episode != r.sharc_episode) {
+      if (!clear_reason) {
+        clear_reason = "map change";
+      }
+    }
+    if (sharc_scale != r.sharc_scene_scale || sharc_bounces != r.sharc_bounces) {
+      if (!clear_reason) {
+        clear_reason = "settings";
+      }
+    }
+    if (pt::g_pt_sharc_reset_request != r.sharc_reset_seen) {
+      if (!clear_reason) {
+        clear_reason = "user";
+      }
+    }
+    if (has_sun) {
+      const float length = std::sqrt(light[0] * light[0] + light[1] * light[1] + light[2] * light[2]);
+      for (int i = 0; i < 3; ++i) light[i] = length > 0.f ? light[i] / length : 0.f;
+      float angle = 0.f, old_energy = 0.f, new_energy = 0.f, difference = 0.f;
+      for (int i = 0; i < 3; ++i) angle += light[i] * r.sharc_light[i];
+      for (int i = 3; i < 6; ++i) {
+        old_energy += r.sharc_light[i];
+        new_energy += light[i];
+        difference += std::abs(light[i] - r.sharc_light[i]);
+      }
+      const float energy = (std::max)(old_energy, new_energy);
+      if (r.sharc_light_valid && (difference > .25f * energy || (energy > 0.f && angle < .999f))) {
+        if (!clear_reason) {
+          clear_reason = "sun";
+        }
+      }
+      const bool changed = r.sharc_light_valid && (difference > 1e-7f || angle < .9999999f);
+      r.sharc_responsive_frames = changed ? 32u : (r.sharc_responsive_frames ? r.sharc_responsive_frames - 1u : 0u);
+      std::copy_n(light, 6, r.sharc_light);
+      r.sharc_light_valid = true;
+    }
+    if (clear_reason) {
+      r.sharc_clear = true;
+    }
+    const uint32_t frames = std::clamp(static_cast<uint32_t>(pt::g_pt_sharc_accumulation_frames), 1u, 1024u);
+    sharc_window = r.sharc_responsive_frames ? (std::min)(frames, 4u) : frames;
+    r.sharc_episode = episode;
+    r.sharc_scene_scale = sharc_scale;
+    r.sharc_bounces = sharc_bounces;
+    r.sharc_reset_seen = pt::g_pt_sharc_reset_request;
+    r.sharc_last_frame = frame;
+  } else {
+    r.sharc_last_frame = UINT32_MAX;  // the next frame with SHARC on clears it
+  }
+  float sharc_prev[3];
+  std::copy_n(r.sharc_clear ? camera : r.sharc_prev_camera, 3, sharc_prev);  // sharc.cpp:473
+  std::copy_n(camera, 3, r.sharc_prev_camera);
   // 5. Signal A (D3D11), flushed.
   uint64_t a = renodx::utils::gpu_fence::NO_SIGNAL;
   try {
@@ -197,6 +307,19 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_srv(13u, light_types, Rt12BufferSrv(4u, RTXDI_INPUT_MAX_LIGHTS));
   const D3D12_UNORDERED_ACCESS_VIEW_DESC out_uav = Rt12TextureUav(DXGI_FORMAT_R16G16B16A16_FLOAT);
   device12->CreateUnorderedAccessView(out.texture12.Get(), nullptr, &out_uav, cpu_at(base + 14u));
+  const auto set_buffer_uav = [&](uint32_t index, ID3D12Resource* resource, uint32_t stride) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
+    view.Format = DXGI_FORMAT_UNKNOWN;
+    view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    view.Buffer.NumElements = sharc_on ? r.sharc_capacity : 1u;
+    view.Buffer.StructureByteStride = stride;
+    device12->CreateUnorderedAccessView(resource, nullptr, &view, cpu_at(base + index));
+  };
+  set_buffer_uav(15u, sharc_on ? r.sharc_hash.Get() : nullptr, 8u);
+  set_buffer_uav(16u, sharc_on ? r.sharc_accumulation.Get() : nullptr, pt::kPtSharcAccumulationStride);
+  set_buffer_uav(17u, sharc_on ? r.sharc_resolved.Get() : nullptr, pt::kPtSharcResolvedStride);
+  ID3D12Resource* const sharc_buffers[] = {sharc_on ? r.sharc_hash.Get() : nullptr, sharc_on ? r.sharc_accumulation.Get() : nullptr,
+                                           sharc_on ? r.sharc_resolved.Get() : nullptr};
   D3D12_GPU_DESCRIPTOR_HANDLE table = r.heap->GetGPUDescriptorHandleForHeapStart();
   table.ptr += static_cast<UINT64>(base) * s.descriptor_size;
   ID3D12Resource* const reads[] = {vertices, indices, mesh_table, scene.instance_table.Get(), uv_arena, s.atlas.texture12.Get(),
@@ -208,8 +331,13 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }
   Transition(barriers, out.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  for (ID3D12Resource* resource : sharc_buffers) {
+    if (resource) {
+      Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+  }
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-  const uint32_t params[kRt12PtConstants] = {
+  uint32_t params[kRt12PtConstants] = {
       w, h, frame,
       std::clamp(static_cast<uint32_t>(pt::g_pt_samples), 1u, 16u),
       std::clamp(static_cast<uint32_t>(pt::g_pt_max_bounces), 1u, 16u),
@@ -223,16 +351,54 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_char_bias, 0.02f, 0.f, 0.5f)),
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_lamp_clearance, 0.2f, 0.f, 1.f)),
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_sky_intensity, 1.f, 0.f, 4.f)),
-      0u};
+      sharc_on ? 1u : 0u,
+      r.sharc_capacity, sharc_ds, sharc_window, std::clamp(static_cast<uint32_t>(pt::g_pt_sharc_stale_frames), 8u, 1024u),
+      std::bit_cast<uint32_t>(static_cast<float>(sharc_scale)),
+      std::bit_cast<uint32_t>(camera[0]), std::bit_cast<uint32_t>(camera[1]), std::bit_cast<uint32_t>(camera[2]),
+      std::bit_cast<uint32_t>(sharc_prev[0]), std::bit_cast<uint32_t>(sharc_prev[1]), std::bit_cast<uint32_t>(sharc_prev[2]),
+      0u, 0u, 0u, 0u, 0u};
   ID3D12DescriptorHeap* heaps[] = {r.heap.Get()};
   list->SetDescriptorHeaps(1u, heaps);
   list->SetComputeRootSignature(r.root.Get());
   list->SetPipelineState(r.pso.Get());
   list->SetComputeRoot32BitConstants(0u, kRt12PtConstants, params, 0u);
   list->SetComputeRootDescriptorTable(1u, table);
+  if (sharc_on) {
+    const auto uav_barrier = [&]() {
+      barriers.clear();
+      for (ID3D12Resource* resource : sharc_buffers) UavBarrier(barriers, resource);
+      list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    };
+    const UINT entry_groups = (r.sharc_capacity + 127u) / 128u;
+    list->SetPipelineState(r.sharc_resolve_pso.Get());
+    if (r.sharc_clear) {
+      params[27] = 1u;
+      list->SetComputeRoot32BitConstants(0u, kRt12PtConstants, params, 0u);
+      list->Dispatch(entry_groups, 1u, 1u);
+      uav_barrier();
+      params[27] = 0u;
+      list->SetComputeRoot32BitConstants(0u, kRt12PtConstants, params, 0u);
+      r.sharc_clear = false;
+      std::lock_guard lock(pt::g_pt_panel_mutex);
+      ++pt::g_pt_panel.sharc_clears;
+      pt::g_pt_panel.sharc_clear_reason = clear_reason ? clear_reason : "allocated";
+    }
+    list->SetPipelineState(r.sharc_update_pso.Get());
+    list->Dispatch(((w + sharc_ds - 1u) / sharc_ds + 7u) / 8u, ((h + sharc_ds - 1u) / sharc_ds + 7u) / 8u, 1u);
+    uav_barrier();
+    list->SetPipelineState(r.sharc_resolve_pso.Get());
+    list->Dispatch(entry_groups, 1u, 1u);
+    uav_barrier();
+    list->SetPipelineState(r.pso.Get());
+  }
   list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
   barriers.clear();
   Transition(barriers, out.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+  for (ID3D12Resource* resource : sharc_buffers) {
+    if (resource) {
+      Transition(barriers, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    }
+  }
   for (ID3D12Resource* resource : reads) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   }
@@ -294,6 +460,10 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     pt::g_pt_panel.lamps = lamps_on ? input.light_count : 0u;
     pt::g_pt_panel.width = w;
     pt::g_pt_panel.height = h;
+    pt::g_pt_panel.sharc_on = sharc_on;
+    pt::g_pt_panel.sharc_capacity_log2 = sharc_on ? static_cast<uint32_t>(std::countr_zero(r.sharc_capacity)) : 0u;
+    pt::g_pt_panel.sharc_downscale = sharc_on ? sharc_ds : 0u;
+    pt::g_pt_panel.sharc_window = sharc_window;
   }
   return out.srv11;
 }
