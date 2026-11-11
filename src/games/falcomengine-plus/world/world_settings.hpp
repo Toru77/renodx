@@ -1553,7 +1553,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.5f,
       .label = "Wind Foliage Softening (Sun, m)",
       .section = "RTXDI Sun",
-      .tooltip = "Length in metres over which a wind-moved foliage object softens its shadow edge. 0 = hard per-object shadow. Use with Wind Foliage Transmission.",
+      .tooltip = "Radius in metres over which each wind-moved foliage shadow is blurred, as if the foliage swayed (noisy like Light Size). 0 = hard per-object shadow. Use with Wind Foliage Transmission.",
       .min = 0.f,
       .max = 4.f,
       .format = "%.2f",

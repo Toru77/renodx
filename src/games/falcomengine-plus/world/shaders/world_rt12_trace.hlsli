@@ -10,6 +10,9 @@
 #define RT12_MASK_SHADOW_ONLY 4u
 #define RT12_MASK_DYNAMIC 8u
 #define RT12_DYNAMIC_INSTANCE_ID 0xFFFFFFu
+#define RT12_WIND_COUNT 0u
+#define RT12_WIND_SKIP 1u
+#define RT12_WIND_ONLY 2u
 #ifndef RT12_TLAS_REGISTER
 #define RT12_TLAS_REGISTER t20
 #endif
@@ -24,9 +27,7 @@ static uint g_rt12_foliage_layers = 0u;
 static float g_rt12_wind_transmission = 0.0;
 static uint g_rt12_wind_layers = 0u;
 static uint g_rt12_wind_slot_object[4];
-static float g_rt12_wind_slot_near[4];
-static float g_rt12_wind_slot_far[4];
-static float g_rt12_wind_softening = 0.0;
+static uint g_rt12_wind_mode = RT12_WIND_COUNT;  // COUNT: wind objects counted; SKIP: ignored; ONLY: only wind objects counted, nothing commits
 static uint g_rt12_wind_occlusion = 0u;
 
 WorldTraceHit TraceWorldClosestDxr(float3 origin, float3 direction, float t_min, float t_max, WorldCameraView view,
@@ -137,7 +138,7 @@ WorldTraceHit TraceWorldRayDxr(float3 origin, float3 direction, float t_min, flo
         if (query.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE) continue;
         if (query.CandidateInstanceID() == RT12_DYNAMIC_INSTANCE_ID)
         {
-            query.CommitNonOpaqueTriangleHit();
+            if (g_rt12_wind_mode != RT12_WIND_ONLY) query.CommitNonOpaqueTriangleHit();
             continue;
         }
         const WorldInstanceGPU instance = g_trace_instances[query.CandidateInstanceID()];
@@ -149,6 +150,7 @@ WorldTraceHit TraceWorldRayDxr(float3 origin, float3 direction, float t_min, flo
         }
         const uint visibility_flags = (uint)(instance.visibility.z + 0.5);
         if ((visibility_flags & view.require_flags) != view.require_flags) continue;
+        if (g_rt12_wind_mode == RT12_WIND_ONLY && (visibility_flags & INSTANCE_FOLIAGE) == 0u) continue;
         const WorldMeshGPU mesh = g_trace_meshes[mesh_id];
         const uint base = (uint)mesh.header.z + query.CandidatePrimitiveIndex() * 3u;
         const uint i0 = g_trace_indices[base];
@@ -157,24 +159,19 @@ WorldTraceHit TraceWorldRayDxr(float3 origin, float3 direction, float t_min, flo
         if (AlphaCutHit((uint)instance.header.z, mesh.bbox_min.w, i0, i1, i2, query.CandidateTriangleBarycentrics(), counters)) continue;
         if (g_rt12_wind_transmission > 0.0 && (visibility_flags & INSTANCE_FOLIAGE) != 0u)
         {
-            const uint wind_object = query.CandidateInstanceID();
-            const float hit_t = query.CandidateTriangleRayT();
-            uint wind_slot = 0u;
-            while (wind_slot < g_rt12_wind_layers && g_rt12_wind_slot_object[wind_slot] != wind_object)
+            if (g_rt12_wind_mode != RT12_WIND_SKIP)
             {
-                ++wind_slot;
-            }
-            if (wind_slot < g_rt12_wind_layers)
-            {
-                g_rt12_wind_slot_near[wind_slot] = min(g_rt12_wind_slot_near[wind_slot], hit_t);
-                g_rt12_wind_slot_far[wind_slot] = max(g_rt12_wind_slot_far[wind_slot], hit_t);
-            }
-            else if (g_rt12_wind_layers < 4u)
-            {
-                g_rt12_wind_slot_object[wind_slot] = wind_object;
-                g_rt12_wind_slot_near[wind_slot] = hit_t;
-                g_rt12_wind_slot_far[wind_slot] = hit_t;
-                ++g_rt12_wind_layers;
+                const uint wind_object = query.CandidateInstanceID();
+                uint wind_slot = 0u;
+                while (wind_slot < g_rt12_wind_layers && g_rt12_wind_slot_object[wind_slot] != wind_object)
+                {
+                    ++wind_slot;
+                }
+                if (wind_slot == g_rt12_wind_layers && g_rt12_wind_layers < 4u)
+                {
+                    g_rt12_wind_slot_object[wind_slot] = wind_object;
+                    ++g_rt12_wind_layers;
+                }
             }
             continue;
         }
@@ -188,10 +185,7 @@ WorldTraceHit TraceWorldRayDxr(float3 origin, float3 direction, float t_min, flo
     float wind_product = 1.0;
     for (uint wind_slot_index = 0u; wind_slot_index < g_rt12_wind_layers; ++wind_slot_index)
     {
-        const float span = g_rt12_wind_slot_far[wind_slot_index] - g_rt12_wind_slot_near[wind_slot_index];
-        const float factor = ((span <= 0.0 || g_rt12_wind_softening <= 0.0) ? g_rt12_wind_transmission
-                              : lerp(1.0, g_rt12_wind_transmission, saturate(span / g_rt12_wind_softening)));
-        wind_product *= factor;
+        wind_product *= g_rt12_wind_transmission;
     }
     g_rt12_wind_occlusion = (uint)min(round((1.0 - wind_product) * 255.0), 255.0);
     if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT)

@@ -135,6 +135,9 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   }
 
   float3 sun_direction = selected_sun.direction;
+  const float3 up = abs(sun_direction.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+  const float3 T = normalize(cross(up, sun_direction));
+  const float3 B = cross(sun_direction, T);
   if (g_sun_disk_tan > 0.0) {
     float2 u;
     if (g_noise_mode != 0u) {
@@ -142,9 +145,6 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     } else {
       u = float2(RTXDI_GetNextRandom(rng), RTXDI_GetNextRandom(rng));
     }
-    const float3 up = abs(sun_direction.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
-    const float3 T = normalize(cross(up, sun_direction));
-    const float3 B = cross(sun_direction, T);
     const float r = g_sun_disk_tan * sqrt(u.x);
     const float phi = 6.2831853 * u.y;
     sun_direction = normalize(sun_direction + (T * cos(phi) + B * sin(phi)) * r);
@@ -216,7 +216,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   g_rt12_foliage_transmission = g_foliage_transmission;
   g_rt12_foliage_layers = 0u;
   g_rt12_wind_transmission = g_wind_transmission;
-  g_rt12_wind_softening = g_wind_softening;
+  g_rt12_wind_mode = (g_wind_transmission > 0.0 && g_wind_softening > 0.0) ? RT12_WIND_SKIP : RT12_WIND_COUNT;
   g_rt12_wind_layers = 0u;
   WorldTraceCounters counters;
   const WorldTraceHit hit = TraceWorldRayDxr(origin, sun_direction, 0.0, coverage_end, true, view, counters);
@@ -240,6 +240,21 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     result.distance = g_max_distance;
     result.reason = RTXDI_SUN_REASON_NONE;
     result.flags |= min(g_rt12_foliage_layers, RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_LAYER_SHIFT;
+    if (g_rt12_wind_mode == RT12_WIND_SKIP) {
+      float2 wind_u;
+      if (g_noise_mode != 0u) {
+        wind_u = asfloat(g_rtxdi_sun_noise.Load(int3((pixel.x + 64u) % 128u, (pixel.y + 64u) % 128u + 128u * g_noise_slice, 0)).xy);
+      } else {
+        wind_u = float2(RTXDI_GetNextRandom(rng), RTXDI_GetNextRandom(rng));
+      }
+      const float wind_radius = g_wind_softening * sqrt(wind_u.x);
+      const float wind_phi = 6.2831853 * wind_u.y;
+      g_rt12_wind_mode = RT12_WIND_ONLY;
+      g_rt12_wind_layers = 0u;
+      WorldTraceCounters wind_counters;
+      TraceWorldRayDxr(origin + (T * cos(wind_phi) + B * sin(wind_phi)) * wind_radius, sun_direction, 0.0, coverage_end,
+                       true, view, wind_counters);
+    }
     result.flags |= min(g_rt12_wind_occlusion, RTXDI_SUN_WIND_OCCLUSION_MASK) << RTXDI_SUN_WIND_OCCLUSION_SHIFT;
   } else {
     result.reason = RTXDI_SUN_REASON_TRUNCATED;

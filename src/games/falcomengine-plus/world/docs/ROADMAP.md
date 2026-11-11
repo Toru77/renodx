@@ -232,7 +232,7 @@ RTXDI M12: the M10 toggle Drop Blocked Samples From Reuse (Local) and the M8 gat
 
 RTXDI M13: Sun Detail gains Layers (wind and leaf layer counts) and Blocker (foliage, alpha, shadow-only or character blocker) views; the image is unchanged. Not validated in game.
 
-RTXDI M14: wind-foliage (INSTANCE_FOLIAGE) shadows count one object per ray and soften over Wind Foliage Softening metres; the sun visibility word carries the wind occlusion in bits 16-23 for visible pixels. Not validated in game.
+RTXDI M14/M14b: wind-foliage (INSTANCE_FOLIAGE) shadows count one object per ray; with Wind Foliage Softening > 0 the main ray ignores wind objects and a second ray, offset up to that radius perpendicular to the sun (noise, like Light Size), counts them, so their shadow edge blurs; the sun visibility word carries the wind occlusion in bits 16-23 for visible pixels. Not validated in game.
 
 ## Reference
 
