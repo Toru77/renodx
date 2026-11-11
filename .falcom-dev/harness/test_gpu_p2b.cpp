@@ -759,7 +759,7 @@ int main() {
           draw_expected += expect_valid ? 1u : 0u;
           draw_gpu += gpu_valid ? 1u : 0u;
           if (gpu_valid == expect_valid) ++valid_match; else ++mismatch_total;
-          if (g.header[0] != static_cast<float>(entry.extra[2]) || g.visibility[2] != static_cast<float>(draw.flags & 6u)) ++mismatch_total;
+          if (g.header[0] != static_cast<float>(entry.extra[2]) || g.visibility[2] != static_cast<float>(draw.flags & 14u)) ++mismatch_total;
           else ++flags_ok;
           if (expect_valid) {
             float inv[16] = {};

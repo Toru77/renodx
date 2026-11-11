@@ -229,7 +229,7 @@ inline std::string BuildP2bDiagJson(const P2bDiagInput& in, std::string* verdict
       check.covered = true;
       check.draw = static_cast<uint32_t>(d);
       check.slot = draw.extra[2];
-      check.flags = draw.info[3] & 6u;
+      check.flags = draw.info[3] & 14u;
       const uint32_t i = static_cast<uint32_t>(r - draw.info[2]);
       uint32_t count = draw.info[1];
       if (draw.extra[0] != 0u) {

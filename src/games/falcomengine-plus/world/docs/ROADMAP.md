@@ -234,6 +234,8 @@ RTXDI M13: Sun Detail gains Layers (wind and leaf layer counts) and Blocker (fol
 
 RTXDI M14/M14b: wind-foliage (INSTANCE_FOLIAGE) shadows count one object per ray; with Wind Foliage Softening > 0 the main ray ignores wind objects and a second ray, offset up to that radius perpendicular to the sun (noise, like Light Size), counts them, so their shadow edge blurs; the sun visibility word carries the wind occlusion in bits 16-23 for visible pixels. Not validated in game.
 
+RTXDI M14c: P2b records of wind rest-pose draws carry INSTANCE_FOLIAGE (bvh_live.hpp dynamic table, world_dynamic_expand), so wind objects flagged moving keep wind shadow softening. Not validated in game.
+
 ## Reference
 
 ### Code map (`world/`)

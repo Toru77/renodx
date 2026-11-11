@@ -2342,7 +2342,8 @@ inline void ExpandLiveDynamic(reshade::api::device* device, reshade::api::comman
       entry.info[2] = draw.out;
       entry.info[3] = (resident ? 1u : 0u)
                       | ((draw.pass & kPoolPassCamera) != 0u ? kInstanceCameraVisible : 0u)
-                      | ((draw.pass & kPoolPassLight) != 0u ? kInstanceShadowCaster : 0u);
+                      | ((draw.pass & kPoolPassLight) != 0u ? kInstanceShadowCaster : 0u)
+                      | ((draw.pass & kPoolPassWind) != 0u ? kInstanceFoliage : 0u);
       entry.extra[0] = draw.indirect ? 1u : 0u;
       entry.extra[1] = static_cast<uint32_t>(draw.args / 16u);
       entry.extra[2] = slot;

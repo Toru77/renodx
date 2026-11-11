@@ -81,7 +81,7 @@ void main(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
             translation.z + max(g0.x, g1.x) + max(g0.y, g1.y) + max(g0.z, g1.z));
         record.bounds_min = float4(lo, 0.0);
         record.bounds_max = float4(hi, 0.0);
-        record.visibility = float4(0.0, 0.0, (float)(draw.info.w & 6u), 0.0);
+        record.visibility = float4(0.0, 0.0, (float)(draw.info.w & 14u), 0.0);
         g_dyn_instances[draw.info.z + i] = record;
     }
 }
