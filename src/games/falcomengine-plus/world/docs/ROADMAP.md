@@ -236,6 +236,8 @@ RTXDI M14/M14b: wind-foliage (INSTANCE_FOLIAGE) shadows count one object per ray
 
 RTXDI M14c: P2b records of wind rest-pose draws carry INSTANCE_FOLIAGE (bvh_live.hpp dynamic table, world_dynamic_expand), so wind objects flagged moving keep wind shadow softening. Not validated in game.
 
+RTXDI M15: Character Self-Shadow Softening (Local, m): for character receivers the lamp shadow ray origin moves sideways by the light-disk sample times min(D / distance, 1), with the into-surface part removed, so self-shadows soften as if the blocker were D m away; 0 or Light Size 0 = unchanged. Not validated in game.
+
 ## Reference
 
 ### Code map (`world/`)

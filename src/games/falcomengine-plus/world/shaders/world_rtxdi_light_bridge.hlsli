@@ -371,8 +371,14 @@ RtxdiDiRawResult RtxdiTraceLocalLight(RAB_Surface surface, RAB_LightSample sampl
   const bool character = (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u;
   const float bias = character ? character_bias : environment_bias;
   if (!isfinite(bias)) return result;
-  const float3 origin = surface.world_position
-                        + surface.shading_normal * (bias * (dot(surface.shading_normal, shadow_direction) >= 0.0 ? 1.0 : -1.0));
+  const float bias_sign = (dot(surface.shading_normal, shadow_direction) >= 0.0 ? 1.0 : -1.0);
+  float3 origin = surface.world_position + surface.shading_normal * (bias * bias_sign);
+  if (character && g_character_self_softening > 0.0) {
+    const float3 outward = surface.shading_normal * bias_sign;
+    float3 lateral = (sample.shadow_target - sample.position) * min(g_character_self_softening / shadow_distance, 1.0);
+    lateral -= outward * min(dot(lateral, outward), 0.0);
+    origin += lateral;
+  }
   if (shadow_distance <= endpoint_clearance) return RtxdiDiMakeVisibleRawResult(sample.radiance * max(max(0.0, dot(surface.shading_normal, direction)), sample.translucency) * inverse_pdf, distance, character ? 1u : 0u, sample.light_index, sample.type, inverse_pdf);
   const float endpoint = max(shadow_distance - endpoint_clearance, 0.0);
   float coverage_end = 0.0;

@@ -2524,7 +2524,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     set_range(12u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 61u, 21u);
     D3D12_ROOT_PARAMETER params[4] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants.Num32BitValues = 20u;
+    params[0].Constants.Num32BitValues = 21u;
     params[0].Constants.ShaderRegister = 0u;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[1].Descriptor.ShaderRegister = 1u;
@@ -2774,7 +2774,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   transfer.di_list->SetComputeRootSignature(transfer.initial_di_root.Get());
   transfer.di_list->SetPipelineState(transfer.initial_di_pso.Get());
   const float local_light_size = rtxdi::FiniteClamped(rtxdi::g_local_light_size, 0.f, 0.f, 0.5f);
-  const uint32_t sun_params[20] = {in.width, in.height, scene_resources_valid ? 1u : 0u, s.scene_coverage_valid ? 1u : 0u,
+  const uint32_t sun_params[21] = {in.width, in.height, scene_resources_valid ? 1u : 0u, s.scene_coverage_valid ? 1u : 0u,
                                    light_count,
                                    std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_normal_bias, 0.02f, 0.f, 0.5f)),
                                    std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_character_normal_bias, 0.02f, 0.f, 0.5f)),
@@ -2786,8 +2786,8 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                                    history_slot.deferred_count, history_slot.light_count, tile_count, history_slot.tile_count,
                                    std::bit_cast<uint32_t>(local_light_size),
                                    (rtxdi::g_local_isfast > 0.5f && s.noise_source != 0u && local_light_size > 0.f) ? 1u : 0u,
-                                   in.frame % 32u};
-  transfer.di_list->SetComputeRoot32BitConstants(0u, 20u, sun_params, 0u);
+                                   in.frame % 32u, std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_character_self_softening, 0.f, 0.f, 2.f))};
+  transfer.di_list->SetComputeRoot32BitConstants(0u, 21u, sun_params, 0u);
   transfer.di_list->SetComputeRootConstantBufferView(1u, slot.di_frame_upload->GetGPUVirtualAddress());
   transfer.di_list->SetComputeRootDescriptorTable(2u, slot.di_descriptors->GetGPUDescriptorHandleForHeapStart());
   transfer.di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);

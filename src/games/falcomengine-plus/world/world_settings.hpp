@@ -1623,6 +1623,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtxdiLocalCharacterSelfSoftening",
+      .binding = &rtxdi::g_local_character_self_softening,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.f,
+      .label = "Character Self-Shadow Softening (Local, m)",
+      .section = "RTXDI Local",
+      .tooltip = "Softens lamp shadows on characters as if the blocker were this many metres from the skin, so arm, hair and clothing shadows get soft edges. Scales with Light Size (Local); no effect at Light Size 0. 0 = off.",
+      .min = 0.f,
+      .max = 2.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiLocalShadowDarkening",
       .binding = &rtxdi::g_local_shadow_darkening,
       .value_type = SettingValueType::FLOAT,
