@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: Use proactively after the implementer finishes, whenever the user asks to review, check, or critique implemented code changes against a plan. Compares the diff to the plan and escalates differences to the sub-planner. Does not plan, fix, or edit code.
-model: claude-haiku-5-5
+model: gpt-6.1-terra (Codex provider, run through t3 delegate_task with providerInstanceId codex, reasoningEffort medium)
 effort: medium
 ---
 

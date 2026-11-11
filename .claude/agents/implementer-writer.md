@@ -1,7 +1,7 @@
 ---
 name: implementer-writer
 description: Use proactively whenever the user asks to implement, write, add, change, or fix code according to an existing plan or clear spec, or asks to make the edits and run the build. Not for planning, choosing between approaches, or reviewing.
-model: claude-haiku-5-5
+model: gpt-6.1-terra (Codex provider, run through t3 delegate_task with providerInstanceId codex, reasoningEffort medium)
 effort: medium
 ---
 
