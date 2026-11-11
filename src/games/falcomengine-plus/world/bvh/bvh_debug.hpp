@@ -37,6 +37,7 @@ struct BvhDebugState {
   std::atomic_int mode{0};  // BvhView
   std::atomic<reshade::api::device*> device{nullptr};
   std::atomic_int inputs{0};  // BVH inputs, set by ApplyBvhInputs: 0 idle, 1 Pool Scan or debug view, 2 forced on by RT effects
+  std::atomic<const char*> status{"off"};  // GPU Debug pass: "drawn" or why it did not draw (string literal)
   // Mirror bound to the settings system so the GPU Debug mode survives a restart.
   float mode_setting{0.f};
 };
@@ -165,23 +166,48 @@ inline void RunBvhDebugPass(
     reshade::api::swapchain* swapchain) {
   if (queue == nullptr || swapchain == nullptr) return;
   const auto view = static_cast<BvhView>(g_bvh_debug.mode.load(std::memory_order_relaxed));
-  if (view != BvhView::TraceShaded && view != BvhView::TraceInstance && view != BvhView::DepthCompare) return;
+  if (view != BvhView::TraceShaded && view != BvhView::TraceInstance && view != BvhView::DepthCompare) {
+    g_bvh_debug.status.store("off", std::memory_order_relaxed);
+    return;
+  }
   const PoolCpuTimer debug_timer{&g_perf_gate.block_us[kPerfBlockDebugPass]};
   auto* device = queue->get_device();
-  if (device == nullptr) return;
+  if (device == nullptr) {
+    g_bvh_debug.status.store("no device", std::memory_order_relaxed);
+    return;
+  }
   BvhDeviceData* data = GetBvhDeviceData(device);
-  if (data == nullptr || !data->bvh_ready || data->active_count == 0u) return;
+  if (data == nullptr || !data->bvh_ready) {
+    g_bvh_debug.status.store("BVH not ready", std::memory_order_relaxed);
+    return;
+  }
+  if (data->active_count == 0u) {
+    g_bvh_debug.status.store("TLAS empty", std::memory_order_relaxed);
+    return;
+  }
 
   const auto backbuffer = swapchain->get_current_back_buffer();
-  if (backbuffer.handle == 0u) return;
+  if (backbuffer.handle == 0u) {
+    g_bvh_debug.status.store("no backbuffer", std::memory_order_relaxed);
+    return;
+  }
   const auto backbuffer_desc = device->get_resource_desc(backbuffer);
-  if (backbuffer_desc.type != reshade::api::resource_type::texture_2d) return;
+  if (backbuffer_desc.type != reshade::api::resource_type::texture_2d) {
+    g_bvh_debug.status.store("backbuffer not 2D", std::memory_order_relaxed);
+    return;
+  }
   const uint32_t width = backbuffer_desc.texture.width;
   const uint32_t height = backbuffer_desc.texture.height;
-  if (!EnsureBvhDebugTarget(device, width, height)) return;
+  if (!EnsureBvhDebugTarget(device, width, height)) {
+    g_bvh_debug.status.store("debug target failed", std::memory_order_relaxed);
+    return;
+  }
 
   auto* cmd_list = queue->get_immediate_command_list();
-  if (cmd_list == nullptr) return;
+  if (cmd_list == nullptr) {
+    g_bvh_debug.status.store("no command list", std::memory_order_relaxed);
+    return;
+  }
 
   const BvhTraceDepthInput depth = GetBvhTraceDepthInput(view);
   if (depth.view.handle != 0u) {
@@ -194,7 +220,14 @@ inline void RunBvhDebugPass(
   const bool inspect_requested = g_bvh_trace.inspect_pending.exchange(false, std::memory_order_relaxed);
   const bool counters = stats_requested || inspect_requested
                         || g_bvh_trace.counters_every_frame.load(std::memory_order_relaxed);
-  DispatchBvhTrace(device, cmd_list, data, TraceShaderMode(view), width, height, depth, counters, inspect_requested);
+  const char* failure = DispatchBvhTrace(device, cmd_list, data, TraceShaderMode(view), width, height, depth, counters, inspect_requested);
+  if (failure != nullptr) {
+    if (stats_requested) g_bvh_trace.stats_requested.store(true, std::memory_order_relaxed);
+    if (inspect_requested) g_bvh_trace.inspect_pending.store(true, std::memory_order_relaxed);
+    g_bvh_debug.status.store(failure, std::memory_order_relaxed);
+    return;
+  }
+  g_bvh_debug.status.store("drawn", std::memory_order_relaxed);
   cmd_list->barrier(
       data->debug_texture, reshade::api::resource_usage::unordered_access,
       reshade::api::resource_usage::shader_resource);

@@ -227,7 +227,8 @@ inline void FillBvhSceneSrvs(
   srvs[17] = data.dynamic.instances_srv;
 }
 
-inline void DispatchBvhTrace(
+// Returns nullptr when the trace was dispatched, otherwise the reason it was not (a string literal).
+inline const char* DispatchBvhTrace(
     reshade::api::device* device,
     reshade::api::command_list* cmd_list,
     BvhDeviceData* data,
@@ -237,10 +238,10 @@ inline void DispatchBvhTrace(
     const BvhTraceDepthInput& depth,
     bool counters,
     bool inspect_requested) {
-  if (device == nullptr || cmd_list == nullptr || data == nullptr) return;
-  if (!EnsureBvhTraceResources(device, data)) return;
-  if (!data->bvh_ready || data->blas_nodes.srv.handle == 0u || data->tlas_node_srv.handle == 0u) return;
-  if (data->debug_uav.handle == 0u || data->trace_stats_uav.handle == 0u) return;
+  if (device == nullptr || cmd_list == nullptr || data == nullptr) return "no device data";
+  if (!EnsureBvhTraceResources(device, data)) return "trace resources failed";
+  if (!data->bvh_ready || data->blas_nodes.srv.handle == 0u || data->tlas_node_srv.handle == 0u) return "BVH buffers missing";
+  if (data->debug_uav.handle == 0u || data->trace_stats_uav.handle == 0u) return "debug or stats view missing";
 
   // The whole buffer (offset 0 and its full size: see WriteBufferRange).
   if (counters) {
@@ -323,6 +324,7 @@ inline void DispatchBvhTrace(
   BeginGpuTimer(device, cmd_list, &data->trace_timer);
   cmd_list->dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
   EndGpuTimer(cmd_list, &data->trace_timer);
+  return nullptr;
 }
 
 inline bool ReadbackBvhTraceStats(
