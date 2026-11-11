@@ -29,3 +29,9 @@ If the decision changes the plan's goal, its scope or files, its default-look ru
 - **Do not**: anything the implementer must not do as a result.
 
 Finish with `HANDOFF: implementer-writer` when the implementer continues, or `HANDOFF: lead` when the lead agent must act. Do not write code changes yourself.
+
+## Token rules
+
+- Read the plan by its file path and section (under `C:\Users\Toru\.claude\plans\renodx\`, never in the repository). Do not ask for the whole plan to be pasted.
+- Grep first. Read only the cited line ranges of code, and avoid opening large files in full.
+- Decide routine questions yourself. Escalate to master-planner only when the goal, scope, shared files, default-look rule, or acceptance criteria would change.

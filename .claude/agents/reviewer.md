@@ -35,3 +35,8 @@ If you find notable differences, finish with:
 `PLAN DEVIATION:` followed by a list, most severe first. Each item has: the plan step or criterion, what the code actually does (file and line), and why it matters. Then write `HANDOFF: sub-planner` so the lead agent sends this report to the sub-planner, who decides what happens next.
 
 If you find none, finish with `NO DEVIATIONS:` and list the plan steps and criteria you verified with evidence for each. Do not write "looks good" without that evidence. Then write `HANDOFF: lead` so the lead agent writes the final summary for the user.
+
+## Token rules
+
+- Your plan is a file under `C:\Users\Toru\.claude\plans\renodx\`, given to you as a path and a section name. Read only that section.
+- Review the diff for the named commit range. Grep first, and read only the cited line ranges of surrounding code.

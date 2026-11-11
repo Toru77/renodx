@@ -28,3 +28,8 @@ When the implementation is done, finish with this report, in this order:
 3. **Handoff to review**: the exact `git diff --stat` and the file list. Write `REVIEW REQUESTED:` and `HANDOFF: reviewer` so the lead agent runs reviewer on this diff and the plan next.
 
 Do not write the final user-facing summary yourself. The lead agent writes it after review.
+
+## Token rules
+
+- Your plan is a file under `C:\Users\Toru\.claude\plans\renodx\`, given to you as a path and a section name. Read only that section. Never store plan files in the repository.
+- Grep first, then read only the line ranges the plan cites.
