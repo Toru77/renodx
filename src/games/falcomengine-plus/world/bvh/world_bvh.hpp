@@ -752,7 +752,8 @@ inline bool DrawBvhPanel() {
     dxr_panel = rt12::g_rt12_panel;
   }
   std::string dxr_line = std::string("DXR: ") + rt12::Rt12ReasonName(dxr_panel.reason) + "  traced " + std::to_string(dxr_panel.traced_frames)
-                         + "  busy " + std::to_string(dxr_panel.busy_frames) + "  wrapped " + (dxr_panel.wrapped ? "yes" : "no");
+                         + "  busy " + std::to_string(dxr_panel.busy_frames) + "  wrapped " + (dxr_panel.wrapped ? "yes" : "no")
+                         + "  SM6.6 " + (dxr_panel.shader_model_6_6 ? "yes" : "no");
   dxr_line += ", P2b records " + std::to_string(dxr_panel.records) + ", GPU scene traced " + std::to_string(dxr_panel.gc_traced_frames);
   if (!dxr_panel.gc_not_ready.empty()) dxr_line += " (not ready: " + dxr_panel.gc_not_ready + ")";
   if (dxr_panel.stuck) dxr_line += "  STUCK (objects leaked)";

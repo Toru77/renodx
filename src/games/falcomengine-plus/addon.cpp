@@ -45,6 +45,7 @@
 #include "./world/bvh/deform_probe.hpp"  // native D3D11 event query (DynCube validity readback poll)
 #include "./world/bvh/gpu_timer.hpp"     // GpuTimer (Dynamic Cubemaps GPU Timing Log)
 #include "./world/rr/rr_state.hpp"
+#include "./world/pt/pt_rt12.hpp"  // path-traced diffuse GI (world/pt)
 #include "./world/rtao/rtao.hpp"       // RTAO round 1 (inline lighting-hook dispatch)
 #include "./world/rtao/rtao_svgf.hpp"  // RTAO SVGF glue (inline lighting-hook dispatch)
 #include "./world/rtxdi/rtxdi_debug_layout.h"
@@ -52,7 +53,7 @@
 
 namespace {
 
-static_assert(sizeof(ShaderInjectData) == 1784u);
+static_assert(sizeof(ShaderInjectData) == 1792u);
 static_assert(alignof(ShaderInjectData) == alignof(float));
 static_assert(offsetof(ShaderInjectData, cs_contact_local_light_clearance) == 80u);
 
@@ -514,6 +515,7 @@ constexpr uint32_t kLightingVbgiRegister = 23u;     // t23 = vbgiTexture
 constexpr uint32_t kLightingRtgiRegister = 37u;     // t37 = rtgiTexture (RTGI final GI, world/rtgi)
 constexpr uint32_t kLightingRtlsRegister = 38u;     // t38 = rtlsTexture (RT Local Shadows term, world/rtls)
 constexpr uint32_t kLightingRtSunRegister = 39u;    // t39 = rtsunTexture (RT Sun Shadows term, world/rtsun)
+constexpr uint32_t kLightingPtRegister = 47u;  // t47 = ptGiTexture (world/pt path-traced GI)
 constexpr uint32_t kLightingDepthRegister = 4u;     // t4 = depthTexture (Sora)
 constexpr uint32_t kLightingDepthRegisterKai = 3u;  // t3 = depthTexture (Kai)
 constexpr uint32_t kLightingSsaoRegister = 5u;      // t5 = ssaoTexture (Sora)
@@ -13146,6 +13148,42 @@ static void BindRtxdiSunOutput(reshade::api::command_list* cmd_list, DeviceData*
 }
 
 // DLSS Ray Reconstruction guides (M1): the compute pass at the lighting hook. Runs on the first lighting draw of the frame.
+static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
+  namespace pt = falcom_world::pt;
+  namespace rt12 = falcom_world::rt12;
+  namespace di = falcom_world::rtxdi;
+  shader_injection.pt_gi_bound = 0.f;
+  if (!IsSora2nd() || !cmd_list) return;
+  const reshade::api::resource_view empty_view = {};
+  cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                             reshade::api::descriptor_table_update{{}, kLightingPtRegister, 0u, 1u,
+                                                                   reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+  if (!pt::PtRequested()) { pt::SetPtReason(pt::PtReason::Off); return; }
+  if ((di::SceneRequestMask() & 1u) == 0u) { pt::SetPtReason(pt::PtReason::NeedsRtxdi); return; }
+  if (!dd || cmd_list != dd->immediate_cmd_list) { pt::SetPtReason(pt::PtReason::DeferredContext); return; }
+  const uint32_t frame = falcom_world::g_state.frame.load();
+  di::InputSnapshot input;
+  { std::shared_lock lock(di::g_input.mutex); input = di::g_input.snapshot; }
+  di::DiSnapshot di_snapshot;
+  { std::shared_lock lock(di::g_di.mutex); di_snapshot = di::g_di.snapshot; }
+  if (input.status != di::InputStatus::Ready || input.ready_frame != frame || input.transfer_slot < 0
+      || input.transfer_slot >= static_cast<int32_t>(rt12::kRt12Slots) || input.width != dd->captured_depth_w
+      || input.height != dd->captured_depth_h) {
+    pt::SetPtReason(pt::PtReason::InputNotReady);
+    return;
+  }
+  const bool lamps = di_snapshot.status == di::DiStatus::Submitted && di_snapshot.frame == frame
+                     && di_snapshot.transfer_slot == input.transfer_slot;
+  const reshade::api::resource_view view = rt12::RunPtTrace(cmd_list->get_device(), cmd_list, input.transfer_slot, lamps);
+  if (view.handle == 0u) return;
+  cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                             reshade::api::descriptor_table_update{{}, kLightingPtRegister, 0u, 1u,
+                                                                   reshade::api::descriptor_type::texture_shader_resource_view, &view});
+  shader_injection.pt_gi_bound = 1.f;
+  shader_injection.pt_intensity = di::FiniteClamped(pt::g_pt_intensity, 1.f, 0.f, 2.f);
+  shader_injection.pt_char_intensity = di::FiniteClamped(pt::g_pt_char_intensity, 1.f, 0.f, 1.f);
+}
+
 static void RunRrGuidesInline(reshade::api::command_list* cmd_list) {
   if (falcom_world::rr::g_rr_perf_guides < 0.5f) return;  // TEMP perf test (remove)
   namespace rr = falcom_world::rr;
@@ -13343,6 +13381,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   auto* lighting_device = cmd_list ? cmd_list->get_device() : nullptr;
   BindRtxdiLocalOutput(cmd_list, lighting_device ? lighting_device->get_private_data<DeviceData>() : nullptr);
   BindRtxdiSunOutput(cmd_list, lighting_device ? lighting_device->get_private_data<DeviceData>() : nullptr);
+  RunPtInline(cmd_list, lighting_device ? lighting_device->get_private_data<DeviceData>() : nullptr);
   // DLSS Ray Reconstruction guides: builds the RR guide buffers; the lighting output is not changed.
   RunRrGuidesInline(cmd_list);
   if (game_compute_state) {

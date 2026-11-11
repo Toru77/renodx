@@ -101,7 +101,7 @@ enum class GpuWorkKind : uint32_t { P2b,
                                     Rtgi,
                                     Rt12,
                                     GpuCapture,
-                                    GcCheck };
+                                    GcCheck, Pt };
 
 struct GpuWorkBreadcrumbSlot {
   std::atomic_uint64_t stamp{0u};
@@ -145,7 +145,7 @@ enum class GpuEvidenceSource : uint8_t { None,
                                          GcBuild,
                                          RrPre,
                                          RrPost,
-                                         RrD3D12 };
+                                         RrD3D12, Pt };
 
 struct GpuEvidenceSnapshot {
   uint64_t sequence = 0u;
@@ -262,6 +262,7 @@ inline const char* GpuEvidenceSourceName(GpuEvidenceSource source) {
     case GpuEvidenceSource::RrPre:   return "rr_pre";
     case GpuEvidenceSource::RrPost:  return "rr_post";
     case GpuEvidenceSource::RrD3D12: return "rr_d3d12";
+    case GpuEvidenceSource::Pt: return "pt";
   }
   return "unknown";
 }
@@ -318,6 +319,7 @@ inline const char* GpuWorkKindName(uint32_t kind) {
     case GpuWorkKind::Rt12:       return "RT12";
     case GpuWorkKind::GpuCapture: return "GPU-capture";
     case GpuWorkKind::GcCheck:    return "GC-check";
+    case GpuWorkKind::Pt:         return "PT";
   }
   return "unknown";
 }

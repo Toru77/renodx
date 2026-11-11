@@ -380,6 +380,20 @@ struct Rt12DiTransferState {
 #endif
 };
 
+// Path-traced diffuse GI (world/pt): its own submission slots, list, root signature, PSO, descriptors and outputs.
+inline constexpr uint32_t kRt12PtDescriptors = 15u;
+inline constexpr uint32_t kRt12PtConstants = 16u;
+struct Rt12PtState {
+  bool created = false;
+  Rt12Slot slots[kRt12Slots];
+  uint32_t next = 0u;
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> list;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;  // shader visible, kRt12Slots * kRt12PtDescriptors
+  Rt12Shared output[kRt12Slots];                      // RGBA16F, depth size; the lighting draw reads srv11 at t47
+};
+
 struct Rt12State {
   uint64_t generation = 0u;
   rtao::RtaoDeviceData scene_bindings;
@@ -392,6 +406,7 @@ struct Rt12State {
   Microsoft::WRL::ComPtr<ID3D12Device> wrapper;
   Microsoft::WRL::ComPtr<ID3D12Device5> device12;
   bool wrapped = false;
+  bool shader_model_6_6 = false;
   Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue12;
   std::unique_ptr<renodx::utils::gpu_fence::Fence> fence11;  // D3D11 signals, D3D12 waits
   std::unique_ptr<renodx::utils::gpu_fence::Fence> fence12;  // D3D12 signals, D3D11 waits and the CPU polls
@@ -460,6 +475,7 @@ struct Rt12State {
   int32_t scene_coverage_slot = -1;
   bool scene_coverage_valid = false;
   PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = nullptr;
+  Rt12PtState path_trace;
   Rt12RtgiState rtgi;
   uint64_t address_generation = ~0ull;                       // blas_generation the per-slot address tables were last written for (see Rt12Slot)
   std::vector<D3D12_RAYTRACING_INSTANCE_DESC> static_descs;  // the static part of the TLAS, cached by its key
@@ -485,7 +501,7 @@ struct Rt12Panel {  // copied under g_rt12_panel_mutex for the panel and the JSO
   Rt12Reason reason = Rt12Reason::Off;
   std::string failed_stage;
   HRESULT hr = S_OK;
-  bool wrapped = false, stuck = false, leaked = false, alpha_mirror = false;
+  bool wrapped = false, shader_model_6_6 = false, stuck = false, leaked = false, alpha_mirror = false;
   uint64_t traced_frames = 0u, fallback_frames[kRt12ReasonCount] = {}, busy_frames = 0u;
   uint64_t present_submits = 0u, lighting_submits = 0u, present_skipped_busy = 0u;
   uint32_t blas_count = 0u, mesh_count = 0u, tlas_instances = 0u, tlas_no_blas = 0u, tlas_holes = 0u, tlas_bad_mesh = 0u;
@@ -1054,6 +1070,10 @@ inline void TeardownRt12(const char* why) {
     if (shared->srv11.handle != 0u) s.device->destroy_resource_view(shared->srv11);
     if (shared->uav11.handle != 0u) s.device->destroy_resource_view(shared->uav11);
   }
+  for (Rt12Shared& shared : s.path_trace.output) {
+    if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
+    if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
+  }
   for (Rt12Shared& shared : s.rtgi.shared) {
     if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
     if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
@@ -1176,6 +1196,11 @@ inline bool CreateRt12(reshade::api::device* device) {
     renodx::utils::log::w("[world-rt12] create failed: no DXR 1.1 or no shader model 6.5");
     return false;
   }
+
+  D3D12_FEATURE_DATA_SHADER_MODEL shader_model_66 = {D3D_SHADER_MODEL_6_6};
+  s.shader_model_6_6 = SUCCEEDED(s.device12->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model_66,
+                                                                  sizeof(shader_model_66)))
+                       && shader_model_66.HighestShaderModel >= D3D_SHADER_MODEL_6_6;
 
   // 7. Direct queue.
   D3D12_COMMAND_QUEUE_DESC queue_desc = {};
@@ -1404,10 +1429,11 @@ inline bool CreateRt12(reshade::api::device* device) {
   bvh::g_live_bvh.reset_requested.store(true, std::memory_order_relaxed);
   UpdatePanel([&s](Rt12Panel& p) {
     p.wrapped = s.wrapped;
+    p.shader_model_6_6 = s.shader_model_6_6;
     p.alpha_mirror = s.atlas.texture11 != nullptr;
   });
   renodx::utils::log::i("[world-rt12] created (wrapped ", s.wrapped ? "yes" : "no", ", tier ",
-                        static_cast<int>(options5.RaytracingTier), ", queue timestamp frequency ", s.timestamp_frequency, ")");
+                        static_cast<int>(options5.RaytracingTier), ", queue timestamp frequency ", s.timestamp_frequency, ", SM 6.6 ", s.shader_model_6_6 ? "yes" : "no", ")");
   return true;
 #else
   return false;
@@ -2127,6 +2153,7 @@ inline void OnPresent(reshade::api::device* device) {
     for (uint32_t a = 0u; a < 3u; ++a) p.arena_bytes[a] = s.arenas[a].capacity * kRt12ArenaStride[a];
     p.alpha_mirror = s.atlas.texture11 != nullptr;
     p.wrapped = s.wrapped;
+    p.shader_model_6_6 = s.shader_model_6_6;
   });
 #endif
 }
@@ -3204,6 +3231,7 @@ inline void DumpRt12Json() {
   out << "  \"failed_stage\": \"" << bvh::PoolJsonEscape(p.failed_stage) << "\",\n";
   out << "  \"hr\": " << static_cast<uint32_t>(p.hr) << ",\n";
   out << "  \"wrapped\": " << (p.wrapped ? "true" : "false") << ",\n";
+  out << "  \"shader_model_6_6\": " << (p.shader_model_6_6 ? "true" : "false") << ",\n";
   out << "  \"stuck\": " << (p.stuck ? "true" : "false") << ",\n";
   out << "  \"leaked\": " << (p.leaked ? "true" : "false") << ",\n";
   out << "  \"alpha_mirror\": " << (p.alpha_mirror ? "true" : "false") << ",\n";

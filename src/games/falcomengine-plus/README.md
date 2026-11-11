@@ -6,6 +6,13 @@ Falcom Engine+ is RenoDX's game-specific graphics addon for Falcom-engine games.
 
 ### World capture and ray tracing
 
+#### Path-traced diffuse GI
+
+Sora 2nd path-traces diffuse indirect lighting using the captured world, the game sun and RTXDI Local lamps, and the game ambient probe for sky light. It needs RTXDI Local (scene transfer and lamps) and works with RTXDI Sun off; sun light at path vertices comes from scene constants and the path tracer's own shadow rays.
+
+**Code:** [world/pt](world/pt/), [world/shaders/world_pt_diffuse.cs_6_6.hlsl](world/shaders/world_pt_diffuse.cs_6_6.hlsl).
+**Reference:** Open Remix `pathtrace.comp`.
+
 #### World capture and scene construction
 
 The addon observes game draws and lighting inputs, classifies geometry from shader contracts, and builds CPU/GPU scene data for ray-traced effects. Static, alpha-tested, deforming, and moving geometry have different capture/admission paths, so start with the roadmap before changing this system.
@@ -45,7 +52,7 @@ RTXDI sun visibility can be traced at half resolution, with a resolve pass that 
 RTXDI sun shadows with Light Size above 0 are averaged over recent frames, reprojected with motion vectors, history-tested against the previous depth and normal and clamped to the 3x3 neighbourhood, so soft penumbras are less noisy; at Light Size 0 nothing changes.
 
 **Code:** [`world/rtgi`](world/rtgi/), [`world/rtxdi`](world/rtxdi/), [`world/shaders`](world/shaders/), [`world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl`](world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl), [world/shaders/world_rtxdi_sun_accumulate.cs_6_5.hlsl](world/shaders/world_rtxdi_sun_accumulate.cs_6_5.hlsl), [`world_settings.hpp`](world/world_settings.hpp), [`lighting_0xCA3D8596.ps_5_0.hlsl`](sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl).
-**References:** [`reference/restir`](reference/restir/), vendored RTXDI [`README`](world/rtxdi/vendor/rtxdi/README.md) and [`license`](world/rtxdi/vendor/rtxdi/LICENSE.txt).
+**References:** [`reference/restir`](reference/restir/), vendored RTXDI [`README`](world/rtxdi/vendor/rtxdi/README.md) and [`license`](licenses/RTXDI-LICENSE.txt).
 
 #### NRD RELAX adapter
 
@@ -132,7 +139,7 @@ These controls fix or refine the game's existing SSR march, history blend, and d
 Dynamic cubemaps capture and filter scene radiance into environment textures used for reflections, including specular irradiance and parallax-corrected sampling. This code is a Falcom Engine+ port and modification of Skyrim Community Shaders' Dynamic Cubemaps.
 
 **Code:** [`dyncube`](dyncube/).
-**Source and terms:** [`dyncube/license.txt`](dyncube/license.txt), [`reference/Dynamic Cubemaps`](reference/Dynamic%20Cubemaps/).
+**Source and terms:** [`licenses/dyncube-license.txt`](licenses/dyncube-license.txt), [`reference/Dynamic Cubemaps`](reference/Dynamic%20Cubemaps/).
 
 ### Temporal, post-processing, and game-specific techniques
 

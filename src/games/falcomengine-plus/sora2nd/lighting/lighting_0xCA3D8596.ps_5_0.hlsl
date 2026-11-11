@@ -203,6 +203,8 @@ Texture2D<float4> csDepthTex : register(t36);
 Texture2D<float4> csLocalContactTex : register(t40);
 // t37 is the RTGI final GI (r11g11b10_float, depth size; world/rtgi), bound by RunRtgiInline while rtgi_gi_bound.
 Texture2D<float4> rtgiTexture : register(t37);
+// t47 is the path-traced diffuse GI (rgba16f, depth size; world/pt): rgb irradiance, a = valid. Bound while pt_gi_bound.
+Texture2D<float4> ptGiTexture : register(t47);
 // t38 is the RT Local Shadows term (world/rtls; depth size): x point shadow, y spot shadow, z RT coverage (1 inside Fade
 // Start). Bound by RunRtlsInline while rtls_flags has RTLS_FLAG_BOUND. Flag bits mirror rtls::kRtlsFlag*.
 Texture2D<float4> rtlsTexture : register(t38);
@@ -400,6 +402,23 @@ void main(
   if (shader_injection_data.rtgi_gi_bound > 0.5f) {
     cachedRTGI = rtgiTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb * r0.xyz * shader_injection_data.rtgi_intensity;
   }
+// Path-traced diffuse GI (world/pt): t47 rgb = irradiance, a = valid. Where valid it replaces the AO (r5.x) and,
+// through cachedVBGI/cachedRTGI = 0, the VBGI and RTGI bounce at later sites; RTGI/RTAO code is removed in M5/M6.
+bool ptGiValid = false;
+float3 ptGiIrradiance = float3(0, 0, 0);
+float3 cachedPtGi = float3(0, 0, 0);
+if (shader_injection_data.pt_gi_bound > 0.5f) {
+  const float4 ptSample = ptGiTexture.SampleLevel(samPoint_s, v1.xy, 0);
+  if (ptSample.a > 0.5f) {
+    ptGiValid = true;
+    ptGiIrradiance = ptSample.rgb * shader_injection_data.pt_intensity;
+    cachedPtGi = ptGiIrradiance * r0.xyz;
+    r5.x = 1.0;
+    cachedVBGI = float3(0, 0, 0);
+    cachedVBGILuma = 0;
+    cachedRTGI = float3(0, 0, 0);
+  }
+}
 
   // Reduce AO where indirect light exists
   if (shader_injection_data.vbgi_reduce_ao > 0.5f && shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
@@ -920,6 +939,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     if (shader_injection_data.rtgi_gi_bound > 0.5f) {
       o0.xyz += cachedRTGI * (csCharacterShading ? saturate(shader_injection_data.rtgi_char_intensity) : 1.0);
     }
+    if (ptGiValid) o0.xyz += cachedPtGi * (csCharacterShading ? saturate(shader_injection_data.pt_char_intensity) : 1.0);
     // VBGI (M7.5): added after the shadow terms like the RTGI bounce; Character Mask Strength scales it on this path.
     if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
       o0.xyz += cachedVBGI * (1.0 - saturate(shader_injection_data.char_gtvbgi_mask_strength));
@@ -1080,6 +1100,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r1.y = r8.x * r8.x + -r1.y;
   r13.xyz = lightProbe_g[8].xyz * r1.yyy + r13.xyz;
   r13.xyz = max(float3(0,0,0), r13.xyz);
+  if (ptGiValid) r13.xyz = ptGiIrradiance;  // path-traced GI replaces the probe ambient
   r14.x = viewInv_g._m30 + -r4.x;
   r14.y = viewInv_g._m31 + -r4.y;
   r14.z = viewInv_g._m32 + -r4.z;

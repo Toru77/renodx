@@ -49,7 +49,7 @@ struct ShaderInjectData {
   float rtxdi_local_character_keep;         // RTXDI blocked-lamp light kept on characters [0..1] (reuses retired offset 88)
   float rtxdi_local_character_intensity;   // RTXDI character lamp light scale [0..2] (reuses retired offset 92)
   float rtxdi_local_character_fallback;    // 0/1: unresolved RTXDI pixels get unshadowed character lamp light (reuses retired offset 96)
-  float rtxdi_sun_character_csm_gate;      // RETIRED: unread, kept for the layout (was the RTXDI sun character CSM gate)
+  float pt_gi_bound;  // 0/1: Sora 2nd t47 holds this frame's path-traced diffuse GI (world/pt); reuses retired rtxdi_sun_character_csm_gate
 
   // Environment "Sun SSS" ray-march. RETIRED across the whole mod; unread.
   float env_sss_enabled;
@@ -729,7 +729,9 @@ struct ShaderInjectData {
   float rtxdi_debug_distance_bound;  // 0/1: t44 is the matching optional N3b distance carrier
   float rtxdi_sun_detail_view;       // Session-only Status/Reason/Hit distance selector for Sun Visibility view
   float rtxdi_sun_detail_bound;      // 0/1: t46 holds matching sun reason/distance data this draw
-                                     // Size: 446 floats = 1784 bytes. The host declares the range as
+  float pt_intensity;  // Path Tracing GI Intensity [0..2]; read only while pt_gi_bound
+  float pt_char_intensity;  // Path Tracing Character GI Intensity [0..1]; read only while pt_gi_bound
+                                     // Size: 448 floats = 1792 bytes. The host declares the range as
                                      // sizeof(ShaderInjectData) / 4 push values (CreateShadowsPipelinesIfNeeded and RunShadows);
                                      // the next added float starts a new float4, and the host range grows with sizeof automatically.
                                      // Prefer reusing a RETIRED slot.

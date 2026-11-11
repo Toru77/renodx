@@ -18,6 +18,7 @@
 
 #include "bvh/world_bvh.hpp"
 #include "capture/draw_census.hpp"
+#include "pt/pt_state.hpp"
 #include "rr/rr_interop.hpp"
 #include "rr/rr_state.hpp"
 #include "rtao/rtao.hpp"
@@ -2007,6 +2008,173 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .min = 0.f,
       .max = 100.f,
       .format = "%.1f%%",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtEnabled",
+      .binding = &pt::g_pt_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Path Traced GI",
+      .section = "Path Tracing",
+      .tooltip = "Sora 2nd. Needs DXR with shader model 6.6 and RTXDI Local (scene transfer and lamps); works with RTXDI Sun off. Replaces probe ambient, SSAO, GTVBAO/VBGI and RTGI in the image. Raw (no denoiser) unless Ray Reconstruction is on.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtStatus",
+      .value_type = SettingValueType::CUSTOM,
+      .can_reset = false,
+      .label = "Path Tracing status",
+      .section = "Path Tracing",
+      .on_draw = []() { pt::DrawPtPanel(); return false; },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtSamples",
+      .binding = &pt::g_pt_samples,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 1.f,
+      .label = "Samples Per Pixel",
+      .section = "Path Tracing",
+      .min = 1.f,
+      .max = 16.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtMaxBounces",
+      .binding = &pt::g_pt_max_bounces,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 16.f,
+      .label = "Max Bounces",
+      .section = "Path Tracing",
+      .min = 1.f,
+      .max = 16.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtRussianRoulette",
+      .binding = &pt::g_pt_russian_roulette,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Russian Roulette",
+      .section = "Path Tracing",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtRouletteMinBounce",
+      .binding = &pt::g_pt_roulette_min_bounce,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 1.f,
+      .label = "Russian Roulette From Bounce",
+      .section = "Path Tracing",
+      .min = 1.f,
+      .max = 16.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtIntensity",
+      .binding = &pt::g_pt_intensity,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "GI Intensity",
+      .section = "Path Tracing",
+      .min = 0.f,
+      .max = 2.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtCharIntensity",
+      .binding = &pt::g_pt_char_intensity,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Character GI Intensity",
+      .section = "Path Tracing",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtSkyIntensity",
+      .binding = &pt::g_pt_sky_intensity,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Sky Intensity",
+      .section = "Path Tracing",
+      .min = 0.f,
+      .max = 4.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtRayMax",
+      .binding = &pt::g_pt_ray_max,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 500.f,
+      .label = "Max Ray Distance",
+      .section = "Path Tracing",
+      .tooltip = "Longest bounce and sun shadow ray, in metres. A bounce ray that hits nothing within it sees the sky.",
+      .min = 1.f,
+      .max = 500.f,
+      .format = "%.0f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtEnvBias",
+      .binding = &pt::g_pt_env_bias,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.02f,
+      .label = "Normal Bias",
+      .section = "Path Tracing",
+      .tooltip = "Rays start this far off the surface along its normal (environment and every bounce hit), against self-hits.",
+      .min = 0.f,
+      .max = 0.5f,
+      .format = "%.3f",
+      .is_visible = visible,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
+      .key = "PtCharBias",
+      .binding = &pt::g_pt_char_bias,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.02f,
+      .label = "Character Normal Bias",
+      .section = "Path Tracing",
+      .tooltip = "Normal Bias for the first ray from character pixels.",
+      .min = 0.f,
+      .max = 0.5f,
+      .format = "%.3f",
+      .is_visible = visible,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
+      .key = "PtLampClearance",
+      .binding = &pt::g_pt_lamp_clearance,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.2f,
+      .label = "Lamp Clearance",
+      .section = "Path Tracing",
+      .tooltip = "Lamp shadow rays stop this far short of the lamp. Inside this distance a lamp is treated as visible.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtSunCasters",
+      .binding = &pt::g_pt_sun_casters,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Sun Shadow Casters Only",
+      .section = "Path Tracing",
+      .tooltip = "Sun shadows at bounce hits come only from objects the game draws into its shadow maps. Off = every object casts.",
+      .labels = {"Off", "On"},
       .is_visible = visible,
   });
   settings->push_back(new Setting{
