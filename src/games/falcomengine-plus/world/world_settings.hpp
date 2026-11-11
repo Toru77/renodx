@@ -2282,6 +2282,20 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "PtSharcRadianceScale",
+      .binding = &pt::g_pt_sharc_radiance_scale,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 100000.f,
+      .label = "SHARC Radiance Scale",
+      .section = "Path Tracing",
+      .tooltip = "Fixed-point scale SHARC uses to store colour. Raise it if colour fades indoors with SHARC on; very high values use more of each cell's 32-bit sums. Changing it clears the SHARC cache.",
+      .min = 1000.f,
+      .max = 1000000.f,
+      .format = "%.0f",
+      .is_visible = visible,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
       .key = "PtSharcCapacityLog2",
       .binding = &pt::g_pt_sharc_capacity_log2,
       .value_type = SettingValueType::INTEGER,

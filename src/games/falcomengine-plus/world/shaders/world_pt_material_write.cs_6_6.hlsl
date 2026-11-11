@@ -22,7 +22,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   uint64_t key;
   uint index;
   if (!HashGridInsertEntry(PtMaterialData(), PtCachePosition(surface.world_position, surface.shading_normal),
-                           surface.shading_normal, PtMaterialGrid(), key, index)) return;
+                           PtMaterialKeyNormal(surface.shading_normal), PtMaterialGrid(), key, index)) return;
   const uint base = index * 4u;
   uint previous;
   InterlockedOr(g_pt_material_values[base + 3u], 0x80000000u, previous);

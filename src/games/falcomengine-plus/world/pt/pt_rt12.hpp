@@ -250,6 +250,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   uint32_t sharc_ds = std::clamp(static_cast<uint32_t>(pt::g_pt_sharc_downscale), 1u, 16u);
   while (sharc_ds < 16u && uint64_t{(w + sharc_ds - 1u) / sharc_ds} * ((h + sharc_ds - 1u) / sharc_ds) > pt::kPtSharcMaxUpdatePaths) ++sharc_ds;
   uint32_t sharc_window = 0u;
+  const uint32_t sharc_radiance_wanted = std::bit_cast<uint32_t>(static_cast<float>(rtxdi::FiniteClamped(pt::g_pt_sharc_radiance_scale, 100000.f, 1000.f, 1000000.f)));
   if (sharc_on) {
     if (r.sharc_last_frame == UINT32_MAX || frame - r.sharc_last_frame > pt::kPtSharcGapFrames) {
       if (!clear_reason) {
@@ -269,6 +270,11 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (pt::g_pt_sharc_reset_request != r.sharc_reset_seen) {
       if (!clear_reason) {
         clear_reason = "user";
+      }
+    }
+    if (sharc_radiance_wanted != r.sharc_radiance_seen) {
+      if (!clear_reason) {
+        clear_reason = "radiance";
       }
     }
     if (has_sun) {
@@ -301,6 +307,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     r.sharc_scene_scale = sharc_scale;
     r.sharc_bounces = sharc_bounces;
     r.sharc_reset_seen = pt::g_pt_sharc_reset_request;
+    r.sharc_radiance_seen = sharc_radiance_wanted;
     r.sharc_last_frame = frame;
   } else {
     r.sharc_last_frame = UINT32_MAX;  // the next frame with SHARC on clears it
@@ -507,7 +514,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       deferred ? input.deferred_count : 0u,
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_char_roughness, 0.5f, 0.05f, 1.f)),
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_char_f0, 0.04f, 0.f, 0.2f)),
-      0u, 0u, 0u, 0u, 0u};
+      0u, sharc_radiance_wanted, 0u, 0u, 0u};
   ID3D12DescriptorHeap* heaps[] = {r.heap.Get()};
   list->SetDescriptorHeaps(1u, heaps);
   list->SetComputeRootSignature(r.root.Get());

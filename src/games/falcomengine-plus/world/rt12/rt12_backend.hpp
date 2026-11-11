@@ -402,6 +402,7 @@ struct Rt12PtState {
   bool sharc_clear = true;
   uint32_t sharc_last_frame = UINT32_MAX, sharc_episode = UINT32_MAX, sharc_scene_scale = 0u, sharc_bounces = 0u;
   uint32_t sharc_reset_seen = 0u, sharc_responsive_frames = 0u;
+  uint32_t sharc_radiance_seen = 0u;
   float sharc_light[6] = {};  // normalized sun direction, sun colour of the last frame
   bool sharc_light_valid = false;
   float sharc_prev_camera[3] = {};

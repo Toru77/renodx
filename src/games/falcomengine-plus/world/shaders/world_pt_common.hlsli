@@ -43,7 +43,7 @@ cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (40 dwords
   float3 g_sharc_camera_prev; uint g_sharc_mode;
   uint g_mat_enabled; uint g_mat_capacity; uint g_mat_rate; float g_mat_cell_scale;
   uint g_mat_deferred_count; float g_mat_char_roughness; float g_mat_char_f0; uint g_mat_mode;
-  uint g_pad0; uint g_pad1; uint g_pad2; uint g_pad3;
+  float g_sharc_radiance_scale; uint g_pad1; uint g_pad2; uint g_pad3;
 };
 uint PtHash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; return x ^ (x >> 16); }
 float PtRandom(inout uint s) { s = PtHash(s + 0x9e3779b9u); return float(s >> 8) * (1.0 / 16777216.0); }
@@ -130,13 +130,20 @@ SharcParameters PtSharcParameters() {
   p.hashGridParameters.levelBias = 0;
   p.hashGridData.capacity = g_sharc_capacity;
   p.hashGridData.hashEntriesBuffer = g_pt_sharc_hash;
-  p.radianceScale = 1000;
+  p.radianceScale = g_sharc_radiance_scale;
   p.accumulationBuffer = g_pt_sharc_accumulation;
   p.resolvedBuffer = g_pt_sharc_resolved;
   return p;
 }
 // A cache cell's position: slightly above the surface (OpenRemix pathtrace.comp:1097-1103). Shared by SHARC and the material cache.
 float3 PtCachePosition(float3 position, float3 n) { return position + n * (1e-3 * length(position - g_sharc_camera) + 1e-4); }
+// Material-cache key normal: the dominant axis with its sign, so shading-normal noise does not split one face. Cell positions keep the real normal.
+float3 PtMaterialKeyNormal(float3 n) {
+  const float3 a = abs(n);
+  const uint axis = (a.x >= a.y && a.x >= a.z) ? 0u : (a.y >= a.z ? 1u : 2u);
+  const float3 codes[6] = {float3(1, 1, 1), float3(-1, 1, 1), float3(1, -1, 1), float3(1, 1, -1), float3(-1, -1, 1), float3(-1, 1, -1)};
+  return codes[axis * 2u + (n[axis] < 0.0 ? 1u : 0u)];
+}
 HashGridParameters PtMaterialGrid() {
   HashGridParameters p;
   p.cameraPosition = g_sharc_camera; p.logarithmBase = 2; p.sceneScale = g_mat_cell_scale; p.levelBias = 0;
@@ -197,7 +204,7 @@ PtMaterial PtHitMaterial(float3 position, float3 nh) {
     }
   }
   uint64_t key;
-  const uint index = HashGridFindEntry(PtMaterialData(), PtCachePosition(position, nh), nh, PtMaterialGrid(), key);
+  const uint index = HashGridFindEntry(PtMaterialData(), PtCachePosition(position, nh), PtMaterialKeyNormal(nh), PtMaterialGrid(), key);
   if (index != HASH_GRID_INVALID_CACHE_INDEX && ((PtReadMaterial(index).w >> 24) & 1u) != 0u) {
     PtCount(1u);
     return PtUnpackMaterial(PtReadMaterial(index));
