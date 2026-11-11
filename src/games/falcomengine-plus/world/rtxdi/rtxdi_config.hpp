@@ -38,6 +38,8 @@ struct EffectiveRtxdiSettings {
   uint32_t history_length = 20u;
   float temporal_depth_threshold = 0.1f;
   float temporal_normal_threshold = 0.5f;
+  bool boiling_filter = true;
+  float boiling_filter_strength = 0.2f;
   float spatial_depth_threshold = 0.05f;
   float spatial_normal_threshold = 0.9f;
   bool relax_diffuse = true;
@@ -63,6 +65,8 @@ inline EffectiveRtxdiSettings CaptureEffectiveRtxdiSettings() {
   effective.history_length = integer_setting(g_history_length, 20.0f, 1l, 32l);
   effective.temporal_depth_threshold = std::clamp(std::isfinite(g_temporal_depth_threshold) ? g_temporal_depth_threshold : 0.1f, 0.0f, 1.0f);
   effective.temporal_normal_threshold = std::clamp(std::isfinite(g_temporal_normal_threshold) ? g_temporal_normal_threshold : 0.5f, -1.0f, 1.0f);
+  effective.boiling_filter = g_boiling_filter > 0.5f;
+  effective.boiling_filter_strength = std::clamp(std::isfinite(g_boiling_filter_strength) ? g_boiling_filter_strength : 0.2f, 0.01f, 1.0f);
   effective.spatial_depth_threshold = std::clamp(std::isfinite(g_spatial_depth_threshold) ? g_spatial_depth_threshold : 0.05f, 0.0f, 1.0f);
   effective.spatial_normal_threshold = std::clamp(std::isfinite(g_spatial_normal_threshold) ? g_spatial_normal_threshold : 0.9f, -1.0f, 1.0f);
   effective.relax_diffuse = g_diffuse_denoiser > 0.5f;
@@ -94,6 +98,8 @@ inline EffectiveRtxdiSettings CaptureEffectiveRtxdiSettings() {
   add(effective.history_length);
   add(std::bit_cast<uint32_t>(effective.temporal_depth_threshold));
   add(std::bit_cast<uint32_t>(effective.temporal_normal_threshold));
+  add(effective.boiling_filter ? 1u : 0u);
+  add(std::bit_cast<uint32_t>(effective.boiling_filter_strength));
   add(std::bit_cast<uint32_t>(effective.spatial_depth_threshold));
   add(std::bit_cast<uint32_t>(effective.spatial_normal_threshold));
   add(effective.relax_diffuse ? 1u : 0u);
@@ -227,6 +233,10 @@ inline std::unique_ptr<::rtxdi::ReSTIRDIContext> CreateDiContext(const DiConfig&
   temporal.depthThreshold = settings.temporal_depth_threshold;
   temporal.normalThreshold = settings.temporal_normal_threshold;
   context->SetTemporalResamplingParameters(temporal);
+  auto boiling = context->GetBoilingFilterParameters();
+  boiling.enableBoilingFilter = settings.boiling_filter ? 1u : 0u;
+  boiling.boilingFilterStrength = settings.boiling_filter_strength;
+  context->SetBoilingFilterParameters(boiling);
   auto shading = context->GetShadingParameters();
   shading.enableFinalVisibility = 1u;
   shading.reuseFinalVisibility = 0u;

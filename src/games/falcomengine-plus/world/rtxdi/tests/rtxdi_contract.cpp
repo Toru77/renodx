@@ -969,7 +969,8 @@ int main() {
       || parameters.di.shadingParams.reuseFinalVisibility || parameters.di.shadingParams.enableDenoiserInputPacking
       || parameters.di.temporalResamplingParams.enableVisibilityShortcut
       || parameters.di.temporalResamplingParams.enablePermutationSampling || parameters.runtime.pad2
-      || parameters.di.reservoirBufferParams.pad1 || parameters.di.reservoirBufferParams.pad2) return EXIT_FAILURE;
+      || parameters.di.reservoirBufferParams.pad1 || parameters.di.reservoirBufferParams.pad2
+      || parameters.di.boilingFilterParams.enableBoilingFilter != 1u || parameters.di.boilingFilterParams.boilingFilterStrength != 0.2f) return EXIT_FAILURE;
   if (parameters.di.bufferIndices.pad1 || parameters.di.bufferIndices.pad2
       || parameters.di.initialSamplingParams.pad1 || parameters.di.initialSamplingParams.pad2 || parameters.di.initialSamplingParams.pad3
       || parameters.di.boilingFilterParams.pad1 || parameters.di.boilingFilterParams.pad2
@@ -1006,6 +1007,18 @@ int main() {
       || balanced_settings.spatial_disocclusion != 4u || quality.local_candidates != 16u || quality.spatial_samples != 8u
       || quality.spatial_disocclusion != 8u || custom.local_candidates != 32u || custom.spatial_samples != 4u
       || custom.spatial_disocclusion != 1u || custom.identity == balanced_settings.identity) return EXIT_FAILURE;
+  const float saved_boiling = falcom_world::rtxdi::g_boiling_filter;
+  const float saved_boiling_strength = falcom_world::rtxdi::g_boiling_filter_strength;
+  falcom_world::rtxdi::g_boiling_filter = 0.f;
+  falcom_world::rtxdi::g_boiling_filter_strength = std::numeric_limits<float>::quiet_NaN();
+  const auto boiling_off = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings();
+  falcom_world::rtxdi::g_boiling_filter = saved_boiling;
+  falcom_world::rtxdi::g_boiling_filter_strength = saved_boiling_strength;
+  const auto boiling_off_context = falcom_world::rtxdi::CreateDiContext(config, boiling_off);
+  if (boiling_off.boiling_filter || boiling_off.boiling_filter_strength != 0.2f
+      || boiling_off.identity == balanced_settings.identity || !boiling_off_context
+      || boiling_off_context->GetBoilingFilterParameters().enableBoilingFilter != 0u
+      || boiling_off_context->GetBoilingFilterParameters().boilingFilterStrength != 0.2f) return EXIT_FAILURE;
   for (uint32_t mode = 0u; mode < 4u; ++mode) {
     auto mode_settings = balanced_settings;
     mode_settings.temporal_enabled = (mode & 1u) != 0u;

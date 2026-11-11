@@ -3412,6 +3412,34 @@ int RunRtxdiDxrBridge() {
                 static_cast<unsigned>(mode_settings.spatial_enabled));
   }
 
+  auto boiling_settings = bridge_settings;
+  boiling_settings.temporal_enabled = true;
+  boiling_settings.spatial_enabled = false;
+  std::array<float, 2u> boiling_target = {}, boiling_weight = {};
+  std::array<UINT, 2u> boiling_m = {};
+  for (UINT pass = 0u; pass < 2u; ++pass) {
+    boiling_settings.boiling_filter = (pass == 1u);
+    bridge_di_context = falcom_world::rtxdi::CreateDiContext(bridge_di_config, boiling_settings);
+    if (!bridge_di_context) return 1;
+    prior_spatial_output.clear();
+    prior_reservoir_state.clear();
+    prior_spatial_output_index = UINT_MAX;
+    baseline_initial_m = 0u;
+    if (!update_upload(di_reservoir_upload.Get(), reservoir_sentinel.data(), static_cast<size_t>(di_reservoir_bytes))) return 1;
+    for (UINT frame = 0u; frame < 3u; ++frame) {
+      if (frame != 0u) bridge_di_context->SetFrameIndex(bridge_di_context->GetFrameIndex() + 1u);
+      char label[96] = {};
+      std::snprintf(label, sizeof(label), "RTXDI boiling filter %s frame %u", pass == 0u ? "Off" : "On", frame);
+      if (!run_di(4u, 1u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0, label, true, 1u, false, 0u,
+                  false, frame != 0u, true, frame != 0u, frame != 0u, false,
+                  &boiling_target[pass], &boiling_m[pass], &boiling_weight[pass])) return 1;
+    }
+  }
+  if (boiling_m[0] != boiling_m[1]
+      || std::bit_cast<uint32_t>(boiling_weight[0]) != std::bit_cast<uint32_t>(boiling_weight[1])
+      || std::bit_cast<uint32_t>(boiling_target[0]) != std::bit_cast<uint32_t>(boiling_target[1])) return 1;
+  std::printf("PASS RTXDI boiling filter 0.2 keeps temporal results identical\n");
+
   D3D12_RESOURCE_BARRIER raw_guard_barrier = {};
   raw_guard_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
   raw_guard_barrier.Transition.pResource = di_raw.Get();

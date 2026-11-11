@@ -843,6 +843,33 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtxdiBoilingFilter",
+      .binding = &rtxdi::g_boiling_filter,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Boiling Filter (Local)",
+      .section = "RTXDI Local",
+      .tooltip = "Drops a lamp reservoir at the end of temporal reuse when its weight is far above the average of its 8x8 pixel group, so rare bright samples do not spread into blotches. RTXDI SDK default: On.",
+      .labels = {"Off", "On"},
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiBoilingFilterStrength",
+      .binding = &rtxdi::g_boiling_filter_strength,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.2f,
+      .label = "Boiling Filter Strength (Local)",
+      .section = "RTXDI Local",
+      .tooltip = "Higher values drop more bright reservoirs: a reservoir is dropped when its weight exceeds (10 / strength - 9) times the group average. 0.2 is the RTXDI SDK default.",
+      .min = 0.01f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_enabled = [] { return rtxdi::g_boiling_filter > 0.5f; },
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiTemporalDepthThreshold",
       .binding = &rtxdi::g_temporal_depth_threshold,
       .value_type = SettingValueType::FLOAT,

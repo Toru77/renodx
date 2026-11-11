@@ -242,6 +242,8 @@ RTXDI M16: Character Self-Shadow Softening (Sun, m): for character receivers the
 
 RTXDI M17: Temporal Accumulation (Sun) (default On) and Accumulation Frames (Sun) (2-32, default 8): with Light Size (Sun) > 0, world_rtxdi_sun_accumulate runs after the sun rays, blends this frame's visibility with the reprojected history (motion vectors, previous depth/normal/class, 3x3 clamp, weight max(1/(n+1), 1/N)) and writes status FILTERED (3) with the filtered occlusion in bits 16-23 (layer bits kept for tint); UNKNOWN, rejected history and the first frame keep the raw word; at Light Size 0 no pass runs. Sun-only RTXDI captures motion vectors when accumulation is wanted. Deferred, found while planning: with a Sun Detail view active, sun_results ends the detail block in COMMON (rt12_rtxdi_transfer.hpp:2012) while the closing barrier (2031) says UNORDERED_ACCESS. Not validated in game.
 
+RTXDI M18: Boiling Filter (Local) (default On) and Boiling Filter Strength (Local) (default 0.2, the SDK values): the temporal DI pass runs RTXDI_BoilingFilter over 8x8 groups before storing; all threads reach the filter, and out-of-bounds threads carry an empty reservoir. Not validated in game.
+
 ## Reference
 
 ### Code map (`world/`)
