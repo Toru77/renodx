@@ -1557,8 +1557,9 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 1.f,
       .label = "Temporal Accumulation (Sun)",
       .section = "RTXDI Sun",
-      .tooltip = "Averages the sun shadow over recent frames, reprojected with motion vectors, so soft edges from Light Size (Sun) are less noisy. Only has an effect when Light Size > 0; at 0 the sun shadow is unchanged.",
+      .tooltip = "Averages the sun shadow over recent frames, reprojected with motion vectors, so soft edges from Light Size (Sun) are less noisy. Only has an effect when Light Size > 0; at 0 the sun shadow is unchanged. Off while Diffuse denoiser is Raw or Ray Reconstruction is active.",
       .labels = {"Off", "On"},
+      .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
       .is_visible = visible,
   });
   settings->push_back(new Setting{
@@ -1572,7 +1573,23 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .min = 2.f,
       .max = 32.f,
       .format = "%d",
-      .is_enabled = [] { return rtxdi::g_sun_accumulation > 0.5f; },
+      .is_enabled = [] { return rtxdi::g_sun_accumulation > 0.5f && rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSunAccumulationStatus",
+      .value_type = SettingValueType::CUSTOM,
+      .can_reset = false,
+      .label = "Sun accumulation status",
+      .section = "RTXDI Sun",
+      .on_draw = []() {
+        if (rr::RrRequested() || rr::RrOwnsDenoise()) {
+          ImGui::TextDisabled("Sun accumulation off: Ray Reconstruction denoises.");
+        } else if (rtxdi::g_diffuse_denoiser <= 0.5f) {
+          ImGui::TextDisabled("Sun accumulation off: Diffuse denoiser is Raw.");
+        }
+        return false;
+      },
       .is_visible = visible,
   });
   settings->push_back(new Setting{

@@ -1448,7 +1448,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
         return finish();
       }
     }
-    if (in.sun && rtxdi::SunAccumulationRequested() && !slot.sun_history) {
+    if (in.sun && rtxdi::SunAccumulationAllowed(in.effective_settings.relax_diffuse, rr::RrRequested() || rr::RrOwnsDenoise()) && !slot.sun_history) {
       D3D12_RESOURCE_DESC history_desc = {};
       history_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
       history_desc.Width = in.width;
@@ -2000,7 +2000,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       query_barriers.clear();
       UavBarrier(query_barriers, slot.sun_results.Get());
       UavBarrier(query_barriers, slot.sun_visibility.texture12.Get());
-      if (motion_available && slot.sun_history && rtxdi::SunAccumulationRequested()) {
+      if (motion_available && slot.sun_history && rtxdi::SunAccumulationAllowed(in.effective_settings.relax_diffuse, rr::RrRequested() || rr::RrOwnsDenoise())) {
         transfer.list->ResourceBarrier(static_cast<UINT>(query_barriers.size()), query_barriers.data());
         query_barriers.clear();
         Rt12DiTransferSlot* history_slot = nullptr;

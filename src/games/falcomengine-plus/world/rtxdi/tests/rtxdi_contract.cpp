@@ -916,9 +916,17 @@ int main() {
   falcom_world::rtxdi::g_sun_accumulation = 0.f;
   falcom_world::rtxdi::g_sun_light_size = 1.f;
   const bool accumulation_off = falcom_world::rtxdi::SunAccumulationRequested();
+  falcom_world::rtxdi::g_sun_accumulation = 1.f;
+  const bool allowed_relax = falcom_world::rtxdi::SunAccumulationAllowed(true, false);
+  const bool allowed_raw = falcom_world::rtxdi::SunAccumulationAllowed(false, false);
+  const bool allowed_rr = falcom_world::rtxdi::SunAccumulationAllowed(true, true);
+  const bool allowed_raw_rr = falcom_world::rtxdi::SunAccumulationAllowed(false, true);
+  falcom_world::rtxdi::g_sun_light_size = 0.f;
+  const bool allowed_at_zero_size = falcom_world::rtxdi::SunAccumulationAllowed(true, false);
   falcom_world::rtxdi::g_sun_accumulation = saved_sun_accumulation;
   falcom_world::rtxdi::g_sun_light_size = saved_sun_light_size;
-  if (accumulation_at_zero_size || !accumulation_at_size_one || accumulation_at_nan_size || accumulation_off) return EXIT_FAILURE;
+  if (accumulation_at_zero_size || !accumulation_at_size_one || accumulation_at_nan_size || accumulation_off
+      || !allowed_relax || allowed_raw || allowed_rr || allowed_raw_rr || allowed_at_zero_size) return EXIT_FAILURE;
   falcom_world::rtxdi::DiConfig config;
   if (falcom_world::rtxdi::CalculateDiConfig(0u, 1u, &config)
       || falcom_world::rtxdi::CalculateDiConfig(UINT32_MAX, 1u, &config)
