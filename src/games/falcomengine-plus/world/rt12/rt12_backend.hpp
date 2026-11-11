@@ -381,8 +381,8 @@ struct Rt12DiTransferState {
 };
 
 // Path-traced diffuse GI (world/pt): its own submission slots, list, root signature, PSO, descriptors and outputs.
-inline constexpr uint32_t kRt12PtDescriptors = 18u;
-inline constexpr uint32_t kRt12PtConstants = 32u;
+inline constexpr uint32_t kRt12PtDescriptors = 24u;
+inline constexpr uint32_t kRt12PtConstants = 40u;
 struct Rt12PtState {
   bool created = false;
   Rt12Slot slots[kRt12Slots];
@@ -404,6 +404,13 @@ struct Rt12PtState {
   float sharc_light[6] = {};  // normalized sun direction, sun colour of the last frame
   bool sharc_light_valid = false;
   float sharc_prev_camera[3] = {};
+  // Material cache (M3): write PSO (shared root signature), keys (uint64) and values (uint4), clear triggers.
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> material_write_pso;
+  Microsoft::WRL::ComPtr<ID3D12Resource> material_keys, material_values;
+  uint32_t material_capacity = 0u, material_failed_capacity = 0u;
+  bool material_clear = true;
+  uint32_t material_last_frame = UINT32_MAX, material_episode = UINT32_MAX, material_cell_scale = 0u, material_reset_seen = 0u;
+  bool sharc_material_on = false;  // material cache state SHARC was trained with
 };
 
 struct Rt12State {

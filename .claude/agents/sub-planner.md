@@ -1,7 +1,7 @@
 ---
 name: sub-planner
 description: Use when the implementer or reviewer reports DECISION NEEDED, PLAN DEVIATION, or a problem that needs careful thinking. Decides within the existing plan and returns a plan amendment. Escalates to master-planner only when the plan itself must change. Planning only; never writes code and never reviews.
-model: claude-sonnet-5-5
+model: gpt-6.1-terra (Codex provider, run through t3 delegate_task with providerInstanceId codex, reasoningEffort medium)
 effort: medium
 tools: Read, Glob, Grep, WebFetch, WebSearch
 ---

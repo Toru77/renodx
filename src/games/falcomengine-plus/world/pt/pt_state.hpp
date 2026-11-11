@@ -13,6 +13,9 @@ inline constexpr uint32_t kPtSharcGapFrames = 5u;           // frames without a 
 inline constexpr uint32_t kPtSharcMaxUpdatePaths = 82944u;  // OpenRemix options.h:346 (1920x1080 at downscale 5)
 inline constexpr uint32_t kPtSharcAccumulationStride = 32u; // OpenRemix sharc_policy.h:9
 inline constexpr uint32_t kPtSharcResolvedStride = 24u;     // OpenRemix sharc_policy.h:10
+inline float g_pt_material_enabled = 1.f, g_pt_material_rate = 4.f, g_pt_material_cell_scale = 30.f,
+             g_pt_material_capacity_log2 = 21.f, g_pt_char_roughness = 0.5f, g_pt_char_f0 = 0.04f;
+inline constexpr uint32_t kPtMaterialValueStride = 16u;
 inline float g_pt_samples = 1.f, g_pt_max_bounces = 16.f, g_pt_russian_roulette = 1.f,
              g_pt_roulette_min_bounce = 1.f, g_pt_intensity = 1.f, g_pt_char_intensity = 1.f, g_pt_sky_intensity = 1.f,
              g_pt_ray_max = 500.f, g_pt_env_bias = 0.02f, g_pt_char_bias = 0.02f, g_pt_lamp_clearance = 0.2f, g_pt_sun_casters = 0.f;
@@ -45,6 +48,10 @@ struct PtPanel {
   uint32_t sharc_capacity_log2 = 0u, sharc_downscale = 0u, sharc_window = 0u;
   uint64_t sharc_clears = 0u;
   const char* sharc_clear_reason = "none";
+  bool mat_on = false;
+  uint32_t mat_capacity_log2 = 0u, mat_rate = 0u;
+  uint64_t mat_clears = 0u;
+  const char* mat_clear_reason = "none";
   uint32_t lamps = 0u, width = 0u, height = 0u;
 };
 inline std::mutex g_pt_panel_mutex;
@@ -65,5 +72,7 @@ inline void DrawPtPanel() {
   ImGui::Text("SHARC: %s  capacity 2^%u  update 1/%u px  window %u frames  clears %llu (last: %s)", p.sharc_on ? "on" : "off",
               p.sharc_capacity_log2, p.sharc_downscale, p.sharc_window, static_cast<unsigned long long>(p.sharc_clears),
               p.sharc_clear_reason);
+  ImGui::Text("Material cache: %s  capacity 2^%u  write 1/%u px  clears %llu (last: %s)", p.mat_on ? "on" : "off",
+              p.mat_capacity_log2, p.mat_rate * p.mat_rate, static_cast<unsigned long long>(p.mat_clears), p.mat_clear_reason);
 }
 }  // namespace falcom_world::pt

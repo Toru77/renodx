@@ -25,7 +25,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     const WorldTraceHit hit = TraceWorldRayDxr(p + n * bias, dir, 1e-3, g_ray_max, false, bounce_view, pt_counters);
     if (hit.prim == 0xFFFFFFFFu) { SharcUpdateMiss(sharc, state, PtSky(dir)); break; }
     const float3 nh = dot(hit.normal, dir) > 0.0 ? -hit.normal : hit.normal;
-    const float3 albedo = PtHitAlbedo(hit);
+    const float3 albedo = PtHitMaterial(hit.position, nh).albedo;
     float3 direct = albedo * PtHitLight(hit.position, nh, rng);
     if (any(isnan(direct)) || any(isinf(direct))) direct = float3(0, 0, 0);
     if (!SharcUpdateHit(sharc, state, PtSharcHit(hit.position, nh, dir, albedo), direct, PtRandom(rng))) break;
