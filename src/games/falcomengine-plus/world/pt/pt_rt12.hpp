@@ -787,7 +787,8 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
     r.water_counter_readback[i]->Unmap(0u, nullptr);
   }
   // 2. Validation: the SSR depth and mrt0 must be same-size single-sample textures in the formats the water block reads.
-  if (depth_srv.handle == 0u || mrt_srv.handle == 0u) return fallback("format");
+  if (depth_srv.handle == 0u) return fallback("no_depth_capture");
+  if (mrt_srv.handle == 0u) return fallback("no_mrt_capture");
   const reshade::api::resource depth_res = device->get_resource_from_view(depth_srv);
   const reshade::api::resource mrt_res = device->get_resource_from_view(mrt_srv);
   const reshade::api::resource_desc depth_desc = device->get_resource_desc(depth_res);
@@ -800,11 +801,33 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
                         && depth_view_format == DXGI_FORMAT_R32_FLOAT;
   const bool mrt_ok = (mrt_format == DXGI_FORMAT_R32G32B32A32_UINT || mrt_format == DXGI_FORMAT_R32G32B32A32_TYPELESS)
                       && mrt_view_format == DXGI_FORMAT_R32G32B32A32_UINT;
-  if (!depth_ok || !mrt_ok || depth_desc.type != reshade::api::resource_type::texture_2d
-      || mrt_desc.type != reshade::api::resource_type::texture_2d || depth_desc.texture.width != w || depth_desc.texture.height != h
-      || mrt_desc.texture.width != w || mrt_desc.texture.height != h || depth_desc.texture.samples != 1u || mrt_desc.texture.samples != 1u) {
-    return fallback("format");
+  // Each rejection names its check; with debug logging on, the event ring keeps the formats and sizes of both sources.
+  const auto reject = [&](const char* reason) {
+    const uint64_t capture_state = pt::g_pt_capture_state.load();
+    if ((capture_state & 1u) != 0u) {
+      // Short fields, water size first so it survives the 160-character event limit: "<check> <w>x<h> d <fmt>/<view> t<type> <W>x<H> s<samples> m ...".
+      pt::RecordPtEvent(g_state.frame.load(std::memory_order_relaxed),
+                        std::string("water ") + reason + " " + std::to_string(w) + "x" + std::to_string(h) + " d "
+                            + std::to_string(static_cast<uint32_t>(depth_format)) + "/"
+                            + std::to_string(static_cast<uint32_t>(depth_view_format)) + " t"
+                            + std::to_string(static_cast<uint32_t>(depth_desc.type)) + " " + std::to_string(depth_desc.texture.width) + "x"
+                            + std::to_string(depth_desc.texture.height) + " s" + std::to_string(depth_desc.texture.samples) + " m "
+                            + std::to_string(static_cast<uint32_t>(mrt_format)) + "/" + std::to_string(static_cast<uint32_t>(mrt_view_format))
+                            + " t" + std::to_string(static_cast<uint32_t>(mrt_desc.type)) + " " + std::to_string(mrt_desc.texture.width) + "x"
+                            + std::to_string(mrt_desc.texture.height) + " s" + std::to_string(mrt_desc.texture.samples),
+                        capture_state);
+    }
+    return fallback(reason);
+  };
+  if (!depth_ok) return reject("depth_format");
+  if (!mrt_ok) return reject("mrt_format");
+  if (depth_desc.type != reshade::api::resource_type::texture_2d || mrt_desc.type != reshade::api::resource_type::texture_2d) {
+    return reject("type");
   }
+  if (depth_desc.texture.width != w || depth_desc.texture.height != h || mrt_desc.texture.width != w || mrt_desc.texture.height != h) {
+    return reject("size");
+  }
+  if (depth_desc.texture.samples != 1u || mrt_desc.texture.samples != 1u) return reject("samples");
   const auto fail_water = [&s, &fallback](Rt12Reason reason, const char* stage, const char* water_reason) {
     FailSession(s, reason, stage);
     return fallback(water_reason);
