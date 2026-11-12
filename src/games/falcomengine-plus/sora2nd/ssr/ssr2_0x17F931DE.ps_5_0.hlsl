@@ -87,6 +87,7 @@ Texture3D<float2> dynCubeIsfastNoiseTex : register(t5);  // IS-FAST volume (128x
 TextureCube<float4> texEnvMap_g : register(t17);
 TextureCube<float4> dynCubeHistPosTex : register(t29);
 TextureCube<float4> dynCubeVanillaTex : register(t30);
+Texture2D<float4> ptReflTexture : register(t48);  // world/pt M4 traced reflection, bound while pt_refl_bound
 
 #include "../../shared.h"
 #include "../../dyncube/dyncube_sample.hlsli"
@@ -118,6 +119,23 @@ void main(
   float4 v1 : TEXCOORD0,
   out float4 o0 : SV_Target0)
 {
+  // MRT texel first: it drives the eligibility gate below and the normal decode.
+  // Gated-out pixels return before any composite math (no depth sample, no cubemap).
+  uint mrtW, mrtH;
+  mrtTexture0.GetDimensions(mrtW, mrtH);
+  int2 mrtPx = int2(min(v1.xy * float2(mrtW, mrtH), float2(mrtW - 1, mrtH - 1)));
+  uint4 mrtRaw = mrtTexture0.Load(int3(mrtPx, 0));
+  // PtReflection on (M4): game SSR is off. Water pixels take the path-traced reflection (w = 1); everything else, or a
+  // frame without a traced result, writes {0, 0}, like a vanilla SSR miss.
+  // Runs before the debug views so they cannot return game SSR output while the override is on.
+  if (shader_injection_data.pt_refl_override > 0.5f) {
+    o0 = float4(0, 0, 0, 0);
+    if ((((int)mrtRaw.w) & 2) != 0 && shader_injection_data.pt_refl_bound > 0.5f) {
+      const float4 ptRefl = ptReflTexture.SampleLevel(samPoint_s, v1.xy, 0);
+      if (ptRefl.a > 0.0) o0 = float4(min(ptRefl.rgb, 65472.0), 1.0);
+    }
+    return;
+  }
   // Composite debug views (water-SSR observability — the lighting-local debug
   // views never execute on forward water pixels, so the composite carries its own).
   // Writes through to the ssr2 target, hence visible on water surfaces.
@@ -130,12 +148,6 @@ void main(
     o0 = float4(ssrConfDbg, ssrConfDbg, ssrConfDbg, ssrConfDbg);
     return;
   }
-  // MRT texel first: it drives the eligibility gate below and the normal decode.
-  // Gated-out pixels return before any composite math (no depth sample, no cubemap).
-  uint mrtW, mrtH;
-  mrtTexture0.GetDimensions(mrtW, mrtH);
-  int2 mrtPx = int2(min(v1.xy * float2(mrtW, mrtH), float2(mrtW - 1, mrtH - 1)));
-  uint4 mrtRaw = mrtTexture0.Load(int3(mrtPx, 0));
   // Water-eligibility gate (verbatim game logic): only mrt0.w&2 pixels take the
   // composite path below, and only while SSR Replacement serves. Everything
   // else runs the vanilla ssr2 body — verbatim when all Vanilla SSR

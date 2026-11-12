@@ -2394,6 +2394,56 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "PtReflection",
+      .binding = &pt::g_pt_reflection_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Path-Traced Reflection",
+      .section = "Path Tracing",
+      .tooltip = "Sora 2nd: environment reflections and water use one traced reflected ray per sample. While on, dynamic cubemaps and game SSR are switched off at runtime (saved settings unchanged); forward glass and other t17 materials keep the game cube.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtReflectionSamples",
+      .binding = &pt::g_pt_reflection_samples,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 1.f,
+      .label = "Reflection Samples Per Pixel",
+      .section = "Path Tracing",
+      .tooltip = "Reflected rays per pixel each frame. More = less noise in rough reflections, more GPU time. Separate from Samples Per Pixel (GI).",
+      .min = 1.f,
+      .max = 8.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtReflectionIntensity",
+      .binding = &pt::g_pt_reflection_intensity,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Reflection Intensity",
+      .section = "Path Tracing",
+      .tooltip = "Scales the traced reflection before the game's own reflection strength and Fresnel. 1 = as traced.",
+      .min = 0.f,
+      .max = 2.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtReflectionRoughnessScale",
+      .binding = &pt::g_pt_reflection_roughness_scale,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Reflection Roughness Scale",
+      .section = "Path Tracing",
+      .tooltip = "Multiplies the game's reflection roughness for the traced ray. Below 1 = sharper reflections, above 1 = blurrier. Ray length uses Max Ray Distance.",
+      .min = 0.5f,
+      .max = 2.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtgiEnabled",
       .binding = &rtgi::g_rtgi_enabled,
       .value_type = SettingValueType::BOOLEAN,

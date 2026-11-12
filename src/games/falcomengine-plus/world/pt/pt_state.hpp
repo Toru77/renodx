@@ -22,6 +22,8 @@ inline constexpr uint32_t kPtMaterialValueStride = 16u;
 inline float g_pt_samples = 1.f, g_pt_max_bounces = 16.f, g_pt_russian_roulette = 1.f,
              g_pt_roulette_min_bounce = 1.f, g_pt_intensity = 1.f, g_pt_char_intensity = 1.f, g_pt_sky_intensity = 1.f,
              g_pt_ray_max = 500.f, g_pt_env_bias = 0.02f, g_pt_char_bias = 0.02f, g_pt_lamp_clearance = 0.2f, g_pt_sun_casters = 0.f;
+inline float g_pt_reflection_enabled = 0.f, g_pt_reflection_samples = 1.f, g_pt_reflection_intensity = 1.f,
+             g_pt_reflection_roughness_scale = 1.f;
 enum class PtReason : uint32_t { Off, DeferredContext, NeedsRtxdi, InputNotReady, DxrOff, NotCreated, NoShaderModel66,
                                  Failed, SceneMissing, Stuck, SubmitFailed, TargetFailed, Tracing, Count };
 inline const char* PtReasonName(PtReason r) {
@@ -55,6 +57,7 @@ struct PtPanel {
   uint32_t mat_capacity_log2 = 0u, mat_rate = 0u;
   uint64_t mat_clears = 0u;
   const char* mat_clear_reason = "none";
+  bool refl_on = false;
   uint32_t gpu_exact = 0u, gpu_hits = 0u, gpu_misses = 0u, gpu_lock_drops = 0u, gpu_writes = 0u;
   uint64_t gpu_frame = 0u;
   bool gpu_available = false;
@@ -109,6 +112,7 @@ inline void DrawPtPanel() {
               p.sharc_clear_reason);
   ImGui::Text("Material cache: %s  capacity 2^%u  write 1/%u px  clears %llu (last: %s)", p.mat_on ? "on" : "off",
               p.mat_capacity_log2, p.mat_rate * p.mat_rate, static_cast<unsigned long long>(p.mat_clears), p.mat_clear_reason);
+  ImGui::Text("Reflection: %s", p.refl_on ? "on" : "off");
   if (p.gpu_available) {
     const uint32_t now = static_cast<uint32_t>(falcom_world::g_state.frame.load());
     const uint32_t gpu = static_cast<uint32_t>(p.gpu_frame);

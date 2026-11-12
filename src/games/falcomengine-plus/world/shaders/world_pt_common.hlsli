@@ -34,6 +34,7 @@ RWStructuredBuffer<uint64_t> g_pt_sharc_hash : register(u1);
 RWStructuredBuffer<SharcAccumulationData> g_pt_sharc_accumulation : register(u2);
 RWStructuredBuffer<SharcPackedData> g_pt_sharc_resolved : register(u3);
 RWStructuredBuffer<uint> g_pt_counters : register(u6);  // GPU diagnostics: 0 exact G-buffer, 1 cache hit, 2 grey miss (PtHitMaterial)
+RWTexture2D<float4> g_pt_reflection : register(u7);  // traced reflection (rgb), mean hit distance (a)
 cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (40 dwords)
   uint2 g_size; uint g_frame; uint g_samples; uint g_max_bounces; uint g_roulette; uint g_roulette_min_bounce;
   uint g_lamp_count; uint g_sun_casters_only; uint g_dynamic_on; float g_ray_max; float g_env_bias; float g_char_bias;
@@ -43,7 +44,7 @@ cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (40 dwords
   float3 g_sharc_camera_prev; uint g_sharc_mode;
   uint g_mat_enabled; uint g_mat_capacity; uint g_mat_rate; float g_mat_cell_scale;
   uint g_mat_deferred_count; float g_mat_char_roughness; float g_mat_char_f0; uint g_mat_mode;
-  float g_sharc_radiance_scale; uint g_pad1; uint g_pad2; uint g_pad3;
+  float g_sharc_radiance_scale; uint g_refl_samples; float g_refl_intensity; float g_refl_roughness_scale;
 };
 uint PtHash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; return x ^ (x >> 16); }
 float PtRandom(inout uint s) { s = PtHash(s + 0x9e3779b9u); return float(s >> 8) * (1.0 / 16777216.0); }
@@ -93,6 +94,22 @@ float3 PtCosineDirection(float3 n, inout uint rng) {
   const float3 t = normalize(cross(up, n));
   const float3 bt = cross(n, t);
   return normalize(t * (sqrt(u1) * cos(6.2831853 * u2)) + bt * (sqrt(u1) * sin(6.2831853 * u2)) + n * sqrt(1.0 - u1));
+}
+// Heitz 2018 GGX visible-normal sampling, then reflection (OpenRemix brdf.glsl:159-170). wo and the result are in the
+// tangent frame (z = normal).
+float3 PtSampleGgx(float3 wo, float alpha, float2 u) {
+  const float3 v = normalize(float3(alpha * wo.xy, wo.z));
+  const float lensq = dot(v.xy, v.xy);
+  const float3 t1 = lensq > 0.0 ? float3(-v.y, v.x, 0.0) / sqrt(lensq) : float3(1.0, 0.0, 0.0);
+  const float3 t2 = cross(v, t1);
+  const float radius = sqrt(u.x);
+  const float phi = 6.2831853 * u.y;
+  const float x = radius * cos(phi);
+  const float s = 0.5 * (1.0 + v.z);
+  const float y = lerp(sqrt(max(0.0, 1.0 - x * x)), radius * sin(phi), s);
+  const float3 nh = x * t1 + y * t2 + sqrt(max(0.0, 1.0 - x * x - y * y)) * v;
+  const float3 h = normalize(float3(alpha * nh.xy, max(0.0, nh.z)));
+  return reflect(-wo, h);
 }
 // Light arriving at a bounce hit: the sun with a shadow ray and one lamp sampled uniformly. The caller multiplies by albedo.
 float3 PtHitLight(float3 position, float3 nh, inout uint rng) {

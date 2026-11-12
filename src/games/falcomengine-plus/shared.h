@@ -731,7 +731,9 @@ struct ShaderInjectData {
   float rtxdi_sun_detail_bound;      // 0/1: t46 holds matching sun reason/distance data this draw
   float pt_intensity;  // Path Tracing GI Intensity [0..2]; read only while pt_gi_bound
   float pt_char_intensity;  // Path Tracing Character GI Intensity [0..1]; read only while pt_gi_bound
-                                     // Size: 448 floats = 1792 bytes. The host declares the range as
+  float pt_refl_override;  // 0/1: Sora 2nd PtReflection is on: dynamic cubes and game SSR are off in the shaders (runtime only)
+  float pt_refl_bound;     // 0/1: t48 holds this frame's path-traced reflection (rgb, a = hit distance) for this draw
+                                     // Size: 450 floats = 1800 bytes. The host declares the range as
                                      // sizeof(ShaderInjectData) / 4 push values (CreateShadowsPipelinesIfNeeded and RunShadows);
                                      // the next added float starts a new float4, and the host range grows with sizeof automatically.
                                      // Prefer reusing a RETIRED slot.

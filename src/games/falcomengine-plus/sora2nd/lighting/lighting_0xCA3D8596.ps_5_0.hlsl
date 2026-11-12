@@ -205,6 +205,9 @@ Texture2D<float4> csLocalContactTex : register(t40);
 Texture2D<float4> rtgiTexture : register(t37);
 // t47 is the path-traced diffuse GI (rgba16f, depth size; world/pt): rgb irradiance, a = valid. Bound while pt_gi_bound.
 Texture2D<float4> ptGiTexture : register(t47);
+// t48 is the path-traced reflection (rgba16f, depth size; world/pt M4): rgb reflection, a = hit distance (0 = none).
+// Bound while pt_refl_bound.
+Texture2D<float4> ptReflTexture : register(t48);
 // t38 is the RT Local Shadows term (world/rtls; depth size): x point shadow, y spot shadow, z RT coverage (1 inside Fade
 // Start). Bound by RunRtlsInline while rtls_flags has RTLS_FLAG_BOUND. Flag bits mirror rtls::kRtlsFlag*.
 Texture2D<float4> rtlsTexture : register(t38);
@@ -1164,17 +1167,18 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r5.y = r20.y ? r5.y : 0;
   r11.xyz = r5.yyy * r11.xyz;
   r11.xyz = lightColor_g.xyz * r11.xyz;
+  const bool dynCubeOn = shader_injection_data.dynCube_enabled > 0.5f && shader_injection_data.pt_refl_override < 0.5f;
   // SSR -> Dynamic -> Vanilla reflection source resolution.
-  bool dynCubeNewSSRActive = shader_injection_data.dynCube_enabled > 0.5f
+  bool dynCubeNewSSRActive = dynCubeOn
       && shader_injection_data.dynCube_force_vanilla < 0.5f
       && shader_injection_data.dynCube_ssr_enabled > 0.5f;
-  bool dynCubeForceDynamicActive = shader_injection_data.dynCube_enabled > 0.5f
+  bool dynCubeForceDynamicActive = dynCubeOn
       && shader_injection_data.dynCube_force_vanilla < 0.5f
       && shader_injection_data.dynCube_force_dynamic > 0.5f;
-  bool dynCubeForceSSRActive = shader_injection_data.dynCube_enabled > 0.5f
+  bool dynCubeForceSSRActive = dynCubeOn
       && shader_injection_data.dynCube_force_vanilla < 0.5f
       && shader_injection_data.dynCube_force_ssr > 0.5f;
-  bool dynCubeReflResolveActive = shader_injection_data.dynCube_enabled > 0.5f
+  bool dynCubeReflResolveActive = dynCubeOn
     && shader_injection_data.dynCube_force_vanilla < 0.5f;
   float3 dynCubeReflDir = float3(0, 0, 0);
    float dynCubeVanillaMipFactor = 0.0;
@@ -1211,7 +1215,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     if (!dynCubeReflResolveActive) {
       // ── Existing vanilla/custom SSR eligibility + blend (kept when no new SSR/force path) ──
       r8.z = (int)r1.z & 2;
-      bool ssrVanillaElig = (r8.z != 0);
+      bool ssrVanillaElig = (r8.z != 0) && shader_injection_data.pt_refl_override < 0.5f;
       if (ssrVanillaElig) {
         r20.xz = resolutionScaling_g.xy * v1.zw;
         r22.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r20.xz, 0).xyzw;
@@ -1237,6 +1241,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             dynCubeResolvedA, dynCubeReflSrc, dynCubeUnusedVanillaWA);
         r21.xyz = dynCubeResolvedA;
       }
+    }
+    if (shader_injection_data.pt_refl_bound > 0.5f && r6.w == 0) {
+      const float4 ptRefl = ptReflTexture.SampleLevel(samPoint_s, v1.xy, 0);
+      if (ptRefl.a > 0.0) r21.xyz = ptRefl.rgb;
     }
     r8.z = cmp(0 < r2.x);
     r9.y = 1 + -abs(r3.y);
@@ -1303,7 +1311,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       if (!dynCubeReflResolveActive) {
         // ── Existing vanilla/custom SSR eligibility + blend (site 2, kept when no new SSR/force path) ──
         r5.y = (int)r1.z & 2;
-        bool ssrVanillaElig2 = (r5.y != 0);
+        bool ssrVanillaElig2 = (r5.y != 0) && shader_injection_data.pt_refl_override < 0.5f;
         if (ssrVanillaElig2) {
           r5.yz = resolutionScaling_g.xy * v1.zw;
           r23.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r5.yz, 0).xyzw;
@@ -1329,12 +1337,16 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r21.xyz = dynCubeResolvedB;
         }
       }
+      if (shader_injection_data.pt_refl_bound > 0.5f) {
+        const float4 ptRefl = ptReflTexture.SampleLevel(samPoint_s, v1.xy, 0);
+        if (ptRefl.a > 0.0) r21.xyz = ptRefl.rgb;
+      }
       // Transmission/refraction tap (game-original): r19 is the refracted direction,
       // not the reflection vector, so it keeps the vanilla cubemap source with the
       // game's roughness LOD rescaled onto the vanilla mip chain. Never the dynamic
       // cube, never parallax-corrected, never dynCube_blur. When DynCube is off,
       // t17 is already vanilla, so the original sample is kept as-is.
-      if (shader_injection_data.dynCube_enabled > 0.5f) {
+      if (shader_injection_data.dynCube_enabled > 0.5f && shader_injection_data.pt_refl_override < 0.5f) {
         uint vanW, vanH, vanL;
         dynCubeVanillaTex.GetDimensions(0, vanW, vanH, vanL);
         float transMip = (vanL > 1u && num_levels > 1u)

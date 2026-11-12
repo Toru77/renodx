@@ -90,6 +90,11 @@ inline std::string SerializePtReport() {
   out << "material capacity log2 setting: " << g_pt_material_capacity_log2 << "\n";
   out << "char roughness: " << g_pt_char_roughness << "\n";
   out << "char f0: " << g_pt_char_f0 << "\n";
+  out << "reflection enabled: " << g_pt_reflection_enabled << "\n";
+  out << "reflection on: " << (p.refl_on ? "true" : "false") << "\n";
+  out << "reflection samples: " << g_pt_reflection_samples << "\n";
+  out << "reflection intensity: " << g_pt_reflection_intensity << "\n";
+  out << "reflection roughness scale: " << g_pt_reflection_roughness_scale << "\n";
   out << "debug logging: " << PtDiagnosticCaptureEnabled() << "\n";
   std::vector<PtEvent> events;
   uint64_t overwritten = 0u;

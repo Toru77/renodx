@@ -53,7 +53,7 @@
 
 namespace {
 
-static_assert(sizeof(ShaderInjectData) == 1792u);
+static_assert(sizeof(ShaderInjectData) == 1800u);
 static_assert(alignof(ShaderInjectData) == alignof(float));
 static_assert(offsetof(ShaderInjectData, cs_contact_local_light_clearance) == 80u);
 
@@ -517,6 +517,9 @@ constexpr uint32_t kLightingRtlsRegister = 38u;     // t38 = rtlsTexture (RT Loc
 constexpr uint32_t kLightingRtSunRegister = 39u;    // t39 = rtsunTexture (RT Sun Shadows term, world/rtsun)
 constexpr uint32_t kLightingPtRegister = 47u;  // t47 = ptGiTexture (world/pt path-traced GI)
 constexpr uint32_t kLightingDepthRegister = 4u;     // t4 = depthTexture (Sora)
+constexpr uint32_t kLightingPtReflectionRegister = 48u;  // t48 = ptReflTexture (lighting and ssr2, world/pt M4)
+static reshade::api::resource_view g_pt_reflection_view = {};
+static uint32_t g_pt_reflection_frame = UINT32_MAX;
 constexpr uint32_t kLightingDepthRegisterKai = 3u;  // t3 = depthTexture (Kai)
 constexpr uint32_t kLightingSsaoRegister = 5u;      // t5 = ssaoTexture (Sora)
 constexpr uint32_t kLightingSsaoRegisterKai = 4u;   // t4 = ssaoTexture (Kai)
@@ -841,6 +844,11 @@ static bool IsSora2nd() {
     checked = true;
   }
   return is_sora2nd;
+}
+
+// M4: while PtReflection is on (Sora 2nd, path tracer on), dynamic cubemaps and game SSR are off at runtime. Saved settings unchanged.
+static bool PtReflectionOverride() {
+  return IsSora2nd() && falcom_world::pt::PtRequested() && falcom_world::pt::g_pt_reflection_enabled > 0.5f;
 }
 
 // -- Sora 1st detection --
@@ -8030,6 +8038,7 @@ static void OnPushDescriptorsCapture(
         && IsDynCubeT17Game()
         && shader_injection.dynCube_force_vanilla < 0.5f
         && (int)shader_injection.dynCube_debug != 4
+        && !PtReflectionOverride()
         && (static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) {
       static bool s_dynCubeT17SwapGuard = false;
       int swapDbg = (int)shader_injection.dynCube_debug;
@@ -9020,6 +9029,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
 // resolver. Otherwise vanilla passes run.
 static bool SoraSSRReplaceActive(reshade::api::command_list* cmd_list) {
   if (!cmd_list) return false;
+  if (PtReflectionOverride()) return false;
   if (shader_injection.dynCube_ssr_replacement < 0.5f) return false;
   if (shader_injection.dynCube_enabled < 0.5f
       || shader_injection.dynCube_force_vanilla > 0.5f
@@ -9040,6 +9050,7 @@ static bool SoraSSRReplaceActive(reshade::api::command_list* cmd_list) {
 // is off (nothing consumes the march output then; the composite resolves
 // dynamic/vanilla only). No pushes needed: vanilla uses only game bindings.
 static bool OnBeforeSoraSSR1Draw(reshade::api::command_list* cmd_list) {
+  if (PtReflectionOverride()) return false;  // PT reflection: game SSR is off, the march has no consumer
   if (shader_injection.dynCube_ssr_replacement > 0.5f
       && shader_injection.dynCube_game_ssr < 0.5f) return false;
   return true;
@@ -9062,6 +9073,7 @@ static bool OnReplaceSoraSSR1Draw(reshade::api::command_list* cmd_list) {
 // (The replacement chain serves via SoraSSRReplaceActive separately.)
 static bool SoraSSRVanillaActive(reshade::api::command_list* cmd_list) {
   if (!cmd_list) return false;
+  if (PtReflectionOverride()) return false;
   if (shader_injection.dynCube_ssr_replacement > 0.5f) return false;
   if (shader_injection.dynCube_enabled < 0.5f
       || shader_injection.dynCube_force_vanilla > 0.5f
@@ -9083,34 +9095,37 @@ static bool SoraSSRVanillaActive(reshade::api::command_list* cmd_list) {
 // Pushes when the composite serves or vanilla improvements are active;
 // otherwise vanilla draws untouched.
 static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list) {
-  if (!SoraSSRReplaceActive(cmd_list) && !SoraSSRVanillaActive(cmd_list)) return true;
+  const bool pt_refl = PtReflectionOverride();
+  if (!pt_refl && !SoraSSRReplaceActive(cmd_list) && !SoraSSRVanillaActive(cmd_list)) return true;
   auto* dev = cmd_list->get_device();
   if (!dev) return true;
   auto* dd = dev->get_private_data<DeviceData>();
   if (!dd) return true;
-  reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
-                                           ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
-                                           : dd->dyncube_srv;
-  if (t17srv.handle) {
+  if (!pt_refl) {
+    reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
+                                             ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
+                                             : dd->dyncube_srv;
+    if (t17srv.handle) {
+      cmd_list->push_descriptors(
+          reshade::api::shader_stage::pixel,
+          reshade::api::pipeline_layout{0}, 0,
+          reshade::api::descriptor_table_update{
+              {}, kDynCubeRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
+    }
+    if (dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv.handle) {
+      auto histPosSrv = dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv;
+      cmd_list->push_descriptors(
+          reshade::api::shader_stage::pixel,
+          reshade::api::pipeline_layout{0}, 0,
+          reshade::api::descriptor_table_update{
+              {}, kDynCubeHistPosRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &histPosSrv});
+    }
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel,
         reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
-            {}, kDynCubeRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
+            {}, kDynCubeVanillaRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->captured_vanilla_env_srv});
   }
-  if (dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv.handle) {
-    auto histPosSrv = dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv;
-    cmd_list->push_descriptors(
-        reshade::api::shader_stage::pixel,
-        reshade::api::pipeline_layout{0}, 0,
-        reshade::api::descriptor_table_update{
-            {}, kDynCubeHistPosRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &histPosSrv});
-  }
-  cmd_list->push_descriptors(
-      reshade::api::shader_stage::pixel,
-      reshade::api::pipeline_layout{0}, 0,
-      reshade::api::descriptor_table_update{
-          {}, kDynCubeVanillaRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &dd->captured_vanilla_env_srv});
   // t4 mrt normals: prefer the march's own t2 capture (same resource the vanilla
   // march decodes, so gate bits and resolution match by construction); fall back
   // to the lighting capture. First-live-wins: dead views keep game bindings.
@@ -9127,10 +9142,21 @@ static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list) {
         reshade::api::descriptor_table_update{
             {}, 4u, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &mrtSrv});
   }
+  if (pt_refl) {
+    const bool fresh = g_pt_reflection_view.handle != 0u && g_pt_reflection_frame == falcom_world::g_state.frame.load();
+    const reshade::api::resource_view refl_view = fresh ? g_pt_reflection_view : reshade::api::resource_view{};
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::pixel,
+        reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{
+            {}, kLightingPtReflectionRegister, 0u, 1u, reshade::api::descriptor_type::texture_shader_resource_view, &refl_view});
+    shader_injection.pt_refl_override = 1.f;
+    shader_injection.pt_refl_bound = fresh ? 1.f : 0.f;
+  }
   // Vanilla-ISFAST frame slice (exact frame_index % 64 mirror of the custom
   // march; -1 = noise unusable -> the shader falls back to hash behavior).
   // IS-FAST noise volume (t5) only when usable; the shader gates sampling on it.
-  {
+  if (!pt_refl) {
     const bool noiseUsable = g_isfast_enabled > 0.5f && dd->isfast_noise_srv.handle;
     shader_injection.dynCube_vanilla_isfast_frame = noiseUsable ? (float)(dd->frame_index % 64u) : -1.f;
     if (noiseUsable && shader_injection.dynCube_vanilla_isfast > 0.5f) {
@@ -9148,7 +9174,7 @@ static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list) {
 // Serves the tree file for the replacement composite and for vanilla temporal
 // improvements alike; the file selects its path in-shader.
 static bool OnReplaceSoraSSR2Draw(reshade::api::command_list* cmd_list) {
-  return SoraSSRReplaceActive(cmd_list) || SoraSSRVanillaActive(cmd_list);
+  return PtReflectionOverride() || SoraSSRReplaceActive(cmd_list) || SoraSSRVanillaActive(cmd_list);
 }
 
 // -- Sora1st SSR Replacement (fused march + temporal composite) --
@@ -13153,10 +13179,16 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   namespace rt12 = falcom_world::rt12;
   namespace di = falcom_world::rtxdi;
   shader_injection.pt_gi_bound = 0.f;
+  shader_injection.pt_refl_bound = 0.f;
+  shader_injection.pt_refl_override = PtReflectionOverride() ? 1.f : 0.f;
+  g_pt_reflection_view = {};
   if (!IsSora2nd() || !cmd_list) return;
   const reshade::api::resource_view empty_view = {};
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, kLightingPtRegister, 0u, 1u,
+                                                                   reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+  cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                             reshade::api::descriptor_table_update{{}, kLightingPtReflectionRegister, 0u, 1u,
                                                                    reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
   if (!pt::PtRequested()) { pt::SetPtReason(pt::PtReason::Off); return; }
   if ((di::SceneRequestMask() & 1u) == 0u) { pt::SetPtReason(pt::PtReason::NeedsRtxdi); return; }
@@ -13174,7 +13206,8 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   }
   const bool lamps = di_snapshot.status == di::DiStatus::Submitted && di_snapshot.frame == frame
                      && di_snapshot.transfer_slot == input.transfer_slot;
-  const reshade::api::resource_view view = rt12::RunPtTrace(cmd_list->get_device(), cmd_list, input.transfer_slot, lamps);
+  reshade::api::resource_view reflection_view = {};
+  const reshade::api::resource_view view = rt12::RunPtTrace(cmd_list->get_device(), cmd_list, input.transfer_slot, lamps, &reflection_view);
   if (view.handle == 0u) return;
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, kLightingPtRegister, 0u, 1u,
@@ -13182,6 +13215,14 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   shader_injection.pt_gi_bound = 1.f;
   shader_injection.pt_intensity = di::FiniteClamped(pt::g_pt_intensity, 1.f, 0.f, 2.f);
   shader_injection.pt_char_intensity = di::FiniteClamped(pt::g_pt_char_intensity, 1.f, 0.f, 1.f);
+  if (reflection_view.handle != 0u) {
+    cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                               reshade::api::descriptor_table_update{{}, kLightingPtReflectionRegister, 0u, 1u,
+                                                                     reshade::api::descriptor_type::texture_shader_resource_view, &reflection_view});
+    shader_injection.pt_refl_bound = 1.f;
+    g_pt_reflection_view = reflection_view;
+    g_pt_reflection_frame = frame;
+  }
 }
 
 static void RunRrGuidesInline(reshade::api::command_list* cmd_list) {
@@ -13396,7 +13437,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   DeployShadows(cmd_list, 1);
 
   // Dynamic Cubemaps � standalone, must run even when GTVBAO/SSR off (any Falcom title)
-  const bool dyncube_active = shader_injection.dynCube_enabled > 0.5f;
+  const bool dyncube_active = shader_injection.dynCube_enabled > 0.5f && !PtReflectionOverride();
   const bool gtvbao_active = shader_injection.gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested();
   const bool vbgi_active = VbgiRunning();
   // RTAO on: GTVBAO's t23 block is skipped (and the early-out below may return), so its flags are cleared here.

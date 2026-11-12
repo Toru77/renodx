@@ -4,7 +4,7 @@
 void main(uint3 id : SV_DispatchThreadID) {
   if (any(id.xy >= g_size)) return;
   RtxdiSurfaceResult surface;
-  if (!PtLoadSurface(id.xy, surface)) { g_pt_output[id.xy] = 0; return; }
+  if (!PtLoadSurface(id.xy, surface)) { g_pt_output[id.xy] = 0; if (g_refl_samples != 0u) g_pt_reflection[id.xy] = 0; return; }
   g_rt12_dynamic_mask = g_dynamic_on != 0u ? RT12_MASK_DYNAMIC : 0u;
   WorldTraceCounters pt_counters;  // required out argument of TraceWorldRayDxr; discarded
   const WorldCameraView bounce_view = {true, 1.0, 0u, 0u};
@@ -46,4 +46,41 @@ void main(uint3 id : SV_DispatchThreadID) {
   float3 A = L / float(g_samples);
   if (any(isnan(A)) || any(isinf(A))) A = float3(0, 0, 0);
   g_pt_output[id.xy] = float4(max(A, 0), 1);
+  if (g_refl_samples != 0u) {
+    float4 refl = float4(0, 0, 0, 0);
+    if ((surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) == 0u) {
+      // Roughness as the lighting shader's reflection mip: deferred roughness x mrt1.y / 255 (lighting :1184-1185).
+      const float rough = saturate(PtGBufferMaterial(id.xy).roughness * ((g_pt_mrt1.Load(int3(id.xy, 0)).y & 255u) * (1.0 / 255.0)) * g_refl_roughness_scale);
+      const float alpha = max(rough * rough, 1e-4);
+      const float3 n = surface.shading_normal;
+      const float3 v = surface.view_direction;
+      const float3 up = abs(n.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+      const float3 t = normalize(cross(up, n));
+      const float3 bt = cross(n, t);
+      const float3 wo = float3(dot(v, t), dot(v, bt), max(dot(v, n), 1e-4));
+      uint refl_rng = PtHash(id.x + id.y * g_size.x + PtHash(g_frame ^ 0x5245464Cu));
+      float3 sum = float3(0, 0, 0);
+      float distance = 0.0;
+      for (uint sample = 0u; sample < g_refl_samples; ++sample) {
+        const float3 l =PtSampleGgx(wo, alpha, float2(PtRandom(refl_rng), PtRandom(refl_rng)));
+        float3 dir = normalize(t * l.x + bt * l.y + n * l.z);
+        if (dot(dir, n) <= 0.0) dir = reflect(-v, n);
+        const WorldTraceHit hit = TraceWorldRayDxr(surface.world_position + n * g_env_bias, dir, 1e-3, g_ray_max, false, bounce_view, pt_counters);
+        if (hit.prim == 0xFFFFFFFFu) { sum += PtSky(dir); distance += g_ray_max; continue; }
+        const float3 nh = dot(hit.normal, dir) > 0.0 ? -hit.normal : hit.normal;
+        const float3 albedo = PtHitMaterial(hit.position, nh).albedo;
+        float3 cached;
+        if (g_sharc_enabled != 0u && SharcGetCachedRadiance(sharc, PtSharcHit(hit.position, nh, dir, albedo), cached, false) && all(isfinite(cached))) {
+          sum += max(cached, 0);
+        } else {
+          sum += albedo * PtHitLight(hit.position, nh, refl_rng);
+        }
+        distance += hit.t;
+      }
+      sum /= float(g_refl_samples);
+      if (any(isnan(sum)) || any(isinf(sum))) sum = float3(0, 0, 0);
+      refl = float4(max(sum, 0) * g_refl_intensity, max(distance / float(g_refl_samples), 1e-3));
+    }
+    g_pt_reflection[id.xy] = refl;
+  }
 }

@@ -381,7 +381,7 @@ struct Rt12DiTransferState {
 };
 
 // Path-traced diffuse GI (world/pt): its own submission slots, list, root signature, PSO, descriptors and outputs.
-inline constexpr uint32_t kRt12PtDescriptors = 25u;
+inline constexpr uint32_t kRt12PtDescriptors = 26u;
 inline constexpr uint32_t kRt12PtConstants = 40u;
 inline constexpr uint32_t kRt12PtCounters = 5u;  // GPU material-cache counters (uint32 each), world_pt_common.hlsli g_pt_counters
 struct Rt12PtState {
@@ -393,6 +393,7 @@ struct Rt12PtState {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;  // shader visible, kRt12Slots * kRt12PtDescriptors
   Rt12Shared output[kRt12Slots];                      // RGBA16F, depth size; the lighting draw reads srv11 at t47
+  Rt12Shared reflection[kRt12Slots];                  // RGBA16F, depth size: traced reflection, a = hit distance; t48 in lighting and ssr2
   // SHARC (M2): update and resolve PSOs (the trace PSO's root signature), the three cache buffers (DEFAULT, rest state COMMON)
   // and the clear-trigger state (OpenRemix sharc.cpp:368-475).
   Microsoft::WRL::ComPtr<ID3D12PipelineState> sharc_update_pso, sharc_resolve_pso;
@@ -1098,6 +1099,10 @@ inline void TeardownRt12(const char* why) {
     if (shared->uav11.handle != 0u) s.device->destroy_resource_view(shared->uav11);
   }
   for (Rt12Shared& shared : s.path_trace.output) {
+    if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
+    if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
+  }
+  for (Rt12Shared& shared : s.path_trace.reflection) {
     if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
     if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
   }

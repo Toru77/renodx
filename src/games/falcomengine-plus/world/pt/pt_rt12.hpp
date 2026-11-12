@@ -15,7 +15,8 @@
 #include "pt_diagnostics.hpp"
 namespace falcom_world::rt12 {
 inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, reshade::api::command_list* cmd_list,
-                                              int32_t transfer_slot, bool lamps) {
+                                              int32_t transfer_slot, bool lamps, reshade::api::resource_view* reflection_view) {
+  *reflection_view = reshade::api::resource_view{0u};
   using Microsoft::WRL::ComPtr;
   const auto fallback = [](pt::PtReason reason) { pt::SetPtReason(reason); return reshade::api::resource_view{0u}; };
   // 1. Gates.
@@ -81,8 +82,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (FAILED(hr)) return fail("pt list", hr);
     hr = r.list->Close();
     if (FAILED(hr)) return fail("pt close", hr);
-    // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u6, descriptor order 0..24.
-    const UINT counts[8] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 3u};
+    // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u7, descriptor order 0..25.
+    const UINT counts[8] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 4u};
     const UINT bases[8] = {0u, 14u, 29u, 30u, 31u, 0u, 36u, 4u};
     const UINT offsets[8] = {0u, 4u, 7u, 8u, 9u, 14u, 18u, 22u};
     D3D12_DESCRIPTOR_RANGE ranges[8] = {};
@@ -203,6 +204,15 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     RetireShared(s, out, s.last_signal);
     if (FAILED(CreateRt12Shared(s, device, DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, 1u, true, &out))) {
       RetireShared(s, out, s.last_signal);
+      return fallback(pt::PtReason::TargetFailed);
+    }
+  }
+  const bool refl_on = pt::g_pt_reflection_enabled > 0.5f && input.color.texture12 && input.mrt1.texture12 && input.mrt2.texture12;
+  Rt12Shared& refl = r.reflection[k];
+  if (refl_on && (!refl.texture11 || refl.width != w || refl.height != h)) {
+    RetireShared(s, refl, s.last_signal);
+    if (FAILED(CreateRt12Shared(s, device, DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, 1u, true, &refl))) {
+      RetireShared(s, refl, s.last_signal);
       return fallback(pt::PtReason::TargetFailed);
     }
   }
@@ -375,7 +385,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     }
   }
   r.sharc_material_on = mat_on;
-  ID3D12Resource* deferred = mat_on && input.deferred_count != 0u ? input.deferred_buffer.Get() : nullptr;
+  const bool gbuf_on = mat_on || refl_on;  // the G-buffer material inputs (t36-t39) serve the material cache and the reflection
+  ID3D12Resource* deferred = gbuf_on && input.deferred_count != 0u ? input.deferred_buffer.Get() : nullptr;
   float sharc_prev[3];
   std::copy_n(r.sharc_clear ? camera : r.sharc_prev_camera, 3, sharc_prev);  // sharc.cpp:473
   std::copy_n(camera, 3, r.sharc_prev_camera);
@@ -431,6 +442,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_srv(13u, light_types, Rt12BufferSrv(4u, RTXDI_INPUT_MAX_LIGHTS));
   const D3D12_UNORDERED_ACCESS_VIEW_DESC out_uav = Rt12TextureUav(DXGI_FORMAT_R16G16B16A16_FLOAT);
   device12->CreateUnorderedAccessView(out.texture12.Get(), nullptr, &out_uav, cpu_at(base + 14u));
+  device12->CreateUnorderedAccessView(refl_on ? refl.texture12.Get() : nullptr, nullptr, &out_uav, cpu_at(base + 25u));
   const auto set_buffer_uav = [&](uint32_t index, ID3D12Resource* resource, uint32_t stride) {
     D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
     view.Format = DXGI_FORMAT_UNKNOWN;
@@ -444,9 +456,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_buffer_uav(17u, sharc_on ? r.sharc_resolved.Get() : nullptr, pt::kPtSharcResolvedStride);
   ID3D12Resource* const sharc_buffers[] = {sharc_on ? r.sharc_hash.Get() : nullptr, sharc_on ? r.sharc_accumulation.Get() : nullptr,
                                            sharc_on ? r.sharc_resolved.Get() : nullptr};
-  set_srv(18u, mat_on ? input.color.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_FLOAT));
-  set_srv(19u, mat_on ? input.mrt1.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
-  set_srv(20u, mat_on ? input.mrt2.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
+  set_srv(18u, gbuf_on ? input.color.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_FLOAT));
+  set_srv(19u, gbuf_on ? input.mrt1.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
+  set_srv(20u, gbuf_on ? input.mrt2.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
   set_srv(21u, deferred, Rt12BufferSrv(RTXDI_INPUT_DEFERRED_STRIDE, deferred ? input.deferred_count : 1u));
   const auto set_material_uav = [&](uint32_t index, ID3D12Resource* resource, uint32_t stride, uint32_t count) {
     D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
@@ -460,8 +472,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_material_uav(23u, mat_on ? r.material_values.Get() : nullptr, 4u, mat_on ? r.material_capacity * 4u : 1u);
   set_material_uav(24u, r.counters[k].Get(), 4u, kRt12PtCounters);
   ID3D12Resource* const material_buffers[] = {mat_on ? r.material_keys.Get() : nullptr, mat_on ? r.material_values.Get() : nullptr};
-  ID3D12Resource* const material_reads[] = {mat_on ? input.color.texture12.Get() : nullptr, mat_on ? input.mrt1.texture12.Get() : nullptr,
-                                            mat_on ? input.mrt2.texture12.Get() : nullptr, deferred};
+  ID3D12Resource* const material_reads[] = {gbuf_on ? input.color.texture12.Get() : nullptr, gbuf_on ? input.mrt1.texture12.Get() : nullptr,
+                                            gbuf_on ? input.mrt2.texture12.Get() : nullptr, deferred};
   D3D12_GPU_DESCRIPTOR_HANDLE table = r.heap->GetGPUDescriptorHandleForHeapStart();
   table.ptr += static_cast<UINT64>(base) * s.descriptor_size;
   ID3D12Resource* const reads[] = {vertices, indices, mesh_table, scene.instance_table.Get(), uv_arena, s.atlas.texture12.Get(),
@@ -473,6 +485,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }
   Transition(barriers, out.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (refl_on) Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   for (ID3D12Resource* resource : sharc_buffers) {
     if (resource) {
       Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -514,7 +527,10 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       deferred ? input.deferred_count : 0u,
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_char_roughness, 0.5f, 0.05f, 1.f)),
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_char_f0, 0.04f, 0.f, 0.2f)),
-      0u, sharc_radiance_wanted, 0u, 0u, 0u};
+      0u, sharc_radiance_wanted,
+      refl_on ? std::clamp(static_cast<uint32_t>(pt::g_pt_reflection_samples), 1u, 8u) : 0u,
+      std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_intensity, 1.f, 0.f, 2.f)),
+      std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_roughness_scale, 1.f, 0.5f, 2.f))};
   ID3D12DescriptorHeap* heaps[] = {r.heap.Get()};
   list->SetDescriptorHeaps(1u, heaps);
   list->SetComputeRootSignature(r.root.Get());
@@ -576,6 +592,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
   barriers.clear();
   Transition(barriers, out.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+  if (refl_on) Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
   for (ID3D12Resource* resource : sharc_buffers) {
     if (resource) {
       Transition(barriers, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -666,7 +683,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     pt::g_pt_panel.mat_on = mat_on;
     pt::g_pt_panel.mat_capacity_log2 = mat_on ? static_cast<uint32_t>(std::countr_zero(r.material_capacity)) : 0u;
     pt::g_pt_panel.mat_rate = mat_on ? mat_rate : 0u;
+    pt::g_pt_panel.refl_on = refl_on;
   }
+  *reflection_view = refl_on ? refl.srv11 : reshade::api::resource_view{0u};
   return out.srv11;
 }
 }  // namespace falcom_world::rt12
