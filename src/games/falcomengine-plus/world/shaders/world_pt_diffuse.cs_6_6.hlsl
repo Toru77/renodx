@@ -56,7 +56,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (water_pass || (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) == 0u) {
       // Roughness as the lighting shader's reflection mip: deferred roughness x mrt1.y / 255 (lighting :1184-1185).
       const bool water_origin = water_pass || ((g_refl_flags & 8u) != 0u && (g_pt_normal.Load(int3(id.xy, 0)).w & 2u) != 0u);
-      const float rough = water_origin ? 0.0 : saturate(PtGBufferMaterial(id.xy).roughness * ((g_pt_mrt1.Load(int3(id.xy, 0)).y & 255u) * (1.0 / 255.0)) * g_refl_roughness_scale);
+      const float rough = water_origin ? saturate(g_water_roughness * g_refl_roughness_scale) : saturate(PtGBufferMaterial(id.xy).roughness * ((g_pt_mrt1.Load(int3(id.xy, 0)).y & 255u) * (1.0 / 255.0)) * g_refl_roughness_scale);
       const float alpha = max(rough * rough, 1e-4);
       const float3 n = surface.shading_normal;
       const float3 v = surface.view_direction;

@@ -474,6 +474,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     view.Buffer.StructureByteStride = stride;
     device12->CreateUnorderedAccessView(resource, nullptr, &view, cpu_at(base + index));
     r.water_frame_inputs.uav_descs[index] = view;
+    r.water_frame_inputs.resources[index] = resource;
   };
   set_buffer_uav(15u, sharc_on ? r.sharc_hash.Get() : nullptr, 8u);
   set_buffer_uav(16u, sharc_on ? r.sharc_accumulation.Get() : nullptr, pt::kPtSharcAccumulationStride);
@@ -492,6 +493,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     view.Buffer.StructureByteStride = stride;
     device12->CreateUnorderedAccessView(resource, nullptr, &view, cpu_at(base + index));
     r.water_frame_inputs.uav_descs[index] = view;
+    r.water_frame_inputs.resources[index] = resource;
   };
   set_material_uav(22u, mat_on ? r.material_keys.Get() : nullptr, 8u, mat_on ? r.material_capacity : 1u);
   set_material_uav(23u, mat_on ? r.material_values.Get() : nullptr, 4u, mat_on ? r.material_capacity * 4u : 1u);
@@ -558,7 +560,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_roughness_scale, 1.f, 0.f, 2.f)),
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_sample_clamp, 16.f, 1.f, 1000.f)),
       (pt::g_pt_reflection_cap_to_one > 0.5f ? 1u : 0u) | (pt::g_pt_reflection_use_sharc > 0.5f ? 2u : 0u) |
-          (pt::g_pt_reflection_footprint > 0.5f ? 4u : 0u) | (pt::g_pt_reflection_water_rule > 0.5f ? 8u : 0u)};
+          (pt::g_pt_reflection_footprint > 0.5f ? 4u : 0u) | (pt::g_pt_reflection_water_rule > 0.5f ? 8u : 0u),
+      std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_water_roughness, 0.05f, 0.f, 1.f)),
+      0u};  // [42] water roughness, [43] padding to 16 bytes (zero)
   ID3D12DescriptorHeap* heaps[] = {r.heap.Get()};
   list->SetDescriptorHeaps(1u, heaps);
   list->SetComputeRootSignature(r.root.Get());
@@ -699,8 +703,6 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   RecordRt12WaitB(s, b, GpuEvidenceSource::Pt);
   if (water_on) {  // publish the water block's inputs for RunPtWaterTrace of this frame
     std::copy_n(params, kRt12PtConstants, r.water_params);
-    r.water_params[15] = 0u;  // water dispatch: no SHARC cache writes
-    r.water_params[28] = 0u;  // water dispatch: no material cache writes
     r.water_main_slot = k;
     r.water_input_slot = transfer_slot;
     r.water_scene_slot = s.scene_slot;
@@ -902,7 +904,9 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
     handle.ptr += static_cast<SIZE_T>(index) * s.descriptor_size;
     return handle;
   };
-  // Water block (R3): every descriptor is written here, after this slot's fence. Null: 14-17 and 22-23.
+  // Water block (R3): every descriptor is written here, after this slot's fence. Null: 14 and 16 (main output and SHARC
+  // accumulation, written only by the main trace). 15, 17, 22 and 23 are the cache reads (SHARC hash and resolved, material
+  // keys and values); the water dispatch does not write them, since the material write and SHARC update passes never run here.
   for (uint32_t i = 0u; i < kRt12PtDescriptors; ++i) {
     const D3D12_CPU_DESCRIPTOR_HANDLE handle = cpu_at(base + i);
     const bool uav_index = (i >= 14u && i <= 17u) || i >= 22u;
@@ -920,6 +924,7 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
       device12->CreateShaderResourceView(resource, &view, handle);
     } else {
       ID3D12Resource* resource = nullptr;
+      if (i == 15u || i == 17u || i == 22u || i == 23u) resource = in.resources[i].Get();
       if (i == 24u) resource = r.water_counters[k].Get();
       if (i == 25u) resource = refl.texture12.Get();
       device12->CreateUnorderedAccessView(resource, nullptr, &in.uav_descs[i], handle);
@@ -935,6 +940,11 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
                                          in.resources[19].Get(), in.resources[20].Get(), in.resources[21].Get()};
   for (ID3D12Resource* resource : water_reads) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  }
+  // Cache reads are UAV-typed descriptors, so they are in UAV state, as in the main trace.
+  ID3D12Resource* const water_cache[] = {in.resources[15].Get(), in.resources[17].Get(), in.resources[22].Get(), in.resources[23].Get()};
+  for (ID3D12Resource* resource : water_cache) {
+    if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   }
   Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   Transition(barriers, r.water_counters[k].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -956,6 +966,9 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
   barriers.clear();
   Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+  for (ID3D12Resource* resource : water_cache) {
+    if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+  }
   Transition(barriers, r.water_counters[k].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
   const bool counters_copied = !r.water_counter_pending[k];

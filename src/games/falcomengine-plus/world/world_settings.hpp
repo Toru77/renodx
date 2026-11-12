@@ -2515,6 +2515,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "PtReflectionWaterRoughness",
+      .binding = &pt::g_pt_reflection_water_roughness,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.05f,
+      .label = "Water roughness",
+      .section = "Path Tracing",
+      .tooltip = "Base roughness of water reflections (0 = mirror). Reflection Roughness Scale still multiplies it.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtgiEnabled",
       .binding = &rtgi::g_rtgi_enabled,
       .value_type = SettingValueType::BOOLEAN,

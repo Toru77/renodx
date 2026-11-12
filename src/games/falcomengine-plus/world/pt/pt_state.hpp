@@ -29,6 +29,7 @@ inline float g_pt_reflection_cap_to_one = 0.f;
 inline float g_pt_reflection_use_sharc = 1.f, g_pt_reflection_footprint = 1.f;
 inline float g_pt_reflection_water_rule = 0.f;
 inline float g_pt_reflection_water_surface = 0.f;
+inline float g_pt_reflection_water_roughness = 0.05f;
 enum class PtReason : uint32_t { Off, DeferredContext, NeedsRtxdi, InputNotReady, DxrOff, NotCreated, NoShaderModel66,
                                  Failed, SceneMissing, Stuck, SubmitFailed, TargetFailed, Tracing, Count };
 inline const char* PtReasonName(PtReason r) {
@@ -123,6 +124,7 @@ inline void DrawPtPanel() {
   ImGui::Text("Reflection: %s", p.refl_on ? "on" : "off");
   ImGui::Text("Water surface: %s, reason %s, pixels %u, traces %u", p.water_on ? "on" : "off", p.water_reason, p.gpu_water_pixels,
               p.gpu_water_traces);
+  ImGui::Text("Water roughness: %.2f x scale %.2f", g_pt_reflection_water_roughness, g_pt_reflection_roughness_scale);
   if (p.gpu_available) {
     const uint32_t now = static_cast<uint32_t>(falcom_world::g_state.frame.load());
     const uint32_t gpu = static_cast<uint32_t>(p.gpu_frame);
