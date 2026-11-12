@@ -799,8 +799,9 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   const DXGI_FORMAT mrt_view_format = static_cast<DXGI_FORMAT>(device->get_resource_view_desc(mrt_srv).format);
   const bool depth_ok = (depth_format == DXGI_FORMAT_R32_FLOAT || depth_format == DXGI_FORMAT_R32_TYPELESS)
                         && depth_view_format == DXGI_FORMAT_R32_FLOAT;
-  const bool mrt_ok = (mrt_format == DXGI_FORMAT_R32G32B32A32_UINT || mrt_format == DXGI_FORMAT_R32G32B32A32_TYPELESS)
-                      && mrt_view_format == DXGI_FORMAT_R32G32B32A32_UINT;
+  const bool mrt_ok = ((mrt_format == DXGI_FORMAT_R32G32B32A32_UINT || mrt_format == DXGI_FORMAT_R32G32B32A32_TYPELESS)
+                       && mrt_view_format == DXGI_FORMAT_R32G32B32A32_UINT)
+                      || (mrt_format == DXGI_FORMAT_R16G16B16A16_UINT && mrt_view_format == DXGI_FORMAT_R16G16B16A16_UINT);
   // Each rejection names its check; with debug logging on, the event ring keeps the formats and sizes of both sources.
   const auto reject = [&](const char* reason) {
     const uint64_t capture_state = pt::g_pt_capture_state.load();
