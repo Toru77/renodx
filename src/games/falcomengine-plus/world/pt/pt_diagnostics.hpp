@@ -95,6 +95,15 @@ inline std::string SerializePtReport() {
   out << "reflection samples: " << g_pt_reflection_samples << "\n";
   out << "reflection intensity: " << g_pt_reflection_intensity << "\n";
   out << "reflection roughness scale: " << g_pt_reflection_roughness_scale << "\n";
+  out << "reflection sample clamp: " << g_pt_reflection_sample_clamp << "\n";
+  out << "reflection cap to one: " << g_pt_reflection_cap_to_one << "\n";
+  out << "reflection uses sharc: " << g_pt_reflection_use_sharc << "\n";
+  out << "reflection footprint test: " << g_pt_reflection_footprint << "\n";
+  out << "water reflection bed test: " << g_pt_reflection_water_rule << "\n";
+  out << "water surface on: " << (p.water_on ? "true" : "false") << "\n";
+  out << "water surface reason: " << p.water_reason << "\n";
+  out << "water surface pixels: " << p.gpu_water_pixels << "\n";
+  out << "water surface traces: " << p.gpu_water_traces << "\n";
   out << "debug logging: " << PtDiagnosticCaptureEnabled() << "\n";
   std::vector<PtEvent> events;
   uint64_t overwritten = 0u;

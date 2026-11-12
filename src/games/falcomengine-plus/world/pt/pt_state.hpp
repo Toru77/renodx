@@ -24,6 +24,11 @@ inline float g_pt_samples = 1.f, g_pt_max_bounces = 16.f, g_pt_russian_roulette 
              g_pt_ray_max = 500.f, g_pt_env_bias = 0.02f, g_pt_char_bias = 0.02f, g_pt_lamp_clearance = 0.2f, g_pt_sun_casters = 0.f;
 inline float g_pt_reflection_enabled = 0.f, g_pt_reflection_samples = 1.f, g_pt_reflection_intensity = 1.f,
              g_pt_reflection_roughness_scale = 1.f;
+inline float g_pt_reflection_sample_clamp = 16.f;
+inline float g_pt_reflection_cap_to_one = 0.f;
+inline float g_pt_reflection_use_sharc = 1.f, g_pt_reflection_footprint = 1.f;
+inline float g_pt_reflection_water_rule = 0.f;
+inline float g_pt_reflection_water_surface = 0.f;
 enum class PtReason : uint32_t { Off, DeferredContext, NeedsRtxdi, InputNotReady, DxrOff, NotCreated, NoShaderModel66,
                                  Failed, SceneMissing, Stuck, SubmitFailed, TargetFailed, Tracing, Count };
 inline const char* PtReasonName(PtReason r) {
@@ -58,6 +63,9 @@ struct PtPanel {
   uint64_t mat_clears = 0u;
   const char* mat_clear_reason = "none";
   bool refl_on = false;
+  bool water_on = false;
+  uint32_t gpu_water_pixels = 0u, gpu_water_traces = 0u;
+  const char* water_reason = "off";
   uint32_t gpu_exact = 0u, gpu_hits = 0u, gpu_misses = 0u, gpu_lock_drops = 0u, gpu_writes = 0u;
   uint64_t gpu_frame = 0u;
   bool gpu_available = false;
@@ -113,6 +121,8 @@ inline void DrawPtPanel() {
   ImGui::Text("Material cache: %s  capacity 2^%u  write 1/%u px  clears %llu (last: %s)", p.mat_on ? "on" : "off",
               p.mat_capacity_log2, p.mat_rate * p.mat_rate, static_cast<unsigned long long>(p.mat_clears), p.mat_clear_reason);
   ImGui::Text("Reflection: %s", p.refl_on ? "on" : "off");
+  ImGui::Text("Water surface: %s, reason %s, pixels %u, traces %u", p.water_on ? "on" : "off", p.water_reason, p.gpu_water_pixels,
+              p.gpu_water_traces);
   if (p.gpu_available) {
     const uint32_t now = static_cast<uint32_t>(falcom_world::g_state.frame.load());
     const uint32_t gpu = static_cast<uint32_t>(p.gpu_frame);

@@ -1154,6 +1154,9 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view captured_ssr_mrt_srv = {};      // ssr1-draw t2 � march's own mrt0 (composite gate + normal decode)
   std::atomic<bool> captured_ssr_mrt_live{true};              // destroy-event driven
   uint64_t captured_ssr_mrt_res = 0u;                         // resource behind the view (destroy matching)
+  reshade::api::resource_view captured_ssr_depth_srv = {};    // ssr1-draw t1 = march's depth (water reflection copy source)
+  std::atomic<bool> captured_ssr_depth_live{true};            // destroy-event driven
+  uint64_t captured_ssr_depth_res = 0u;                       // resource behind the view (destroy matching)
   reshade::api::resource_view captured_vanilla_env_srv = {};  // game's texEnvMap_g (t17) binding � vanilla cube fallback
   reshade::api::resource_view captured_scene_cbv_view = {};   // push_descriptors passes CBV as resource_view
   reshade::api::buffer_range captured_scene_cbv = {};
@@ -8006,6 +8009,20 @@ static void OnPushDescriptorsCapture(
         d->captured_ssr_mrt_live = true;
       }
     }
+    // Capture ssr1-draw t1 (the march's depth): the source of the water reflection's depth copy. ONLY from the ssr1 pixel shader.
+    if (update.binding == 1u && update.count >= 1
+        && views[0].handle != 0u) {
+      uint32_t hash = pixel_hash();
+      if (hash == 0xE2F406C7u) {
+        if (d->captured_ssr_depth_srv.handle != views[0].handle) {
+          auto info = CSResolveCapture(device, views[0]);
+          d->captured_ssr_depth_res = info.res;
+          CSLog("capture", std::string("ssrDepth handle -> ") + info.dims);
+        }
+        d->captured_ssr_depth_srv = views[0];
+        d->captured_ssr_depth_live = true;
+      }
+    }
     // Capture the game's vanilla texEnvMap_g (t17) binding � the vanilla cubemap
     // fallback layer (t30). From ANY pixel-shader t17 bind (lighting, glass, ...),
     // refreshed on every bind so game reallocations/resizes can never leave a stale
@@ -8465,6 +8482,7 @@ static void KillAllTracked(DeviceData* d, uint64_t deadView, uint64_t deadRes) {
   KillTrackedInput(d, d->deferred_scene_cbv_view, d->deferred_cbv_res, d->defCbvLive, "defCbv", deadView, deadRes);
   KillTrackedInput(d, d->captured_ssr1_srv, d->captured_ssr1_res, d->captured_ssr1_live, "ssr1", deadView, deadRes);
   KillTrackedInput(d, d->captured_ssr_mrt_srv, d->captured_ssr_mrt_res, d->captured_ssr_mrt_live, "ssrMrt", deadView, deadRes);
+  KillTrackedInput(d, d->captured_ssr_depth_srv, d->captured_ssr_depth_res, d->captured_ssr_depth_live, "ssrDepth", deadView, deadRes);
   KillTrackedInput(d, d->rcas_motion_srv, d->rcas_motion_res, d->rcas_motion_live, "rcasMotion", deadView, deadRes);
   KillTrackedInput(d, d->mb_rtv4_srv,
                    d->mb_rtv4_res.load(std::memory_order_acquire), d->mb_rtv4_live,
@@ -9096,6 +9114,16 @@ static bool SoraSSRVanillaActive(reshade::api::command_list* cmd_list) {
 // otherwise vanilla draws untouched.
 static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list) {
   const bool pt_refl = PtReflectionOverride();
+  const bool water_surface_on = falcom_world::pt::g_pt_reflection_water_surface > 0.5f;
+  if (!(pt_refl && water_surface_on)) {
+    // The water path is not active: clear a stale water state once (reason "off" marks it cleared).
+    bool water_stale = false;
+    {
+      std::lock_guard lock(falcom_world::pt::g_pt_panel_mutex);
+      water_stale = std::string_view(falcom_world::pt::g_pt_panel.water_reason) != "off";
+    }
+    if (water_stale) falcom_world::rt12::SetPtWaterOff("off");
+  }
   if (!pt_refl && !SoraSSRReplaceActive(cmd_list) && !SoraSSRVanillaActive(cmd_list)) return true;
   auto* dev = cmd_list->get_device();
   if (!dev) return true;
@@ -9144,7 +9172,15 @@ static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list) {
   }
   if (pt_refl) {
     const bool fresh = g_pt_reflection_view.handle != 0u && g_pt_reflection_frame == falcom_world::g_state.frame.load();
-    const reshade::api::resource_view refl_view = fresh ? g_pt_reflection_view : reshade::api::resource_view{};
+    reshade::api::resource_view refl_view = fresh ? g_pt_reflection_view : reshade::api::resource_view{};
+    if (fresh && falcom_world::pt::g_pt_reflection_water_surface > 0.5f && dd->captured_ssr_depth_srv.handle && dd->captured_ssr_depth_live
+        && dd->captured_ssr_mrt_srv.handle && dd->captured_ssr_mrt_live) {
+      const reshade::api::resource_view water_view =
+          falcom_world::rt12::RunPtWaterTrace(dev, cmd_list, dd->captured_ssr_depth_srv, dd->captured_ssr_mrt_srv);
+      if (water_view.handle != 0u) refl_view = water_view;
+    } else if (water_surface_on) {
+      falcom_world::rt12::SetPtWaterOff("gate");
+    }
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel,
         reshade::api::pipeline_layout{0}, 0,
@@ -13462,6 +13498,12 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       dd0->dyncube_next_update_frame = 0;
     }
     dd0->dyncube_was_enabled = dyncube_active;
+    if (PtReflectionOverride() && dd0->dyncube_loadingWipePending) {
+      // The override skips the dynamic-cube scheduler, the only consumer of this flag. Left set it holds the loading
+      // guard (PrepareRtxdiSceneInline) forever. Hand the wipe to the next dynamic-cube capture instead.
+      dd0->dyncube_loadingWipePending = false;
+      dd0->dyncube_needs_reset = true;
+    }
   }
   if (!gtvbao_active && !vbgi_active && !dyncube_active) return true;
   if (!cmd_list) return true;

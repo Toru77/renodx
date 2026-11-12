@@ -1,7 +1,7 @@
 ---
 name: master-planner
 description: Use whenever the user asks to plan, design, break down, or figure out how to build something, asks how to approach a change, or asks which option to choose. Also use when the sub-planner escalates a decision that changes the plan. Planning only; never writes code and never reviews.
-model: claude-opus-5-5
+model: claude-sonnet-5-5
 effort: medium
 tools: Read, Glob, Grep, WebFetch, WebSearch
 ---

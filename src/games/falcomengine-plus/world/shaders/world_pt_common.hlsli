@@ -35,7 +35,7 @@ RWStructuredBuffer<SharcAccumulationData> g_pt_sharc_accumulation : register(u2)
 RWStructuredBuffer<SharcPackedData> g_pt_sharc_resolved : register(u3);
 RWStructuredBuffer<uint> g_pt_counters : register(u6);  // GPU diagnostics: 0 exact G-buffer, 1 cache hit, 2 grey miss (PtHitMaterial)
 RWTexture2D<float4> g_pt_reflection : register(u7);  // traced reflection (rgb), mean hit distance (a)
-cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (40 dwords)
+cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (42 dwords)
   uint2 g_size; uint g_frame; uint g_samples; uint g_max_bounces; uint g_roulette; uint g_roulette_min_bounce;
   uint g_lamp_count; uint g_sun_casters_only; uint g_dynamic_on; float g_ray_max; float g_env_bias; float g_char_bias;
   float g_lamp_clearance; float g_sky_intensity; uint g_sharc_enabled;
@@ -45,6 +45,7 @@ cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (40 dwords
   uint g_mat_enabled; uint g_mat_capacity; uint g_mat_rate; float g_mat_cell_scale;
   uint g_mat_deferred_count; float g_mat_char_roughness; float g_mat_char_f0; uint g_mat_mode;
   float g_sharc_radiance_scale; uint g_refl_samples; float g_refl_intensity; float g_refl_roughness_scale;
+  float g_refl_sample_clamp; uint g_refl_flags;  // 1 = cap to one, 2 = reflection uses SHARC, 4 = SHARC footprint test, 8 = water bed test, 16 = water pass (reflection from the SSR-time water surface)
 };
 uint PtHash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; return x ^ (x >> 16); }
 float PtRandom(inout uint s) { s = PtHash(s + 0x9e3779b9u); return float(s >> 8) * (1.0 / 16777216.0); }

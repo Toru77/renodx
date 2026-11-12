@@ -37,6 +37,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     return fallback(pt::PtReason::InputNotReady);
   }
   Rt12PtState& r = s.path_trace;
+  r.water_frame = UINT32_MAX;  // invalidated by each main trace; published only after its own success
+  r.water_frame_inputs = {};
   Rt12DiTransferSlot& input = s.di_transfer.slots[static_cast<uint32_t>(transfer_slot)];
   Rt12Slot& scene = s.lighting_slots[static_cast<uint32_t>(s.scene_slot)];
   const auto fail = [&s, &fallback](const char* stage, HRESULT hr) {
@@ -82,6 +84,14 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (FAILED(hr)) return fail("pt list", hr);
     hr = r.list->Close();
     if (FAILED(hr)) return fail("pt close", hr);
+    for (Rt12Slot& slot : r.water_slots) {
+      hr = s.device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot.allocator));
+      if (FAILED(hr)) return fail("pt water allocator", hr);
+    }
+    hr = s.device12->CreateCommandList(0u, D3D12_COMMAND_LIST_TYPE_DIRECT, r.water_slots[0].allocator.Get(), nullptr, IID_PPV_ARGS(&r.water_list));
+    if (FAILED(hr)) return fail("pt water list", hr);
+    hr = r.water_list->Close();
+    if (FAILED(hr)) return fail("pt water close", hr);
     // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u7, descriptor order 0..25.
     const UINT counts[8] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 4u};
     const UINT bases[8] = {0u, 14u, 29u, 30u, 31u, 0u, 36u, 4u};
@@ -127,7 +137,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
 #endif
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap_desc.NumDescriptors = kRt12Slots * kRt12PtDescriptors;
+    heap_desc.NumDescriptors = 2u * kRt12Slots * kRt12PtDescriptors;  // main blocks, then water blocks
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = s.device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&r.heap));
     if (FAILED(hr)) return fail("pt heap", hr);
@@ -138,6 +148,12 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_READBACK, kRt12PtCounters * sizeof(uint32_t), D3D12_RESOURCE_STATE_COPY_DEST,
                             D3D12_RESOURCE_FLAG_NONE, r.counter_readback[i]);
       if (FAILED(hr)) return fail("pt counter readback", hr);
+      hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, kRt12PtCounters * sizeof(uint32_t), D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, r.water_counters[i]);
+      if (FAILED(hr)) return fail("pt water counters", hr);
+      hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_READBACK, kRt12PtCounters * sizeof(uint32_t), D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_FLAG_NONE, r.water_counter_readback[i]);
+      if (FAILED(hr)) return fail("pt water counter readback", hr);
     }
     hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_UPLOAD, kRt12PtCounters * sizeof(uint32_t), D3D12_RESOURCE_STATE_GENERIC_READ,
                           D3D12_RESOURCE_FLAG_NONE, r.counter_zero);
@@ -208,6 +224,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     }
   }
   const bool refl_on = pt::g_pt_reflection_enabled > 0.5f && input.color.texture12 && input.mrt1.texture12 && input.mrt2.texture12;
+  const bool water_on = pt::g_pt_reflection_water_surface > 0.5f && refl_on;
   Rt12Shared& refl = r.reflection[k];
   if (refl_on && (!refl.texture11 || refl.width != w || refl.height != h)) {
     RetireShared(s, refl, s.last_signal);
@@ -414,6 +431,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   };
   const auto set_srv = [&](uint32_t index, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view) {
     device12->CreateShaderResourceView(resource, &view, cpu_at(base + index));
+    r.water_frame_inputs.srv_descs[index] = view;
+    r.water_frame_inputs.resources[index] = resource;
   };
   set_srv(0u, vertices, Rt12BufferSrv(kRt12ArenaStride[kRt12ArenaVertices], vertex_count));
   set_srv(1u, indices, Rt12BufferSrv(kRt12ArenaStride[kRt12ArenaIndices], index_count));
@@ -434,6 +453,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   tlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   tlas_srv.RaytracingAccelerationStructure.Location = scene.tlas->GetGPUVirtualAddress();
   device12->CreateShaderResourceView(nullptr, &tlas_srv, cpu_at(base + 7u));
+  r.water_frame_inputs.srv_descs[7u] = tlas_srv;
+  r.water_frame_inputs.tlas = scene.tlas;
   set_srv(8u, dynamic_vertices, Rt12BufferSrv(16u, dynamic_vertices ? uint64_t{kRt12CarrierWidth} * kRt12CarrierHeight : 1u));
   set_srv(9u, input.depth.texture12.Get(), Rt12TextureSrv(DXGI_FORMAT_R32_FLOAT));
   set_srv(10u, input.normal.texture12.Get(), Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
@@ -442,7 +463,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_srv(13u, light_types, Rt12BufferSrv(4u, RTXDI_INPUT_MAX_LIGHTS));
   const D3D12_UNORDERED_ACCESS_VIEW_DESC out_uav = Rt12TextureUav(DXGI_FORMAT_R16G16B16A16_FLOAT);
   device12->CreateUnorderedAccessView(out.texture12.Get(), nullptr, &out_uav, cpu_at(base + 14u));
+  r.water_frame_inputs.uav_descs[14u] = out_uav;
   device12->CreateUnorderedAccessView(refl_on ? refl.texture12.Get() : nullptr, nullptr, &out_uav, cpu_at(base + 25u));
+  r.water_frame_inputs.uav_descs[25u] = out_uav;
   const auto set_buffer_uav = [&](uint32_t index, ID3D12Resource* resource, uint32_t stride) {
     D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
     view.Format = DXGI_FORMAT_UNKNOWN;
@@ -450,6 +473,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     view.Buffer.NumElements = sharc_on ? r.sharc_capacity : 1u;
     view.Buffer.StructureByteStride = stride;
     device12->CreateUnorderedAccessView(resource, nullptr, &view, cpu_at(base + index));
+    r.water_frame_inputs.uav_descs[index] = view;
   };
   set_buffer_uav(15u, sharc_on ? r.sharc_hash.Get() : nullptr, 8u);
   set_buffer_uav(16u, sharc_on ? r.sharc_accumulation.Get() : nullptr, pt::kPtSharcAccumulationStride);
@@ -467,6 +491,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     view.Buffer.NumElements = count;
     view.Buffer.StructureByteStride = stride;
     device12->CreateUnorderedAccessView(resource, nullptr, &view, cpu_at(base + index));
+    r.water_frame_inputs.uav_descs[index] = view;
   };
   set_material_uav(22u, mat_on ? r.material_keys.Get() : nullptr, 8u, mat_on ? r.material_capacity : 1u);
   set_material_uav(23u, mat_on ? r.material_values.Get() : nullptr, 4u, mat_on ? r.material_capacity * 4u : 1u);
@@ -530,7 +555,10 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       0u, sharc_radiance_wanted,
       refl_on ? std::clamp(static_cast<uint32_t>(pt::g_pt_reflection_samples), 1u, 8u) : 0u,
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_intensity, 1.f, 0.f, 2.f)),
-      std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_roughness_scale, 1.f, 0.5f, 2.f))};
+      std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_roughness_scale, 1.f, 0.f, 2.f)),
+      std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_sample_clamp, 16.f, 1.f, 1000.f)),
+      (pt::g_pt_reflection_cap_to_one > 0.5f ? 1u : 0u) | (pt::g_pt_reflection_use_sharc > 0.5f ? 2u : 0u) |
+          (pt::g_pt_reflection_footprint > 0.5f ? 4u : 0u) | (pt::g_pt_reflection_water_rule > 0.5f ? 8u : 0u)};
   ID3D12DescriptorHeap* heaps[] = {r.heap.Get()};
   list->SetDescriptorHeaps(1u, heaps);
   list->SetComputeRootSignature(r.root.Get());
@@ -669,6 +697,15 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   if (!waited) return submit_fail(Rt12Reason::SubmitFailed, "pt d3d11 wait on fence B");
   RecordRt12WaitB(s, b, GpuEvidenceSource::Pt);
+  if (water_on) {  // publish the water block's inputs for RunPtWaterTrace of this frame
+    std::copy_n(params, kRt12PtConstants, r.water_params);
+    r.water_params[15] = 0u;  // water dispatch: no SHARC cache writes
+    r.water_params[28] = 0u;  // water dispatch: no material cache writes
+    r.water_main_slot = k;
+    r.water_input_slot = transfer_slot;
+    r.water_scene_slot = s.scene_slot;
+    r.water_frame = frame;
+  }
   // 9. Panel.
   pt::SetPtReason(pt::PtReason::Tracing);
   {
@@ -687,5 +724,287 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   *reflection_view = refl_on ? refl.srv11 : reshade::api::resource_view{0u};
   return out.srv11;
+}
+// Water panel state when no water reflection is traced this draw: off, the reason, and no water counters.
+inline void SetPtWaterOff(const char* reason) {
+  std::lock_guard lock(pt::g_pt_panel_mutex);
+  pt::g_pt_panel.water_on = false;
+  pt::g_pt_panel.water_reason = reason;
+  pt::g_pt_panel.gpu_water_pixels = 0u;
+  pt::g_pt_panel.gpu_water_traces = 0u;
+}
+// Water reflection from the SSR surface (M4): traces the water pixels of the SSR draw, from copies of its depth and mrt0,
+// into water_reflection[k] (read by ssr2). Uses the water block that the main trace of this frame published.
+inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device, reshade::api::command_list* cmd_list,
+                                                   const reshade::api::resource_view& depth_srv,
+                                                   const reshade::api::resource_view& mrt_srv) {
+  using Microsoft::WRL::ComPtr;
+  const auto fallback = [](const char* reason) {
+    SetPtWaterOff(reason);
+    return reshade::api::resource_view{0u};
+  };
+  // 1. Gates.
+  if (!g_rt12 || g_rt12->device != device) return fallback("gate");
+  Rt12State& s = *g_rt12;
+  if (s.unfenced_execution || s.stuck || s.failed) return fallback("gate");
+  if (reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()) != s.ctx11.Get()) {  // NOLINT(performance-no-int-to-ptr)
+    return fallback("gate");
+  }
+  Rt12PtState& r = s.path_trace;
+  const uint32_t frame = g_state.frame.load();
+  if (!r.created || r.water_frame != frame) return fallback("gate");
+  r.water_frame = UINT32_MAX;  // one water trace per published main trace
+  const uint32_t k = r.water_main_slot;
+  const uint32_t w = r.water_params[0];
+  const uint32_t h = r.water_params[1];
+  Rt12Slot& water_slot = r.water_slots[k];
+  // The input and scene slots the main trace captured must still be the frame's current slots.
+  if (s.di_transfer.input_frame != frame || s.di_transfer.input_slot != r.water_input_slot || s.scene_frame != frame
+      || s.scene_slot != r.water_scene_slot) {
+    return fallback("stale_slot");
+  }
+  Rt12DiTransferSlot& input = s.di_transfer.slots[static_cast<uint32_t>(r.water_input_slot)];
+  Rt12Slot& scene = s.lighting_slots[static_cast<uint32_t>(r.water_scene_slot)];
+  const Rt12PtWaterFrame& in = r.water_frame_inputs;
+  // Water counters: a completed readback is published once, in frame order; never waits.
+  const uint64_t completed = Rt12CompletedValue(s);
+  for (uint32_t i = 0u; i < kRt12Slots; ++i) {
+    if (!r.water_counter_pending[i] || r.water_counter_fence[i] > completed) continue;
+    void* mapped = nullptr;
+    if (FAILED(r.water_counter_readback[i]->Map(0u, nullptr, &mapped))) continue;
+    if (mapped != nullptr) {
+      const auto* values = static_cast<const uint32_t*>(mapped);
+      {
+        std::lock_guard lock(pt::g_pt_panel_mutex);
+        if (static_cast<int32_t>(r.water_counter_frame[i] - r.water_counter_published_frame) >= 0) {
+          pt::g_pt_panel.gpu_water_pixels = values[5];
+          pt::g_pt_panel.gpu_water_traces = values[6];
+          r.water_counter_published_frame = r.water_counter_frame[i];
+        }
+      }
+      r.water_counter_pending[i] = false;
+    }
+    r.water_counter_readback[i]->Unmap(0u, nullptr);
+  }
+  // 2. Validation: the SSR depth and mrt0 must be same-size single-sample textures in the formats the water block reads.
+  if (depth_srv.handle == 0u || mrt_srv.handle == 0u) return fallback("format");
+  const reshade::api::resource depth_res = device->get_resource_from_view(depth_srv);
+  const reshade::api::resource mrt_res = device->get_resource_from_view(mrt_srv);
+  const reshade::api::resource_desc depth_desc = device->get_resource_desc(depth_res);
+  const reshade::api::resource_desc mrt_desc = device->get_resource_desc(mrt_res);
+  const DXGI_FORMAT depth_format = static_cast<DXGI_FORMAT>(depth_desc.texture.format);
+  const DXGI_FORMAT mrt_format = static_cast<DXGI_FORMAT>(mrt_desc.texture.format);
+  const DXGI_FORMAT depth_view_format = static_cast<DXGI_FORMAT>(device->get_resource_view_desc(depth_srv).format);
+  const DXGI_FORMAT mrt_view_format = static_cast<DXGI_FORMAT>(device->get_resource_view_desc(mrt_srv).format);
+  const bool depth_ok = (depth_format == DXGI_FORMAT_R32_FLOAT || depth_format == DXGI_FORMAT_R32_TYPELESS)
+                        && depth_view_format == DXGI_FORMAT_R32_FLOAT;
+  const bool mrt_ok = (mrt_format == DXGI_FORMAT_R32G32B32A32_UINT || mrt_format == DXGI_FORMAT_R32G32B32A32_TYPELESS)
+                      && mrt_view_format == DXGI_FORMAT_R32G32B32A32_UINT;
+  if (!depth_ok || !mrt_ok || depth_desc.type != reshade::api::resource_type::texture_2d
+      || mrt_desc.type != reshade::api::resource_type::texture_2d || depth_desc.texture.width != w || depth_desc.texture.height != h
+      || mrt_desc.texture.width != w || mrt_desc.texture.height != h || depth_desc.texture.samples != 1u || mrt_desc.texture.samples != 1u) {
+    return fallback("format");
+  }
+  const auto fail_water = [&s, &fallback](Rt12Reason reason, const char* stage, const char* water_reason) {
+    FailSession(s, reason, stage);
+    return fallback(water_reason);
+  };
+  // 3. Slot wait: this water slot's previous submission must be complete (a timeout is stuck).
+  if (water_slot.fence_value > Rt12CompletedValue(s) && !WaitRt12Fence(s, water_slot.fence_value, kRt12StuckMs)) {
+    s.stuck = true;
+    pt::PtLogWarn("[world-rt12] pt water stuck: fence at " + std::to_string(Rt12CompletedValue(s)) + ", slot submitted "
+                  + std::to_string(water_slot.fence_value));
+    DisableMirror();
+    return fallback("stuck");
+  }
+  // 4. Copy targets and water reflection at the SSR draw's size (a replaced texture is retired with the last signal).
+  if (r.water_depth_format != depth_format) {
+    for (Rt12Shared& shared : r.water_depth) RetireShared(s, shared, s.last_signal);
+    r.water_depth_format = depth_format;
+  }
+  if (r.water_normal_format != mrt_format) {
+    for (Rt12Shared& shared : r.water_normal) RetireShared(s, shared, s.last_signal);
+    r.water_normal_format = mrt_format;
+  }
+  Rt12Shared& depth_copy = r.water_depth[k];
+  if (!depth_copy.texture11 || depth_copy.width != w || depth_copy.height != h) {
+    RetireShared(s, depth_copy, s.last_signal);
+    if (FAILED(CreateRt12Shared(s, device, depth_format, w, h, 1u, false, &depth_copy, depth_view_format))) {
+      RetireShared(s, depth_copy, s.last_signal);
+      return fallback("copy");
+    }
+  }
+  Rt12Shared& normal_copy = r.water_normal[k];
+  if (!normal_copy.texture11 || normal_copy.width != w || normal_copy.height != h) {
+    RetireShared(s, normal_copy, s.last_signal);
+    if (FAILED(CreateRt12Shared(s, device, mrt_format, w, h, 1u, false, &normal_copy, mrt_view_format))) {
+      RetireShared(s, normal_copy, s.last_signal);
+      return fallback("copy");
+    }
+  }
+  Rt12Shared& refl = r.water_reflection[k];
+  if (!refl.texture11 || refl.width != w || refl.height != h) {
+    RetireShared(s, refl, s.last_signal);
+    if (FAILED(CreateRt12Shared(s, device, DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, 1u, true, &refl))) {
+      RetireShared(s, refl, s.last_signal);
+      return fallback("copy");
+    }
+  }
+  // 5. Copy the SSR draw's depth and mrt0 (D3D11), then signal A, flushed. Single-mip, single-slice sources only.
+  if (depth_desc.texture.levels != 1u || depth_desc.texture.depth_or_layers != 1u || mrt_desc.texture.levels != 1u
+      || mrt_desc.texture.depth_or_layers != 1u) {
+    return fallback("copy");
+  }
+  s.ctx11->CopyResource(depth_copy.texture11.Get(), reinterpret_cast<ID3D11Resource*>(depth_res.handle));  // NOLINT(performance-no-int-to-ptr)
+  s.ctx11->CopyResource(normal_copy.texture11.Get(), reinterpret_cast<ID3D11Resource*>(mrt_res.handle));  // NOLINT(performance-no-int-to-ptr)
+  uint64_t a = renodx::utils::gpu_fence::NO_SIGNAL;
+  try {
+    a = renodx::utils::gpu_fence::QueueSignal(s.ctx11.Get(), s.fence11.get());
+    s.ctx11->Flush();
+  } catch (const std::exception&) {
+    a = renodx::utils::gpu_fence::NO_SIGNAL;
+  }
+  RecordRt12SignalA(s, a, GpuEvidenceSource::Pt);
+  if (a == renodx::utils::gpu_fence::NO_SIGNAL) return fail_water(Rt12Reason::FenceError, "pt water fence11 signal", "submit");
+  // 6. Record: descriptors, barriers, counters, dispatch.
+  ID3D12GraphicsCommandList4* list = r.water_list.Get();
+  if (FAILED(water_slot.allocator->Reset()) || FAILED(list->Reset(water_slot.allocator.Get(), nullptr))) {
+    return fail_water(Rt12Reason::SubmitFailed, "pt water reset", "record");
+  }
+  ID3D12Device5* device12 = s.device12.Get();
+  const uint32_t base = (kRt12Slots + k) * kRt12PtDescriptors;
+  const auto cpu_at = [&r, &s](uint32_t index) {
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = r.heap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(index) * s.descriptor_size;
+    return handle;
+  };
+  // Water block (R3): every descriptor is written here, after this slot's fence. Null: 14-17 and 22-23.
+  for (uint32_t i = 0u; i < kRt12PtDescriptors; ++i) {
+    const D3D12_CPU_DESCRIPTOR_HANDLE handle = cpu_at(base + i);
+    const bool uav_index = (i >= 14u && i <= 17u) || i >= 22u;
+    if (!uav_index) {
+      ID3D12Resource* resource = in.resources[i].Get();
+      D3D12_SHADER_RESOURCE_VIEW_DESC view = in.srv_descs[i];
+      if (i == 9u) {
+        resource = depth_copy.texture12.Get();
+        view = Rt12TextureSrv(depth_view_format);
+      }
+      if (i == 10u) {
+        resource = normal_copy.texture12.Get();
+        view = Rt12TextureSrv(mrt_view_format);
+      }
+      device12->CreateShaderResourceView(resource, &view, handle);
+    } else {
+      ID3D12Resource* resource = nullptr;
+      if (i == 24u) resource = r.water_counters[k].Get();
+      if (i == 25u) resource = refl.texture12.Get();
+      device12->CreateUnorderedAccessView(resource, nullptr, &in.uav_descs[i], handle);
+    }
+  }
+  // Counters: cleared before the dispatch, copied to the readback after it (only when no readback is pending).
+  std::vector<D3D12_RESOURCE_BARRIER>& barriers = water_slot.barrier_scratch;
+  barriers.clear();
+  ID3D12Resource* const water_reads[] = {in.resources[0].Get(), in.resources[1].Get(), in.resources[2].Get(), in.resources[3].Get(),
+                                         in.resources[4].Get(), in.resources[5].Get(), in.resources[6].Get(), in.resources[8].Get(),
+                                         depth_copy.texture12.Get(), normal_copy.texture12.Get(), in.resources[11].Get(),
+                                         in.resources[12].Get(), in.resources[13].Get(), in.resources[18].Get(),
+                                         in.resources[19].Get(), in.resources[20].Get(), in.resources[21].Get()};
+  for (ID3D12Resource* resource : water_reads) {
+    if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  }
+  Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  Transition(barriers, r.water_counters[k].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+  list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  list->CopyBufferRegion(r.water_counters[k].Get(), 0u, r.counter_zero.Get(), 0u, kRt12PtCounters * sizeof(uint32_t));
+  barriers.clear();
+  Transition(barriers, r.water_counters[k].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  // Dispatch: the water pass of world_pt_diffuse (flag 16 in the reflection flags).
+  ID3D12DescriptorHeap* heaps[] = {r.heap.Get()};
+  list->SetDescriptorHeaps(1u, heaps);
+  list->SetComputeRootSignature(r.root.Get());
+  list->SetPipelineState(r.pso.Get());
+  r.water_params[41] |= 16u;
+  list->SetComputeRoot32BitConstants(0u, kRt12PtConstants, r.water_params, 0u);
+  D3D12_GPU_DESCRIPTOR_HANDLE table = r.heap->GetGPUDescriptorHandleForHeapStart();
+  table.ptr += static_cast<UINT64>(base) * s.descriptor_size;
+  list->SetComputeRootDescriptorTable(1u, table);
+  list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+  barriers.clear();
+  Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+  Transition(barriers, r.water_counters[k].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  const bool counters_copied = !r.water_counter_pending[k];
+  if (counters_copied) {
+    list->CopyBufferRegion(r.water_counter_readback[k].Get(), 0u, r.water_counters[k].Get(), 0u, kRt12PtCounters * sizeof(uint32_t));
+  }
+  barriers.clear();
+  Transition(barriers, r.water_counters[k].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+  for (ID3D12Resource* resource : water_reads) {
+    if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+  }
+  list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  if (FAILED(list->Close())) return fail_water(Rt12Reason::SubmitFailed, "pt water close", "record");
+  // 7. Submission: wait for A and the previous D3D12 work, execute, signal B.
+  bool ordered = false;
+  try {
+    ordered = renodx::utils::gpu_fence::QueueWait(s.queue12.Get(), s.fence11.get(), a);
+    if (ordered && s.last_signal != 0u) {
+      ordered = renodx::utils::gpu_fence::QueueWait(s.queue12.Get(), s.fence12.get(), s.last_signal);
+    }
+  } catch (const std::exception&) {
+    ordered = false;
+  }
+  if (!ordered) return fail_water(Rt12Reason::SubmitFailed, "pt water order wait", "submit");
+  RecordRt12WaitA(s, a, GpuEvidenceSource::Pt);
+  if (s.last_signal != 0u) RecordRt12WaitPriorB(s, s.last_signal, GpuEvidenceSource::Pt);
+  ID3D12CommandList* lists[] = {list};
+  BeginRt12Submission(s);
+  s.unfenced_execution = true;  // stays true if no signal B follows (teardown then leaks instead of freeing in-use objects)
+  s.queue12->ExecuteCommandLists(1u, lists);
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12Submit, GpuEvidenceSource::Pt);
+  RecordGpuWorkBreadcrumb(GpuWorkKind::Rt12, k);
+  uint64_t b = renodx::utils::gpu_fence::NO_SIGNAL;
+  try {
+    b = renodx::utils::gpu_fence::QueueSignal(s.queue12.Get(), s.fence12.get());
+  } catch (const std::exception&) {
+    b = renodx::utils::gpu_fence::NO_SIGNAL;
+  }
+  if (b == renodx::utils::gpu_fence::NO_SIGNAL) {
+    s.sync_evidence.signal_b_result = E_FAIL;
+    RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::Pt);
+    return fail_water(Rt12Reason::SubmitFailed, "pt water signal", "submit");
+  }
+  s.unfenced_execution = false;
+  water_slot.fence_value = b;
+  if (counters_copied) {
+    r.water_counter_fence[k] = b;
+    r.water_counter_frame[k] = frame;
+    r.water_counter_pending[k] = true;
+  }
+  scene.fence_value = (std::max)(scene.fence_value, b);
+  input.fence_value = (std::max)(input.fence_value, b);
+  // The submitted inputs stay alive until this submission's fence completes; the snapshot is then empty for the next trace.
+  for (const ComPtr<ID3D12Resource>& resource : in.resources) RetireObject(s, b, resource);
+  RetireObject(s, b, in.tlas);
+  r.water_frame_inputs = {};
+  NoteRt12Signal(s, b);
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::Pt);
+  // 8. D3D11 waits for B on the GPU before ssr2 reads the water reflection.
+  bool waited = false;
+  try {
+    waited = renodx::utils::gpu_fence::QueueWait(s.ctx11.Get(), s.fence12.get(), b);
+  } catch (const std::exception&) {
+    waited = false;
+  }
+  if (!waited) return fail_water(Rt12Reason::SubmitFailed, "pt water d3d11 wait on fence B", "submit");
+  RecordRt12WaitB(s, b, GpuEvidenceSource::Pt);
+  // 9. Panel.
+  {
+    std::lock_guard lock(pt::g_pt_panel_mutex);
+    pt::g_pt_panel.water_on = true;
+    pt::g_pt_panel.water_reason = "ok";
+  }
+  return refl.srv11;
 }
 }  // namespace falcom_world::rt12

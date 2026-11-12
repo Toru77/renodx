@@ -382,8 +382,16 @@ struct Rt12DiTransferState {
 
 // Path-traced diffuse GI (world/pt): its own submission slots, list, root signature, PSO, descriptors and outputs.
 inline constexpr uint32_t kRt12PtDescriptors = 26u;
-inline constexpr uint32_t kRt12PtConstants = 40u;
-inline constexpr uint32_t kRt12PtCounters = 5u;  // GPU material-cache counters (uint32 each), world_pt_common.hlsli g_pt_counters
+inline constexpr uint32_t kRt12PtConstants = 42u;
+inline constexpr uint32_t kRt12PtCounters = 7u;  // GPU material-cache counters (uint32 each), world_pt_common.hlsli g_pt_counters
+// Descriptor inputs of the main trace's frame, kept for the water block (M4): descriptor i is srv_descs[i] or uav_descs[i] on
+// resources[i]. The TLAS has no resource in its SRV, so it is retained separately.
+struct Rt12PtWaterFrame {
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv_descs[kRt12PtDescriptors] = {};
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav_descs[kRt12PtDescriptors] = {};
+  Microsoft::WRL::ComPtr<ID3D12Resource> resources[kRt12PtDescriptors];
+  Microsoft::WRL::ComPtr<ID3D12Resource> tlas;
+};
 struct Rt12PtState {
   bool created = false;
   Rt12Slot slots[kRt12Slots];
@@ -394,6 +402,26 @@ struct Rt12PtState {
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;  // shader visible, kRt12Slots * kRt12PtDescriptors
   Rt12Shared output[kRt12Slots];                      // RGBA16F, depth size; the lighting draw reads srv11 at t47
   Rt12Shared reflection[kRt12Slots];                  // RGBA16F, depth size: traced reflection, a = hit distance; t48 in lighting and ssr2
+  // Water reflection from the SSR surface (M4): a copy of the SSR-time depth and mrt0 at the SSR draw, traced by a second
+  // water dispatch into water_reflection (read by ssr2). Own slots and list; the water block follows the main block.
+  Rt12Slot water_slots[kRt12Slots];
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> water_list;
+  Rt12Shared water_depth[kRt12Slots];
+  Rt12Shared water_normal[kRt12Slots];
+  Rt12Shared water_reflection[kRt12Slots];
+  DXGI_FORMAT water_depth_format = DXGI_FORMAT_UNKNOWN;
+  DXGI_FORMAT water_normal_format = DXGI_FORMAT_UNKNOWN;
+  uint32_t water_frame = UINT32_MAX;  // frame of the last RunPtTrace that prepared the water block; UINT32_MAX = none
+  uint32_t water_main_slot = 0u;      // main slot k of that trace (the water block index is kRt12Slots + k)
+  int32_t water_input_slot = -1, water_scene_slot = -1;  // transfer and scene slots of that trace (checked before the water submission)
+  uint32_t water_params[kRt12PtConstants] = {};
+  Rt12PtWaterFrame water_frame_inputs;  // descriptor inputs of the frame in water_frame (reset by each main trace)
+  // Water counters (own buffers and readbacks, same rules as the main counters; frame order is water_counter_published_frame).
+  Microsoft::WRL::ComPtr<ID3D12Resource> water_counters[kRt12Slots], water_counter_readback[kRt12Slots];
+  uint64_t water_counter_fence[kRt12Slots] = {};
+  uint32_t water_counter_frame[kRt12Slots] = {};
+  bool water_counter_pending[kRt12Slots] = {};
+  uint32_t water_counter_published_frame = 0u;
   // SHARC (M2): update and resolve PSOs (the trace PSO's root signature), the three cache buffers (DEFAULT, rest state COMMON)
   // and the clear-trigger state (OpenRemix sharc.cpp:368-475).
   Microsoft::WRL::ComPtr<ID3D12PipelineState> sharc_update_pso, sharc_resolve_pso;
@@ -940,7 +968,8 @@ inline void RetireShared(Rt12State& s, Rt12Shared& shared, uint64_t fence) {
 
 // A D3D11-created shared texture opened in D3D12 (10.2). Stops at the first failure.
 inline HRESULT CreateRt12Shared(Rt12State& state, reshade::api::device* device, DXGI_FORMAT format, uint32_t width, uint32_t height,
-                                uint32_t array_size, bool uav, Rt12Shared* out) {
+                                uint32_t array_size, bool uav, Rt12Shared* out,
+                                DXGI_FORMAT view_format_override = DXGI_FORMAT_UNKNOWN) {
   using Microsoft::WRL::ComPtr;
   D3D11_TEXTURE2D_DESC desc = {};
   desc.Width = width;
@@ -966,7 +995,8 @@ inline HRESULT CreateRt12Shared(Rt12State& state, reshade::api::device* device, 
   if (FAILED(hr)) return hr;
 
   // ReShade views: the enum values of reshade::api::format are the DXGI_FORMAT values for these formats.
-  const auto view_format = static_cast<reshade::api::format>(format);
+  const DXGI_FORMAT view_dxgi_format = (view_format_override == DXGI_FORMAT_UNKNOWN ? format : view_format_override);
+  const auto view_format = static_cast<reshade::api::format>(view_dxgi_format);
   const auto view_type = array_size > 1u ? reshade::api::resource_view_type::texture_2d_array
                                          : reshade::api::resource_view_type::texture_2d;
   const reshade::api::resource resource = {reinterpret_cast<uint64_t>(out->texture11.Get())};
@@ -1106,6 +1136,20 @@ inline void TeardownRt12(const char* why) {
     if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
     if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
   }
+  for (Rt12Shared& shared : s.path_trace.water_reflection) {
+    if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
+    if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
+  }
+  for (Rt12Shared& shared : s.path_trace.water_depth) {
+    if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
+    if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
+  }
+  for (Rt12Shared& shared : s.path_trace.water_normal) {
+    if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
+    if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
+  }
+  s.path_trace.water_frame = UINT32_MAX;
+  s.path_trace.water_frame_inputs = {};
   for (Rt12Shared& shared : s.rtgi.shared) {
     if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
     if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
