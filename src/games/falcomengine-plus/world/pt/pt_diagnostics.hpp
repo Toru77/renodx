@@ -96,6 +96,9 @@ inline std::string SerializePtReport() {
   out << "reflection intensity: " << g_pt_reflection_intensity << "\n";
   out << "reflection roughness scale: " << g_pt_reflection_roughness_scale << "\n";
   out << "reflection sample clamp: " << g_pt_reflection_sample_clamp << "\n";
+  out << "reflection clamp enabled: " << g_pt_reflection_clamp_enabled << "\n";
+  out << "gi clamp enabled: " << g_pt_gi_clamp_enabled << "\n";
+  out << "gi clamp: " << g_pt_gi_clamp << "\n";
   out << "reflection cap to one: " << g_pt_reflection_cap_to_one << "\n";
   out << "reflection uses sharc: " << g_pt_reflection_use_sharc << "\n";
   out << "reflection footprint test: " << g_pt_reflection_footprint << "\n";

@@ -1961,7 +1961,7 @@ int RunRtxdiDxrBridge() {
   di_ranges[12] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 61u, 0u, 21u};
   D3D12_ROOT_PARAMETER di_params[4] = {};
   di_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  di_params[0].Constants.Num32BitValues = 21u;
+  di_params[0].Constants.Num32BitValues = 22u;
   di_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   di_params[1].Descriptor.ShaderRegister = 1u;
   di_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -2125,12 +2125,12 @@ int RunRtxdiDxrBridge() {
     list->ResourceBarrier(1u, &barrier);
     list->SetComputeRootSignature(di_root.Get());
     list->SetPipelineState(di_pso.Get());
-    const UINT params[21] = {3u, 2u, 1u, coverage_valid ? 1u : 0u, local_lights,
+    const UINT params[22] = {3u, 2u, 1u, coverage_valid ? 1u : 0u, local_lights,
                              std::bit_cast<UINT>(0.01f), std::bit_cast<UINT>(0.02f), std::bit_cast<UINT>(0.001f),
                              std::bit_cast<UINT>(-2.0f), std::bit_cast<UINT>(-2.0f), std::bit_cast<UINT>(-2.0f),
                              std::bit_cast<UINT>(4.0f), deferred_count, deferred_count, local_lights,
-                             RTXDI_INPUT_MAX_TILES, RTXDI_INPUT_MAX_TILES, 0u, 0u, 0u, 0u};
-    list->SetComputeRoot32BitConstants(0u, 21u, params, 0u);
+                             RTXDI_INPUT_MAX_TILES, RTXDI_INPUT_MAX_TILES, 0u, 0u, 0u, 0u, 0u};
+    list->SetComputeRoot32BitConstants(0u, 22u, params, 0u);
     list->SetComputeRootConstantBufferView(1u, frame_upload->GetGPUVirtualAddress());
     list->SetComputeRootDescriptorTable(2u, di_heap->GetGPUDescriptorHandleForHeapStart());
     list->Dispatch(1u, 1u, 1u);

@@ -1723,6 +1723,32 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtxdiLocalLightClampEnabled",
+      .binding = &rtxdi::g_local_light_clamp_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Light Sampling Clamp (Local)",
+      .section = "RTXDI Local",
+      .tooltip = "Limits the luminance of the RTXDI-selected lamp at each pixel (diffuse and specular, scaled together). Fewer lamp fireflies, but removes energy. Off = current look.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiLocalLightClamp",
+      .binding = &rtxdi::g_local_light_clamp,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 16.f,
+      .label = "Light Sampling Clamp Limit (Local)",
+      .section = "RTXDI Local",
+      .tooltip = "Luminance limit for the selected lamp before material colour. Lower = fewer fireflies, less energy.",
+      .min = 1.f,
+      .max = 1000.f,
+      .format = "%.1f",
+      .is_enabled = [] { return rtxdi::g_local_light_clamp_enabled > 0.5f; },
+      .is_visible = visible,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiLocalShadowDarkening",
       .binding = &rtxdi::g_local_shadow_darkening,
       .value_type = SettingValueType::FLOAT,
@@ -2444,6 +2470,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "PtReflectionClampEnabled",
+      .binding = &pt::g_pt_reflection_clamp_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Reflection Sample Clamp Enabled",
+      .section = "Path Tracing",
+      .tooltip = "On = each reflected ray is clamped by Reflection Sample Clamp (current look). Off = no per-ray clamp; brighter highlights, more fireflies.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "PtReflectionSampleClamp",
       .binding = &pt::g_pt_reflection_sample_clamp,
       .value_type = SettingValueType::FLOAT,
@@ -2454,6 +2491,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .min = 1.f,
       .max = 1000.f,
       .format = "%.1f",
+      .is_enabled = [] { return pt::g_pt_reflection_clamp_enabled > 0.5f; },
       .is_visible = visible,
       .is_logarithmic = true,
   });
@@ -2467,6 +2505,32 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .tooltip = "A/B test: limits the final traced reflection to 1.0 (the game cubemap range). On = no highlight headroom.",
       .labels = {"Off", "On"},
       .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtGiClampEnabled",
+      .binding = &pt::g_pt_gi_clamp_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "GI Clamp Enabled",
+      .section = "Path Tracing",
+      .tooltip = "Clamps the luminance of each bounce's light and each SHARC cache read in the GI path. Fewer fireflies, but removes energy (darker bright bounces). Off = current look.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtGiClamp",
+      .binding = &pt::g_pt_gi_clamp,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 16.f,
+      .label = "GI Clamp",
+      .section = "Path Tracing",
+      .tooltip = "Luminance limit per bounce contribution. Lower = fewer fireflies, less energy.",
+      .min = 1.f,
+      .max = 1000.f,
+      .format = "%.1f",
+      .is_enabled = [] { return pt::g_pt_gi_clamp_enabled > 0.5f; },
+      .is_visible = visible,
+      .is_logarithmic = true,
   });
   settings->push_back(new Setting{
       .key = "PtReflectionUseSharc",

@@ -31,11 +31,11 @@ void main(uint3 id : SV_DispatchThreadID) {
           const float voxel = HashGridGetVoxelSize(HashGridGetLevel(data.positionWorld, sharc.hashGridParameters), sharc.hashGridParameters);
           float3 cached;
           if (hit.t > voxel * 1.732050808 && SharcGetCachedRadiance(sharc, data, cached, false) && all(isfinite(cached))) {
-            L += T * max(cached, 0);
+            L += PtClampLuminance(T * max(cached, 0), g_gi_clamp);
             break;
           }
         }
-        L += T * albedo * PtHitLight(hit.position, nh, rng);
+        L += PtClampLuminance(T * albedo * PtHitLight(hit.position, nh, rng), g_gi_clamp);
         T *= albedo;
         if (g_roulette != 0u && b + 1u >= g_roulette_min_bounce) {
           const float pr = max(0.05, pow(saturate(max(T.x, max(T.y, T.z))), 0.25));
@@ -95,9 +95,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         const bool footprint_ok = (g_refl_flags & 4u) == 0u || hit.t * spread > voxel * 1.732050808;
         float3 cached;
         if (use_sharc && footprint_ok && SharcGetCachedRadiance(sharc, sharc_hit, cached, false) && all(isfinite(cached))) {
-          sum += min(max(cached, 0), g_refl_sample_clamp);
+          sum += g_refl_sample_clamp > 0.0 ? min(max(cached, 0), g_refl_sample_clamp) : max(cached, 0);
         } else {
-          sum += min(albedo * (PtHitLight(hit.position, nh, refl_rng) + PtSky(nh)), g_refl_sample_clamp);
+          const float3 lit = albedo * (PtHitLight(hit.position, nh, refl_rng) + PtSky(nh));
+          sum += g_refl_sample_clamp > 0.0 ? min(lit, g_refl_sample_clamp) : lit;
         }
         distance += hit.t;
       }

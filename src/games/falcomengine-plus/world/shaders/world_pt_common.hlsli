@@ -45,8 +45,8 @@ cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (44 dwords
   uint g_mat_enabled; uint g_mat_capacity; uint g_mat_rate; float g_mat_cell_scale;
   uint g_mat_deferred_count; float g_mat_char_roughness; float g_mat_char_f0; uint g_mat_mode;
   float g_sharc_radiance_scale; uint g_refl_samples; float g_refl_intensity; float g_refl_roughness_scale;
-  float g_refl_sample_clamp; uint g_refl_flags;  // 1 = cap to one, 2 = reflection uses SHARC, 4 = SHARC footprint test, 8 = water bed test, 16 = water pass (reflection from the SSR-time water surface)
-  float g_water_roughness; uint g_pt_params_pad;  // base roughness of water reflections (Water roughness setting); pad to 16 bytes
+  float g_refl_sample_clamp; uint g_refl_flags;  // per-sample reflection radiance clamp (0 = off); flags: 1 = cap to one, 2 = reflection uses SHARC, 4 = SHARC footprint test, 8 = water bed test, 16 = water pass (reflection from the SSR-time water surface)
+  float g_water_roughness; float g_gi_clamp;  // base roughness of water reflections; GI luminance clamp (0 = off)
 };
 uint PtHash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; return x ^ (x >> 16); }
 float PtRandom(inout uint s) { s = PtHash(s + 0x9e3779b9u); return float(s >> 8) * (1.0 / 16777216.0); }
@@ -112,6 +112,11 @@ float3 PtSampleGgx(float3 wo, float alpha, float2 u) {
   const float3 nh = x * t1 + y * t2 + sqrt(max(0.0, 1.0 - x * x - y * y)) * v;
   const float3 h = normalize(float3(alpha * nh.xy, max(0.0, nh.z)));
   return reflect(-wo, h);
+}
+// Scales c down to luminance limit, keeping hue (OpenRemix fireflies.glsl:6-12). limit 0 = off.
+float3 PtClampLuminance(float3 c, float limit) {
+  const float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
+  return limit > 0.0 && lum > limit ? c * (limit / lum) : c;
 }
 // Light arriving at a bounce hit: the sun with a shadow ray and one lamp sampled uniformly. The caller multiplies by albedo.
 float3 PtHitLight(float3 position, float3 nh, inout uint rng) {

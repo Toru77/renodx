@@ -49,6 +49,7 @@ cbuffer RtxdiDiParams : register(b0) {
   uint g_noise_mode;
   uint g_noise_slice;
   float g_character_self_softening;
+  float g_local_light_clamp;
 };
 
 cbuffer RtxdiN1FramePrefix : register(b1) {

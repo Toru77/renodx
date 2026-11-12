@@ -363,6 +363,14 @@ RtxdiDiRawResult RtxdiTraceLocalLight(RAB_Surface surface, RAB_LightSample sampl
       || !isfinite(endpoint_clearance) || endpoint_clearance < 0.0 || !isfinite(region_size) || region_size <= 0.0) return result;
   const float distance = sqrt(distance_squared);
   const float3 direction = delta / distance;
+  // Optional local light clamp: scales the published weight only, never the stored reservoir.
+  if (g_local_light_clamp > 0.0) {
+    const float lum = dot(sample.radiance * max(max(0.0, dot(surface.shading_normal, direction)), sample.translucency) * inverse_pdf, float3(0.2126, 0.7152, 0.0722));
+    if (isfinite(lum) && lum > g_local_light_clamp) {
+      inverse_pdf *= g_local_light_clamp / lum;
+      result.inverse_pdf = inverse_pdf;
+    }
+  }
   const float3 shadow_delta = sample.shadow_target - surface.world_position;
   const float shadow_distance_squared = dot(shadow_delta, shadow_delta);
   if (!all(isfinite(shadow_delta)) || !isfinite(shadow_distance_squared) || shadow_distance_squared <= 1e-12) return result;
