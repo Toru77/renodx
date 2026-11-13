@@ -53,6 +53,30 @@ struct PtReGirBuild {
   bool valid = false;
 };
 
+struct PtReGirSelection {
+  bool valid = false;
+  uint32_t light_index = 0;
+  uint32_t c20 = 0;
+  uint32_t multiplicity = 0;
+  double pmf = 0.0;
+};
+
+inline PtReGirSelection PtReGirSelect(uint32_t x24, uint32_t light_count,
+                                     const std::array<uint32_t, kPtReGirSlotsPerCell>& slots) {
+  PtReGirSelection result = {};
+  if (x24 >= (1u << 24) || light_count == 0 || light_count > RTXDI_LIGHT_TABLE_CAPACITY) return result;
+  for (uint32_t slot : slots) if (slot >= light_count) return result;
+  result.light_index = (x24 & (1u << 23)) == 0 ? slots[(x24 >> 20) & 7u]
+                                                : static_cast<uint32_t>((static_cast<uint64_t>(x24 & 0xfffffu) * light_count) >> 20);
+  for (uint32_t slot : slots) result.multiplicity += slot == result.light_index ? 1u : 0u;
+  const uint64_t lower = (static_cast<uint64_t>(result.light_index) * (1u << 20) + light_count - 1u) / light_count;
+  const uint64_t upper = (static_cast<uint64_t>(result.light_index + 1u) * (1u << 20) + light_count - 1u) / light_count;
+  result.c20 = static_cast<uint32_t>(upper - lower);
+  result.pmf = 0.5 * result.multiplicity / 8.0 + 0.5 * result.c20 / (1u << 20);
+  result.valid = std::isfinite(result.pmf) && result.pmf > 0.0;
+  return result;
+}
+
 inline bool BuildPtReGirReference(const PtReGirIdentity& identity, std::span<const std::array<float, 3>> positions,
                                   std::span<const RtxdiLightTableEntry> lights, std::span<const uint32_t> draws,
                                   PtReGirBuild* output) {

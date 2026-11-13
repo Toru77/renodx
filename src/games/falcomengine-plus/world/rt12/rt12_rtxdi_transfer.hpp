@@ -1196,6 +1196,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       result.status = rtxdi::InputStatus::Busy;
       return finish();
     }
+    slot.regir_source_identity = {};
     bool perf_timing = false;
     if (perf_gather && slot.perf_pending) {
       rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.rtxdi_timing_skip_events);
@@ -1234,6 +1235,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     slot.output_c_fence = 0u;
     result.stage = rtxdi::InputStage::Allocate;
     if (transfer.owner_generation != 0u && transfer.owner_generation != s.generation) {
+      for (Rt12DiTransferSlot& transfer_slot : transfer.slots) transfer_slot.regir_source_identity = {};
       s.failed = true;
       s.stuck = true;
       result.status = rtxdi::InputStatus::Quarantined;
@@ -1450,6 +1452,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       candidate.output_staged = false;
       slot = std::move(candidate);
       candidate_guard.release();
+      for (Rt12DiTransferSlot& transfer_slot : transfer.slots) transfer_slot.regir_source_identity = {};
       transfer.owner_generation = s.generation;
       ++transfer.configuration_generation;
     }
@@ -2402,6 +2405,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
 #endif
   const uint32_t slot_index = static_cast<uint32_t>(input.transfer_slot);
   Rt12DiTransferSlot& slot = transfer.slots[slot_index];
+  slot.regir_source_identity = {};
   const bool perf_timing = bvh::g_perf_gate.gather.load(std::memory_order_relaxed)
                            && slot.perf_pending
                            && slot.perf_gather_epoch == bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed)
@@ -3800,6 +3804,12 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   }
   s.unfenced_execution = false;
   slot.di_fence_value = di_fence;
+  slot.regir_source_identity = {.owner_generation = s.generation,
+                                .transfer_configuration = transfer.configuration_generation,
+                                .table_fence = di_fence,
+                                .frame = in.frame,
+                                .transfer_slot = slot_index,
+                                .light_count = light_count};
   if (perf_timing) {
     slot.perf_fence = di_fence;
     slot.perf_valid_mask |= 2u;

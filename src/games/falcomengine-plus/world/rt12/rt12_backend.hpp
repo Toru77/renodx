@@ -41,6 +41,7 @@
 #include "../rtao/rtao_resources.hpp"
 #include "../rtgi/rtgi_resources.hpp"
 #include "../rtgi/rtgi_state.hpp"
+#include "../pt/pt_regir_contract.hpp"
 #include "../pt/pt_state.hpp"
 #include "../rtxdi/rtxdi_config.hpp"
 #include "../rtxdi/rtxdi_perf_contract.hpp"
@@ -311,6 +312,7 @@ struct Rt12DiTransferSlot {
   uint64_t fence_value = 0u;
   uint32_t width = 0u, height = 0u;
   uint64_t di_fence_value = 0u;
+  pt::PtReGirIdentity regir_source_identity = {};
   uint64_t perf_gather_epoch = 0u, perf_owner_generation = 0u, perf_transfer_configuration = 0u;
   uint64_t perf_di_configuration = 0u, perf_settings_identity = 0u, perf_fence = 0u;
   uint32_t perf_frame = UINT32_MAX, perf_width = 0u, perf_height = 0u;
@@ -403,9 +405,14 @@ struct Rt12DiTransferState {
 };
 
 // Path-traced diffuse GI (world/pt): its own submission slots, list, root signature, PSO, descriptors and outputs.
-inline constexpr uint32_t kRt12PtDescriptors = 27u;
-inline constexpr uint32_t kRt12PtConstants = 48u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
+inline constexpr uint32_t kRt12PtDescriptors = 29u;
+inline constexpr uint32_t kRt12PtConstants = 52u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
 inline constexpr uint32_t kRt12PtCounters = 9u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
+inline constexpr uint32_t kRt12ReGirDescriptors = 5u;
+inline constexpr uint32_t kRt12ReGirPasses = 3u;
+inline constexpr uint32_t kRt12ReGirConstants = 2u;
+inline constexpr uint32_t kRt12ReGirHeaderStride = 4u * sizeof(uint32_t);
+inline constexpr uint32_t kRt12ReGirCellStride = (4u + pt::kPtReGirSlotsPerCell) * sizeof(uint32_t);
 // Descriptor inputs of the main trace's frame, kept for the water block (M4): descriptor i is srv_descs[i] or uav_descs[i] on
 // resources[i]. The TLAS has no resource in its SRV, so it is retained separately.
 struct Rt12PtWaterFrame {
@@ -421,6 +428,15 @@ struct Rt12PtState {
   Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> list;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> regir_root;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> regir_register_pso, regir_weights_pso, regir_build_pso;
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> regir_heap;
+  Microsoft::WRL::ComPtr<ID3D12Resource> regir_header[kRt12Slots], regir_cells[kRt12Slots], regir_weights[kRt12Slots];
+  Microsoft::WRL::ComPtr<ID3D12Resource> regir_header_readback[kRt12Slots], regir_cells_readback[kRt12Slots];
+  pt::PtReGirIdentity regir_identity[kRt12Slots] = {};
+  uint64_t regir_last_use[kRt12Slots] = {}, regir_counts_fence[kRt12Slots] = {};
+  uint32_t regir_counts_frame[kRt12Slots] = {};
+  bool regir_counts_pending[kRt12Slots] = {};
   bool sparse_effective = false;
   bool sparse_reflections_effective = false;
   uint32_t sparse_effective_levels = 256u;

@@ -3,6 +3,7 @@
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <d3dcommon.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
@@ -16,6 +17,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -23,6 +26,11 @@
 #include <vector>
 
 #include "../rtxdi_input_d3d11.hpp"
+#include "../../pt/pt_regir_contract.hpp"
+#include "world_regir_selection_contract.h"
+#include "world_regir_register.h"
+#include "world_regir_weights.h"
+#include "world_regir_build.h"
 
 #include "world_rtxdi_pack_inputs.h"
 #include "world_rtxdi_pack_records.h"
@@ -41,6 +49,12 @@ struct SharedTexture {
 }  // namespace
 
 int main() {
+  ComPtr<ID3D12Debug> debug;
+  if (FAILED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+    std::fprintf(stderr, "FAIL D3D12 debug layer unavailable\n");
+    return 1;
+  }
+  debug->EnableDebugLayer();
   // Whole-buffer native bindings are reported as 4096 constants; exercise the
   // physical 80/81/95/96-row extents through the exact descriptor intersection.
   for (const auto& test : std::array<std::array<UINT, 5>, 4>{{{{13, 9, 1, 0, 80}}, {{13, 9, 1, 1, 81}}, {{1920, 1080, 0, 1, 95}}, {{1920, 1080, 1, 0, 96}}}}) {
@@ -79,6 +93,9 @@ int main() {
       std::fprintf(stderr, "SKIP D3D12 unavailable: 0x%08lx\n", static_cast<unsigned long>(hr));
       return 77;
     }
+    ComPtr<ID3D12InfoQueue> info_queue;
+    if (!check(d12.As(&info_queue), "query D3D12 InfoQueue")) return 1;
+    info_queue->ClearStoredMessages();
     D3D12_FEATURE_DATA_SHADER_MODEL model = {D3D_SHADER_MODEL_6_5};
     hr = d12->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
     if (FAILED(hr) || model.HighestShaderModel < D3D_SHADER_MODEL_6_5) {
@@ -445,6 +462,10 @@ int main() {
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ComPtr<ID3D12DescriptorHeap> heap;
     if (!check(d12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "create descriptor heap")) return 1;
+    D3D12_DESCRIPTOR_HEAP_DESC clear_heap_desc = heap_desc;
+    clear_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    ComPtr<ID3D12DescriptorHeap> clear_heap;
+    if (!check(d12->CreateDescriptorHeap(&clear_heap_desc, IID_PPV_ARGS(&clear_heap)), "create clear descriptor heap")) return 1;
     const UINT descriptor_size = d12->GetDescriptorHandleIncrementSize(heap_desc.Type);
     std::array<ComPtr<ID3D12Resource>, 4> output;
     std::array<ComPtr<ID3D12Resource>, 4> readback;
@@ -461,7 +482,7 @@ int main() {
       desc.SampleDesc.Count = 1;
       desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
       desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-      if (!check(d12->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&output[i])), "create output buffer")) return 1;
+      if (!check(d12->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&output[i])), "create output buffer")) return 1;
       props.Type = D3D12_HEAP_TYPE_READBACK;
       desc.Flags = D3D12_RESOURCE_FLAG_NONE;
       if (!check(d12->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback[i])), "create readback buffer")) return 1;
@@ -480,6 +501,9 @@ int main() {
       uav.Buffer.NumElements = sizes[i] / 4;
       uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
       d12->CreateUnorderedAccessView(output[i].Get(), nullptr, &uav, handle);
+      auto clear_handle = clear_heap->GetCPUDescriptorHandleForHeapStart();
+      clear_handle.ptr += static_cast<SIZE_T>(i) * descriptor_size;
+      d12->CreateUnorderedAccessView(output[i].Get(), nullptr, &uav, clear_handle);
     }
     std::array<ComPtr<ID3D12Resource>, 5> pixel_readback;
     std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 5> footprints = {};
@@ -667,9 +691,9 @@ int main() {
     list->SetDescriptorHeaps(1, heaps);
     constexpr UINT sentinel[] = {0xdeadbeefu, 0xdeadbeefu, 0xdeadbeefu, 0xdeadbeefu};
     for (UINT i = 0; i < 4; ++i) {
-      auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+      auto cpu = clear_heap->GetCPUDescriptorHandleForHeapStart();
       auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
-      cpu.ptr += static_cast<SIZE_T>(4 + i) * descriptor_size;
+      cpu.ptr += static_cast<SIZE_T>(i) * descriptor_size;
       gpu.ptr += static_cast<UINT64>(4 + i) * descriptor_size;
       list->ClearUnorderedAccessViewUint(gpu, cpu, output[i].Get(), sentinel, 0, nullptr);
       D3D12_RESOURCE_BARRIER barrier = {};
@@ -755,6 +779,442 @@ int main() {
       pixel_readback[i]->Unmap(0, nullptr);
       if (!match) return 1;
     }
+    if (width == 13u && height == 9u && scene_rows == 80u) {
+      struct SelectionInput { uint32_t x24; uint32_t count; std::array<uint32_t, 8> slots; };
+      struct SelectionOutput { uint32_t valid, index, c20, multiplicity; float pmf; };
+      static_assert(sizeof(SelectionInput) == 40u && sizeof(SelectionOutput) == 20u);
+      const std::array<SelectionInput, 9> selection_inputs = {{{0u, 3u, {0u, 0u, 1u, 1u, 1u, 2u, 2u, 2u}},
+          {(1u << 20) - 1u, 3u, {0u, 0u, 1u, 1u, 1u, 2u, 2u, 2u}},
+          {1u << 20, 3u, {0u, 0u, 1u, 1u, 1u, 2u, 2u, 2u}},
+          {(1u << 23) - 1u, 3u, {0u, 0u, 1u, 1u, 1u, 2u, 2u, 2u}},
+          {1u << 23, 3u, {0u, 0u, 1u, 1u, 1u, 2u, 2u, 2u}},
+          {(1u << 24) - 1u, 3u, {0u, 0u, 1u, 1u, 1u, 2u, 2u, 2u}},
+          {1u << 24, 3u, {}}, {0u, 0u, {}}, {0u, 2u, {0u, 0u, 0u, 0u, 0u, 0u, 0u, 2u}}}};
+      ComPtr<ID3D12PipelineState> selection_pso;
+      D3D12_COMPUTE_PIPELINE_STATE_DESC selection_pso_desc = {};
+      selection_pso_desc.pRootSignature = root.Get();
+      selection_pso_desc.CS = {__world_regir_selection_contract.data(), __world_regir_selection_contract.size()};
+      if (!check(d12->CreateComputePipelineState(&selection_pso_desc, IID_PPV_ARGS(&selection_pso)), "create ReGIR selection PSO")) return 1;
+      std::array<ComPtr<ID3D12Resource>, 3> selection_buffers;
+      const uint64_t selection_sizes[] = {sizeof(selection_inputs), sizeof(SelectionOutput) * selection_inputs.size(), sizeof(SelectionOutput) * selection_inputs.size()};
+      for (uint32_t i = 0u; i < 3u; ++i) {
+        D3D12_HEAP_PROPERTIES properties = {};
+        properties.Type = i == 0u ? D3D12_HEAP_TYPE_UPLOAD : (i == 1u ? D3D12_HEAP_TYPE_DEFAULT : D3D12_HEAP_TYPE_READBACK);
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = selection_sizes[i];
+        desc.Height = 1u; desc.DepthOrArraySize = 1u; desc.MipLevels = 1u; desc.SampleDesc.Count = 1u;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = i == 1u ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+        const D3D12_RESOURCE_STATES state = i == 0u ? D3D12_RESOURCE_STATE_GENERIC_READ : (i == 1u ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!check(d12->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&selection_buffers[i])), "create ReGIR selection buffer")) return 1;
+      }
+      void* mapped = nullptr;
+      if (!check(selection_buffers[0]->Map(0u, nullptr, &mapped), "map ReGIR selection input")) return 1;
+      std::memcpy(mapped, selection_inputs.data(), sizeof(selection_inputs));
+      selection_buffers[0]->Unmap(0u, nullptr);
+      ComPtr<ID3D12DescriptorHeap> selection_heap;
+      if (!check(d12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&selection_heap)), "create ReGIR selection heap")) return 1;
+      D3D12_SHADER_RESOURCE_VIEW_DESC selection_srv = {};
+      selection_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+      selection_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      selection_srv.Buffer.NumElements = static_cast<UINT>(selection_inputs.size());
+      selection_srv.Buffer.StructureByteStride = sizeof(SelectionInput);
+      auto selection_cpu = selection_heap->GetCPUDescriptorHandleForHeapStart();
+      d12->CreateShaderResourceView(selection_buffers[0].Get(), &selection_srv, selection_cpu);
+      selection_cpu.ptr += static_cast<SIZE_T>(4u) * descriptor_size;
+      D3D12_UNORDERED_ACCESS_VIEW_DESC selection_uav = {};
+      selection_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+      selection_uav.Buffer.NumElements = static_cast<UINT>(selection_inputs.size());
+      selection_uav.Buffer.StructureByteStride = sizeof(SelectionOutput);
+      d12->CreateUnorderedAccessView(selection_buffers[1].Get(), nullptr, &selection_uav, selection_cpu);
+      if (!check(allocator->Reset(), "reset ReGIR allocator") || !check(list->Reset(allocator.Get(), nullptr), "reset ReGIR list")) return 1;
+      ID3D12DescriptorHeap* selection_heaps[] = {selection_heap.Get()};
+      list->SetDescriptorHeaps(1u, selection_heaps);
+      list->SetComputeRootSignature(root.Get());
+      list->SetPipelineState(selection_pso.Get());
+      list->SetComputeRootDescriptorTable(1u, selection_heap->GetGPUDescriptorHandleForHeapStart());
+      list->Dispatch(1u, 1u, 1u);
+      D3D12_RESOURCE_BARRIER selection_barrier = {};
+      selection_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      selection_barrier.Transition.pResource = selection_buffers[1].Get();
+      selection_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      selection_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      selection_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+      list->ResourceBarrier(1u, &selection_barrier);
+      list->CopyBufferRegion(selection_buffers[2].Get(), 0u, selection_buffers[1].Get(), 0u, selection_sizes[1]);
+      if (!check(list->Close(), "close ReGIR selection list")) return 1;
+      queue->ExecuteCommandLists(1u, lists);
+      if (!check(queue->Signal(fence.Get(), 2u), "signal ReGIR selection")) return 1;
+      deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      while (fence->GetCompletedValue() < 2u && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      if (fence->GetCompletedValue() != 2u) return 1;
+      if (!check(selection_buffers[2]->Map(0u, nullptr, &mapped), "map ReGIR selection output")) return 1;
+      const auto* results = static_cast<const SelectionOutput*>(mapped);
+      for (size_t i = 0u; i < selection_inputs.size(); ++i) {
+        const auto expected = falcom_world::pt::PtReGirSelect(selection_inputs[i].x24, selection_inputs[i].count, selection_inputs[i].slots);
+        if (results[i].valid != static_cast<uint32_t>(expected.valid) || results[i].index != expected.light_index
+            || results[i].c20 != expected.c20 || results[i].multiplicity != expected.multiplicity
+            || std::abs(results[i].pmf - expected.pmf) > 1e-7) {
+          std::fprintf(stderr, "FAIL ReGIR GPU selection case %zu\n", i);
+          selection_buffers[2]->Unmap(0u, nullptr);
+          return 1;
+        }
+      }
+      selection_buffers[2]->Unmap(0u, nullptr);
+      std::printf("PASS ReGIR shared selector GPU mapping and PMF (tolerance 1e-7)\n");
+    }
+    if (width == 13u && !zero_lights) {
+      struct GpuCell {
+        int32_t key[3];
+        uint32_t valid;
+        uint32_t slots[8];
+      };
+      static_assert(sizeof(GpuCell) == 48);
+      static_assert(offsetof(GpuCell, key) == 0);
+      static_assert(offsetof(GpuCell, valid) == 12);
+      static_assert(offsetof(GpuCell, slots) == 16);
+      uint32_t header[4] = {1u, 0u, 0u, 1u};
+      GpuCell cell = {};
+      cell.valid = 1u;
+      std::fill(std::begin(cell.slots), std::end(cell.slots), 0u);
+      RtxdiLightTableEntry lights[2] = {};
+      lights[0].radius = 1.f;
+      lights[0].power = 1.f;
+      lights[0].type = RTXDI_LIGHT_TABLE_TYPE_POINT;
+      lights[1] = lights[0];
+      lights[1].power = 3.f;
+      constexpr UINT64 weight_bytes = RTXDI_LIGHT_TABLE_CAPACITY * sizeof(float);
+      const UINT64 sizes[] = {sizeof(header), sizeof(cell), sizeof(lights), weight_bytes, sizeof(cell), weight_bytes, sizeof(cell)};
+      std::array<ComPtr<ID3D12Resource>, 7> buffers;
+      for (UINT i = 0; i < buffers.size(); ++i) {
+        D3D12_HEAP_PROPERTIES properties = {};
+        properties.Type = i < 3 ? D3D12_HEAP_TYPE_UPLOAD : (i < 5 ? D3D12_HEAP_TYPE_DEFAULT : D3D12_HEAP_TYPE_READBACK);
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = sizes[i];
+        desc.Height = 1; desc.DepthOrArraySize = 1; desc.MipLevels = 1; desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = i == 3 || i == 4 ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+        const auto state = i < 3 ? D3D12_RESOURCE_STATE_GENERIC_READ : (i < 5 ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!check(d12->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&buffers[i])), "create ReGIR production buffer")) return 1;
+      }
+      std::array<ComPtr<ID3D12DescriptorHeap>, 2> heaps;
+      for (auto& fixture_heap : heaps) if (!check(d12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&fixture_heap)), "create ReGIR production heap")) return 1;
+      const auto srv = [&](UINT pass, UINT slot, UINT resource, UINT count, UINT stride) {
+        auto handle = heaps[pass]->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<SIZE_T>(slot) * descriptor_size;
+        D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+        desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc.Buffer.NumElements = count;
+        desc.Buffer.StructureByteStride = stride;
+        d12->CreateShaderResourceView(buffers[resource].Get(), &desc, handle);
+      };
+      const auto uav = [&](UINT pass, UINT resource, UINT count, UINT stride) {
+        auto handle = heaps[pass]->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<SIZE_T>(4) * descriptor_size;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
+        desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        desc.Buffer.NumElements = count;
+        desc.Buffer.StructureByteStride = stride;
+        d12->CreateUnorderedAccessView(buffers[resource].Get(), nullptr, &desc, handle);
+      };
+      srv(0, 0, 2, 2, sizeof(RtxdiLightTableEntry));
+      srv(0, 1, 0, 1, sizeof(header));
+      srv(0, 2, 1, 1, sizeof(cell));
+      uav(0, 3, RTXDI_LIGHT_TABLE_CAPACITY, sizeof(float));
+      srv(1, 0, 0, 1, sizeof(header));
+      srv(1, 1, 3, RTXDI_LIGHT_TABLE_CAPACITY, sizeof(float));
+      uav(1, 4, 1, sizeof(cell));
+      std::array<ComPtr<ID3D12PipelineState>, 2> pipelines;
+      D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc = {};
+      pipeline_desc.pRootSignature = root.Get();
+      pipeline_desc.CS = {__world_regir_weights.data(), __world_regir_weights.size()};
+      if (!check(d12->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&pipelines[0])), "create ReGIR weights PSO")) return 1;
+      pipeline_desc.CS = {__world_regir_build.data(), __world_regir_build.size()};
+      if (!check(d12->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&pipelines[1])), "create ReGIR build PSO")) return 1;
+      const char* case_names[] = {"two-light", "reordered two-light", "zero-light", "invalid-header", "all-zero/invalid-light", "over-capacity-count"};
+      float original_weights[2] = {};
+      for (UINT fixture_case = 0; fixture_case < 6; ++fixture_case) {
+        if (fixture_case == 1) std::swap(lights[0], lights[1]);
+        if (fixture_case == 3) header[3] = 0u;
+        if (fixture_case == 4) {
+          header[3] = 1u;
+          lights[0].power = 0.f;
+          lights[1].radius = 0.f;
+        }
+        if (fixture_case == 5) {
+          header[3] = 1u;
+          for (auto& light : lights) {
+            light = {};
+            light.radius = 1.f;
+            light.power = 1.f;
+            light.type = RTXDI_LIGHT_TABLE_TYPE_POINT;
+          }
+        }
+        const void* initial[] = {header, &cell, lights};
+        for (UINT i = 0; i < 3; ++i) {
+          void* mapped = nullptr;
+          if (!check(buffers[i]->Map(0, nullptr, &mapped), "map ReGIR fixture")) return 1;
+          std::memcpy(mapped, initial[i], static_cast<size_t>(sizes[i]));
+          buffers[i]->Unmap(0, nullptr);
+        }
+      if (!check(allocator->Reset(), "reset ReGIR production allocator") || !check(list->Reset(allocator.Get(), nullptr), "reset ReGIR production list")) return 1;
+      if (fixture_case != 0) {
+        D3D12_RESOURCE_BARRIER reset_barriers[2] = {};
+        for (UINT index = 0; index < 2; ++index) {
+          reset_barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          reset_barriers[index].Transition.pResource = buffers[3 + index].Get();
+          reset_barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          reset_barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+          reset_barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+        list->ResourceBarrier(2, reset_barriers);
+      }
+      D3D12_RESOURCE_BARRIER initial_barrier = {};
+      initial_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      initial_barrier.Transition.pResource = buffers[4].Get();
+      initial_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      initial_barrier.Transition.StateBefore = fixture_case == 0 ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      initial_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+      list->ResourceBarrier(1, &initial_barrier);
+      list->CopyBufferRegion(buffers[4].Get(), 0, buffers[1].Get(), 0, sizes[1]);
+      initial_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      initial_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      list->ResourceBarrier(1, &initial_barrier);
+      list->SetComputeRootSignature(root.Get());
+      const uint32_t params[2] = {fixture_case == 2 ? 0u : (fixture_case == 5 ? RTXDI_LIGHT_TABLE_CAPACITY + 1u : 2u), 1u};
+      list->SetComputeRoot32BitConstants(0, 2, params, 0);
+      ID3D12DescriptorHeap* active_heap[] = {heaps[0].Get()};
+      list->SetDescriptorHeaps(1, active_heap);
+      list->SetComputeRootDescriptorTable(1, heaps[0]->GetGPUDescriptorHandleForHeapStart());
+      list->SetPipelineState(pipelines[0].Get());
+      list->Dispatch(16, 1, 1);
+      D3D12_RESOURCE_BARRIER barrier = {};
+      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barrier.Transition.pResource = buffers[3].Get();
+      barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      list->ResourceBarrier(1, &barrier);
+      active_heap[0] = heaps[1].Get();
+      list->SetDescriptorHeaps(1, active_heap);
+      list->SetComputeRootDescriptorTable(1, heaps[1]->GetGPUDescriptorHandleForHeapStart());
+      list->SetPipelineState(pipelines[1].Get());
+      list->Dispatch(1, 1, 1);
+      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+      list->ResourceBarrier(1, &barrier);
+      barrier.Transition.pResource = buffers[4].Get();
+      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      list->ResourceBarrier(1, &barrier);
+      list->CopyBufferRegion(buffers[5].Get(), 0, buffers[3].Get(), 0, sizes[3]);
+      list->CopyBufferRegion(buffers[6].Get(), 0, buffers[4].Get(), 0, sizes[4]);
+      if (!check(list->Close(), "close ReGIR production list")) return 1;
+      queue->ExecuteCommandLists(1, lists);
+      const UINT64 production_fence = 3u + fixture_case;
+      if (!check(queue->Signal(fence.Get(), production_fence), "signal ReGIR production")) return 1;
+      deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      while (fence->GetCompletedValue() < production_fence && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      if (fence->GetCompletedValue() < production_fence || fence->GetCompletedValue() == UINT64_MAX) return 1;
+      void* mapped = nullptr;
+      if (!check(buffers[5]->Map(0, nullptr, &mapped), "map ReGIR weights")) return 1;
+      const auto* weights = static_cast<const float*>(mapped);
+      bool weights_ok = std::isfinite(weights[0]) && std::isfinite(weights[1]);
+      if (fixture_case == 0) {
+        weights_ok = weights_ok && weights[0] > 0.f && weights[1] > weights[0];
+        original_weights[0] = weights[0];
+        original_weights[1] = weights[1];
+      } else if (fixture_case == 1) {
+        weights_ok = weights_ok && weights[0] == original_weights[1] && weights[1] == original_weights[0];
+      } else if (fixture_case == 5) {
+        weights_ok = weights_ok && weights[0] > 0.f && weights[1] > 0.f;
+      } else {
+        weights_ok = weights_ok && weights[0] == 0.f && weights[1] == 0.f;
+      }
+      const float current_weights[2] = {weights[0], weights[1]};
+      buffers[5]->Unmap(0, nullptr);
+      if (!check(buffers[6]->Map(0, nullptr, &mapped), "map ReGIR cells")) return 1;
+      const auto* result = static_cast<const GpuCell*>(mapped);
+      bool cells_ok = result->valid == (fixture_case < 2 ? 1u : 0u);
+      for (uint32_t slot : result->slots) {
+        cells_ok = cells_ok && (fixture_case < 2 ? (slot < 2 && current_weights[slot] > 0.f) : slot == RTXDI_LIGHT_TABLE_INVALID_INDEX);
+      }
+      buffers[6]->Unmap(0, nullptr);
+      if (!weights_ok || !cells_ok) {
+        std::fprintf(stderr, "FAIL ReGIR production %s GPU readback\n", case_names[fixture_case]);
+        return 1;
+      }
+      std::printf("PASS ReGIR production %s GPU readback\n", case_names[fixture_case]);
+      }
+    }
+    if ((width == 13u && !zero_lights) || (width == 1920u && !local)) {
+      const float boundary_positions[] = {-1048576.f, 1048575.875f, 1048576.f, -4.001f, -4.f, 3.999f, 4.f};
+      const UINT case_count = width == 13u ? 8u : 1u;
+      for (UINT fixture_case = 0; fixture_case < case_count; ++fixture_case) {
+      const bool overflow_case = width != 13u;
+      const bool boundary_case = !overflow_case && fixture_case != 0u;
+      std::vector<float> depth(width * height, 0.5f);
+      if (!overflow_case && !boundary_case) depth[0] = 0.f;
+      std::vector<std::array<uint32_t, 4>> normal(width * height, {32768u, 32768u, 0u, 0u});
+      std::array<std::array<uint32_t, 4>, 96> fixture_scene = {};
+      const auto set_float = [&](UINT row, UINT column, float value) { std::memcpy(&fixture_scene[row][column], &value, sizeof(value)); };
+      for (UINT axis = 0; axis < 4; ++axis) {
+        set_float(axis, axis, axis == 2 ? -1.f : 1.f);
+        set_float(20 + axis, axis, 1.f);
+      }
+      if (boundary_case) {
+        set_float(20, 0, 0.f);
+        set_float(20, 3, boundary_positions[fixture_case - 1u]);
+        set_float(21, 1, 0.f);
+      } else if (overflow_case) {
+        set_float(20, 0, 8192.f);
+        set_float(21, 1, 8192.f);
+      }
+      set_float(6, 3, 3.f);
+      set_float(49, 0, 1.f);
+      set_float(49, 1, 1.f);
+      ctx->UpdateSubresource(carriers[0].texture11.Get(), 0, nullptr, depth.data(), width * sizeof(float), 0);
+      ctx->UpdateSubresource(carriers[1].texture11.Get(), 0, nullptr, normal.data(), width * 16u, 0);
+      ctx->UpdateSubresource(carriers[5].texture11.Get(), 0, nullptr, fixture_scene.data(), 96u * 16u, 0);
+      D3D11_QUERY_DESC query_desc = {D3D11_QUERY_EVENT, 0};
+      ComPtr<ID3D11Query> upload_complete;
+      if (!check(d11->CreateQuery(&query_desc, &upload_complete), "create registration upload query")) return 1;
+      ctx->End(upload_complete.Get());
+      ctx->Flush();
+      deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      HRESULT upload_status = S_FALSE;
+      while ((upload_status = ctx->GetData(upload_complete.Get(), nullptr, 0, 0)) == S_FALSE
+             && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      if (upload_status != S_OK) {
+        std::fprintf(stderr, "FAIL registration upload synchronization: 0x%08lx\n", static_cast<unsigned long>(upload_status));
+        return 1;
+      }
+      constexpr UINT cell_stride = 48u;
+      const UINT64 bytes[] = {16u, 256u * cell_stride, 16u, 256u * cell_stride};
+      std::array<ComPtr<ID3D12Resource>, 4> fixture_buffers;
+      for (UINT index = 0; index < fixture_buffers.size(); ++index) {
+        D3D12_HEAP_PROPERTIES properties = {};
+        properties.Type = index < 2 ? D3D12_HEAP_TYPE_DEFAULT : D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = bytes[index]; desc.Height = 1; desc.DepthOrArraySize = 1; desc.MipLevels = 1; desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = index < 2 ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+        if (!check(d12->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc,
+                    index < 2 ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr, IID_PPV_ARGS(&fixture_buffers[index])), "create ReGIR registration buffer")) return 1;
+      }
+      ComPtr<ID3D12DescriptorHeap> fixture_heap;
+      if (!check(d12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&fixture_heap)), "create ReGIR registration heap")) return 1;
+      const UINT texture_indices[] = {0u, 1u, 5u};
+      for (UINT index = 0; index < 3; ++index) {
+        auto handle = fixture_heap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<SIZE_T>(index) * descriptor_size;
+        D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+        desc.Format = index == 0 ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
+        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc.Texture2D.MipLevels = 1;
+        d12->CreateShaderResourceView(carriers[texture_indices[index]].texture12.Get(), &desc, handle);
+      }
+      for (UINT index = 0; index < 2; ++index) {
+        auto handle = fixture_heap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<SIZE_T>(4u + index) * descriptor_size;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
+        desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        desc.Buffer.NumElements = index == 0 ? 1u : 256u;
+        desc.Buffer.StructureByteStride = index == 0 ? 16u : cell_stride;
+        d12->CreateUnorderedAccessView(fixture_buffers[index].Get(), nullptr, &desc, handle);
+      }
+      D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+      desc.pRootSignature = root.Get();
+      desc.CS = {__world_regir_register.data(), __world_regir_register.size()};
+      ComPtr<ID3D12PipelineState> fixture_pipeline;
+      if (!check(d12->CreateComputePipelineState(&desc, IID_PPV_ARGS(&fixture_pipeline)), "create ReGIR registration PSO")
+          || !check(allocator->Reset(), "reset registration allocator") || !check(list->Reset(allocator.Get(), nullptr), "reset registration list")) return 1;
+      ID3D12DescriptorHeap* fixture_heaps[] = {fixture_heap.Get()};
+      list->SetDescriptorHeaps(1, fixture_heaps);
+      list->SetComputeRootSignature(root.Get());
+      const UINT size[] = {width, height};
+      list->SetComputeRoot32BitConstants(0, 2, size, 0);
+      list->SetComputeRootDescriptorTable(1, fixture_heap->GetGPUDescriptorHandleForHeapStart());
+      list->SetPipelineState(fixture_pipeline.Get());
+      list->Dispatch(1, 1, 1);
+      for (UINT index = 0; index < 2; ++index) {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = fixture_buffers[index].Get();
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        list->ResourceBarrier(1, &barrier);
+        list->CopyBufferRegion(fixture_buffers[index + 2].Get(), 0, fixture_buffers[index].Get(), 0, bytes[index]);
+      }
+      if (!check(list->Close(), "close registration list")) return 1;
+      queue->ExecuteCommandLists(1, lists);
+      const UINT64 registration_fence = 9u + fixture_case;
+      if (!check(queue->Signal(fence.Get(), registration_fence), "signal registration")) return 1;
+      deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      while (fence->GetCompletedValue() < registration_fence && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      if (fence->GetCompletedValue() < registration_fence) return 1;
+      void* mapped = nullptr;
+      if (!check(fixture_buffers[2]->Map(0, nullptr, &mapped), "map registration header")) return 1;
+      const auto* header = static_cast<const uint32_t*>(mapped);
+      const bool rejected_boundary = boundary_case && fixture_case == 3u;
+      const UINT expected_count = overflow_case ? 256u : (boundary_case ? (rejected_boundary ? 0u : 1u) : 4u);
+      const UINT expected_rejected = rejected_boundary ? width * height : (boundary_case || overflow_case ? 0u : 1u);
+      const UINT expected_overflow = overflow_case ? 4096u - 256u : 0u;
+      const bool valid_header = header[0] == expected_count && header[1] == expected_rejected
+                                && header[2] == expected_overflow && header[3] == 1u;
+      if (!valid_header) std::fprintf(stderr, "FAIL registration case %u header %u %u %u %u expected %u %u %u 1\n",
+                                      fixture_case, header[0], header[1], header[2], header[3],
+                                      expected_count, expected_rejected, expected_overflow);
+      fixture_buffers[2]->Unmap(0, nullptr);
+      if (!check(fixture_buffers[3]->Map(0, nullptr, &mapped), "map registration cells")) return 1;
+      const auto* words = static_cast<const int32_t*>(mapped);
+      bool keys[2][2] = {};
+      bool valid_keys = true;
+      for (UINT index = 0; index < expected_count; ++index) {
+        const int32_t x = words[index * 12], y = words[index * 12 + 1], z = words[index * 12 + 2];
+        if (overflow_case) {
+          const uint64_t pixel = uint64_t(width) * height * index / 4096u;
+          const float uv_x = (static_cast<float>(pixel % width) + 0.5f) / static_cast<float>(width);
+          const float uv_y = (static_cast<float>(pixel / width) + 0.5f) / static_cast<float>(height);
+          const int32_t expected_x = static_cast<int32_t>(std::floor((uv_x * 2.f - 1.f) * 2048.f));
+          const int32_t expected_y = static_cast<int32_t>(std::floor((1.f - uv_y * 2.f) * 2048.f));
+          if (x != expected_x || y != expected_y || z != 0) {
+            std::fprintf(stderr, "FAIL registration overflow key %u: %d %d %d expected %d %d 0\n", index, x, y, z, expected_x, expected_y);
+            valid_keys = false;
+          }
+        } else if (boundary_case) {
+          const int32_t expected_x = static_cast<int32_t>(std::floor(boundary_positions[fixture_case - 1u] / 4.f));
+          if (x != expected_x || y != 0 || z != 0) valid_keys = false;
+        } else if (x < -1 || x > 0 || y < -1 || y > 0 || z != 0 || keys[x + 1][y + 1]) valid_keys = false;
+        else keys[x + 1][y + 1] = true;
+      }
+      fixture_buffers[3]->Unmap(0, nullptr);
+      if (!valid_header || !valid_keys) {
+        std::fprintf(stderr, "FAIL ReGIR production registration readback header=%u keys=%u\n", valid_header, valid_keys);
+        return 1;
+      }
+      std::printf("PASS ReGIR production registration %s case %u\n", overflow_case ? "256-cell overflow" : (boundary_case ? "boundary and same-cell dedup" : "reconstruction and rejection"), fixture_case);
+      }
+    }
+    const UINT64 message_count = info_queue->GetNumStoredMessagesAllowedByRetrievalFilter();
+    for (UINT64 index = 0; index < message_count; ++index) {
+      SIZE_T size = 0;
+      if (!check(info_queue->GetMessage(index, nullptr, &size), "size D3D12 message")) return 1;
+      std::vector<uint8_t> storage(size);
+      auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+      if (!check(info_queue->GetMessage(index, message, &size), "read D3D12 message")) return 1;
+      if (message->Severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
+        std::fprintf(stderr, "FAIL D3D12 InfoQueue: %s\n", message->pDescription);
+        return 1;
+      }
+    }
+    std::printf("PASS D3D12 producer InfoQueue clean (%llu messages)\n", static_cast<unsigned long long>(message_count));
     std::printf("PASS %ux%u local=%u zero_lights=%u scene_rows=%u motion=absent tail=zero\n", width, height,
                 static_cast<int>(local), static_cast<int>(zero_lights), scene_rows);
   }

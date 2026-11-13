@@ -108,6 +108,14 @@ struct PtPanel {
   uint64_t mat_clears = 0u;
   const char* mat_clear_reason = "none";
   bool refl_on = false;
+  bool regir_requested = false, regir_active = false;
+  const char* regir_fallback_reason = "off";
+  uint32_t regir_frame = UINT32_MAX, regir_transfer_slot = UINT32_MAX, regir_light_count = 0u;
+  uint64_t regir_owner_generation = 0u, regir_transfer_configuration = 0u;
+  uint64_t regir_source_fence = 0u, regir_build_fence = 0u, regir_last_use_fence = 0u;
+  bool regir_counts_available = false;
+  uint32_t regir_counts_frame = 0u, regir_cell_count = 0u, regir_rejected_count = 0u, regir_overflow_count = 0u, regir_valid_count = 0u;
+  uint64_t regir_counts_fence = 0u, regir_counts_generation = 0u;
   bool water_on = false;
   uint32_t gpu_water_pixels = 0u, gpu_water_traces = 0u;
   const char* water_reason = "off";

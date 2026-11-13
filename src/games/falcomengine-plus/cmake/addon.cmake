@@ -31,6 +31,11 @@ target_sources(falcom-rtxdi-bridge PRIVATE
 target_sources(falcom-rtxdi-bridge PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_hitdistance.h")
 target_sources(falcom-rtxdi-bridge PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_regir_register.h"
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_regir_weights.h"
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_regir_build.h"
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_regir_selection_contract.h")
+target_sources(falcom-rtxdi-bridge PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_sampling_contract.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_coverage_contract.h")
 target_sources(falcomengine-plus PRIVATE

@@ -77,7 +77,26 @@ inline std::string SerializePtReport() {
   out << "gpu_available: " << p.gpu_available << "\n";
   out << "material cell scale: " << g_pt_material_cell_scale << "\n";
   out << "samples: " << g_pt_samples << "\n";
-  out << "regir requested: " << g_pt_regir_enabled << "\n";
+  out << "regir requested: " << p.regir_requested << "\n";
+  out << "regir active: " << p.regir_active << "\n";
+  out << "regir uniform fallback: " << p.regir_fallback_reason << "\n";
+  out << "regir owner generation: " << p.regir_owner_generation << "\n";
+  out << "regir transfer configuration: " << p.regir_transfer_configuration << "\n";
+  out << "regir counts available: " << p.regir_counts_available << "\n";
+  if (p.regir_counts_available) {
+    out << "regir counts frame: " << p.regir_counts_frame << "\n";
+    out << "regir counts completion fence: " << p.regir_counts_fence << "\n";
+    out << "regir registered cells: " << p.regir_cell_count << "\n";
+    out << "regir rejected positions: " << p.regir_rejected_count << "\n";
+    out << "regir overflow positions: " << p.regir_overflow_count << "\n";
+    out << "regir valid cells: " << p.regir_valid_count << "\n";
+  }
+  out << "regir source frame: " << p.regir_frame << "\n";
+  out << "regir transfer slot: " << p.regir_transfer_slot << "\n";
+  out << "regir lamp count: " << p.regir_light_count << "\n";
+  out << "regir source table fence: " << p.regir_source_fence << "\n";
+  out << "regir build fence: " << p.regir_build_fence << "\n";
+  out << "regir last-use fence: " << p.regir_last_use_fence << "\n";
   out << "max bounces: " << g_pt_max_bounces << "\n";
   out << "russian roulette: " << g_pt_russian_roulette << "\n";
   out << "roulette min bounce: " << g_pt_roulette_min_bounce << "\n";

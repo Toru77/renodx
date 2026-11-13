@@ -2183,7 +2183,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "ReGIR",
       .section = "Path Tracing",
-      .tooltip = "Reserved for ReGIR light sampling; inactive until the complete cell-pool path is implemented.",
+      .tooltip = "Builds primary-surface light pools for matching path-traced hits; unmatched hits use uniform sampling.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });

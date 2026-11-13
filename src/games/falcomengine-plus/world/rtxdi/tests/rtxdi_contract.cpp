@@ -1782,7 +1782,7 @@ int main() {
     const std::array<uint32_t, 8> first_draws = {0u, (1u << 30) - 1u, 1u << 30, UINT32_MAX, 0u, 1u << 30, UINT32_MAX, 1u};
     std::copy(first_draws.begin(), first_draws.end(), draws.begin());
     std::array<std::array<float, 3>, 1> origin = {{{0.f, 0.f, 0.f}}};
-    PtReGirBuild build = {};
+    static PtReGirBuild build = {};
     if (BuildPtReGirReference(identity, origin, lights, draws, nullptr)
         || !BuildPtReGirReference(identity, origin, lights, draws, &build)
         || !PtReGirIdentityMatches(build, identity) || build.cell_count != 1u || !build.cells[0].valid) return EXIT_FAILURE;
@@ -1816,7 +1816,7 @@ int main() {
         || BuildPtReGirReference(identity, origin, std::span(lights).first(1), draws, &build)
         || build.valid || build.cell_count != 0u || build.cells[0].slots[0].light_index != RTXDI_LIGHT_TABLE_INVALID_INDEX
         || BuildPtReGirReference(identity, origin, lights, std::span(draws).first(draws.size() - 1), &build)) return EXIT_FAILURE;
-    std::array<std::array<float, 3>, kPtReGirMaxPositions + 1> too_many = {};
+    static std::array<std::array<float, 3>, kPtReGirMaxPositions + 1> too_many = {};
     if (BuildPtReGirReference(identity, too_many, lights, draws, &build) || build.valid) return EXIT_FAILURE;
     const std::array<std::array<float, 3>, 10> boundaries = {{{-0.001f, 0.f, 0.f}, {-4.f, 0.f, 0.f},
         {-4.001f, 0.f, 0.f}, {0.f, 0.f, 0.f}, {4.f, 0.f, 0.f}, {-1048576.f, 0.f, 0.f},
@@ -1849,6 +1849,71 @@ int main() {
     bad_lights[1].position[1] = infinity;
     if (!BuildPtReGirReference(identity, origin, bad_lights, draws, &build) || build.cells[0].valid) return EXIT_FAILURE;
     std::printf("PASS ReGIR CPU bounded staging contract\n");
+  }
+  {
+    using namespace falcom_world::pt;
+    constexpr uint32_t domain20 = 1u << 20;
+    constexpr uint32_t domain24 = 1u << 24;
+    const std::array<uint32_t, 9> counts = {1u, 2u, 3u, 7u, 8u, 31u, 256u, 1000u, 1024u};
+    for (uint32_t count : counts) {
+      std::array<uint32_t, RTXDI_LIGHT_TABLE_CAPACITY> buckets = {};
+      const std::array<uint32_t, 8> slots = {};
+      for (uint32_t draw = 0; draw < domain20; ++draw) {
+        const auto selection = PtReGirSelect((1u << 23) | draw, count, slots);
+        if (!selection.valid || selection.light_index >= count) return EXIT_FAILURE;
+        ++buckets[selection.light_index];
+      }
+      uint32_t total = 0;
+      for (uint32_t index = 0; index < count; ++index) {
+        const uint32_t draw = static_cast<uint32_t>((static_cast<uint64_t>(index) * domain20 + count - 1u) / count);
+        const auto selection = PtReGirSelect((1u << 23) | draw, count, slots);
+        if (selection.light_index != index || buckets[index] == 0 || buckets[index] != selection.c20) return EXIT_FAILURE;
+        total += buckets[index];
+      }
+      if (total != domain20) return EXIT_FAILURE;
+    }
+    const std::array<uint32_t, 8> single_pool = {};
+    for (uint32_t draw = 0; draw < domain24; ++draw) {
+      const auto selection = PtReGirSelect(draw, 1u, single_pool);
+      if (!selection.valid || selection.light_index != 0u || selection.c20 != domain20
+          || selection.multiplicity != 8u || selection.pmf != 1.0) return EXIT_FAILURE;
+    }
+    const std::array<std::array<uint32_t, 8>, 2> pools = {{{0u, 0u, 1u, 1u, 1u, 2u, 2u, 2u},
+                                                           {2u, 2u, 1u, 1u, 1u, 0u, 0u, 0u}}};
+    for (size_t pool_index = 0; pool_index < pools.size(); ++pool_index) {
+      const auto& slots = pools[pool_index];
+      std::array<uint32_t, 3> observed = {};
+      std::array<uint32_t, 3> branches = {};
+      for (uint32_t draw = 0; draw < domain24; ++draw) {
+        const auto selection = PtReGirSelect(draw, 3u, slots);
+        if (!selection.valid || selection.light_index >= observed.size()) return EXIT_FAILURE;
+        ++observed[selection.light_index];
+        if ((draw & (1u << 23)) == 0) ++branches[selection.light_index];
+      }
+      const std::array<std::array<double, 3>, 2> reordered_contributions = {{{2.5, 0.0, 0.0}, {0.0, 0.0, 2.5}}};
+      const auto& contributions = reordered_contributions[pool_index];
+      double expected = 0.0;
+      double sum = 0.0;
+      for (uint32_t index = 0; index < 3u; ++index) {
+        const uint32_t draw = static_cast<uint32_t>((static_cast<uint64_t>(index) * domain20 + 2u) / 3u);
+        const auto selection = PtReGirSelect((1u << 23) | draw, 3u, slots);
+        if (branches[index] != selection.multiplicity * domain20
+            || observed[index] != branches[index] + 8u * selection.c20
+            || selection.pmf != static_cast<double>(observed[index]) / domain24) return EXIT_FAILURE;
+        expected += selection.pmf * (contributions[index] / selection.pmf);
+        sum += contributions[index];
+      }
+      if (std::abs(expected - sum) > 1e-12) return EXIT_FAILURE;
+      for (uint32_t slot = 0; slot < 8u; ++slot) {
+        if (PtReGirSelect(slot * domain20, 3u, slots).light_index != slots[slot]
+            || PtReGirSelect((slot + 1u) * domain20 - 1u, 3u, slots).light_index != slots[slot]) return EXIT_FAILURE;
+      }
+      if (PtReGirSelect(domain24 - 1u, 3u, slots).light_index != 2u
+          || PtReGirSelect(domain24, 3u, slots).valid || PtReGirSelect(0u, 0u, slots).valid
+          || PtReGirSelect(0u, RTXDI_LIGHT_TABLE_CAPACITY + 1u, slots).valid
+          || PtReGirSelect(0u, 2u, slots).valid) return EXIT_FAILURE;
+    }
+    std::printf("PASS ReGIR CPU finite-domain mixture and estimator contract\n");
   }
   return EXIT_SUCCESS;
 }

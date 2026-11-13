@@ -94,11 +94,11 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     hr = r.water_list->Close();
     if (FAILED(hr)) return fail("pt water close", hr);
     // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u7 | t40, descriptor order 0..26.
-    const UINT counts[9] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 4u, 1u};
-    const UINT bases[9] = {0u, 14u, 29u, 30u, 31u, 0u, 36u, 4u, 40u};
-    const UINT offsets[9] = {0u, 4u, 7u, 8u, 9u, 14u, 18u, 22u, 26u};
-    D3D12_DESCRIPTOR_RANGE ranges[9] = {};
-    for (uint32_t i = 0u; i < 9u; ++i) {
+    const UINT counts[10] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 4u, 1u, 2u};
+    const UINT bases[10] = {0u, 14u, 29u, 30u, 31u, 0u, 36u, 4u, 40u, 41u};
+    const UINT offsets[10] = {0u, 4u, 7u, 8u, 9u, 14u, 18u, 22u, 26u, 27u};
+    D3D12_DESCRIPTOR_RANGE ranges[10] = {};
+    for (uint32_t i = 0u; i < 10u; ++i) {
       ranges[i].RangeType = (i == 5u || i == 7u) ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
       ranges[i].NumDescriptors = counts[i];
       ranges[i].BaseShaderRegister = bases[i];
@@ -108,7 +108,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.Num32BitValues = kRt12PtConstants;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable.NumDescriptorRanges = 9u;
+    params[1].DescriptorTable.NumDescriptorRanges = 10u;
     params[1].DescriptorTable.pDescriptorRanges = ranges;
     D3D12_ROOT_SIGNATURE_DESC root_desc = {};
     root_desc.NumParameters = 2u;
@@ -136,6 +136,83 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
 #else
     return fail("pt shader not embedded", E_FAIL);
 #endif
+    const bool regir_created = [&]() {
+    D3D12_DESCRIPTOR_RANGE regir_ranges[2] = {};
+    regir_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    regir_ranges[0].NumDescriptors = 3u;
+    regir_ranges[0].OffsetInDescriptorsFromTableStart = 0u;
+    regir_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    regir_ranges[1].NumDescriptors = 2u;
+    regir_ranges[1].OffsetInDescriptorsFromTableStart = 3u;
+    D3D12_ROOT_PARAMETER regir_params[2] = {};
+    regir_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    regir_params[0].Constants.Num32BitValues = kRt12ReGirConstants;
+    regir_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    regir_params[1].DescriptorTable.NumDescriptorRanges = 2u;
+    regir_params[1].DescriptorTable.pDescriptorRanges = regir_ranges;
+    D3D12_ROOT_SIGNATURE_DESC regir_desc = {};
+    regir_desc.NumParameters = 2u;
+    regir_desc.pParameters = regir_params;
+    hr = s.serialize(&regir_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
+    if (FAILED(hr)) return false;
+    hr = s.device12->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&r.regir_root));
+    if (FAILED(hr)) return false;
+#if defined(__world_regir_register_EMBED_FILE) && defined(__world_regir_weights_EMBED_FILE) && defined(__world_regir_build_EMBED_FILE)
+    D3D12_COMPUTE_PIPELINE_STATE_DESC regir_pso_desc = {};
+    regir_pso_desc.pRootSignature = r.regir_root.Get();
+    regir_pso_desc.CS = {__world_regir_register.data(), __world_regir_register.size()};
+    hr = s.device12->CreateComputePipelineState(&regir_pso_desc, IID_PPV_ARGS(&r.regir_register_pso));
+    if (FAILED(hr)) return false;
+    regir_pso_desc.CS = {__world_regir_weights.data(), __world_regir_weights.size()};
+    hr = s.device12->CreateComputePipelineState(&regir_pso_desc, IID_PPV_ARGS(&r.regir_weights_pso));
+    if (FAILED(hr)) return false;
+    regir_pso_desc.CS = {__world_regir_build.data(), __world_regir_build.size()};
+    hr = s.device12->CreateComputePipelineState(&regir_pso_desc, IID_PPV_ARGS(&r.regir_build_pso));
+    if (FAILED(hr)) return false;
+#else
+    return false;
+#endif
+    D3D12_DESCRIPTOR_HEAP_DESC regir_heap_desc = {};
+    regir_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    regir_heap_desc.NumDescriptors = kRt12Slots * kRt12ReGirPasses * kRt12ReGirDescriptors;
+    regir_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = s.device12->CreateDescriptorHeap(&regir_heap_desc, IID_PPV_ARGS(&r.regir_heap));
+    if (FAILED(hr)) return false;
+    for (uint32_t i = 0u; i < kRt12Slots; ++i) {
+      hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, kRt12ReGirHeaderStride, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, r.regir_header[i]);
+      if (FAILED(hr)) return false;
+      hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, pt::kPtReGirMaxCells * kRt12ReGirCellStride, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, r.regir_cells[i]);
+      if (FAILED(hr)) return false;
+      hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT,
+                            pt::kPtReGirMaxCells * RTXDI_LIGHT_TABLE_CAPACITY * sizeof(float), D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, r.regir_weights[i]);
+      if (FAILED(hr)) return false;
+      if (SUCCEEDED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_READBACK, kRt12ReGirHeaderStride,
+                                     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, r.regir_header_readback[i]))) {
+        if (FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_READBACK, pt::kPtReGirMaxCells * kRt12ReGirCellStride,
+                                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, r.regir_cells_readback[i]))) {
+          r.regir_header_readback[i].Reset();
+        }
+      }
+    }
+      return true;
+    }();
+    if (!regir_created) {
+      r.regir_root.Reset();
+      r.regir_register_pso.Reset();
+      r.regir_weights_pso.Reset();
+      r.regir_build_pso.Reset();
+      r.regir_heap.Reset();
+      for (uint32_t i = 0u; i < kRt12Slots; ++i) {
+        r.regir_header[i].Reset();
+        r.regir_cells[i].Reset();
+        r.regir_weights[i].Reset();
+        r.regir_header_readback[i].Reset();
+        r.regir_cells_readback[i].Reset();
+      }
+    }
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.NumDescriptors = 2u * kRt12Slots * kRt12PtDescriptors;  // main blocks, then water blocks
@@ -168,6 +245,44 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   // 2b. GPU counters: a slot's counters are read once its submission's fence is complete. Never waits.
   const uint64_t completed = Rt12CompletedValue(s);
+  {
+    std::lock_guard lock(pt::g_pt_panel_mutex);
+    if (pt::g_pt_panel.regir_counts_generation != s.generation) pt::g_pt_panel.regir_counts_available = false;
+  }
+  for (uint32_t i = 0u; i < kRt12Slots; ++i) {
+    if (!r.regir_counts_pending[i] || r.regir_counts_fence[i] > completed) continue;
+    void* header_data = nullptr;
+    const D3D12_RANGE header_range = {0u, kRt12ReGirHeaderStride};
+    if (FAILED(r.regir_header_readback[i]->Map(0u, &header_range, &header_data))) continue;
+    void* cells_data = nullptr;
+    const D3D12_RANGE cells_range = {0u, pt::kPtReGirMaxCells * kRt12ReGirCellStride};
+    const HRESULT cells_result = r.regir_cells_readback[i]->Map(0u, &cells_range, &cells_data);
+    if (SUCCEEDED(cells_result) && header_data && cells_data) {
+      const auto* header_values = static_cast<const uint32_t*>(header_data);
+      const auto* cell_values = static_cast<const uint32_t*>(cells_data);
+      const uint32_t cell_count = (std::min)(header_values[0], pt::kPtReGirMaxCells);
+      uint32_t valid_count = 0u;
+      for (uint32_t cell = 0u; cell < cell_count; ++cell) {
+        valid_count += cell_values[cell * (kRt12ReGirCellStride / sizeof(uint32_t)) + 3u] != 0u ? 1u : 0u;
+      }
+      std::lock_guard lock(pt::g_pt_panel_mutex);
+      if (!pt::g_pt_panel.regir_counts_available || pt::g_pt_panel.regir_counts_generation != s.generation
+          || r.regir_counts_fence[i] > pt::g_pt_panel.regir_counts_fence) {
+        pt::g_pt_panel.regir_counts_available = true;
+        pt::g_pt_panel.regir_counts_generation = s.generation;
+        pt::g_pt_panel.regir_counts_frame = r.regir_counts_frame[i];
+        pt::g_pt_panel.regir_counts_fence = r.regir_counts_fence[i];
+        pt::g_pt_panel.regir_cell_count = header_values[0];
+        pt::g_pt_panel.regir_rejected_count = header_values[1];
+        pt::g_pt_panel.regir_overflow_count = header_values[2];
+        pt::g_pt_panel.regir_valid_count = valid_count;
+      }
+      r.regir_counts_pending[i] = false;
+    }
+    const D3D12_RANGE no_writes = {0u, 0u};
+    if (SUCCEEDED(cells_result)) r.regir_cells_readback[i]->Unmap(0u, &no_writes);
+    r.regir_header_readback[i]->Unmap(0u, &no_writes);
+  }
   for (uint32_t i = 0u; i < kRt12Slots; ++i) {
     if (!r.counter_pending[i] || r.counter_fence[i] > completed) continue;
     void* mapped = nullptr;
@@ -452,6 +567,21 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.pt_timing_skip_events);  // query heap or readback allocation failed
   }
   ID3D12Device5* device12 = s.device12.Get();
+  const uint32_t regir_slot = static_cast<uint32_t>(transfer_slot);
+  const pt::PtReGirIdentity source_identity = input.regir_source_identity;
+  const bool regir_requested = pt::g_pt_regir_enabled > 0.5f;
+  const bool regir_identity_matches = source_identity.owner_generation == s.generation
+                        && source_identity.transfer_configuration == s.di_transfer.configuration_generation
+                        && source_identity.table_fence != 0u && source_identity.frame == frame
+                        && source_identity.transfer_slot == static_cast<uint32_t>(transfer_slot)
+                        && source_identity.light_count == input.light_count && input.light_count <= RTXDI_LIGHT_TABLE_CAPACITY;
+  const bool regir_slot_available = r.regir_last_use[regir_slot] <= Rt12CompletedValue(s);
+  const bool regir_resources_available = r.regir_root && r.regir_register_pso && r.regir_weights_pso && r.regir_build_pso
+                        && r.regir_heap && r.regir_header[regir_slot] && r.regir_cells[regir_slot] && r.regir_weights[regir_slot];
+  const bool regir_on = regir_requested && lamps_on && regir_identity_matches && regir_slot_available && regir_resources_available;
+  const bool regir_copy_counts = regir_on && !r.regir_counts_pending[regir_slot]
+                                 && r.regir_header_readback[regir_slot] && r.regir_cells_readback[regir_slot];
+  r.regir_identity[regir_slot] = {};
   const bool sparse_requested = pt::g_pt_sparse_enabled > 0.5f;
   pt::PtSparsePolicy sparse_policy = pt::ComputePtSparsePolicy(
       sparse_requested, pt::g_pt_sparse_adaptive > 0.5f, pt::g_pt_sparse_rate, pt::g_pt_sparse_exponent,
@@ -531,6 +661,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_srv(20u, gbuf_on ? input.mrt2.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
   set_srv(21u, deferred, Rt12BufferSrv(RTXDI_INPUT_DEFERRED_STRIDE, deferred ? input.deferred_count : 1u));
   set_srv(26u, sparse_effective ? s.noise.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
+  set_srv(27u, regir_on ? r.regir_header[regir_slot].Get() : nullptr, Rt12BufferSrv(kRt12ReGirHeaderStride, 1u));
+  set_srv(28u, regir_on ? r.regir_cells[regir_slot].Get() : nullptr, Rt12BufferSrv(kRt12ReGirCellStride, pt::kPtReGirMaxCells));
   const auto set_material_uav = [&](uint32_t index, ID3D12Resource* resource, uint32_t stride, uint32_t count) {
     D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
     view.Format = DXGI_FORMAT_UNKNOWN;
@@ -579,6 +711,100 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   barriers.clear();
   Transition(barriers, r.counters[k].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  if (regir_on) {
+    const uint32_t regir_base = regir_slot * kRt12ReGirPasses * kRt12ReGirDescriptors;
+    const auto regir_cpu = [&](uint32_t pass, uint32_t index) {
+      D3D12_CPU_DESCRIPTOR_HANDLE handle = r.regir_heap->GetCPUDescriptorHandleForHeapStart();
+      handle.ptr += static_cast<SIZE_T>(regir_base + pass * kRt12ReGirDescriptors + index) * s.descriptor_size;
+      return handle;
+    };
+    const auto regir_srv = [&](uint32_t pass, uint32_t index, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view) {
+      device12->CreateShaderResourceView(resource, &view, regir_cpu(pass, index));
+    };
+    const auto regir_uav = [&](uint32_t pass, uint32_t index, ID3D12Resource* resource, uint32_t stride, uint32_t count) {
+      D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
+      view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+      view.Buffer.NumElements = count;
+      view.Buffer.StructureByteStride = stride;
+      device12->CreateUnorderedAccessView(resource, nullptr, &view, regir_cpu(pass, 3u + index));
+    };
+    ID3D12Resource* header = r.regir_header[regir_slot].Get();
+    ID3D12Resource* cells = r.regir_cells[regir_slot].Get();
+    ID3D12Resource* weights = r.regir_weights[regir_slot].Get();
+    regir_srv(0u, 0u, input.depth.texture12.Get(), Rt12TextureSrv(DXGI_FORMAT_R32_FLOAT));
+    regir_srv(0u, 1u, input.normal.texture12.Get(), Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
+    regir_srv(0u, 2u, input.scene.texture12.Get(), Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
+    regir_uav(0u, 0u, header, kRt12ReGirHeaderStride, 1u);
+    regir_uav(0u, 1u, cells, kRt12ReGirCellStride, pt::kPtReGirMaxCells);
+    regir_srv(1u, 0u, light_table, Rt12BufferSrv(sizeof(RtxdiLightTableEntry), RTXDI_LIGHT_TABLE_CAPACITY));
+    regir_srv(1u, 1u, header, Rt12BufferSrv(kRt12ReGirHeaderStride, 1u));
+    regir_srv(1u, 2u, cells, Rt12BufferSrv(kRt12ReGirCellStride, pt::kPtReGirMaxCells));
+    regir_uav(1u, 0u, weights, sizeof(float), pt::kPtReGirMaxCells * RTXDI_LIGHT_TABLE_CAPACITY);
+    regir_uav(1u, 1u, nullptr, sizeof(uint32_t), 1u);
+    regir_srv(2u, 0u, header, Rt12BufferSrv(kRt12ReGirHeaderStride, 1u));
+    regir_srv(2u, 1u, weights, Rt12BufferSrv(sizeof(float), pt::kPtReGirMaxCells * RTXDI_LIGHT_TABLE_CAPACITY));
+    regir_srv(2u, 2u, nullptr, Rt12BufferSrv(sizeof(uint32_t), 1u));
+    regir_uav(2u, 0u, cells, kRt12ReGirCellStride, pt::kPtReGirMaxCells);
+    regir_uav(2u, 1u, nullptr, sizeof(uint32_t), 1u);
+    barriers.clear();
+    for (ID3D12Resource* resource : {header, cells, weights}) {
+      Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    ID3D12DescriptorHeap* regir_heaps[] = {r.regir_heap.Get()};
+    list->SetDescriptorHeaps(1u, regir_heaps);
+    list->SetComputeRootSignature(r.regir_root.Get());
+    const auto regir_table = [&](uint32_t pass) {
+      D3D12_GPU_DESCRIPTOR_HANDLE handle = r.regir_heap->GetGPUDescriptorHandleForHeapStart();
+      handle.ptr += static_cast<UINT64>(regir_base + pass * kRt12ReGirDescriptors) * s.descriptor_size;
+      list->SetComputeRootDescriptorTable(1u, handle);
+    };
+    D3D12_GPU_DESCRIPTOR_HANDLE header_gpu = r.regir_heap->GetGPUDescriptorHandleForHeapStart();
+    header_gpu.ptr += static_cast<UINT64>(regir_base + 3u) * s.descriptor_size;
+    const uint32_t clear_header[4] = {};
+    list->ClearUnorderedAccessViewUint(header_gpu, regir_cpu(0u, 3u), header, clear_header, 0u, nullptr);
+    barriers.clear();
+    UavBarrier(barriers, header);
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    const uint32_t register_params[] = {w, h};
+    list->SetPipelineState(r.regir_register_pso.Get());
+    list->SetComputeRoot32BitConstants(0u, kRt12ReGirConstants, register_params, 0u);
+    regir_table(0u);
+    list->Dispatch(1u, 1u, 1u);
+    barriers.clear();
+    UavBarrier(barriers, header);
+    UavBarrier(barriers, cells);
+    Transition(barriers, header, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(barriers, cells, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    const uint32_t build_params[] = {input.light_count, frame};
+    list->SetPipelineState(r.regir_weights_pso.Get());
+    list->SetComputeRoot32BitConstants(0u, kRt12ReGirConstants, build_params, 0u);
+    regir_table(1u);
+    list->Dispatch(RTXDI_LIGHT_TABLE_CAPACITY / 64u, pt::kPtReGirMaxCells, 1u);
+    barriers.clear();
+    UavBarrier(barriers, weights);
+    Transition(barriers, weights, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(barriers, cells, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    list->SetPipelineState(r.regir_build_pso.Get());
+    regir_table(2u);
+    list->Dispatch((pt::kPtReGirMaxCells + 63u) / 64u, 1u, 1u);
+    barriers.clear();
+    UavBarrier(barriers, cells);
+    Transition(barriers, cells, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               regir_copy_counts ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (regir_copy_counts) Transition(barriers, header, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    if (regir_copy_counts) {
+      list->CopyBufferRegion(r.regir_header_readback[regir_slot].Get(), 0u, header, 0u, kRt12ReGirHeaderStride);
+      list->CopyBufferRegion(r.regir_cells_readback[regir_slot].Get(), 0u, cells, 0u, pt::kPtReGirMaxCells * kRt12ReGirCellStride);
+      barriers.clear();
+      Transition(barriers, header, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      Transition(barriers, cells, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    }
+  }
   uint32_t params[kRt12PtConstants] = {
       w, h, frame,
       std::clamp(static_cast<uint32_t>(pt::g_pt_samples), 1u, 16u),
@@ -615,7 +841,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       pt::g_pt_gi_clamp_enabled > 0.5f ? std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_gi_clamp, 16.f, 1.f, 1000.f)) : 0u,  // [42] water roughness, [43] GI clamp (0 = off)
       pt::g_pt_sharc_firefly_clamp_enabled > 0.5f ? 1u : 0u,  // [44] SHARC update clamp on, [45] its limit (multiple of the cell mean)
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_sharc_firefly_clamp, 10.f, 1.f, 100.f)),
-      sparse_requested ? sparse_policy.levels : 0u, sparse_policy.dense_reason == pt::PtSparseDenseReason::None ? 1u : 0u};
+      sparse_requested ? sparse_policy.levels : 0u, sparse_policy.dense_reason == pt::PtSparseDenseReason::None ? 1u : 0u,
+      regir_on ? 1u : 0u, 0u, 0u, 0u};
   ID3D12DescriptorHeap* heaps[] = {r.heap.Get()};
   list->SetDescriptorHeaps(1u, heaps);
   list->SetComputeRootSignature(r.root.Get());
@@ -700,6 +927,11 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   if (sparse_effective) {
     Transition(barriers, s.noise.texture12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   }
+  if (regir_on) {
+    for (ID3D12Resource* resource : {r.regir_header[regir_slot].Get(), r.regir_cells[regir_slot].Get(), r.regir_weights[regir_slot].Get()}) {
+      Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
+  }
   Transition(barriers, r.counters[k].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
   if (!r.counter_pending[k]) {
@@ -756,6 +988,16 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   scene.fence_value = (std::max)(scene.fence_value, b);
   input.fence_value = (std::max)(input.fence_value, b);
+  if (regir_on) {
+    r.regir_last_use[regir_slot] = b;
+    r.regir_identity[regir_slot] = source_identity;
+    if (regir_copy_counts) {
+      r.regir_counts_fence[regir_slot] = b;
+      r.regir_counts_frame[regir_slot] = frame;
+      r.regir_counts_pending[regir_slot] = true;
+    }
+    input.di_fence_value = (std::max)(input.di_fence_value, b);
+  }
   for (size_t i = retired_begin; i < s.retired.size(); ++i) s.retired[i].fence_value = b;
   NoteRt12Signal(s, b);
   RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::Pt);
@@ -808,6 +1050,19 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     pt::g_pt_panel.mat_capacity_log2 = mat_on ? static_cast<uint32_t>(std::countr_zero(r.material_capacity)) : 0u;
     pt::g_pt_panel.mat_rate = mat_on ? mat_rate : 0u;
     pt::g_pt_panel.refl_on = refl_on;
+    pt::g_pt_panel.regir_requested = regir_requested;
+    pt::g_pt_panel.regir_active = regir_on;
+    pt::g_pt_panel.regir_fallback_reason = !regir_requested ? "off" : !lamps_on ? "no_lamps"
+        : !regir_identity_matches ? "source_identity" : !regir_slot_available ? "slot_busy"
+        : !regir_resources_available ? "resources" : "none";
+    pt::g_pt_panel.regir_owner_generation = source_identity.owner_generation;
+    pt::g_pt_panel.regir_transfer_configuration = source_identity.transfer_configuration;
+    pt::g_pt_panel.regir_frame = source_identity.frame;
+    pt::g_pt_panel.regir_transfer_slot = source_identity.transfer_slot;
+    pt::g_pt_panel.regir_light_count = source_identity.light_count;
+    pt::g_pt_panel.regir_source_fence = source_identity.table_fence;
+    pt::g_pt_panel.regir_build_fence = regir_on ? b : 0u;
+    pt::g_pt_panel.regir_last_use_fence = r.regir_last_use[regir_slot];
   }
   *reflection_view = refl_on ? refl.srv11 : reshade::api::resource_view{0u};
   return out.srv11;
@@ -852,6 +1107,17 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   }
   Rt12DiTransferSlot& input = s.di_transfer.slots[static_cast<uint32_t>(r.water_input_slot)];
   Rt12Slot& scene = s.lighting_slots[static_cast<uint32_t>(r.water_scene_slot)];
+  const uint32_t regir_slot = static_cast<uint32_t>(r.water_input_slot);
+  const pt::PtReGirIdentity& regir_identity = r.regir_identity[regir_slot];
+  const pt::PtReGirIdentity& source_identity = input.regir_source_identity;
+  if (regir_identity.owner_generation != source_identity.owner_generation
+      || regir_identity.transfer_configuration != source_identity.transfer_configuration
+      || regir_identity.table_fence == 0u || regir_identity.table_fence != source_identity.table_fence
+      || regir_identity.frame != source_identity.frame || regir_identity.transfer_slot != source_identity.transfer_slot
+      || regir_identity.light_count != source_identity.light_count || source_identity.owner_generation != s.generation
+      || source_identity.transfer_configuration != s.di_transfer.configuration_generation || source_identity.frame != frame) {
+    r.water_params[48] = 0u;
+  }
   const Rt12PtWaterFrame& in = r.water_frame_inputs;
   // Water counters: a completed readback is published once, in frame order; never waits.
   const uint64_t completed = Rt12CompletedValue(s);
@@ -1038,7 +1304,9 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
                                          in.resources[4].Get(), in.resources[5].Get(), in.resources[6].Get(), in.resources[8].Get(),
                                          depth_copy.texture12.Get(), normal_copy.texture12.Get(), in.resources[11].Get(),
                                          in.resources[12].Get(), in.resources[13].Get(), in.resources[18].Get(),
-                                         in.resources[19].Get(), in.resources[20].Get(), in.resources[21].Get()};
+                                         in.resources[19].Get(), in.resources[20].Get(), in.resources[21].Get(),
+                                         r.water_params[48] ? in.resources[27].Get() : nullptr,
+                                         r.water_params[48] ? in.resources[28].Get() : nullptr};
   for (ID3D12Resource* resource : water_reads) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }
@@ -1134,6 +1402,16 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   }
   scene.fence_value = (std::max)(scene.fence_value, b);
   input.fence_value = (std::max)(input.fence_value, b);
+  if (r.water_params[48] != 0u) {
+    r.regir_last_use[regir_slot] = (std::max)(r.regir_last_use[regir_slot], b);
+    input.di_fence_value = (std::max)(input.di_fence_value, b);
+    std::lock_guard lock(pt::g_pt_panel_mutex);
+    if (pt::g_pt_panel.regir_active && pt::g_pt_panel.regir_owner_generation == regir_identity.owner_generation
+        && pt::g_pt_panel.regir_source_fence == regir_identity.table_fence
+        && pt::g_pt_panel.regir_frame == regir_identity.frame && pt::g_pt_panel.regir_transfer_slot == regir_slot) {
+      pt::g_pt_panel.regir_last_use_fence = r.regir_last_use[regir_slot];
+    }
+  }
   // The submitted inputs stay alive until this submission's fence completes; the snapshot is then empty for the next trace.
   for (const ComPtr<ID3D12Resource>& resource : in.resources) RetireObject(s, b, resource);
   RetireObject(s, b, in.tlas);

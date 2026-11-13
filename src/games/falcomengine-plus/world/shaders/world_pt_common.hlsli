@@ -8,7 +8,7 @@
 #define RT12_DYNAMIC_VERTICES_REGISTER t30
 #include "world_rt12_trace.hlsli"
 #include "world_rtxdi_surface.hlsli"
-#include "../rtxdi/rtxdi_di_layout.h"
+#include "world_regir_shared.hlsli"
 #include "world_rt_lamps.hlsli"
 // SHARC configuration (compile time, identical in the three passes): OpenRemix sharc.glsl:9-19.
 #define SHARC_ENABLE_RESPONSIVE_LIGHTING 0
@@ -29,6 +29,8 @@ Texture2D<uint4> g_pt_mrt1 : register(t37);       // .z & 255: specular scale
 Texture2D<uint4> g_pt_mrt2 : register(t38);       // .x: deferred material index
 StructuredBuffer<GameDeferredParam> g_pt_deferred : register(t39);
 Texture2D<uint4> g_pt_noise : register(t40);
+StructuredBuffer<PtReGirHeader> g_pt_regir_header : register(t41);
+StructuredBuffer<PtReGirCell> g_pt_regir_cells : register(t42);
 RWStructuredBuffer<uint64_t> g_pt_material_keys : register(u4);
 globallycoherent RWStructuredBuffer<uint> g_pt_material_values : register(u5);
 RWTexture2D<float4> g_pt_output : register(u0);
@@ -51,6 +53,7 @@ cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (48 dwords
   float g_water_roughness; float g_gi_clamp;  // base roughness of water reflections; GI luminance clamp (0 = off)
   uint g_sharc_firefly_clamp_enabled; float g_sharc_firefly_clamp;  // SHARC update clamp on (1) / off (0); limit as a multiple of the cell mean (OpenRemix sharcFireflyClamp)
   uint g_sparse_levels; uint g_sparse_enabled;
+  uint g_regir_enabled;
 };
 uint PtHash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; return x ^ (x >> 16); }
 bool PtSparseSelected(uint2 pixel) { return uint(asfloat(g_pt_noise.Load(int3((pixel.x + 53u) % 128u, (pixel.y + 91u) % 128u + 128u * (g_frame % 32u), 0)).x) * 256.0) < g_sparse_levels; }
@@ -136,7 +139,42 @@ float3 PtHitLight(float3 position, float3 nh, inout uint rng) {
   }
   float3 lamp = float3(0, 0, 0);
   if (g_lamp_count > 0u) {
-    const uint i = min(uint(PtRandom(rng) * g_lamp_count), g_lamp_count - 1u);
+    bool pool_valid = false;
+    PtReGirCell pool = (PtReGirCell)0;
+    int3 key;
+    if (g_regir_enabled != 0u && g_lamp_count <= RTXDI_LIGHT_TABLE_CAPACITY && PtReGirCellKey(position, key)) {
+      uint header_count, header_stride, cell_count, cell_stride;
+      g_pt_regir_header.GetDimensions(header_count, header_stride);
+      g_pt_regir_cells.GetDimensions(cell_count, cell_stride);
+      if (header_count != 0u && g_pt_regir_header[0].valid != 0u
+          && g_pt_regir_header[0].cell_count <= min(cell_count, PT_REGIR_MAX_CELLS)) {
+        for (uint cell_index = 0u; cell_index < g_pt_regir_header[0].cell_count; ++cell_index) {
+          const PtReGirCell candidate = g_pt_regir_cells[cell_index];
+          if (all(candidate.key == key) && candidate.valid != 0u) {
+            pool = candidate;
+            pool_valid = true;
+            for (uint slot = 0u; slot < PT_REGIR_SLOTS; ++slot) pool_valid = pool_valid && pool.slots[slot] < g_lamp_count;
+            break;
+          }
+        }
+      }
+    }
+    uint i;
+    float lamp_scale;
+    PtReGirSelection selection = (PtReGirSelection)0;
+    uint next_rng = rng;
+    if (pool_valid) {
+      next_rng = PtHash(rng + 0x9e3779b9u);
+      selection = PtReGirSelect(next_rng >> 8, g_lamp_count, pool.slots);
+    }
+    if (selection.valid != 0u) {
+      rng = next_rng;
+      i = selection.light_index;
+      lamp_scale = 1.0 / selection.pmf;
+    } else {
+      i = min(uint(PtRandom(rng) * g_lamp_count), g_lamp_count - 1u);
+      lamp_scale = g_lamp_count;
+    }
     const uint type = g_pt_light_table[i].type;
     if (type == RTGI_LAMP_TYPE_POINT || type == RTGI_LAMP_TYPE_SPOT) {
       const LightParam lp = g_pt_lights[i];
@@ -146,7 +184,7 @@ float3 PtHitLight(float3 position, float3 nh, inout uint rng) {
                     * max(lp.translucency, dot(nh, l));
       const float reach = length(to) - g_lamp_clearance;
       const bool vis = reach <= 1e-3 || TraceWorldRayDxr(q, l, 1e-3, reach, true, lamp_view, counters).prim == 0xFFFFFFFFu;
-      if (e > 0.0 && vis) lamp = max(lp.color, 0.0) * e * g_lamp_count;
+      if (e > 0.0 && vis) lamp = max(lp.color, 0.0) * e * lamp_scale;
     }
   }
   return sun + lamp;
