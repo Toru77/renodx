@@ -77,6 +77,7 @@ inline std::string SerializePtReport() {
   out << "gpu_available: " << p.gpu_available << "\n";
   out << "material cell scale: " << g_pt_material_cell_scale << "\n";
   out << "samples: " << g_pt_samples << "\n";
+  out << "regir requested: " << g_pt_regir_enabled << "\n";
   out << "max bounces: " << g_pt_max_bounces << "\n";
   out << "russian roulette: " << g_pt_russian_roulette << "\n";
   out << "roulette min bounce: " << g_pt_roulette_min_bounce << "\n";

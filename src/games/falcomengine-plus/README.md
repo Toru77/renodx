@@ -12,7 +12,9 @@ Sora 2nd path-traces diffuse indirect lighting using the captured world, the gam
 
 Sparse Rendering, adapted from OpenRemix and off by default, uses IS-FAST blue noise to select opaque pixels when Ray Reconstruction is active; selected diffuse lighting is scaled by the inverse sampling rate, while reflections can remain dense or be sampled sparsely and weighted before their per-ray clamp; skipped diffuse lighting is zeroed to valid black and water remains dense.
 
-**Code:** [world/pt](world/pt/), [world/shaders/world_pt_diffuse.cs_6_6.hlsl](world/shaders/world_pt_diffuse.cs_6_6.hlsl), [world/shaders/world_pt_sharc_update.cs_6_6.hlsl](world/shaders/world_pt_sharc_update.cs_6_6.hlsl), [world/shaders/world_pt_sharc_resolve.cs_6_6.hlsl](world/shaders/world_pt_sharc_resolve.cs_6_6.hlsl), [world/shaders/world_pt_material_write.cs_6_6.hlsl](world/shaders/world_pt_material_write.cs_6_6.hlsl).
+The default-Off ReGIR setting and its compile-only weight kernel are inactive preparation for future light sampling.
+
+**Code:** [world/pt](world/pt/), [world/shaders/world_regir_weights.cs_6_5.hlsl](world/shaders/world_regir_weights.cs_6_5.hlsl), [world/shaders/world_pt_diffuse.cs_6_6.hlsl](world/shaders/world_pt_diffuse.cs_6_6.hlsl), [world/shaders/world_pt_sharc_update.cs_6_6.hlsl](world/shaders/world_pt_sharc_update.cs_6_6.hlsl), [world/shaders/world_pt_sharc_resolve.cs_6_6.hlsl](world/shaders/world_pt_sharc_resolve.cs_6_6.hlsl), [world/shaders/world_pt_material_write.cs_6_6.hlsl](world/shaders/world_pt_material_write.cs_6_6.hlsl).
 **Reference:** Open Remix `pathtrace.comp`.
 
 #### World capture and scene construction

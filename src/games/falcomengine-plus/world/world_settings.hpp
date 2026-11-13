@@ -2177,6 +2177,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "PtReGirEnabled",
+      .binding = &pt::g_pt_regir_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "ReGIR",
+      .section = "Path Tracing",
+      .tooltip = "Reserved for ReGIR light sampling; inactive until the complete cell-pool path is implemented.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "PtSparseEnabled",
       .binding = &pt::g_pt_sparse_enabled,
       .value_type = SettingValueType::BOOLEAN,

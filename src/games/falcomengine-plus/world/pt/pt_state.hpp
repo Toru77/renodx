@@ -9,6 +9,7 @@
 #include <deps/imgui/imgui.h>
 namespace falcom_world::pt {
 inline float g_pt_enabled = 0.f;
+inline float g_pt_regir_enabled = 0.f;
 inline bool PtRequested() { return g_pt_enabled > 0.5f; }
 inline float g_pt_sparse_reflections = 1.f;
 inline float g_pt_sparse_enabled = 0.f, g_pt_sparse_adaptive = 1.f, g_pt_sparse_rate = 0.10f,
