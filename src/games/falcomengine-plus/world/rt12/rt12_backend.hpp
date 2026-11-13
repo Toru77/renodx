@@ -71,7 +71,7 @@ inline constexpr uint32_t kRt12TeardownMs = 2000u;  // CPU wait budget for a tea
 inline constexpr uint32_t kRt12Descriptors = 20u;
 inline constexpr uint32_t kRt12Timestamps = 7u;  // per slot: present 0..1, lighting 2..6
 inline constexpr uint32_t kRt12DiPerfSamples = 8u;  // RTXDI transfer-slot intervals (2 timestamps each): input, local, distance, NRD, initial, temporal, spatial, sun
-inline constexpr uint32_t kRt12PtPerfBlocks = 3u * kRt12Slots;  // PT timing blocks: main, water, sparse resolve (one block per slot each)
+inline constexpr uint32_t kRt12PtPerfBlocks = 2u * kRt12Slots;  // PT timing blocks: main and water (one block per slot each)
 inline constexpr uint32_t kRt12StatsWidth = 32u;
 inline constexpr uint64_t kRt12ArenaMinBytes = 1024ull * 1024ull;
 
@@ -405,7 +405,7 @@ struct Rt12DiTransferState {
 // Path-traced diffuse GI (world/pt): its own submission slots, list, root signature, PSO, descriptors and outputs.
 inline constexpr uint32_t kRt12PtDescriptors = 27u;
 inline constexpr uint32_t kRt12PtConstants = 48u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
-inline constexpr uint32_t kRt12PtCounters = 10u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
+inline constexpr uint32_t kRt12PtCounters = 9u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
 // Descriptor inputs of the main trace's frame, kept for the water block (M4): descriptor i is srv_descs[i] or uav_descs[i] on
 // resources[i]. The TLAS has no resource in its SRV, so it is retained separately.
 struct Rt12PtWaterFrame {
@@ -473,7 +473,7 @@ struct Rt12PtState {
   uint32_t counter_frame[kRt12Slots] = {};
   bool counter_pending[kRt12Slots] = {};
   bool counter_sparse[kRt12Slots] = {};
-  // M0t: main, water, sparse resolve blocks; queries 2*block and 2*block+1; readback bytes 16*block.
+  // M0t: main and water blocks; queries 2*block and 2*block+1; readback bytes 16*block.
   // Read only after the block's fence completed; never waits.
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> perf_queries;  // 2 * kRt12PtPerfBlocks
   Microsoft::WRL::ComPtr<ID3D12Resource> perf_readback;  // 16 * kRt12PtPerfBlocks bytes, READBACK
@@ -522,8 +522,8 @@ struct Rt12State {
   uint64_t timestamp_frequency = 0u;
   double rtxdi_gpu_ms_sum[kRt12DiPerfSamples] = {};
   uint32_t rtxdi_gpu_samples[kRt12DiPerfSamples] = {};
-  double pt_gpu_ms_sum[3] = {};   // M0t: PT main (0), water (1), sparse resolve (2)
-  uint32_t pt_gpu_samples[3] = {};
+  double pt_gpu_ms_sum[2] = {};   // M0t: PT main (0), water (1)
+  uint32_t pt_gpu_samples[2] = {};
   uint32_t rtxdi_gpu_completed_batches = 0u;
   uint32_t rtxdi_perf_last_frame = UINT32_MAX;
   uint64_t rtxdi_perf_epoch = 0u;

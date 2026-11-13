@@ -446,7 +446,6 @@ inline void OnWorldPresentBvh(
       extra.rtxdi_sun = {rt12_state.rtxdi_gpu_ms_sum[7], rt12_state.rtxdi_gpu_samples[7]};
       extra.pt_main = {rt12_state.pt_gpu_ms_sum[0], rt12_state.pt_gpu_samples[0]};
       extra.pt_water = {rt12_state.pt_gpu_ms_sum[1], rt12_state.pt_gpu_samples[1]};
-      extra.pt_sparse_resolve = {rt12_state.pt_gpu_ms_sum[2], rt12_state.pt_gpu_samples[2]};
     }
   }
   const auto present_time = SamplePerfPresent(device, extra);
