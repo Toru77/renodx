@@ -30,9 +30,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
   }
   if (found) {
+    PtCount(8u);
     g_pt_output[id.xy] = g_pt_output[best_pixel];
     if (g_refl_samples != 0u) g_pt_reflection[id.xy] = g_pt_reflection[best_pixel];
   } else {
+    PtCount(9u);
     PtEvaluate(id, surface, false);
   }
 }

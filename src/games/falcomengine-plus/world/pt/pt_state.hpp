@@ -106,8 +106,9 @@ struct PtPanel {
   uint32_t gpu_water_pixels = 0u, gpu_water_traces = 0u;
   const char* water_reason = "off";
   uint32_t gpu_exact = 0u, gpu_hits = 0u, gpu_misses = 0u, gpu_lock_drops = 0u, gpu_writes = 0u;
+  uint32_t sparse_selected = 0u, sparse_reconstructed = 0u, sparse_fallback = 0u;
   uint64_t gpu_frame = 0u;
-  bool gpu_available = false;
+  bool gpu_available = false, sparse_sample_active = false;
   uint32_t lamps = 0u, width = 0u, height = 0u;
 };
 inline std::mutex g_pt_panel_mutex;
@@ -154,9 +155,10 @@ inline void DrawPtPanel() {
               static_cast<unsigned long long>(p.frames[static_cast<uint32_t>(PtReason::Tracing)]),
               lamps_text.c_str(), p.width, p.height);
   ImGui::Text("Slot waits %llu  max %.2f ms", static_cast<unsigned long long>(p.waits), p.wait_ms_max);
-  ImGui::Text("Sparse policy: requested %s  quantized rate %.4f  dense reason %s (rendering remains dense)",
+  ImGui::Text("Sparse policy: requested %s  effective rate %u/256  dense reason %s",
               !p.sparse_requested ? "off" : p.sparse_adaptive ? "adaptive" : "fixed",
-              p.sparse_policy.levels / 256.f, PtSparseDenseReasonName(p.sparse_policy.dense_reason));
+              p.sparse_policy.dense_reason == PtSparseDenseReason::None ? p.sparse_policy.levels : 256u,
+              PtSparseDenseReasonName(p.sparse_policy.dense_reason));
   ImGui::Text("SHARC: %s  capacity 2^%u  update 1/%u px  window %u frames  clears %llu (last: %s)", p.sharc_on ? "on" : "off",
               p.sharc_capacity_log2, p.sharc_downscale, p.sharc_window, static_cast<unsigned long long>(p.sharc_clears),
               p.sharc_clear_reason);
@@ -170,6 +172,9 @@ inline void DrawPtPanel() {
     const uint32_t now = static_cast<uint32_t>(falcom_world::g_state.frame.load());
     const uint32_t gpu = static_cast<uint32_t>(p.gpu_frame);
     const uint32_t age = now - gpu;
+    ImGui::Text("Sparse counters (available, active %s), frame %llu (age %u): selected %u, reconstructed %u, fallback %u, valid %llu",
+                p.sparse_sample_active ? "yes" : "no", static_cast<unsigned long long>(p.gpu_frame), age, p.sparse_selected, p.sparse_reconstructed, p.sparse_fallback,
+                static_cast<unsigned long long>(p.sparse_selected) + p.sparse_reconstructed + p.sparse_fallback);
     ImGui::Text("GPU material lookups, frame %llu (age %u): exact %u, hits %u, grey misses %u; writes %u, lock drops %u",
                 static_cast<unsigned long long>(p.gpu_frame), age,
                 p.gpu_exact, p.gpu_hits, p.gpu_misses, p.gpu_writes, p.gpu_lock_drops);

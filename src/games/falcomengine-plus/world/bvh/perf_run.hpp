@@ -88,6 +88,7 @@ enum PerfCost : size_t {
   kPerfGpuRtxdiSun,
   kPerfGpuPtMain,
   kPerfGpuPtWater,
+  kPerfGpuPtSparseResolve,
   kPerfRebuildPhase0,
   kPerfRebuildPhase1,
   kPerfRebuildPhase2,
@@ -152,6 +153,7 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"gpu_rtxdi_sun", true, kPerfSubset, true, "RTXDI sun subset (overlaps gpu_rtxdi_input)"},
     {"gpu_pt_main", true, kPerfGpu, true, nullptr},
     {"gpu_pt_water", true, kPerfGpu, true, nullptr},
+    {"gpu_pt_sparse_resolve", true, kPerfGpu, true, "Opaque PT cost = gpu_pt_main + gpu_pt_sparse_resolve; excludes SHARC, material work, queue waits and copies"},
     {"rebuild_phase_0", true, kPerfSubset, false, kCachePhaseNames[0]},
     {"rebuild_phase_1", true, kPerfSubset, false, kCachePhaseNames[1]},
     {"rebuild_phase_2", true, kPerfSubset, false, kCachePhaseNames[2]},
@@ -400,7 +402,7 @@ struct PerfExtraGpu {
   PerfTimerSample rtao, rtao_filter, rtgi, rtgi_denoise, rtls, rtls_denoise, rtsun, rtsun_denoise, deform_refit;
   PerfTimerSample rtxdi_input, rtxdi_local, rtxdi_distance, rtxdi_nrd;
   double dxr_tlas_ms = 0.0, dxr_records_ms = 0.0, dxr_characters_ms = 0.0, gc_blas_ms = 0.0, dxr_rtgi_ms = 0.0;  // D3D12 timestamp sums (rt12 panels); inside gpu_rtao, so Subset rows
-  PerfTimerSample rtxdi_initial, rtxdi_temporal, rtxdi_spatial, rtxdi_sun, pt_main, pt_water;
+  PerfTimerSample rtxdi_initial, rtxdi_temporal, rtxdi_spatial, rtxdi_sun, pt_main, pt_water, pt_sparse_resolve;
 };
 
 // Performance tab: the last kPerfTabWindow presents. NaN means "--" (no value in the window).
@@ -616,6 +618,8 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.events[kPerfGpuPtMain] = extra.pt_main.samples;
   c.cost[kPerfGpuPtWater] = extra.pt_water.ms_sum;
   c.events[kPerfGpuPtWater] = extra.pt_water.samples;
+  c.cost[kPerfGpuPtSparseResolve] = extra.pt_sparse_resolve.ms_sum;
+  c.events[kPerfGpuPtSparseResolve] = extra.pt_sparse_resolve.samples;
   c.cost[kPerfDxrTlasGpu] = extra.dxr_tlas_ms;
   c.cost[kPerfDxrRecordsGpu] = extra.dxr_records_ms;
   c.cost[kPerfDxrCharactersGpu] = extra.dxr_characters_ms;

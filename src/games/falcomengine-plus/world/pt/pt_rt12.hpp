@@ -187,6 +187,10 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
           pt::g_pt_panel.gpu_misses = values[2];
           pt::g_pt_panel.gpu_lock_drops = values[3];
           pt::g_pt_panel.gpu_writes = values[4];
+          pt::g_pt_panel.sparse_sample_active = r.counter_sparse[i];
+          pt::g_pt_panel.sparse_selected = values[7];
+          pt::g_pt_panel.sparse_reconstructed = values[8];
+          pt::g_pt_panel.sparse_fallback = values[9];
           pt::g_pt_panel.gpu_frame = static_cast<uint32_t>(r.counter_frame[i]);
           pt::g_pt_panel.gpu_available = true;
         }
@@ -663,7 +667,16 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * k + 1u);
     list->ResolveQueryData(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * k, 2u, r.perf_readback.Get(), 16ull * k);
   }
+  const uint32_t sparse_block = 2u * kRt12Slots + k;
+  bool sparse_perf_timing = false;
   if (sparse_requested && sparse_policy.dense_reason == pt::PtSparseDenseReason::None && sparse_policy.levels < 256u) {
+    sparse_perf_timing = rtxdi::CanStartGpuTiming(pt_perf_gather, s.timestamp_frequency, r.perf_pending[sparse_block])
+                         && r.perf_queries && r.perf_readback;
+    if (pt_perf_gather && r.perf_pending[sparse_block]) {
+      bvh::g_perf_gate.pt_timing_pending_frames.fetch_add(1u, std::memory_order_relaxed);
+    } else if (pt_perf_gather && !sparse_perf_timing) {
+      rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.pt_timing_skip_events);
+    }
     D3D12_RESOURCE_BARRIER sparse_barriers[2] = {};
     sparse_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     sparse_barriers[0].UAV.pResource = out.texture12.Get();
@@ -671,7 +684,12 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     sparse_barriers[1].UAV.pResource = refl.texture12.Get();
     list->ResourceBarrier(refl_on ? 2u : 1u, sparse_barriers);
     list->SetPipelineState(r.sparse_resolve_pso.Get());
+    if (sparse_perf_timing) list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * sparse_block);
     list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+    if (sparse_perf_timing) {
+      list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * sparse_block + 1u);
+      list->ResolveQueryData(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * sparse_block, 2u, r.perf_readback.Get(), 16ull * sparse_block);
+    }
   }
   barriers.clear();
   Transition(barriers, out.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -738,9 +756,15 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     r.perf_fence[k] = b;
     r.perf_epoch[k] = pt_perf_epoch;
   }
+  if (sparse_perf_timing) {
+    r.perf_pending[sparse_block] = true;
+    r.perf_fence[sparse_block] = b;
+    r.perf_epoch[sparse_block] = pt_perf_epoch;
+  }
   if (!r.counter_pending[k]) {
     r.counter_fence[k] = b;
     r.counter_frame[k] = frame;
+    r.counter_sparse[k] = sparse_policy.dense_reason == pt::PtSparseDenseReason::None && sparse_policy.levels < 256u;
     r.counter_pending[k] = true;
   }
   scene.fence_value = (std::max)(scene.fence_value, b);

@@ -45,8 +45,16 @@ inline std::string SerializePtReport() {
   out << "width: " << p.width << "\n";
   out << "height: " << p.height << "\n";
   out << "sparse requested mode: " << (!p.sparse_requested ? "off" : p.sparse_adaptive ? "adaptive" : "fixed") << "\n";
-  out << "sparse quantized rate: " << p.sparse_policy.levels / 256.f << " (rendering remains dense)\n";
+  out << "sparse effective levels: " << (p.sparse_policy.dense_reason == PtSparseDenseReason::None ? p.sparse_policy.levels : 256u) << " / 256\n";
   out << "sparse dense reason: " << PtSparseDenseReasonName(p.sparse_policy.dense_reason) << "\n";
+  out << "sparse counter available: " << p.gpu_available << "\n";
+  out << "sparse sample active: " << p.sparse_sample_active << "\n";
+  out << "sparse counter frame: " << p.gpu_frame << "\n";
+  out << "sparse counter age: " << (static_cast<uint32_t>(g_state.frame.load()) - static_cast<uint32_t>(p.gpu_frame)) << "\n";
+  out << "sparse selected: " << p.sparse_selected << "\n";
+  out << "sparse reconstructed: " << p.sparse_reconstructed << "\n";
+  out << "sparse fallback: " << p.sparse_fallback << "\n";
+  out << "sparse valid: " << (static_cast<uint64_t>(p.sparse_selected) + p.sparse_reconstructed + p.sparse_fallback) << "\n";
   out << "slot waits: " << p.waits << "\n";
   out << "max wait ms: " << p.wait_ms_max << "\n";
   out << "sharc on: " << p.sharc_on << "\n";

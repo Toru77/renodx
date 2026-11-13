@@ -41,6 +41,7 @@
 #include "../rtao/rtao_resources.hpp"
 #include "../rtgi/rtgi_resources.hpp"
 #include "../rtgi/rtgi_state.hpp"
+#include "../pt/pt_state.hpp"
 #include "../rtxdi/rtxdi_config.hpp"
 #include "../rtxdi/rtxdi_perf_contract.hpp"
 #include "../rtxdi/rtxdi_state.hpp"
@@ -70,7 +71,7 @@ inline constexpr uint32_t kRt12TeardownMs = 2000u;  // CPU wait budget for a tea
 inline constexpr uint32_t kRt12Descriptors = 20u;
 inline constexpr uint32_t kRt12Timestamps = 7u;  // per slot: present 0..1, lighting 2..6
 inline constexpr uint32_t kRt12DiPerfSamples = 8u;  // RTXDI transfer-slot intervals (2 timestamps each): input, local, distance, NRD, initial, temporal, spatial, sun
-inline constexpr uint32_t kRt12PtPerfBlocks = 2u * kRt12Slots;  // PT timing blocks: main slot k, water slot kRt12Slots + k
+inline constexpr uint32_t kRt12PtPerfBlocks = 3u * kRt12Slots;  // PT timing blocks: main, water, sparse resolve (one block per slot each)
 inline constexpr uint32_t kRt12StatsWidth = 32u;
 inline constexpr uint64_t kRt12ArenaMinBytes = 1024ull * 1024ull;
 
@@ -404,7 +405,7 @@ struct Rt12DiTransferState {
 // Path-traced diffuse GI (world/pt): its own submission slots, list, root signature, PSO, descriptors and outputs.
 inline constexpr uint32_t kRt12PtDescriptors = 26u;
 inline constexpr uint32_t kRt12PtConstants = 48u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
-inline constexpr uint32_t kRt12PtCounters = 7u;  // GPU material-cache counters (uint32 each), world_pt_common.hlsli g_pt_counters
+inline constexpr uint32_t kRt12PtCounters = 10u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
 // Descriptor inputs of the main trace's frame, kept for the water block (M4): descriptor i is srv_descs[i] or uav_descs[i] on
 // resources[i]. The TLAS has no resource in its SRV, so it is retained separately.
 struct Rt12PtWaterFrame {
@@ -472,7 +473,8 @@ struct Rt12PtState {
   uint64_t counter_fence[kRt12Slots] = {};
   uint32_t counter_frame[kRt12Slots] = {};
   bool counter_pending[kRt12Slots] = {};
-  // M0t: block k = main slot k, kRt12Slots + k = water slot k; queries 2*block and 2*block+1; readback bytes 16*block.
+  bool counter_sparse[kRt12Slots] = {};
+  // M0t: main, water, sparse resolve blocks; queries 2*block and 2*block+1; readback bytes 16*block.
   // Read only after the block's fence completed; never waits.
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> perf_queries;  // 2 * kRt12PtPerfBlocks
   Microsoft::WRL::ComPtr<ID3D12Resource> perf_readback;  // 16 * kRt12PtPerfBlocks bytes, READBACK
@@ -521,8 +523,8 @@ struct Rt12State {
   uint64_t timestamp_frequency = 0u;
   double rtxdi_gpu_ms_sum[kRt12DiPerfSamples] = {};
   uint32_t rtxdi_gpu_samples[kRt12DiPerfSamples] = {};
-  double pt_gpu_ms_sum[2] = {};   // M0t: PT main (0), water (1)
-  uint32_t pt_gpu_samples[2] = {};
+  double pt_gpu_ms_sum[3] = {};   // M0t: PT main (0), water (1), sparse resolve (2)
+  uint32_t pt_gpu_samples[3] = {};
   uint32_t rtxdi_gpu_completed_batches = 0u;
   uint32_t rtxdi_perf_last_frame = UINT32_MAX;
   uint64_t rtxdi_perf_epoch = 0u;
@@ -2036,7 +2038,7 @@ inline void OnPresent(reshade::api::device* device) {
   for (uint32_t block = 0u; block < kRt12PtPerfBlocks; ++block) {
     if (!rtxdi::ClaimCompletedGpuTiming(&pt.perf_pending[block], s.completion_available, pt.perf_fence[block], completed))
       continue;
-    const uint32_t pass = block < kRt12Slots ? 0u : 1u;
+    const uint32_t pass = block / kRt12Slots;
     const bool identity_valid = perf_gather && pt.perf_epoch[block] == perf_epoch && pt.perf_readback;
     uint64_t timestamps[2] = {};
     double milliseconds = 0.0;
@@ -3444,6 +3446,8 @@ inline SceneTransactionResult RunSceneTransaction(reshade::api::device* device, 
 
 // Writes the JSON dump (10.8) from a copy of the panel.
 inline void DumpRt12Json() {
+  pt::PtPanel pt_snapshot;
+  { std::lock_guard lock(pt::g_pt_panel_mutex); pt_snapshot = pt::g_pt_panel; }
   Rt12Panel p;
   {
     std::lock_guard lock(g_rt12_panel_mutex);
@@ -3451,6 +3455,17 @@ inline void DumpRt12Json() {
   }
   std::ostringstream out;
   out << "{\n  \"schema\": 1,\n";
+  out << "  \"pt_sparse\": {\"requested_mode\": \"" << (!pt_snapshot.sparse_requested ? "off" : pt_snapshot.sparse_adaptive ? "adaptive" : "fixed")
+      << "\", \"effective_levels\": " << (pt_snapshot.sparse_policy.dense_reason == pt::PtSparseDenseReason::None ? pt_snapshot.sparse_policy.levels : 256u)
+      << ", \"effective_rate\": " << (pt_snapshot.sparse_policy.dense_reason == pt::PtSparseDenseReason::None ? pt_snapshot.sparse_policy.levels / 256.f : 1.f)
+      << ", \"dense_reason\": \"" << pt::PtSparseDenseReasonName(pt_snapshot.sparse_policy.dense_reason)
+      << "\", \"counter_available\": " << (pt_snapshot.gpu_available ? "true" : "false")
+      << ", \"sample_active\": " << (pt_snapshot.sparse_sample_active ? "true" : "false")
+      << ", \"counter_frame\": " << pt_snapshot.gpu_frame
+      << ", \"counter_age\": " << (static_cast<uint32_t>(g_state.frame.load()) - static_cast<uint32_t>(pt_snapshot.gpu_frame))
+      << ", \"selected\": " << pt_snapshot.sparse_selected << ", \"reconstructed\": " << pt_snapshot.sparse_reconstructed
+      << ", \"fallback\": " << pt_snapshot.sparse_fallback
+      << ", \"valid\": " << (static_cast<uint64_t>(pt_snapshot.sparse_selected) + pt_snapshot.sparse_reconstructed + pt_snapshot.sparse_fallback) << "},\n";
   out << "  \"switch_on\": " << (g_rt12_enabled.load(std::memory_order_relaxed) ? "true" : "false") << ",\n";
   out << "  \"reason\": \"" << Rt12ReasonName(p.reason) << "\",\n";
   out << "  \"failed_stage\": \"" << bvh::PoolJsonEscape(p.failed_stage) << "\",\n";
