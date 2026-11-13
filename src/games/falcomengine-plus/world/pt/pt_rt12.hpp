@@ -555,6 +555,10 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   barriers.clear();
   Transition(barriers, r.counters[k].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  const bool sparse_requested = pt::g_pt_sparse_enabled > 0.5f;
+  const pt::PtSparsePolicy sparse_policy = pt::ComputePtSparsePolicy(
+      sparse_requested, pt::g_pt_sparse_adaptive > 0.5f, pt::g_pt_sparse_rate, pt::g_pt_sparse_exponent,
+      pt::g_pt_sparse_quality, pt::g_pt_sparse_max_rate, w, h);
   uint32_t params[kRt12PtConstants] = {
       w, h, frame,
       std::clamp(static_cast<uint32_t>(pt::g_pt_samples), 1u, 16u),
@@ -589,7 +593,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_water_roughness, 0.05f, 0.f, 1.f)),
       pt::g_pt_gi_clamp_enabled > 0.5f ? std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_gi_clamp, 16.f, 1.f, 1000.f)) : 0u,  // [42] water roughness, [43] GI clamp (0 = off)
       pt::g_pt_sharc_firefly_clamp_enabled > 0.5f ? 1u : 0u,  // [44] SHARC update clamp on, [45] its limit (multiple of the cell mean)
-      std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_sharc_firefly_clamp, 10.f, 1.f, 100.f))};
+      std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_sharc_firefly_clamp, 10.f, 1.f, 100.f)),
+      sparse_requested ? sparse_policy.levels : 0u, sparse_policy.dense_reason == pt::PtSparseDenseReason::None ? 1u : 0u};
   ID3D12DescriptorHeap* heaps[] = {r.heap.Get()};
   list->SetDescriptorHeaps(1u, heaps);
   list->SetComputeRootSignature(r.root.Get());
@@ -741,6 +746,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   RecordRt12WaitB(s, b, GpuEvidenceSource::Pt);
   if (water_on) {  // publish the water block's inputs for RunPtWaterTrace of this frame
     std::copy_n(params, kRt12PtConstants, r.water_params);
+    r.water_params[46] = 0u;
+    r.water_params[47] = 0u;
     r.water_main_slot = k;
     r.water_input_slot = transfer_slot;
     r.water_scene_slot = s.scene_slot;
@@ -753,6 +760,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     pt::g_pt_panel.lamps = lamps_on ? input.light_count : 0u;
     pt::g_pt_panel.width = w;
     pt::g_pt_panel.height = h;
+    pt::g_pt_panel.sparse_policy = sparse_policy;
+    pt::g_pt_panel.sparse_requested = sparse_requested;
+    pt::g_pt_panel.sparse_adaptive = pt::g_pt_sparse_adaptive > 0.5f;
     pt::g_pt_panel.sharc_on = sharc_on;
     pt::g_pt_panel.sharc_capacity_log2 = sharc_on ? static_cast<uint32_t>(std::countr_zero(r.sharc_capacity)) : 0u;
     pt::g_pt_panel.sharc_downscale = sharc_on ? sharc_ds : 0u;

@@ -44,6 +44,9 @@ inline std::string SerializePtReport() {
   out << "lamps: " << p.lamps << "\n";
   out << "width: " << p.width << "\n";
   out << "height: " << p.height << "\n";
+  out << "sparse requested mode: " << (!p.sparse_requested ? "off" : p.sparse_adaptive ? "adaptive" : "fixed") << "\n";
+  out << "sparse quantized rate: " << p.sparse_policy.levels / 256.f << " (rendering remains dense)\n";
+  out << "sparse dense reason: " << PtSparseDenseReasonName(p.sparse_policy.dense_reason) << "\n";
   out << "slot waits: " << p.waits << "\n";
   out << "max wait ms: " << p.wait_ms_max << "\n";
   out << "sharc on: " << p.sharc_on << "\n";

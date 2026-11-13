@@ -2177,6 +2177,72 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "PtSparseEnabled",
+      .binding = &pt::g_pt_sparse_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Sparse Rendering",
+      .section = "Path Tracing",
+      .tooltip = "Trace a subset of opaque PT pixels and reconstruct the rest; water stays dense.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtSparseAdaptive",
+      .binding = &pt::g_pt_sparse_adaptive,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Sparse Adaptive Rate",
+      .section = "Path Tracing",
+      .tooltip = "Scale the reference rate with render resolution.",
+      .labels = {"Off", "On"},
+      .is_visible = [visible]() { return visible() && pt::g_pt_sparse_enabled > 0.5f; },
+  });
+  settings->push_back(new Setting{
+      .key = "PtSparseRate",
+      .binding = &pt::g_pt_sparse_rate,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.10f,
+      .label = "Sparse Sampling Rate",
+      .section = "Path Tracing",
+      .tooltip = "Fraction at reference resolution, or fixed fraction when adaptive is off.",
+      .min = 0.0625f, .max = 1.f, .format = "%.4f",
+      .is_visible = [visible]() { return visible() && pt::g_pt_sparse_enabled > 0.5f; },
+  });
+  settings->push_back(new Setting{
+      .key = "PtSparseExponent",
+      .binding = &pt::g_pt_sparse_exponent,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.91f,
+      .label = "Sparse Resolution Exponent",
+      .section = "Path Tracing",
+      .tooltip = "How strongly the rate rises at lower resolutions.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_visible = [visible]() { return visible() && pt::g_pt_sparse_enabled > 0.5f; },
+  });
+  settings->push_back(new Setting{
+      .key = "PtSparseQuality",
+      .binding = &pt::g_pt_sparse_quality,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.30f,
+      .label = "Sparse Quality",
+      .section = "Path Tracing",
+      .tooltip = "Moves adaptive rate logarithmically toward 1/16 or 1. Ignored when adaptive is off.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_visible = [visible]() { return visible() && pt::g_pt_sparse_enabled > 0.5f; },
+  });
+  settings->push_back(new Setting{
+      .key = "PtSparseMaxRate",
+      .binding = &pt::g_pt_sparse_max_rate,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.75f,
+      .label = "Sparse Max Rate",
+      .section = "Path Tracing",
+      .tooltip = "Dense rendering above this computed rate; 1.0 allows an explicit full-rate comparison.",
+      .min = 0.0625f, .max = 1.f, .format = "%.4f",
+      .is_visible = [visible]() { return visible() && pt::g_pt_sparse_enabled > 0.5f; },
+  });
+  settings->push_back(new Setting{
       .key = "PtSamples",
       .binding = &pt::g_pt_samples,
       .value_type = SettingValueType::INTEGER,

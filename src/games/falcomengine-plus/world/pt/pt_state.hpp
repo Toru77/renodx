@@ -1,5 +1,7 @@
 #pragma once
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -8,6 +10,37 @@
 namespace falcom_world::pt {
 inline float g_pt_enabled = 0.f;
 inline bool PtRequested() { return g_pt_enabled > 0.5f; }
+inline float g_pt_sparse_enabled = 0.f, g_pt_sparse_adaptive = 1.f, g_pt_sparse_rate = 0.10f,
+             g_pt_sparse_exponent = 0.91f, g_pt_sparse_quality = 0.30f, g_pt_sparse_max_rate = 0.75f;
+enum class PtSparseDenseReason : uint32_t { None, Disabled, RateAboveMax, FullRate };
+struct PtSparsePolicy { uint32_t levels; PtSparseDenseReason dense_reason; };
+inline const char* PtSparseDenseReasonName(PtSparseDenseReason reason) {
+  switch (reason) {
+    case PtSparseDenseReason::None: return "none";
+    case PtSparseDenseReason::Disabled: return "disabled";
+    case PtSparseDenseReason::RateAboveMax: return "rate_above_max";
+    case PtSparseDenseReason::FullRate: return "full_rate";
+    default: return "unknown";
+  }
+}
+inline PtSparsePolicy ComputePtSparsePolicy(bool enabled, bool adaptive, float base, float exponent, float quality,
+                                            float max_rate, uint32_t width, uint32_t height) {
+  if (!enabled) return {256u, PtSparseDenseReason::Disabled};
+  base = std::clamp(std::isfinite(base) ? base : 0.10f, 0.0625f, 1.f);
+  exponent = std::clamp(std::isfinite(exponent) ? exponent : 0.91f, 0.f, 1.f);
+  quality = std::clamp(std::isfinite(quality) ? quality : 0.30f, 0.f, 1.f);
+  max_rate = std::clamp(std::isfinite(max_rate) ? max_rate : 0.75f, 0.0625f, 1.f);
+  double rate = base;
+  if (adaptive) {
+    const double pixels = std::max(static_cast<double>(width) * height, 1.0);
+    const double scaled = std::clamp(rate * std::pow((2227.0 * 1238.0) / pixels, exponent), 0.0625, 1.0);
+    const double bound = (quality >= 0.5f ? 1.0 : 0.0625);
+    rate = scaled * std::pow(bound / scaled, std::abs(2.0 * quality - 1.0));
+  }
+  const uint32_t levels = std::clamp(static_cast<uint32_t>(std::round(rate * 256.0)), 1u, 256u);
+  return {levels, rate > max_rate ? PtSparseDenseReason::RateAboveMax
+                                  : (levels == 256u ? PtSparseDenseReason::FullRate : PtSparseDenseReason::None)};
+}
 inline float g_pt_sharc_enabled = 1.f, g_pt_sharc_accumulation_frames = 32.f, g_pt_sharc_stale_frames = 64.f,
              g_pt_sharc_scene_scale = 15.f, g_pt_sharc_downscale = 5.f, g_pt_sharc_capacity_log2 = 22.f;
 inline float g_pt_sharc_radiance_scale = 100000.f;
@@ -55,6 +88,8 @@ inline const char* PtReasonName(PtReason r) {
 }
 struct PtPanel {
   PtReason reason = PtReason::Off;
+  PtSparsePolicy sparse_policy = {256u, PtSparseDenseReason::Disabled};
+  bool sparse_requested = false, sparse_adaptive = false;
   uint64_t frames[static_cast<uint32_t>(PtReason::Count)] = {};
   uint64_t waits = 0u;
   float wait_ms_max = 0.f;
@@ -119,6 +154,9 @@ inline void DrawPtPanel() {
               static_cast<unsigned long long>(p.frames[static_cast<uint32_t>(PtReason::Tracing)]),
               lamps_text.c_str(), p.width, p.height);
   ImGui::Text("Slot waits %llu  max %.2f ms", static_cast<unsigned long long>(p.waits), p.wait_ms_max);
+  ImGui::Text("Sparse policy: requested %s  quantized rate %.4f  dense reason %s (rendering remains dense)",
+              !p.sparse_requested ? "off" : p.sparse_adaptive ? "adaptive" : "fixed",
+              p.sparse_policy.levels / 256.f, PtSparseDenseReasonName(p.sparse_policy.dense_reason));
   ImGui::Text("SHARC: %s  capacity 2^%u  update 1/%u px  window %u frames  clears %llu (last: %s)", p.sharc_on ? "on" : "off",
               p.sharc_capacity_log2, p.sharc_downscale, p.sharc_window, static_cast<unsigned long long>(p.sharc_clears),
               p.sharc_clear_reason);
