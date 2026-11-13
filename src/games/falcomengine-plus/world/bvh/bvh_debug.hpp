@@ -430,6 +430,8 @@ inline void OnWorldPresentBvh(
       if (rt12_state.rtxdi_perf_epoch != perf_epoch) {
         std::fill(std::begin(rt12_state.rtxdi_gpu_ms_sum), std::end(rt12_state.rtxdi_gpu_ms_sum), 0.0);
         std::fill(std::begin(rt12_state.rtxdi_gpu_samples), std::end(rt12_state.rtxdi_gpu_samples), 0u);
+        std::fill(std::begin(rt12_state.pt_gpu_ms_sum), std::end(rt12_state.pt_gpu_ms_sum), 0.0);
+        std::fill(std::begin(rt12_state.pt_gpu_samples), std::end(rt12_state.pt_gpu_samples), 0u);
         rt12_state.rtxdi_gpu_completed_batches = 0u;
         rt12_state.rtxdi_perf_last_frame = UINT32_MAX;
         rt12_state.rtxdi_perf_epoch = perf_epoch;
@@ -438,6 +440,12 @@ inline void OnWorldPresentBvh(
       extra.rtxdi_local = {rt12_state.rtxdi_gpu_ms_sum[1], rt12_state.rtxdi_gpu_samples[1]};
       extra.rtxdi_distance = {rt12_state.rtxdi_gpu_ms_sum[2], rt12_state.rtxdi_gpu_samples[2]};
       extra.rtxdi_nrd = {rt12_state.rtxdi_gpu_ms_sum[3], rt12_state.rtxdi_gpu_samples[3]};
+      extra.rtxdi_initial = {rt12_state.rtxdi_gpu_ms_sum[4], rt12_state.rtxdi_gpu_samples[4]};
+      extra.rtxdi_temporal = {rt12_state.rtxdi_gpu_ms_sum[5], rt12_state.rtxdi_gpu_samples[5]};
+      extra.rtxdi_spatial = {rt12_state.rtxdi_gpu_ms_sum[6], rt12_state.rtxdi_gpu_samples[6]};
+      extra.rtxdi_sun = {rt12_state.rtxdi_gpu_ms_sum[7], rt12_state.rtxdi_gpu_samples[7]};
+      extra.pt_main = {rt12_state.pt_gpu_ms_sum[0], rt12_state.pt_gpu_samples[0]};
+      extra.pt_water = {rt12_state.pt_gpu_ms_sum[1], rt12_state.pt_gpu_samples[1]};
     }
   }
   const auto present_time = SamplePerfPresent(device, extra);

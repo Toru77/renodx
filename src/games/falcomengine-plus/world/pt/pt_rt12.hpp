@@ -417,10 +417,35 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   RecordRt12SignalA(s, a, GpuEvidenceSource::Pt);
   if (a == renodx::utils::gpu_fence::NO_SIGNAL) return submit_fail(Rt12Reason::FenceError, "pt fence11 signal");
+  const auto pt_main_cpu_start = bvh::PerfNow();  // M0t: D3D12 record and submit only (no D3D11 flush, copies or waits)
   // 6. Record: descriptors, barriers, trace.
   ID3D12GraphicsCommandList4* list = r.list.Get();
   if (FAILED(pt_slot.allocator->Reset()) || FAILED(list->Reset(pt_slot.allocator.Get(), nullptr))) {
     return submit_fail(Rt12Reason::SubmitFailed, "pt reset");
+  }
+  const bool pt_perf_gather = bvh::g_perf_gate.gather.load(std::memory_order_relaxed);
+  const uint64_t pt_perf_epoch = bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed);
+  bool pt_perf_timing = false;
+  if (rtxdi::CanStartGpuTiming(pt_perf_gather, s.timestamp_frequency, r.perf_pending[k])) {
+    if (!r.perf_queries || !r.perf_readback) {
+      D3D12_QUERY_HEAP_DESC query_desc = {};
+      query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+      query_desc.Count = 2u * kRt12PtPerfBlocks;
+      if (FAILED(s.device12->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&r.perf_queries)))
+          || FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_READBACK, 16ull * kRt12PtPerfBlocks,
+                                     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, r.perf_readback))) {
+        r.perf_queries.Reset();
+        r.perf_readback.Reset();
+      }
+    }
+    pt_perf_timing = r.perf_queries && r.perf_readback;
+  }
+  if (pt_perf_gather && s.timestamp_frequency == 0u) {
+    rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.pt_timing_skip_events);
+  } else if (pt_perf_gather && r.perf_pending[k]) {
+    bvh::g_perf_gate.pt_timing_pending_frames.fetch_add(1u, std::memory_order_relaxed);
+  } else if (pt_perf_gather && !pt_perf_timing) {
+    rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.pt_timing_skip_events);  // query heap or readback allocation failed
   }
   ID3D12Device5* device12 = s.device12.Get();
   const uint32_t base = k * kRt12PtDescriptors;
@@ -621,7 +646,12 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     uav_barrier();
     list->SetPipelineState(r.pso.Get());
   }
+  if (pt_perf_timing) list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * k);
   list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+  if (pt_perf_timing) {
+    list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * k + 1u);
+    list->ResolveQueryData(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * k, 2u, r.perf_readback.Get(), 16ull * k);
+  }
   barriers.clear();
   Transition(barriers, out.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
   if (refl_on) Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -665,6 +695,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   BeginRt12Submission(s);
   s.unfenced_execution = true;  // stays true if no signal B follows (teardown then leaks instead of freeing in-use objects)
   s.queue12->ExecuteCommandLists(1u, lists);
+  bvh::AddPerfBlockMs(bvh::kPerfBlockPtMainCpu, bvh::LiveElapsedMs(pt_main_cpu_start));
   RecordRt12Evidence(s, GpuEvidenceEvent::Rt12Submit, GpuEvidenceSource::Pt);
   RecordGpuWorkBreadcrumb(GpuWorkKind::Rt12, k);
   RecordGpuWorkBreadcrumb(GpuWorkKind::Pt, w);
@@ -681,6 +712,11 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   s.unfenced_execution = false;
   pt_slot.fence_value = b;
+  if (pt_perf_timing) {
+    r.perf_pending[k] = true;
+    r.perf_fence[k] = b;
+    r.perf_epoch[k] = pt_perf_epoch;
+  }
   if (!r.counter_pending[k]) {
     r.counter_fence[k] = b;
     r.counter_frame[k] = frame;
@@ -892,10 +928,23 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   }
   RecordRt12SignalA(s, a, GpuEvidenceSource::Pt);
   if (a == renodx::utils::gpu_fence::NO_SIGNAL) return fail_water(Rt12Reason::FenceError, "pt water fence11 signal", "submit");
+  const auto water_cpu_start = bvh::PerfNow();  // M0t: D3D12 record and submit only (no D3D11 copies, flush or waits)
   // 6. Record: descriptors, barriers, counters, dispatch.
   ID3D12GraphicsCommandList4* list = r.water_list.Get();
   if (FAILED(water_slot.allocator->Reset()) || FAILED(list->Reset(water_slot.allocator.Get(), nullptr))) {
     return fail_water(Rt12Reason::SubmitFailed, "pt water reset", "record");
+  }
+  const uint32_t water_block = kRt12Slots + k;
+  const bool water_perf_gather = bvh::g_perf_gate.gather.load(std::memory_order_relaxed);
+  const uint64_t water_perf_epoch = bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed);
+  const bool water_perf_timing = rtxdi::CanStartGpuTiming(water_perf_gather, s.timestamp_frequency, r.perf_pending[water_block])
+                                 && r.perf_queries && r.perf_readback;
+  if (water_perf_gather && s.timestamp_frequency == 0u) {
+    rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.pt_timing_skip_events);
+  } else if (water_perf_gather && r.perf_pending[water_block]) {
+    bvh::g_perf_gate.pt_timing_pending_frames.fetch_add(1u, std::memory_order_relaxed);
+  } else if (water_perf_gather && !water_perf_timing) {
+    rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.pt_timing_skip_events);  // query heap or readback not allocated
   }
   ID3D12Device5* device12 = s.device12.Get();
   const uint32_t base = (kRt12Slots + k) * kRt12PtDescriptors;
@@ -963,7 +1012,13 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   D3D12_GPU_DESCRIPTOR_HANDLE table = r.heap->GetGPUDescriptorHandleForHeapStart();
   table.ptr += static_cast<UINT64>(base) * s.descriptor_size;
   list->SetComputeRootDescriptorTable(1u, table);
+  if (water_perf_timing) list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * water_block);
   list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+  if (water_perf_timing) {
+    list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * water_block + 1u);
+    list->ResolveQueryData(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * water_block, 2u, r.perf_readback.Get(),
+                           16ull * water_block);
+  }
   barriers.clear();
   Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
   for (ID3D12Resource* resource : water_cache) {
@@ -999,6 +1054,7 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   BeginRt12Submission(s);
   s.unfenced_execution = true;  // stays true if no signal B follows (teardown then leaks instead of freeing in-use objects)
   s.queue12->ExecuteCommandLists(1u, lists);
+  bvh::AddPerfBlockMs(bvh::kPerfBlockPtWaterCpu, bvh::LiveElapsedMs(water_cpu_start));
   RecordRt12Evidence(s, GpuEvidenceEvent::Rt12Submit, GpuEvidenceSource::Pt);
   RecordGpuWorkBreadcrumb(GpuWorkKind::Rt12, k);
   uint64_t b = renodx::utils::gpu_fence::NO_SIGNAL;
@@ -1014,6 +1070,11 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   }
   s.unfenced_execution = false;
   water_slot.fence_value = b;
+  if (water_perf_timing) {
+    r.perf_pending[water_block] = true;
+    r.perf_fence[water_block] = b;
+    r.perf_epoch[water_block] = water_perf_epoch;
+  }
   if (counters_copied) {
     r.water_counter_fence[k] = b;
     r.water_counter_frame[k] = frame;

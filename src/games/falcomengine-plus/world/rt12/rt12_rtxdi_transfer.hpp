@@ -1489,12 +1489,12 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       if (!slot.perf_queries || !slot.perf_readback) {
         D3D12_QUERY_HEAP_DESC query_desc = {};
         query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        query_desc.Count = 8u;
+        query_desc.Count = 2u * kRt12DiPerfSamples;
         D3D12_HEAP_PROPERTIES readback_heap = {};
         readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
         D3D12_RESOURCE_DESC readback_desc = {};
         readback_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        readback_desc.Width = 64u;
+        readback_desc.Width = 16u * kRt12DiPerfSamples;
         readback_desc.Height = 1u;
         readback_desc.DepthOrArraySize = 1u;
         readback_desc.MipLevels = 1u;
@@ -1880,7 +1880,9 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     bool sun_detail_recorded = false;
     bool sun_accumulated = false;
     bool sun_history_used = false;
+    bool perf_sun_recorded = false;
     if (in.sun) {
+      const auto sun_cpu_start = bvh::PerfNow();
       Rt12Slot& scene = s.lighting_slots[static_cast<uint32_t>(in.scene_slot)];
       const bool gc = s.scene_gc;
       ID3D12Resource* vertices = gc ? g_rt12_gc_scene.vertices : s.arenas[kRt12ArenaVertices].buffer.Get();
@@ -1988,6 +1990,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       auto query_gpu = slot.descriptors->GetGPUDescriptorHandleForHeapStart();
       query_gpu.ptr += static_cast<UINT64>(8u) * s.descriptor_size;
       transfer.list->SetComputeRootDescriptorTable(1u, query_gpu);
+      if (perf_timing) transfer.list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 14u);
       if (sun_half) {
         transfer.list->Dispatch(((in.width + 1u) / 2u + 7u) / 8u, ((in.height + 1u) / 2u + 7u) / 8u, 1u);
         query_barriers.clear();
@@ -2179,6 +2182,11 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       Transition(query_barriers, slot.sun_visibility.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                  D3D12_RESOURCE_STATE_COMMON);
       transfer.list->ResourceBarrier(static_cast<UINT>(query_barriers.size()), query_barriers.data());
+      if (perf_timing) {
+        transfer.list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 15u);
+        perf_sun_recorded = true;
+      }
+      bvh::AddPerfBlockMs(bvh::kPerfBlockRtxdiSunCpu, bvh::LiveElapsedMs(sun_cpu_start));
     }
     barriers.clear();
     for (auto* buffer : buffers)
@@ -2200,6 +2208,10 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       transfer.list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1u);
       transfer.list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0u, 2u,
                                       slot.perf_readback.Get(), 0u);
+      if (perf_sun_recorded) {
+        transfer.list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 14u, 2u,
+                                        slot.perf_readback.Get(), 112u);
+      }
     }
     hr = transfer.list->Close();
     if (FAILED(hr)) {
@@ -2241,6 +2253,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
         slot.perf_pending = true;
         slot.perf_fence = b;
         slot.perf_valid_mask = 1u;
+        if (perf_sun_recorded) slot.perf_valid_mask |= 128u;
       }
       Rt12Slot& scene = s.lighting_slots[static_cast<uint32_t>(in.scene_slot)];
       scene.fence_value = (std::max)(scene.fence_value, b);
@@ -2376,6 +2389,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                            && slot.perf_settings_identity == in.effective_settings.identity;
   bool perf_distance_recorded = false;
   bool perf_nrd_recorded = false;
+  bool perf_temporal_recorded = false;
 #if defined(FALCOM_NRD_ENABLED)
   slot.nrd.dispatch_ready = false;
   slot.nrd.diffuse_output_valid = false;
@@ -2930,6 +2944,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   Transition(barriers, slot.di_results.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   Transition(barriers, slot.di_resolved.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  const auto initial_cpu_start = bvh::PerfNow();
   transfer.di_list->SetComputeRootSignature(transfer.initial_di_root.Get());
   transfer.di_list->SetPipelineState(transfer.initial_di_pso.Get());
   const float local_light_size = rtxdi::FiniteClamped(rtxdi::g_local_light_size, 0.f, 0.f, 0.5f);
@@ -2950,19 +2965,33 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   transfer.di_list->SetComputeRoot32BitConstants(0u, 22u, sun_params, 0u);
   transfer.di_list->SetComputeRootConstantBufferView(1u, slot.di_frame_upload->GetGPUVirtualAddress());
   transfer.di_list->SetComputeRootDescriptorTable(2u, slot.di_descriptors->GetGPUDescriptorHandleForHeapStart());
+  if (perf_timing) transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 8u);
   transfer.di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
+  if (perf_timing) transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 9u);
   barriers.clear();
   UavBarrier(barriers, s.di.reservoirs.Get());
   transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  bvh::AddPerfBlockMs(bvh::kPerfBlockRtxdiInitialCpu, bvh::LiveElapsedMs(initial_cpu_start));
   if (history_valid && in.effective_settings.temporal_enabled) {
+    const auto temporal_cpu_start = bvh::PerfNow();
     transfer.di_list->SetPipelineState(transfer.temporal_di_pso.Get());
+    if (perf_timing) transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 10u);
     transfer.di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
+    if (perf_timing) {
+      transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 11u);
+      perf_temporal_recorded = true;
+    }
     barriers.clear();
     UavBarrier(barriers, s.di.reservoirs.Get());
     transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    bvh::AddPerfBlockMs(bvh::kPerfBlockRtxdiTemporalCpu, bvh::LiveElapsedMs(temporal_cpu_start));
   }
+  const auto spatial_cpu_start = bvh::PerfNow();
   transfer.di_list->SetPipelineState(transfer.spatial_di_pso.Get());
+  if (perf_timing) transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 12u);
   transfer.di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
+  if (perf_timing) transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 13u);
+  bvh::AddPerfBlockMs(bvh::kPerfBlockRtxdiSpatialCpu, bvh::LiveElapsedMs(spatial_cpu_start));
   if (n1_ready) {
     barriers.clear();
     UavBarrier(barriers, slot.di_results.Get());
@@ -3573,6 +3602,14 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6u, 2u,
                                          slot.perf_readback.Get(), 48u);
     }
+    transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 8u, 2u,
+                                       slot.perf_readback.Get(), 64u);
+    if (perf_temporal_recorded) {
+      transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 10u, 2u,
+                                         slot.perf_readback.Get(), 80u);
+    }
+    transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 12u, 2u,
+                                       slot.perf_readback.Get(), 96u);
   }
   hr = transfer.di_list->Close();
   if (FAILED(hr)) return publish(rtxdi::DiStatus::Failed, hr);
@@ -3605,6 +3642,9 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     slot.perf_valid_mask |= 2u;
     if (perf_distance_recorded) slot.perf_valid_mask |= 4u;
     if (perf_nrd_recorded) slot.perf_valid_mask |= 8u;
+    slot.perf_valid_mask |= 16u;
+    if (perf_temporal_recorded) slot.perf_valid_mask |= 32u;
+    slot.perf_valid_mask |= 64u;
   }
   if (diag_armed) {
     slot.diag_pending = true;

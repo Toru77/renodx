@@ -82,6 +82,12 @@ enum PerfCost : size_t {
   kPerfGpuRtxdiLocal,
   kPerfGpuRtxdiDistance,
   kPerfGpuRtxdiNrd,
+  kPerfGpuRtxdiInitial,
+  kPerfGpuRtxdiTemporal,
+  kPerfGpuRtxdiSpatial,
+  kPerfGpuRtxdiSun,
+  kPerfGpuPtMain,
+  kPerfGpuPtWater,
   kPerfRebuildPhase0,
   kPerfRebuildPhase1,
   kPerfRebuildPhase2,
@@ -140,6 +146,12 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"gpu_rtxdi_local", true, kPerfGpu, true, nullptr},
     {"gpu_rtxdi_distance", true, kPerfSubset, true, "N3b distance subset"},
     {"gpu_rtxdi_nrd", true, kPerfSubset, true, "NRD prep/RELAX/publication subset"},
+    {"gpu_rtxdi_initial", true, kPerfSubset, true, "RTXDI local initial subset"},
+    {"gpu_rtxdi_temporal", true, kPerfSubset, true, "RTXDI local temporal subset"},
+    {"gpu_rtxdi_spatial", true, kPerfSubset, true, "RTXDI local spatial subset"},
+    {"gpu_rtxdi_sun", true, kPerfSubset, true, "RTXDI sun subset (overlaps gpu_rtxdi_input)"},
+    {"gpu_pt_main", true, kPerfGpu, true, nullptr},
+    {"gpu_pt_water", true, kPerfGpu, true, nullptr},
     {"rebuild_phase_0", true, kPerfSubset, false, kCachePhaseNames[0]},
     {"rebuild_phase_1", true, kPerfSubset, false, kCachePhaseNames[1]},
     {"rebuild_phase_2", true, kPerfSubset, false, kCachePhaseNames[2]},
@@ -226,6 +238,12 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"capture_hook", true, kPerfSubset, false, nullptr},
     {"deform_probe_map", true, kPerfSubset, false, nullptr},
     {"deform_probe_eval", true, kPerfSubset, false, nullptr},
+    {"pt_main_cpu", true, kPerfSubset, false, nullptr},
+    {"pt_water_cpu", true, kPerfSubset, false, nullptr},
+    {"rtxdi_initial_cpu", true, kPerfSubset, false, nullptr},
+    {"rtxdi_temporal_cpu", true, kPerfSubset, false, nullptr},
+    {"rtxdi_spatial_cpu", true, kPerfSubset, false, nullptr},
+    {"rtxdi_sun_cpu", true, kPerfSubset, false, nullptr},
 };
 inline constexpr bool PerfInTotal(const PerfCostInfo& info) {
   return info.role == kPerfInPresent || info.role == kPerfDrawTime || info.role == kPerfGpu;
@@ -382,6 +400,7 @@ struct PerfExtraGpu {
   PerfTimerSample rtao, rtao_filter, rtgi, rtgi_denoise, rtls, rtls_denoise, rtsun, rtsun_denoise, deform_refit;
   PerfTimerSample rtxdi_input, rtxdi_local, rtxdi_distance, rtxdi_nrd;
   double dxr_tlas_ms = 0.0, dxr_records_ms = 0.0, dxr_characters_ms = 0.0, gc_blas_ms = 0.0, dxr_rtgi_ms = 0.0;  // D3D12 timestamp sums (rt12 panels); inside gpu_rtao, so Subset rows
+  PerfTimerSample rtxdi_initial, rtxdi_temporal, rtxdi_spatial, rtxdi_sun, pt_main, pt_water;
 };
 
 // Performance tab: the last kPerfTabWindow presents. NaN means "--" (no value in the window).
@@ -585,6 +604,18 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.events[kPerfGpuRtxdiDistance] = extra.rtxdi_distance.samples;
   c.cost[kPerfGpuRtxdiNrd] = extra.rtxdi_nrd.ms_sum;
   c.events[kPerfGpuRtxdiNrd] = extra.rtxdi_nrd.samples;
+  c.cost[kPerfGpuRtxdiInitial] = extra.rtxdi_initial.ms_sum;
+  c.events[kPerfGpuRtxdiInitial] = extra.rtxdi_initial.samples;
+  c.cost[kPerfGpuRtxdiTemporal] = extra.rtxdi_temporal.ms_sum;
+  c.events[kPerfGpuRtxdiTemporal] = extra.rtxdi_temporal.samples;
+  c.cost[kPerfGpuRtxdiSpatial] = extra.rtxdi_spatial.ms_sum;
+  c.events[kPerfGpuRtxdiSpatial] = extra.rtxdi_spatial.samples;
+  c.cost[kPerfGpuRtxdiSun] = extra.rtxdi_sun.ms_sum;
+  c.events[kPerfGpuRtxdiSun] = extra.rtxdi_sun.samples;
+  c.cost[kPerfGpuPtMain] = extra.pt_main.ms_sum;
+  c.events[kPerfGpuPtMain] = extra.pt_main.samples;
+  c.cost[kPerfGpuPtWater] = extra.pt_water.ms_sum;
+  c.events[kPerfGpuPtWater] = extra.pt_water.samples;
   c.cost[kPerfDxrTlasGpu] = extra.dxr_tlas_ms;
   c.cost[kPerfDxrRecordsGpu] = extra.dxr_records_ms;
   c.cost[kPerfDxrCharactersGpu] = extra.dxr_characters_ms;
@@ -944,6 +975,8 @@ inline void ClearPerfGathered(BvhDeviceData* data) {
   g_perf_gate.rtxdi_rejections.store(0u);
   g_perf_gate.rtxdi_busy_skips.store(0u);
   g_perf_gate.rtxdi_timing_skip_events.store(0u);
+  g_perf_gate.pt_timing_skip_events.store(0u);
+  g_perf_gate.pt_timing_pending_frames.store(0u);
   g_perf_gate.deform_update_us.store(0u);
   for (std::atomic_uint64_t& us : g_perf_gate.block_us) us.store(0u);
   g_perf_gate.hook_draws.store(0u);

@@ -68,6 +68,8 @@ inline constexpr uint32_t kRt12TeardownMs = 2000u;  // CPU wait budget for a tea
 // records SRV and descs / instance table UAV (13.1c).
 inline constexpr uint32_t kRt12Descriptors = 20u;
 inline constexpr uint32_t kRt12Timestamps = 7u;  // per slot: present 0..1, lighting 2..6
+inline constexpr uint32_t kRt12DiPerfSamples = 8u;  // RTXDI transfer-slot intervals (2 timestamps each): input, local, distance, NRD, initial, temporal, spatial, sun
+inline constexpr uint32_t kRt12PtPerfBlocks = 2u * kRt12Slots;  // PT timing blocks: main slot k, water slot kRt12Slots + k
 inline constexpr uint32_t kRt12StatsWidth = 32u;
 inline constexpr uint64_t kRt12ArenaMinBytes = 1024ull * 1024ull;
 
@@ -448,6 +450,13 @@ struct Rt12PtState {
   uint64_t counter_fence[kRt12Slots] = {};
   uint32_t counter_frame[kRt12Slots] = {};
   bool counter_pending[kRt12Slots] = {};
+  // M0t: block k = main slot k, kRt12Slots + k = water slot k; queries 2*block and 2*block+1; readback bytes 16*block.
+  // Read only after the block's fence completed; never waits.
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> perf_queries;  // 2 * kRt12PtPerfBlocks
+  Microsoft::WRL::ComPtr<ID3D12Resource> perf_readback;  // 16 * kRt12PtPerfBlocks bytes, READBACK
+  uint64_t perf_fence[kRt12PtPerfBlocks] = {};
+  uint64_t perf_epoch[kRt12PtPerfBlocks] = {};
+  bool perf_pending[kRt12PtPerfBlocks] = {};
 };
 
 struct Rt12State {
@@ -488,8 +497,10 @@ struct Rt12State {
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> queries;        // kRt12Slots * kRt12Timestamps
   Microsoft::WRL::ComPtr<ID3D12Resource> query_readback;  // kRt12Slots * kRt12Timestamps * 8 bytes
   uint64_t timestamp_frequency = 0u;
-  double rtxdi_gpu_ms_sum[4] = {};
-  uint32_t rtxdi_gpu_samples[4] = {};
+  double rtxdi_gpu_ms_sum[kRt12DiPerfSamples] = {};
+  uint32_t rtxdi_gpu_samples[kRt12DiPerfSamples] = {};
+  double pt_gpu_ms_sum[2] = {};   // M0t: PT main (0), water (1)
+  uint32_t pt_gpu_samples[2] = {};
   uint32_t rtxdi_gpu_completed_batches = 0u;
   uint32_t rtxdi_perf_last_frame = UINT32_MAX;
   uint64_t rtxdi_perf_epoch = 0u;
@@ -1928,6 +1939,8 @@ inline void OnPresent(reshade::api::device* device) {
   if (s.rtxdi_perf_epoch != perf_epoch) {
     std::fill(std::begin(s.rtxdi_gpu_ms_sum), std::end(s.rtxdi_gpu_ms_sum), 0.0);
     std::fill(std::begin(s.rtxdi_gpu_samples), std::end(s.rtxdi_gpu_samples), 0u);
+    std::fill(std::begin(s.pt_gpu_ms_sum), std::end(s.pt_gpu_ms_sum), 0.0);
+    std::fill(std::begin(s.pt_gpu_samples), std::end(s.pt_gpu_samples), 0u);
     s.rtxdi_gpu_completed_batches = 0u;
     s.rtxdi_perf_last_frame = UINT32_MAX;
     s.rtxdi_perf_epoch = perf_epoch;
@@ -1953,11 +1966,11 @@ inline void OnPresent(reshade::api::device* device) {
       }
       if (identity_valid && slot.perf_readback) {
         void* mapped = nullptr;
-        const D3D12_RANGE read_range = {0u, 64u};
+        const D3D12_RANGE read_range = {0u, kRt12DiPerfSamples * 16u};
         if (SUCCEEDED(slot.perf_readback->Map(0u, &read_range, &mapped)) && mapped != nullptr) {
           const auto* timestamps = static_cast<const uint64_t*>(mapped);
           bool any_sample = false;
-          for (uint32_t sample = 0u; sample < 4u; ++sample) {
+          for (uint32_t sample = 0u; sample < kRt12DiPerfSamples; ++sample) {
             if ((slot.perf_valid_mask & (1u << sample)) == 0u) continue;
             const uint32_t timestamp = sample * 2u;
             double milliseconds = 0.0;
@@ -1981,6 +1994,21 @@ inline void OnPresent(reshade::api::device* device) {
       }
       slot.perf_valid_mask = 0u;
       slot.perf_fence = 0u;
+    }
+  }
+  Rt12PtState& pt = s.path_trace;
+  for (uint32_t block = 0u; block < kRt12PtPerfBlocks; ++block) {
+    if (!rtxdi::ClaimCompletedGpuTiming(&pt.perf_pending[block], s.completion_available, pt.perf_fence[block], completed))
+      continue;
+    const uint32_t pass = block < kRt12Slots ? 0u : 1u;
+    const bool identity_valid = perf_gather && pt.perf_epoch[block] == perf_epoch && pt.perf_readback;
+    uint64_t timestamps[2] = {};
+    double milliseconds = 0.0;
+    if (!identity_valid
+        || !ReadRt12Timestamps(pt.perf_readback.Get(), block * 2u, 2u, timestamps)
+        || !rtxdi::DecodeGpuTimestampPair(timestamps[0], timestamps[1], s.timestamp_frequency, &milliseconds)
+        || !rtxdi::AccumulateGpuSample(milliseconds, &s.pt_gpu_ms_sum[pass], &s.pt_gpu_samples[pass])) {
+      if (perf_gather) rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.pt_timing_skip_events);
     }
   }
   for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {

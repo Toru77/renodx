@@ -416,6 +416,20 @@ inline void DrawPerformanceTab() {
     ImGui::TextDisabled("NRD timing unavailable (no NRD SDK build)");
 #endif
   }
+  if (ImGui::CollapsingHeader("PT timing session")) {
+    if (rt12::g_rt12) {
+      uint32_t pending = 0u;
+      for (const bool value : rt12::g_rt12->path_trace.perf_pending) pending += value ? 1u : 0u;
+      ImGui::Text("PT GPU timing: main samples %u, water samples %u, pending measurement batches %u, "
+                  "timing skip events %llu (allocation, zero frequency, invalid or stale interval), "
+                  "not timed (previous measurement still pending) %llu",
+                  rt12::g_rt12->pt_gpu_samples[0], rt12::g_rt12->pt_gpu_samples[1], pending,
+                  static_cast<unsigned long long>(g_perf_gate.pt_timing_skip_events.load(std::memory_order_relaxed)),
+                  static_cast<unsigned long long>(g_perf_gate.pt_timing_pending_frames.load(std::memory_order_relaxed)));
+    } else {
+      ImGui::TextDisabled("GPU timing unavailable (RT12 session not created)");
+    }
+  }
   if (ImGui::CollapsingHeader("Largest frame spike of the last 30 presents")) {
     const PerfSpike& spike = view.spike;
     if (!spike.valid) {
@@ -458,7 +472,7 @@ inline void DrawPerformanceTab() {
       ImGui::EndTable();
     }
   }
-  ImGui::TextDisabled("Last %u presents: now = newest present, avg = mean of the window, max = largest of the window (per row; the totals are the largest per-sample totals, so they need not equal the sum of the row maxima). CPU rows are per present; GPU rows are per measured frame. RTXDI input/local rows cover D3D12 command-list work only; distance and NRD rows are subsets excluded from gpu_total. D3D11 pack/copy and cross-queue waits are not included, so these are not end-to-end latency. Unattributed CPU = the two present handlers minus the rows inside them.",
+  ImGui::TextDisabled("Last %u presents: now = newest present, avg = mean of the window, max = largest of the window (per row; the totals are the largest per-sample totals, so they need not equal the sum of the row maxima). CPU rows are per present; GPU rows are per measured frame. RTXDI input/local rows cover D3D12 command-list work only; distance, NRD, initial, temporal, spatial and sun rows are subsets excluded from gpu_total; the sun row overlaps the input row. PT main/water rows time only the main and water trace dispatches (SHARC and material passes excluded). D3D11 pack/copy and cross-queue waits are not included, so these are not end-to-end latency. Unattributed CPU = the two present handlers minus the rows inside them.",
                       static_cast<unsigned>(kPerfTabWindow));
   if (ImGui::Button("Performance test (30 s)")) RequestPerfRun(g_diag_label);
   if (ImGui::IsItemHovered()) {

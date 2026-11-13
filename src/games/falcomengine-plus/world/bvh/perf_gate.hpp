@@ -80,6 +80,12 @@ enum PerfBlock : size_t {
   kPerfBlockCaptureHook,   // OnPushDescriptorsCapture, whole (addon.cpp), timed before its gate
   kPerfBlockDeformProbeMap,   // ResolveDeformSlot: map_buffer_region of the staging copy
   kPerfBlockDeformProbeEval,  // ResolveDeformSlot: the judging loop over the mapped capture
+  kPerfBlockPtMainCpu,        // (M0t) PT main trace: from after the slot wait and D3D11 signal to ExecuteCommandLists; includes GPU-side QueueWait calls and the first-frame query heap allocation; excludes D3D11 flush and CPU fence waits
+  kPerfBlockPtWaterCpu,       // (M0t) PT water trace: from after the slot wait and D3D11 signal to ExecuteCommandLists; includes GPU-side QueueWait calls; excludes D3D11 copies, flush and CPU fence waits
+  kPerfBlockRtxdiInitialCpu,  // (M0t) RTXDI local initial dispatch and its barrier
+  kPerfBlockRtxdiTemporalCpu, // (M0t) RTXDI local temporal dispatch and its barrier
+  kPerfBlockRtxdiSpatialCpu,  // (M0t) RTXDI local spatial dispatch and its barrier
+  kPerfBlockRtxdiSunCpu,      // (M0t) RTXDI sun block: CPU time from the top of the sun block to its end, including descriptor setup, barriers, and first-frame detail pipeline creation; excludes GPU waits and the D3D11 path
   kPerfBlockCount
 };
 
@@ -102,6 +108,8 @@ struct PerfGate {
   std::atomic_uint64_t rtxdi_rejections{0u};
   std::atomic_uint64_t rtxdi_busy_skips{0u};
   std::atomic_uint64_t rtxdi_timing_skip_events{0u};
+  std::atomic_uint64_t pt_timing_skip_events{0u};
+  std::atomic_uint64_t pt_timing_pending_frames{0u};  // PT pass submissions not timed because that block's previous measurement was still pending (not a skip event)
   std::atomic_uint64_t deform_update_us{0u};         // UpdateDeformLive CPU time of the last present
   std::atomic_uint64_t block_us[kPerfBlockCount]{};  // CPU time of each PerfBlock (cumulative nanoseconds; written by PoolCpuTimer or AddPerfBlockMs)
   std::atomic_uint64_t hook_draws{0u};        // draws that reached the pool path of WorldDrawCallback (gather only)
