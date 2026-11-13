@@ -4,6 +4,7 @@ void PtEvaluate(uint3 id, RtxdiSurfaceResult surface, bool water_pass) {
   WorldTraceCounters pt_counters;  // required out argument of TraceWorldRayDxr; discarded
   const WorldCameraView bounce_view = {true, 1.0, 0u, 0u};
   const SharcParameters sharc = PtSharcParameters();
+  const bool water_origin = water_pass || ((g_refl_flags & 8u) != 0u && (g_pt_normal.Load(int3(id.xy, 0)).w & 2u) != 0u);
   if (!water_pass) {
     uint rng = PtHash(id.x + id.y * g_size.x + PtHash(g_frame));
     float3 L = float3(0, 0, 0);
@@ -41,13 +42,13 @@ void PtEvaluate(uint3 id, RtxdiSurfaceResult surface, bool water_pass) {
     }
     float3 A = L / float(g_samples);
     if (any(isnan(A)) || any(isinf(A))) A = float3(0, 0, 0);
+    if (!water_origin && g_sparse_enabled != 0u && g_sparse_levels < 256u) A *= 256.0 / float(g_sparse_levels);
     g_pt_output[id.xy] = float4(max(A, 0), 1);
   }
   if (g_refl_samples != 0u) {
     float4 refl = float4(0, 0, 0, 0);
     if (water_pass || (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) == 0u) {
       // Roughness as the lighting shader's reflection mip: deferred roughness x mrt1.y / 255 (lighting :1184-1185).
-      const bool water_origin = water_pass || ((g_refl_flags & 8u) != 0u && (g_pt_normal.Load(int3(id.xy, 0)).w & 2u) != 0u);
       const float rough = water_origin ? saturate(g_water_roughness * g_refl_roughness_scale) : saturate(PtGBufferMaterial(id.xy).roughness * ((g_pt_mrt1.Load(int3(id.xy, 0)).y & 255u) * (1.0 / 255.0)) * g_refl_roughness_scale);
       const float alpha = max(rough * rough, 1e-4);
       const float3 n = surface.shading_normal;
@@ -98,6 +99,7 @@ void PtEvaluate(uint3 id, RtxdiSurfaceResult surface, bool water_pass) {
       if (any(isnan(sum)) || any(isinf(sum))) sum = float3(0, 0, 0);
       float3 rgb = max(sum, 0) * g_refl_intensity;
       if ((g_refl_flags & 1u) != 0u) rgb = min(rgb, 1.0);
+      if (!water_origin && g_sparse_enabled != 0u && g_sparse_levels < 256u) rgb *= 256.0 / float(g_sparse_levels);
       refl = float4(rgb, max(distance / float(g_refl_samples), 1e-3));
     }
     g_pt_reflection[id.xy] = refl;

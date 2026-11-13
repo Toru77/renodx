@@ -768,9 +768,11 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   RecordRt12WaitB(s, b, GpuEvidenceSource::Pt);
   const uint32_t sparse_effective_levels = sparse_policy.dense_reason == pt::PtSparseDenseReason::None ? sparse_policy.levels : 256u;
   if (r.sparse_effective != sparse_effective || r.sparse_effective_levels != sparse_effective_levels) {
-    if (const auto runtime = rr::SnapshotRrD3D12Runtime(); runtime != nullptr) runtime->MarkHistoryReset();
-    r.sparse_effective = sparse_effective;
-    r.sparse_effective_levels = sparse_effective_levels;
+    if (const auto runtime = rr::SnapshotRrD3D12Runtime(); runtime != nullptr) {
+      runtime->MarkHistoryReset();
+      r.sparse_effective = sparse_effective;
+      r.sparse_effective_levels = sparse_effective_levels;
+    }
   }
   if (water_on) {  // publish the water block's inputs for RunPtWaterTrace of this frame
     std::copy_n(params, kRt12PtConstants, r.water_params);

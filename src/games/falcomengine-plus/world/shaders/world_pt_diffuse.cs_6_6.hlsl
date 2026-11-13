@@ -8,11 +8,16 @@ void main(uint3 id : SV_DispatchThreadID) {
   RtxdiSurfaceResult surface;
   if (!PtLoadSurface(id.xy, surface)) { if (!water_pass) g_pt_output[id.xy] = 0; if (g_refl_samples != 0u || water_pass) g_pt_reflection[id.xy] = 0; return; }
   if (water_pass && (g_pt_normal.Load(int3(id.xy, 0)).w & 2u) == 0u) { g_pt_reflection[id.xy] = 0; return; }
-  if (!water_pass && g_sparse_enabled != 0u && g_sparse_levels < 256u) {
+  if (!water_pass && !((g_refl_flags & 8u) != 0u && (g_pt_normal.Load(int3(id.xy, 0)).w & 2u) != 0u)
+      && g_sparse_enabled != 0u && g_sparse_levels < 256u) {
     PtCount(8u);
     if (!PtSparseSelected(id.xy)) {
-      g_pt_output[id.xy] = 0;
-      if (g_refl_samples != 0u) g_pt_reflection[id.xy] = 0;
+      g_pt_output[id.xy] = float4(0, 0, 0, 1);
+      if (g_refl_samples != 0u) {
+        g_pt_reflection[id.xy] = (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u
+            ? float4(0, 0, 0, 0)
+            : float4(0, 0, 0, 1e-3);
+      }
       return;
     }
     PtCount(7u);
