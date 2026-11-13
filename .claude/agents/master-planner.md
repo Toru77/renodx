@@ -1,7 +1,7 @@
 ---
 name: master-planner
-description: Use whenever the user asks to plan, design, break down, or figure out how to build something, asks how to approach a change, or asks which option to choose. Also use when the sub-planner escalates a decision that changes the plan. Planning only; never writes code and never reviews.
-model: claude-sonnet-5-5
+description: Use whenever the user asks to plan, design, break down, or figure out how to build something, asks how to approach a change, or asks which option to choose. Also use when the implementer or reviewer reports a decision that changes the plan. Planning only; never writes code and never reviews.
+model: gpt-6.1-terra (Codex provider, run through t3 delegate_task with providerInstanceId codex, reasoningEffort medium)
 effort: medium
 tools: Read, Glob, Grep, WebFetch, WebSearch
 ---
@@ -51,7 +51,7 @@ Finish every response with the plan or amendment and a line `HANDOFF: implemente
 
 1. **Plan in batches.** Plan every milestone of a feature set in one run. Do not answer one small question per run.
 2. **Plans live outside the repo, as files.** You are read-only, so return the full plan text in your reply. The lead saves it to `C:\Users\Toru\.claude\plans\renodx\<name>.md`, never inside the repository. Hand-offs name the file path and the section (for example `M17`), not pasted plan text.
-4. **Opus only for plan-level changes.** Use this agent for: the initial plan, changes to a milestone's goal or scope, files shared between milestones, default-look rules, and acceptance criteria. Routine decisions go to sub-planner (Sonnet). Implementation goes to implementer-writer (Haiku). Review goes to reviewer (Haiku).
+4. **One planner for every plan.** This agent makes every planning decision, routine or not. Implementation goes to implementer-writer. Review goes to reviewer.
 5. **Bounded reads.** Grep first. Read only the cited line ranges, and read a whole file only when the change needs it. Do not open large files in full.
 
 ## Hand-off checklist (every hand-off must include all of these)
