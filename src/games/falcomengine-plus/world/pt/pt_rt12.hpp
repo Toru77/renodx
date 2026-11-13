@@ -11,6 +11,7 @@
 #include "../rtao/rtao.hpp"  // include order only: defines rtao::NullComputeSlots, which rt12_backend.hpp and rt12_rtxdi_transfer.hpp call; M1 uses no RTAO behaviour (moves to a neutral header in M6)
 #include "../rt12/rt12_backend.hpp"
 #include "../rt12/rt12_rtxdi_transfer.hpp"
+#include "../rr/rr_d3d12.hpp"
 #include "pt_state.hpp"
 #include "pt_diagnostics.hpp"
 namespace falcom_world::rt12 {
@@ -117,12 +118,15 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (FAILED(hr)) return fail("pt root serialize", hr);
     hr = s.device12->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&r.root));
     if (FAILED(hr)) return fail("pt root", hr);
-#if defined(__world_pt_diffuse_EMBED_FILE) && defined(__world_pt_sharc_update_EMBED_FILE) && defined(__world_pt_sharc_resolve_EMBED_FILE) && defined(__world_pt_material_write_EMBED_FILE)
+#if defined(__world_pt_diffuse_EMBED_FILE) && defined(__world_pt_sparse_resolve_EMBED_FILE) && defined(__world_pt_sharc_update_EMBED_FILE) && defined(__world_pt_sharc_resolve_EMBED_FILE) && defined(__world_pt_material_write_EMBED_FILE)
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc = {};
     pso_desc.pRootSignature = r.root.Get();
     pso_desc.CS = {__world_pt_diffuse.data(), __world_pt_diffuse.size()};
     hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.pso));
     if (FAILED(hr)) return fail("pt pso", hr);
+    pso_desc.CS = {__world_pt_sparse_resolve.data(), __world_pt_sparse_resolve.size()};
+    hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.sparse_resolve_pso));
+    if (FAILED(hr)) return fail("pt sparse resolve pso", hr);
     pso_desc.CS = {__world_pt_sharc_update.data(), __world_pt_sharc_update.size()};
     hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.sharc_update_pso));
     if (FAILED(hr)) return fail("pt sharc update pso", hr);
@@ -659,6 +663,16 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * k + 1u);
     list->ResolveQueryData(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * k, 2u, r.perf_readback.Get(), 16ull * k);
   }
+  if (sparse_requested && sparse_policy.dense_reason == pt::PtSparseDenseReason::None && sparse_policy.levels < 256u) {
+    D3D12_RESOURCE_BARRIER sparse_barriers[2] = {};
+    sparse_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    sparse_barriers[0].UAV.pResource = out.texture12.Get();
+    sparse_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    sparse_barriers[1].UAV.pResource = refl.texture12.Get();
+    list->ResourceBarrier(refl_on ? 2u : 1u, sparse_barriers);
+    list->SetPipelineState(r.sparse_resolve_pso.Get());
+    list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+  }
   barriers.clear();
   Transition(barriers, out.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
   if (refl_on) Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -744,6 +758,12 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   if (!waited) return submit_fail(Rt12Reason::SubmitFailed, "pt d3d11 wait on fence B");
   RecordRt12WaitB(s, b, GpuEvidenceSource::Pt);
+  const uint32_t sparse_effective_levels = sparse_policy.dense_reason == pt::PtSparseDenseReason::None ? sparse_policy.levels : 256u;
+  if (r.sparse_requested != sparse_requested || r.sparse_effective_levels != sparse_effective_levels) {
+    if (const auto runtime = rr::SnapshotRrD3D12Runtime(); runtime != nullptr) runtime->MarkHistoryReset();
+    r.sparse_requested = sparse_requested;
+    r.sparse_effective_levels = sparse_effective_levels;
+  }
   if (water_on) {  // publish the water block's inputs for RunPtWaterTrace of this frame
     std::copy_n(params, kRt12PtConstants, r.water_params);
     r.water_params[46] = 0u;

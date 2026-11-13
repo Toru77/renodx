@@ -52,6 +52,7 @@ cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (48 dwords
   uint g_sparse_levels; uint g_sparse_enabled;
 };
 uint PtHash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; return x ^ (x >> 16); }
+bool PtSparseSelected(uint2 pixel) { return (PtHash(pixel.x + pixel.y * g_size.x + PtHash(g_frame ^ 0x73707273u)) >> 24) < g_sparse_levels; }
 float PtRandom(inout uint s) { s = PtHash(s + 0x9e3779b9u); return float(s >> 8) * (1.0 / 16777216.0); }
 static float3 g_pt_sun_color;
 static float3 g_pt_sun_dir;
