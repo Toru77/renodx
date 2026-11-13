@@ -1344,12 +1344,32 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
         const uint64_t pixels = uint64_t{in.width} * in.height;
         ok = pixels <= UINT64_MAX / sizeof(RtxdiDiRawResult)
              && make_buffer(uint64_t{RTXDI_INPUT_MAX_LIGHTS} * sizeof(uint32_t), &candidate.light_types)
+             && make_buffer(uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * sizeof(RtxdiLightTableEntry), &candidate.light_table)
+             && make_buffer(uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * sizeof(uint32_t), &candidate.previous_to_current)
+             && make_buffer(uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * sizeof(uint32_t), &candidate.current_to_previous)
              && make_buffer(pixels * sizeof(RtxdiDiRawResult), &candidate.di_results);
         if (ok) {
           allocation_error = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_UPLOAD,
                                               kRtxdiFrameCbvBytes, D3D12_RESOURCE_STATE_GENERIC_READ,
                                               D3D12_RESOURCE_FLAG_NONE, candidate.di_frame_upload);
           ok = SUCCEEDED(allocation_error);
+        }
+        if (ok) {
+          allocation_error = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_UPLOAD,
+                                              uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * 2u * sizeof(uint32_t),
+                                              D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE,
+                                              candidate.light_map_reset_upload);
+          ok = SUCCEEDED(allocation_error);
+          if (ok) {
+            void* reset_data = nullptr;
+            allocation_error = candidate.light_map_reset_upload->Map(0u, nullptr, &reset_data);
+            ok = SUCCEEDED(allocation_error) && reset_data != nullptr;
+            if (ok) {
+              std::fill_n(static_cast<uint32_t*>(reset_data), RTXDI_LIGHT_TABLE_CAPACITY * 2u,
+                          RTXDI_LIGHT_TABLE_INVALID_INDEX);
+              candidate.light_map_reset_upload->Unmap(0u, nullptr);
+            }
+          }
         }
         if (ok) {
           allocation_error = s.device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -1370,6 +1390,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
         ok = SUCCEEDED(allocation_error);
       }
       if (ok && in.local) {
+        heap.NumDescriptors = 58u;
         allocation_error = s.device12->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&candidate.di_descriptors));
         ok = SUCCEEDED(allocation_error);
       }
@@ -2429,6 +2450,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                               .spatial_disocclusion = in.effective_settings.spatial_disocclusion,
                               .history_length = in.effective_settings.history_length,
                               .temporal_enabled = in.effective_settings.temporal_enabled,
+                              .stable_light_remap = in.effective_settings.stable_light_remap,
                               .spatial_enabled = in.effective_settings.spatial_enabled,
                               .relax_selected = in.effective_settings.relax_diffuse,
                               .scene_slot = in.scene_slot,
@@ -2538,7 +2560,10 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   }
   if (!s.di.context || s.di.settings_identity != in.effective_settings.identity || !slot.local
       || slot.width != in.width || slot.height != in.height || !slot.di_allocator
-      || !slot.di_descriptors || !slot.light_types || !slot.di_results || !slot.di_frame_upload) {
+      || !slot.di_descriptors || !slot.light_types || !slot.light_table || !slot.previous_to_current
+      || !slot.current_to_previous || !slot.light_map_reset_upload || !slot.di_results || !slot.di_frame_upload) {
+    slot.light_table_status = RTXDI_LIGHT_TABLE_STATUS_RESOURCE_FAILED;
+    slot.light_table_reason = RTXDI_LIGHT_TABLE_STATUS_RESOURCE_FAILED;
     return publish(rtxdi::DiStatus::Failed, E_FAIL);
   }
   ComPtr<ID3D11Buffer> current_scene;
@@ -2569,13 +2594,16 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
 
   const uint32_t light_count = input.layout.lights_copied;
   const uint32_t tile_count = input.layout.tiles_copied;
+  slot.light_table_source = input.layout.lights_source;
+  slot.light_table_truncated = input.layout.lights_truncated;
+  slot.light_table_remap_enabled = in.effective_settings.stable_light_remap;
   Rt12DiTransferSlot* previous_slot = nullptr;
   if (s.di.history_valid && s.di.history_transfer_slot >= 0 && s.di.history_transfer_slot < static_cast<int32_t>(kRt12Slots)) {
     Rt12DiTransferSlot& candidate = transfer.slots[static_cast<uint32_t>(s.di.history_transfer_slot)];
     const bool previous_inputs = candidate.local && candidate.width == in.width && candidate.height == in.height
                                  && candidate.depth.texture12 && candidate.normal.texture12 && candidate.scene.texture12
                                  && candidate.color.texture12 && candidate.mrt2.texture12 && candidate.deferred_buffer
-                                 && candidate.lights_buffer && candidate.light_types;
+                                 && candidate.lights_buffer && candidate.light_types && candidate.light_table;
     if (rtxdi::ValidDiHistoryIdentity({.previous_frame = s.di.history_frame,
                                        .current_frame = in.frame,
                                        .previous_width = s.di.history_width,
@@ -2595,6 +2623,9 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     }
   }
   s.di.frame.parameters = rtxdi::MakeDiFrameParameters(s.di.config, *s.di.context);
+  if (in.effective_settings.stable_light_remap) {
+    s.di.frame.parameters.flags |= RTXDI_FRAME_FLAG_STABLE_LIGHT_REMAP;
+  }
   s.di.frame.parameters.width = in.width;
   s.di.frame.parameters.height = in.height;
   s.di.frame.parameters.history_valid = history_valid ? 1u : 0u;
@@ -2621,6 +2652,12 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
         && FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_READBACK, RTXDI_DIAG_COUNTER_BYTES,
                                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, slot.diag_readback))) {
       slot.diag_readback.Reset();
+    }
+    if (!slot.light_readback
+        && FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_READBACK,
+                                   uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * sizeof(rtgi::LightParamCpu),
+                                   D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, slot.light_readback))) {
+      slot.light_readback.Reset();
     }
     diag_armed = transfer.diag_zero && slot.diag_counters && slot.diag_readback;
   }
@@ -2673,8 +2710,50 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     transfer.classify_root = std::move(root);
     transfer.classify_pso = std::move(pso);
   }
+  if (!transfer.light_table_root || !transfer.light_table_pso) {
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 5u;
+    ranges[0].OffsetInDescriptorsFromTableStart = 0u;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 4u;
+    ranges[1].OffsetInDescriptorsFromTableStart = 5u;
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.Num32BitValues = 4u;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 2u;
+    params[1].DescriptorTable.pDescriptorRanges = ranges;
+    D3D12_ROOT_SIGNATURE_DESC desc = {};
+    desc.NumParameters = 2u;
+    desc.pParameters = params;
+    ComPtr<ID3DBlob> blob, error;
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pso;
+    HRESULT table_hr = s.serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
+    if (SUCCEEDED(table_hr)) {
+      table_hr = s.device12->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root));
+    }
+#if defined(__world_light_table_EMBED_FILE)
+    if (SUCCEEDED(table_hr)) {
+      D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {};
+      pipeline.pRootSignature = root.Get();
+      pipeline.CS = {__world_light_table.data(), __world_light_table.size()};
+      table_hr = s.device12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&pso));
+    }
+#else
+    table_hr = E_FAIL;
+#endif
+    if (FAILED(table_hr)) {
+      slot.light_table_status = RTXDI_LIGHT_TABLE_STATUS_PIPELINE_FAILED;
+      slot.light_table_reason = RTXDI_LIGHT_TABLE_STATUS_PIPELINE_FAILED;
+      return publish(rtxdi::DiStatus::Failed, table_hr);
+    }
+    transfer.light_table_root = std::move(root);
+    transfer.light_table_pso = std::move(pso);
+  }
   if (!transfer.initial_di_root || !transfer.initial_di_pso || !transfer.temporal_di_pso || !transfer.spatial_di_pso) {
-    D3D12_DESCRIPTOR_RANGE ranges[13] = {};
+    D3D12_DESCRIPTOR_RANGE ranges[14] = {};
     const auto set_range = [&](uint32_t index, D3D12_DESCRIPTOR_RANGE_TYPE type, uint32_t count,
                                uint32_t shader_register, uint32_t offset) {
       ranges[index].RangeType = type;
@@ -2695,6 +2774,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     set_range(10u, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3u, 3u, 36u);
     set_range(11u, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1u, 6u, 39u);
     set_range(12u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 61u, 21u);
+    set_range(13u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4u, 46u, 40u);
     D3D12_ROOT_PARAMETER params[4] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.Num32BitValues = 22u;
@@ -2702,7 +2782,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[1].Descriptor.ShaderRegister = 1u;
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[2].DescriptorTable.NumDescriptorRanges = 13u;
+    params[2].DescriptorTable.NumDescriptorRanges = 14u;
     params[2].DescriptorTable.pDescriptorRanges = ranges;
     params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[3].Constants.Num32BitValues = 10u;
@@ -2857,6 +2937,10 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   const D3D12_SHADER_RESOURCE_VIEW_DESC motion_srv = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_FLOAT);
   native->CreateShaderResourceView(slot.motion.texture12.Get(), &motion_srv, cpu_at(22u));
   Rt12DiTransferSlot& history_slot = (previous_slot ? *previous_slot : slot);
+  write_buffer_srv(40u, slot.light_table.Get(), sizeof(RtxdiLightTableEntry), RTXDI_LIGHT_TABLE_CAPACITY);
+  write_buffer_srv(41u, history_slot.light_table.Get(), sizeof(RtxdiLightTableEntry), RTXDI_LIGHT_TABLE_CAPACITY);
+  write_buffer_srv(42u, slot.previous_to_current.Get(), sizeof(uint32_t), RTXDI_LIGHT_TABLE_CAPACITY);
+  write_buffer_srv(43u, slot.current_to_previous.Get(), sizeof(uint32_t), RTXDI_LIGHT_TABLE_CAPACITY);
   native->CreateShaderResourceView(history_slot.depth.texture12.Get(), &depth_srv, cpu_at(23u));
   native->CreateShaderResourceView(history_slot.normal.texture12.Get(), &uint4_texture, cpu_at(24u));
   native->CreateShaderResourceView(history_slot.scene.texture12.Get(), &uint4_texture, cpu_at(25u));
@@ -2888,12 +2972,21 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   diag_view.Buffer.NumElements = RTXDI_DIAG_COUNTER_COUNT;
   diag_view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
   native->CreateUnorderedAccessView(diag_armed ? slot.diag_counters.Get() : nullptr, nullptr, &diag_view, cpu_at(39u));
+  write_buffer_srv(49u, slot.lights_buffer.Get(), RTXDI_INPUT_LIGHT_STRIDE, light_count);
+  write_buffer_srv(50u, slot.light_types.Get(), sizeof(uint32_t), RTXDI_LIGHT_TABLE_CAPACITY);
+  write_buffer_srv(51u, history_slot.lights_buffer.Get(), RTXDI_INPUT_LIGHT_STRIDE, history_slot.light_count);
+  write_buffer_srv(52u, history_slot.light_table.Get(), sizeof(RtxdiLightTableEntry), RTXDI_LIGHT_TABLE_CAPACITY);
+  write_buffer_srv(53u, slot.light_table.Get(), sizeof(RtxdiLightTableEntry), RTXDI_LIGHT_TABLE_CAPACITY);
+  write_buffer_uav(54u, slot.light_table.Get(), sizeof(RtxdiLightTableEntry), RTXDI_LIGHT_TABLE_CAPACITY);
+  write_buffer_uav(55u, slot.previous_to_current.Get(), sizeof(uint32_t), RTXDI_LIGHT_TABLE_CAPACITY);
+  write_buffer_uav(56u, slot.current_to_previous.Get(), sizeof(uint32_t), RTXDI_LIGHT_TABLE_CAPACITY);
+  write_buffer_uav(57u, diag_armed ? slot.diag_counters.Get() : nullptr, sizeof(uint32_t), RTXDI_DIAG_COUNTER_COUNT);
   native->CreateShaderResourceView(s.noise.texture12.Get(), &uint4_texture, cpu_at(21u));
 
   ID3D12DescriptorHeap* heaps[] = {slot.di_descriptors.Get()};
   transfer.di_list->SetDescriptorHeaps(1u, heaps);
   std::vector<D3D12_RESOURCE_BARRIER> barriers;
-  barriers.reserve(32u);
+  barriers.reserve(48u);
   if (diag_armed) {
     Transition(barriers, slot.diag_counters.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
@@ -2923,17 +3016,62 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     transfer.di_list->Dispatch((tile_count + 63u) / 64u, 1u, 1u);
   }
   barriers.clear();
+  UavBarrier(barriers, slot.light_types.Get());
+  Transition(barriers, slot.lights_buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  Transition(barriers, slot.light_types.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  Transition(barriers, slot.light_table.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  Transition(barriers, slot.previous_to_current.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+  Transition(barriers, slot.current_to_previous.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (history_valid && &history_slot != &slot) {
+    Transition(barriers, history_slot.lights_buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(barriers, history_slot.light_table.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  }
+  transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  transfer.di_list->CopyBufferRegion(slot.previous_to_current.Get(), 0u, slot.light_map_reset_upload.Get(), 0u,
+                                     uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * sizeof(uint32_t));
+  transfer.di_list->CopyBufferRegion(slot.current_to_previous.Get(), 0u, slot.light_map_reset_upload.Get(),
+                                     uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * sizeof(uint32_t),
+                                     uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * sizeof(uint32_t));
+  barriers.clear();
+  Transition(barriers, slot.previous_to_current.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  Transition(barriers, slot.current_to_previous.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  transfer.di_list->SetComputeRootSignature(transfer.light_table_root.Get());
+  transfer.di_list->SetPipelineState(transfer.light_table_pso.Get());
+  D3D12_GPU_DESCRIPTOR_HANDLE light_table_gpu = slot.di_descriptors->GetGPUDescriptorHandleForHeapStart();
+  light_table_gpu.ptr += static_cast<UINT64>(49u) * s.descriptor_size;
+  transfer.di_list->SetComputeRootDescriptorTable(1u, light_table_gpu);
+  uint32_t light_table_constants[4] = {light_count, history_valid ? history_slot.light_count : 0u, history_valid ? 1u : 0u, 0u};
+  transfer.di_list->SetComputeRoot32BitConstants(0u, 4u, light_table_constants, 0u);
+  if (light_count != 0u) transfer.di_list->Dispatch((light_count + 63u) / 64u, 1u, 1u);
+  barriers.clear();
+  UavBarrier(barriers, slot.light_table.Get());
+  Transition(barriers, slot.light_table.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  light_table_constants[3] = 1u;
+  transfer.di_list->SetComputeRoot32BitConstants(0u, 4u, light_table_constants, 0u);
+  const uint32_t light_table_dispatch_count = (std::max)(light_count, history_valid ? history_slot.light_count : 0u);
+  if (light_table_dispatch_count != 0u) transfer.di_list->Dispatch((light_table_dispatch_count + 63u) / 64u, 1u, 1u);
+  barriers.clear();
+  UavBarrier(barriers, slot.previous_to_current.Get());
+  UavBarrier(barriers, slot.current_to_previous.Get());
+  Transition(barriers, slot.previous_to_current.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  Transition(barriers, slot.current_to_previous.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  barriers.clear();
   ID3D12Resource* history_resources[] = {history_slot.depth.texture12.Get(), history_slot.normal.texture12.Get(),
                                          history_slot.scene.texture12.Get(), history_slot.color.texture12.Get(),
                                          history_slot.mrt2.texture12.Get(), history_slot.deferred_buffer.Get(),
-                                         history_slot.lights_buffer.Get(), history_slot.light_types.Get(), history_slot.tiles_buffer.Get()};
+                                         history_slot.tiles_buffer.Get()};
   for (ID3D12Resource* resource : {vertices, indices, mesh_table, scene.instance_table.Get(), uv_arena, s.atlas.texture12.Get(),
-                                   s.materials.Get(), slot.lights_buffer.Get(), slot.light_types.Get(), slot.color.texture12.Get(),
+                                   s.materials.Get(), slot.color.texture12.Get(),
                                    slot.mrt1.texture12.Get(), slot.mrt2.texture12.Get(), slot.deferred_buffer.Get(), dynamic_vertices, slot.depth.texture12.Get(),
                                    slot.normal.texture12.Get(), slot.scene.texture12.Get(), slot.motion.texture12.Get(), s.noise.texture12.Get()}) {
-    if (resource) Transition(barriers, resource, resource == slot.light_types.Get() ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_COMMON,
-                             resource == slot.light_types.Get() ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                                                                : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }
   if (history_valid) {
     for (ID3D12Resource* resource : history_resources) {
@@ -3556,6 +3694,18 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   }
 #endif
   barriers.clear();
+  if (diag_armed && light_count != 0u && slot.light_readback) {
+    Transition(barriers, slot.lights_buffer.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    transfer.di_list->CopyBufferRegion(slot.light_readback.Get(), 0u, slot.lights_buffer.Get(), 0u,
+                                       uint64_t{light_count} * sizeof(rtgi::LightParamCpu));
+    barriers.clear();
+    Transition(barriers, slot.lights_buffer.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  }
+  barriers.clear();
   UavBarrier(barriers, s.di.reservoirs.Get());
   UavBarrier(barriers, slot.di_results.Get());
   UavBarrier(barriers, slot.di_resolved.texture12.Get());
@@ -3571,13 +3721,20 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   Transition(barriers, slot.di_results.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
   Transition(barriers, slot.di_resolved.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
   for (ID3D12Resource* resource : {vertices, indices, mesh_table, scene.instance_table.Get(), uv_arena, s.atlas.texture12.Get(),
-                                   s.materials.Get(), slot.lights_buffer.Get(), slot.light_types.Get(), slot.color.texture12.Get(),
+                                   s.materials.Get(), slot.lights_buffer.Get(), slot.light_types.Get(), slot.light_table.Get(),
+                                   slot.previous_to_current.Get(), slot.current_to_previous.Get(), slot.color.texture12.Get(),
                                    slot.mrt2.texture12.Get(), slot.deferred_buffer.Get(), dynamic_vertices, slot.depth.texture12.Get(),
                                    slot.normal.texture12.Get(), slot.scene.texture12.Get(), slot.motion.texture12.Get(), s.noise.texture12.Get()}) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   }
   Transition(barriers, slot.tiles_buffer.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   if (history_valid) {
+    if (&history_slot != &slot) {
+      Transition(barriers, history_slot.lights_buffer.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                 D3D12_RESOURCE_STATE_COMMON);
+      Transition(barriers, history_slot.light_table.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                 D3D12_RESOURCE_STATE_COMMON);
+    }
     for (ID3D12Resource* resource : history_resources) {
       if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
@@ -3612,7 +3769,11 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                                        slot.perf_readback.Get(), 96u);
   }
   hr = transfer.di_list->Close();
-  if (FAILED(hr)) return publish(rtxdi::DiStatus::Failed, hr);
+  if (FAILED(hr)) {
+    slot.light_table_status = RTXDI_LIGHT_TABLE_STATUS_DISPATCH_FAILED;
+    slot.light_table_reason = RTXDI_LIGHT_TABLE_STATUS_DISPATCH_FAILED;
+    return publish(rtxdi::DiStatus::Failed, hr);
+  }
 
   ID3D12CommandList* lists[] = {transfer.di_list.Get()};
   uint64_t di_fence = renodx::utils::gpu_fence::NO_SIGNAL;
@@ -3628,6 +3789,8 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       bvh::g_perf_gate.rtxdi_submissions.fetch_add(1u, std::memory_order_relaxed);
     }
   } catch (...) {
+    slot.light_table_status = RTXDI_LIGHT_TABLE_STATUS_DISPATCH_FAILED;
+    slot.light_table_reason = RTXDI_LIGHT_TABLE_STATUS_DISPATCH_FAILED;
     transfer.input_frame = UINT32_MAX;
     if (rtxdi::DiPostSubmitSignalDisposition(true, false) == rtxdi::DiSignalDisposition::QuarantineSession) {
       FailSession(s, Rt12Reason::SubmitFailed, "rtxdi initial DI signal");
@@ -3646,10 +3809,19 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     if (perf_temporal_recorded) slot.perf_valid_mask |= 32u;
     slot.perf_valid_mask |= 64u;
   }
+  slot.light_table_status = slot.light_table_truncated != 0u ? RTXDI_LIGHT_TABLE_STATUS_TRUNCATED
+                               : !history_valid              ? RTXDI_LIGHT_TABLE_STATUS_NO_HISTORY
+                               : light_count == 0u            ? RTXDI_LIGHT_TABLE_STATUS_ZERO_LIGHTS
+                                                              : RTXDI_LIGHT_TABLE_STATUS_READY;
+  slot.light_table_reason = slot.light_table_status;
   if (diag_armed) {
     slot.diag_pending = true;
     slot.diag_fence = di_fence;
     slot.diag_frame = in.frame;
+    slot.diag_snapshot = {.frame = in.frame, .status = slot.light_table_status, .reason = slot.light_table_reason,
+                          .source_count = slot.light_table_source, .copied_count = slot.light_count,
+                          .truncated_count = slot.light_table_truncated, .fence = di_fence,
+                          .remap_enabled = in.effective_settings.stable_light_remap};
     slot.diag_epoch = diagnostic_epoch;
     slot.diag_flags = (n1_ready ? RTXDI_DIAG_SAMPLE_N1 : 0u) | (in.effective_settings.spatial_enabled ? RTXDI_DIAG_SAMPLE_SPATIAL : 0u)
                       | (history_valid && in.effective_settings.temporal_enabled ? RTXDI_DIAG_SAMPLE_TEMPORAL : 0u)

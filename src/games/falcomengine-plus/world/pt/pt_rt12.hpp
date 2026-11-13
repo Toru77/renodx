@@ -65,9 +65,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   ID3D12Resource* uv_arena = gc ? g_rt12_gc_scene.uvs : s.arenas[kRt12ArenaUvs].buffer.Get();
   const uint64_t uv_count = gc ? g_rt12_gc_scene.uv_count : s.arenas[kRt12ArenaUvs].used;
   ID3D12Resource* dynamic_vertices = s.scene_dynamic_count != 0u ? s.dynamic_vertices.Get() : nullptr;
-  const bool lamps_on = lamps && input.light_count != 0u && input.lights_buffer && input.light_types;
+  const bool lamps_on = lamps && input.light_count != 0u && input.lights_buffer && input.light_table;
   ID3D12Resource* lights = lamps_on ? input.lights_buffer.Get() : nullptr;
-  ID3D12Resource* light_types = lamps_on ? input.light_types.Get() : nullptr;
+  ID3D12Resource* light_table = lamps_on ? input.light_table.Get() : nullptr;
   if (!scene.tlas || !scene.instance_table || !vertices || !indices || !mesh_table || !uv_arena || !s.atlas.texture12
       || !s.materials || (s.scene_dynamic_count != 0u && !dynamic_vertices) || !input.depth.texture12
       || !input.normal.texture12 || !input.scene.texture12) {
@@ -485,7 +485,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_srv(10u, input.normal.texture12.Get(), Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
   set_srv(11u, input.scene.texture12.Get(), Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
   set_srv(12u, lights, Rt12BufferSrv(RTXDI_INPUT_LIGHT_STRIDE, lamps_on ? input.light_count : 1u));
-  set_srv(13u, light_types, Rt12BufferSrv(4u, RTXDI_INPUT_MAX_LIGHTS));
+  set_srv(13u, light_table, Rt12BufferSrv(sizeof(RtxdiLightTableEntry), RTXDI_LIGHT_TABLE_CAPACITY));
   const D3D12_UNORDERED_ACCESS_VIEW_DESC out_uav = Rt12TextureUav(DXGI_FORMAT_R16G16B16A16_FLOAT);
   device12->CreateUnorderedAccessView(out.texture12.Get(), nullptr, &out_uav, cpu_at(base + 14u));
   r.water_frame_inputs.uav_descs[14u] = out_uav;
@@ -530,7 +530,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   table.ptr += static_cast<UINT64>(base) * s.descriptor_size;
   ID3D12Resource* const reads[] = {vertices, indices, mesh_table, scene.instance_table.Get(), uv_arena, s.atlas.texture12.Get(),
                                    s.materials.Get(), dynamic_vertices, input.depth.texture12.Get(), input.normal.texture12.Get(),
-                                   input.scene.texture12.Get(), lights, light_types};
+                                   input.scene.texture12.Get(), lights, light_table};
   std::vector<D3D12_RESOURCE_BARRIER>& barriers = pt_slot.barrier_scratch;
   barriers.clear();
   for (ID3D12Resource* resource : reads) {

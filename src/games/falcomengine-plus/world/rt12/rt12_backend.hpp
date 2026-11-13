@@ -18,6 +18,7 @@
 #include <exception>
 #include <filesystem>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -271,6 +272,14 @@ struct Rt12SunDetailIdentity {
   bool staged = false;
 };
 
+struct Rt12DiDiagnosticSnapshot {
+  uint32_t frame = UINT32_MAX, status = RTXDI_LIGHT_TABLE_STATUS_NO_HISTORY;
+  uint32_t reason = RTXDI_LIGHT_TABLE_STATUS_NO_HISTORY, source_count = 0u;
+  uint32_t copied_count = 0u, truncated_count = 0u;
+  uint64_t fence = 0u;
+  bool remap_enabled = false;
+};
+
 // Transfer slots own their carriers until their own B fence completes.
 struct Rt12DiTransferSlot {
   Rt12Shared depth, normal, scene, color, mrt1, mrt2, motion;
@@ -286,7 +295,9 @@ struct Rt12DiTransferSlot {
   Rt12DebugDistanceIdentity debug_distance_identity = {};
 #endif
   Microsoft::WRL::ComPtr<ID3D12Resource> scene_buffer, lights_buffer, tiles_buffer, deferred_buffer, sun_results, sun_history;
-  Microsoft::WRL::ComPtr<ID3D12Resource> light_types, di_results, di_frame_upload;
+  Microsoft::WRL::ComPtr<ID3D12Resource> light_types, light_table, previous_to_current, current_to_previous;
+  Microsoft::WRL::ComPtr<ID3D12Resource> light_map_reset_upload;
+  Microsoft::WRL::ComPtr<ID3D12Resource> di_results, di_frame_upload;
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> di_allocator;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> perf_queries;
@@ -305,8 +316,10 @@ struct Rt12DiTransferSlot {
   uint8_t perf_valid_mask = 0u;
   bool perf_pending = false;
   Microsoft::WRL::ComPtr<ID3D12Resource> diag_counters, diag_readback;
+  Microsoft::WRL::ComPtr<ID3D12Resource> light_readback;
   uint64_t diag_epoch = 0u, diag_fence = 0u;
   uint32_t diag_frame = UINT32_MAX, diag_flags = 0u;
+  Rt12DiDiagnosticSnapshot diag_snapshot = {};
   bool diag_pending = false;
   uint64_t output_b_fence = 0u, output_c_fence = 0u;
   uint64_t output_owner_generation = 0u, output_configuration_generation = 0u;
@@ -319,6 +332,10 @@ struct Rt12DiTransferSlot {
   uint32_t output_frame = UINT32_MAX, output_width = 0u, output_height = 0u;
   int32_t output_scene_slot = -1, output_transfer_slot = -1;
   uint32_t light_count = 0u, tile_count = 0u, deferred_count = 0u;
+  uint32_t light_table_source = 0u, light_table_truncated = 0u;
+  uint32_t light_table_status = RTXDI_LIGHT_TABLE_STATUS_NO_HISTORY;
+  uint32_t light_table_reason = RTXDI_LIGHT_TABLE_STATUS_NO_HISTORY;
+  bool light_table_remap_enabled = false;
   bool local = false;
   bool sun = false;
   bool sun_accumulated = false;
@@ -349,6 +366,8 @@ struct Rt12DiTransferState {
   Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> di_list;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> classify_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> classify_pso;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> light_table_root;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> light_table_pso;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> initial_di_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> initial_di_pso;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> temporal_di_pso;
@@ -589,6 +608,20 @@ struct Rt12Panel {  // copied under g_rt12_panel_mutex for the panel and the JSO
   uint64_t gc_traced_frames = 0u;
   uint32_t gc_records = 0u;  // bound of the last GC frame
   std::string gc_not_ready;  // last gpu_capture sub-reason ("" after a traced GC frame)
+  bool light_table_available = false;
+  uint32_t light_table_status = RTXDI_LIGHT_TABLE_STATUS_NO_HISTORY;
+  uint32_t light_table_reason = RTXDI_LIGHT_TABLE_STATUS_NO_HISTORY;
+  uint32_t light_table_frame = UINT32_MAX;
+  uint64_t light_table_fence = 0u;
+  uint32_t light_table_source = 0u, light_table_copied = 0u, light_table_truncated = 0u;
+  uint32_t light_table_written = 0u, light_table_matched = 0u, light_table_unmatched_previous = 0u;
+  uint32_t light_table_unmatched_current = 0u, light_table_collisions = 0u, light_table_duplicates = 0u;
+  uint32_t light_table_invalid = 0u, light_table_incompatible = 0u, light_table_hits = 0u;
+  bool light_table_remap_enabled = false;
+  bool light_table_ranges_available = false;
+  float light_position_min[3] = {}, light_position_max[3] = {};
+  float light_radius_min = 0.f, light_radius_max = 0.f;
+  float light_colour_min[3] = {}, light_colour_max[3] = {};
 };
 inline std::mutex g_rt12_panel_mutex;
 inline Rt12Panel g_rt12_panel;
@@ -2012,10 +2045,57 @@ inline void OnPresent(reshade::api::device* device) {
     }
   }
   for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {
-    if (!rtxdi::ClaimCompletedGpuTiming(&slot.diag_pending, s.completion_available, slot.diag_fence, completed)) continue;
+    if (!rtxdi::ClaimCompletedGpuTiming(&slot.diag_pending, s.completion_available, slot.diag_snapshot.fence, completed)) continue;
     std::array<uint32_t, RTXDI_DIAG_COUNTER_COUNT> counters = {};
     bool read = false;
     void* mapped = nullptr;
+    bool light_ranges_available = false;
+    std::array<float, 3> position_min = {
+        std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+    std::array<float, 3> position_max = {
+        std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
+    std::array<float, 3> colour_min = {
+        std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+    std::array<float, 3> colour_max = {
+        std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
+    float radius_min = std::numeric_limits<float>::max();
+    float radius_max = std::numeric_limits<float>::lowest();
+    if (slot.light_readback && slot.diag_snapshot.copied_count != 0u) {
+      void* light_data = nullptr;
+      const D3D12_RANGE light_read_range = {0u, static_cast<SIZE_T>(slot.diag_snapshot.copied_count) * sizeof(rtgi::LightParamCpu)};
+      if (SUCCEEDED(slot.light_readback->Map(0u, &light_read_range, &light_data)) && light_data != nullptr) {
+        const auto* lights = static_cast<const rtgi::LightParamCpu*>(light_data);
+        std::array<bool, 3> has_position = {};
+        std::array<bool, 3> has_colour = {};
+        bool has_radius = false;
+        for (uint32_t light_index = 0u; light_index < slot.diag_snapshot.copied_count; ++light_index) {
+          const rtgi::LightParamCpu& light = lights[light_index];
+          if (std::isfinite(light.radius)) {
+            radius_min = (std::min)(radius_min, light.radius);
+            radius_max = (std::max)(radius_max, light.radius);
+            has_radius = true;
+          }
+          for (uint32_t component = 0u; component < 3u; ++component) {
+            if (std::isfinite(light.pos[component])) {
+              position_min[component] = (std::min)(position_min[component], light.pos[component]);
+              position_max[component] = (std::max)(position_max[component], light.pos[component]);
+              has_position[component] = true;
+            }
+            if (std::isfinite(light.color[component])) {
+              colour_min[component] = (std::min)(colour_min[component], light.color[component]);
+              colour_max[component] = (std::max)(colour_max[component], light.color[component]);
+              has_colour[component] = true;
+            }
+          }
+        }
+        light_ranges_available = has_radius;
+        for (uint32_t component = 0u; component < 3u; ++component) {
+          light_ranges_available = light_ranges_available && has_position[component] && has_colour[component];
+        }
+        const D3D12_RANGE no_light_writes = {0u, 0u};
+        slot.light_readback->Unmap(0u, &no_light_writes);
+      }
+    }
     const D3D12_RANGE read_range = {0u, RTXDI_DIAG_COUNTER_BYTES};
     if (slot.diag_readback && SUCCEEDED(slot.diag_readback->Map(0u, &read_range, &mapped)) && mapped != nullptr) {
       std::memcpy(counters.data(), mapped, sizeof(counters));
@@ -2024,8 +2104,46 @@ inline void OnPresent(reshade::api::device* device) {
       read = true;
     }
     if (read) {
-      rtxdi::RecordDiagnosticGpuCounters(rtxdi::GetDiagnosticState(), slot.diag_epoch, slot.diag_frame, slot.diag_fence,
+      rtxdi::RecordDiagnosticGpuCounters(rtxdi::GetDiagnosticState(), slot.diag_epoch, slot.diag_snapshot.frame, slot.diag_snapshot.fence,
                                          slot.diag_flags, counters);
+      {
+        std::lock_guard lock(g_rt12_panel_mutex);
+        Rt12Panel& panel = g_rt12_panel;
+        if (panel.light_table_frame == UINT32_MAX
+            || static_cast<int32_t>(slot.diag_snapshot.frame - panel.light_table_frame) >= 0) {
+          panel.light_table_available = true;
+          panel.light_table_status = slot.diag_snapshot.status;
+          panel.light_table_reason = slot.diag_snapshot.reason;
+          panel.light_table_frame = slot.diag_snapshot.frame;
+          panel.light_table_fence = slot.diag_snapshot.fence;
+          panel.light_table_source = slot.diag_snapshot.source_count;
+          panel.light_table_copied = slot.diag_snapshot.copied_count;
+          panel.light_table_truncated = slot.diag_snapshot.truncated_count;
+          panel.light_table_written = counters[RTXDI_DIAG_LIGHT_TABLE_WRITTEN];
+          panel.light_table_matched = counters[RTXDI_DIAG_LIGHT_ID_MATCHED];
+          panel.light_table_unmatched_previous = counters[RTXDI_DIAG_LIGHT_ID_UNMATCHED];
+          panel.light_table_unmatched_current = counters[RTXDI_DIAG_LIGHT_CURRENT_UNMATCHED];
+          panel.light_table_collisions = counters[RTXDI_DIAG_LIGHT_HASH_COLLISIONS];
+          panel.light_table_duplicates = counters[RTXDI_DIAG_LIGHT_ID_DUPLICATES];
+          panel.light_table_invalid = counters[RTXDI_DIAG_LIGHT_INVALID_ID];
+          panel.light_table_incompatible = counters[RTXDI_DIAG_LIGHT_INCOMPATIBLE];
+          panel.light_table_hits = counters[RTXDI_DIAG_LIGHT_REMAP_HITS];
+          panel.light_table_remap_enabled = slot.diag_snapshot.remap_enabled;
+          if (panel.light_table_status == RTXDI_LIGHT_TABLE_STATUS_READY && panel.light_table_invalid != 0u) {
+            panel.light_table_status = RTXDI_LIGHT_TABLE_STATUS_INVALID_INPUT;
+            panel.light_table_reason = RTXDI_LIGHT_TABLE_STATUS_INVALID_INPUT;
+          }
+          panel.light_table_ranges_available = light_ranges_available;
+          if (light_ranges_available) {
+            std::copy(position_min.begin(), position_min.end(), panel.light_position_min);
+            std::copy(position_max.begin(), position_max.end(), panel.light_position_max);
+            panel.light_radius_min = radius_min;
+            panel.light_radius_max = radius_max;
+            std::copy(colour_min.begin(), colour_min.end(), panel.light_colour_min);
+            std::copy(colour_max.begin(), colour_max.end(), panel.light_colour_max);
+          }
+        }
+      }
     }
     slot.diag_fence = 0u;
   }
@@ -3381,6 +3499,43 @@ inline void DumpRt12Json() {
   out << "  \"dynamic_blas_bytes\": " << p.dynamic_blas_bytes << ",\n";
   out << "  \"gpu_capture\": {\"traced_frames\": " << p.gc_traced_frames << ", \"records\": " << p.gc_records << ", \"not_ready\": \""
       << bvh::PoolJsonEscape(p.gc_not_ready) << "\"},\n";
+  out << "  \"light_table\": {\"frame\": " << p.light_table_frame << ", \"available\": "
+      << (p.light_table_available ? "true" : "false") << ", \"status\": " << p.light_table_status
+      << ", \"reason\": " << p.light_table_reason << ", \"remap_enabled\": "
+      << (p.light_table_remap_enabled ? "true" : "false") << ", \"source_lights\": " << p.light_table_source
+      << ", \"copied_lights\": " << p.light_table_copied << ", \"truncated_lights\": " << p.light_table_truncated
+      << ", \"entries_written\": " << p.light_table_written << ", \"matched_stable_ids\": " << p.light_table_matched
+      << ", \"unmatched_previous\": " << p.light_table_unmatched_previous
+      << ", \"unmatched_current\": " << p.light_table_unmatched_current
+      << ", \"hash_collisions\": " << p.light_table_collisions
+      << ", \"duplicate_identities\": " << p.light_table_duplicates
+      << ", \"invalid_ids\": " << p.light_table_invalid
+      << ", \"incompatible\": " << p.light_table_incompatible << ", \"remap_hits\": " << p.light_table_hits
+      << ", \"readback_frame\": " << p.light_table_frame << ", \"readback_fence\": " << p.light_table_fence;
+  if (p.light_table_ranges_available) {
+    out << ", \"position_min\": [";
+    for (uint32_t component = 0u; component < 3u; ++component) {
+      out << (component == 0u ? "" : ", ") << bvh::PoolJsonFloat{p.light_position_min[component]};
+    }
+    out << "], \"position_max\": [";
+    for (uint32_t component = 0u; component < 3u; ++component) {
+      out << (component == 0u ? "" : ", ") << bvh::PoolJsonFloat{p.light_position_max[component]};
+    }
+    out << "], \"radius_min\": " << bvh::PoolJsonFloat{p.light_radius_min}
+        << ", \"radius_max\": " << bvh::PoolJsonFloat{p.light_radius_max} << ", \"colour_min\": [";
+    for (uint32_t component = 0u; component < 3u; ++component) {
+      out << (component == 0u ? "" : ", ") << bvh::PoolJsonFloat{p.light_colour_min[component]};
+    }
+    out << "], \"colour_max\": [";
+    for (uint32_t component = 0u; component < 3u; ++component) {
+      out << (component == 0u ? "" : ", ") << bvh::PoolJsonFloat{p.light_colour_max[component]};
+    }
+    out << "]";
+  } else {
+    out << ", \"position_min\": null, \"position_max\": null, \"radius_min\": null, \"radius_max\": null"
+        << ", \"colour_min\": null, \"colour_max\": null";
+  }
+  out << "},\n";
   out << "  \"records\": " << p.records << "\n}\n";
   const std::filesystem::path path = bvh::PoolOutputDir() / "world_rt12.json";
   std::string text = out.str();

@@ -4,6 +4,21 @@
 #define RTXDI_FRAME_FLAG_SPATIAL_AFTER_INITIAL 1u
 #define RTXDI_FRAME_FLAG_SPATIAL_ENABLED       2u
 #define RTXDI_FRAME_FLAG_DIAGNOSTICS           4u
+#define RTXDI_FRAME_FLAG_STABLE_LIGHT_REMAP    8u
+#define RTXDI_LIGHT_TABLE_CAPACITY              1024u
+#define RTXDI_LIGHT_TABLE_TYPE_UNTYPED          0u
+#define RTXDI_LIGHT_TABLE_TYPE_POINT            1u
+#define RTXDI_LIGHT_TABLE_TYPE_SPOT             2u
+#define RTXDI_LIGHT_TABLE_TYPE_AMBIGUOUS        3u
+#define RTXDI_LIGHT_TABLE_INVALID_INDEX          0xffffffffu
+#define RTXDI_LIGHT_TABLE_STATUS_READY            0u
+#define RTXDI_LIGHT_TABLE_STATUS_NO_HISTORY       1u
+#define RTXDI_LIGHT_TABLE_STATUS_ZERO_LIGHTS      2u
+#define RTXDI_LIGHT_TABLE_STATUS_INVALID_INPUT    3u
+#define RTXDI_LIGHT_TABLE_STATUS_RESOURCE_FAILED  4u
+#define RTXDI_LIGHT_TABLE_STATUS_PIPELINE_FAILED  5u
+#define RTXDI_LIGHT_TABLE_STATUS_DISPATCH_FAILED  6u
+#define RTXDI_LIGHT_TABLE_STATUS_TRUNCATED        7u
 
 #define RTXDI_DI_LIGHT_TYPE_POINT       1u
 #define RTXDI_DI_LIGHT_TYPE_SPOT        2u
@@ -34,6 +49,7 @@
 #define RTXDI_SUN_TRACE_RESOLVE 2u
 
 #ifdef __cplusplus
+#include <cstddef>
 #include <cstdint>
 struct RtxdiDiRawResult {
   // Pre-material local diffuse; later shading applies base color and dynamic intensity once.
@@ -48,6 +64,21 @@ struct RtxdiDiRawResult {
   float inverse_pdf;
   uint32_t reserved;
 };
+struct RtxdiLightTableEntry {
+  float position[3];
+  float radius;
+  float power;
+  uint32_t type;
+  uint32_t stable_id_lo;
+  uint32_t stable_id_hi;
+};
+static_assert(sizeof(RtxdiLightTableEntry) == 32u);
+static_assert(alignof(RtxdiLightTableEntry) == 4u);
+static_assert(offsetof(RtxdiLightTableEntry, radius) == 12u);
+static_assert(offsetof(RtxdiLightTableEntry, power) == 16u);
+static_assert(offsetof(RtxdiLightTableEntry, type) == 20u);
+static_assert(offsetof(RtxdiLightTableEntry, stable_id_lo) == 24u);
+static_assert(offsetof(RtxdiLightTableEntry, stable_id_hi) == 28u);
 static_assert(sizeof(RtxdiDiRawResult) == 48u);
 #else
 struct RtxdiDiRawResult {
@@ -62,6 +93,14 @@ struct RtxdiDiRawResult {
   uint selected_light_type;
   float inverse_pdf;
   uint reserved;
+};
+struct RtxdiLightTableEntry {
+  float3 position;
+  float radius;
+  float power;
+  uint type;
+  uint stable_id_lo;
+  uint stable_id_hi;
 };
 RtxdiDiRawResult RtxdiDiMakeVisibleRawResult(float3 diffuse_radiance, float distance, uint flags,
                                              uint light_index, uint light_type, float inverse_pdf) {

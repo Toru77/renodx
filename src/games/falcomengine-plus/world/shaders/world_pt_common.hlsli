@@ -8,6 +8,7 @@
 #define RT12_DYNAMIC_VERTICES_REGISTER t30
 #include "world_rt12_trace.hlsli"
 #include "world_rtxdi_surface.hlsli"
+#include "../rtxdi/rtxdi_di_layout.h"
 #include "world_rt_lamps.hlsli"
 // SHARC configuration (compile time, identical in the three passes): OpenRemix sharc.glsl:9-19.
 #define SHARC_ENABLE_RESPONSIVE_LIGHTING 0
@@ -22,7 +23,7 @@ Texture2D<float> g_pt_depth : register(t31);
 Texture2D<uint4> g_pt_normal : register(t32);
 Texture2D<uint4> g_pt_scene : register(t33);
 StructuredBuffer<LightParam> g_pt_lights : register(t34);
-StructuredBuffer<uint> g_pt_light_types : register(t35);
+StructuredBuffer<RtxdiLightTableEntry> g_pt_light_table : register(t35);
 Texture2D<float4> g_pt_color : register(t36);     // G-buffer albedo (transfer slot color)
 Texture2D<uint4> g_pt_mrt1 : register(t37);       // .z & 255: specular scale
 Texture2D<uint4> g_pt_mrt2 : register(t38);       // .x: deferred material index
@@ -133,7 +134,7 @@ float3 PtHitLight(float3 position, float3 nh, inout uint rng) {
   float3 lamp = float3(0, 0, 0);
   if (g_lamp_count > 0u) {
     const uint i = min(uint(PtRandom(rng) * g_lamp_count), g_lamp_count - 1u);
-    const uint type = g_pt_light_types[i];
+    const uint type = g_pt_light_table[i].type;
     if (type == RTGI_LAMP_TYPE_POINT || type == RTGI_LAMP_TYPE_SPOT) {
       const LightParam lp = g_pt_lights[i];
       const float3 to = lp.pos - position;

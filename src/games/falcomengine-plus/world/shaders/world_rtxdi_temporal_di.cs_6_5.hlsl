@@ -71,6 +71,7 @@ cbuffer RtxdiFrameParameters : register(b1) {
   RTXDI_Parameters g_di;
 };
 
+#define RTXDI_TEMPORAL_DI_PASS 1
 #include "world_rtxdi_light_bridge.hlsli"
 #include <Rtxdi/DI/TemporalResampling.hlsli>
 #include <Rtxdi/DI/ReservoirStorage.hlsli>

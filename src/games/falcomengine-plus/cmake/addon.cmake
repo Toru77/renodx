@@ -20,6 +20,7 @@ target_sources(falcom-rtxdi-bridge PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_sun_visibility.h")
 target_sources(falcom-rtxdi-bridge PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_classify_lights.h"
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_light_table.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_initial_di.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_spatial_di.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_temporal_di.h"

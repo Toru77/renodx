@@ -144,6 +144,116 @@ bool SurfaceIsZero(const TestSurfaceResult& result) {
 }  // namespace
 
 int main() {
+  {
+    static_assert(sizeof(RtxdiLightTableEntry) == 32u);
+    static_assert(alignof(RtxdiLightTableEntry) == 4u);
+    static_assert(offsetof(RtxdiLightTableEntry, radius) == 12u);
+    static_assert(offsetof(RtxdiLightTableEntry, power) == 16u);
+    static_assert(offsetof(RtxdiLightTableEntry, type) == 20u);
+    static_assert(offsetof(RtxdiLightTableEntry, stable_id_lo) == 24u);
+    static_assert(offsetof(RtxdiLightTableEntry, stable_id_hi) == 28u);
+    const auto quantize = [](float value, float scale, int32_t* output) {
+      if (!std::isfinite(value)) return false;
+      const float scaled = value * scale;
+      if (!std::isfinite(scaled)) return false;
+      const float rounded = std::floor(scaled + 0.5f);
+      if (!std::isfinite(rounded) || rounded < -2147483648.0f || rounded >= 2147483648.0f) return false;
+      *output = static_cast<int32_t>(rounded);
+      return true;
+    };
+    const auto hash_identity = [](const std::array<int32_t, 7>& values, uint32_t type) {
+      uint64_t hash = 14695981039346656037ull;
+      const auto hash_word = [&hash](uint32_t word) {
+        for (uint32_t byte_index = 0u; byte_index < 4u; ++byte_index) {
+          hash ^= (word >> (byte_index * 8u)) & 0xffu;
+          hash *= 1099511628211ull;
+        }
+      };
+      for (const int32_t value : values) hash_word(static_cast<uint32_t>(value));
+      hash_word(type);
+      return hash;
+    };
+    int32_t quantized = 0;
+    if (!quantize(0.5f / 256.f, 256.f, &quantized) || quantized != 1
+        || !quantize(-0.5f / 256.f, 256.f, &quantized) || quantized != 0
+        || !quantize(-1.5f / 256.f, 256.f, &quantized) || quantized != -1
+        || quantize(std::numeric_limits<float>::infinity(), 256.f, &quantized)
+        || quantize(std::numeric_limits<float>::quiet_NaN(), 256.f, &quantized)
+        || quantize(8388608.f, 256.f, &quantized)) {
+      return EXIT_FAILURE;
+    }
+    const std::array<int32_t, 7> golden_values = {0, -1, 256, 128, 1024, 0, -1024};
+    if (hash_identity(golden_values, RTXDI_LIGHT_TABLE_TYPE_SPOT) != 0xc80e9739cad116a6ull) return EXIT_FAILURE;
+    std::printf("PASS stable light table layout and CPU quantization/hash golden vector: negative half steps, range, nonfinite\n");
+
+    struct IdentityCase {
+      std::array<int32_t, 7> tuple = {};
+      uint64_t id = 0u;
+      bool compatible = true;
+    };
+    const std::array<IdentityCase, 4> previous = {{{{{1, 2, 3, 4, 5, 6, 7}}, 11u, true},
+                                                   {{{8, 9, 10, 11, 12, 13, 14}}, 22u, true},
+                                                   {{{1, 2, 3, 4, 5, 6, 7}}, 11u, true},
+                                                   {{{20, 21, 22, 23, 24, 25, 26}}, 33u, false}}};
+    const std::array<IdentityCase, 5> current = {{{{{8, 9, 10, 11, 12, 13, 14}}, 22u, true},
+                                                  {{{1, 2, 3, 4, 5, 6, 7}}, 11u, true},
+                                                  {{{1, 2, 3, 4, 5, 6, 7}}, 11u, true},
+                                                  {{{20, 21, 22, 23, 24, 25, 26}}, 33u, true},
+                                                  {{{30, 31, 32, 33, 34, 35, 36}}, 11u, true}}};
+    std::array<uint32_t, 4> previous_to_current = {};
+    std::array<uint32_t, 5> current_to_previous = {};
+    previous_to_current.fill(RTXDI_LIGHT_TABLE_INVALID_INDEX);
+    current_to_previous.fill(RTXDI_LIGHT_TABLE_INVALID_INDEX);
+    for (uint32_t previous_index = 0u; previous_index < previous.size(); ++previous_index) {
+      uint32_t occurrence = 0u;
+      for (uint32_t earlier = 0u; earlier < previous_index; ++earlier) {
+        if (previous[earlier].id == previous[previous_index].id && previous[earlier].tuple == previous[previous_index].tuple) ++occurrence;
+      }
+      uint32_t candidate_occurrence = 0u;
+      for (uint32_t current_index = 0u; current_index < current.size(); ++current_index) {
+        if (previous[previous_index].id != current[current_index].id) continue;
+        if (previous[previous_index].tuple != current[current_index].tuple) continue;
+        if (candidate_occurrence++ != occurrence) continue;
+        if (previous[previous_index].compatible && current[current_index].compatible) {
+          previous_to_current[previous_index] = current_index;
+          current_to_previous[current_index] = previous_index;
+        }
+        break;
+      }
+    }
+    if (previous_to_current != std::array<uint32_t, 4>{1u, 0u, 2u, RTXDI_LIGHT_TABLE_INVALID_INDEX}
+        || current_to_previous != std::array<uint32_t, 5>{1u, 0u, 2u, RTXDI_LIGHT_TABLE_INVALID_INDEX, RTXDI_LIGHT_TABLE_INVALID_INDEX}) {
+      std::fprintf(stderr, "FAIL M2 CPU maps prev=%u,%u,%u,%u curr=%u,%u,%u,%u,%u\n",
+                   previous_to_current[0], previous_to_current[1], previous_to_current[2], previous_to_current[3],
+                   current_to_previous[0], current_to_previous[1], current_to_previous[2], current_to_previous[3],
+                   current_to_previous[4]);
+      return EXIT_FAILURE;
+    }
+    const std::array<IdentityCase, 1> forced_collision_previous = {{{{{1, 2, 3, 4, 5, 6, 7}}, 11u, true}}};
+    const std::array<IdentityCase, 1> forced_collision_current = {{{{{8, 2, 3, 4, 5, 6, 7}}, 11u, true}}};
+    std::array<uint32_t, 1> collision_previous_to_current = {RTXDI_LIGHT_TABLE_INVALID_INDEX};
+    std::array<uint32_t, 1> collision_current_to_previous = {RTXDI_LIGHT_TABLE_INVALID_INDEX};
+    for (uint32_t previous_index = 0u; previous_index < forced_collision_previous.size(); ++previous_index) {
+      for (uint32_t current_index = 0u; current_index < forced_collision_current.size(); ++current_index) {
+        if (forced_collision_previous[previous_index].id != forced_collision_current[current_index].id
+            || forced_collision_previous[previous_index].tuple != forced_collision_current[current_index].tuple) continue;
+        collision_previous_to_current[previous_index] = current_index;
+        collision_current_to_previous[current_index] = previous_index;
+      }
+    }
+    if (collision_previous_to_current[0] != RTXDI_LIGHT_TABLE_INVALID_INDEX
+        || collision_current_to_previous[0] != RTXDI_LIGHT_TABLE_INVALID_INDEX) return EXIT_FAILURE;
+    std::printf("PASS M2 CPU forced collision rejects unequal tuples\n");
+    const auto previous_mode = falcom_world::rtxdi::g_local_stable_light_remap;
+    falcom_world::rtxdi::g_local_stable_light_remap = 0.f;
+    const auto off_identity = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings().identity;
+    falcom_world::rtxdi::g_local_stable_light_remap = 1.f;
+    const auto on_identity = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings().identity;
+    falcom_world::rtxdi::g_local_stable_light_remap = previous_mode;
+    if (off_identity == on_identity || previous_to_current[0] == RTXDI_LIGHT_TABLE_INVALID_INDEX
+        || previous_to_current[1] == RTXDI_LIGHT_TABLE_INVALID_INDEX) return EXIT_FAILURE;
+    std::printf("PASS stable light CPU reference reorder, duplicate tie-break, insertion/removal, collision tuple rejection, incompatible pair, setting identity\n");
+  }
   if (ResolveRtxdiDebugEffectiveView(RTXDI_DEBUG_VIEW_OFF, false) != RTXDI_DEBUG_VIEW_OFF
       || ResolveRtxdiDebugEffectiveView(RTXDI_DEBUG_VIEW_RAW_DIFFUSE, true) != RTXDI_DEBUG_VIEW_OFF
       || ResolveRtxdiDebugEffectiveView(RTXDI_DEBUG_VIEW_FILTERED_DIFFUSE, false)
@@ -939,9 +1049,15 @@ int main() {
   using falcom_world::rtxdi::SelectDiResourceAction;
   const auto balanced_settings = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings();
   const DiResourceIdentity installed = {.config = config, .owner_generation = 4u, .configuration_generation = 7u, .settings_identity = balanced_settings.identity, .present = true, .complete = true};
+  const float saved_stable_light_remap = falcom_world::rtxdi::g_local_stable_light_remap;
+  falcom_world::rtxdi::g_local_stable_light_remap = 1.f;
+  const auto stable_remap_settings = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings();
+  falcom_world::rtxdi::g_local_stable_light_remap = saved_stable_light_remap;
   if (SelectDiResourceAction(false, 4u, {}, config, balanced_settings.identity) != DiResourceAction::Skip
       || SelectDiResourceAction(true, 4u, {}, config, balanced_settings.identity) != DiResourceAction::Create
       || SelectDiResourceAction(true, 4u, installed, config, balanced_settings.identity) != DiResourceAction::Reuse
+      || stable_remap_settings.identity == balanced_settings.identity
+      || SelectDiResourceAction(true, 4u, installed, config, stable_remap_settings.identity) != DiResourceAction::Create
       || SelectDiResourceAction(true, 4u, installed, config, balanced_settings.identity + 1u) != DiResourceAction::Create
       || SelectDiResourceAction(true, 5u, installed, config, balanced_settings.identity) != DiResourceAction::OwnerMismatch
       || SelectDiResourceAction(true, 0u, installed, config, balanced_settings.identity) != DiResourceAction::OwnerMismatch) return EXIT_FAILURE;

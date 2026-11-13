@@ -680,6 +680,14 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
            g[RTXDI_DIAG_LIGHT_TYPE_NONE], g[RTXDI_DIAG_LIGHT_TYPE_POINT], g[RTXDI_DIAG_LIGHT_TYPE_SPOT],
            g[RTXDI_DIAG_LIGHT_TYPE_BOTH], g[RTXDI_DIAG_LIGHT_RADIUS_POSITIVE], g[RTXDI_DIAG_LIGHT_TYPED_RADIUS_POSITIVE],
            g[RTXDI_DIAG_TILE_CELLS_NONEMPTY], g[RTXDI_DIAG_TILE_POINT_REFS], g[RTXDI_DIAG_TILE_SPOT_REFS]);
+    append("gpu_light_table frame=%llu fence=%llu written=%u matched=%u unmatched_previous=%u unmatched_current=%u collisions=%u duplicates=%u invalid=%u incompatible=%u remap_hits=%u\n",
+           static_cast<unsigned long long>(snapshot.gpu_sample_frame),
+           static_cast<unsigned long long>(snapshot.gpu_sample_fence),
+           g[RTXDI_DIAG_LIGHT_TABLE_WRITTEN], g[RTXDI_DIAG_LIGHT_ID_MATCHED],
+           g[RTXDI_DIAG_LIGHT_ID_UNMATCHED], g[RTXDI_DIAG_LIGHT_CURRENT_UNMATCHED],
+           g[RTXDI_DIAG_LIGHT_HASH_COLLISIONS], g[RTXDI_DIAG_LIGHT_ID_DUPLICATES],
+           g[RTXDI_DIAG_LIGHT_INVALID_ID], g[RTXDI_DIAG_LIGHT_INCOMPATIBLE],
+           g[RTXDI_DIAG_LIGHT_REMAP_HITS]);
     append("gpu_candidates tried=%u info_valid=%u type_none=%u type_both=%u lamp_invalid=%u sample_valid=%u tile_valid=%u in_tile=%u target_nonzero=%u initial_surfaces=%u initial_reservoirs=%u radiance_zero=%u\n",
            g[RTXDI_DIAG_CAND_TRIED], g[RTXDI_DIAG_CAND_INFO_VALID], g[RTXDI_DIAG_CAND_TYPE_NONE], g[RTXDI_DIAG_CAND_TYPE_BOTH],
            g[RTXDI_DIAG_CAND_LAMP_INVALID], g[RTXDI_DIAG_CAND_SAMPLE_VALID], g[RTXDI_DIAG_CAND_TILE_VALID],

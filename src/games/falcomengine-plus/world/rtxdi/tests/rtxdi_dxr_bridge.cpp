@@ -23,6 +23,7 @@
 #include "rtxdi_lighting_consumer_contract.h"
 #include "rtxdi_raw_guard_contract.h"
 #include "rtxdi_surface_contract.h"
+#include "world_light_table.h"
 #include "world_rtxdi_classify_lights.h"
 #include "world_rtxdi_initial_di.h"
 #include "world_rtxdi_nrd_coverage_contract.h"
@@ -522,6 +523,433 @@ int RunRtxdiDxrBridge() {
     wait_has_di_dispatch = false;
     return done;
   };
+
+  {
+    constexpr UINT light_count = 4u;
+    constexpr UINT diagnostic_count = RTXDI_DIAG_COUNTER_COUNT;
+    std::array<RtxdiLightParam, light_count> light_data = {};
+    light_data[0].pos[1] = -1.f / 256.f;
+    light_data[0].pos[2] = 1.f;
+    light_data[0].radius = 0.5f;
+    light_data[0].radius_inv = 2.f;
+    light_data[0].color[0] = 1.f;
+    light_data[0].color[2] = -1.f;
+    light_data[0].spot_angle_inv = 1.f;
+    light_data[0].attenuation_angle = 1.f;
+    light_data[0].vec[2] = 1.f;
+    light_data[1].pos[0] = 2.f;
+    light_data[1].radius = 1.f;
+    light_data[1].radius_inv = 1.f;
+    light_data[1].color[1] = 0.5f;
+    light_data[2].pos[0] = std::numeric_limits<float>::infinity();
+    light_data[2].radius = 1.f;
+    light_data[2].radius_inv = 1.f;
+    light_data[3].pos[0] = 9000000.f;
+    light_data[3].radius = 1.f;
+    light_data[3].radius_inv = 1.f;
+    const std::array<uint32_t, light_count> light_types = {RTXDI_LIGHT_TABLE_TYPE_SPOT,
+                                                          RTXDI_LIGHT_TABLE_TYPE_POINT,
+                                                          RTXDI_LIGHT_TABLE_TYPE_AMBIGUOUS,
+                                                          RTXDI_LIGHT_TABLE_TYPE_UNTYPED};
+    ComPtr<ID3D12Resource> current_lights, current_types, previous_lights, previous_table, current_table_dummy;
+    if (!UploadBuffer(device.Get(), light_data.data(), sizeof(light_data), &current_lights)
+        || !UploadBuffer(device.Get(), light_types.data(), sizeof(light_types), &current_types)
+        || !UploadBuffer(device.Get(), light_data.data(), sizeof(light_data), &previous_lights)) return 1;
+    std::array<RtxdiLightTableEntry, light_count> dummy_table = {};
+    if (!UploadBuffer(device.Get(), dummy_table.data(), sizeof(dummy_table), &previous_table)
+        || !UploadBuffer(device.Get(), dummy_table.data(), sizeof(dummy_table), &current_table_dummy)) return 1;
+    const std::array<uint32_t, diagnostic_count> zero_diagnostics = {};
+    std::array<uint32_t, light_count> reset_maps = {};
+    reset_maps.fill(RTXDI_LIGHT_TABLE_INVALID_INDEX);
+    ComPtr<ID3D12Resource> diagnostic_zero_upload;
+    ComPtr<ID3D12Resource> map_reset_upload;
+    if (!UploadBuffer(device.Get(), zero_diagnostics.data(), sizeof(zero_diagnostics), &diagnostic_zero_upload)
+        || !UploadBuffer(device.Get(), reset_maps.data(), sizeof(reset_maps), &map_reset_upload)) return 1;
+    ComPtr<ID3D12Resource> output_table, previous_to_current, current_to_previous, diagnostics;
+    if (!CreateDefaultBuffer(device.Get(), sizeof(RtxdiLightTableEntry) * light_count,
+                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &output_table)
+        || !CreateDefaultBuffer(device.Get(), sizeof(uint32_t) * light_count,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &previous_to_current)
+        || !CreateDefaultBuffer(device.Get(), sizeof(uint32_t) * light_count,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &current_to_previous)
+        || !CreateDefaultBuffer(device.Get(), sizeof(uint32_t) * diagnostic_count,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &diagnostics)) return 1;
+    D3D12_DESCRIPTOR_HEAP_DESC table_heap_desc = {};
+    table_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    table_heap_desc.NumDescriptors = 9u;
+    table_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    ComPtr<ID3D12DescriptorHeap> table_heap;
+    if (!Check(device->CreateDescriptorHeap(&table_heap_desc, IID_PPV_ARGS(&table_heap)), "create light table heap")) return 1;
+    const UINT table_descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    CreateBufferSrv(device.Get(), table_heap.Get(), table_descriptor_size, 0u, current_lights.Get(), light_count, sizeof(RtxdiLightParam));
+    CreateBufferSrv(device.Get(), table_heap.Get(), table_descriptor_size, 1u, current_types.Get(), light_count, sizeof(uint32_t));
+    CreateBufferSrv(device.Get(), table_heap.Get(), table_descriptor_size, 2u, previous_lights.Get(), light_count, sizeof(RtxdiLightParam));
+    CreateBufferSrv(device.Get(), table_heap.Get(), table_descriptor_size, 3u, previous_table.Get(), light_count, sizeof(RtxdiLightTableEntry));
+    CreateBufferSrv(device.Get(), table_heap.Get(), table_descriptor_size, 4u, current_table_dummy.Get(), light_count, sizeof(RtxdiLightTableEntry));
+    const auto create_table_uav = [&](UINT descriptor_index, ID3D12Resource* resource, UINT elements, UINT stride) {
+      D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
+      desc.Format = DXGI_FORMAT_UNKNOWN;
+      desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+      desc.Buffer.NumElements = elements;
+      desc.Buffer.StructureByteStride = stride;
+      auto handle = table_heap->GetCPUDescriptorHandleForHeapStart();
+      handle.ptr += static_cast<SIZE_T>(descriptor_index) * table_descriptor_size;
+      device->CreateUnorderedAccessView(resource, nullptr, &desc, handle);
+    };
+    create_table_uav(5u, output_table.Get(), light_count, sizeof(RtxdiLightTableEntry));
+    create_table_uav(6u, previous_to_current.Get(), light_count, sizeof(uint32_t));
+    create_table_uav(7u, current_to_previous.Get(), light_count, sizeof(uint32_t));
+    create_table_uav(8u, diagnostics.Get(), diagnostic_count, sizeof(uint32_t));
+    D3D12_DESCRIPTOR_RANGE table_ranges[2] = {};
+    table_ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5u, 0u, 0u, 0u};
+    table_ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4u, 0u, 0u, 5u};
+    ComPtr<ID3D12RootSignature> table_root;
+    ComPtr<ID3D12PipelineState> table_pso;
+    if (!CreateRoot(device.Get(), table_ranges, 2u, 4u, &table_root)
+        || !CreatePso(device.Get(), table_root.Get(), __world_light_table, &table_pso)) return 1;
+    const auto table_readback_desc = BufferDesc(sizeof(RtxdiLightTableEntry) * light_count);
+    const auto diagnostic_readback_desc = BufferDesc(sizeof(uint32_t) * diagnostic_count);
+    const auto readback_heap = Heap(D3D12_HEAP_TYPE_READBACK);
+    ComPtr<ID3D12Resource> table_readback, diagnostic_readback;
+    if (!Check(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &table_readback_desc,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&table_readback)),
+               "create light table readback")
+        || !Check(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &diagnostic_readback_desc,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&diagnostic_readback)),
+                 "create light table diagnostics readback")) return 1;
+    std::array<D3D12_RESOURCE_BARRIER, 4> table_barriers = {};
+    const std::array<ID3D12Resource*, 4> table_outputs = {output_table.Get(), previous_to_current.Get(),
+                                                        current_to_previous.Get(), diagnostics.Get()};
+    for (UINT index = 0u; index < table_outputs.size(); ++index) {
+      table_barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      table_barriers[index].Transition.pResource = table_outputs[index];
+      table_barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      table_barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+      table_barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    list->ResourceBarrier(static_cast<UINT>(table_barriers.size()), table_barriers.data());
+    ID3D12DescriptorHeap* table_heaps[] = {table_heap.Get()};
+    list->SetDescriptorHeaps(1u, table_heaps);
+    list->SetComputeRootSignature(table_root.Get());
+    list->SetPipelineState(table_pso.Get());
+    list->SetComputeRoot32BitConstants(0u, 4u, std::array<UINT, 4>{light_count, 0u, 0u, 0u}.data(), 0u);
+    list->SetComputeRootDescriptorTable(1u, table_heap->GetGPUDescriptorHandleForHeapStart());
+    D3D12_RESOURCE_BARRIER diagnostic_reset = {};
+    diagnostic_reset.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    diagnostic_reset.Transition.pResource = diagnostics.Get();
+    diagnostic_reset.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    diagnostic_reset.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    diagnostic_reset.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(1u, &diagnostic_reset);
+    list->CopyBufferRegion(diagnostics.Get(), 0u, diagnostic_zero_upload.Get(), 0u,
+                           sizeof(uint32_t) * diagnostic_count);
+    diagnostic_reset.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    diagnostic_reset.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(1u, &diagnostic_reset);
+    list->Dispatch(1u, 1u, 1u);
+    for (UINT index = 0u; index < table_outputs.size(); ++index) {
+      table_barriers[index] = {};
+      table_barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+      table_barriers[index].UAV.pResource = table_outputs[index];
+    }
+    list->ResourceBarrier(static_cast<UINT>(table_barriers.size()), table_barriers.data());
+    for (UINT index = 0u; index < table_outputs.size(); ++index) {
+      table_barriers[index] = {};
+      table_barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      table_barriers[index].Transition.pResource = table_outputs[index];
+      table_barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      table_barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      table_barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+    list->ResourceBarrier(static_cast<UINT>(table_barriers.size()), table_barriers.data());
+    list->CopyBufferRegion(table_readback.Get(), 0u, output_table.Get(), 0u, sizeof(RtxdiLightTableEntry) * light_count);
+    list->CopyBufferRegion(diagnostic_readback.Get(), 0u, diagnostics.Get(), 0u, sizeof(uint32_t) * diagnostic_count);
+    wait_context = "M2 light table build and structured-buffer readback";
+    if (!submit_wait()) return 1;
+    std::array<RtxdiLightTableEntry, light_count> table_results = {};
+    std::array<uint32_t, diagnostic_count> table_diagnostics = {};
+    void* table_mapped = nullptr;
+    if (!Check(table_readback->Map(0u, nullptr, &table_mapped), "map light table readback")) return 1;
+    std::memcpy(table_results.data(), table_mapped, sizeof(table_results));
+    table_readback->Unmap(0u, nullptr);
+    void* table_diagnostics_mapped = nullptr;
+    if (!Check(diagnostic_readback->Map(0u, nullptr, &table_diagnostics_mapped), "map light table diagnostics")) return 1;
+    std::memcpy(table_diagnostics.data(), table_diagnostics_mapped, sizeof(table_diagnostics));
+    diagnostic_readback->Unmap(0u, nullptr);
+    if (!Check(allocator->Reset(), "reset M2 build allocator")
+        || !Check(base_list->Reset(allocator.Get(), nullptr), "reset M2 build list")) return 1;
+    const uint64_t expected_hash = 0xc80e9739cad116a6ull;
+    if (table_results[0].stable_id_lo != static_cast<uint32_t>(expected_hash)
+        || table_results[0].stable_id_hi != static_cast<uint32_t>(expected_hash >> 32u)
+        || table_results[0].type != RTXDI_LIGHT_TABLE_TYPE_SPOT || std::abs(table_results[0].power - 0.05315f) > 1e-6f
+        || (table_results[1].stable_id_lo == 0u && table_results[1].stable_id_hi == 0u)
+        || table_results[1].type != RTXDI_LIGHT_TABLE_TYPE_POINT
+        || table_results[2].stable_id_lo != 0u || table_results[2].stable_id_hi != 0u
+        || table_results[3].stable_id_lo != 0u || table_results[3].stable_id_hi != 0u
+        || table_diagnostics[RTXDI_DIAG_LIGHT_TABLE_WRITTEN] != light_count
+        || table_diagnostics[RTXDI_DIAG_LIGHT_INVALID_ID] != 1u) {
+      std::fprintf(stderr, "FAIL M2 GPU table golden hash=%08x%08x expected=%016llx written=%u invalid=%u\n",
+                   table_results[0].stable_id_hi, table_results[0].stable_id_lo,
+                   static_cast<unsigned long long>(expected_hash),
+                   table_diagnostics[RTXDI_DIAG_LIGHT_TABLE_WRITTEN], table_diagnostics[RTXDI_DIAG_LIGHT_INVALID_ID]);
+      return 1;
+    }
+    auto previous_light_data = light_data;
+    std::swap(previous_light_data[0], previous_light_data[1]);
+    auto previous_table_data = table_results;
+    std::swap(previous_table_data[0], previous_table_data[1]);
+    void* previous_lights_mapped = nullptr;
+    if (!Check(previous_lights->Map(0u, nullptr, &previous_lights_mapped), "map previous light test upload")) return 1;
+    std::memcpy(previous_lights_mapped, previous_light_data.data(), sizeof(previous_light_data));
+    previous_lights->Unmap(0u, nullptr);
+    void* previous_table_mapped = nullptr;
+    if (!Check(previous_table->Map(0u, nullptr, &previous_table_mapped), "map previous table test upload")) return 1;
+    std::memcpy(previous_table_mapped, previous_table_data.data(), sizeof(previous_table_data));
+    previous_table->Unmap(0u, nullptr);
+    ComPtr<ID3D12Resource> match_table_dummy;
+    if (!CreateDefaultBuffer(device.Get(), sizeof(RtxdiLightTableEntry) * light_count,
+                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON,
+                             &match_table_dummy)) return 1;
+    CreateBufferSrv(device.Get(), table_heap.Get(), table_descriptor_size, 4u, output_table.Get(), light_count,
+                    sizeof(RtxdiLightTableEntry));
+    create_table_uav(5u, match_table_dummy.Get(), light_count, sizeof(RtxdiLightTableEntry));
+    D3D12_RESOURCE_BARRIER match_barriers[4] = {};
+    const std::array<ID3D12Resource*, 4> match_resources = {output_table.Get(), previous_to_current.Get(),
+                                                            current_to_previous.Get(), diagnostics.Get()};
+    const std::array<D3D12_RESOURCE_STATES, 4> match_before = {D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                               D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                               D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                               D3D12_RESOURCE_STATE_COPY_SOURCE};
+    const std::array<D3D12_RESOURCE_STATES, 4> match_after = {D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                              D3D12_RESOURCE_STATE_COPY_DEST,
+                                                              D3D12_RESOURCE_STATE_COPY_DEST,
+                                                              D3D12_RESOURCE_STATE_COPY_DEST};
+    for (UINT index = 0u; index < match_resources.size(); ++index) {
+      match_barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      match_barriers[index].Transition.pResource = match_resources[index];
+      match_barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      match_barriers[index].Transition.StateBefore = match_before[index];
+      match_barriers[index].Transition.StateAfter = match_after[index];
+    }
+    list->ResourceBarrier(4u, match_barriers);
+    list->CopyBufferRegion(previous_to_current.Get(), 0u, map_reset_upload.Get(), 0u, sizeof(reset_maps));
+    list->CopyBufferRegion(current_to_previous.Get(), 0u, map_reset_upload.Get(), 0u, sizeof(reset_maps));
+    D3D12_RESOURCE_BARRIER map_state_barriers[2] = {};
+    const std::array<ID3D12Resource*, 2> map_resources = {previous_to_current.Get(), current_to_previous.Get()};
+    for (UINT index = 0u; index < map_resources.size(); ++index) {
+      map_state_barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      map_state_barriers[index].Transition.pResource = map_resources[index];
+      map_state_barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      map_state_barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      map_state_barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    list->ResourceBarrier(2u, map_state_barriers);
+    D3D12_RESOURCE_BARRIER dummy_barrier = {};
+    dummy_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    dummy_barrier.Transition.pResource = match_table_dummy.Get();
+    dummy_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    dummy_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    dummy_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(1u, &dummy_barrier);
+    list->CopyBufferRegion(diagnostics.Get(), 0u, diagnostic_zero_upload.Get(), 0u,
+                           sizeof(uint32_t) * diagnostic_count);
+    match_barriers[3].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    match_barriers[3].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(1u, &match_barriers[3]);
+    list->SetDescriptorHeaps(1u, table_heaps);
+    list->SetComputeRootSignature(table_root.Get());
+    list->SetPipelineState(table_pso.Get());
+    list->SetComputeRoot32BitConstants(0u, 4u, std::array<UINT, 4>{light_count, light_count, 1u, 1u}.data(), 0u);
+    list->SetComputeRootDescriptorTable(1u, table_heap->GetGPUDescriptorHandleForHeapStart());
+    list->Dispatch(1u, 1u, 1u);
+    D3D12_RESOURCE_BARRIER match_uav_barriers[3] = {};
+    for (UINT index = 0u; index < 3u; ++index) {
+      match_uav_barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+      match_uav_barriers[index].UAV.pResource = index == 0u ? match_table_dummy.Get() : match_resources[index];
+    }
+    list->ResourceBarrier(3u, match_uav_barriers);
+    for (UINT index = 1u; index < 4u; ++index) {
+      match_barriers[index] = {};
+      match_barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      match_barriers[index].Transition.pResource = match_resources[index];
+      match_barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      match_barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      match_barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+    list->ResourceBarrier(3u, &match_barriers[1]);
+    list->CopyBufferRegion(table_readback.Get(), 0u, previous_to_current.Get(), 0u,
+                           sizeof(uint32_t) * light_count);
+    list->CopyBufferRegion(table_readback.Get(), sizeof(uint32_t) * light_count, current_to_previous.Get(), 0u,
+                           sizeof(uint32_t) * light_count);
+    list->CopyBufferRegion(diagnostic_readback.Get(), 0u, diagnostics.Get(), 0u,
+                           sizeof(uint32_t) * diagnostic_count);
+    wait_context = "M2 reordered light map and reverse-map readback";
+    if (!submit_wait()) return 1;
+    std::array<uint32_t, light_count * 2u> map_results = {};
+    if (!Check(table_readback->Map(0u, nullptr, &table_mapped), "map remap result")) return 1;
+    std::memcpy(map_results.data(), table_mapped, sizeof(map_results));
+    table_readback->Unmap(0u, nullptr);
+    if (!Check(diagnostic_readback->Map(0u, nullptr, &table_diagnostics_mapped), "map remap diagnostics")) return 1;
+    std::memcpy(table_diagnostics.data(), table_diagnostics_mapped, sizeof(table_diagnostics));
+    diagnostic_readback->Unmap(0u, nullptr);
+    const auto quantize_identity = [](const RtxdiLightParam& light, std::array<int32_t, 7>* values) {
+      const float inputs[7] = {light.pos[0], light.pos[1], light.pos[2], light.radius,
+                               light.color[0], light.color[1], light.color[2]};
+      const float scales[7] = {256.f, 256.f, 256.f, 256.f, 1024.f, 1024.f, 1024.f};
+      for (UINT component = 0u; component < 7u; ++component) {
+        if (!std::isfinite(inputs[component])) return false;
+        const float rounded = std::floor(inputs[component] * scales[component] + 0.5f);
+        if (!std::isfinite(rounded) || rounded < -2147483648.f || rounded >= 2147483648.f) return false;
+        (*values)[component] = static_cast<int32_t>(rounded);
+      }
+      return true;
+    };
+    std::array<uint32_t, light_count> cpu_previous_to_current = {}, cpu_current_to_previous = {};
+    cpu_previous_to_current.fill(RTXDI_LIGHT_TABLE_INVALID_INDEX);
+    cpu_current_to_previous.fill(RTXDI_LIGHT_TABLE_INVALID_INDEX);
+    for (UINT previous_index = 0u; previous_index < light_count; ++previous_index) {
+      std::array<int32_t, 7> previous_values = {};
+      if (!quantize_identity(previous_light_data[previous_index], &previous_values)) continue;
+      uint32_t occurrence = 0u;
+      for (UINT earlier = 0u; earlier < previous_index; ++earlier) {
+        std::array<int32_t, 7> earlier_values = {};
+        if (previous_table_data[earlier].type == previous_table_data[previous_index].type
+            && quantize_identity(previous_light_data[earlier], &earlier_values) && earlier_values == previous_values) ++occurrence;
+      }
+      uint32_t candidate_occurrence = 0u;
+      for (UINT current_index = 0u; current_index < light_count; ++current_index) {
+        std::array<int32_t, 7> current_values = {};
+        if (previous_table_data[previous_index].stable_id_lo != table_results[current_index].stable_id_lo
+            || previous_table_data[previous_index].stable_id_hi != table_results[current_index].stable_id_hi
+            || previous_table_data[previous_index].type != table_results[current_index].type
+            || !quantize_identity(light_data[current_index], &current_values) || current_values != previous_values) continue;
+        if (candidate_occurrence++ != occurrence) continue;
+        if (previous_table_data[previous_index].type == RTXDI_LIGHT_TABLE_TYPE_POINT
+            || previous_table_data[previous_index].type == RTXDI_LIGHT_TABLE_TYPE_SPOT) {
+          cpu_previous_to_current[previous_index] = current_index;
+          cpu_current_to_previous[current_index] = previous_index;
+        }
+        break;
+      }
+    }
+    if (!std::equal(cpu_previous_to_current.begin(), cpu_previous_to_current.end(), map_results.begin())
+        || !std::equal(cpu_current_to_previous.begin(), cpu_current_to_previous.end(), map_results.begin() + light_count)
+        || table_diagnostics[RTXDI_DIAG_LIGHT_ID_MATCHED] != 2u
+        || table_diagnostics[RTXDI_DIAG_LIGHT_REMAP_HITS] != 2u
+        || table_diagnostics[RTXDI_DIAG_LIGHT_ID_UNMATCHED] != 1u
+        || table_diagnostics[RTXDI_DIAG_LIGHT_CURRENT_UNMATCHED] != 1u) {
+      std::fprintf(stderr, "FAIL M2 GPU reordered map %u,%u,%u,%u matched=%u unmatched=%u current_unmatched=%u\n",
+                   map_results[0], map_results[1], map_results[2], map_results[3],
+                   table_diagnostics[RTXDI_DIAG_LIGHT_ID_MATCHED], table_diagnostics[RTXDI_DIAG_LIGHT_ID_UNMATCHED],
+                   table_diagnostics[RTXDI_DIAG_LIGHT_CURRENT_UNMATCHED]);
+      return 1;
+    }
+    std::printf("PASS M2 GPU FNV64 golden lanes: low=0x%08x high=0x%08x\n", table_results[0].stable_id_lo, table_results[0].stable_id_hi);
+    std::printf("PASS M2 GPU structured table stride=32, FNV golden hash, invalid inputs, reordered bidirectional map and diagnostics\n");
+    if (!Check(allocator->Reset(), "reset M2 table allocator")
+        || !Check(base_list->Reset(allocator.Get(), nullptr), "reset M2 table list")) return 1;
+    D3D12_RESOURCE_BARRIER no_history_barriers[3] = {};
+    const std::array<ID3D12Resource*, 3> no_history_resources = {
+        previous_to_current.Get(), current_to_previous.Get(), diagnostics.Get()};
+    for (UINT index = 0u; index < no_history_resources.size(); ++index) {
+      no_history_barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      no_history_barriers[index].Transition.pResource = no_history_resources[index];
+      no_history_barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      no_history_barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+      no_history_barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    list->ResourceBarrier(3u, no_history_barriers);
+    list->CopyBufferRegion(previous_to_current.Get(), 0u, map_reset_upload.Get(), 0u, sizeof(uint32_t) * 2u);
+    list->CopyBufferRegion(current_to_previous.Get(), 0u, map_reset_upload.Get(), 0u, sizeof(uint32_t) * 2u);
+    list->CopyBufferRegion(diagnostics.Get(), 0u, diagnostic_zero_upload.Get(), 0u,
+                           sizeof(uint32_t) * diagnostic_count);
+    for (UINT index = 0u; index < no_history_resources.size(); ++index) {
+      no_history_barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      no_history_barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    list->ResourceBarrier(3u, no_history_barriers);
+    list->SetDescriptorHeaps(1u, table_heaps);
+    list->SetComputeRootSignature(table_root.Get());
+    list->SetPipelineState(table_pso.Get());
+    list->SetComputeRoot32BitConstants(0u, 4u, std::array<UINT, 4>{2u, 0u, 0u, 1u}.data(), 0u);
+    list->SetComputeRootDescriptorTable(1u, table_heap->GetGPUDescriptorHandleForHeapStart());
+    list->Dispatch(1u, 1u, 1u);
+    for (UINT index = 0u; index < no_history_resources.size(); ++index) {
+      no_history_barriers[index] = {};
+      no_history_barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+      no_history_barriers[index].UAV.pResource = no_history_resources[index];
+    }
+    list->ResourceBarrier(3u, no_history_barriers);
+    for (UINT index = 0u; index < no_history_resources.size(); ++index) {
+      no_history_barriers[index] = {};
+      no_history_barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      no_history_barriers[index].Transition.pResource = no_history_resources[index];
+      no_history_barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      no_history_barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      no_history_barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+    list->ResourceBarrier(3u, no_history_barriers);
+    list->CopyBufferRegion(table_readback.Get(), 0u, previous_to_current.Get(), 0u, sizeof(uint32_t) * 2u);
+    list->CopyBufferRegion(table_readback.Get(), sizeof(uint32_t) * 2u, current_to_previous.Get(), 0u,
+                           sizeof(uint32_t) * 2u);
+    list->CopyBufferRegion(diagnostic_readback.Get(), 0u, diagnostics.Get(), 0u,
+                           sizeof(uint32_t) * diagnostic_count);
+    wait_context = "M2 no-history invalid maps and counters";
+    if (!submit_wait()) return 1;
+    std::array<uint32_t, 4> no_history_maps = {};
+    if (!Check(table_readback->Map(0u, nullptr, &table_mapped), "map no-history maps")) return 1;
+    std::memcpy(no_history_maps.data(), table_mapped, sizeof(no_history_maps));
+    table_readback->Unmap(0u, nullptr);
+    if (!Check(diagnostic_readback->Map(0u, nullptr, &table_diagnostics_mapped), "map no-history counters")) return 1;
+    std::memcpy(table_diagnostics.data(), table_diagnostics_mapped, sizeof(table_diagnostics));
+    diagnostic_readback->Unmap(0u, nullptr);
+    if (no_history_maps != std::array<uint32_t, 4>{RTXDI_LIGHT_TABLE_INVALID_INDEX, RTXDI_LIGHT_TABLE_INVALID_INDEX,
+                                                    RTXDI_LIGHT_TABLE_INVALID_INDEX, RTXDI_LIGHT_TABLE_INVALID_INDEX}
+        || table_diagnostics[RTXDI_DIAG_LIGHT_CURRENT_UNMATCHED] != 2u
+        || table_diagnostics[RTXDI_DIAG_LIGHT_REMAP_HITS] != 0u) return 1;
+    std::printf("PASS M2 GPU no-history maps remain invalid\n");
+    if (!Check(allocator->Reset(), "reset M2 no-history allocator")
+        || !Check(base_list->Reset(allocator.Get(), nullptr), "reset M2 no-history list")) return 1;
+    D3D12_RESOURCE_BARRIER zero_light_barriers[3] = {};
+    for (UINT index = 0u; index < no_history_resources.size(); ++index) {
+      zero_light_barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      zero_light_barriers[index].Transition.pResource = no_history_resources[index];
+      zero_light_barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      zero_light_barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+      zero_light_barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    list->ResourceBarrier(3u, zero_light_barriers);
+    list->CopyBufferRegion(previous_to_current.Get(), 0u, map_reset_upload.Get(), 0u, sizeof(reset_maps));
+    list->CopyBufferRegion(current_to_previous.Get(), 0u, map_reset_upload.Get(), 0u, sizeof(reset_maps));
+    list->CopyBufferRegion(diagnostics.Get(), 0u, diagnostic_zero_upload.Get(), 0u,
+                           sizeof(uint32_t) * diagnostic_count);
+    for (UINT index = 0u; index < no_history_resources.size(); ++index) {
+      zero_light_barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      zero_light_barriers[index].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+    list->ResourceBarrier(3u, zero_light_barriers);
+    list->CopyBufferRegion(table_readback.Get(), 0u, previous_to_current.Get(), 0u, sizeof(reset_maps));
+    list->CopyBufferRegion(table_readback.Get(), sizeof(reset_maps), current_to_previous.Get(), 0u, sizeof(reset_maps));
+    list->CopyBufferRegion(diagnostic_readback.Get(), 0u, diagnostics.Get(), 0u,
+                           sizeof(uint32_t) * diagnostic_count);
+    wait_context = "M2 zero-light clear without shader dispatch";
+    if (!submit_wait()) return 1;
+    std::array<uint32_t, light_count * 2u> zero_light_maps = {};
+    if (!Check(table_readback->Map(0u, nullptr, &table_mapped), "map zero-light maps")) return 1;
+    std::memcpy(zero_light_maps.data(), table_mapped, sizeof(zero_light_maps));
+    table_readback->Unmap(0u, nullptr);
+    if (!Check(diagnostic_readback->Map(0u, nullptr, &table_diagnostics_mapped), "map zero-light counters")) return 1;
+    std::memcpy(table_diagnostics.data(), table_diagnostics_mapped, sizeof(table_diagnostics));
+    diagnostic_readback->Unmap(0u, nullptr);
+    if (zero_light_maps != std::array<uint32_t, light_count * 2u>{RTXDI_LIGHT_TABLE_INVALID_INDEX,
+            RTXDI_LIGHT_TABLE_INVALID_INDEX, RTXDI_LIGHT_TABLE_INVALID_INDEX, RTXDI_LIGHT_TABLE_INVALID_INDEX,
+            RTXDI_LIGHT_TABLE_INVALID_INDEX, RTXDI_LIGHT_TABLE_INVALID_INDEX, RTXDI_LIGHT_TABLE_INVALID_INDEX,
+            RTXDI_LIGHT_TABLE_INVALID_INDEX}
+        || std::any_of(table_diagnostics.begin(), table_diagnostics.end(), [](uint32_t value) { return value != 0u; })) return 1;
+    std::printf("PASS M2 GPU zero lights leaves counters zero\n");
+    if (!Check(allocator->Reset(), "reset M2 zero-light allocator")
+        || !Check(base_list->Reset(allocator.Get(), nullptr), "reset M2 zero-light list")) return 1;
+  }
 
   const std::array<float, 12> vertex_data = {-20.f, -20.f, 0.f, 0.f, 20.f, -20.f, 0.f, 0.f, 0.f, 20.f, 0.f, 0.f};
   ComPtr<ID3D12Resource> vertices;
@@ -1718,11 +2146,25 @@ int RunRtxdiDxrBridge() {
     std::memcpy(material.bytes + 136, &local_specular_flag, sizeof(local_specular_flag));
   }
   auto previous_deferred = deferred;
-  ComPtr<ID3D12Resource> light_upload, previous_light_upload, previous_type_upload, tile_upload, deferred_upload,
+  std::array<RtxdiLightTableEntry, 4> current_light_table = {}, previous_light_table = {};
+  const std::array<uint32_t, 4> identity_light_maps = {0u, 1u, 2u, 3u};
+  for (UINT index = 0u; index < lights.size(); ++index) {
+    current_light_table[index].type = index == 0u ? RTXDI_LIGHT_TABLE_TYPE_POINT
+                                      : index == 1u ? RTXDI_LIGHT_TABLE_TYPE_SPOT
+                                      : index == 2u ? RTXDI_LIGHT_TABLE_TYPE_AMBIGUOUS
+                                                    : RTXDI_LIGHT_TABLE_TYPE_UNTYPED;
+  }
+  previous_light_table = current_light_table;
+  ComPtr<ID3D12Resource> light_upload, previous_light_upload, previous_type_upload, current_light_table_upload,
+      previous_light_table_upload, previous_to_current_upload, current_to_previous_upload, tile_upload, deferred_upload,
       previous_deferred_upload, frame_upload;
   if (!UploadBuffer(device.Get(), lights.data(), sizeof(lights), &light_upload)
       || !UploadBuffer(device.Get(), lights.data(), sizeof(lights), &previous_light_upload)
       || !UploadBuffer(device.Get(), std::array<uint32_t, 4>{1u, 2u, 3u, 0u}.data(), sizeof(uint32_t) * lights.size(), &previous_type_upload)
+      || !UploadBuffer(device.Get(), current_light_table.data(), sizeof(current_light_table), &current_light_table_upload)
+      || !UploadBuffer(device.Get(), previous_light_table.data(), sizeof(previous_light_table), &previous_light_table_upload)
+      || !UploadBuffer(device.Get(), identity_light_maps.data(), sizeof(identity_light_maps), &previous_to_current_upload)
+      || !UploadBuffer(device.Get(), identity_light_maps.data(), sizeof(identity_light_maps), &current_to_previous_upload)
       || !UploadBuffer(device.Get(), tile_records.data(), tile_records.size() * sizeof(RtxdiTileData), &tile_upload)
       || !UploadBuffer(device.Get(), deferred.data(), sizeof(deferred), &deferred_upload)
       || !UploadBuffer(device.Get(), previous_deferred.data(), sizeof(previous_deferred), &previous_deferred_upload)) return 1;
@@ -1836,7 +2278,7 @@ int RunRtxdiDxrBridge() {
 
   D3D12_DESCRIPTOR_HEAP_DESC di_heap_desc = {};
   di_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  di_heap_desc.NumDescriptors = 40u;
+  di_heap_desc.NumDescriptors = 44u;
   di_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   ComPtr<ID3D12DescriptorHeap> di_heap;
   if (!Check(device->CreateDescriptorHeap(&di_heap_desc, IID_PPV_ARGS(&di_heap)), "create initial DI heap")) return 1;
@@ -1892,6 +2334,14 @@ int RunRtxdiDxrBridge() {
                   RTXDI_INPUT_DEFERRED_STRIDE);
   CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 29u, previous_light_upload.Get(), 4u, sizeof(RtxdiLightParam));
   CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 30u, previous_type_upload.Get(), 4u, sizeof(uint32_t));
+  CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 40u, current_light_table_upload.Get(), 4u,
+                  sizeof(RtxdiLightTableEntry));
+  CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 41u, previous_light_table_upload.Get(), 4u,
+                  sizeof(RtxdiLightTableEntry));
+  CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 42u, previous_to_current_upload.Get(), 4u,
+                  sizeof(uint32_t));
+  CreateBufferSrv(device.Get(), di_heap.Get(), di_descriptor_size, 43u, current_to_previous_upload.Get(), 4u,
+                  sizeof(uint32_t));
   const auto create_di_uav = [&](UINT index, ID3D12Resource* resource, UINT count, UINT stride) {
     D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
     view.Format = DXGI_FORMAT_UNKNOWN;
@@ -1951,7 +2401,7 @@ int RunRtxdiDxrBridge() {
                 "create classifier root")
       || !CreatePso(device.Get(), classify_root.Get(), __world_rtxdi_classify_lights, &classify_pso)) return 1;
 
-  D3D12_DESCRIPTOR_RANGE di_ranges[13] = {};
+  D3D12_DESCRIPTOR_RANGE di_ranges[14] = {};
   di_ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4u, 0u, 0u, 0u};
   di_ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3u, 14u, 0u, 4u};
   di_ranges[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 6u, 17u, 0u, 7u};
@@ -1965,13 +2415,14 @@ int RunRtxdiDxrBridge() {
   di_ranges[10] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3u, 3u, 0u, 36u};
   di_ranges[11] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1u, 6u, 0u, 39u};
   di_ranges[12] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 61u, 0u, 21u};
+  di_ranges[13] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4u, 46u, 0u, 40u};
   D3D12_ROOT_PARAMETER di_params[4] = {};
   di_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   di_params[0].Constants.Num32BitValues = 22u;
   di_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   di_params[1].Descriptor.ShaderRegister = 1u;
   di_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  di_params[2].DescriptorTable.NumDescriptorRanges = 13u;
+  di_params[2].DescriptorTable.NumDescriptorRanges = 14u;
   di_params[2].DescriptorTable.pDescriptorRanges = di_ranges;
   di_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   di_params[3].Constants.Num32BitValues = 10u;
@@ -2048,6 +2499,27 @@ int RunRtxdiDxrBridge() {
                     float* pixel_zero_raw_radiance = nullptr, float* pixel_zero_inverse_pdf = nullptr,
                     bool check_unwritten_arrays = false, UINT extra_flags = 0u) {
     if (mask_index >= tlases.size() || local_lights > 4u) return false;
+    for (UINT light_index = 0u; light_index < current_light_table.size(); ++light_index) {
+      uint32_t classified_type = 0u;
+      for (const RtxdiTileData& tile_record : tile_records) {
+        const UINT point_count = (std::min)(tile_record.point_count, 63u);
+        for (UINT point_index = 0u; point_index < point_count; ++point_index) {
+          if (tile_record.point_indices[point_index] >= 0
+              && static_cast<UINT>(tile_record.point_indices[point_index]) == light_index) {
+            classified_type |= RTXDI_LIGHT_TABLE_TYPE_POINT;
+          }
+        }
+        const UINT spot_count = (std::min)(tile_record.spot_count, 63u);
+        for (UINT spot_index = 0u; spot_index < spot_count; ++spot_index) {
+          if (tile_record.spot_indices[spot_index] >= 0
+              && static_cast<UINT>(tile_record.spot_indices[spot_index]) == light_index) {
+            classified_type |= RTXDI_LIGHT_TABLE_TYPE_SPOT;
+          }
+        }
+      }
+      current_light_table[light_index].type = classified_type;
+    }
+    if (!update_upload(current_light_table_upload.Get(), current_light_table.data(), sizeof(current_light_table))) return false;
     wait_context = label;
     wait_has_di_dispatch = true;
     bridge_di_context->SetResamplingMode(temporal && spatial ? ::rtxdi::ReSTIRDI_ResamplingMode::TemporalAndSpatial
@@ -3140,10 +3612,41 @@ int RunRtxdiDxrBridge() {
               "RTXDI temporal rejects reordered light identity", true, 1u, true, 0u,
               false, true, true, false)) return 1;
   lights = unchanged_lights;
+  previous_lights = unchanged_lights;
+  std::reverse(previous_lights.begin(), previous_lights.end());
+  std::reverse(previous_light_table.begin(), previous_light_table.end());
+  const std::array<uint32_t, 4> previous_to_current_map = {3u, 2u, 1u, 0u};
+  const std::array<uint32_t, 4> current_to_previous_map = {3u, 2u, 1u, 0u};
+  wait_context = "upload remapped previous light order";
+  if (!update_upload(light_upload.Get(), lights.data(), sizeof(lights))
+      || !update_upload(previous_light_upload.Get(), previous_lights.data(), sizeof(previous_lights))
+      || !update_upload(previous_light_table_upload.Get(), previous_light_table.data(), sizeof(previous_light_table))
+      || !update_upload(previous_to_current_upload.Get(), previous_to_current_map.data(), sizeof(previous_to_current_map))
+      || !update_upload(current_to_previous_upload.Get(), current_to_previous_map.data(), sizeof(current_to_previous_map))) return 1;
+  prepare_temporal_frame();
+  if (!seed_temporal_history_light(1u)
+      || !run_di(4u, 4u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+                 "RTXDI temporal rejects reordered light without stable remap", true, 1u, false, 0u,
+                 false, true, true, false, true, false)) return 1;
+  UINT reordered_temporal_m = 0u;
+  prepare_temporal_frame();
+  if (!seed_temporal_history_light(1u)
+      || !run_di(4u, 4u, true, RTXDI_DI_STATUS_VISIBLE, RTXDI_DI_REASON_NONE, 0,
+                 "RTXDI temporal reuses reordered light with stable remap", true, 1u, false, 0u,
+                 false, true, true, true, true, false, nullptr, &reordered_temporal_m, nullptr, nullptr, nullptr, false,
+                 RTXDI_FRAME_FLAG_STABLE_LIGHT_REMAP)
+      || reordered_temporal_m <= 1u) return 1;
+  std::printf("PASS RTXDI temporal synthetic light reorder remap=Off rejects; remap=On reuses mapped light M=%u\n",
+              reordered_temporal_m);
+  lights = unchanged_lights;
+  previous_light_table = current_light_table;
   wait_context = "restore current lights";
   if (!update_upload(light_upload.Get(), lights.data(), sizeof(lights))) return 1;
   wait_context = "restore previous lights";
-  if (!update_upload(previous_light_upload.Get(), lights.data(), sizeof(lights))) return 1;
+  if (!update_upload(previous_light_upload.Get(), lights.data(), sizeof(lights))
+      || !update_upload(previous_light_table_upload.Get(), previous_light_table.data(), sizeof(previous_light_table))
+      || !update_upload(previous_to_current_upload.Get(), identity_light_maps.data(), sizeof(identity_light_maps))
+      || !update_upload(current_to_previous_upload.Get(), identity_light_maps.data(), sizeof(identity_light_maps))) return 1;
 
   previous_scene_pixels[(RTXDI_SURFACE_VIEW_ROW + 2u) * 4u + 3u] = std::bit_cast<uint32_t>(-0.5f);
   wait_context = "upload previous camera depth offset";

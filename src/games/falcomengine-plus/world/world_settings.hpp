@@ -821,6 +821,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtxdiStableLightRemap",
+      .binding = &rtxdi::g_local_stable_light_remap,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Stable Light Remap",
+      .section = "RTXDI Local",
+      .tooltip = "Match temporal light samples by quantized light identity when game light indices change. Off preserves exact same-index validation.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiSpatialReuse",
       .binding = &rtxdi::g_spatial_reuse,
       .value_type = SettingValueType::BOOLEAN,
@@ -1174,6 +1185,40 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                     di.output_width, di.output_height, di.output_frame,
                     static_cast<unsigned long long>(di.output_fence_b), static_cast<unsigned long long>(di.output_fence_c),
                     static_cast<unsigned int>(di.error));
+        rt12::Rt12Panel rt12_panel;
+        {
+          std::lock_guard lock(rt12::g_rt12_panel_mutex);
+          rt12_panel = rt12::g_rt12_panel;
+        }
+        ImGui::Text("Stable light remap: %s", di.stable_light_remap ? "On" : "Off");
+        if (rt12_panel.light_table_available) {
+          const char* light_table_status = rt12_panel.light_table_status == RTXDI_LIGHT_TABLE_STATUS_READY           ? "Ready"
+                                          : rt12_panel.light_table_status == RTXDI_LIGHT_TABLE_STATUS_NO_HISTORY    ? "NoHistory"
+                                          : rt12_panel.light_table_status == RTXDI_LIGHT_TABLE_STATUS_ZERO_LIGHTS   ? "ZeroLights"
+                                          : rt12_panel.light_table_status == RTXDI_LIGHT_TABLE_STATUS_INVALID_INPUT ? "InvalidInput"
+                                          : rt12_panel.light_table_status == RTXDI_LIGHT_TABLE_STATUS_RESOURCE_FAILED
+                                              ? "ResourceCreateFailed"
+                                          : rt12_panel.light_table_status == RTXDI_LIGHT_TABLE_STATUS_PIPELINE_FAILED
+                                              ? "PipelineCreateFailed"
+                                          : rt12_panel.light_table_status == RTXDI_LIGHT_TABLE_STATUS_DISPATCH_FAILED
+                                              ? "DispatchOrFenceFailed"
+                                              : "Truncated";
+          ImGui::Text("Light table: %s reason=%u entries=%u/%u truncated=%u", light_table_status,
+                      rt12_panel.light_table_reason, rt12_panel.light_table_written, rt12_panel.light_table_copied,
+                      rt12_panel.light_table_truncated);
+          ImGui::Text("Light remap: %s matched=%u unmatched_prev=%u unmatched_current=%u hits=%u",
+                      rt12_panel.light_table_remap_enabled ? "On" : "Off", rt12_panel.light_table_matched,
+                      rt12_panel.light_table_unmatched_previous, rt12_panel.light_table_unmatched_current,
+                      rt12_panel.light_table_hits);
+          ImGui::Text("Light identity: collisions=%u duplicates=%u invalid=%u incompatible=%u",
+                      rt12_panel.light_table_collisions, rt12_panel.light_table_duplicates,
+                      rt12_panel.light_table_invalid, rt12_panel.light_table_incompatible);
+        } else {
+          ImGui::Text("Light table: unavailable");
+          ImGui::Text("Light remap: %s matched=unavailable unmatched_prev=unavailable unmatched_current=unavailable hits=unavailable",
+                      di.stable_light_remap ? "On" : "Off");
+          ImGui::Text("Light identity: collisions=unavailable duplicates=unavailable invalid=unavailable incompatible=unavailable");
+        }
         rtxdi::SunSnapshot sun;
         {
           std::shared_lock lock(rtxdi::g_sun.mutex);
@@ -1189,11 +1234,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                     sun.accumulated ? "yes" : "no", sun.accumulation_history ? "yes" : "no",
                     static_cast<unsigned long long>(sun.fence_b), static_cast<unsigned long long>(sun.fence_c),
                     static_cast<unsigned int>(sun.error));
-        rt12::Rt12Panel rt12_panel;
-        {
-          std::lock_guard lock(rt12::g_rt12_panel_mutex);
-          rt12_panel = rt12::g_rt12_panel;
-        }
         ImGui::Text("IS-FAST noise copies: %llu (sun uses it only when IS-FAST is On and Light Size > 0; 0 = SDK random sequence)",
                     static_cast<unsigned long long>(rt12_panel.noise_copies));
         const auto isfast_state = [&rt12_panel](float light_size, float isfast) -> const char* {

@@ -2,6 +2,11 @@
 
 #include "../rtxdi/rtxdi_diag_layout.h"
 
+StructuredBuffer<RtxdiLightTableEntry> g_rtxdi_light_table : register(t46);
+StructuredBuffer<RtxdiLightTableEntry> g_rtxdi_prev_light_table : register(t47);
+StructuredBuffer<uint> g_rtxdi_previous_to_current : register(t48);
+StructuredBuffer<uint> g_rtxdi_current_to_previous : register(t49);
+
 static uint g_rtxdi_surface_diag = RTXDI_DIAG_SURFACE_REASON_NONE;
 
 struct RAB_Surface {
@@ -166,14 +171,14 @@ RAB_LightInfo RAB_LoadLightInfo(uint light_index, bool previous) {
   if (previous) g_rtxdi_prev_lights.GetDimensions(light_count, stride);
   else g_rtxdi_lights.GetDimensions(light_count, stride);
   uint type_count;
-  if (previous) g_rtxdi_prev_light_types.GetDimensions(type_count, stride);
-  else g_rtxdi_light_types.GetDimensions(type_count, stride);
+  if (previous) g_rtxdi_prev_light_table.GetDimensions(type_count, stride);
+  else g_rtxdi_light_table.GetDimensions(type_count, stride);
 #if defined(RTXDI_DIAG_INITIAL_PASS)
   RtxdiDiagAdd(RTXDI_DIAG_CAND_TRIED, previous ? 0u : 1u);
 #endif
   if (light_index >= (previous ? g_prev_light_count : g_light_count) || light_index >= light_count || light_index >= type_count) return info;
 
-  const uint type = (previous ? g_rtxdi_prev_light_types[light_index] : g_rtxdi_light_types[light_index]);
+  const uint type = (previous ? g_rtxdi_prev_light_table[light_index].type : g_rtxdi_light_table[light_index].type);
 #if defined(RTXDI_DIAG_INITIAL_PASS)
   RtxdiDiagAdd(RTXDI_DIAG_CAND_TYPE_NONE, !previous && type == 0u);
   RtxdiDiagAdd(RTXDI_DIAG_CAND_TYPE_BOTH, !previous && type == (RTGI_LAMP_TYPE_POINT | RTGI_LAMP_TYPE_SPOT));
@@ -209,6 +214,24 @@ RAB_LightInfo RAB_LoadLightInfo(uint light_index, bool previous) {
 }
 
 int RAB_TranslateLightIndex(uint light_index, bool previous) {
+#if defined(RTXDI_TEMPORAL_DI_PASS)
+  if ((g_frame_flags & RTXDI_FRAME_FLAG_STABLE_LIGHT_REMAP) != 0u) {
+    if (g_history_valid == 0u) return -1;
+    uint map_count;
+    uint map_stride;
+    if (previous) g_rtxdi_current_to_previous.GetDimensions(map_count, map_stride);
+    else g_rtxdi_previous_to_current.GetDimensions(map_count, map_stride);
+    const uint source_count = previous ? g_light_count : g_prev_light_count;
+    if (light_index >= source_count || light_index >= map_count) return -1;
+    const uint mapped_index = previous ? g_rtxdi_current_to_previous[light_index] : g_rtxdi_previous_to_current[light_index];
+    const uint destination_count = previous ? g_prev_light_count : g_light_count;
+    if (mapped_index == RTXDI_LIGHT_TABLE_INVALID_INDEX || mapped_index >= destination_count) return -1;
+    const RAB_LightInfo source_light = RAB_LoadLightInfo(light_index, !previous);
+    const RAB_LightInfo destination_light = RAB_LoadLightInfo(mapped_index, previous);
+    if (source_light.valid == 0u || destination_light.valid == 0u || source_light.type != destination_light.type) return -1;
+    return int(mapped_index);
+  }
+#endif
   const RAB_LightInfo source_light = RAB_LoadLightInfo(light_index, previous);
   const RAB_LightInfo destination_light = RAB_LoadLightInfo(light_index, !previous);
   if (source_light.valid == 0u || destination_light.valid == 0u || source_light.type != destination_light.type) return -1;

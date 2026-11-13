@@ -43,6 +43,7 @@ struct EffectiveRtxdiSettings {
   float boiling_filter_strength = 0.2f;
   bool permutation_sampling = false;
   bool initial_visibility = false;
+  bool stable_light_remap = false;
   float spatial_depth_threshold = 0.05f;
   float spatial_normal_threshold = 0.9f;
   bool relax_diffuse = true;
@@ -72,6 +73,7 @@ inline EffectiveRtxdiSettings CaptureEffectiveRtxdiSettings() {
   effective.boiling_filter_strength = std::clamp(std::isfinite(g_boiling_filter_strength) ? g_boiling_filter_strength : 0.2f, 0.01f, 1.0f);
   effective.permutation_sampling = g_permutation_sampling > 0.5f;
   effective.initial_visibility = g_initial_visibility > 0.5f;
+  effective.stable_light_remap = g_local_stable_light_remap > 0.5f;
   effective.spatial_depth_threshold = std::clamp(std::isfinite(g_spatial_depth_threshold) ? g_spatial_depth_threshold : 0.05f, 0.0f, 1.0f);
   effective.spatial_normal_threshold = std::clamp(std::isfinite(g_spatial_normal_threshold) ? g_spatial_normal_threshold : 0.9f, -1.0f, 1.0f);
   effective.relax_diffuse = g_diffuse_denoiser > 0.5f;
@@ -117,6 +119,7 @@ inline EffectiveRtxdiSettings CaptureEffectiveRtxdiSettings() {
   add(std::bit_cast<uint32_t>(effective.boiling_filter_strength));
   add(effective.permutation_sampling ? 1u : 0u);
   add(effective.initial_visibility ? 1u : 0u);
+  add(effective.stable_light_remap ? 1u : 0u);
   add(std::bit_cast<uint32_t>(effective.spatial_depth_threshold));
   add(std::bit_cast<uint32_t>(effective.spatial_normal_threshold));
   add(effective.relax_diffuse ? 1u : 0u);
