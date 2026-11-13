@@ -58,6 +58,7 @@ void PtEvaluate(uint3 id, RtxdiSurfaceResult surface, bool water_pass) {
       const float3 bt = cross(n, t);
       const float3 wo = float3(dot(v, t), dot(v, bt), max(dot(v, n), 1e-4));
       uint refl_rng = PtHash(id.x + id.y * g_size.x + PtHash(g_frame ^ 0x5245464Cu));
+      const float sparse_scale = !water_origin && g_sparse_enabled != 0u && g_sparse_levels < 256u ? 256.0 / float(g_sparse_levels) : 1.0;
       float3 sum = float3(0, 0, 0);
       float distance = 0.0;
       for (uint sample = 0u; sample < g_refl_samples; ++sample) {
@@ -66,14 +67,14 @@ void PtEvaluate(uint3 id, RtxdiSurfaceResult surface, bool water_pass) {
         float3 dir = normalize(t * l.x + bt * l.y + n * l.z);
         if (dot(dir, n) <= 0.0) dir = reflect(-v, n);
         const WorldTraceHit hit = TraceWorldRayDxr(surface.world_position + n * g_env_bias, dir, 1e-3, g_ray_max, false, bounce_view, pt_counters);
-        if (hit.prim == 0xFFFFFFFFu) { sum += PtSky(dir); distance += g_ray_max; continue; }
+        if (hit.prim == 0xFFFFFFFFu) { sum += PtSky(dir) * sparse_scale; distance += g_ray_max; continue; }
         if (water_origin) {
           const float4 hit_clip = mul(g_pt_view_proj, float4(hit.position, 1.0));
           if (hit_clip.w > 1e-6) {
             const float2 huv = float2(hit_clip.x / hit_clip.w * 0.5 + 0.5, 0.5 - hit_clip.y / hit_clip.w * 0.5);
             if (all(huv >= 0.0) && all(huv < 1.0)
                 && (g_pt_normal.Load(int3(min(uint2(huv * float2(g_size)), g_size - 1u), 0)).w & 2u) != 0u) {
-              sum += PtSky(reflect(-v, n));
+              sum += PtSky(reflect(-v, n)) * sparse_scale;
               distance += g_ray_max;
               continue;
             }
@@ -88,9 +89,10 @@ void PtEvaluate(uint3 id, RtxdiSurfaceResult surface, bool water_pass) {
         const bool footprint_ok = (g_refl_flags & 4u) == 0u || hit.t * spread > voxel * 1.732050808;
         float3 cached;
         if (use_sharc && footprint_ok && SharcGetCachedRadiance(sharc, sharc_hit, cached, false) && all(isfinite(cached))) {
-          sum += g_refl_sample_clamp > 0.0 ? min(max(cached, 0), g_refl_sample_clamp) : max(cached, 0);
+          cached = max(cached, 0) * sparse_scale;
+          sum += g_refl_sample_clamp > 0.0 ? min(cached, g_refl_sample_clamp) : cached;
         } else {
-          const float3 lit = albedo * (PtHitLight(hit.position, nh, refl_rng) + PtSky(nh));
+          const float3 lit = albedo * (PtHitLight(hit.position, nh, refl_rng) + PtSky(nh)) * sparse_scale;
           sum += g_refl_sample_clamp > 0.0 ? min(lit, g_refl_sample_clamp) : lit;
         }
         distance += hit.t;
@@ -99,7 +101,6 @@ void PtEvaluate(uint3 id, RtxdiSurfaceResult surface, bool water_pass) {
       if (any(isnan(sum)) || any(isinf(sum))) sum = float3(0, 0, 0);
       float3 rgb = max(sum, 0) * g_refl_intensity;
       if ((g_refl_flags & 1u) != 0u) rgb = min(rgb, 1.0);
-      if (!water_origin && g_sparse_enabled != 0u && g_sparse_levels < 256u) rgb *= 256.0 / float(g_sparse_levels);
       refl = float4(rgb, max(distance / float(g_refl_samples), 1e-3));
     }
     g_pt_reflection[id.xy] = refl;
