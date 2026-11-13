@@ -1,4 +1,5 @@
 #include "../rtxdi_contract.h"
+#include "../../pt/pt_regir_contract.hpp"
 #include "../../bvh/alpha_atlas.hpp"
 #include "../rtxdi_camera_qualification.hpp"
 #include "../rtxdi_config.hpp"
@@ -1770,5 +1771,84 @@ int main() {
       || AccumulateGpuSample(std::numeric_limits<double>::infinity(), &gpu_sum, &gpu_samples)
       || std::abs(gpu_sum - 1.25) > 1.0e-9 || gpu_samples != 2u) return EXIT_FAILURE;
   std::printf("PASS RTXDI performance contracts: producer B signals vs completed batches/interval samples, per-event timing skips, gather gate, completion/poll-once, full identity matrix, timestamp validity, finite accumulation\n");
+  {
+    using namespace falcom_world::pt;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float infinity = std::numeric_limits<float>::infinity();
+    PtReGirIdentity identity = {1u, 2u, 3u, 4u, 1u, 2u};
+    std::array<RtxdiLightTableEntry, 2> lights = {{{{1.f, 1.f, 1.f}, 1.f, 1.f, RTXDI_LIGHT_TABLE_TYPE_POINT, 0u, 0u},
+                                                   {{1.f, 1.f, 1.f}, 1.f, 3.f, RTXDI_LIGHT_TABLE_TYPE_SPOT, 0u, 0u}}};
+    std::array<uint32_t, kPtReGirMaxCells * kPtReGirSlotsPerCell> draws = {};
+    const std::array<uint32_t, 8> first_draws = {0u, (1u << 30) - 1u, 1u << 30, UINT32_MAX, 0u, 1u << 30, UINT32_MAX, 1u};
+    std::copy(first_draws.begin(), first_draws.end(), draws.begin());
+    std::array<std::array<float, 3>, 1> origin = {{{0.f, 0.f, 0.f}}};
+    PtReGirBuild build = {};
+    if (BuildPtReGirReference(identity, origin, lights, draws, nullptr)
+        || !BuildPtReGirReference(identity, origin, lights, draws, &build)
+        || !PtReGirIdentityMatches(build, identity) || build.cell_count != 1u || !build.cells[0].valid) return EXIT_FAILURE;
+    for (size_t index = 0; index < first_draws.size(); ++index) {
+      const bool first = first_draws[index] < (1u << 30);
+      if (build.cells[0].slots[index].light_index != (first ? 0u : 1u)
+          || build.cells[0].slots[index].ticket_count != (first ? (1ull << 30) : (3ull << 30))) return EXIT_FAILURE;
+    }
+    std::array<PtReGirIdentity, 6> stale = {};
+    stale.fill(identity);
+    ++stale[0].owner_generation;
+    ++stale[1].transfer_configuration;
+    ++stale[2].table_fence;
+    ++stale[3].frame;
+    ++stale[4].transfer_slot;
+    ++stale[5].light_count;
+    for (const auto& candidate : stale) if (PtReGirIdentityMatches(build, candidate)) return EXIT_FAILURE;
+    std::array<PtReGirIdentity, 6> invalid = {};
+    invalid.fill(identity);
+    invalid[0].owner_generation = 0;
+    invalid[1].transfer_configuration = 0;
+    invalid[2].table_fence = 0;
+    invalid[3].frame = UINT32_MAX;
+    invalid[4].transfer_slot = 3;
+    invalid[5].light_count = RTXDI_LIGHT_TABLE_CAPACITY + 1u;
+    for (const auto& candidate : invalid) {
+      if (BuildPtReGirReference(candidate, origin, lights, draws, &build) || build.valid || build.cell_count != 0u
+          || PtReGirIdentityMatches(build, candidate)) return EXIT_FAILURE;
+    }
+    if (!BuildPtReGirReference(identity, origin, lights, draws, &build)
+        || BuildPtReGirReference(identity, origin, std::span(lights).first(1), draws, &build)
+        || build.valid || build.cell_count != 0u || build.cells[0].slots[0].light_index != RTXDI_LIGHT_TABLE_INVALID_INDEX
+        || BuildPtReGirReference(identity, origin, lights, std::span(draws).first(draws.size() - 1), &build)) return EXIT_FAILURE;
+    std::array<std::array<float, 3>, kPtReGirMaxPositions + 1> too_many = {};
+    if (BuildPtReGirReference(identity, too_many, lights, draws, &build) || build.valid) return EXIT_FAILURE;
+    const std::array<std::array<float, 3>, 10> boundaries = {{{-0.001f, 0.f, 0.f}, {-4.f, 0.f, 0.f},
+        {-4.001f, 0.f, 0.f}, {0.f, 0.f, 0.f}, {4.f, 0.f, 0.f}, {-1048576.f, 0.f, 0.f},
+        {1048576.f, 0.f, 0.f}, {nan, 0.f, 0.f}, {0.f, infinity, 0.f}, {-1048577.f, 0.f, 0.f}}};
+    if (!BuildPtReGirReference(identity, boundaries, lights, draws, &build) || build.cell_count != 5u
+        || build.rejected_position_count != 4u || build.cells[0].key.x != -1 || build.cells[1].key.x != -2
+        || build.cells[2].key.x != 0 || build.cells[3].key.x != 1 || build.cells[4].key.x != -262144) return EXIT_FAILURE;
+    std::array<std::array<float, 3>, 258> capacity = {};
+    for (uint32_t index = 0; index < 257; ++index) capacity[index][0] = static_cast<float>(index * 4u);
+    capacity[257] = capacity[0];
+    if (!BuildPtReGirReference(identity, capacity, lights, draws, &build) || build.cell_count != 256u
+        || build.overflow_position_count != 1u || build.cells[255].key.x != 255) return EXIT_FAILURE;
+    PtReGirIdentity empty_identity = identity;
+    empty_identity.light_count = 0;
+    if (!BuildPtReGirReference(empty_identity, origin, {}, draws, &build) || !build.valid || build.cells[0].valid
+        || !BuildPtReGirReference(empty_identity, {}, {}, draws, &build) || build.cell_count != 0u) return EXIT_FAILURE;
+    const std::array<float, 4> bad_values = {0.f, nan, infinity, -1.f};
+    for (float value : bad_values) {
+      auto bad_lights = lights;
+      bad_lights[0].power = value;
+      bad_lights[1].power = value;
+      if (!BuildPtReGirReference(identity, origin, bad_lights, draws, &build) || build.cells[0].valid) return EXIT_FAILURE;
+      bad_lights = lights;
+      bad_lights[0].radius = value;
+      bad_lights[1].radius = value;
+      if (!BuildPtReGirReference(identity, origin, bad_lights, draws, &build) || build.cells[0].valid) return EXIT_FAILURE;
+    }
+    auto bad_lights = lights;
+    bad_lights[0].type = RTXDI_LIGHT_TABLE_TYPE_UNTYPED;
+    bad_lights[1].position[1] = infinity;
+    if (!BuildPtReGirReference(identity, origin, bad_lights, draws, &build) || build.cells[0].valid) return EXIT_FAILURE;
+    std::printf("PASS ReGIR CPU bounded staging contract\n");
+  }
   return EXIT_SUCCESS;
 }
