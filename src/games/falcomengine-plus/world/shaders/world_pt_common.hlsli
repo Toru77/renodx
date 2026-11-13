@@ -28,6 +28,7 @@ Texture2D<float4> g_pt_color : register(t36);     // G-buffer albedo (transfer s
 Texture2D<uint4> g_pt_mrt1 : register(t37);       // .z & 255: specular scale
 Texture2D<uint4> g_pt_mrt2 : register(t38);       // .x: deferred material index
 StructuredBuffer<GameDeferredParam> g_pt_deferred : register(t39);
+Texture2D<uint4> g_pt_noise : register(t40);
 RWStructuredBuffer<uint64_t> g_pt_material_keys : register(u4);
 globallycoherent RWStructuredBuffer<uint> g_pt_material_values : register(u5);
 RWTexture2D<float4> g_pt_output : register(u0);
@@ -52,7 +53,7 @@ cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (48 dwords
   uint g_sparse_levels; uint g_sparse_enabled;
 };
 uint PtHash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; return x ^ (x >> 16); }
-bool PtSparseSelected(uint2 pixel) { return (PtHash(pixel.x + pixel.y * g_size.x + PtHash(g_frame ^ 0x73707273u)) >> 24) < g_sparse_levels; }
+bool PtSparseSelected(uint2 pixel) { return uint(asfloat(g_pt_noise.Load(int3((pixel.x + 53u) % 128u, (pixel.y + 91u) % 128u + 128u * (g_frame % 32u), 0)).x) * 256.0) < g_sparse_levels; }
 float PtRandom(inout uint s) { s = PtHash(s + 0x9e3779b9u); return float(s >> 8) * (1.0 / 16777216.0); }
 static float3 g_pt_sun_color;
 static float3 g_pt_sun_dir;

@@ -52,9 +52,7 @@ inline std::string SerializePtReport() {
   out << "sparse counter frame: " << p.gpu_frame << "\n";
   out << "sparse counter age: " << (static_cast<uint32_t>(g_state.frame.load()) - static_cast<uint32_t>(p.gpu_frame)) << "\n";
   out << "sparse selected: " << p.sparse_selected << "\n";
-  out << "sparse reconstructed: " << p.sparse_reconstructed << "\n";
-  out << "sparse fallback: " << p.sparse_fallback << "\n";
-  out << "sparse valid: " << (static_cast<uint64_t>(p.sparse_selected) + p.sparse_reconstructed + p.sparse_fallback) << "\n";
+  out << "sparse valid: " << p.sparse_valid << "\n";
   out << "slot waits: " << p.waits << "\n";
   out << "max wait ms: " << p.wait_ms_max << "\n";
   out << "sharc on: " << p.sharc_on << "\n";

@@ -403,7 +403,7 @@ struct Rt12DiTransferState {
 };
 
 // Path-traced diffuse GI (world/pt): its own submission slots, list, root signature, PSO, descriptors and outputs.
-inline constexpr uint32_t kRt12PtDescriptors = 26u;
+inline constexpr uint32_t kRt12PtDescriptors = 27u;
 inline constexpr uint32_t kRt12PtConstants = 48u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
 inline constexpr uint32_t kRt12PtCounters = 10u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
 // Descriptor inputs of the main trace's frame, kept for the water block (M4): descriptor i is srv_descs[i] or uav_descs[i] on
@@ -421,8 +421,7 @@ struct Rt12PtState {
   Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> list;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> sparse_resolve_pso;
-  bool sparse_requested = false;
+  bool sparse_effective = false;
   uint32_t sparse_effective_levels = 256u;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;  // shader visible, kRt12Slots * kRt12PtDescriptors
   Rt12Shared output[kRt12Slots];                      // RGBA16F, depth size; the lighting draw reads srv11 at t47
@@ -576,6 +575,7 @@ struct Rt12State {
   reshade::api::pipeline pack_pipeline = {0u}, noise_pipeline = {0u}, resolve_pipeline = {0u}, carrier_pipeline = {0u},
                          records_carrier_pipeline = {0u};
   uint64_t noise_source = 0u;  // isfast view handle last copied into `noise`
+  uint64_t pt_noise_source = 0u;
   reshade::api::resource atlas_source = {0u};
   uint64_t atlas_blits = ~0ull;  // data->alpha.blits at the last atlas copy
   std::vector<Rt12Retired> retired;
@@ -1063,7 +1063,7 @@ inline HRESULT CreateRt12Shared(Rt12State& state, reshade::api::device* device, 
 }
 
 // D3D11 compute pipelines of the pass A helpers (pack, noise, resolve), on RTAO's pipeline layout.
-inline bool CreateRt12Pipelines(reshade::api::device* device, reshade::api::pipeline_layout layout, Rt12State& s, bool trace_ao, bool noise) {
+inline bool CreateRt12Pipelines(reshade::api::device* device, reshade::api::pipeline_layout layout, Rt12State& s, bool trace_ao, bool noise, bool pt_noise) {
   const auto make = [&](auto& code, reshade::api::pipeline* out) {
     reshade::api::shader_desc shader = {};
     shader.code = code.data();
@@ -1079,11 +1079,11 @@ inline bool CreateRt12Pipelines(reshade::api::device* device, reshade::api::pipe
     return false;
 #endif
   }
-  if ((trace_ao || noise) && s.noise_pipeline.handle == 0u) {
+  if ((trace_ao || noise || pt_noise) && s.noise_pipeline.handle == 0u) {
 #if defined(__world_rt12_noise_EMBED_FILE)
-    if (!make(__world_rt12_noise, &s.noise_pipeline)) return false;
+    if (!make(__world_rt12_noise, &s.noise_pipeline) && (trace_ao || noise)) return false;
 #else
-    return false;
+    if (trace_ao || noise) return false;
 #endif
   }
   if (trace_ao && s.resolve_pipeline.handle == 0u) {
@@ -2394,6 +2394,7 @@ struct SceneTransactionInputs {
   uint32_t frame = 0u;
   uint64_t generation = 0u;
   reshade::api::resource_view isfast_view = {0u};  // RTXDI: IS-FAST view copied into s.noise when no RTAO pass does
+  reshade::api::resource_view pt_isfast_view = {0u};
 };
 
 struct SceneAoInputs {
@@ -2518,7 +2519,7 @@ inline SceneTransactionResult RunSceneTransaction(reshade::api::device* device, 
     }
   }
   const reshade::api::resource_view isfast_view = (trace_ao ? ao->isfast_view : inputs.isfast_view);
-  if (!CreateRt12Pipelines(device, rd.layout, s, trace_ao, isfast_view.handle != 0u)) return fallback(Rt12Reason::TargetFailed);
+  if (!CreateRt12Pipelines(device, rd.layout, s, trace_ao, isfast_view.handle != 0u, inputs.pt_isfast_view.handle != 0u)) return fallback(Rt12Reason::TargetFailed);
   if (!characters.empty()) {
     if (s.carrier.texture12 == nullptr
         && FAILED(CreateRt12Shared(s, device, DXGI_FORMAT_R32G32B32A32_UINT, kRt12CarrierWidth, kRt12CarrierHeight, 1u, true,
@@ -2621,6 +2622,18 @@ inline SceneTransactionResult RunSceneTransaction(reshade::api::device* device, 
     cmd_list->dispatch(16u, 512u, 1u);
     rtao::NullComputeSlots(cmd_list, rtao::kRtaoSrvCount, rtao::kRtaoUavCount, 0u);
     s.noise_source = isfast_view.handle;
+    s.pt_noise_source = isfast_view.handle;
+    UpdatePanel([](Rt12Panel& p) { p.noise_copies += 1u; });
+  }
+  if (inputs.pt_isfast_view.handle != 0u && inputs.pt_isfast_view.handle != s.pt_noise_source
+      && s.noise_pipeline.handle != 0u && (s.noise_source == 0u || s.noise_source == inputs.pt_isfast_view.handle)) {
+    reshade::api::resource_view srvs[rtao::kRtaoSrvCount] = {};
+    srvs[18] = inputs.pt_isfast_view;
+    const reshade::api::resource_view uav_views[rtao::kRtaoUavCount] = {s.noise.uav11};
+    bind_pass(s.noise_pipeline, srvs, uav_views);
+    cmd_list->dispatch(16u, 512u, 1u);
+    rtao::NullComputeSlots(cmd_list, rtao::kRtaoSrvCount, rtao::kRtaoUavCount, 0u);
+    s.pt_noise_source = inputs.pt_isfast_view.handle;
     UpdatePanel([](Rt12Panel& p) { p.noise_copies += 1u; });
   }
 
@@ -3463,9 +3476,7 @@ inline void DumpRt12Json() {
       << ", \"sample_active\": " << (pt_snapshot.sparse_sample_active ? "true" : "false")
       << ", \"counter_frame\": " << pt_snapshot.gpu_frame
       << ", \"counter_age\": " << (static_cast<uint32_t>(g_state.frame.load()) - static_cast<uint32_t>(pt_snapshot.gpu_frame))
-      << ", \"selected\": " << pt_snapshot.sparse_selected << ", \"reconstructed\": " << pt_snapshot.sparse_reconstructed
-      << ", \"fallback\": " << pt_snapshot.sparse_fallback
-      << ", \"valid\": " << (static_cast<uint64_t>(pt_snapshot.sparse_selected) + pt_snapshot.sparse_reconstructed + pt_snapshot.sparse_fallback) << "},\n";
+      << ", \"selected\": " << pt_snapshot.sparse_selected << ", \"valid\": " << pt_snapshot.sparse_valid << "},\n";
   out << "  \"switch_on\": " << (g_rt12_enabled.load(std::memory_order_relaxed) ? "true" : "false") << ",\n";
   out << "  \"reason\": \"" << Rt12ReasonName(p.reason) << "\",\n";
   out << "  \"failed_stage\": \"" << bvh::PoolJsonEscape(p.failed_stage) << "\",\n";

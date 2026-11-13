@@ -12358,9 +12358,19 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
     const bool rtxdi_isfast_wanted = g_isfast_enabled > 0.5f
         && (((request_mask & 2u) != 0u && di::g_sun_isfast > 0.5f && di::g_sun_light_size > 0.f)
             || ((request_mask & 1u) != 0u && di::g_local_isfast > 0.5f && di::g_local_light_size > 0.f));
-    if (rtxdi_isfast_wanted) LoadISFASTNoiseTexture(dev, dd);
+    const bool pt_isfast_wanted = falcom_world::pt::PtRequested() && falcom_world::pt::g_pt_sparse_enabled > 0.5f
+                                  && falcom_world::rr::RrRequested() && falcom_world::rr::RrOwnsDenoise()
+                                  && falcom_world::pt::ComputePtSparsePolicy(
+                                         true, falcom_world::pt::g_pt_sparse_adaptive > 0.5f, falcom_world::pt::g_pt_sparse_rate,
+                                         falcom_world::pt::g_pt_sparse_exponent, falcom_world::pt::g_pt_sparse_quality,
+                                         falcom_world::pt::g_pt_sparse_max_rate, dd->captured_depth_w, dd->captured_depth_h)
+                                             .dense_reason == falcom_world::pt::PtSparseDenseReason::None;
+    if (rtxdi_isfast_wanted || pt_isfast_wanted) {
+      LoadISFASTNoiseTexture(dev, dd);
+    }
     result = rt12::PrepareSceneForRtxdi(dev, cmd_list, dd->captured_scene_cbv_view, true,
-                                        rtxdi_isfast_wanted ? dd->isfast_noise_srv : reshade::api::resource_view{0u});
+                                        rtxdi_isfast_wanted ? dd->isfast_noise_srv : reshade::api::resource_view{0u},
+                                        pt_isfast_wanted ? dd->isfast_noise_srv : reshade::api::resource_view{0u});
     if (result.scene_ready) {
       status = (result.reused ? di::SceneStatus::Reused : di::SceneStatus::Submitted);
     } else if (rt12::g_rt12->unfenced_execution || rt12::g_rt12->stuck) {
@@ -13243,7 +13253,7 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   const bool lamps = di_snapshot.status == di::DiStatus::Submitted && di_snapshot.frame == frame
                      && di_snapshot.transfer_slot == input.transfer_slot;
   reshade::api::resource_view reflection_view = {};
-  const reshade::api::resource_view view = rt12::RunPtTrace(cmd_list->get_device(), cmd_list, input.transfer_slot, lamps, &reflection_view);
+  const reshade::api::resource_view view = rt12::RunPtTrace(cmd_list->get_device(), cmd_list, input.transfer_slot, lamps, dd->isfast_noise_srv, &reflection_view);
   if (view.handle == 0u) return;
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, kLightingPtRegister, 0u, 1u,

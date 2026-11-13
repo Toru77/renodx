@@ -12,7 +12,7 @@ inline float g_pt_enabled = 0.f;
 inline bool PtRequested() { return g_pt_enabled > 0.5f; }
 inline float g_pt_sparse_enabled = 0.f, g_pt_sparse_adaptive = 1.f, g_pt_sparse_rate = 0.10f,
              g_pt_sparse_exponent = 0.91f, g_pt_sparse_quality = 0.30f, g_pt_sparse_max_rate = 0.75f;
-enum class PtSparseDenseReason : uint32_t { None, Disabled, RateAboveMax, FullRate };
+enum class PtSparseDenseReason : uint32_t { None, Disabled, RateAboveMax, FullRate, RrNotRequested, RrNotActive, NoiseUnavailable };
 struct PtSparsePolicy { uint32_t levels; PtSparseDenseReason dense_reason; };
 inline const char* PtSparseDenseReasonName(PtSparseDenseReason reason) {
   switch (reason) {
@@ -20,6 +20,9 @@ inline const char* PtSparseDenseReasonName(PtSparseDenseReason reason) {
     case PtSparseDenseReason::Disabled: return "disabled";
     case PtSparseDenseReason::RateAboveMax: return "rate_above_max";
     case PtSparseDenseReason::FullRate: return "full_rate";
+    case PtSparseDenseReason::RrNotRequested: return "rr_not_requested";
+    case PtSparseDenseReason::RrNotActive: return "rr_not_active";
+    case PtSparseDenseReason::NoiseUnavailable: return "noise_unavailable";
     default: return "unknown";
   }
 }
@@ -106,7 +109,7 @@ struct PtPanel {
   uint32_t gpu_water_pixels = 0u, gpu_water_traces = 0u;
   const char* water_reason = "off";
   uint32_t gpu_exact = 0u, gpu_hits = 0u, gpu_misses = 0u, gpu_lock_drops = 0u, gpu_writes = 0u;
-  uint32_t sparse_selected = 0u, sparse_reconstructed = 0u, sparse_fallback = 0u;
+  uint32_t sparse_selected = 0u, sparse_valid = 0u;
   uint64_t gpu_frame = 0u;
   bool gpu_available = false, sparse_sample_active = false;
   uint32_t lamps = 0u, width = 0u, height = 0u;
@@ -172,9 +175,8 @@ inline void DrawPtPanel() {
     const uint32_t now = static_cast<uint32_t>(falcom_world::g_state.frame.load());
     const uint32_t gpu = static_cast<uint32_t>(p.gpu_frame);
     const uint32_t age = now - gpu;
-    ImGui::Text("Sparse counters (available, active %s), frame %llu (age %u): selected %u, reconstructed %u, fallback %u, valid %llu",
-                p.sparse_sample_active ? "yes" : "no", static_cast<unsigned long long>(p.gpu_frame), age, p.sparse_selected, p.sparse_reconstructed, p.sparse_fallback,
-                static_cast<unsigned long long>(p.sparse_selected) + p.sparse_reconstructed + p.sparse_fallback);
+    ImGui::Text("Sparse counters (available, active %s), frame %llu (age %u): selected %u, valid %u",
+                p.sparse_sample_active ? "yes" : "no", static_cast<unsigned long long>(p.gpu_frame), age, p.sparse_selected, p.sparse_valid);
     ImGui::Text("GPU material lookups, frame %llu (age %u): exact %u, hits %u, grey misses %u; writes %u, lock drops %u",
                 static_cast<unsigned long long>(p.gpu_frame), age,
                 p.gpu_exact, p.gpu_hits, p.gpu_misses, p.gpu_writes, p.gpu_lock_drops);

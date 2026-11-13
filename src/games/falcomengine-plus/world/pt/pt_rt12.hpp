@@ -16,7 +16,7 @@
 #include "pt_diagnostics.hpp"
 namespace falcom_world::rt12 {
 inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, reshade::api::command_list* cmd_list,
-                                              int32_t transfer_slot, bool lamps, reshade::api::resource_view* reflection_view) {
+                                              int32_t transfer_slot, bool lamps, reshade::api::resource_view isfast_view, reshade::api::resource_view* reflection_view) {
   *reflection_view = reshade::api::resource_view{0u};
   using Microsoft::WRL::ComPtr;
   const auto fallback = [](pt::PtReason reason) { pt::SetPtReason(reason); return reshade::api::resource_view{0u}; };
@@ -93,12 +93,12 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (FAILED(hr)) return fail("pt water list", hr);
     hr = r.water_list->Close();
     if (FAILED(hr)) return fail("pt water close", hr);
-    // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u7, descriptor order 0..25.
-    const UINT counts[8] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 4u};
-    const UINT bases[8] = {0u, 14u, 29u, 30u, 31u, 0u, 36u, 4u};
-    const UINT offsets[8] = {0u, 4u, 7u, 8u, 9u, 14u, 18u, 22u};
-    D3D12_DESCRIPTOR_RANGE ranges[8] = {};
-    for (uint32_t i = 0u; i < 8u; ++i) {
+    // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u7 | t40, descriptor order 0..26.
+    const UINT counts[9] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 4u, 1u};
+    const UINT bases[9] = {0u, 14u, 29u, 30u, 31u, 0u, 36u, 4u, 40u};
+    const UINT offsets[9] = {0u, 4u, 7u, 8u, 9u, 14u, 18u, 22u, 26u};
+    D3D12_DESCRIPTOR_RANGE ranges[9] = {};
+    for (uint32_t i = 0u; i < 9u; ++i) {
       ranges[i].RangeType = (i == 5u || i == 7u) ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
       ranges[i].NumDescriptors = counts[i];
       ranges[i].BaseShaderRegister = bases[i];
@@ -108,7 +108,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.Num32BitValues = kRt12PtConstants;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable.NumDescriptorRanges = 8u;
+    params[1].DescriptorTable.NumDescriptorRanges = 9u;
     params[1].DescriptorTable.pDescriptorRanges = ranges;
     D3D12_ROOT_SIGNATURE_DESC root_desc = {};
     root_desc.NumParameters = 2u;
@@ -118,15 +118,12 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (FAILED(hr)) return fail("pt root serialize", hr);
     hr = s.device12->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&r.root));
     if (FAILED(hr)) return fail("pt root", hr);
-#if defined(__world_pt_diffuse_EMBED_FILE) && defined(__world_pt_sparse_resolve_EMBED_FILE) && defined(__world_pt_sharc_update_EMBED_FILE) && defined(__world_pt_sharc_resolve_EMBED_FILE) && defined(__world_pt_material_write_EMBED_FILE)
+#if defined(__world_pt_diffuse_EMBED_FILE) && defined(__world_pt_sharc_update_EMBED_FILE) && defined(__world_pt_sharc_resolve_EMBED_FILE) && defined(__world_pt_material_write_EMBED_FILE)
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc = {};
     pso_desc.pRootSignature = r.root.Get();
     pso_desc.CS = {__world_pt_diffuse.data(), __world_pt_diffuse.size()};
     hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.pso));
     if (FAILED(hr)) return fail("pt pso", hr);
-    pso_desc.CS = {__world_pt_sparse_resolve.data(), __world_pt_sparse_resolve.size()};
-    hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.sparse_resolve_pso));
-    if (FAILED(hr)) return fail("pt sparse resolve pso", hr);
     pso_desc.CS = {__world_pt_sharc_update.data(), __world_pt_sharc_update.size()};
     hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.sharc_update_pso));
     if (FAILED(hr)) return fail("pt sharc update pso", hr);
@@ -189,8 +186,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
           pt::g_pt_panel.gpu_writes = values[4];
           pt::g_pt_panel.sparse_sample_active = r.counter_sparse[i];
           pt::g_pt_panel.sparse_selected = values[7];
-          pt::g_pt_panel.sparse_reconstructed = values[8];
-          pt::g_pt_panel.sparse_fallback = values[9];
+          pt::g_pt_panel.sparse_valid = values[8];
           pt::g_pt_panel.gpu_frame = static_cast<uint32_t>(r.counter_frame[i]);
           pt::g_pt_panel.gpu_available = true;
         }
@@ -456,6 +452,20 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.pt_timing_skip_events);  // query heap or readback allocation failed
   }
   ID3D12Device5* device12 = s.device12.Get();
+  const bool sparse_requested = pt::g_pt_sparse_enabled > 0.5f;
+  pt::PtSparsePolicy sparse_policy = pt::ComputePtSparsePolicy(
+      sparse_requested, pt::g_pt_sparse_adaptive > 0.5f, pt::g_pt_sparse_rate, pt::g_pt_sparse_exponent,
+      pt::g_pt_sparse_quality, pt::g_pt_sparse_max_rate, w, h);
+  if (sparse_policy.dense_reason == pt::PtSparseDenseReason::None) {
+    if (!rr::RrRequested()) {
+      sparse_policy.dense_reason = pt::PtSparseDenseReason::RrNotRequested;
+    } else if (!rr::RrOwnsDenoise()) {
+      sparse_policy.dense_reason = pt::PtSparseDenseReason::RrNotActive;
+    } else if (isfast_view.handle == 0u || s.pt_noise_source != isfast_view.handle || !s.noise.texture12) {
+      sparse_policy.dense_reason = pt::PtSparseDenseReason::NoiseUnavailable;
+    }
+  }
+  const bool sparse_effective = sparse_policy.dense_reason == pt::PtSparseDenseReason::None && sparse_policy.levels < 256u;
   const uint32_t base = k * kRt12PtDescriptors;
   const auto cpu_at = [&r, &s](uint32_t index) {
     D3D12_CPU_DESCRIPTOR_HANDLE handle = r.heap->GetCPUDescriptorHandleForHeapStart();
@@ -518,6 +528,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_srv(19u, gbuf_on ? input.mrt1.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
   set_srv(20u, gbuf_on ? input.mrt2.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
   set_srv(21u, deferred, Rt12BufferSrv(RTXDI_INPUT_DEFERRED_STRIDE, deferred ? input.deferred_count : 1u));
+  set_srv(26u, sparse_effective ? s.noise.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
   const auto set_material_uav = [&](uint32_t index, ID3D12Resource* resource, uint32_t stride, uint32_t count) {
     D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
     view.Format = DXGI_FORMAT_UNKNOWN;
@@ -544,6 +555,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   for (ID3D12Resource* resource : reads) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }
+  if (sparse_effective) {
+    Transition(barriers, s.noise.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  }
   Transition(barriers, out.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   if (refl_on) Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   for (ID3D12Resource* resource : sharc_buffers) {
@@ -563,10 +577,6 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   barriers.clear();
   Transition(barriers, r.counters[k].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-  const bool sparse_requested = pt::g_pt_sparse_enabled > 0.5f;
-  const pt::PtSparsePolicy sparse_policy = pt::ComputePtSparsePolicy(
-      sparse_requested, pt::g_pt_sparse_adaptive > 0.5f, pt::g_pt_sparse_rate, pt::g_pt_sparse_exponent,
-      pt::g_pt_sparse_quality, pt::g_pt_sparse_max_rate, w, h);
   uint32_t params[kRt12PtConstants] = {
       w, h, frame,
       std::clamp(static_cast<uint32_t>(pt::g_pt_samples), 1u, 16u),
@@ -667,30 +677,6 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * k + 1u);
     list->ResolveQueryData(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * k, 2u, r.perf_readback.Get(), 16ull * k);
   }
-  const uint32_t sparse_block = 2u * kRt12Slots + k;
-  bool sparse_perf_timing = false;
-  if (sparse_requested && sparse_policy.dense_reason == pt::PtSparseDenseReason::None && sparse_policy.levels < 256u) {
-    sparse_perf_timing = rtxdi::CanStartGpuTiming(pt_perf_gather, s.timestamp_frequency, r.perf_pending[sparse_block])
-                         && r.perf_queries && r.perf_readback;
-    if (pt_perf_gather && r.perf_pending[sparse_block]) {
-      bvh::g_perf_gate.pt_timing_pending_frames.fetch_add(1u, std::memory_order_relaxed);
-    } else if (pt_perf_gather && !sparse_perf_timing) {
-      rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.pt_timing_skip_events);
-    }
-    D3D12_RESOURCE_BARRIER sparse_barriers[2] = {};
-    sparse_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    sparse_barriers[0].UAV.pResource = out.texture12.Get();
-    sparse_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    sparse_barriers[1].UAV.pResource = refl.texture12.Get();
-    list->ResourceBarrier(refl_on ? 2u : 1u, sparse_barriers);
-    list->SetPipelineState(r.sparse_resolve_pso.Get());
-    if (sparse_perf_timing) list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * sparse_block);
-    list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
-    if (sparse_perf_timing) {
-      list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * sparse_block + 1u);
-      list->ResolveQueryData(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * sparse_block, 2u, r.perf_readback.Get(), 16ull * sparse_block);
-    }
-  }
   barriers.clear();
   Transition(barriers, out.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
   if (refl_on) Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -707,6 +693,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   for (ID3D12Resource* resource : reads) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+  }
+  if (sparse_effective) {
+    Transition(barriers, s.noise.texture12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   }
   Transition(barriers, r.counters[k].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
@@ -756,11 +745,6 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     r.perf_fence[k] = b;
     r.perf_epoch[k] = pt_perf_epoch;
   }
-  if (sparse_perf_timing) {
-    r.perf_pending[sparse_block] = true;
-    r.perf_fence[sparse_block] = b;
-    r.perf_epoch[sparse_block] = pt_perf_epoch;
-  }
   if (!r.counter_pending[k]) {
     r.counter_fence[k] = b;
     r.counter_frame[k] = frame;
@@ -783,9 +767,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   if (!waited) return submit_fail(Rt12Reason::SubmitFailed, "pt d3d11 wait on fence B");
   RecordRt12WaitB(s, b, GpuEvidenceSource::Pt);
   const uint32_t sparse_effective_levels = sparse_policy.dense_reason == pt::PtSparseDenseReason::None ? sparse_policy.levels : 256u;
-  if (r.sparse_requested != sparse_requested || r.sparse_effective_levels != sparse_effective_levels) {
+  if (r.sparse_effective != sparse_effective || r.sparse_effective_levels != sparse_effective_levels) {
     if (const auto runtime = rr::SnapshotRrD3D12Runtime(); runtime != nullptr) runtime->MarkHistoryReset();
-    r.sparse_requested = sparse_requested;
+    r.sparse_effective = sparse_effective;
     r.sparse_effective_levels = sparse_effective_levels;
   }
   if (water_on) {  // publish the water block's inputs for RunPtWaterTrace of this frame
@@ -1014,10 +998,13 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   // keys and values); the water dispatch does not write them, since the material write and SHARC update passes never run here.
   for (uint32_t i = 0u; i < kRt12PtDescriptors; ++i) {
     const D3D12_CPU_DESCRIPTOR_HANDLE handle = cpu_at(base + i);
-    const bool uav_index = (i >= 14u && i <= 17u) || i >= 22u;
+    const bool uav_index = (i >= 14u && i <= 17u) || (i >= 22u && i <= 25u);
     if (!uav_index) {
       ID3D12Resource* resource = in.resources[i].Get();
       D3D12_SHADER_RESOURCE_VIEW_DESC view = in.srv_descs[i];
+      if (i == 26u) {
+        resource = nullptr;
+      }
       if (i == 9u) {
         resource = depth_copy.texture12.Get();
         view = Rt12TextureSrv(depth_view_format);

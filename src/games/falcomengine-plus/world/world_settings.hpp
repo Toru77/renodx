@@ -2183,7 +2183,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "Sparse Rendering",
       .section = "Path Tracing",
-      .tooltip = "Trace a subset of opaque PT pixels and reconstruct the rest; water stays dense.",
+      .tooltip = "With Ray Reconstruction active, trace a subset of opaque PT pixels and zero the rest; water stays dense.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });
