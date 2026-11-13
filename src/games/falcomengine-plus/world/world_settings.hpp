@@ -724,7 +724,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   const auto mark_rtxdi_custom = [](float, float) {
-    if (!rtxdi::g_applying_quality_preset && rtxdi::g_quality_preset < 2.5f) {
+    if (!rtxdi::g_applying_quality_preset && rtxdi::g_quality_preset != 3.f) {
       rtxdi::g_quality_preset = 3.f;
       renodx::utils::settings::UpdateSetting("RtxdiQualityPreset", 3.f);
     }
@@ -741,18 +741,33 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .min = 0.f,
       .max = 3.f,
       .on_change_value = [](float, float current) {
-        if (current >= 3.f) return;
-        const uint32_t preset = static_cast<uint32_t>(std::clamp(std::lround(current), 0l, 2l));
-        constexpr uint32_t candidates[] = {4u, 8u, 16u};
-        constexpr uint32_t spatial[] = {2u, 4u, 8u};
+        if (current == 3.f) return;
+        const uint32_t preset = static_cast<uint32_t>(std::clamp(std::lround(current), 0l, 3l));
+        constexpr uint32_t candidates[] = {16u, 32u, 32u};
+        constexpr uint32_t spatial[] = {1u, 1u, 2u};
         constexpr uint32_t disocclusion[] = {4u, 8u, 16u};
+        constexpr float radius[] = {16.f, 30.f, 30.f};
+        constexpr float history[] = {20.f, 20.f, 20.f};
+        constexpr float boiling[] = {0.2f, 0.2f, 0.2f};
+        constexpr float permutation[] = {0.f, 1.f, 1.f};
+        constexpr float visibility[] = {0.f, 1.f, 1.f};
         rtxdi::g_applying_quality_preset = true;
         rtxdi::g_local_candidates = static_cast<float>(candidates[preset]);
         rtxdi::g_spatial_samples = static_cast<float>(spatial[preset]);
         rtxdi::g_spatial_disocclusion = static_cast<float>(disocclusion[preset]);
+        rtxdi::g_spatial_radius = radius[preset];
+        rtxdi::g_history_length = history[preset];
+        rtxdi::g_boiling_filter_strength = boiling[preset];
+        rtxdi::g_permutation_sampling = permutation[preset];
+        rtxdi::g_initial_visibility = visibility[preset];
         renodx::utils::settings::UpdateSetting("RtxdiLocalCandidates", rtxdi::g_local_candidates);
         renodx::utils::settings::UpdateSetting("RtxdiSpatialSamples", rtxdi::g_spatial_samples);
         renodx::utils::settings::UpdateSetting("RtxdiSpatialDisocclusion", rtxdi::g_spatial_disocclusion);
+        renodx::utils::settings::UpdateSetting("RtxdiSpatialRadius", rtxdi::g_spatial_radius);
+        renodx::utils::settings::UpdateSetting("RtxdiHistoryLength", rtxdi::g_history_length);
+        renodx::utils::settings::UpdateSetting("RtxdiBoilingFilterStrength", rtxdi::g_boiling_filter_strength);
+        renodx::utils::settings::UpdateSetting("RtxdiPermutationSampling", rtxdi::g_permutation_sampling);
+        renodx::utils::settings::UpdateSetting("RtxdiInitialVisibility", rtxdi::g_initial_visibility);
         rtxdi::g_applying_quality_preset = false;
       },
       .is_visible = visible,
@@ -761,7 +776,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .key = "RtxdiLocalCandidates",
       .binding = &rtxdi::g_local_candidates,
       .value_type = SettingValueType::INTEGER,
-      .default_value = 8.f,
+      .default_value = 32.f,
       .label = "Local light candidates",
       .section = "RTXDI Local",
       .min = 1.f,
@@ -782,6 +797,30 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtxdiPermutationSampling",
+      .binding = &rtxdi::g_permutation_sampling,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Permutation sampling",
+      .section = "RTXDI Local",
+      .tooltip = "RTXDI SDK permutation sampling for temporal reuse: history lookups use a permuted pixel instead of random jitter. Needs valid motion vectors. Balanced preset: On.",
+      .labels = {"Off", "On"},
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiInitialVisibility",
+      .binding = &rtxdi::g_initial_visibility,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Initial visibility",
+      .section = "RTXDI Local",
+      .tooltip = "Shadow-tests each pixel's initial light sample and drops it when blocked, before temporal and spatial reuse. Costs one extra shadow ray per pixel. Final visibility is unchanged. Balanced preset: On.",
+      .labels = {"Off", "On"},
+      .on_change_value = mark_rtxdi_custom,
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiSpatialReuse",
       .binding = &rtxdi::g_spatial_reuse,
       .value_type = SettingValueType::BOOLEAN,
@@ -796,7 +835,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .key = "RtxdiSpatialSamples",
       .binding = &rtxdi::g_spatial_samples,
       .value_type = SettingValueType::INTEGER,
-      .default_value = 4.f,
+      .default_value = 1.f,
       .label = "Spatial samples",
       .section = "RTXDI Local",
       .min = 1.f,
@@ -823,7 +862,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .key = "RtxdiSpatialRadius",
       .binding = &rtxdi::g_spatial_radius,
       .value_type = SettingValueType::FLOAT,
-      .default_value = 4.f,
+      .default_value = 30.f,
       .label = "Spatial radius (pixels)",
       .section = "RTXDI Local",
       .min = 1.f,
@@ -2333,6 +2372,32 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .max = 22.f,
       .format = "%d",
       .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtSharcFireflyClamp",
+      .binding = &pt::g_pt_sharc_firefly_clamp_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "SHARC Firefly Clamp",
+      .section = "Path Tracing",
+      .tooltip = "Limits SHARC cache updates that are far above their cell's average (OpenRemix sharcFireflyClamp). Fewer cache fireflies, but darkens bright cached light. Off = current look.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtSharcFireflyClampLimit",
+      .binding = &pt::g_pt_sharc_firefly_clamp,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 10.f,
+      .label = "SHARC Firefly Clamp Limit",
+      .section = "Path Tracing",
+      .tooltip = "Largest SHARC update, as a multiple of its cell's average luminance. Lower = fewer fireflies, less energy.",
+      .min = 1.f,
+      .max = 100.f,
+      .format = "%.1f",
+      .is_enabled = [] { return pt::g_pt_sharc_firefly_clamp_enabled > 0.5f; },
+      .is_visible = visible,
+      .is_logarithmic = true,
   });
   settings->push_back(new Setting{
       .key = "PtSharcClear",

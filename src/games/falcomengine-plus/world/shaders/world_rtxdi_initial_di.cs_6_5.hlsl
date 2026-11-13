@@ -177,10 +177,23 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     return;
   }
   RtxdiDiagAdd(RTXDI_DIAG_INITIAL_RESERVOIRS, 1u);
+  const bool initial_visibility = g_di.initialSamplingParams.enableInitialVisibility != 0u;
+  RtxdiDiRawResult initial_raw = (RtxdiDiRawResult)0;
+  if (initial_visibility) {
+    initial_raw = RtxdiTraceLocalLight(surface, selected_sample, g_scene_resources_valid, g_coverage_valid,
+                                       g_environment_bias, g_character_bias, g_endpoint_clearance, g_region_min,
+                                       g_region_size, RTXDI_GetDIReservoirInvPdf(reservoir));
+    if (initial_raw.status == RTXDI_DI_STATUS_BLOCKED) {
+      RTXDI_StoreVisibilityInDIReservoir(reservoir, float3(0.0, 0.0, 0.0), true);
+      RtxdiDiagAdd(RTXDI_DIAG_INITIAL_VISIBILITY_BLOCKED, 1u);
+    }
+  }
   RTXDI_StoreDIReservoir(reservoir, g_di.reservoirBufferParams, pixel, g_di.bufferIndices.initialSamplingOutputBufferIndex);
   if ((g_frame_flags & RTXDI_FRAME_FLAG_SPATIAL_AFTER_INITIAL) != 0u) return;
-  RtxdiWriteInitialRaw(pixel_index,
-                       RtxdiTraceLocalLight(surface, selected_sample, g_scene_resources_valid, g_coverage_valid,
-                                            g_environment_bias, g_character_bias, g_endpoint_clearance, g_region_min,
-                                            g_region_size, RTXDI_GetDIReservoirInvPdf(reservoir)));
+  if (!initial_visibility) {
+    initial_raw = RtxdiTraceLocalLight(surface, selected_sample, g_scene_resources_valid, g_coverage_valid,
+                                       g_environment_bias, g_character_bias, g_endpoint_clearance, g_region_min,
+                                       g_region_size, RTXDI_GetDIReservoirInvPdf(reservoir));
+  }
+  RtxdiWriteInitialRaw(pixel_index, initial_raw);
 }

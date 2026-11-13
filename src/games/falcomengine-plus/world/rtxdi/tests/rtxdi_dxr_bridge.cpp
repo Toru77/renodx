@@ -1735,7 +1735,13 @@ int RunRtxdiDxrBridge() {
   di_frame.parameters.di.reservoirBufferParams.reservoirArrayPitch = 256u;
   falcom_world::rtxdi::DiConfig bridge_di_config;
   if (!falcom_world::rtxdi::CalculateDiConfig(3u, 2u, &bridge_di_config)) return 1;
-  const auto bridge_settings = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings();
+  // Pinned: the fixture's spatial neighbour offsets (32/127, 0) only reach the mismatch pixels at radius 4.
+  auto bridge_settings = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings();
+  bridge_settings.local_candidates = 8u;
+  bridge_settings.spatial_samples = 4u;
+  bridge_settings.spatial_radius = 4.0f;
+  bridge_settings.permutation_sampling = false;
+  bridge_settings.initial_visibility = false;
   auto bridge_di_context = falcom_world::rtxdi::CreateDiContext(bridge_di_config, bridge_settings);
   if (!bridge_di_context) return 1;
   di_frame.parameters = falcom_world::rtxdi::MakeDiFrameParameters(bridge_di_config, *bridge_di_context);

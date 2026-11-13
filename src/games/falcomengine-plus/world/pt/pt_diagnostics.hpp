@@ -84,6 +84,8 @@ inline std::string SerializePtReport() {
   out << "scene scale: " << g_pt_sharc_scene_scale << "\n";
   out << "sharc downscale setting: " << g_pt_sharc_downscale << "\n";
   out << "sharc radiance scale: " << g_pt_sharc_radiance_scale << "\n";
+  out << "sharc firefly clamp enabled: " << g_pt_sharc_firefly_clamp_enabled << "\n";
+  out << "sharc firefly clamp: " << g_pt_sharc_firefly_clamp << "\n";
   out << "material enabled: " << g_pt_material_enabled << "\n";
   out << "material rate setting: " << g_pt_material_rate << "\n";
   out << "material cell scale setting: " << g_pt_material_cell_scale << "\n";

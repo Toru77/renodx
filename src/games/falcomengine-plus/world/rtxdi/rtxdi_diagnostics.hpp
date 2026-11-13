@@ -708,6 +708,8 @@ inline std::string SerializeDiagnosticReport(const DiagnosticSnapshot& snapshot)
            g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 6u], g[RTXDI_DIAG_UNKNOWN_REASON_BASE + 7u]);
     append("gpu_blocked near_lamp=%u elsewhere=%u\n", g[RTXDI_DIAG_BLOCKED_NEAR_LAMP],
            g[RTXDI_DIAG_TUPLE_STATUS_BASE + 2u] - g[RTXDI_DIAG_BLOCKED_NEAR_LAMP]);
+    append("gpu_initial_visibility reservoirs=%u blocked=%u\n", g[RTXDI_DIAG_INITIAL_RESERVOIRS],
+           g[RTXDI_DIAG_INITIAL_VISIBILITY_BLOCKED]);
     append("gpu_n1 pixels=%u config_invalid=%u invalid=%u visible=%u blocked=%u unknown=%u empty=%u membership_reject=%u\n",
            g[RTXDI_DIAG_N1_PIXELS], g[RTXDI_DIAG_N1_CONFIG_INVALID], g[RTXDI_DIAG_N1_STATUS_BASE],
            g[RTXDI_DIAG_N1_STATUS_BASE + 1u], g[RTXDI_DIAG_N1_STATUS_BASE + 2u], g[RTXDI_DIAG_N1_STATUS_BASE + 3u],

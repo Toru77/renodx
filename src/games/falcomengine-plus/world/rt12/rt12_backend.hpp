@@ -384,7 +384,7 @@ struct Rt12DiTransferState {
 
 // Path-traced diffuse GI (world/pt): its own submission slots, list, root signature, PSO, descriptors and outputs.
 inline constexpr uint32_t kRt12PtDescriptors = 26u;
-inline constexpr uint32_t kRt12PtConstants = 44u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
+inline constexpr uint32_t kRt12PtConstants = 46u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
 inline constexpr uint32_t kRt12PtCounters = 7u;  // GPU material-cache counters (uint32 each), world_pt_common.hlsli g_pt_counters
 // Descriptor inputs of the main trace's frame, kept for the water block (M4): descriptor i is srv_descs[i] or uav_descs[i] on
 // resources[i]. The TLAS has no resource in its SRV, so it is retained separately.

@@ -27,6 +27,7 @@ inline float g_pt_reflection_enabled = 0.f, g_pt_reflection_samples = 1.f, g_pt_
 inline float g_pt_reflection_sample_clamp = 16.f;
 inline float g_pt_reflection_clamp_enabled = 1.f;
 inline float g_pt_gi_clamp_enabled = 0.f, g_pt_gi_clamp = 16.f;
+inline float g_pt_sharc_firefly_clamp_enabled = 0.f, g_pt_sharc_firefly_clamp = 10.f;
 inline float g_pt_reflection_cap_to_one = 0.f;
 inline float g_pt_reflection_use_sharc = 1.f, g_pt_reflection_footprint = 1.f;
 inline float g_pt_reflection_water_rule = 0.f;

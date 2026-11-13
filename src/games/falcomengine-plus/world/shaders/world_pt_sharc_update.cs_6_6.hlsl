@@ -28,7 +28,29 @@ void main(uint3 id : SV_DispatchThreadID) {
     const float3 albedo = PtHitMaterial(hit.position, nh).albedo;
     float3 direct = albedo * PtHitLight(hit.position, nh, rng);
     if (any(isnan(direct)) || any(isinf(direct))) direct = float3(0, 0, 0);
-    if (!SharcUpdateHit(sharc, state, PtSharcHit(hit.position, nh, dir, albedo), direct, PtRandom(rng))) break;
+    const SharcHitData sharc_hit = PtSharcHit(hit.position, nh, dir, albedo);
+    const float random_value = PtRandom(rng);
+    // OpenRemix updateCache: the light passed to the path's earlier cells is limited to g_sharc_firefly_clamp times the mean of this
+    // vertex's cell; the rest of the vertex's own light is added to that cell directly when the SDK will not resample it.
+    float3 carried = direct;
+    uint cell = HASH_GRID_INVALID_CACHE_INDEX;
+    if (g_sharc_firefly_clamp_enabled != 0u) {
+      uint64_t key;
+      cell = HashGridFindEntry(sharc.hashGridData, sharc_hit.positionWorld, sharc_hit.normalWorld, sharc.hashGridParameters, key);
+      if (cell != HASH_GRID_INVALID_CACHE_INDEX) {
+        const SharcVoxelData voxel = SharcGetVoxelData(sharc.resolvedBuffer, cell);
+        if (voxel.accumulatedSampleNum > SHARC_SAMPLE_NUM_THRESHOLD) {
+          const float limit = SharcRadianceLuma(voxel.accumulatedRadiance) * g_sharc_firefly_clamp;
+          const float value = SharcRGBToYCoCg(direct * rcp(sharc_hit.materialDemodulation)).x;
+          if (limit > 1e-6 && value > limit) carried = direct * (limit / value);
+        }
+      }
+    }
+    if (any(direct > carried)
+        && uint(round(lerp(SHARC_RESAMPLING_DEPTH_MIN, SHARC_PROPAGATION_DEPTH, random_value))) > state.pathLength)
+      SharcAddVoxelData(sharc, cell, (direct - carried) * rcp(sharc_hit.materialDemodulation), float3(1, 1, 1),
+                        SharcGetRadianceDirection(sharc_hit), SharcGetRadianceDirectionWeight(sharc_hit), 0u);
+    if (!SharcUpdateHit(sharc, state, sharc_hit, carried, random_value)) break;
     SharcSetThroughput(state, albedo);
     p = hit.position;
     n = nh;

@@ -41,6 +41,8 @@ struct EffectiveRtxdiSettings {
   float temporal_normal_threshold = 0.5f;
   bool boiling_filter = true;
   float boiling_filter_strength = 0.2f;
+  bool permutation_sampling = false;
+  bool initial_visibility = false;
   float spatial_depth_threshold = 0.05f;
   float spatial_normal_threshold = 0.9f;
   bool relax_diffuse = true;
@@ -68,6 +70,8 @@ inline EffectiveRtxdiSettings CaptureEffectiveRtxdiSettings() {
   effective.temporal_normal_threshold = std::clamp(std::isfinite(g_temporal_normal_threshold) ? g_temporal_normal_threshold : 0.5f, -1.0f, 1.0f);
   effective.boiling_filter = g_boiling_filter > 0.5f;
   effective.boiling_filter_strength = std::clamp(std::isfinite(g_boiling_filter_strength) ? g_boiling_filter_strength : 0.2f, 0.01f, 1.0f);
+  effective.permutation_sampling = g_permutation_sampling > 0.5f;
+  effective.initial_visibility = g_initial_visibility > 0.5f;
   effective.spatial_depth_threshold = std::clamp(std::isfinite(g_spatial_depth_threshold) ? g_spatial_depth_threshold : 0.05f, 0.0f, 1.0f);
   effective.spatial_normal_threshold = std::clamp(std::isfinite(g_spatial_normal_threshold) ? g_spatial_normal_threshold : 0.9f, -1.0f, 1.0f);
   effective.relax_diffuse = g_diffuse_denoiser > 0.5f;
@@ -77,13 +81,22 @@ inline EffectiveRtxdiSettings CaptureEffectiveRtxdiSettings() {
   effective.relax_prepass_radius = integer_setting(g_relax_prepass_radius, 30.0f, 0l, 64l);
   effective.relax_atrous_iterations = integer_setting(g_relax_atrous_iterations, 5.0f, 2l, 8l);
   if (effective.quality_preset != 3u) {
-    constexpr uint32_t candidates[] = {4u, 8u, 16u};
-    constexpr uint32_t spatial[] = {2u, 4u, 8u};
+    constexpr uint32_t candidates[] = {16u, 32u, 32u};
+    constexpr uint32_t spatial[] = {1u, 1u, 2u};
     constexpr uint32_t disocclusion[] = {4u, 8u, 16u};
-    const uint32_t preset = (std::min)(effective.quality_preset, 2u);
-    effective.local_candidates = candidates[preset];
-    effective.spatial_samples = spatial[preset];
-    effective.spatial_disocclusion = disocclusion[preset];
+    constexpr float radius[] = {16.f, 30.f, 30.f};
+    constexpr uint32_t history[] = {20u, 20u, 20u};
+    constexpr float boiling[] = {0.2f, 0.2f, 0.2f};
+    constexpr bool permutation[] = {false, true, true};
+    constexpr bool visibility[] = {false, true, true};
+    effective.local_candidates = candidates[effective.quality_preset];
+    effective.spatial_samples = spatial[effective.quality_preset];
+    effective.spatial_disocclusion = disocclusion[effective.quality_preset];
+    effective.spatial_radius = radius[effective.quality_preset];
+    effective.history_length = history[effective.quality_preset];
+    effective.boiling_filter_strength = boiling[effective.quality_preset];
+    effective.permutation_sampling = permutation[effective.quality_preset];
+    effective.initial_visibility = visibility[effective.quality_preset];
   }
   uint64_t hash = 1469598103934665603ull;
   const auto add = [&hash](uint32_t value) {
@@ -102,6 +115,8 @@ inline EffectiveRtxdiSettings CaptureEffectiveRtxdiSettings() {
   add(std::bit_cast<uint32_t>(effective.temporal_normal_threshold));
   add(effective.boiling_filter ? 1u : 0u);
   add(std::bit_cast<uint32_t>(effective.boiling_filter_strength));
+  add(effective.permutation_sampling ? 1u : 0u);
+  add(effective.initial_visibility ? 1u : 0u);
   add(std::bit_cast<uint32_t>(effective.spatial_depth_threshold));
   add(std::bit_cast<uint32_t>(effective.spatial_normal_threshold));
   add(effective.relax_diffuse ? 1u : 0u);
@@ -216,6 +231,7 @@ inline std::unique_ptr<::rtxdi::ReSTIRDIContext> CreateDiContext(const DiConfig&
   initial.numBrdfSamples = 0u;
   initial.localLightSamplingMode = ReSTIRDI_LocalLightSamplingMode::Uniform;
   initial.environmentMapImportanceSampling = 0u;
+  initial.enableInitialVisibility = settings.initial_visibility ? 1u : 0u;
   context->SetInitialSamplingParameters(initial);
   auto spatial = context->GetSpatialResamplingParameters();
   spatial.numSamples = settings.spatial_samples;
@@ -230,7 +246,7 @@ inline std::unique_ptr<::rtxdi::ReSTIRDIContext> CreateDiContext(const DiConfig&
   context->SetSpatialResamplingParameters(spatial);
   auto temporal = context->GetTemporalResamplingParameters();
   temporal.enableVisibilityShortcut = 0u;
-  temporal.enablePermutationSampling = 0u;
+  temporal.enablePermutationSampling = settings.permutation_sampling ? 1u : 0u;
   temporal.maxHistoryLength = settings.history_length;
   temporal.depthThreshold = settings.temporal_depth_threshold;
   temporal.normalThreshold = settings.temporal_normal_threshold;
