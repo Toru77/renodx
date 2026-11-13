@@ -2183,9 +2183,20 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "Sparse Rendering",
       .section = "Path Tracing",
-      .tooltip = "With Ray Reconstruction active, trace a subset of opaque PT pixels and zero the rest; water stays dense.",
+      .tooltip = "With Ray Reconstruction active, trace diffuse GI at a subset of opaque pixels, with optional sparse reflections; water stays dense.",
       .labels = {"Off", "On"},
       .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtSparseReflections",
+      .binding = &pt::g_pt_sparse_reflections,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Sparse Rendering Reflections",
+      .section = "Path Tracing",
+      .tooltip = "Apply sparse sampling to path-traced reflections. Off keeps reflections dense while diffuse GI remains sparse.",
+      .labels = {"Off", "On"},
+      .is_visible = [visible]() { return visible() && pt::g_pt_sparse_enabled > 0.5f; },
   });
   settings->push_back(new Setting{
       .key = "PtSparseAdaptive",

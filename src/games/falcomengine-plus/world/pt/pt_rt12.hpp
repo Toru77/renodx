@@ -466,6 +466,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     }
   }
   const bool sparse_effective = sparse_policy.dense_reason == pt::PtSparseDenseReason::None && sparse_policy.levels < 256u;
+  const bool sparse_reflections_requested = pt::g_pt_sparse_reflections > 0.5f;
+  const bool sparse_reflections_effective = sparse_effective && refl_on && sparse_reflections_requested;
   const uint32_t base = k * kRt12PtDescriptors;
   const auto cpu_at = [&r, &s](uint32_t index) {
     D3D12_CPU_DESCRIPTOR_HANDLE handle = r.heap->GetCPUDescriptorHandleForHeapStart();
@@ -607,7 +609,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_roughness_scale, 1.f, 0.f, 2.f)),
       pt::g_pt_reflection_clamp_enabled > 0.5f ? std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_sample_clamp, 16.f, 1.f, 1000.f)) : 0u,
       (pt::g_pt_reflection_cap_to_one > 0.5f ? 1u : 0u) | (pt::g_pt_reflection_use_sharc > 0.5f ? 2u : 0u) |
-          (pt::g_pt_reflection_footprint > 0.5f ? 4u : 0u) | (pt::g_pt_reflection_water_rule > 0.5f ? 8u : 0u),
+          (pt::g_pt_reflection_footprint > 0.5f ? 4u : 0u) | (pt::g_pt_reflection_water_rule > 0.5f ? 8u : 0u) |
+          (sparse_reflections_requested ? 32u : 0u),
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_water_roughness, 0.05f, 0.f, 1.f)),
       pt::g_pt_gi_clamp_enabled > 0.5f ? std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_gi_clamp, 16.f, 1.f, 1000.f)) : 0u,  // [42] water roughness, [43] GI clamp (0 = off)
       pt::g_pt_sharc_firefly_clamp_enabled > 0.5f ? 1u : 0u,  // [44] SHARC update clamp on, [45] its limit (multiple of the cell mean)
@@ -767,11 +770,13 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   if (!waited) return submit_fail(Rt12Reason::SubmitFailed, "pt d3d11 wait on fence B");
   RecordRt12WaitB(s, b, GpuEvidenceSource::Pt);
   const uint32_t sparse_effective_levels = sparse_policy.dense_reason == pt::PtSparseDenseReason::None ? sparse_policy.levels : 256u;
-  if (r.sparse_effective != sparse_effective || r.sparse_effective_levels != sparse_effective_levels) {
+  if (r.sparse_effective != sparse_effective || r.sparse_effective_levels != sparse_effective_levels ||
+      r.sparse_reflections_effective != sparse_reflections_effective) {
     if (const auto runtime = rr::SnapshotRrD3D12Runtime(); runtime != nullptr) {
       runtime->MarkHistoryReset();
       r.sparse_effective = sparse_effective;
       r.sparse_effective_levels = sparse_effective_levels;
+      r.sparse_reflections_effective = sparse_reflections_effective;
     }
   }
   if (water_on) {  // publish the water block's inputs for RunPtWaterTrace of this frame
@@ -792,6 +797,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     pt::g_pt_panel.height = h;
     pt::g_pt_panel.sparse_policy = sparse_policy;
     pt::g_pt_panel.sparse_requested = sparse_requested;
+    pt::g_pt_panel.sparse_reflections_requested = sparse_reflections_requested;
+    pt::g_pt_panel.sparse_reflections_effective = sparse_reflections_effective;
     pt::g_pt_panel.sparse_adaptive = pt::g_pt_sparse_adaptive > 0.5f;
     pt::g_pt_panel.sharc_on = sharc_on;
     pt::g_pt_panel.sharc_capacity_log2 = sharc_on ? static_cast<uint32_t>(std::countr_zero(r.sharc_capacity)) : 0u;

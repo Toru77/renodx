@@ -1,11 +1,11 @@
-void PtEvaluate(uint3 id, RtxdiSurfaceResult surface, bool water_pass) {
+void PtEvaluate(uint3 id, RtxdiSurfaceResult surface, bool water_pass, bool evaluate_diffuse) {
   if (water_pass) PtCount(5u);
   g_rt12_dynamic_mask = g_dynamic_on != 0u ? RT12_MASK_DYNAMIC : 0u;
   WorldTraceCounters pt_counters;  // required out argument of TraceWorldRayDxr; discarded
   const WorldCameraView bounce_view = {true, 1.0, 0u, 0u};
   const SharcParameters sharc = PtSharcParameters();
   const bool water_origin = water_pass || ((g_refl_flags & 8u) != 0u && (g_pt_normal.Load(int3(id.xy, 0)).w & 2u) != 0u);
-  if (!water_pass) {
+  if (!water_pass && evaluate_diffuse) {
     uint rng = PtHash(id.x + id.y * g_size.x + PtHash(g_frame));
     float3 L = float3(0, 0, 0);
     for (uint sample = 0u; sample < g_samples; ++sample) {
@@ -58,7 +58,7 @@ void PtEvaluate(uint3 id, RtxdiSurfaceResult surface, bool water_pass) {
       const float3 bt = cross(n, t);
       const float3 wo = float3(dot(v, t), dot(v, bt), max(dot(v, n), 1e-4));
       uint refl_rng = PtHash(id.x + id.y * g_size.x + PtHash(g_frame ^ 0x5245464Cu));
-      const float sparse_scale = !water_origin && g_sparse_enabled != 0u && g_sparse_levels < 256u ? 256.0 / float(g_sparse_levels) : 1.0;
+      const float sparse_scale = !water_origin && (g_refl_flags & 32u) != 0u && g_sparse_enabled != 0u && g_sparse_levels < 256u ? 256.0 / float(g_sparse_levels) : 1.0;
       float3 sum = float3(0, 0, 0);
       float distance = 0.0;
       for (uint sample = 0u; sample < g_refl_samples; ++sample) {

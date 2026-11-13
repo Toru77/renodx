@@ -45,6 +45,8 @@ inline std::string SerializePtReport() {
   out << "width: " << p.width << "\n";
   out << "height: " << p.height << "\n";
   out << "sparse requested mode: " << (!p.sparse_requested ? "off" : p.sparse_adaptive ? "adaptive" : "fixed") << "\n";
+  out << "sparse reflections requested: " << p.sparse_reflections_requested << "\n";
+  out << "sparse reflections effective: " << p.sparse_reflections_effective << "\n";
   out << "sparse effective levels: " << (p.sparse_policy.dense_reason == PtSparseDenseReason::None ? p.sparse_policy.levels : 256u) << " / 256\n";
   out << "sparse dense reason: " << PtSparseDenseReasonName(p.sparse_policy.dense_reason) << "\n";
   out << "sparse counter available: " << p.gpu_available << "\n";

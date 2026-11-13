@@ -10,6 +10,7 @@
 namespace falcom_world::pt {
 inline float g_pt_enabled = 0.f;
 inline bool PtRequested() { return g_pt_enabled > 0.5f; }
+inline float g_pt_sparse_reflections = 1.f;
 inline float g_pt_sparse_enabled = 0.f, g_pt_sparse_adaptive = 1.f, g_pt_sparse_rate = 0.10f,
              g_pt_sparse_exponent = 0.91f, g_pt_sparse_quality = 0.30f, g_pt_sparse_max_rate = 0.75f;
 enum class PtSparseDenseReason : uint32_t { None, Disabled, RateAboveMax, FullRate, RrNotRequested, RrNotActive, NoiseUnavailable };
@@ -93,6 +94,7 @@ struct PtPanel {
   PtReason reason = PtReason::Off;
   PtSparsePolicy sparse_policy = {256u, PtSparseDenseReason::Disabled};
   bool sparse_requested = false, sparse_adaptive = false;
+  bool sparse_reflections_requested = false, sparse_reflections_effective = false;
   uint64_t frames[static_cast<uint32_t>(PtReason::Count)] = {};
   uint64_t waits = 0u;
   float wait_ms_max = 0.f;
@@ -162,6 +164,8 @@ inline void DrawPtPanel() {
               !p.sparse_requested ? "off" : p.sparse_adaptive ? "adaptive" : "fixed",
               p.sparse_policy.dense_reason == PtSparseDenseReason::None ? p.sparse_policy.levels : 256u,
               PtSparseDenseReasonName(p.sparse_policy.dense_reason));
+  ImGui::Text("Sparse reflections: requested %s  effective %s",
+              p.sparse_reflections_requested ? "on" : "off", p.sparse_reflections_effective ? "on" : "off");
   ImGui::Text("SHARC: %s  capacity 2^%u  update 1/%u px  window %u frames  clears %llu (last: %s)", p.sharc_on ? "on" : "off",
               p.sharc_capacity_log2, p.sharc_downscale, p.sharc_window, static_cast<unsigned long long>(p.sharc_clears),
               p.sharc_clear_reason);

@@ -47,7 +47,7 @@ cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (48 dwords
   uint g_mat_enabled; uint g_mat_capacity; uint g_mat_rate; float g_mat_cell_scale;
   uint g_mat_deferred_count; float g_mat_char_roughness; float g_mat_char_f0; uint g_mat_mode;
   float g_sharc_radiance_scale; uint g_refl_samples; float g_refl_intensity; float g_refl_roughness_scale;
-  float g_refl_sample_clamp; uint g_refl_flags;  // per-sample reflection radiance clamp (0 = off); flags: 1 = cap to one, 2 = reflection uses SHARC, 4 = SHARC footprint test, 8 = water bed test, 16 = water pass (reflection from the SSR-time water surface)
+  float g_refl_sample_clamp; uint g_refl_flags;  // per-sample reflection radiance clamp (0 = off); flags: 1 = cap to one, 2 = reflection uses SHARC, 4 = SHARC footprint test, 8 = water bed test, 16 = water pass (reflection from the SSR-time water surface), 32 = sparse reflections enabled
   float g_water_roughness; float g_gi_clamp;  // base roughness of water reflections; GI luminance clamp (0 = off)
   uint g_sharc_firefly_clamp_enabled; float g_sharc_firefly_clamp;  // SHARC update clamp on (1) / off (0); limit as a multiple of the cell mean (OpenRemix sharcFireflyClamp)
   uint g_sparse_levels; uint g_sparse_enabled;

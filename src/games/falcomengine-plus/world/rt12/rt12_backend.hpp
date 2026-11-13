@@ -422,6 +422,7 @@ struct Rt12PtState {
   Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
   bool sparse_effective = false;
+  bool sparse_reflections_effective = false;
   uint32_t sparse_effective_levels = 256u;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;  // shader visible, kRt12Slots * kRt12PtDescriptors
   Rt12Shared output[kRt12Slots];                      // RGBA16F, depth size; the lighting draw reads srv11 at t47

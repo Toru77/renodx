@@ -13,14 +13,23 @@ void main(uint3 id : SV_DispatchThreadID) {
     PtCount(8u);
     if (!PtSparseSelected(id.xy)) {
       g_pt_output[id.xy] = float4(0, 0, 0, 1);
-      if (g_refl_samples != 0u) {
-        g_pt_reflection[id.xy] = (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u
-            ? float4(0, 0, 0, 0)
-            : float4(0, 0, 0, 1e-3);
+      if ((g_refl_flags & 32u) != 0u) {
+        if (g_refl_samples != 0u) {
+          g_pt_reflection[id.xy] = (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u
+              ? float4(0, 0, 0, 0)
+              : float4(0, 0, 0, 1e-3);
+        }
+        return;
       }
+      if (g_refl_samples == 0u) return;
+      if ((surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u) {
+        g_pt_reflection[id.xy] = float4(0, 0, 0, 0);
+        return;
+      }
+      PtEvaluate(id, surface, water_pass, false);
       return;
     }
     PtCount(7u);
   }
-  PtEvaluate(id, surface, water_pass);
+  PtEvaluate(id, surface, water_pass, true);
 }
