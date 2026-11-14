@@ -126,6 +126,7 @@ float3 PtClampLuminance(float3 c, float limit) {
   const float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
   return limit > 0.0 && lum > limit ? c * (limit / lum) : c;
 }
+void PtCount(uint index) { uint previous; InterlockedAdd(g_pt_counters[index], 1u, previous); }
 // Light arriving at a bounce hit: the sun with a shadow ray and one lamp sampled uniformly. The caller multiplies by albedo.
 float3 PtHitLight(float3 position, float3 nh, inout uint rng) {
   WorldTraceCounters counters;
@@ -139,25 +140,45 @@ float3 PtHitLight(float3 position, float3 nh, inout uint rng) {
   }
   float3 lamp = float3(0, 0, 0);
   if (g_lamp_count > 0u) {
+    const bool regir_eligible = g_regir_enabled != 0u && g_lamp_count <= RTXDI_LIGHT_TABLE_CAPACITY;
+    if (regir_eligible) PtCount(9u);
     bool pool_valid = false;
+    uint fallback_reason = regir_eligible ? 0u : 1u;
     PtReGirCell pool = (PtReGirCell)0;
     int3 key;
-    if (g_regir_enabled != 0u && g_lamp_count <= RTXDI_LIGHT_TABLE_CAPACITY && PtReGirCellKey(position, key)) {
+    if (regir_eligible && PtReGirCellKey(position, key)) {
+      PtCount(10u);
       uint header_count, header_stride, cell_count, cell_stride;
       g_pt_regir_header.GetDimensions(header_count, header_stride);
       g_pt_regir_cells.GetDimensions(cell_count, cell_stride);
       if (header_count != 0u && g_pt_regir_header[0].valid != 0u
           && g_pt_regir_header[0].cell_count <= min(cell_count, PT_REGIR_MAX_CELLS)) {
+        bool matched = false;
         for (uint cell_index = 0u; cell_index < g_pt_regir_header[0].cell_count; ++cell_index) {
           const PtReGirCell candidate = g_pt_regir_cells[cell_index];
           if (all(candidate.key == key) && candidate.valid != 0u) {
+            matched = true;
+            PtCount(11u);
             pool = candidate;
             pool_valid = true;
-            for (uint slot = 0u; slot < PT_REGIR_SLOTS; ++slot) pool_valid = pool_valid && pool.slots[slot] < g_lamp_count;
+            for (uint slot = 0u; slot < PT_REGIR_SLOTS; ++slot) {
+              if (pool.slots[slot] >= g_lamp_count) {
+                pool_valid = false;
+                fallback_reason = 5u;
+                PtCount(14u);
+              }
+            }
             break;
           }
         }
+        if (!matched) PtCount(12u);
+      } else {
+        fallback_reason = 4u;
+        PtCount(13u);
       }
+      if (fallback_reason == 0u && !pool_valid) fallback_reason = 3u;
+    } else if (regir_eligible) {
+      fallback_reason = 2u;
     }
     uint i;
     float lamp_scale;
@@ -168,10 +189,13 @@ float3 PtHitLight(float3 position, float3 nh, inout uint rng) {
       selection = PtReGirSelect(next_rng >> 8, g_lamp_count, pool.slots);
     }
     if (selection.valid != 0u) {
+      PtCount(15u);
       rng = next_rng;
       i = selection.light_index;
       lamp_scale = 1.0 / selection.pmf;
     } else {
+      if (fallback_reason == 0u) fallback_reason = 3u;
+      PtCount(15u + fallback_reason);
       i = min(uint(PtRandom(rng) * g_lamp_count), g_lamp_count - 1u);
       lamp_scale = g_lamp_count;
     }
@@ -249,7 +273,6 @@ uint4 PtReadMaterial(uint index) {
   const uint base = index * 4u;
   return uint4(g_pt_material_values[base], g_pt_material_values[base + 1u], g_pt_material_values[base + 2u], g_pt_material_values[base + 3u]);
 }
-void PtCount(uint index) { uint previous; InterlockedAdd(g_pt_counters[index], 1u, previous); }
 // The material at a bounce hit: the G-buffer when the hit is the visible surface on screen, else the cache, else grey 0.5.
 PtMaterial PtHitMaterial(float3 position, float3 nh) {
   PtMaterial m;

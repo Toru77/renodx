@@ -19,6 +19,16 @@ This file is the root, always-on guidance for AI coding agents. Keep it short. P
 - `src/shaders/AGENTS.md` - shared HLSL shader library files.
 - `src/utils/AGENTS.md` - shared C++ utility infrastructure and ReShade wrappers.
 
+## Agent role guides
+
+Role-specific workflows are in `.agents/agents/`. Read the matching guide when a task is explicitly planning, implementation from an existing plan, or review against a plan:
+
+- `.agents/agents/master-planner.md` - planning and design decisions.
+- `.agents/agents/implementer-writer.md` - implementing a settled plan.
+- `.agents/agents/reviewer.md` - reviewing implementation against a plan.
+
+These guides complement this file and any nested `AGENTS.md`; they do not replace repository guidance.
+
 Nested `AGENTS.md` files require `chat.useNestedAgentsMdFiles` to be enabled in `.vscode/settings.json` for VS Code to load them automatically.
 
 ## Workflow skills

@@ -248,6 +248,11 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   {
     std::lock_guard lock(pt::g_pt_panel_mutex);
     if (pt::g_pt_panel.regir_counts_generation != s.generation) pt::g_pt_panel.regir_counts_available = false;
+    if (pt::g_pt_panel.regir_water_counts_owner_generation != pt::g_pt_panel.regir_owner_generation) {
+      pt::g_pt_panel.regir_water_counts_available = false;
+      pt::g_pt_panel.regir_water_counts_frame = 0u;
+      pt::g_pt_panel.regir_water_counts_owner_generation = 0u;
+    }
   }
   for (uint32_t i = 0u; i < kRt12Slots; ++i) {
     if (!r.regir_counts_pending[i] || r.regir_counts_fence[i] > completed) continue;
@@ -299,6 +304,18 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
           pt::g_pt_panel.gpu_misses = values[2];
           pt::g_pt_panel.gpu_lock_drops = values[3];
           pt::g_pt_panel.gpu_writes = values[4];
+          pt::g_pt_panel.regir_eligible = values[9];
+          pt::g_pt_panel.regir_lookups = values[10];
+          pt::g_pt_panel.regir_matches = values[11];
+          pt::g_pt_panel.regir_misses = values[12];
+          pt::g_pt_panel.regir_invalid_headers = values[13];
+          pt::g_pt_panel.regir_invalid_slots = values[14];
+          pt::g_pt_panel.regir_selections = values[15];
+          pt::g_pt_panel.regir_fallback_disabled = values[16];
+          pt::g_pt_panel.regir_fallback_key = values[17];
+          pt::g_pt_panel.regir_fallback_miss = values[18];
+          pt::g_pt_panel.regir_fallback_header = values[19];
+          pt::g_pt_panel.regir_fallback_slots = values[20];
           pt::g_pt_panel.sparse_sample_active = r.counter_sparse[i];
           pt::g_pt_panel.sparse_selected = values[7];
           pt::g_pt_panel.sparse_valid = values[8];
@@ -549,9 +566,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (!r.perf_queries || !r.perf_readback) {
       D3D12_QUERY_HEAP_DESC query_desc = {};
       query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-      query_desc.Count = 2u * kRt12PtPerfBlocks;
+      query_desc.Count = kRt12PtPerfTimestamps * kRt12PtPerfBlocks;
       if (FAILED(s.device12->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&r.perf_queries)))
-          || FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_READBACK, 16ull * kRt12PtPerfBlocks,
+          || FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_READBACK, 80ull * kRt12PtPerfBlocks,
                                      D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, r.perf_readback))) {
         r.perf_queries.Reset();
         r.perf_readback.Reset();
@@ -568,6 +585,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   ID3D12Device5* device12 = s.device12.Get();
   const uint32_t regir_slot = static_cast<uint32_t>(transfer_slot);
+  if (pt_perf_timing) r.perf_valid_mask[k] = 0u;
   const pt::PtReGirIdentity source_identity = input.regir_source_identity;
   const bool regir_requested = pt::g_pt_regir_enabled > 0.5f;
   const bool regir_identity_matches = source_identity.owner_generation == s.generation
@@ -770,7 +788,12 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     list->SetPipelineState(r.regir_register_pso.Get());
     list->SetComputeRoot32BitConstants(0u, kRt12ReGirConstants, register_params, 0u);
     regir_table(0u);
+    if (pt_perf_timing) list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * kRt12PtPerfBlocks + 8u * k + 0u);
     list->Dispatch(1u, 1u, 1u);
+    if (pt_perf_timing) {
+      list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * kRt12PtPerfBlocks + 8u * k + 1u);
+      r.perf_valid_mask[k] |= 1u;
+    }
     barriers.clear();
     UavBarrier(barriers, header);
     UavBarrier(barriers, cells);
@@ -781,7 +804,12 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     list->SetPipelineState(r.regir_weights_pso.Get());
     list->SetComputeRoot32BitConstants(0u, kRt12ReGirConstants, build_params, 0u);
     regir_table(1u);
+    if (pt_perf_timing) list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * kRt12PtPerfBlocks + 8u * k + 2u);
     list->Dispatch(RTXDI_LIGHT_TABLE_CAPACITY / 64u, pt::kPtReGirMaxCells, 1u);
+    if (pt_perf_timing) {
+      list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * kRt12PtPerfBlocks + 8u * k + 3u);
+      r.perf_valid_mask[k] |= 2u;
+    }
     barriers.clear();
     UavBarrier(barriers, weights);
     Transition(barriers, weights, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -789,7 +817,12 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
     list->SetPipelineState(r.regir_build_pso.Get());
     regir_table(2u);
+    if (pt_perf_timing) list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * kRt12PtPerfBlocks + 8u * k + 4u);
     list->Dispatch((pt::kPtReGirMaxCells + 63u) / 64u, 1u, 1u);
+    if (pt_perf_timing) {
+      list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * kRt12PtPerfBlocks + 8u * k + 5u);
+      r.perf_valid_mask[k] |= 4u;
+    }
     barriers.clear();
     UavBarrier(barriers, cells);
     Transition(barriers, cells, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -902,10 +935,19 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     list->SetPipelineState(r.pso.Get());
   }
   if (pt_perf_timing) list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * k);
+  if (pt_perf_timing) list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * kRt12PtPerfBlocks + 8u * k + 6u);
   list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
   if (pt_perf_timing) {
     list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * k + 1u);
+    list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * kRt12PtPerfBlocks + 8u * k + 7u);
+    r.perf_valid_mask[k] |= 8u;
     list->ResolveQueryData(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * k, 2u, r.perf_readback.Get(), 16ull * k);
+    for (uint32_t interval = 0u; interval < 4u; ++interval) {
+      if ((r.perf_valid_mask[k] & (1u << interval)) == 0u) continue;
+      const uint32_t query = 2u * kRt12PtPerfBlocks + 8u * k + interval * 2u;
+      list->ResolveQueryData(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query, 2u, r.perf_readback.Get(),
+                             16ull * kRt12PtPerfBlocks + 64ull * k + 16ull * interval);
+    }
   }
   barriers.clear();
   Transition(barriers, out.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -1074,6 +1116,11 @@ inline void SetPtWaterOff(const char* reason) {
   pt::g_pt_panel.water_reason = reason;
   pt::g_pt_panel.gpu_water_pixels = 0u;
   pt::g_pt_panel.gpu_water_traces = 0u;
+  pt::g_pt_panel.regir_water_counts_available = false;
+  pt::g_pt_panel.regir_water_counts_frame = 0u;
+  pt::g_pt_panel.regir_water_counts_owner_generation = 0u;
+  pt::g_pt_panel.regir_water_submission_frame = UINT32_MAX;
+  pt::g_pt_panel.regir_water_submission_owner_generation = 0u;
 }
 // Water reflection from the SSR surface (M4): traces the water pixels of the SSR draw, from copies of its depth and mrt0,
 // into water_reflection[k] (read by ssr2). Uses the water block that the main trace of this frame published.
@@ -1124,14 +1171,44 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   for (uint32_t i = 0u; i < kRt12Slots; ++i) {
     if (!r.water_counter_pending[i] || r.water_counter_fence[i] > completed) continue;
     void* mapped = nullptr;
-    if (FAILED(r.water_counter_readback[i]->Map(0u, nullptr, &mapped))) continue;
+    if (FAILED(r.water_counter_readback[i]->Map(0u, nullptr, &mapped))) {
+      std::lock_guard lock(pt::g_pt_panel_mutex);
+      pt::g_pt_panel.regir_water_counts_available = false;
+      pt::g_pt_panel.regir_water_counts_frame = 0u;
+      pt::g_pt_panel.regir_water_counts_owner_generation = 0u;
+      continue;
+    }
     if (mapped != nullptr) {
       const auto* values = static_cast<const uint32_t*>(mapped);
       {
         std::lock_guard lock(pt::g_pt_panel_mutex);
-        if (static_cast<int32_t>(r.water_counter_frame[i] - r.water_counter_published_frame) >= 0) {
+        const uint32_t readback_frame = pt::g_pt_panel.regir_water_pending_frame[i];
+        const uint64_t owner_generation = pt::g_pt_panel.regir_water_pending_owner_generation[i];
+        const uint32_t owner = pt::g_pt_panel.regir_water_pending_owner[i];
+        const bool submission_matches = pt::g_pt_panel.regir_water_submission_frame == readback_frame
+                                        && pt::g_pt_panel.regir_water_submission_owner_generation == owner_generation
+                                        && owner == r.water_main_slot;
+        const bool identity_matches = owner_generation != 0u && pt::g_pt_panel.regir_active
+                                      && pt::g_pt_panel.regir_owner_generation == owner_generation;
+        if (submission_matches && identity_matches && readback_frame == r.water_counter_frame[i]
+            && static_cast<int32_t>(readback_frame - r.water_counter_published_frame) >= 0) {
           pt::g_pt_panel.gpu_water_pixels = values[5];
           pt::g_pt_panel.gpu_water_traces = values[6];
+          pt::g_pt_panel.regir_water_counts_available = true;
+          pt::g_pt_panel.regir_water_counts_frame = readback_frame;
+          pt::g_pt_panel.regir_water_counts_owner_generation = owner_generation;
+          pt::g_pt_panel.regir_water_eligible = values[9];
+          pt::g_pt_panel.regir_water_lookups = values[10];
+          pt::g_pt_panel.regir_water_matches = values[11];
+          pt::g_pt_panel.regir_water_misses = values[12];
+          pt::g_pt_panel.regir_water_invalid_headers = values[13];
+          pt::g_pt_panel.regir_water_invalid_slots = values[14];
+          pt::g_pt_panel.regir_water_selections = values[15];
+          pt::g_pt_panel.regir_water_fallback_disabled = values[16];
+          pt::g_pt_panel.regir_water_fallback_key = values[17];
+          pt::g_pt_panel.regir_water_fallback_miss = values[18];
+          pt::g_pt_panel.regir_water_fallback_header = values[19];
+          pt::g_pt_panel.regir_water_fallback_slots = values[20];
           r.water_counter_published_frame = r.water_counter_frame[i];
         }
       }
@@ -1254,6 +1331,7 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   const uint64_t water_perf_epoch = bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed);
   const bool water_perf_timing = rtxdi::CanStartGpuTiming(water_perf_gather, s.timestamp_frequency, r.perf_pending[water_block])
                                  && r.perf_queries && r.perf_readback;
+  if (water_perf_timing) r.perf_valid_mask[water_block] = 0u;
   if (water_perf_gather && s.timestamp_frequency == 0u) {
     rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.pt_timing_skip_events);
   } else if (water_perf_gather && r.perf_pending[water_block]) {
@@ -1333,11 +1411,19 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   table.ptr += static_cast<UINT64>(base) * s.descriptor_size;
   list->SetComputeRootDescriptorTable(1u, table);
   if (water_perf_timing) list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * water_block);
+  if (water_perf_timing) list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                        2u * kRt12PtPerfBlocks + 8u * water_block + 6u);
   list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
   if (water_perf_timing) {
     list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * water_block + 1u);
+    list->EndQuery(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                   2u * kRt12PtPerfBlocks + 8u * water_block + 7u);
+    r.perf_valid_mask[water_block] = 8u;
     list->ResolveQueryData(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u * water_block, 2u, r.perf_readback.Get(),
                            16ull * water_block);
+    const uint32_t trace_query = 2u * kRt12PtPerfBlocks + 8u * water_block + 6u;
+    list->ResolveQueryData(r.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, trace_query, 2u, r.perf_readback.Get(),
+                           16ull * kRt12PtPerfBlocks + 64ull * water_block + 48ull);
   }
   barriers.clear();
   Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -1399,6 +1485,15 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
     r.water_counter_fence[k] = b;
     r.water_counter_frame[k] = frame;
     r.water_counter_pending[k] = true;
+    std::lock_guard lock(pt::g_pt_panel_mutex);
+    pt::g_pt_panel.regir_water_pending_frame[k] = frame;
+    pt::g_pt_panel.regir_water_pending_owner_generation[k] = r.water_params[48] != 0u ? regir_identity.owner_generation : 0u;
+    pt::g_pt_panel.regir_water_pending_owner[k] = r.water_params[48] != 0u ? regir_slot : UINT32_MAX;
+    pt::g_pt_panel.regir_water_submission_frame = frame;
+    pt::g_pt_panel.regir_water_submission_owner_generation = r.water_params[48] != 0u ? regir_identity.owner_generation : 0u;
+    pt::g_pt_panel.regir_water_counts_available = false;
+    pt::g_pt_panel.regir_water_counts_frame = 0u;
+    pt::g_pt_panel.regir_water_counts_owner_generation = 0u;
   }
   scene.fence_value = (std::max)(scene.fence_value, b);
   input.fence_value = (std::max)(input.fence_value, b);

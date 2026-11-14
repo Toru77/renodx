@@ -878,7 +878,7 @@ int main() {
       GpuCell cell = {};
       cell.valid = 1u;
       std::fill(std::begin(cell.slots), std::end(cell.slots), 0u);
-      RtxdiLightTableEntry lights[2] = {};
+      RtxdiLightTableEntry lights[RTXDI_LIGHT_TABLE_CAPACITY] = {};
       lights[0].radius = 1.f;
       lights[0].power = 1.f;
       lights[0].type = RTXDI_LIGHT_TABLE_TYPE_POINT;
@@ -920,7 +920,7 @@ int main() {
         desc.Buffer.StructureByteStride = stride;
         d12->CreateUnorderedAccessView(buffers[resource].Get(), nullptr, &desc, handle);
       };
-      srv(0, 0, 2, 2, sizeof(RtxdiLightTableEntry));
+      srv(0, 0, 2, RTXDI_LIGHT_TABLE_CAPACITY, sizeof(RtxdiLightTableEntry));
       srv(0, 1, 0, 1, sizeof(header));
       srv(0, 2, 1, 1, sizeof(cell));
       uav(0, 3, RTXDI_LIGHT_TABLE_CAPACITY, sizeof(float));
@@ -934,9 +934,54 @@ int main() {
       if (!check(d12->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&pipelines[0])), "create ReGIR weights PSO")) return 1;
       pipeline_desc.CS = {__world_regir_build.data(), __world_regir_build.size()};
       if (!check(d12->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&pipelines[1])), "create ReGIR build PSO")) return 1;
-      const char* case_names[] = {"two-light", "reordered two-light", "zero-light", "invalid-header", "all-zero/invalid-light", "over-capacity-count"};
+      const auto original_scans = [&](const float* weights, uint32_t count, const std::array<float, 8>& draws) {
+        GpuCell expected = {};
+        expected.valid = 1u;
+        std::fill(std::begin(expected.slots), std::end(expected.slots), RTXDI_LIGHT_TABLE_INVALID_INDEX);
+        for (uint32_t slot = 0; slot < 8; ++slot) {
+          float cumulative = 0.f;
+          for (uint32_t light_index = 0; light_index < count; ++light_index) {
+            if (std::isfinite(weights[light_index]) && weights[light_index] > 0.f) cumulative += weights[light_index];
+            if (draws[slot] < cumulative) {
+              expected.slots[slot] = light_index;
+              break;
+            }
+          }
+          if (expected.slots[slot] >= count) expected.valid = 0u;
+        }
+        return expected;
+      };
+      const float sentinel_weights[] = {1.f};
+      const std::array<float, 8> sentinel_draws = {1.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+      const GpuCell sentinel_original = original_scans(sentinel_weights, 1u, sentinel_draws);
+      GpuCell sentinel_combined = {};
+      sentinel_combined.valid = 1u;
+      std::fill(std::begin(sentinel_combined.slots), std::end(sentinel_combined.slots), RTXDI_LIGHT_TABLE_INVALID_INDEX);
+      float sentinel_cumulative = 0.f;
+      uint32_t sentinel_assigned = 0u;
+      for (uint32_t light_index = 0; light_index < 1u && sentinel_assigned < 8u; ++light_index) {
+        if (std::isfinite(sentinel_weights[light_index]) && sentinel_weights[light_index] > 0.f) sentinel_cumulative += sentinel_weights[light_index];
+        for (uint32_t slot = 0; slot < 8u; ++slot) {
+          if (sentinel_combined.slots[slot] == RTXDI_LIGHT_TABLE_INVALID_INDEX && sentinel_draws[slot] < sentinel_cumulative) {
+            sentinel_combined.slots[slot] = light_index;
+            ++sentinel_assigned;
+          }
+        }
+      }
+      for (uint32_t slot : sentinel_combined.slots) if (slot >= 1u) sentinel_combined.valid = 0u;
+      bool sentinel_ok = sentinel_original.valid == 0u && sentinel_combined.valid == 0u;
+      for (uint32_t slot = 0; slot < 8u; ++slot) {
+        const uint32_t expected = slot == 0u ? RTXDI_LIGHT_TABLE_INVALID_INDEX : 0u;
+        sentinel_ok = sentinel_ok && sentinel_original.slots[slot] == expected && sentinel_combined.slots[slot] == expected;
+      }
+      if (!sentinel_ok) {
+        std::fprintf(stderr, "FAIL ReGIR CPU unresolved-slot control flow\n");
+        return 1;
+      }
+      std::printf("PASS ReGIR CPU unresolved-slot control flow\n");
+      const char* case_names[] = {"two-light", "reordered two-light", "zero-light", "invalid-header", "all-zero/invalid-light", "over-capacity-count", "one-light", "equal weights", "interspersed zero and invalid weights", "strongly skewed weights", "1024 repeated weights", "1024 reordered weights"};
       float original_weights[2] = {};
-      for (UINT fixture_case = 0; fixture_case < 6; ++fixture_case) {
+      for (UINT fixture_case = 0; fixture_case < 12; ++fixture_case) {
         if (fixture_case == 1) std::swap(lights[0], lights[1]);
         if (fixture_case == 3) header[3] = 0u;
         if (fixture_case == 4) {
@@ -951,6 +996,21 @@ int main() {
             light.radius = 1.f;
             light.power = 1.f;
             light.type = RTXDI_LIGHT_TABLE_TYPE_POINT;
+          }
+        }
+        if (fixture_case >= 6) {
+          header[3] = 1u;
+          for (UINT index = 0; index < RTXDI_LIGHT_TABLE_CAPACITY; ++index) {
+            lights[index] = {};
+            lights[index].radius = 1.f;
+            lights[index].power = fixture_case == 9 ? (index == 3 ? 10000.f : 1.f)
+                                  : (fixture_case == 10 ? static_cast<float>(1u + index % 3u)
+                                     : (fixture_case == 11 ? static_cast<float>(3u - index % 3u) : 1.f));
+            lights[index].type = RTXDI_LIGHT_TABLE_TYPE_POINT;
+          }
+          if (fixture_case == 8) {
+            lights[1].power = 0.f;
+            lights[3].radius = 0.f;
           }
         }
         const void* initial[] = {header, &cell, lights};
@@ -984,7 +1044,7 @@ int main() {
       initial_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
       list->ResourceBarrier(1, &initial_barrier);
       list->SetComputeRootSignature(root.Get());
-      const uint32_t params[2] = {fixture_case == 2 ? 0u : (fixture_case == 5 ? RTXDI_LIGHT_TABLE_CAPACITY + 1u : 2u), 1u};
+      const uint32_t params[2] = {fixture_case == 2 ? 0u : (fixture_case == 5 ? RTXDI_LIGHT_TABLE_CAPACITY + 1u : (fixture_case == 6 ? 1u : (fixture_case >= 10 ? RTXDI_LIGHT_TABLE_CAPACITY : (fixture_case >= 7 ? 8u : 2u)))), fixture_case >= 6 ? fixture_case * 17u : 1u};
       list->SetComputeRoot32BitConstants(0, 2, params, 0);
       ID3D12DescriptorHeap* active_heap[] = {heaps[0].Get()};
       list->SetDescriptorHeaps(1, active_heap);
@@ -1030,17 +1090,39 @@ int main() {
         weights_ok = weights_ok && weights[0] == original_weights[1] && weights[1] == original_weights[0];
       } else if (fixture_case == 5) {
         weights_ok = weights_ok && weights[0] > 0.f && weights[1] > 0.f;
-      } else {
+      } else if (fixture_case < 6) {
         weights_ok = weights_ok && weights[0] == 0.f && weights[1] == 0.f;
+      } else {
+        for (uint32_t index = 0; index < params[0]; ++index) {
+          const bool zero = fixture_case == 8 && (index == 1u || index == 3u);
+          weights_ok = weights_ok && (zero ? weights[index] == 0.f : std::isnormal(weights[index]) && weights[index] > 0.f);
+        }
       }
-      const float current_weights[2] = {weights[0], weights[1]};
+      GpuCell expected = {};
+      std::fill(std::begin(expected.slots), std::end(expected.slots), RTXDI_LIGHT_TABLE_INVALID_INDEX);
+      if (header[3] != 0u && params[0] != 0u && params[0] <= RTXDI_LIGHT_TABLE_CAPACITY) {
+        float total = 0.f;
+        for (uint32_t index = 0; index < params[0]; ++index) if (std::isfinite(weights[index]) && weights[index] > 0.f) total += weights[index];
+        if (std::isfinite(total) && total > 0.f) {
+          std::array<float, 8> draws = {};
+          for (uint32_t slot = 0; slot < 8u; ++slot) {
+            uint32_t hash = params[1] * 0x9e3779b9u ^ slot * 0x85ebca6bu;
+            hash ^= hash >> 16; hash *= 0x7feb352du; hash ^= hash >> 15; hash *= 0x846ca68bu; hash ^= hash >> 16;
+            draws[slot] = static_cast<float>(hash >> 8) * (1.f / 16777216.f) * total;
+            float cumulative = 0.f;
+            for (uint32_t index = 0; index < params[0]; ++index) {
+              if (std::isfinite(weights[index]) && weights[index] > 0.f) cumulative += weights[index];
+              if (std::abs(draws[slot] - cumulative) <= total * 1e-7f) weights_ok = false;
+            }
+          }
+          expected = original_scans(weights, params[0], draws);
+        }
+      }
       buffers[5]->Unmap(0, nullptr);
       if (!check(buffers[6]->Map(0, nullptr, &mapped), "map ReGIR cells")) return 1;
       const auto* result = static_cast<const GpuCell*>(mapped);
-      bool cells_ok = result->valid == (fixture_case < 2 ? 1u : 0u);
-      for (uint32_t slot : result->slots) {
-        cells_ok = cells_ok && (fixture_case < 2 ? (slot < 2 && current_weights[slot] > 0.f) : slot == RTXDI_LIGHT_TABLE_INVALID_INDEX);
-      }
+      bool cells_ok = result->valid == expected.valid;
+      for (uint32_t slot = 0; slot < 8u; ++slot) cells_ok = cells_ok && result->slots[slot] == expected.slots[slot];
       buffers[6]->Unmap(0, nullptr);
       if (!weights_ok || !cells_ok) {
         std::fprintf(stderr, "FAIL ReGIR production %s GPU readback\n", case_names[fixture_case]);
@@ -1154,7 +1236,7 @@ int main() {
       }
       if (!check(list->Close(), "close registration list")) return 1;
       queue->ExecuteCommandLists(1, lists);
-      const UINT64 registration_fence = 9u + fixture_case;
+      const UINT64 registration_fence = 15u + fixture_case;
       if (!check(queue->Signal(fence.Get(), registration_fence), "signal registration")) return 1;
       deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
       while (fence->GetCompletedValue() < registration_fence && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));

@@ -80,6 +80,51 @@ inline std::string SerializePtReport() {
   out << "regir requested: " << p.regir_requested << "\n";
   out << "regir active: " << p.regir_active << "\n";
   out << "regir uniform fallback: " << p.regir_fallback_reason << "\n";
+  out << "regir per-hit main counts available: " << p.gpu_available << "\n";
+  out << "regir per-hit water counts available: " << p.regir_water_counts_available << "\n";
+  out << "regir main eligible calls: " << p.regir_eligible << "\n";
+  out << "regir main lookup attempts: " << p.regir_lookups << "\n";
+  out << "regir main valid-cell matches: " << p.regir_matches << "\n";
+  out << "regir main misses: " << p.regir_misses << "\n";
+  out << "regir main invalid headers: " << p.regir_invalid_headers << "\n";
+  out << "regir main invalid slots: " << p.regir_invalid_slots << "\n";
+  out << "regir main successful selections: " << p.regir_selections << "\n";
+  out << "regir main uniform fallback disabled: " << p.regir_fallback_disabled << "\n";
+  out << "regir main uniform fallback key: " << p.regir_fallback_key << "\n";
+  out << "regir main uniform fallback miss: " << p.regir_fallback_miss << "\n";
+  out << "regir main uniform fallback header: " << p.regir_fallback_header << "\n";
+  out << "regir main uniform fallback slots: " << p.regir_fallback_slots << "\n";
+  out << "regir water readback frame: " << p.regir_water_counts_frame << "\n";
+  out << "regir water readback owner generation: " << p.regir_water_counts_owner_generation << "\n";
+  out << "regir water submission frame: " << p.regir_water_submission_frame << "\n";
+  out << "regir water submission owner generation: " << p.regir_water_submission_owner_generation << "\n";
+  if (p.regir_water_counts_available) {
+  out << "regir water eligible calls: " << p.regir_water_eligible << "\n";
+  out << "regir water lookup attempts: " << p.regir_water_lookups << "\n";
+  out << "regir water valid-cell matches: " << p.regir_water_matches << "\n";
+  out << "regir water misses: " << p.regir_water_misses << "\n";
+  out << "regir water invalid headers: " << p.regir_water_invalid_headers << "\n";
+  out << "regir water invalid slots: " << p.regir_water_invalid_slots << "\n";
+  out << "regir water successful selections: " << p.regir_water_selections << "\n";
+  out << "regir water uniform fallback disabled: " << p.regir_water_fallback_disabled << "\n";
+  out << "regir water uniform fallback key: " << p.regir_water_fallback_key << "\n";
+  out << "regir water uniform fallback miss: " << p.regir_water_fallback_miss << "\n";
+  out << "regir water uniform fallback header: " << p.regir_water_fallback_header << "\n";
+  out << "regir water uniform fallback slots: " << p.regir_water_fallback_slots << "\n";
+  } else {
+    out << "regir water counters: unavailable/stale\n";
+  }
+  for (uint32_t pass = 0u; pass < 2u; ++pass) {
+    const char* pass_name = pass == 0u ? "main" : "water";
+    for (uint32_t interval = 0u; interval < 4u; ++interval) {
+      out << "pt " << pass_name << " interval " << interval << " valid: "
+          << ((p.pt_interval_valid[pass] & (1u << interval)) != 0u) << "\n";
+      if ((p.pt_interval_valid[pass] & (1u << interval)) != 0u) {
+        out << "pt " << pass_name << " interval " << interval << " last ms: " << p.pt_interval_last_ms[pass][interval] << "\n";
+        out << "pt " << pass_name << " interval " << interval << " average ms: " << p.pt_interval_average_ms[pass][interval] << "\n";
+      }
+    }
+  }
   out << "regir owner generation: " << p.regir_owner_generation << "\n";
   out << "regir transfer configuration: " << p.regir_transfer_configuration << "\n";
   out << "regir counts available: " << p.regir_counts_available << "\n";

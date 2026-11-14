@@ -120,6 +120,22 @@ struct PtPanel {
   uint32_t gpu_water_pixels = 0u, gpu_water_traces = 0u;
   const char* water_reason = "off";
   uint32_t gpu_exact = 0u, gpu_hits = 0u, gpu_misses = 0u, gpu_lock_drops = 0u, gpu_writes = 0u;
+  uint32_t regir_eligible = 0u, regir_lookups = 0u, regir_matches = 0u, regir_misses = 0u;
+  uint32_t regir_invalid_headers = 0u, regir_invalid_slots = 0u, regir_selections = 0u;
+  uint32_t regir_fallback_disabled = 0u, regir_fallback_key = 0u, regir_fallback_miss = 0u;
+  uint32_t regir_fallback_header = 0u, regir_fallback_slots = 0u;
+  uint32_t regir_water_eligible = 0u, regir_water_lookups = 0u, regir_water_matches = 0u, regir_water_misses = 0u;
+  uint32_t regir_water_invalid_headers = 0u, regir_water_invalid_slots = 0u, regir_water_selections = 0u;
+  uint32_t regir_water_fallback_disabled = 0u, regir_water_fallback_key = 0u, regir_water_fallback_miss = 0u;
+  uint32_t regir_water_fallback_header = 0u, regir_water_fallback_slots = 0u;
+  bool regir_water_counts_available = false;
+  uint32_t regir_water_counts_frame = 0u, regir_water_submission_frame = UINT32_MAX;
+  uint64_t regir_water_counts_owner_generation = 0u, regir_water_submission_owner_generation = 0u;
+  uint32_t regir_water_pending_frame[3] = {};
+  uint64_t regir_water_pending_owner_generation[3] = {};
+  uint32_t regir_water_pending_owner[3] = {};
+  float pt_interval_last_ms[2][4] = {}, pt_interval_average_ms[2][4] = {};
+  uint8_t pt_interval_valid[2] = {};
   uint32_t sparse_selected = 0u, sparse_valid = 0u;
   uint64_t gpu_frame = 0u;
   bool gpu_available = false, sparse_sample_active = false;
@@ -181,6 +197,14 @@ inline void DrawPtPanel() {
   ImGui::Text("Material cache: %s  capacity 2^%u  write 1/%u px  clears %llu (last: %s)", p.mat_on ? "on" : "off",
               p.mat_capacity_log2, p.mat_rate * p.mat_rate, static_cast<unsigned long long>(p.mat_clears), p.mat_clear_reason);
   ImGui::Text("Reflection: %s", p.refl_on ? "on" : "off");
+  static const char* interval_names[] = {"ReGIR register", "ReGIR weights", "ReGIR build", "PT trace"};
+  for (uint32_t pass = 0u; pass < 2u; ++pass) {
+    for (uint32_t interval = 0u; interval < 4u; ++interval) {
+      if ((p.pt_interval_valid[pass] & (1u << interval)) == 0u) continue;
+      ImGui::Text("PT %s %s: %.3f ms (avg %.3f ms)", pass == 0u ? "main" : "water", interval_names[interval],
+                  p.pt_interval_last_ms[pass][interval], p.pt_interval_average_ms[pass][interval]);
+    }
+  }
   ImGui::Text("Water surface: %s, reason %s, pixels %u, traces %u", p.water_on ? "on" : "off", p.water_reason, p.gpu_water_pixels,
               p.gpu_water_traces);
   ImGui::Text("Water roughness: %.2f x scale %.2f", g_pt_reflection_water_roughness, g_pt_reflection_roughness_scale);
@@ -193,6 +217,23 @@ inline void DrawPtPanel() {
     ImGui::Text("GPU material lookups, frame %llu (age %u): exact %u, hits %u, grey misses %u; writes %u, lock drops %u",
                 static_cast<unsigned long long>(p.gpu_frame), age,
                 p.gpu_exact, p.gpu_hits, p.gpu_misses, p.gpu_writes, p.gpu_lock_drops);
+    ImGui::Text("ReGIR main hits: eligible %u, lookups %u, matches %u, misses %u, invalid header/slots %u/%u, selected %u",
+                p.regir_eligible, p.regir_lookups, p.regir_matches, p.regir_misses, p.regir_invalid_headers,
+                p.regir_invalid_slots, p.regir_selections);
+    ImGui::Text("ReGIR main uniform fallback: disabled %u, key %u, miss %u, header %u, slots %u",
+                p.regir_fallback_disabled, p.regir_fallback_key, p.regir_fallback_miss, p.regir_fallback_header,
+                p.regir_fallback_slots);
+    if (p.regir_water_counts_available) {
+      ImGui::Text("ReGIR water hits (frame %u, owner generation %llu): eligible %u, lookups %u, matches %u, misses %u, invalid header/slots %u/%u, selected %u",
+                  p.regir_water_counts_frame, static_cast<unsigned long long>(p.regir_water_counts_owner_generation),
+                  p.regir_water_eligible, p.regir_water_lookups, p.regir_water_matches, p.regir_water_misses,
+                  p.regir_water_invalid_headers, p.regir_water_invalid_slots, p.regir_water_selections);
+      ImGui::Text("ReGIR water uniform fallback: disabled %u, key %u, miss %u, header %u, slots %u",
+                  p.regir_water_fallback_disabled, p.regir_water_fallback_key, p.regir_water_fallback_miss,
+                  p.regir_water_fallback_header, p.regir_water_fallback_slots);
+    } else {
+      ImGui::Text("ReGIR water hits: unavailable/stale");
+    }
   } else {
     ImGui::Text("GPU counters: unavailable");
   }

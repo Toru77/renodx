@@ -14,6 +14,8 @@ Sparse Rendering, adapted from OpenRemix and off by default, uses IS-FAST blue n
 
 The default-Off ReGIR path builds proposal pools from primary surfaces and looks up the actual hit position for light sampling, with uniform fallback when a matching valid pool is unavailable. Its discrete mixture PMF assumes an equiprobable 24-bit input; CPU and GPU fixtures do not establish game RNG statistics or replace owner validation. GPU readback exercises registration reconstruction, deduplication and overflow, the selector, reordered two-light weights/build, and invalid producer inputs; it does not prove production trace gates, main/water behavior, stale fallback, fence-failure handling, or owner game behavior.
 
+PT diagnostics report per-hit ReGIR lookup and fallback counters separately for main and water, with asynchronous pass timings; registration, weights, and build timings apply only to main submissions, while water reports its own trace interval.
+
 **Code:** [world/pt](world/pt/), [ReGIR registration](world/shaders/world_regir_register.cs_6_5.hlsl), [ReGIR weights](world/shaders/world_regir_weights.cs_6_5.hlsl), [ReGIR build](world/shaders/world_regir_build.cs_6_5.hlsl), [world/pt/pt_regir_contract.hpp](world/pt/pt_regir_contract.hpp), [world/shaders/world_pt_diffuse.cs_6_6.hlsl](world/shaders/world_pt_diffuse.cs_6_6.hlsl), [world/shaders/world_pt_sharc_update.cs_6_6.hlsl](world/shaders/world_pt_sharc_update.cs_6_6.hlsl), [world/shaders/world_pt_sharc_resolve.cs_6_6.hlsl](world/shaders/world_pt_sharc_resolve.cs_6_6.hlsl), [world/shaders/world_pt_material_write.cs_6_6.hlsl](world/shaders/world_pt_material_write.cs_6_6.hlsl).
 **Reference:** Open Remix `pathtrace.comp`.
 

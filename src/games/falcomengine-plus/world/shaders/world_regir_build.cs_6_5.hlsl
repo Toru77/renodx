@@ -30,19 +30,25 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     }
     if (isfinite(total) && total > 0.0) {
       cell.valid = 1u;
+      float draws[PT_REGIR_SLOTS];
       for (uint slot = 0u; slot < PT_REGIR_SLOTS; ++slot) {
         uint hash = cell_index ^ (g_frame * 0x9e3779b9u) ^ (slot * 0x85ebca6bu);
         hash ^= hash >> 16; hash *= 0x7feb352du; hash ^= hash >> 15; hash *= 0x846ca68bu; hash ^= hash >> 16;
-        const float draw = float(hash >> 8) * (1.0 / 16777216.0) * total;
-        float cumulative = 0.0;
-        for (uint light_index = 0u; light_index < count; ++light_index) {
-          const float weight = g_weights[offset + light_index];
-          if (isfinite(weight) && weight > 0.0) cumulative += weight;
-          if (draw < cumulative) {
+        draws[slot] = float(hash >> 8) * (1.0 / 16777216.0) * total;
+      }
+      float cumulative = 0.0;
+      uint assigned = 0u;
+      for (uint light_index = 0u; light_index < count && assigned < PT_REGIR_SLOTS; ++light_index) {
+        const float weight = g_weights[offset + light_index];
+        if (isfinite(weight) && weight > 0.0) cumulative += weight;
+        for (uint slot = 0u; slot < PT_REGIR_SLOTS; ++slot) {
+          if (cell.slots[slot] == RTXDI_LIGHT_TABLE_INVALID_INDEX && draws[slot] < cumulative) {
             cell.slots[slot] = light_index;
-            break;
+            ++assigned;
           }
         }
+      }
+      for (uint slot = 0u; slot < PT_REGIR_SLOTS; ++slot) {
         if (cell.slots[slot] >= count) cell.valid = 0u;
       }
     }

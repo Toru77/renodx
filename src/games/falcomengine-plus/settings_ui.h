@@ -286,35 +286,29 @@ struct ClassifiedRow {
   RowClass row_class;
 };
 
-// Classification temporarily toggles g_settings_mode so it can tell which rows
-// are visible in Basic mode, which exist only in Advanced mode, and which are
-// unavailable for the running game. Every is_visible lambda in this addon only
-// reads the mode flag and cached exe predicates, so the probe is deterministic.
-static std::vector<ClassifiedRow>& ClassifiedRows() {
-  static std::vector<ClassifiedRow> rows = []() {
-    std::vector<ClassifiedRow> result;
-    result.reserve(::settings.size());
-    const float saved_mode = g_settings_mode;
-    for (auto* setting : ::settings) {
-      if (setting == nullptr) continue;
-      if (setting->section == "Settings") {
-        result.push_back({setting, RowClass::Hidden});
-        continue;
-      }
-      g_settings_mode = 1.f;
-      const bool advanced_visible = (setting->is_visible == nullptr) || setting->is_visible();
-      g_settings_mode = 0.f;
-      const bool basic_visible = (setting->is_visible == nullptr) || setting->is_visible();
-      RowClass row_class = RowClass::Hidden;
-      if (advanced_visible) {
-        row_class = basic_visible ? RowClass::Basic : RowClass::Advanced;
-      }
-      result.push_back({setting, row_class});
+// Probe both modes against current visibility predicates.
+static std::vector<ClassifiedRow> ClassifiedRows() {
+  std::vector<ClassifiedRow> result;
+  result.reserve(::settings.size());
+  const float saved_mode = g_settings_mode;
+  for (auto* setting : ::settings) {
+    if (setting == nullptr) continue;
+    if (setting->section == "Settings") {
+      result.push_back({setting, RowClass::Hidden});
+      continue;
     }
-    g_settings_mode = saved_mode;
-    return result;
-  }();
-  return rows;
+    g_settings_mode = 1.f;
+    const bool advanced_visible = (setting->is_visible == nullptr) || setting->is_visible();
+    g_settings_mode = 0.f;
+    const bool basic_visible = (setting->is_visible == nullptr) || setting->is_visible();
+    RowClass row_class = RowClass::Hidden;
+    if (advanced_visible) {
+      row_class = basic_visible ? RowClass::Basic : RowClass::Advanced;
+    }
+    result.push_back({setting, row_class});
+  }
+  g_settings_mode = saved_mode;
+  return result;
 }
 
 static bool IsRowDrawable(const ClassifiedRow& row) {

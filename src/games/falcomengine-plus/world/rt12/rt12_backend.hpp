@@ -73,6 +73,7 @@ inline constexpr uint32_t kRt12Descriptors = 20u;
 inline constexpr uint32_t kRt12Timestamps = 7u;  // per slot: present 0..1, lighting 2..6
 inline constexpr uint32_t kRt12DiPerfSamples = 8u;  // RTXDI transfer-slot intervals (2 timestamps each): input, local, distance, NRD, initial, temporal, spatial, sun
 inline constexpr uint32_t kRt12PtPerfBlocks = 2u * kRt12Slots;  // PT timing blocks: main and water (one block per slot each)
+inline constexpr uint32_t kRt12PtPerfTimestamps = 10u;  // aggregate pair, then ReGIR register/weights/build and trace pairs
 inline constexpr uint32_t kRt12StatsWidth = 32u;
 inline constexpr uint64_t kRt12ArenaMinBytes = 1024ull * 1024ull;
 
@@ -407,7 +408,7 @@ struct Rt12DiTransferState {
 // Path-traced diffuse GI (world/pt): its own submission slots, list, root signature, PSO, descriptors and outputs.
 inline constexpr uint32_t kRt12PtDescriptors = 29u;
 inline constexpr uint32_t kRt12PtConstants = 52u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
-inline constexpr uint32_t kRt12PtCounters = 9u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
+inline constexpr uint32_t kRt12PtCounters = 21u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
 inline constexpr uint32_t kRt12ReGirDescriptors = 5u;
 inline constexpr uint32_t kRt12ReGirPasses = 3u;
 inline constexpr uint32_t kRt12ReGirConstants = 2u;
@@ -492,10 +493,11 @@ struct Rt12PtState {
   bool counter_sparse[kRt12Slots] = {};
   // M0t: main and water blocks; queries 2*block and 2*block+1; readback bytes 16*block.
   // Read only after the block's fence completed; never waits.
-  Microsoft::WRL::ComPtr<ID3D12QueryHeap> perf_queries;  // 2 * kRt12PtPerfBlocks
-  Microsoft::WRL::ComPtr<ID3D12Resource> perf_readback;  // 16 * kRt12PtPerfBlocks bytes, READBACK
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> perf_queries;  // kRt12PtPerfTimestamps * kRt12PtPerfBlocks
+  Microsoft::WRL::ComPtr<ID3D12Resource> perf_readback;  // 8 * kRt12PtPerfTimestamps * kRt12PtPerfBlocks bytes, READBACK
   uint64_t perf_fence[kRt12PtPerfBlocks] = {};
   uint64_t perf_epoch[kRt12PtPerfBlocks] = {};
+  uint8_t perf_valid_mask[kRt12PtPerfBlocks] = {};
   bool perf_pending[kRt12PtPerfBlocks] = {};
 };
 
@@ -1999,6 +2001,14 @@ inline void OnPresent(reshade::api::device* device) {
     s.rtxdi_gpu_completed_batches = 0u;
     s.rtxdi_perf_last_frame = UINT32_MAX;
     s.rtxdi_perf_epoch = perf_epoch;
+    {
+      std::lock_guard lock(pt::g_pt_panel_mutex);
+      for (uint32_t pass = 0u; pass < 2u; ++pass) {
+        pt::g_pt_panel.pt_interval_valid[pass] = 0u;
+        std::fill(std::begin(pt::g_pt_panel.pt_interval_average_ms[pass]),
+                  std::end(pt::g_pt_panel.pt_interval_average_ms[pass]), 0.f);
+      }
+    }
   }
   if (s.completion_available) {
     for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {
@@ -2057,6 +2067,11 @@ inline void OnPresent(reshade::api::device* device) {
       continue;
     const uint32_t pass = block / kRt12Slots;
     const bool identity_valid = perf_gather && pt.perf_epoch[block] == perf_epoch && pt.perf_readback;
+    const uint8_t valid_mask = pt.perf_valid_mask[block];
+    if (perf_gather && !identity_valid) {
+      std::lock_guard lock(pt::g_pt_panel_mutex);
+      pt::g_pt_panel.pt_interval_valid[pass] = 0u;
+    }
     uint64_t timestamps[2] = {};
     double milliseconds = 0.0;
     if (!identity_valid
@@ -2065,6 +2080,38 @@ inline void OnPresent(reshade::api::device* device) {
         || !rtxdi::AccumulateGpuSample(milliseconds, &s.pt_gpu_ms_sum[pass], &s.pt_gpu_samples[pass])) {
       if (perf_gather) rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.pt_timing_skip_events);
     }
+    if (identity_valid && pt.perf_fence[block] <= completed) {
+      uint8_t published_mask = valid_mask;
+      float interval_ms[4] = {};
+      for (uint32_t interval = 0u; interval < 4u; ++interval) {
+        if ((valid_mask & (1u << interval)) == 0u) continue;
+        uint64_t interval_timestamps[2] = {};
+        const uint32_t query = 2u * kRt12PtPerfBlocks + 8u * block + interval * 2u;
+        if (!ReadRt12Timestamps(pt.perf_readback.Get(), query, 2u, interval_timestamps)) {
+          published_mask &= static_cast<uint8_t>(~(1u << interval));
+          continue;
+        }
+        double milliseconds = 0.0;
+        if (!rtxdi::DecodeGpuTimestampPair(interval_timestamps[0], interval_timestamps[1], s.timestamp_frequency,
+                                           &milliseconds)) {
+          published_mask &= static_cast<uint8_t>(~(1u << interval));
+          continue;
+        }
+        interval_ms[interval] = static_cast<float>(milliseconds);
+      }
+      {
+        std::lock_guard lock(pt::g_pt_panel_mutex);
+        pt::g_pt_panel.pt_interval_valid[pass] = published_mask;
+        for (uint32_t interval = 0u; interval < 4u; ++interval) {
+          if ((published_mask & (1u << interval)) == 0u) continue;
+          pt::g_pt_panel.pt_interval_last_ms[pass][interval] = interval_ms[interval];
+          const float previous = pt::g_pt_panel.pt_interval_average_ms[pass][interval];
+          pt::g_pt_panel.pt_interval_average_ms[pass][interval] = previous == 0.f
+              ? interval_ms[interval] : previous * 0.875f + interval_ms[interval] * 0.125f;
+        }
+      }
+    }
+    pt.perf_valid_mask[block] = 0u;
   }
   for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {
     if (!rtxdi::ClaimCompletedGpuTiming(&slot.diag_pending, s.completion_available, slot.diag_snapshot.fence, completed)) continue;
