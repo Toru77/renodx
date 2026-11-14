@@ -4,6 +4,13 @@ Falcom Engine+ is RenoDX's game-specific graphics addon for Falcom-engine games.
 
 ## Technique index
 
+### Framework compatibility
+
+An optional restart-required setting keeps Falcom Engine+'s pipeline-layout tracking separate from other RenoDX add-ons, allowing incompatible tracker layouts to be tested together. It is off by default.
+
+**Code:** [`framework_compat.hpp`](framework_compat.hpp), [`addon.cpp`](addon.cpp).
+
+
 ### World capture and ray tracing
 
 #### Path-traced diffuse GI

@@ -32,6 +32,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "./framework_compat.hpp"
+
 #include "../../mods/shader.hpp"
 #include "../../utils/descriptor.hpp"
 #include "../../utils/dlss_hook.hpp"
@@ -807,6 +809,7 @@ static float g_isfast_temporal_speed = 1.f;
 static float g_isfast_seed_offset = 0.f;
 
 // -- Settings visibility --
+static float g_framework_compatibility = 0.f;
 static float g_settings_mode = 0.f;  // 0=Basic, 1=Advanced
 static bool IsAdvancedSettingsMode() { return g_settings_mode >= 0.5f; }
 
@@ -2785,6 +2788,18 @@ renodx::utils::settings::Settings settings = {
           }
         },
         .is_global = true,
+    },
+    new renodx::utils::settings::Setting{
+        .key = "FrameworkCompatibility",
+        .binding = &g_framework_compatibility,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Framework Compatibility (Restart Required)",
+        .section = "Compatibility",
+        .tooltip = "Separates pipeline-layout tracking from other RenoDX add-ons. Enable when using add-ons built with incompatible RenoDX versions. Restart the game to apply.",
+        .labels = {"Off", "On"},
+        .is_global = true,
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // �� IS-FAST Master Toggle (top-level) ��
     new renodx::utils::settings::Setting{
@@ -17712,6 +17727,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
+      reshade::get_config_value(nullptr, renodx::utils::settings::global_name.c_str(), "FrameworkCompatibility", falcom_framework_compat::isolate_pipeline_layout);
+      reshade::log::message(reshade::log::level::info,
+                            falcom_framework_compat::isolate_pipeline_layout
+                                ? "[Falcom Engine+] Framework compatibility enabled for this session."
+                                : "[Falcom Engine+] Framework compatibility disabled for this session.");
       renodx::utils::settings::use_presets = false;
       renodx::mods::shader::force_pipeline_cloning = true;
       renodx::mods::shader::allow_multiple_push_constants = true;
