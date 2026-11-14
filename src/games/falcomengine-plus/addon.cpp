@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (C) 2026
  * SPDX-License-Identifier: MIT
  */
@@ -2793,7 +2793,7 @@ renodx::utils::settings::Settings settings = {
         .key = "FrameworkCompatibility",
         .binding = &g_framework_compatibility,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f,
+        .default_value = 1.f,
         .label = "Framework Compatibility (Restart Required)",
         .section = "Compatibility",
         .tooltip = "Separates pipeline-layout tracking from other RenoDX add-ons. Enable when using add-ons built with incompatible RenoDX versions. Restart the game to apply.",
