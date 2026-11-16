@@ -61,3 +61,7 @@ For human discoverability, `.agents/skills/README.md` summarizes the skills and 
 - For C++ parameters, use pointers for modifiable/out values and `const&` for non-modified inputs that should not be copied; avoid non-const references except established callback/API signatures.
 - Validate changes with the smallest relevant build target or manual verification path.
 
+## Graphify scope
+
+- For work on a game under `src/games/<game>`, treat that game directory as the Graphify project root. If its `graphify-out/graph.json` is missing, first run `graphify extract "<game-directory>" --code-only`; consult that graph for code investigation and run `graphify update "<game-directory>"` after each implementation. Pass `--graph "<game-directory>/graphify-out/graph.json"` to queries when outside that directory.
+- Do not build a graph for the entire RenoDX repository as a default. For work spanning multiple games, use a separate graph per relevant game. For work outside a game, select the smallest relevant subsystem directory as the graph root. Follow narrower project instructions and verify graph findings against source.
