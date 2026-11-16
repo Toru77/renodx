@@ -7,7 +7,7 @@
 
 #include "gtvbao_common.hlsl"
 #ifndef GTVBAO_GI
-#include "../world/shaders/world_rt_denoise.hlsli"
+#include "../../world/shaders/world_rt_denoise.hlsli"
 #endif
 
 Texture2D<lpfloat>     g_srcWorkingDepth   : register(t0);

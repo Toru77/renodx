@@ -83,7 +83,7 @@ Texture2D<float4> prevTexture : register(t3);
 Texture3D<float2> csIsfastNoise : register(t35);  // IS-FAST volume, custom camera pass dither
 
 #include "../../../shared.h"
-#include "../../../shadows/shadows_common.hlsli"
+#include "../../../customshaders/shadows/shadows_common.hlsli"
 #include "../../../reference/rendering.hlsl"
 
 

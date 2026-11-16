@@ -9,5 +9,5 @@
 #define FXAA_QUALITY__PRESET 29
 #define FXAA_LUMA_SEPARATE_R8 1
 #define FXAA_GATHER4_ALPHA 0
-#include "../reference/taa/Fxaa3_11.h"
+#include "../../reference/taa/Fxaa3_11.h"
 #include "fxaa_common.hlsli"

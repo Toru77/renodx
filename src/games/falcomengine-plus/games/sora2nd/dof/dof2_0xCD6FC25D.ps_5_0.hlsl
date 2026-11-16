@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Sora 2nd DoF gather (bokeh) pass -- per-game shell only.
 //
-// The whole algorithm is not here. It lives in dof/dof_common.hlsli and is shared
+// The whole algorithm is not here. It lives in customshaders/dof/dof_common.hlsli and is shared
 // verbatim with the other gather pass.
 //
 // This pass is also what Sora 1st uses: it has a CoC pass of its own (0x1CA8DE95)
@@ -17,4 +17,4 @@
 // D3D9 debug-annotation ordering FXC is free to vary across an include boundary.
 // ─────────────────────────────────────────────────────────────────────────────
 #define DOF_PASS_GATHER
-#include "../../../dof/dof_common.hlsli"
+#include "../../../customshaders/dof/dof_common.hlsli"

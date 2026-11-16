@@ -27,7 +27,7 @@
 
 // Falcom MRT world-normal decode, shared with the shadow compute passes.
 // Must come first: the helpers below and GTVBAO.hlsli both call it.
-#include "../include/mrt_normal.hlsli"
+#include "../../include/mrt_normal.hlsli"
 
 // ── Game's scene constant buffer (b0) ──
 // Must be declared BEFORE GTVBAO.hlsli so GTVBAO_MainPass can reference its members.

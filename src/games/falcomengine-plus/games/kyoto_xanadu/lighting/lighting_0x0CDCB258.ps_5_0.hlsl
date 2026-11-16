@@ -193,7 +193,7 @@ Texture3D<float2> csIsfastNoise : register(t35);
 Texture2D<float4> csDepthTex : register(t36);
 
 #include "../../../shared.h"
-#include "../../../shadows/shadows_common.hlsli"
+#include "../../../customshaders/shadows/shadows_common.hlsli"
 
 
 // 3Dmigoto declarations

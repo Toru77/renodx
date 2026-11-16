@@ -21,7 +21,7 @@
 // and no extra push fields are needed. mb_working_w/h is FULL resolution here;
 // the gather is the pass that sees the halved values.
 
-#include "../shared.h"
+#include "../../shared.h"
 
 Texture2D<float4>   g_srcColor : register(t0);
 RWTexture2D<float4> g_outColor : register(u0);

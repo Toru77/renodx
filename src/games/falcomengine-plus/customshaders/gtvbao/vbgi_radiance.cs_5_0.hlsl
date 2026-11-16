@@ -5,8 +5,8 @@
 // Lamps follow the game's lamp tile lists (lightIndices_g) through world_rt_lamps.hlsli; shadow maps and specular are ignored.
 // Kai (M7.7): material from mrtTexture1.x, emissive factor from mrtTexture0.z, sun from the game's cascaded shadow maps with saturate(dot(N, -L)); no mrtTexture2.
 
-#include "../include/mrt_normal.hlsli"
-#include "../world/shaders/world_rt_lamps.hlsli"
+#include "../../include/mrt_normal.hlsli"
+#include "../../world/shaders/world_rt_lamps.hlsli"
 #include "../taa/taa_reproject.hlsli"
 
 // The game's DeferredParam (144 bytes): emissive is head[0].w (byte 12), dynamicLightIntensity is mid.w (byte 76).

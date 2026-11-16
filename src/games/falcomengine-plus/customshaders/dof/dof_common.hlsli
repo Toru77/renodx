@@ -45,7 +45,7 @@
 #ifndef FALCOMENGINE_PLUS_DOF_COMMON_HLSLI_
 #define FALCOMENGINE_PLUS_DOF_COMMON_HLSLI_
 
-#include "../shared.h"
+#include "../../shared.h"
 
 cbuffer cb_dof : register(b2)
 {

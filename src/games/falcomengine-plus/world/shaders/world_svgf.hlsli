@@ -7,7 +7,7 @@
 // with the Sec. 4.4 edge stops, Eq. 4 to 6). "Non-paper" marks a value the paper does not give. No mesh ID, no MRT0 .w
 // read and no class or flag test in any SVGF pass.
 
-#include "../../taa/taa_common.hlsli"
+#include "../../customshaders/taa/taa_common.hlsli"
 #include "../../include/mrt_normal.hlsli"
 #include "world_rt_denoise.hlsli"
 

@@ -85,8 +85,8 @@ TextureCube<float4> dynCubeVanillaTex : register(t30);
 Texture3D<float2> dynCubeIsfastNoiseTex : register(t5);  // IS-FAST volume (128x128x32 RG8), pushed when usable
 
 #include "../../../shared.h"
-#include "../../../dyncube/dyncube_sample.hlsli"
-#include "../../../dyncube/dyncube_resolve.hlsli"
+#include "../../../customshaders/dyncube/dyncube_sample.hlsli"
+#include "../../../customshaders/dyncube/dyncube_resolve.hlsli"
 
 // Static point-clamp sampler for the IS-FAST noise volume (mirrors the custom
 // march sampling: stable texel values, frac-wrapped UVs stay in [0,1)).

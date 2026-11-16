@@ -25,7 +25,7 @@
 //   t6 materials    the game's deferredParams_g (DeferredParam, 144 bytes)
 //   u0 output       rgba8_unorm: .x point share, .y diagnostic code / 255, .z spot share, .w 1 = written
 
-#include "../world/shaders/world_rt_lamps.hlsli"
+#include "../../world/shaders/world_rt_lamps.hlsli"
 
 // The cb_scene subset of shadows_common.hlsli plus lightTileSizeInv_g, which Sora 1st, Sora 2nd and Kai declare at c29.
 cbuffer cb_scene : register(b0)

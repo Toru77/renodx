@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Kai DoF gather (bokeh) pass -- per-game shell only.
 //
-// The whole algorithm is not here. It lives in dof/dof_common.hlsli and is shared
+// The whole algorithm is not here. It lives in customshaders/dof/dof_common.hlsli and is shared
 // verbatim with the other gather pass.
 //
 // This pass has NO per-game content at all: it declares no cb_scene, and the two
@@ -14,4 +14,4 @@
 // D3D9 debug-annotation ordering FXC is free to vary across an include boundary.
 // ─────────────────────────────────────────────────────────────────────────────
 #define DOF_PASS_GATHER
-#include "../../../dof/dof_common.hlsli"
+#include "../../../customshaders/dof/dof_common.hlsli"

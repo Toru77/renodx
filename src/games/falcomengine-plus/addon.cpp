@@ -547,7 +547,7 @@ constexpr uint64_t kDynCubeLoadingStaleFrames = 5u;
 constexpr uint32_t DYNCUBE_VALIDITY_MAX_WAIT_TICKS = 8u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
 
-// -- Contact Shadows (shadows/*.cs_5_0.hlsl) --
+// -- Contact Shadows (customshaders/shadows/*.cs_5_0.hlsl) --
 // One compute pass per entry, so one layout/pipeline/table slot each. The index
 // is fixed and used to size the DeviceData arrays, so the shader, the host and
 // the two resource sets cannot drift apart.
@@ -702,7 +702,7 @@ static float ContactShadowQualitySamples(float quality) {
 }
 // Height the shaders divide pixel-denominated paper constants by, so a 4K
 // player sees the same blur as a 1080p player. Must match MB_REF_H in
-// motionblur/motion_blur_common.hlsli.
+// customshaders/motionblur/motion_blur_common.hlsli.
 constexpr float kMotionBlurRefHeight = 1080.0f;
 constexpr uint32_t kMotionBlurLogFrameGap = 120u;
 
@@ -945,7 +945,7 @@ static bool VbgiGameSupported() { return !IsKyoto() && !IsDaybreak2(); }
 static bool VbgiRowVisible() { return IsAdvancedSettingsMode() && VbgiGameSupported(); }
 static bool VbgiRunning() { return g_vbgi_enabled > 0.5f && VbgiGameSupported() && !falcom_world::rtao::RtaoRequested(); }
 static bool VbgiFarRunning() { return VbgiRunning() && g_vbgi_far_enabled > 0.5f; }
-// Local contact shadows run as a compute pass (shadows/contact_local.cs_5_0.hlsl) on the titles whose lighting shaders
+// Local contact shadows run as a compute pass (customshaders/shadows/contact_local.cs_5_0.hlsl) on the titles whose lighting shaders
 // read the term at t40. Off while RT Local Shadows is requested, as the Local Lights row is.
 static bool LocalContactComputeRunning() {
   return shader_injection.cs_contact_local_enabled > 0.5f && (IsSora1st() || IsSora2nd() || IsKai()) && !falcom_world::rtls::RtlsRequested();
@@ -1566,7 +1566,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // not, and a rejected UAV write leaves the target holding whatever was there
   // before, which reads as a plausible image rather than as a failure. The spare
   // channels carry the per-pixel diagnostic that makes the pass debuggable; see
-  // the layout block in shadows/shadows_common.hlsli.
+  // the layout block in customshaders/shadows/shadows_common.hlsli.
   reshade::api::resource contact_shadow_texture = {};
   reshade::api::resource_view contact_shadow_srv = {};
   reshade::api::resource_view contact_shadow_uav = {};
@@ -1575,7 +1575,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource contact_denoise_texture = {};
   reshade::api::resource_view contact_denoise_srv = {};
   reshade::api::resource_view contact_denoise_uav = {};
-  // Local contact target (shadows/contact_local.cs_5_0.hlsl): .x point share, .y diagnostic, .z spot share, .w written.
+  // Local contact target (customshaders/shadows/contact_local.cs_5_0.hlsl): .x point share, .y diagnostic, .z spot share, .w written.
   // Bound at t40 for the main lighting draws.
   reshade::api::resource contact_local_texture = {};
   reshade::api::resource_view contact_local_srv = {};
@@ -14245,7 +14245,7 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   d->resources_created = false;
 }
 
-// ----------- Contact Shadows (shadows/*.cs_5_0.hlsl) -----------
+// ----------- Contact Shadows (customshaders/shadows/*.cs_5_0.hlsl) -----------
 
 // Rebuilds the two rgba8_unorm targets at the depth buffer's resolution. The depth
 // buffer is the authority: both passes read it and both sample the G-buffer on the

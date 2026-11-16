@@ -2,7 +2,7 @@
 // Sora 2nd DoF CoC pass -- per-game shell only.
 //
 // The algorithm (Improved CoC curve plus the preserved 3Dmigoto vanilla path) is
-// not here; it lives in dof/dof_common.hlsli and is shared verbatim with Sora 1st
+// not here; it lives in customshaders/dof/dof_common.hlsli and is shared verbatim with Sora 1st
 // and Kai. Change it there and all three games change together.
 //
 // What genuinely belongs to this game is the cb_scene layout below, and nothing
@@ -67,4 +67,4 @@ cbuffer cb_scene : register(b0)
 }
 
 #define DOF_PASS_COC
-#include "../../../dof/dof_common.hlsli"
+#include "../../../customshaders/dof/dof_common.hlsli"

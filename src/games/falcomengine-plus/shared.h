@@ -438,7 +438,7 @@ struct ShaderInjectData {
   // —— Motion Blur (Guertin et al. 2013, Sora 2nd) ——
   // Deploy: 0=Off, 1=Cutscene Only (DoF draw), 2=Always On (tonemap draw).
   // Motion blur runs in UV space; every length below is a 1080p-equivalent
-  // pixel value and is converted by motionblur/motion_blur_common.hlsli, so a
+  // pixel value and is converted by customshaders/motionblur/motion_blur_common.hlsli, so a
   // 4K player sees the same blur as a 1080p player.
   // 0=Off, 1=Cutscene Only, 2=Always On. Read on the CPU as the single gate for
   // the whole chain; no shader reads it.
@@ -576,9 +576,9 @@ struct ShaderInjectData {
    // fallback instead. Set only while the push is active; reset every frame.
   float gtvbao_mrt_normal_debug;
   // ---- Contact Shadows compute pass (appended last: do not insert above) ----
-  // The contact term is computed in shadows/*.cs_5_0.hlsl and consumed by the lighting shaders; it supersedes the inline raymarches (char_shadow_* / env_sss_* / local_sss_* above, now retired).
+  // The contact term is computed in customshaders/shadows/*.cs_5_0.hlsl and consumed by the lighting shaders; it supersedes the inline raymarches (char_shadow_* / env_sss_* / local_sss_* above, now retired).
 
-  // Sun contact denoise (shadows/contact_denoise.cs_5_0.hlsl): a separable joint bilateral over
+  // Sun contact denoise (customshaders/shadows/contact_denoise.cs_5_0.hlsl): a separable joint bilateral over
   // the sun contact term. These take six retired micro shadow slots, so the layout does not move.
   float cs_contact_denoise_enabled;       // 0=Off, 1=On, default On
   float cs_contact_denoise_radius;        // [1..8] pixels per axis, default 4
@@ -586,7 +586,7 @@ struct ShaderInjectData {
   float cs_contact_denoise_normal_sigma;  // [0.01..1] edge stop on 1 - dot(Nc, Nt), default 0.1
   float cs_contact_denoise_passes;        // [1..4] horizontal + vertical iterations, default 1
   float cs_denoise_axis;                  // runtime: 0 = horizontal, 1 = vertical; set by RunShadows before each denoise dispatch
-  // Local contact denoise (shadows/contact_local_denoise.cs_5_0.hlsl): the same filter over the point (.x) and spot (.z)
+  // Local contact denoise (customshaders/shadows/contact_local_denoise.cs_5_0.hlsl): the same filter over the point (.x) and spot (.z)
   // shares of the local term. These take the five remaining retired micro shadow slots, so the layout does not move.
   float cs_contact_local_denoise_enabled;       // 0=Off, 1=On, default On
   float cs_contact_local_denoise_radius;        // [1..8] pixels per axis, default 4

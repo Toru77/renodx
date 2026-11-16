@@ -198,7 +198,7 @@ Texture3D<float2> csIsfastNoise : register(t35);
 // at t4; the shadow path takes its own binding to the same resource so the
 // element type can be fixed in the shared helper (see shadows_common.hlsli).
 Texture2D<float4> csDepthTex : register(t36);
-// t40 is the local contact term (shadows/contact_local.cs_5_0.hlsl; depth size): x point, z spot share of the lamp
+// t40 is the local contact term (customshaders/shadows/contact_local.cs_5_0.hlsl; depth size): x point, z spot share of the lamp
 // light the march blocks. Bound by DeployShadows while cs_contact_local_bound is set.
 Texture2D<float4> csLocalContactTex : register(t40);
 // t37 is the RTGI final GI (r11g11b10_float, depth size; world/rtgi), bound by RunRtgiInline while rtgi_gi_bound.
@@ -228,9 +228,9 @@ Texture2D<float4> rtsunTexture : register(t39);
 
 #include "../../../shared.h"
 #include "../../../world/shaders/world_rtxdi_debug.hlsli"
-#include "../../../shadows/shadows_common.hlsli"
-#include "../../../dyncube/dyncube_sample.hlsli"
-#include "../../../dyncube/dyncube_resolve.hlsli"
+#include "../../../customshaders/shadows/shadows_common.hlsli"
+#include "../../../customshaders/dyncube/dyncube_sample.hlsli"
+#include "../../../customshaders/dyncube/dyncube_resolve.hlsli"
 #include "../../../reference/brdf.hlsli"
 #include "../../../reference/rendering.hlsl"
 
@@ -1533,7 +1533,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   const float rtlsSpotVis = rtlsSpotOn
       ? 1.0 - min(rtlsTerm.y * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening) : 1.0;
   const float rtlsSpotCover = rtlsSpotOn ? rtlsTerm.z : 0.0;
-  // -- Local contact shadows (shadows/contact_local.cs_5_0.hlsl): x point, z spot share of the lamp light the march
+  // -- Local contact shadows (customshaders/shadows/contact_local.cs_5_0.hlsl): x point, z spot share of the lamp light the march
   // blocks; 0 = the game's behaviour. The material path (r20.y) picks Point/Spot or Env Point/Env Spot, as RTLS does.
   float2 csLocalShare = float2(0, 0);
   if (shader_injection_data.cs_contact_local_bound > 0.5f) {

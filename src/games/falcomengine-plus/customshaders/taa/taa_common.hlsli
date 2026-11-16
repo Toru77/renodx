@@ -26,7 +26,7 @@
 #ifndef FALCOMENGINE_PLUS_TAA_COMMON_HLSLI_
 #define FALCOMENGINE_PLUS_TAA_COMMON_HLSLI_
 
-#include "../shared.h"
+#include "../../shared.h"
 
 // Must match shared.h Custom TAA fields.
 #define CUSTOM_TAA_FILTER_BILINEAR 0

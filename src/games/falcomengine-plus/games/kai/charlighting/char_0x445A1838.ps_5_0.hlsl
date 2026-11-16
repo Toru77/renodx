@@ -89,7 +89,7 @@ Texture2D<float4> contactShadowTex : register(t34);    // Contact Shadows term +
 Texture3D<float2> csIsfastNoise : register(t35);       // IS-FAST volume, custom camera pass dither
 
 #include "../../../shared.h"
-#include "../../../shadows/shadows_common.hlsli"
+#include "../../../customshaders/shadows/shadows_common.hlsli"
 #include "../../../reference/rendering.hlsl"
 
 // 3Dmigoto declarations

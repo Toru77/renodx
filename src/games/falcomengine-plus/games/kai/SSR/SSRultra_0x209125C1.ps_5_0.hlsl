@@ -96,8 +96,8 @@ TextureCube<float4> dynCubeVanillaTex : register(t30);
 Texture3D<float2> dynCubeIsfastNoiseTex : register(t5);  // IS-FAST volume (128x128x32 RG8), pushed when usable
 
 #include "../../../shared.h"
-#include "../../../dyncube/dyncube_sample.hlsli"
-#include "../../../dyncube/dyncube_resolve.hlsli"
+#include "../../../customshaders/dyncube/dyncube_sample.hlsli"
+#include "../../../customshaders/dyncube/dyncube_resolve.hlsli"
 
 // Static cube sampler (game binds no cube sampler on ssr draws):
 // trilinear wrap is the cube-sampling standard.

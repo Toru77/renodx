@@ -18,10 +18,10 @@
 // before it is relied on.
 
 // User settings via push constants at b13 (shared.h).
-#include "../shared.h"
+#include "../../shared.h"
 
 // Falcom MRT world-normal decode, shared with the GTVBAO passes.
-#include "../include/mrt_normal.hlsli"
+#include "../../include/mrt_normal.hlsli"
 
 // ── Game's scene constant buffer (b0) ──
 // Must match the register layout of the game's own lighting shader. See the
@@ -83,7 +83,7 @@ float3 FalcomDirectionToLight()
 // the handedness is entirely in proj_g, and the sign guard below normalises it.
 // mul = -proj[3][2], add = proj[2][2], linear = mul / (add - deviceZ).
 // This is the same pair gtvbao_common.hlsl (BuildGTAOConstants) and
-// dyncube/dyncube_common.hlsli (DynCubeGetDepthUnpackConsts) derive; they
+// customshaders/dyncube/dyncube_common.hlsli (DynCubeGetDepthUnpackConsts) derive; they
 // cannot include this file because gtvbao declares its own b13 block.
 float2 FalcomDepthUnpackConsts()
 {

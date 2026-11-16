@@ -96,7 +96,7 @@ Texture2D<float4> Tex0 : register(t0);
 StructuredBuffer<InstanceParam> instances_g : register(t15);
 
 #include "../../../shared.h"
-#include "../../../foliage/grass_ao.hlsli"
+#include "../../../customshaders/foliage/grass_ao.hlsli"
 
 // 3Dmigoto declarations
 #define cmp -

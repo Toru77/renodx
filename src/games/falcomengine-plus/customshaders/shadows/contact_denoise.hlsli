@@ -12,7 +12,7 @@
 
 #define RENODX_SHADOWS_DECLARE_CB_SCENE
 #include "shadows_common.hlsli"
-#include "../world/shaders/world_rt_denoise.hlsli"
+#include "../../world/shaders/world_rt_denoise.hlsli"
 #if defined(CONTACT_DENOISE_LOCAL)
 #define CONTACT_DENOISE_RADIUS cs_contact_local_denoise_radius
 #define CONTACT_DENOISE_DEPTH_SIGMA cs_contact_local_denoise_depth_sigma

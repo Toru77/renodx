@@ -36,7 +36,7 @@
 // frame-to-frame jitter delta is ALREADY inside the value (every geometry
 // shader adds jitterDiff_g before writing the target), so no jitter term is
 // subtracted here — doing so would double-compensate. Same rule as the custom
-// TAA, see taa/taa_common.hlsli.
+// TAA, see customshaders/taa/taa_common.hlsli.
 //
 // The velocity texture re-expresses this in UV (pixels / texture dims) so
 // every downstream stage is resolution free. mb_intensity multiplies the
@@ -46,7 +46,7 @@
 #ifndef FALCOMENGINE_PLUS_MOTION_BLUR_COMMON_HLSLI_
 #define FALCOMENGINE_PLUS_MOTION_BLUR_COMMON_HLSLI_
 
-#include "../shared.h"
+#include "../../shared.h"
 
 // Reference height for all pixel-denominated paper constants (see header).
 #define MB_REF_H 1080.0

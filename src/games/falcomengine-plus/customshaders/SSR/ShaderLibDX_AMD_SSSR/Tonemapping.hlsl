@@ -17,7 +17,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#include "tonemappers.hlsl"
+#include "Tonemappers.hlsl"
 
 //--------------------------------------------------------------------------------------
 // Constant Buffer
@@ -29,9 +29,37 @@ cbuffer cbPerFrame : register(b0)
 }
 
 //--------------------------------------------------------------------------------------
+// I/O Structures
+//--------------------------------------------------------------------------------------
+struct VERTEX
+{
+    float2 vTexcoord : TEXCOORD;
+};
+
+//--------------------------------------------------------------------------------------
 // Texture definitions
 //--------------------------------------------------------------------------------------
-RWTexture2D<float4>      HDR              :register(u0);
+Texture2D        HDR              :register(t0);
+SamplerState     samLinearWrap    :register(s0);
+
+
+float3 Pattern(float2 vTexcoord)
+{
+    if (vTexcoord.x < .5)
+        return float3(.5, .5, .5);
+
+    uint y = vTexcoord.y * 720;
+    if ((y & 1) == 1)
+        return float3(1.0, 1.0, 1.0);
+
+
+    return float3(0, 0, 0);
+}
+
+float3 ApplyGamma(float3 color)
+{
+    return pow(abs(color.rgb), 1.0f / 2.2f);
+}
 
 float3 Tonemap(float3 color, float exposure, int tonemapper)
 {
@@ -53,14 +81,16 @@ float3 Tonemap(float3 color, float exposure, int tonemapper)
 // Main function
 //--------------------------------------------------------------------------------------
 
-[numthreads(WIDTH, HEIGHT, 1)]
-void main(uint3 dtID : SV_DispatchThreadID)
+float4 mainPS(VERTEX Input) : SV_Target
 {
-    int2 coord = dtID.xy;
+    if (u_exposure < 0)
+    {
+        return HDR.Sample(samLinearWrap, Input.vTexcoord);
+    }
 
-    float4 texColor = HDR.Load(int3(coord, 0));
+    float4 texColor = HDR.Sample(samLinearWrap, Input.vTexcoord);
 
     float3 color = Tonemap(texColor.rgb, u_exposure, u_toneMapper);
 
-    HDR[coord] = float4(color, texColor.a);
+    return float4(color, 1);
 }

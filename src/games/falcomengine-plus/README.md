@@ -109,14 +109,14 @@ The RR integration observes the game's D3D11 NGX session and initializes a separ
 
 GT-VBAO computes screen-space ambient occlusion by evaluating visibility bitmasks from depth and surface data, then filters and upscales the result. The local source identifies the upstream project, paper basis, and MIT license.
 
-**Code:** [`gtvbao`](gtvbao/), [`gtvbao/GTVBAO.h`](gtvbao/GTVBAO.h).
+**Code:** [`gtvbao`](customshaders/gtvbao/), [`gtvbao/GTVBAO.h`](customshaders/gtvbao/GTVBAO.h).
 **Reference:** [GameTechDev/GT-VBAO](https://github.com/GameTechDev/GT-VBAO), linked from the source header.
 
 #### GTVBGI / VBGI
 
 GTVBGI also uses visibility bitmasks to estimate indirect illumination. Far-field and multi-bounce paths have their own passes and history resources.
 
-**Code:** [`gtvbao`](gtvbao/), especially [`gtvbao_vbgi_main.cs_5_0.hlsl`](gtvbao/gtvbao_vbgi_main.cs_5_0.hlsl), [`vbgi_radiance.cs_5_0.hlsl`](gtvbao/vbgi_radiance.cs_5_0.hlsl), and [`vbgi_far_temporal.cs_5_0.hlsl`](gtvbao/vbgi_far_temporal.cs_5_0.hlsl).
+**Code:** [`gtvbao`](customshaders/gtvbao/), especially [`gtvbao_vbgi_main.cs_5_0.hlsl`](customshaders/gtvbao/gtvbao_vbgi_main.cs_5_0.hlsl), [`vbgi_radiance.cs_5_0.hlsl`](customshaders/gtvbao/vbgi_radiance.cs_5_0.hlsl), and [`vbgi_far_temporal.cs_5_0.hlsl`](customshaders/gtvbao/vbgi_far_temporal.cs_5_0.hlsl).
 **Source note:** the main-pass comment credits Mirko Salm's Shadertoy GT-VBGI implementation.
 
 #### Falcom SSGI
@@ -135,7 +135,7 @@ Character SSGI adjusts how Falcom's sampled SSGI signal contributes to character
 
 Contact shadows ray-march the screen-space depth buffer from a shaded surface toward the light and write a visibility term. The compute variant adds local shadowing and a separate denoise stage; TAA can stabilize the jittered samples downstream.
 
-**Code:** [`shadows`](shadows/), [`addon.cpp`](addon.cpp) for input capture and dispatch.
+**Code:** [`shadows`](customshaders/shadows/), [`addon.cpp`](addon.cpp) for input capture and dispatch.
 **Reference:** [`reference/contact_hardening_soft_shadows.txt`](reference/contact_hardening_soft_shadows.txt) and the source comments.
 
 #### Screen-space reflections
@@ -143,7 +143,7 @@ Contact shadows ray-march the screen-space depth buffer from a shaded surface to
 The game-specific SSR shaders trace or sample the screen-space scene for reflections and apply game-specific history logic. Their inputs and reprojection details differ by game, so inspect the matching shader before changing its resource bindings.
 
 **Code:** [`sora1st` SSR](games/sora1st/ssr/), [`sora2nd` SSR](games/sora2nd/ssr/), [`Kai` SSR](games/kai/SSR/).
-**Reference:** [`reference/SSR`](reference/SSR/) and [`SSR`](SSR/).
+**Reference:** [`reference/SSR`](reference/SSR/) and [`SSR`](customshaders/SSR/).
 
 #### Vanilla SSR improvements
 
@@ -155,7 +155,7 @@ These controls fix or refine the game's existing SSR march, history blend, and d
 
 Dynamic cubemaps capture and filter scene radiance into environment textures used for reflections, including specular irradiance and parallax-corrected sampling. This code is a Falcom Engine+ port and modification of Skyrim Community Shaders' Dynamic Cubemaps.
 
-**Code:** [`dyncube`](dyncube/).
+**Code:** [`dyncube`](customshaders/dyncube/).
 **Source and terms:** [`licenses/dyncube-license.txt`](licenses/dyncube-license.txt), [`reference/Dynamic Cubemaps`](reference/Dynamic%20Cubemaps/).
 
 ### Temporal, post-processing, and game-specific techniques
@@ -164,33 +164,33 @@ Dynamic cubemaps capture and filter scene radiance into environment textures use
 
 The custom TAA passes reproject the previous frame, validate history using depth/color information, and accumulate it with a motion-sensitive feedback path. Both Sora games share the reprojection helper while keeping game-specific shader entry points.
 
-**Code:** [`taa`](taa/), [`taa/taa_reproject.hlsli`](taa/taa_reproject.hlsli), [`games/sora1st/taa`](games/sora1st/taa/), [`games/sora2nd/taa`](games/sora2nd/taa/).
+**Code:** [`taa`](customshaders/taa/), [`taa/taa_reproject.hlsli`](customshaders/taa/taa_reproject.hlsli), [`games/sora1st/taa`](games/sora1st/taa/), [`games/sora2nd/taa`](games/sora2nd/taa/).
 **Reference:** [`reference/taa`](reference/taa/).
 
 #### Motion blur
 
 Motion blur converts the game's motion vectors to UV velocity, reduces the field to tile and neighborhood maxima, then gathers and composites along motion directions. Its motion-source options and capture constraints are mapped below.
 
-**Code:** [`motionblur`](motionblur/), input selection and capture in [`addon.cpp`](addon.cpp).
+**Code:** [`motionblur`](customshaders/motionblur/), input selection and capture in [`addon.cpp`](addon.cpp).
 **Reference:** [`reference/motionblur`](reference/motionblur/).
 
 #### Depth of field (DoF)
 
 DoF generates a circle-of-confusion field and gathers nearby color samples to form the bokeh result. Shared shader logic is used by per-game entry points.
 
-**Code:** [`dof`](dof/), [`games/sora1st/dof`](games/sora1st/dof/), [`games/sora2nd/dof`](games/sora2nd/dof/), [`games/kai/DOF`](games/kai/DOF/), [`games/daybreak2/dof`](games/daybreak2/dof/).
+**Code:** [`dof`](customshaders/dof/), [`games/sora1st/dof`](games/sora1st/dof/), [`games/sora2nd/dof`](games/sora2nd/dof/), [`games/kai/DOF`](games/kai/DOF/), [`games/daybreak2/dof`](games/daybreak2/dof/).
 
 #### FXAA
 
 FXAA provides three shader variants for edge detection and quality tradeoffs. The game-specific replacement points are selected by shader hash.
 
-**Code:** [`fxaa`](fxaa/), game-specific registration in [`addon.cpp`](addon.cpp).
+**Code:** [`fxaa`](customshaders/fxaa/), game-specific registration in [`addon.cpp`](addon.cpp).
 
 #### RCAS sharpening
 
 RCAS sharpens the post-TAA image and can adapt its strength using captured motion. The resource map below identifies that input.
 
-**Code:** [`rcas`](rcas/), setup and motion capture in [`addon.cpp`](addon.cpp).
+**Code:** [`rcas`](customshaders/rcas/), setup and motion capture in [`addon.cpp`](addon.cpp).
 **Reference:** [`reference/rcas`](reference/rcas/).
 
 #### Volumetric fog
@@ -209,7 +209,7 @@ Fog Color Correction adjusts the fog contribution in supported game lighting sha
 
 Character Shadowing adds a camera-space contact pass and combines its result in supported character-lighting shaders. The mode and input resources are handled by the add-on and per-game lighting replacements.
 
-**Code:** [`addon.cpp`](addon.cpp), [`shadows`](shadows/), [`games/sora1st/lighting`](games/sora1st/lighting/), [`games/sora2nd/lighting`](games/sora2nd/lighting/), [`games/kai/charlighting`](games/kai/charlighting/), [`games/daybreak2/char`](games/daybreak2/char/).
+**Code:** [`addon.cpp`](addon.cpp), [`shadows`](customshaders/shadows/), [`games/sora1st/lighting`](games/sora1st/lighting/), [`games/sora2nd/lighting`](games/sora2nd/lighting/), [`games/kai/charlighting`](games/kai/charlighting/), [`games/daybreak2/char`](games/daybreak2/char/).
 
 #### Character outline
 
@@ -239,7 +239,7 @@ Game-specific foliage shaders adjust alpha-tested, static, and moving foliage ma
 
 A shared helper applies a root-to-tip occlusion gradient to supported grass and clutter shaders. Its base, tip, and curve values are passed through shader-injection data.
 
-**Code:** [`foliage/grass_ao.hlsli`](foliage/grass_ao.hlsli), including shaders in [`games/kai/foliage`](games/kai/foliage/) and [`games/sora1st/foliage`](games/sora1st/foliage/).
+**Code:** [`foliage/grass_ao.hlsli`](customshaders/foliage/grass_ao.hlsli), including shaders in [`games/kai/foliage`](games/kai/foliage/) and [`games/sora1st/foliage`](games/sora1st/foliage/).
 
 #### Shadow-map filtering
 
@@ -270,7 +270,7 @@ The addon captures resources from specific game shader bindings and draw events;
 | Vanilla SSAO | Captured from t5 for Sora or t4 for Kai on the recognized lighting shader. This lets replacement/composite paths inspect or preserve the game's AO input. | GTVBAO activation and the game-specific lighting paths. See the register constants and `captured_ssao_srv` in [`addon.cpp`](addon.cpp). |
 | Scene constants (`cb_scene`) | Captured from b0 on lighting draws; draw-time values and ranges are tracked rather than assuming one stable buffer offset. | Camera transforms and reconstruction in world effects, shadow/fog passes, and game shader replacements. See [`world/capture/cb_tracking.hpp`](world/capture/cb_tracking.hpp), [`world/capture/cb_value_tracker.hpp`](world/capture/cb_value_tracker.hpp), and `captured_scene_cbv` in [`addon.cpp`](addon.cpp). |
 | Motion vectors: G-buffer RTV4 | Captured from the engine's RTV4 during render-target binding. `MBMotionRtv4Ensure` validates it, creates an add-on-owned SRV, and checks that dimensions match depth before world temporal passes use it. | Temporal RTAO, RTGI/ReSTIR GI, RTLS, RT Sun, GTVBAO/VBGI, RTXDI temporal DI, and the default motion-blur input. If it conflicts with TAA t3, world temporal reuse is rejected; see `UpdateRtMotion` in [`addon.cpp`](addon.cpp). |
-| Motion vectors: TAA t3 | Captured from t3 only on recognized Sora TAA shader draws; this resource is not assumed ready before lighting. | Custom TAA, motion-adaptive RCAS, and the optional Sora motion-blur input. Kai motion blur uses RTV4. See the t3 capture in [`addon.cpp`](addon.cpp), [`taa_reproject.hlsli`](taa/taa_reproject.hlsli), and RCAS/motion-blur dispatch setup there. |
+| Motion vectors: TAA t3 | Captured from t3 only on recognized Sora TAA shader draws; this resource is not assumed ready before lighting. | Custom TAA, motion-adaptive RCAS, and the optional Sora motion-blur input. Kai motion blur uses RTV4. See the t3 capture in [`addon.cpp`](addon.cpp), [`taa_reproject.hlsli`](customshaders/taa/taa_reproject.hlsli), and RCAS/motion-blur dispatch setup there. |
 | World geometry and transforms | Draw callbacks and per-command-list SRV/constant-buffer tracking observe game vertex/index buffers, instance data, and draw-time transforms. The pool and scene builders copy/convert admitted data into add-on-owned CPU/GPU structures. | World BVH and DXR paths. Start at [`world/capture/draw_census.hpp`](world/capture/draw_census.hpp), [`world/capture/cb_tracking.hpp`](world/capture/cb_tracking.hpp), [`world/bvh/bvh_pool.hpp`](world/bvh/bvh_pool.hpp), and [`world/rt12`](world/rt12/). |
 | Sora 2nd lighting and RTXDI inputs | The lighting callback gathers depth, normal, scene constants, color, MRT material buffers, motion, tiled-light indices, local-light records, and deferred data. It validates and packs these views for the separate D3D12 path. | RTXDI local-light/sun visibility and its temporal DI pass. Follow input assembly in [`addon.cpp`](addon.cpp), resource transfer in [`world/rt12/rt12_rtxdi_transfer.hpp`](world/rt12/rt12_rtxdi_transfer.hpp), and shader input contracts in [`world/rtxdi`](world/rtxdi/). |
 | Local-light records | The Sora 2nd lighting path exposes `dynamicLights_g` and `lightIndices_g`; the RTXDI input bridge snapshots the game data for its D3D12 work. | RTGI local lights and RTXDI direct-light sampling. Kai hero-light records are handled separately by [`kai_hero_light.hpp`](kai_hero_light.hpp) and the Kai lighting path. |
@@ -283,7 +283,7 @@ Do not assume every temporal effect samples the same motion texture. World tempo
 
 ## Reference library
 
-General papers, research notes, and reference implementations are grouped under [`reference`](reference/) and [`SSR`](SSR/). Each technique entry above points to its specific source or license when one is tracked; game shader evidence is under [`world/reference`](world/reference/) and [`world/research`](world/research/).
+General papers, research notes, and reference implementations are grouped under [`reference`](reference/) and [`SSR`](customshaders/SSR/). Each technique entry above points to its specific source or license when one is tracked; game shader evidence is under [`world/reference`](world/reference/) and [`world/research`](world/research/).
 
 ## Where to continue
 

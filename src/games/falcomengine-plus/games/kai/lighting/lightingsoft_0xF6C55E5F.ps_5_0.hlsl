@@ -235,16 +235,16 @@ Texture2D<float4> contactShadowTex : register(t34);      // Contact Shadows term
 // shared helper can fix one element type -- see shadows_common.hlsli.
 Texture3D<float2> csIsfastNoise : register(t35);
 Texture2D<float4> csDepthTex : register(t36);
-// t40 is the local contact term (shadows/contact_local.cs_5_0.hlsl; depth size): x point, z spot share of the lamp
+// t40 is the local contact term (customshaders/shadows/contact_local.cs_5_0.hlsl; depth size): x point, z spot share of the lamp
 // light the march blocks. Bound by DeployShadows while cs_contact_local_bound is set.
 Texture2D<float4> csLocalContactTex : register(t40);
 
 #include "../../../shared.h"
-#include "../../../shadows/shadows_common.hlsli"
+#include "../../../customshaders/shadows/shadows_common.hlsli"
 #include "../../../reference/rendering.hlsl"
 #include "../../../reference/brdf.hlsli"
-#include "../../../dyncube/dyncube_sample.hlsli"
-#include "../../../dyncube/dyncube_resolve.hlsli"
+#include "../../../customshaders/dyncube/dyncube_sample.hlsli"
+#include "../../../customshaders/dyncube/dyncube_resolve.hlsli"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -1558,7 +1558,7 @@ void main(
   r4.y = min(1, r6.w);
   r6.xyw = float3(1,1,1) + -r8.xyz;
   r6.xyw = r4.yyy * r6.xyw + r8.xyz;
-  // -- Local contact shadows (shadows/contact_local.cs_5_0.hlsl): x point, z spot share of the lamp light the march
+  // -- Local contact shadows (customshaders/shadows/contact_local.cs_5_0.hlsl): x point, z spot share of the lamp light the march
   // blocks; 0 = the game's behaviour. The material path (r19.y) picks Point/Spot or Env Point/Env Spot, as RTLS does.
   float2 csLocalShare = float2(0, 0);
   if (shader_injection_data.cs_contact_local_bound > 0.5f) {

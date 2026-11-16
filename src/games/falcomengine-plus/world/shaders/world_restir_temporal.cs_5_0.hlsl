@@ -6,7 +6,7 @@
 // Writes the raw GI (u0, the trace's contract: rgb GI x fade, a = 1 valid, -1 not traced; the trace's value unchanged
 // when no history is merged), this frame's temporal reservoir (u2..u4), counters 24..27 (u1) and debug view 13 (u5).
 
-#include "../../taa/taa_common.hlsli"
+#include "../../customshaders/taa/taa_common.hlsli"
 #include "../../include/mrt_normal.hlsli"
 #include "world_rt_denoise.hlsli"
 
