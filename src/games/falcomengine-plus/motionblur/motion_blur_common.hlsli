@@ -133,7 +133,7 @@ float2 MBJitterHalton(int2 p) {
 
 // ── game motion -> UV velocity ──
 // Source: the game's motion texture (t3 of the TAA draw). Encoding, established
-// from the geometry shaders that write it (e.g. sora2nd/foliage/
+// from the geometry shaders that write it (e.g. games/sora2nd/foliage/
 // staticfoliage_0xF1EC53A8:201-207):
 //
 //   motion.xy = (prevPixel - curPixel) + jitterDiff_g     [raw float2, pixels]

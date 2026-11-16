@@ -253,7 +253,7 @@ float3 GTVBAO_TuneNormal(float3 viewNormal, float influence, float zPreservation
 //
 // The engine's view_g is -Z forward (D3D right-handed). Proof: the vanilla
 // lighting shader negates the view-space z to build a fog coordinate --
-//   sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl:379,381
+//   games/sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl:379,381
 //     r1.w = dot(view_g._m02_m12_m22_m32, r4.xyzw);  // view-space z
 //     r3.z = -r1.w / volumeCameraFarClip_g;          // negated
 // An already-positive view z would make that fog coordinate negative.

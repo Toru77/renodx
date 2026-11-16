@@ -58,9 +58,9 @@ cbuffer cb_scene : register(b0)
 // the scene. Everything that needs "which way is the light" must negate it. Three
 // independent confirmations in the engine's own code:
 //
-//   sora1st/lighting/lighting_0xFDAAF80E:811  dot(N, -lightDirection_g.xyz)
-//   sora2nd/lighting/lighting_0xCA3D8596:859  dot(N, -lightDirection_g.xyz)
-//   kai/lighting/lighting_0x430ED091:263-272
+//   games/sora1st/lighting/lighting_0xFDAAF80E:811  dot(N, -lightDirection_g.xyz)
+//   games/sora2nd/lighting/lighting_0xCA3D8596:859  dot(N, -lightDirection_g.xyz)
+//   games/kai/lighting/lighting_0x430ED091:263-272
 //     GetMainLightDirectionViewToLight(), whose comment reads "lightDirection_g
 //     points from the light to the scene; invert to get direction TO light" and
 //     which returns -light_dir_view * rsqrt(len2).
@@ -275,7 +275,7 @@ float FalcomContactShadowMarch(float4 clipStart, float4 clipEnd, float2 unpack,
 //
 // cb_local2's rayMarchShadowDir_g is not a unit direction. The engine uses it
 // directly as `dir * (0.0005 + 0.0015 * |dot(N, camAxis)|)` across 10 steps
-// (kai/charlighting/char_0x445A1838:220-225, and the same block in both Sora SSAO
+// (games/kai/charlighting/char_0x445A1838:220-225, and the same block in both Sora SSAO
 // passes), so the effective world-space march length is an engine constant scaled by
 // a view-angle term. The custom character pass therefore has to NORMALISE it and take
 // its own length from a user setting, or every "Ray Length" value would be multiplied

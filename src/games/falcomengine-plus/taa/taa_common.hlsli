@@ -1,7 +1,7 @@
 // Custom TAA shared core (Sora 1st / 2nd).
 //
 // From-scratch temporal accumulation. The dumped vanilla TAA files under
-// sora1st/taa and sora2nd/taa are REFERENCE ONLY and stay untouched; this
+// games/sora1st/taa and games/sora2nd/taa are REFERENCE ONLY and stay untouched; this
 // file re-implements only the verified external interface (resource bindings
 // + coordinate convention) and builds an independent algorithm on top:
 //

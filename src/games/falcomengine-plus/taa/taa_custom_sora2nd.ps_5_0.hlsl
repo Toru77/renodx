@@ -1,7 +1,7 @@
 // Custom TAA replacement for Sora 2nd (game hash 0x9D91FAC3).
 //
 // From-scratch implementation; the dumped vanilla reference at
-// sora2nd/taa/taa_0x9D91FAC3.ps_5_0.hlsl is untouched. Only the verified
+// games/sora2nd/taa/taa_0x9D91FAC3.ps_5_0.hlsl is untouched. Only the verified
 // external interface is shared: b2 cb_taa, s0/s1, t0 color, t1 depth,
 // t2 history, t3 motion (texel units), texelSize/prevResolutionScale.
 //

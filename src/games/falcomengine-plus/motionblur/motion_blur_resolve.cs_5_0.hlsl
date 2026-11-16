@@ -20,7 +20,7 @@
 // the early-out / the half-res routing all untouched.
 //
 // ── WHY THIS REPRODUCES THE GAME'S OWN MATH ──────────────────────────────────
-// This is not an independent derivation. sora2nd/foliage/staticfoliage_
+// This is not an independent derivation. games/sora2nd/foliage/staticfoliage_
 // 0xF1EC53A8.ps_5_0.hlsl:201-207 computes, for STATIC foliage, exactly the
 // camera-only term:
 //
@@ -42,7 +42,7 @@
 // every transform is mul(VECTOR, MATRIX). Getting this backwards is silent and
 // catastrophic: it produced a whirlpool at screen centre with the whole frame
 // blurring into it. The authority is the game's own reprojection at
-// sora2nd/ssr/ssr2_0x17F931DE:156-164, which divides the xy by the result of
+// games/sora2nd/ssr/ssr2_0x17F931DE:156-164, which divides the xy by the result of
 // dotting with _m03_m13_m23_m33 -- _mRC selects a COLUMN, so that is column 3,
 // i.e. w = sum_j v_j * M[j][3] = [v * M]. See the comment at the call site.
 //
@@ -208,7 +208,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
   // ── mul(VECTOR, MATRIX), NOT mul(matrix, vector) ────────────────────────────
   // The engine stores its matrices ROW-MAJOR and applies them as row-vector
   // products. The proof is the game's own reprojection at
-  // sora2nd/ssr/ssr2_0x17F931DE:156-164:
+  // games/sora2nd/ssr/ssr2_0x17F931DE:156-164:
   //
   //   r1.x = dot(r0.xyzw, ssrPrevViewProj_g._m00_m10_m20_m30);
   //   r1.y = dot(r0.xyzw, ssrPrevViewProj_g._m01_m11_m21_m31);

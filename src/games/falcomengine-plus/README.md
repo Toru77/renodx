@@ -68,7 +68,7 @@ RTXDI sun shadows with Light Size above 0 are averaged over recent frames, repro
 
 An optional RTXDI local light clamp (off by default) caps the luminance of each pixel's selected lamp by scaling its published weight, so lamp fireflies drop at the cost of energy; stored reservoirs are not changed.
 
-**Code:** [`world/rtgi`](world/rtgi/), [`world/rtxdi`](world/rtxdi/), [`world/shaders`](world/shaders/), [`world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl`](world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl), [world/shaders/world_rtxdi_sun_accumulate.cs_6_5.hlsl](world/shaders/world_rtxdi_sun_accumulate.cs_6_5.hlsl), [`world_settings.hpp`](world/world_settings.hpp), [`lighting_0xCA3D8596.ps_5_0.hlsl`](sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl).
+**Code:** [`world/rtgi`](world/rtgi/), [`world/rtxdi`](world/rtxdi/), [`world/shaders`](world/shaders/), [`world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl`](world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl), [world/shaders/world_rtxdi_sun_accumulate.cs_6_5.hlsl](world/shaders/world_rtxdi_sun_accumulate.cs_6_5.hlsl), [`world_settings.hpp`](world/world_settings.hpp), [`lighting_0xCA3D8596.ps_5_0.hlsl`](games/sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl).
 **References:** [`reference/restir`](reference/restir/), vendored RTXDI [`README`](world/rtxdi/vendor/rtxdi/README.md) and [`license`](licenses/RTXDI-LICENSE.txt).
 
 #### NRD RELAX adapter
@@ -123,13 +123,13 @@ GTVBGI also uses visibility bitmasks to estimate indirect illumination. Far-fiel
 
 Falcom SSGI reshapes Kai's existing screen-space indirect-light signal in supported lighting shaders; it does not run GTVBGI's visibility-bitmask gather.
 
-**Code:** [`kai/lighting`](kai/lighting/), shared settings in [`shared.h`](shared.h).
+**Code:** [`games/kai/lighting`](games/kai/lighting/), shared settings in [`shared.h`](shared.h).
 
 #### Character SSGI
 
 Character SSGI adjusts how Falcom's sampled SSGI signal contributes to character lighting. It is part of the Kai lighting shader path, not a separate GI pass.
 
-**Code:** [`kai/lighting`](kai/lighting/), settings and shared data in [`addon.cpp`](addon.cpp) and [`shared.h`](shared.h).
+**Code:** [`games/kai/lighting`](games/kai/lighting/), settings and shared data in [`addon.cpp`](addon.cpp) and [`shared.h`](shared.h).
 
 #### Contact shadows
 
@@ -142,14 +142,14 @@ Contact shadows ray-march the screen-space depth buffer from a shaded surface to
 
 The game-specific SSR shaders trace or sample the screen-space scene for reflections and apply game-specific history logic. Their inputs and reprojection details differ by game, so inspect the matching shader before changing its resource bindings.
 
-**Code:** [`sora1st` SSR](sora1st/ssr/), [`sora2nd` SSR](sora2nd/ssr/), [`Kai` SSR](kai/SSR/).
+**Code:** [`sora1st` SSR](games/sora1st/ssr/), [`sora2nd` SSR](games/sora2nd/ssr/), [`Kai` SSR](games/kai/SSR/).
 **Reference:** [`reference/SSR`](reference/SSR/) and [`SSR`](SSR/).
 
 #### Vanilla SSR improvements
 
 These controls fix or refine the game's existing SSR march, history blend, and disocclusion checks. The feature is implemented inside the Sora 2nd SSR shader replacement and selected by addon hooks.
 
-**Code:** [`sora2nd/ssr`](sora2nd/ssr/), control and hook selection in [`addon.cpp`](addon.cpp).
+**Code:** [`games/sora2nd/ssr`](games/sora2nd/ssr/), control and hook selection in [`addon.cpp`](addon.cpp).
 
 #### Dynamic cubemaps
 
@@ -164,7 +164,7 @@ Dynamic cubemaps capture and filter scene radiance into environment textures use
 
 The custom TAA passes reproject the previous frame, validate history using depth/color information, and accumulate it with a motion-sensitive feedback path. Both Sora games share the reprojection helper while keeping game-specific shader entry points.
 
-**Code:** [`taa`](taa/), [`taa/taa_reproject.hlsli`](taa/taa_reproject.hlsli), [`sora1st/taa`](sora1st/taa/), [`sora2nd/taa`](sora2nd/taa/).
+**Code:** [`taa`](taa/), [`taa/taa_reproject.hlsli`](taa/taa_reproject.hlsli), [`games/sora1st/taa`](games/sora1st/taa/), [`games/sora2nd/taa`](games/sora2nd/taa/).
 **Reference:** [`reference/taa`](reference/taa/).
 
 #### Motion blur
@@ -178,7 +178,7 @@ Motion blur converts the game's motion vectors to UV velocity, reduces the field
 
 DoF generates a circle-of-confusion field and gathers nearby color samples to form the bokeh result. Shared shader logic is used by per-game entry points.
 
-**Code:** [`dof`](dof/), [`sora1st/dof`](sora1st/dof/), [`sora2nd/dof`](sora2nd/dof/), [`kai/DOF`](kai/DOF/), [`daybreak2/dof`](daybreak2/dof/).
+**Code:** [`dof`](dof/), [`games/sora1st/dof`](games/sora1st/dof/), [`games/sora2nd/dof`](games/sora2nd/dof/), [`games/kai/DOF`](games/kai/DOF/), [`games/daybreak2/dof`](games/daybreak2/dof/).
 
 #### FXAA
 
@@ -197,25 +197,25 @@ RCAS sharpens the post-TAA image and can adapt its strength using captured motio
 
 Volumetric fog is implemented through game-specific shader replacements, with IS-FAST jitter and haze anti-aliasing available in supported variants. The game-specific constant-buffer layouts and shader hooks are kept with each game's shader.
 
-**Code:** [`sora1st/volfog`](sora1st/volfog/), [`sora2nd/volfog`](sora2nd/volfog/), [`kai/volfog`](kai/volfog/), [`daybreak2/volfog`](daybreak2/volfog/), controls in [`addon.cpp`](addon.cpp).
+**Code:** [`games/sora1st/volfog`](games/sora1st/volfog/), [`games/sora2nd/volfog`](games/sora2nd/volfog/), [`games/kai/volfog`](games/kai/volfog/), [`games/daybreak2/volfog`](games/daybreak2/volfog/), controls in [`addon.cpp`](addon.cpp).
 
 #### Fog color correction
 
 Fog Color Correction adjusts the fog contribution in supported game lighting shaders. Its controls are passed through the add-on shader-injection data.
 
-**Code:** game lighting and fog shaders in [`kai`](kai/), [`sora1st`](sora1st/), [`sora2nd`](sora2nd/), settings in [`addon.cpp`](addon.cpp) and fields in [`shared.h`](shared.h).
+**Code:** game lighting and fog shaders in [`kai`](games/kai/), [`sora1st`](games/sora1st/), [`sora2nd`](games/sora2nd/), settings in [`addon.cpp`](addon.cpp) and fields in [`shared.h`](shared.h).
 
 #### Character shadowing
 
 Character Shadowing adds a camera-space contact pass and combines its result in supported character-lighting shaders. The mode and input resources are handled by the add-on and per-game lighting replacements.
 
-**Code:** [`addon.cpp`](addon.cpp), [`shadows`](shadows/), [`sora1st/lighting`](sora1st/lighting/), [`sora2nd/lighting`](sora2nd/lighting/), [`kai/charlighting`](kai/charlighting/), [`daybreak2/char`](daybreak2/char/).
+**Code:** [`addon.cpp`](addon.cpp), [`shadows`](shadows/), [`games/sora1st/lighting`](games/sora1st/lighting/), [`games/sora2nd/lighting`](games/sora2nd/lighting/), [`games/kai/charlighting`](games/kai/charlighting/), [`games/daybreak2/char`](games/daybreak2/char/).
 
 #### Character outline
 
 The character-outline replacement adjusts the Sora 2nd outline pixel shader. Its shader is grouped with other Sora 2nd character passes.
 
-**Code:** [`sora2nd/char`](sora2nd/char/).
+**Code:** [`games/sora2nd/char`](games/sora2nd/char/).
 
 #### Kai hero light
 
@@ -227,37 +227,37 @@ The hero-light feature identifies configured player lights in Kai's light record
 
 Supported lighting shaders can blend in Hammon diffuse, multiscattering GGX specular, and roughness/highlight limits. These are game-lighting replacements, not a standalone post-process.
 
-**Code:** [`sora1st/lighting`](sora1st/lighting/), [`sora2nd/lighting`](sora2nd/lighting/), [`kai/lighting`](kai/lighting/), [`reference/brdf.hlsli`](reference/brdf.hlsli).
+**Code:** [`games/sora1st/lighting`](games/sora1st/lighting/), [`games/sora2nd/lighting`](games/sora2nd/lighting/), [`games/kai/lighting`](games/kai/lighting/), [`reference/brdf.hlsli`](reference/brdf.hlsli).
 
 #### Foliage shader replacements
 
 Game-specific foliage shaders adjust alpha-tested, static, and moving foliage materials. This material shading work is separate from world ray-tracing admission and geometry updates.
 
-**Code:** [`sora1st/foliage`](sora1st/foliage/), [`sora2nd/foliage`](sora2nd/foliage/), [`kai/foliage`](kai/foliage/), world path: [`world/bvh`](world/bvh/).
+**Code:** [`games/sora1st/foliage`](games/sora1st/foliage/), [`games/sora2nd/foliage`](games/sora2nd/foliage/), [`games/kai/foliage`](games/kai/foliage/), world path: [`world/bvh`](world/bvh/).
 
 #### Foliage grass AO
 
 A shared helper applies a root-to-tip occlusion gradient to supported grass and clutter shaders. Its base, tip, and curve values are passed through shader-injection data.
 
-**Code:** [`foliage/grass_ao.hlsli`](foliage/grass_ao.hlsli), including shaders in [`kai/foliage`](kai/foliage/) and [`sora1st/foliage`](sora1st/foliage/).
+**Code:** [`foliage/grass_ao.hlsli`](foliage/grass_ao.hlsli), including shaders in [`games/kai/foliage`](games/kai/foliage/) and [`games/sora1st/foliage`](games/sora1st/foliage/).
 
 #### Shadow-map filtering
 
 Game-specific shadow shaders adjust filtering and shadow response while preserving the game's shadow-map passes. Sora shadow shaders and Kai's PCSS shader are kept with their respective game lighting code.
 
-**Code:** [`sora1st/shadow`](sora1st/shadow/), [`sora2nd/shadow`](sora2nd/shadow/), [`kai/lighting/pcss_0x30190562.ps_5_0.hlsl`](kai/lighting/pcss_0x30190562.ps_5_0.hlsl), settings and hooks in [`addon.cpp`](addon.cpp).
+**Code:** [`games/sora1st/shadow`](games/sora1st/shadow/), [`games/sora2nd/shadow`](games/sora2nd/shadow/), [`games/kai/lighting/pcss_0x30190562.ps_5_0.hlsl`](games/kai/lighting/pcss_0x30190562.ps_5_0.hlsl), settings and hooks in [`addon.cpp`](addon.cpp).
 
 #### Game SSAO shader replacements
 
 These replace or modify the games' existing SSAO and combined character-shadow pixel shaders. They are separate from the standalone GTVBAO compute passes.
 
-**Code:** [`sora1st/ssao`](sora1st/ssao/), [`sora2nd/ssao`](sora2nd/ssao/), lighting-resource capture in [`addon.cpp`](addon.cpp).
+**Code:** [`games/sora1st/ssao`](games/sora1st/ssao/), [`games/sora2nd/ssao`](games/sora2nd/ssao/), lighting-resource capture in [`addon.cpp`](addon.cpp).
 
 #### Sky shader replacement
 
 The Sora 1st sky pass has a game-specific pixel-shader override. Its shader is isolated from screen-space reflection and dynamic-cubemap code.
 
-**Code:** [`sora1st/sky`](sora1st/sky/).
+**Code:** [`games/sora1st/sky`](games/sora1st/sky/).
 
 ## Shared game resources
 

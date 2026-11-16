@@ -5,7 +5,7 @@
 //
 // Falcom packs the world-space normal as a cylindrical (azimuth, cos-polar)
 // pair: .x = atan2(N.y, N.x)/PI + 1, .y = N.z + 1, each scaled by 32767.5.
-// Matches the vanilla lighting decode (see sora2nd/lighting/lighting.asm:
+// Matches the vanilla lighting decode (see games/sora2nd/lighting/lighting.asm:
 // `mad r8.zw` -> `sincos` -> `dp3 r3.y, r8.xywx`).
 //
 // DecodeFalcomMrtNormalAsGame matches the game's decode with no zero case. A packed

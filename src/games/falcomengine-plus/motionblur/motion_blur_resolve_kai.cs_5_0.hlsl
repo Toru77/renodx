@@ -23,8 +23,8 @@
 // Sourced by diffing the cbuffer declarations of the two games' own GBuffer
 // shaders, which are the authority:
 //
-//   sora1st/foliage/staticfoliage_0x39F91AE8.ps_5_0.hlsl  -> c74 / c78
-//   sora2nd/foliage/staticfoliage_0xF1EC53A8.ps_5_0.hlsl  -> c75 / c79
+//   games/sora1st/foliage/staticfoliage_0x39F91AE8.ps_5_0.hlsl  -> c74 / c78
+//   games/sora2nd/foliage/staticfoliage_0xF1EC53A8.ps_5_0.hlsl  -> c75 / c79
 //
 // c0 through c31 are IDENTICAL in both, which is why view_g, proj_g and
 // viewProjInv_g are declared with the same offsets here as there, and why the
@@ -59,7 +59,7 @@ cbuffer cb_scene : register(b0)
   float4x4 viewProjInv_g : packoffset(c20);
   // -- THE ONLY LINES THAT DIFFER FROM THE SORA RESOLVES --------------------
   // Kai offsets, from the game's own GBuffer shader
-  // kai/foliage/foliage_0x534E54EA.ps_5_0.hlsl. Sora 1st uses c74/c78 and Sora 2nd
+  // games/kai/foliage/foliage_0x534E54EA.ps_5_0.hlsl. Sora 1st uses c74/c78 and Sora 2nd
   // c75/c79 for the same two fields.
   //
   // Kai's jitter field is NOT called jitterDiff_g and is NOT at the Sora offset:

@@ -23,7 +23,7 @@ struct ShaderInjectData {
   // The screen-space shadow RAYMARCH behind these (mode 2, "Bend_SSS") was
   // The Bend_SSS character ray-march (char_shadow_* below) and the environment
   // "Sun SSS" ray-march (env_sss_* below) have both been deleted from every
-  // shader in this mod, daybreak2/char included, and their settings are gone.
+  // shader in this mod, games/daybreak2/char included, and their settings are gone.
   // The slots stay declared so that the packoffset of every later field is
   // unchanged: this block is a contiguous range, and removing a line from the
   // middle would shift the whole tail of the struct on both sides of the C++ /

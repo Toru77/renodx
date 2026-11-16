@@ -23,8 +23,8 @@
 // Sourced by diffing the cbuffer declarations of the two games' own GBuffer
 // shaders, which are the authority:
 //
-//   sora1st/foliage/staticfoliage_0x39F91AE8.ps_5_0.hlsl  -> c74 / c78
-//   sora2nd/foliage/staticfoliage_0xF1EC53A8.ps_5_0.hlsl  -> c75 / c79
+//   games/sora1st/foliage/staticfoliage_0x39F91AE8.ps_5_0.hlsl  -> c74 / c78
+//   games/sora2nd/foliage/staticfoliage_0xF1EC53A8.ps_5_0.hlsl  -> c75 / c79
 //
 // c0 through c31 are IDENTICAL in both, which is why view_g, proj_g and
 // viewProjInv_g are declared with the same offsets here as there, and why the

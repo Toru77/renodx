@@ -2,7 +2,7 @@
 #define RTGI_LAMP_TYPE_POINT 1u
 #define RTGI_LAMP_TYPE_SPOT 2u
 
-// The game's LightParam (sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl): 112 bytes. The full layout sets the stride.
+// The game's LightParam (games/sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl): 112 bytes. The full layout sets the stride.
 struct LightParam
 {
     float3 pos;

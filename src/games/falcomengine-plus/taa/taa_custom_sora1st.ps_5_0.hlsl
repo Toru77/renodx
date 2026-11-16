@@ -1,7 +1,7 @@
 // Custom TAA replacement for Sora 1st (game hash 0xFA37EA04).
 //
 // From-scratch implementation; the dumped vanilla reference at
-// sora1st/taa/taa_0xFA37EA04.ps_5_0.hlsl is untouched. Only the verified
+// games/sora1st/taa/taa_0xFA37EA04.ps_5_0.hlsl is untouched. Only the verified
 // external interface is shared: b2 cb_taa, s0/s1, t0 color, t1 depth,
 // t2 history, t3 motion (texel units), texelSize/prevResolutionScale.
 //

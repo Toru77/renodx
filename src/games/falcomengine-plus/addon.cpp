@@ -2336,7 +2336,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     },
     // -- Custom TAA (Sora 1st/2nd; vanilla baseline, custom when enabled) --
     // NOTE: custom files use unique embed stems (taa_custom_sora1st/2nd) so the
-    // dumped vanilla reference files under sora1st/taa and sora2nd/taa keep
+    // dumped vanilla reference files under games/sora1st/taa and games/sora2nd/taa keep
     // compiling untouched; the runtime CRCs below are the game's TAA hashes.
     // The initial slot payload is vanilla. OnBeforeCustomTAADraw selects the
     // custom payload when enabled and reasserts vanilla when disabled.
