@@ -168,16 +168,14 @@ struct GcStats {
 // G5: what keeps the CPU pool full, gathered once per present by ApplyBvhInputs (bvh_debug.hpp).
 struct GcPoolReduceInputs {
   bool switch_on = false;    // g_gpu_capture.reduce_pool
-  bool gc_owns = false;      // rt12::GcOwnsRtao(): cache and trace on
+  bool gc_owns = false;      // rt12::GcOwnsScene(): cache and trace on
   bool gc_active = false;    // g_gpu_capture.active
   bool dxr_on = false;       // rt12::g_rt12_enabled
   bool dxr_running = false;  // rt12::g_rt12 exists, not failed, not stuck
   bool scene_ready = false;  // rt12::g_rt12_gc_scene.ready
-  bool rtao = false;
-  bool debug_view = false;  // a BVH GPU debug view
-  bool pool_scan = false;   // the Pool Scan tick
+  bool debug_view = false;   // a BVH GPU debug view
+  bool pool_scan = false;    // the Pool Scan tick
   bool rtxdi = false;
-  bool discovery = false;  // RTAO Two-Sided discovery (always the compute pass)
 };
 
 // G5: the reduced-pool state (under g_gpu_capture.mutex).
@@ -191,11 +189,11 @@ struct GcPoolReduceStats {
 struct GpuCaptureState {
   std::atomic<bool> enabled{false};           // the panel switch (session only, not saved)
   std::atomic<bool> active{false};            // set by the present side once its objects exist; every hook returns on !active
-  std::atomic<bool> trace{true};              // G4: DXR RTAO traces the GPU scene while the cache is on (session only)
+  std::atomic<bool> trace{true};              // G4: the DXR scene transaction traces the GPU scene while the cache is on (session only)
   std::atomic<bool> trace_no_cpu_mesh{true};  // G4: also trace slots whose key has no CPU mesh (session only, A/B)
-  std::atomic<bool> reduce_pool{true};        // G5: reduce the CPU pool while DXR RTAO is the only RT consumer (session only)
-  std::atomic<bool> pool_reduced{false};      // G5: set by UpdateGcPoolReduce; read by the draw hooks, UpdateLiveBvh and RTAO
-  std::atomic<bool> reduced_fallback{false};  // G5: an RTAO frame fell back while reduced (rtao::Dispatch); read at the next present
+  std::atomic<bool> reduce_pool{true};        // G5: reduce the CPU pool while the DXR scene is the only RT consumer (session only)
+  std::atomic<bool> pool_reduced{false};      // G5: set by UpdateGcPoolReduce; read by the draw hooks and UpdateLiveBvh
+  std::atomic<bool> reduced_fallback{false};  // G5: a scene frame fell back while reduced; read at the next present
   std::mutex mutex;
   reshade::api::resource staging = {0u};  // D3D11 raw buffer, kGcStagingBytes
   uint64_t staging_used = 0u;             // bytes reserved in this present's copies
@@ -313,7 +311,7 @@ inline uint32_t GcRecordsBound(const std::vector<uint32_t>& recent_out) {
 
 // G5: one present of the reduced CPU pool (ApplyBvhInputs; render thread, no lock held). Reduced after kGcPoolReduceStreak
 // presents in a row with no blocker; full again at the first present with one. Going full re-streams the pool as a map change
-// does (every schedule is due at the next frame). An RTAO fallback while reduced is a blocker and counts a vanilla frame.
+// does (every schedule is due at the next frame). A scene fallback while reduced is a blocker and counts a vanilla frame.
 // Locks: g_gpu_capture.mutex, then g_pool.mutex, never nested; no graphics call.
 inline void UpdateGcPoolReduce(const GcPoolReduceInputs& in, uint32_t frame) {
   const bool fallback = g_gpu_capture.reduced_fallback.exchange(false, std::memory_order_relaxed);
@@ -323,11 +321,9 @@ inline void UpdateGcPoolReduce(const GcPoolReduceInputs& in, uint32_t frame) {
                         : !in.dxr_running ? "dxr_failed"
                         : !in.gc_active   ? "gc_inactive"
                         : !in.scene_ready ? "not_ready"
-                        : !in.rtao        ? "rtao_off"
                         : in.debug_view   ? "debug_view"
                         : in.pool_scan    ? "pool_scan"
                         : in.rtxdi        ? "rtxdi_scene"
-                        : in.discovery    ? "discovery"
                         : fallback        ? "fallback"
                                           : nullptr;
   const bool was = g_gpu_capture.pool_reduced.load(std::memory_order_relaxed);

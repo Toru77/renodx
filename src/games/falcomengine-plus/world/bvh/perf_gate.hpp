@@ -20,7 +20,6 @@ enum PerfBlock : size_t {
   kPerfBlockRecordTlas,         // RecordCacheTlasRebuild (after the TLAS timing)
   kPerfBlockGpuCheck,           // CheckLiveBvhOnGpu (on request)
   kPerfBlockCacheDiag,          // UpdateCacheDiag
-  kPerfBlockRtaoStats,          // MaybeCaptureRtaoStats (on request)
   kPerfBlockDebugPass,          // RunBvhDebugPass (while a debug view is on)
   kPerfBlockResolveIndirect,    // ResolveIndirectDraws (includes the GPU wait)
   kPerfBlockP2bRecord,          // ExpandLiveDynamic after its gate
@@ -45,11 +44,10 @@ enum PerfBlock : size_t {
   kPerfBlockCbHooks,            // cb tracker map, unmap and update hooks
   kPerfBlockBindHook,           // OnPushDescriptorsWorld
   kPerfBlockPoolWriteHooks,     // NotePoolBufferWrite
-  kPerfBlockRtaoInline,         // RunRtaoInline, whole (rtao_record_cpu is inside)
-  kPerfBlockLightingRt,         // the RT block of the lighting hook (snapshot, RTAO, restore)
-  kPerfBlockRt12SignalFlush,    // RunRtaoPassA: fence11 signal A and ctx11 Flush
-  kPerfBlockRt12Submit,         // RunRtaoPassA: D3D12 waits, ExecuteCommandLists, signal B
-  kPerfBlockRt12WaitB,          // RunRtaoPassA: D3D11 wait on fence B
+  kPerfBlockLightingRt,         // the RT block of the lighting hook (snapshot, scene prepare, restore)
+  kPerfBlockRt12SignalFlush,    // RunSceneTransaction: fence11 signal A and ctx11 Flush
+  kPerfBlockRt12Submit,         // RunSceneTransaction: D3D12 waits, ExecuteCommandLists, signal B
+  kPerfBlockRt12WaitB,          // RunSceneTransaction: D3D11 wait on fence B
   kPerfBlockSegToRt,            // wall clock: finish_present to the lighting RT block (or to the present, no RT block)
   kPerfBlockSegAfterRt,         // wall clock: end of the lighting RT block to OnWorldPresentBvh
   kPerfBlockSegPresent,         // wall clock: OnWorldPresentBvh to finish_present
@@ -72,11 +70,10 @@ enum PerfBlock : size_t {
   kPerfBlockGcPresent,     // rt12::OnGcPresent, whole (OnWorldPresentBvh)
   kPerfBlockRt12Present,   // rt12::OnPresent, whole (OnWorldPresentBvh)
   kPerfBlockDrawHookPre,   // WorldDrawCallback direct: hook start to record start
-  kPerfBlockRtaoPost,      // rtao_svgf.hpp DispatchRtaoSvgf: input pass, SVGF chain, upsample, table nulls
-  kPerfBlockRt12PassA,     // rt12::RunRtaoPassA, whole
-  kPerfBlockRt12D3d11Passes,  // RunRtaoPassA steps 10-11: D3D11 noise copy and passes
-  kPerfBlockRt12Record,    // RunRtaoPassA step 13: D3D12 recording to Close
-  kPerfBlockRt12Resolve,   // RunRtaoPassA step 15: D3D11 resolve
+  kPerfBlockRt12PassA,     // rt12::RunSceneTransaction, whole
+  kPerfBlockRt12D3d11Passes,  // RunSceneTransaction steps 10-11: D3D11 noise copy and passes
+  kPerfBlockRt12Record,    // RunSceneTransaction step 13: D3D12 recording to Close
+  kPerfBlockRt12Resolve,   // RunSceneTransaction step 15: D3D11 resolve
   kPerfBlockCaptureHook,   // OnPushDescriptorsCapture, whole (addon.cpp), timed before its gate
   kPerfBlockDeformProbeMap,   // ResolveDeformSlot: map_buffer_region of the staging copy
   kPerfBlockDeformProbeEval,  // ResolveDeformSlot: the judging loop over the mapped capture
@@ -97,7 +94,6 @@ struct PerfGate {
   std::atomic_uint64_t present_world_us{0u};    // cumulative CPU time of OnWorldPresent (bracket)
   std::atomic_uint64_t present_bvh_us{0u};      // cumulative CPU time of OnWorldPresentBvh (bracket)
   std::atomic_uint64_t alpha_sync_us{0u};       // SyncLiveAlpha CPU time of the last present
-  std::atomic_uint64_t rtao_record_us{0u};      // rtao::Dispatch CPU time (command recording)
   std::atomic_uint64_t rtxdi_input_cpu_us{0u};  // RTXDI input validation/allocation/record/submission, nanoseconds
   std::atomic_uint64_t rtxdi_di_cpu_us{0u};     // RTXDI local-DI validation/record/submission, nanoseconds
   std::atomic_uint64_t rtxdi_attempts{0u};

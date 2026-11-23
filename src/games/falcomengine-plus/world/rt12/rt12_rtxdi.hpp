@@ -14,7 +14,7 @@ inline SceneTransactionResult PrepareSceneForRtxdi(reshade::api::device* device,
       || g_rt12->failed || g_rt12->stuck || g_rt12->unfenced_execution || cmd_list == nullptr || scene_cbv_view.handle == 0u) return {};
   if (reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()) != g_rt12->ctx11.Get()) return {};  // NOLINT(performance-no-int-to-ptr)
   auto* data = bvh::GetBvhDeviceData(device);
-  const bool gc = GcOwnsRtao();
+  const bool gc = GcOwnsScene();
   if (data == nullptr || (gc && (!g_rt12_gc_scene.ready || g_rt12_gc_scene.version == 0u))
       || (!gc && (!data->tlas_built || g_rt12->mirror_dropped || bvh::g_gpu_capture.pool_reduced.load(std::memory_order_relaxed)))) {
     return {.reason = Rt12Reason::TlasEmpty};
@@ -56,7 +56,7 @@ inline SceneTransactionResult PrepareSceneForRtxdi(reshade::api::device* device,
     return {.scene_ready = true, .reused = true, .frame = frame, .slot = s.scene_slot, .fence_b = s.scene_fence};
   }
   return RunSceneTransaction(device, cmd_list,
-                             {.scene_cbv_view = scene_cbv_view, .records = records, .characters = characters, .character_snapshot = snapshot, .use_gpu_cache = gc, .frame = frame, .generation = s.generation, .isfast_view = isfast_view, .pt_isfast_view = pt_isfast_view}, nullptr);
+                             {.scene_cbv_view = scene_cbv_view, .records = records, .characters = characters, .character_snapshot = snapshot, .use_gpu_cache = gc, .frame = frame, .generation = s.generation, .isfast_view = isfast_view, .pt_isfast_view = pt_isfast_view});
 }
 
 }  // namespace falcom_world::rt12

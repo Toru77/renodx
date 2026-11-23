@@ -235,7 +235,7 @@ inline constexpr float kPoolRegionMinSize = 64.f;
 inline constexpr float kPoolRegionMaxSize = 512.f;
 inline constexpr float kPoolWindSwayRangeMin = 25.f;
 inline constexpr float kPoolWindSwayRangeMax = 1044.f;
-inline constexpr float kPoolRegionRayMargin = 10.f;  // = RtaoRayMax maximum (world_settings.hpp); AO rays reach this far past the range
+inline constexpr float kPoolRegionRayMargin = 10.f;  // = the maximum trace-ray distance (world_settings.hpp); rays reach this far past the range
 
 // Why a scanned draw did not produce an instance copy. Non-rigid vertex
 // shaders are counted per class in PoolStats::draws_by_vs_class instead.

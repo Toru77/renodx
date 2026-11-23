@@ -2486,7 +2486,7 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
     const bool sway_switched = data->tlas_sway_on != g_pool.alpha_wind_sway.load(std::memory_order_relaxed);
     const bool slack_switched = data->tlas_slack != g_live_bvh.slack.load(std::memory_order_relaxed);
     const bool allow_slack = !(alpha_off_now || sway_switched || per_frame_switched || flags_changed || slack_switched);
-    // Flag changes wait for the rebuild interval (up to 8 presents of latency: a short ghost or duplicate in the debug view and RTAO for a flag set); switch changes are immediate.
+    // Flag changes wait for the rebuild interval (up to 8 presents of latency: a short ghost or duplicate in the debug view and the DXR scene for a flag set); switch changes are immediate.
     // A skipped rebuild (RebuildLiveTlas) counts as a check: the next one keeps the cadence it would have had.
     const uint32_t last_tlas = (std::max)(data->live.tlas_frame, data->tlas_check_frame);
     if (!reduced && change != nullptr && frame >= data->tlas_retry_frame

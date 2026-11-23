@@ -20,7 +20,6 @@
 #include <vector>
 
 #include "../world_state.hpp"
-#include "../rtao/rtao_state.hpp"
 #include "../bvh/bvh_pool.hpp"
 #include "../bvh/bvh_live.hpp"
 #include "../bvh/deform_live.hpp"
@@ -359,11 +358,6 @@ inline void CommitDrawRecord(
     const DrawRecord& record,
     reshade::api::device* device,
     WorldCommandListData* cl_data) {
-  // Two-Sided discovery (diagnostic): camera-view opaque candidate draws by (cull mode, front face). Only while on.
-  if (rtao::g_rtao_discovery > 0.5f && record.is_candidate && !record.blend_enable
-      && contract::IsCameraViewVertex(record.vs_pipeline)) {
-    rtao::g_rtao_cull_hist[std::min(record.cull_mode, 3u)][record.front_counter_clockwise ? 1 : 0].fetch_add(1u, std::memory_order_relaxed);
-  }
   const bool census = CensusEnabled();
   if (census) {
     std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -558,7 +552,7 @@ inline bool OnCopyTextureRegionDepthLog(
   return false;
 }
 
-// With the census and RTAO discovery off, no consumer (lighting capture, pool, deform) reads a draw of another VS class or
+// With the census off, no consumer (lighting capture, pool, deform) reads a draw of another VS class or
 // PS: such a draw skips the record. Only diagnostics change: the pool's per-class draw statistics, the record parity gauges
 // and timers, and the census serials.
 inline bool IsDrawConsumed(reshade::api::command_list* cmd_list) {
@@ -566,7 +560,7 @@ inline bool IsDrawConsumed(reshade::api::command_list* cmd_list) {
   const uint64_t vs_pipeline = (shader_state != nullptr ? shader_state->stage_states[renodx::utils::shader::VERTEX_INDEX].pipeline.handle : 0u);
   const uint32_t ps_hash = (shader_state != nullptr ? renodx::utils::shader::GetCurrentPixelShaderHash(shader_state) : 0u);
   const auto vs_class = static_cast<contract::VsClass>(contract::LookupVertexTraits(vs_pipeline).cls);
-  return CensusEnabled() || rtao::g_rtao_discovery > 0.5f || IsLightingHash(ps_hash)
+  return CensusEnabled() || IsLightingHash(ps_hash)
          || vs_class == contract::VsClass::Rigid || vs_class == contract::VsClass::Wind || contract::IsDeformingClass(vs_class);
 }
 

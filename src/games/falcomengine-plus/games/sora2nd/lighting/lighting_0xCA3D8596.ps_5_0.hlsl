@@ -350,8 +350,7 @@ void main(
     uint4 GTVBAO_raw = gtvbaoTexture.Load(int3(texel, 0));
     float GTVBAO_ao = float(GTVBAO_raw.x) / 255.0;
 
-    // RTAO producing: the texel is RTAO's, so the GTVBAO encoding diagnostic does not apply (default branch).
-    const int fix = (shader_injection_data.rtao_ao_bound > 0.5f ? 0 : (int)shader_injection_data.gtvbao_fix_experimental);
+    const int fix = (int)shader_injection_data.gtvbao_fix_experimental;
     if (fix == 1) {
       ao_sample.x = 1.0;  // Neutral: test if veil is from AO value
     } else if (fix == 2) {
@@ -362,10 +361,6 @@ void main(
       ao_sample = float3(GTVBAO_ao, GTVBAO_ao, GTVBAO_ao);  // All channels GTVBAO
     } else {
       ao_sample.x = GTVBAO_ao;  // Default current
-    }
-    // RTAO Max Darkening: only texels darker than the floor change; skipped at 1 so the default output is unchanged.
-    if (shader_injection_data.rtao_ao_bound > 0.5f && shader_injection_data.rtao_max_darkening < 1.0f) {
-      ao_sample.x = max(ao_sample.x, 1.0 - saturate(shader_injection_data.rtao_max_darkening));
     }
   }
   r5.xyz = ao_sample;
@@ -402,9 +397,8 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
 
   // —— GTVBAO Debug View ——
   // Scaled for HDR: raw 0-1 AO values would be blinding without scaling.
-  // rtao_debug_show: RTAO texel (t22) shown through the mode-2 branch below.
-  if (shader_injection_data.gtvbao_debug_view > 0.5f || shader_injection_data.rtao_debug_show > 0.5f) {
-    int mode = shader_injection_data.rtao_debug_show > 0.5f ? 2 : (int)shader_injection_data.gtvbao_debug_view;
+  if (shader_injection_data.gtvbao_debug_view > 0.5f) {
+    int mode = (int)shader_injection_data.gtvbao_debug_view;
     float hdr_scale = 0.3;
     if (mode == 1) {
       // AO Only: gray for visibility
@@ -479,7 +473,7 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
     r8.xyz = r9.xyz * r8.xyz;
     r3.zw = (int2)r1.zz & int2(1,64);
     // Bit 0 set: the character shading path below, which never reads the AO (r5.x). Bit 0 clear: the map-AO
-    // path, which applies r5.x itself. RTAO on characters (after charColor) applies only where r5.x is unused.
+    // path, which applies r5.x itself.
     const bool csCharacterShading = r3.z != 0;
     if (r3.z != 0) {
       r9.x = r0.x;
@@ -862,14 +856,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       }
       charColor += r0.xyz * rtxdiCharLampLight * shader_injection_data.rtxdi_local_character_intensity;
     }
-    // RTAO on characters, whatever "Allow GTVBAO" says: RTAO replaces GTVBAO, whose character settings do not
-    // apply while it produces. Character Intensity scales it after the temporal pass and the filter.
-    if (shader_injection_data.rtao_ao_bound > 0.5f) {
-      if (csCharacterShading) {
-        charColor *= lerp(1.0, r5.x, saturate(shader_injection_data.rtao_char_intensity));
-      }
-    } else if (shader_injection_data.char_gtvbao_mode > 0.5f
-               && shader_injection_data.gtvbao_dedicated_bound > 0.5f) {
+    if (shader_injection_data.char_gtvbao_mode > 0.5f
+        && shader_injection_data.gtvbao_dedicated_bound > 0.5f) {
       // GTVBAO on characters — apply bitmask AO to character pixels
       float gtvbaoCharMask = saturate(shader_injection_data.char_gtvbao_mask_strength);
       float gtvbaoAO = lerp(r5.x, 1.0, gtvbaoCharMask);

@@ -2099,7 +2099,7 @@ inline void OnGcPresent(reshade::api::device* device, reshade::api::command_queu
   panel.inst_ms_sum = gc.inst_timer.ms_sum;
   panel.inst_ms_n = gc.inst_timer.samples;
   panel.compare = gc.compare;
-  // 12b. G4 (D5, D7): the GPU-cache scene for RunRtaoPassA (raw pointers, valid until the next present), and the mesh and
+  // 12b. G4 (D5, D7): the GPU-cache scene for the DXR scene transaction (raw pointers, valid until the next present), and the mesh and
   // address tables when the slot keys moved.
   if (!scene_slot_keys.empty()) {
     g_rt12_gc_scene.meshes.assign(size_t{bvh::kGcMaxEntries} * 16u, 0.f);

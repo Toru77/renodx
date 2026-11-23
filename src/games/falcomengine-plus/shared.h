@@ -41,7 +41,7 @@ struct ShaderInjectData {
   float rtxdi_local_bound;                  // 0/1: Sora 2nd t41 holds a matching staged local-DI tuple this lighting draw
   float rtxdi_sun_bound;                    // 0/1: Sora 2nd t42 holds matching RTXDI sun visibility for this draw
   float rtxdi_sun_darkening;                // RTXDI Sun Shadow Darkening [0..1]
-  float rtao_debug_show;                    // RTAO: 1 = the lighting shader shows the RTAO texel (t22) as an image (RunRtaoInline); 0 off
+  float reserved_slot_01;                   // reserved: unused slot kept so later packoffsets do not move
   float rtxdi_sun_character_darkening;      // RTXDI Sun Character Shadow Darkening [0..1]
   float rtxdi_local_darkening;              // RTXDI Local Shadow Darkening [0..1] (reuses retired offset 76)
   float cs_contact_local_light_clearance;   // [0..1] world units; reuses a retired slot without moving later fields
@@ -327,9 +327,9 @@ struct ShaderInjectData {
   float dynCube_debug_face;                // 0..5 face for preview when debug=1/2/5/6
   float dynCube_debug_mip;                 // 0..7 mip for GGX filtered preview when debug=8
   float dynCube_force_mip;                 // debug: -1=normal roughness LOD, 0..7=force t17 mip
-  float rtao_char_intensity;  // RTAO Character Intensity [0..1], set by PushRtaoAo; read only while rtao_ao_bound
-  float rtao_max_darkening;  // RTAO Max Darkening [0..1], set by PushRtaoAo; AO floor = 1 - this
-  float rtao_ao_bound;  // 1 = t22 holds the RTAO output for this lighting draw (PushRtaoAo); 0 = not (RunRtaoInline)
+  float reserved_slot_11;  // reserved: unused slot kept so later packoffsets do not move
+  float reserved_slot_12;  // reserved: unused slot kept so later packoffsets do not move
+  float reserved_slot_13;  // reserved: unused slot kept so later packoffsets do not move
   float reserved_slot_14;  // reserved: unused slot kept so later packoffsets do not move
   float reserved_slot_15;  // reserved: unused slot kept so later packoffsets do not move
   float reserved_slot_16;  // reserved: unused slot kept so later packoffsets do not move
@@ -524,10 +524,9 @@ struct ShaderInjectData {
                                   // change with framerate. Applying it once,
                                   // in MBGameMotionToUV, puts all of them into
                                   // reference-frame units together. 1.0 = no-op.
-  // RTAO state for this present (rtao.hpp): 0 off, 1 requested but not producing
-  // (vanilla SSAO), 2 producing (RTAO AO at t22, SSAO neutral). Takes the slot of
-  // the retired motion-blur field, so later packoffsets do not move.
-  float rtao_active;
+  // Retired per-present state slot; it takes the place of a motion-blur field so
+  // later packoffsets do not move.
+  float reserved_slot_17;
   // ---- convention probe (appended last) ----
   // The game's motion encoding is documented inconsistently in this repo:
   // motion_blur_common.hlsli says prevPixel - curPixel, while the decompiled

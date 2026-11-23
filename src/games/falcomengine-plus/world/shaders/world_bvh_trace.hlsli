@@ -52,7 +52,7 @@ Texture2DArray<uint> g_alpha_atlas : register(t15);
 StructuredBuffer<AlphaMaterialGPU> g_alpha_materials : register(t16);
 #ifdef WORLD_TRACE_DYNAMIC_INSTANCES
 // Flagged draws of this present (P2b, world_dynamic_expand.cs_5_0.hlsl): expanded instances, traced after the TLAS.
-// The including shader picks the slot: the trace pass keeps t17, RTAO binds them at t19 (its t17 is the MRT normal).
+// The including shader picks the slot via WORLD_TRACE_DYNAMIC_SLOT (t17 by default; a pass with t17 as its MRT normal uses t19).
 #ifndef WORLD_TRACE_DYNAMIC_SLOT
 #define WORLD_TRACE_DYNAMIC_SLOT t17
 #endif
@@ -97,8 +97,8 @@ struct WorldCameraView
 {
     bool hide;             // skip surfaces the game camera does not show
     float floor_value;     // cb_scene.disableMapObjNearFade_g
-    uint skip_flags;       // INSTANCE_* bits: an instance with any of them is never hit (RTAO Foliage skip); 0 = none
-    uint require_flags;    // INSTANCE_* bits: hit only with all of them; 0 = none (RTGI sun shadow casters)
+    uint skip_flags;       // INSTANCE_* bits: an instance with any of them is never hit (foliage skip); 0 = none
+    uint require_flags;    // INSTANCE_* bits: hit only with all of them; 0 = none
 };
 
 void TraceResetCounters(out WorldTraceCounters counters)
@@ -774,8 +774,7 @@ WorldTraceHit TraceWorldAny(float3 origin, float3 direction, float t_min, float 
     return TraceWorldRay(origin, direction, t_min, t_max, true, view, counters);
 }
 
-// Interleaved gradient noise pair for ray sampling when IS-FAST is not loaded (RTGI, RTLS). world_rtao.cs_5_0.hlsl keeps
-// its own copy while its source is pinned by hash (test_rtao, ROADMAP Open decision 3).
+// Interleaved gradient noise pair for ray sampling when IS-FAST is not loaded (the inline ray-traced passes).
 float2 TraceIgnNoise2(float2 q)
 {
     return frac(52.9829189 * frac(float2(dot(q, float2(0.06711056, 0.00583715)), dot(q + 47.0, float2(0.06711056, 0.00583715)))));

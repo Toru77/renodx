@@ -58,7 +58,6 @@ enum PerfCost : size_t {
   kPerfDeformUpdateCpu,
   kPerfPoolHooks,
   kPerfDeformHookCpu,
-  kPerfRtaoRecordCpu,
   kPerfRtxdiInputCpu,
   kPerfRtxdiDiCpu,
   kPerfPresentWorldCpu,
@@ -67,8 +66,6 @@ enum PerfCost : size_t {
   kPerfGpuAlphaBlit,
   kPerfGpuP2bExpand,
   kPerfGpuDeformRefit,
-  kPerfGpuRtao,
-  kPerfGpuRtaoFilter,
   kPerfGpuRtxdiInput,
   kPerfGpuRtxdiLocal,
   kPerfGpuRtxdiDistance,
@@ -96,7 +93,7 @@ enum PerfCost : size_t {
   kPerfDxrRecordsGpu,
   kPerfDxrCharactersGpu,
   kPerfGcBlasBuildGpu,
-  kPerfBlockRow,  // the block rows (PerfBlock order, perf_gate.hpp) follow: the first 12 are InPresent (disjoint), the rest Subset
+  kPerfBlockRow,  // the block rows (PerfBlock order, perf_gate.hpp) follow: the first 11 are InPresent (disjoint), the rest Subset
   kPerfCostCount = kPerfBlockRow + kPerfBlockCount
 };
 inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
@@ -112,7 +109,6 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"deform_update_cpu", true, kPerfInPresent, false, nullptr},
     {"pool_hooks", false, kPerfDrawTime, false, nullptr},
     {"deform_hook_cpu", false, kPerfDrawTime, false, nullptr},
-    {"rtao_record_cpu", true, kPerfDrawTime, false, nullptr},
     {"rtxdi_input_cpu", true, kPerfDrawTime, false, nullptr},
     {"rtxdi_di_cpu", true, kPerfDrawTime, false, nullptr},
     {"present_world_cpu", true, kPerfBracket, false, nullptr},
@@ -121,8 +117,6 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"gpu_alpha_blit", true, kPerfGpu, true, nullptr},
     {"gpu_p2b_expand", true, kPerfGpu, true, nullptr},
     {"gpu_deform_refit", true, kPerfGpu, true, nullptr},
-    {"gpu_rtao", true, kPerfGpu, true, nullptr},
-    {"gpu_rtao_filter", true, kPerfGpu, true, nullptr},
     {"gpu_rtxdi_input", true, kPerfGpu, true, nullptr},
     {"gpu_rtxdi_local", true, kPerfGpu, true, nullptr},
     {"gpu_rtxdi_distance", true, kPerfSubset, true, "N3b distance subset"},
@@ -157,7 +151,6 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"record_tlas_rebuild", true, kPerfInPresent, false, nullptr},
     {"gpu_check", true, kPerfInPresent, false, nullptr},
     {"cache_diag", true, kPerfInPresent, false, nullptr},
-    {"rtao_stats", true, kPerfInPresent, false, nullptr},
     {"debug_pass", true, kPerfInPresent, false, nullptr},
     {"resolve_indirect", true, kPerfInPresent, false, nullptr},
     {"p2b_record", true, kPerfInPresent, false, nullptr},
@@ -183,7 +176,6 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"cb_hooks", true, kPerfSubset, false, nullptr},
     {"bind_hook", true, kPerfSubset, false, nullptr},
     {"pool_write_hooks", true, kPerfSubset, false, nullptr},
-    {"rtao_inline", true, kPerfSubset, false, nullptr},
     {"lighting_rt", true, kPerfSubset, false, nullptr},
     {"rt12_signal_flush", true, kPerfSubset, false, nullptr},
     {"rt12_submit", true, kPerfSubset, false, nullptr},
@@ -210,7 +202,6 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"gc_present", true, kPerfSubset, false, nullptr},
     {"rt12_present", true, kPerfSubset, false, nullptr},
     {"draw_hook_pre", true, kPerfSubset, false, nullptr},
-    {"rtao_post", true, kPerfSubset, false, nullptr},
     {"rt12_pass_a", true, kPerfSubset, false, nullptr},
     {"rt12_d3d11_passes", true, kPerfSubset, false, nullptr},
     {"rt12_record", true, kPerfSubset, false, nullptr},
@@ -298,7 +289,7 @@ struct PerfSetting {
 inline constexpr PerfSetting kPerfSettings[kPerfSettingCount] = {
     {"alpha_foliage", 0, 1, {kPerfAlphaSyncCpu, kPerfCostCount, kPerfCostCount, kPerfCostCount}, {kPerfGpuAlphaBlit, kPerfCostCount},
      {kPerfCostCount, kPerfCostCount},
-     "admission and UV/atlas capture at draw time (inside pool_hooks); alpha instances' share of tlas_rebuild, tlas_refit, gpu_trace, gpu_rtao (any-hit)",
+     "admission and UV/atlas capture at draw time (inside pool_hooks); alpha instances' share of tlas_rebuild, tlas_refit and gpu_trace (any-hit)",
      "needs A/B: Alpha foliage OFF vs ON"},
     {"foliage_motion", 1, 1, {kPerfCostCount, kPerfCostCount, kPerfCostCount, kPerfCostCount}, {kPerfCostCount, kPerfCostCount},
      {kPerfTlasRefit, kPerfRefitPhase0},
@@ -306,8 +297,8 @@ inline constexpr PerfSetting kPerfSettings[kPerfSettingCount] = {
      "needs A/B: Foliage motion OFF vs ON; compare tlas_refit, refit_phase_0"},
     {"deforming_meshes", 2, 1, {kPerfDeformHookCpu, kPerfDeformUpdateCpu, kPerfBlockRow + kPerfBlockDeformProbe, kPerfCostCount},
      {kPerfGpuDeformRefit, kPerfCostCount}, {kPerfCostCount, kPerfCostCount},
-     "deforming instances' share of tlas_* and of gpu_trace / gpu_rtao",
-     "needs A/B: Deforming meshes OFF (RTAO OFF too, it needs them)"},
+     "deforming instances' share of tlas_* and of gpu_trace",
+     "needs A/B: Deforming meshes OFF (RTXDI off too, it needs them)"},
     {"follow_moving", 3, 3, {kPerfBlockRow + kPerfBlockFollowScan, kPerfP2bExpandCpu, kPerfBlockRow + kPerfBlockP2bRecord, kPerfCostCount},
      {kPerfGpuP2bExpand, kPerfCostCount}, {kPerfCostCount, kPerfCostCount},
      "exclude-moving admission and TLAS size effect; P2b TLAS exclusion savings; trace cost of expanded draws; follow/P2b capture at draw time (inside pool_hooks)",
@@ -377,9 +368,9 @@ struct PerfTimerSample {
   uint32_t samples = 0u;
 };
 struct PerfExtraGpu {
-  PerfTimerSample rtao, rtao_filter, deform_refit;
+  PerfTimerSample deform_refit;
   PerfTimerSample rtxdi_input, rtxdi_local, rtxdi_distance, rtxdi_nrd;
-  double dxr_tlas_ms = 0.0, dxr_records_ms = 0.0, dxr_characters_ms = 0.0, gc_blas_ms = 0.0;  // D3D12 timestamp sums (rt12 panels); inside gpu_rtao, so Subset rows
+  double dxr_tlas_ms = 0.0, dxr_records_ms = 0.0, dxr_characters_ms = 0.0, gc_blas_ms = 0.0;  // D3D12 timestamp sums (rt12 panels); inside the scene trace, so Subset rows
   PerfTimerSample rtxdi_initial, rtxdi_temporal, rtxdi_spatial, rtxdi_sun, pt_main, pt_water;
 };
 
@@ -466,7 +457,7 @@ inline PerfTotalsValue PerfTotals(const double* values) {
   // draw hook, but the bind and capture hooks also run nested inside lighting_rt (NullComputeSlots, compute restore) and inside
   // the DynCube t17 swap, so hook_outer over-counts by that nested time when RT passes or DynCube are on. Known limitation.
   const double draw_hook_outer = values[kPerfBlockRow + kPerfBlockDrawHookTotal] - values[kPerfPoolHooks] - values[kPerfDeformHookCpu];
-  const double lighting_rt_outer = values[kPerfBlockRow + kPerfBlockLightingRt] - values[kPerfRtaoRecordCpu]
+  const double lighting_rt_outer = values[kPerfBlockRow + kPerfBlockLightingRt]
                                    - values[kPerfRtxdiInputCpu] - values[kPerfRtxdiDiCpu];
   totals.hook_outer = std::max(0.0, draw_hook_outer) + std::max(0.0, lighting_rt_outer) + values[kPerfBlockRow + kPerfBlockBindHook]
                       + values[kPerfBlockRow + kPerfBlockCaptureHook] + values[kPerfBlockRow + kPerfBlockCbHooks]
@@ -543,7 +534,6 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.cost[kPerfDeformUpdateCpu] = PerfMsOf(g_perf_gate.deform_update_us);
   c.cost[kPerfPoolHooks] = PerfMsOf(g_pool.cpu_hook_frame_us);
   c.cost[kPerfDeformHookCpu] = PerfMsOf(g_deform_live.cpu_frame_us);
-  c.cost[kPerfRtaoRecordCpu] = PerfMsOf(g_perf_gate.rtao_record_us);
   c.cost[kPerfRtxdiInputCpu] = PerfMsOf(g_perf_gate.rtxdi_input_cpu_us);
   c.cost[kPerfRtxdiDiCpu] = PerfMsOf(g_perf_gate.rtxdi_di_cpu_us);
   c.cost[kPerfPresentWorldCpu] = PerfMsOf(g_perf_gate.present_world_us);
@@ -556,10 +546,6 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.events[kPerfGpuP2bExpand] = data->dynamic.timer.samples;
   c.cost[kPerfGpuDeformRefit] = extra.deform_refit.ms_sum;
   c.events[kPerfGpuDeformRefit] = extra.deform_refit.samples;
-  c.cost[kPerfGpuRtao] = extra.rtao.ms_sum;
-  c.events[kPerfGpuRtao] = extra.rtao.samples;
-  c.cost[kPerfGpuRtaoFilter] = extra.rtao_filter.ms_sum;
-  c.events[kPerfGpuRtaoFilter] = extra.rtao_filter.samples;
   c.cost[kPerfGpuRtxdiInput] = extra.rtxdi_input.ms_sum;
   c.events[kPerfGpuRtxdiInput] = extra.rtxdi_input.samples;
   c.cost[kPerfGpuRtxdiLocal] = extra.rtxdi_local.ms_sum;
@@ -915,8 +901,7 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
 }
 
 // Gathering was switched OFF: clears what it gathered (CPU sums, maxima, last values, phase sums, GPU timer statistics,
-// cache-diag timings) and the tab window. The RTAO timers are cleared by rtao::ClearRtaoPerfGathered. Runs on the present
-// thread, one lock at a time; no graphics call is made under a lock.
+// cache-diag timings) and the tab window. Runs on the present thread, one lock at a time; no graphics call is made under a lock.
 inline void ClearPerfGathered(BvhDeviceData* data) {
   g_pool.cpu_hook_us.store(0u);
   g_pool.cpu_drain_us.store(0u);
@@ -927,7 +912,6 @@ inline void ClearPerfGathered(BvhDeviceData* data) {
   g_perf_gate.present_world_us.store(0u);
   g_perf_gate.present_bvh_us.store(0u);
   g_perf_gate.alpha_sync_us.store(0u);
-  g_perf_gate.rtao_record_us.store(0u);
   g_perf_gate.rtxdi_input_cpu_us.store(0u);
   g_perf_gate.rtxdi_di_cpu_us.store(0u);
   g_perf_gate.rtxdi_attempts.store(0u);

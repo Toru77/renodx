@@ -304,7 +304,7 @@ struct DynamicCapture {
   uint32_t index_count = 0u;
   uint32_t instance_count = 0u;
   uint32_t first_instance = 0u;
-  bool skinned = false;  // VsClass::Skinned: the character set traced by RTAO/RTGI
+  bool skinned = false;  // VsClass::Skinned: the character set traced by the DXR scene transaction and RTXDI
 };
 
 struct DynamicCaptureShader {
@@ -414,7 +414,7 @@ struct DeformLiveState {
   // Objects of the last present.
   reshade::api::resource objects_buffer = {0u};
   reshade::api::resource_view objects_srv = {0u};
-  // Characters of this frame for RTAO and RTGI (RefitDeformLiveCharacters); the present never writes it.
+  // Characters of this frame for the DXR scene transaction and RTXDI (RefitDeformLiveCharacters); the present never writes it.
   reshade::api::resource lighting_objects_buffer = {0u};
   reshade::api::resource_view lighting_objects_srv = {0u};
   uint32_t object_count = 0u;
@@ -1418,7 +1418,7 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
   g_deform_live.object_info = std::move(info);
 }
 
-// Lighting time (RTAO and RTGI): refits this frame's skinned characters so their
+// Lighting time (the DXR scene transaction and RTXDI): refits this frame's skinned characters so their
 // BLAS sits in the trace inputs. Once per frame, shared by both passes.
 inline DynamicTraceInputs RefitDeformLiveCharacters(reshade::api::device* device,
                                                     reshade::api::command_list* cmd_list) {
@@ -1509,7 +1509,7 @@ inline uint64_t DeformLightingSnapshot(uint32_t frame) {
   return g_deform_live.lighting_frame == frame ? g_deform_live.lighting_snapshot : 0u;
 }
 
-// rt12 (DXR RTAO): the characters RefitDeformLiveCharacters traced for this frame and the arena they live in.
+// rt12 (DXR scene): the characters RefitDeformLiveCharacters traced for this frame and the arena they live in.
 // False when that refit did not run this frame or produced nothing.
 inline bool GetDeformLiveCharacters(reshade::api::device* device, std::vector<DynamicCharacter>* out,
                                     reshade::api::resource_view* arena_srv) {

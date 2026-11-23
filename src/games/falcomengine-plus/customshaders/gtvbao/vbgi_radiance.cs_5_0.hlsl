@@ -165,7 +165,7 @@ void main(uint2 p : SV_DispatchThreadID)
   const uint4 mrt0 = g_mrt0.Load(int3(VbgiTexel(uv, uint2(m0w, m0h)), 0));
   const float3 n = DecodeFalcomMrtNormalAsGame(mrt0.xy);
 
-  // World position from the representative pixel's depth (same mapping as world_rtao).
+  // World position from the representative pixel's depth (same depth-to-world mapping as the GTVBAO pass).
   const float4 world_h = mul(float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, depth, 1.0f), viewProjInv_g);
   const float3 P = world_h.xyz / world_h.w;
   const float view_z = dot(view_g._m02_m12_m22_m32, float4(P, 1.0f));

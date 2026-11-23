@@ -19,9 +19,6 @@
 #include "../../../../utils/render.hpp"
 #include "../rt12/rt12_capture.hpp"
 #include "../rt12/rt12_probe.hpp"
-#include "../rtao/rtao.hpp"
-#include "../rtao/rtao_svgf.hpp"
-#include "../rtgi/rtgi.hpp"
 #include "bvh_build.hpp"
 #include "bvh_live.hpp"
 #include "bvh_resources.hpp"
@@ -289,7 +286,7 @@ inline void RefreshPoolCaptureRequest() {
 }
 
 inline bool RtBvhDemanded() {
-  return rtao::RtaoRequested() || rtxdi::SceneRequested();
+  return rtxdi::SceneRequested();
 }
 
 inline void ApplyBvhInputs() {
@@ -315,19 +312,17 @@ inline void ApplyBvhInputs() {
   store(g_live_bvh.enabled, demand || (diagnostic && g_live_bvh.enabled_setting > 0.5f));
   store(g_deform.enabled, demand || (diagnostic && deform_setting));
   store(g_deform_live.enabled, demand || (diagnostic && deform_setting));
-  // G5: reduce the CPU pool while DXR RTAO, tracing the GPU scene, is the only RT consumer.
+  // G5: reduce the CPU pool while the DXR scene transaction is the only RT consumer.
   const rt12::Rt12State* rt12_state = rt12::g_rt12.get();
   UpdateGcPoolReduce(GcPoolReduceInputs{.switch_on = g_gpu_capture.reduce_pool.load(std::memory_order_relaxed),
-                                        .gc_owns = rt12::GcOwnsRtao(),
+                                        .gc_owns = rt12::GcOwnsScene(),
                                         .gc_active = g_gpu_capture.active.load(std::memory_order_relaxed),
                                         .dxr_on = rt12::g_rt12_enabled.load(std::memory_order_relaxed),
                                         .dxr_running = rt12_state != nullptr && !rt12_state->failed && !rt12_state->stuck,
                                         .scene_ready = rt12::g_rt12_gc_scene.ready,
-                                        .rtao = rtao::RtaoRequested(),
                                         .debug_view = g_bvh_debug.mode.load(std::memory_order_relaxed) != 0,
                                         .pool_scan = scan_setting,
-                                        .rtxdi = rtxdi::SceneRequested() && !rt12::GcOwnsRtao(),
-                                        .discovery = rtao::g_rtao_discovery > 0.5f},
+                                        .rtxdi = rtxdi::SceneRequested() && !rt12::GcOwnsScene()},
                      g_state.frame.load());
   RefreshPoolCaptureRequest();
 }
@@ -356,20 +351,12 @@ inline void OnWorldPresentBvh(
   if (rt12::g_rt12_probe.requested.exchange(false, std::memory_order_relaxed)) rt12::RunRt12Probe(device, g_state.frame.load());
   if (g_perf_gate.clear_pending.exchange(false)) {
     ClearPerfGathered(GetBvhDeviceData(device));
-    rtao::ClearRtaoPerfGathered(device);
-    ClearGpuTimerStats(&rtao::GetRtaoSvgfData(device).denoise.timer);
   }
   g_bvh_debug.device.store(device, std::memory_order_relaxed);
   ApplyBvhInputs();
 
   PerfExtraGpu extra;
   if (g_perf_gate.gather.load(std::memory_order_relaxed)) {
-    {
-      const rtao::RtaoDeviceData& rtao_data = rtao::GetRtaoDeviceData(device);
-      extra.rtao = {rtao_data.timer.ms_sum, rtao_data.timer.samples};
-      const rtao::RtaoSvgfData& rtao_svgf = rtao::GetRtaoSvgfData(device);
-      extra.rtao_filter = {rtao_svgf.denoise.timer.ms_sum, rtao_svgf.denoise.timer.samples};
-    }
     {
       std::lock_guard<std::mutex> lock(g_deform_live.mutex);
       extra.deform_refit = {g_deform_live.refit_timer.ms_sum, g_deform_live.refit_timer.samples};
@@ -420,7 +407,6 @@ inline void OnWorldPresentBvh(
   }
   UpdateCacheDiag(device, present_time);
   UpdateDeformLive(device, queue);
-  rtao::MaybeCaptureRtaoStats(device, queue);
   RunBvhDebugPass(queue, swapchain);
 }
 

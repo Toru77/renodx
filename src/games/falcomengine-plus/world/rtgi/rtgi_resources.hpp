@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "../../../../utils/log.hpp"
+#include "../bvh/bvh_resources.hpp"
 #include "../rtao/rtao_resources.hpp"
 
 namespace falcom_world::rtgi {
@@ -109,11 +110,6 @@ inline constexpr std::span<const std::uint8_t> kSvgfFinalizeAoShader = __world_s
 #else
 inline constexpr std::span<const std::uint8_t> kSvgfFinalizeAoShader = {};
 #endif
-#if defined(__world_rtgi_upsample_EMBED_FILE)
-inline constexpr std::span<const std::uint8_t> kRtgiUpsampleShader = __world_rtgi_upsample;
-#else
-inline constexpr std::span<const std::uint8_t> kRtgiUpsampleShader = {};
-#endif
 // b12 for the SVGF passes (reproject, variance, a-trous), matching cbuffer cb_svgf in world_svgf.hlsli.
 struct SvgfPushConstants {
   float size[4];      // c0: trace width, trace height, full width, full height
@@ -194,11 +190,6 @@ struct RtgiPipelineDesc {
   std::span<const std::uint8_t> code;  // empty: the shader is not embedded
   const char* name;                    // log name
 };
-
-// The upsample pipeline: ensured by the owner alongside its other pipelines.
-inline constexpr RtgiPipelineDesc kRtgiUpsamplePipelineDesc = {.srv_count = kRtgiUpsampleSrvCount, .uav_count = kRtgiUpsampleUavCount,
-                                                              .sampler_count = 0u, .push_count = kRtgiUpsamplePushCount,
-                                                              .code = kRtgiUpsampleShader, .name = "upsample"};
 
 // Creates one RTGI-layout compute pipeline on first use (RtgiPipeline layout); a failure is latched and logged once.
 inline bool EnsureRtgiPipeline(reshade::api::device* device, RtgiPipeline* p, const RtgiPipelineDesc& desc) {

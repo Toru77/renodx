@@ -34,7 +34,6 @@ inline void OnDestroyDeviceBvh(reshade::api::device* device) {
   rt12::DestroyGc(device);
   rt12::DestroyRt12(device);
   DestroyBvhDebugResources(device);
-  rtao::DestroyRtaoSvgfData(device);
   rtao::DestroyRtaoDeviceData(device);
   rr::DestroyRrDeviceData(device);
   DestroyBvhDeviceData(device);
@@ -143,7 +142,7 @@ inline bool DrawRayTracingRows() {
     }
     changed = true;
   }
-  ImGui::TextDisabled("BVH range: every pooled object within this distance of the camera is in the BVH; RTAO reaches it at 100% fade.");
+  ImGui::TextDisabled("BVH range: every pooled object within this distance of the camera is in the BVH.");
   static const std::vector<RayTracingRow> rows = {
       {"Alpha foliage (leaves, grass, fences)",
        "Adds alpha-tested foliage, including foliage drawn by indirect (GPU driven) calls.",
@@ -753,7 +752,7 @@ inline bool DrawBvhPanel() {
   bool dxr = rt12::g_rt12_enabled.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("DXR backend (experimental)", &dxr)) rt12::g_rt12_enabled.store(dxr, std::memory_order_relaxed);
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Session only. RTAO pass A traces on a Direct3D 12 device with hardware ray tracing (DXR 1.1). Turning it on reloads the BVH (a few frames without RT). Characters are traced on DXR. Off: the compute path, exactly as before.");
+    ImGui::SetTooltip("Session only. The shared DXR scene transaction traces on a Direct3D 12 device with hardware ray tracing (DXR 1.1) for RTXDI and path tracing. Turning it on reloads the BVH (a few frames without RT). Characters are traced on DXR. Off: the compute path, exactly as before.");
   }
   ImGui::SameLine();
   if (ImGui::Button("Dump DXR JSON")) rt12::DumpRt12Json();
@@ -799,7 +798,7 @@ inline bool DrawBvhPanel() {
   bool gc_on = bvh::g_gpu_capture.enabled.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("GPU geometry cache (experimental)", &gc_on)) bvh::g_gpu_capture.enabled.store(gc_on, std::memory_order_relaxed);
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Session only. Needs the DXR backend. Copies and decodes the static meshes on the GPU into a separate D3D12 cache with its own BLAS. With Trace the GPU scene on, DXR RTAO traces it instead of the mirror. Off: no GPU cache work at all.");
+    ImGui::SetTooltip("Session only. Needs the DXR backend. Copies and decodes the static meshes on the GPU into a separate D3D12 cache with its own BLAS. With Trace the GPU scene on, the DXR scene transaction traces it instead of the mirror. Off: no GPU cache work at all.");
   }
   ImGui::SameLine();
   if (ImGui::Button("Check GPU geometry")) rt12::g_gc_check_requested.store(true, std::memory_order_relaxed);
@@ -813,7 +812,7 @@ inline bool DrawBvhPanel() {
   bool gc_trace = bvh::g_gpu_capture.trace.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Trace the GPU scene (experimental)", &gc_trace)) bvh::g_gpu_capture.trace.store(gc_trace, std::memory_order_relaxed);
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Session only, needs the GPU geometry cache. DXR RTAO traces the GPU instance set and the GPU BLAS instead of the mirror; frames it cannot trace run the compute pass (gpu_capture). Off: the mirror is re-streamed (M5).");
+    ImGui::SetTooltip("Session only, needs the GPU geometry cache. The DXR scene transaction traces the GPU instance set and the GPU BLAS instead of the mirror; frames it cannot trace fall back to the mirror (gpu_capture). Off: the mirror is re-streamed (M5).");
   }
   bool gc_trace_no_cpu_mesh = bvh::g_gpu_capture.trace_no_cpu_mesh.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Trace meshes the CPU pool lacks", &gc_trace_no_cpu_mesh)) {
@@ -827,7 +826,7 @@ inline bool DrawBvhPanel() {
     bvh::g_gpu_capture.reduce_pool.store(gc_reduce_pool, std::memory_order_relaxed);
   }
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Session only. While DXR RTAO traces the GPU scene and no other RT effect, BVH debug view, Pool Scan or discovery is on, the CPU pool stops its per-draw instance staging and P2b records and the CPU TLAS is not rebuilt. A frame DXR cannot trace shows vanilla SSAO and turns the full pool back on (re-stream). Off: the full pool (G4). State in the RTAO panel.");
+    ImGui::SetTooltip("Session only. While the DXR scene transaction traces the GPU scene and no other RT effect, BVH debug view or Pool Scan is on, the CPU pool stops its per-draw instance staging and P2b records and the CPU TLAS is not rebuilt. A frame DXR cannot trace turns the full pool back on (re-stream). Off: the full pool (G4). State in the GPU cache panel.");
   }
   rt12::Rt12GcPanel gc_panel;
   {
