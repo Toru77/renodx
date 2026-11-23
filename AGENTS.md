@@ -23,13 +23,25 @@ This file is the root, always-on guidance for AI coding agents. Keep it short. P
 
 Role-specific workflows are in `.agents/agents/`. Read the matching guide when a task is explicitly planning, implementation from an existing plan, or review against a plan:
 
-- `.agents/agents/master-planner.md` - planning and design decisions.
+- `.agents/agents/low-planner.md`, `mid-planner.md`, `high-planner.md` - planning and design decisions at three model tiers. All three share the role definition in `.agents/agents/planner.md`.
 - `.agents/agents/implementer-writer.md` - implementing a settled plan.
 - `.agents/agents/reviewer.md` - reviewing implementation against a plan.
 
 These guides complement this file and any nested `AGENTS.md`; they do not replace repository guidance.
 
 Nested `AGENTS.md` files require `chat.useNestedAgentsMdFiles` to be enabled in `.vscode/settings.json` for VS Code to load them automatically.
+
+## Agent loop policy
+
+The lead agent owns the loop; agents never call each other or start a second cycle themselves.
+
+- Plan once per feature set, in batches. Hand-offs name the plan file path and section, never pasted plan text.
+- Review one milestone commit range at a time (`git diff <base>..<commit>`). Never re-review a range already reported on. The reviewer gets one pass per launch.
+- Cap reviewer launches at two per milestone. If the second pass still finds deviations, stop and bring the decision to the user.
+- Batch open questions into one amendment request and route to a higher planner tier (low → mid → high) once instead of re-planning repeatedly. Keep one tier per plan.
+- A hand-off is a routing label, not an auto-retry: `NO DEVIATIONS` / `FIXED` end the milestone; `PLAN DEVIATION` / `DECISION NEEDED` go to the lead for a decision.
+- Run independent milestones in parallel when their file lists do not overlap.
+- Grep first and read only cited line ranges. Rerun only checks affected by a fix.
 
 ## Workflow skills
 
