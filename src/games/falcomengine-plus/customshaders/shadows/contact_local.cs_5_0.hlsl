@@ -10,7 +10,7 @@
 // Spot). A pixel with neither kind on writes kContactDiagNoLocalKind and marches nothing.
 //
 // The origin is lifted along the MRT normal by Local Normal Bias, and along the negated normal for a lamp behind the
-// surface (lit through translucency), as RT Local Shadows does.
+// surface (lit through translucency).
 //
 // Runs on Sora 1st, Sora 2nd and Kai (Kai and Kai soft share the Kai path). It reads lightTileSizeInv_g at cb_scene c29
 // and LightIndexData.tileDepthInv, which these games lay out the same way. Kyoto keeps the inline march in its lighting shader.

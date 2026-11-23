@@ -15,13 +15,7 @@ An optional restart-required setting keeps Falcom Engine+'s pipeline-layout trac
 
 #### Path-traced diffuse GI
 
-Sora 2nd path-traces diffuse indirect lighting using the captured world, the game sun and RTXDI Local lamps, the game ambient probe for sky light, and bounce albedo from the G-buffer on screen or a material cache learned from visible pixels off screen, keyed by each surface's dominant normal axis; with Path-Traced Reflection on, environment reflections and water use traced reflected rays (the optional Water Surface Reflection toggle traces water from a copy of the SSR surface), and game SSR and dynamic cubemaps are switched off at runtime. It needs RTXDI Local (scene transfer and lamps) and works with RTXDI Sun off; sun light at path vertices comes from scene constants and the path tracer's own shadow rays. SHARC (NVIDIA's radiance cache, world/sharc/vendor) ends paths early on cached light; its colour scale is tunable, it clears on map changes, loading screens, large sun changes and scale changes, and optional clamps on reflected rays (on by default) and bounce light (off by default) trade energy for fewer fireflies, and an optional SHARC update clamp (off by default) limits cache updates far above their cell's average.
-
-Sparse Rendering, adapted from OpenRemix and off by default, uses IS-FAST blue noise to select opaque pixels when Ray Reconstruction is active; selected diffuse lighting is scaled by the inverse sampling rate, while reflections can remain dense or be sampled sparsely and weighted before their per-ray clamp; skipped diffuse lighting is zeroed to valid black and water remains dense.
-
-The default-Off ReGIR path builds proposal pools from primary surfaces and looks up the actual hit position for light sampling, with uniform fallback when a matching valid pool is unavailable. Its discrete mixture PMF assumes an equiprobable 24-bit input; CPU and GPU fixtures do not establish game RNG statistics or replace owner validation. GPU readback exercises registration reconstruction, deduplication and overflow, the selector, reordered two-light weights/build, and invalid producer inputs; it does not prove production trace gates, main/water behavior, stale fallback, fence-failure handling, or owner game behavior.
-
-PT diagnostics report per-hit ReGIR lookup and fallback counters separately for main and water, with asynchronous pass timings; registration, weights, and build timings apply only to main submissions, while water reports its own trace interval.
+Sora 2nd path-traces diffuse indirect lighting using the captured world, RTXDI Local lamps, the game sun and G-buffer or material-cache bounce albedo; with Path-Traced Reflection on, environment and water reflections use traced rays. It needs RTXDI Local (scene transfer and lamps) and works with RTXDI Sun off. SHARC (NVIDIA's radiance cache) ends paths early on cached light, while Sparse Rendering and the default-Off ReGIR path trade samples for cost.
 
 **Code:** [world/pt](world/pt/), [ReGIR registration](world/shaders/world_regir_register.cs_6_5.hlsl), [ReGIR weights](world/shaders/world_regir_weights.cs_6_5.hlsl), [ReGIR build](world/shaders/world_regir_build.cs_6_5.hlsl), [world/pt/pt_regir_contract.hpp](world/pt/pt_regir_contract.hpp), [world/shaders/world_pt_diffuse.cs_6_6.hlsl](world/shaders/world_pt_diffuse.cs_6_6.hlsl), [world/shaders/world_pt_sharc_update.cs_6_6.hlsl](world/shaders/world_pt_sharc_update.cs_6_6.hlsl), [world/shaders/world_pt_sharc_resolve.cs_6_6.hlsl](world/shaders/world_pt_sharc_resolve.cs_6_6.hlsl), [world/shaders/world_pt_material_write.cs_6_6.hlsl](world/shaders/world_pt_material_write.cs_6_6.hlsl).
 **Reference:** Open Remix `pathtrace.comp`.
@@ -38,37 +32,11 @@ IS-FAST supplies precomputed blue-noise samples to opted-in effects so spatial s
 
 **Code:** [`addon.cpp`](addon.cpp); the embedded asset and consumers are listed in the resource map below.
 
-#### Ray-traced ambient occlusion (RTAO)
+#### RTXDI direct-light resampling
 
-RTAO traces visibility rays against the captured world scene and writes an AO term into the game's lighting path. Temporal reprojection and edge-aware spatial filtering are optional stages in the shared SVGF chain.
+RTXDI resamples direct light from the game's point and spot lamps with SDK temporal and spatial passes, including boiling, disocclusion and visibility handling, and publishes a guarded local-DI tuple to Sora 2nd lighting. Its sun path traces visibility per surface with soft penumbras, half-resolution tracing and temporal accumulation, while the traced scene and lamp table are shared with path tracing. Shadow darkening, foliage transmission and the RTXDI panel's bounded diagnostics and debug views are configured in the RTXDI sections.
 
-**Code:** [`world/rtao`](world/rtao/), [`world/shaders/world_rtao.cs_5_0.hlsl`](world/shaders/world_rtao.cs_5_0.hlsl), [`world/shaders/world_svgf.hlsli`](world/shaders/world_svgf.hlsli).
-
-#### Ray-traced global illumination (RTGI)
-
-RTGI traces diffuse indirect light and composites it into game lighting, with game sun and local-light data supplying direct illumination at ray hits. Its trace, history, denoising, and composite stages are separated in the world module and shader directory.
-
-**Code:** [`world/rtgi`](world/rtgi/), [`world/shaders/world_rtgi.cs_5_0.hlsl`](world/shaders/world_rtgi.cs_5_0.hlsl).
-
-#### ReSTIR GI and direct-light resampling
-
-ReSTIR GI reuses weighted lighting samples across pixels and frames to reduce noise; RTXDI provides the SDK resampling structures and algorithms for the direct-light path. The game adapter validates captured surfaces and light identities before consuming a selected sample. The lamp jitter point is redrawn for every final shadow ray.
-
-The RTXDI temporal pass runs the SDK boiling filter, which empties a reservoir whose weight is far above its 8x8 group's average, so rare bright samples do not spread into blotches. Spatial reuse applies the SDK disocclusion boost: pixels without temporal history take more neighbour samples. The Balanced preset (default) also enables SDK permutation sampling for temporal history lookups, which needs valid motion vectors, and initial visibility, which shadow-tests each pixel's initial light sample and drops it when blocked before reuse; the Performance preset turns both off, and the Quality preset keeps both on.
-
-RTXDI local lights share a per-transfer-slot table across PT and RTXDI; its optional Stable Light Remap setting is Off by default and preserves the exact same-index temporal rule until enabled. The table hashes quantized point/spot identity and validates the original light tuple before mapping reordered lights; owner validation is pending.
-
-The RTXDI panel provides session-only debug views over existing local-DI, sun, denoised-diffuse, and qualified distance outputs, plus bounded CPU diagnostics that can be copied or cleared without including scene contents or raw native addresses. Structured Lights/Tiles/Deferred rejections report the failing validation predicate and bounded SRV/resource descriptor evidence with session-local identity tokens. BVH debug presentation takes precedence over RTXDI views, which take precedence over legacy overlays. The earlier `SceneBindingChanged` rejection was not reproduced in the latest diagnostic capture: scene promotion and input transfer reached Ready. A separate local-enabled capture reaches the Lights structured-view check and reports `InvalidStructuredView`; its precise descriptor failure is still under investigation.
-
-RTXDI shadow darkening scales how dark blocked lamp and sun shadows get on the environment and on characters, with one character slider per light. The raw lamp and sun lighting paths apply these settings; the RELAX denoiser input does not yet.
-
-RTXDI sun visibility can be traced at half resolution, with a resolve pass that fills the other pixels from neighbours and falls back to full-resolution traces at edges. RTXDI sun and lamp shadows can sample a disk-shaped light for soft penumbras, using the shared IS-FAST noise, which the RTXDI scene pass copies itself when RTAO does not; on characters, lamp and sun shadow rays can also start from a point shifted with the disk sample so close self-shadows from arms, hair and clothing get soft edges. Sun shadows can also let tinted sunlight through alpha-tested leaf layers, and a share of sunlight through each wind-moved foliage object (opaque or alpha-tested) so moving foliage casts softer shadows.
-
-RTXDI sun shadows with Light Size above 0 are averaged over recent frames, reprojected with motion vectors, history-tested against the previous depth and normal and clamped to the 3x3 neighbourhood, so soft penumbras are less noisy; at Light Size 0 nothing changes.
-
-An optional RTXDI local light clamp (off by default) caps the luminance of each pixel's selected lamp by scaling its published weight, so lamp fireflies drop at the cost of energy; stored reservoirs are not changed.
-
-**Code:** [`world/rtgi`](world/rtgi/), [`world/rtxdi`](world/rtxdi/), [`world/shaders`](world/shaders/), [`world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl`](world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl), [world/shaders/world_rtxdi_sun_accumulate.cs_6_5.hlsl](world/shaders/world_rtxdi_sun_accumulate.cs_6_5.hlsl), [`world_settings.hpp`](world/world_settings.hpp), [`lighting_0xCA3D8596.ps_5_0.hlsl`](games/sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl).
+**Code:** [`world/rtxdi`](world/rtxdi/), [`world/shaders`](world/shaders/), [`world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl`](world/shaders/world_rtxdi_sun_visibility.cs_6_5.hlsl), [world/shaders/world_rtxdi_sun_accumulate.cs_6_5.hlsl](world/shaders/world_rtxdi_sun_accumulate.cs_6_5.hlsl), [`world_settings.hpp`](world/world_settings.hpp), [`lighting_0xCA3D8596.ps_5_0.hlsl`](games/sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl).
 **References:** [`reference/restir`](reference/restir/), vendored RTXDI [`README`](world/rtxdi/vendor/rtxdi/README.md) and [`license`](licenses/RTXDI-LICENSE.txt).
 
 #### NRD RELAX adapter
@@ -78,23 +46,11 @@ The world D3D12 path prepares diffuse/specular signals and guide data for NVIDIA
 **Code:** [`world/rt12/rt12_nrd.hpp`](world/rt12/rt12_nrd.hpp), [`world/rt12/rt12_rtxdi_transfer.hpp`](world/rt12/rt12_rtxdi_transfer.hpp), [`world/shaders`](world/shaders/).
 **Context:** [`world/docs/ROADMAP.md`](world/docs/ROADMAP.md) describes its input contract and integration limits.
 
-#### Ray-traced local shadows (RTLS)
-
-RTLS traces visibility from shaded surfaces toward local lights. It keeps its own trace resources and can use the shared temporal/spatial denoising path.
-
-**Code:** [`world/rtls`](world/rtls/), [`world/shaders/world_rtls.cs_5_0.hlsl`](world/shaders/world_rtls.cs_5_0.hlsl).
-
-#### Ray-traced sun shadows
-
-RT Sun traces visibility toward the directional sun and supplies a shadow term to game lighting. It can use the shared temporal/spatial denoising path.
-
-**Code:** [`world/rtsun`](world/rtsun/), [`world/shaders/world_rtsun.cs_5_0.hlsl`](world/shaders/world_rtsun.cs_5_0.hlsl).
-
 #### SVGF denoising
 
-SVGF reprojects and validates temporal history, estimates variance, then applies an edge-aware a-trous filter. The shared chain is used by RTGI, RTAO, RTLS, RT Sun, GTVBAO, and GTVBGI paths that enable it.
+SVGF reprojects and validates temporal history, estimates variance, then applies an edge-aware a-trous filter. The shared chain serves GTVBAO and VBGI.
 
-**Code:** [`world/shaders/world_svgf.hlsli`](world/shaders/world_svgf.hlsli), [`world/rtgi/rtgi.hpp`](world/rtgi/rtgi.hpp).
+**Code:** [`world/shaders/world_svgf.hlsli`](world/shaders/world_svgf.hlsli), [`world/denoise/denoise.hpp`](world/denoise/denoise.hpp).
 **Reference:** [`reference/svgf`](reference/svgf/).
 
 #### DLSS Ray Reconstruction
@@ -266,20 +222,20 @@ The addon captures resources from specific game shader bindings and draw events;
 | Resource | Where the addon gets it | Main consumers and tracing pointers |
 |---|---|---|
 | Scene depth | Captured from a recognized lighting shader's depth SRV: t4 in Sora shaders and t3 in Kai shaders. Binding constants and hash-gated capture are in [`addon.cpp`](addon.cpp); world lifetime/size tracking is in [`world/capture/depth_source.hpp`](world/capture/depth_source.hpp). | World ray tracing, GTVBAO/VBGI, contact shadows, and depth-aware temporal validation. Other passes may bind their own depth input; check that pass's shader and hook. |
-| G-buffer normal | Captured from t1 (`mrtTexture0`) on recognized lighting shaders. The game resource is held in add-on state and bound to passes that need surface orientation. | RTAO, RTGI, RTLS, RT Sun, GTVBAO/VBGI, contact shadows, and edge-aware filters. Search `captured_mrt_normal_srv` in [`addon.cpp`](addon.cpp). |
+| G-buffer normal | Captured from t1 (`mrtTexture0`) on recognized lighting shaders. The game resource is held in add-on state and bound to passes that need surface orientation. | GTVBAO/VBGI, contact shadows, and edge-aware filters. Search `captured_mrt_normal_srv` in [`addon.cpp`](addon.cpp). |
 | Vanilla SSAO | Captured from t5 for Sora or t4 for Kai on the recognized lighting shader. This lets replacement/composite paths inspect or preserve the game's AO input. | GTVBAO activation and the game-specific lighting paths. See the register constants and `captured_ssao_srv` in [`addon.cpp`](addon.cpp). |
 | Scene constants (`cb_scene`) | Captured from b0 on lighting draws; draw-time values and ranges are tracked rather than assuming one stable buffer offset. | Camera transforms and reconstruction in world effects, shadow/fog passes, and game shader replacements. See [`world/capture/cb_tracking.hpp`](world/capture/cb_tracking.hpp), [`world/capture/cb_value_tracker.hpp`](world/capture/cb_value_tracker.hpp), and `captured_scene_cbv` in [`addon.cpp`](addon.cpp). |
-| Motion vectors: G-buffer RTV4 | Captured from the engine's RTV4 during render-target binding. `MBMotionRtv4Ensure` validates it, creates an add-on-owned SRV, and checks that dimensions match depth before world temporal passes use it. | Temporal RTAO, RTGI/ReSTIR GI, RTLS, RT Sun, GTVBAO/VBGI, RTXDI temporal DI, and the default motion-blur input. If it conflicts with TAA t3, world temporal reuse is rejected; see `UpdateRtMotion` in [`addon.cpp`](addon.cpp). |
+| Motion vectors: G-buffer RTV4 | Captured from the engine's RTV4 during render-target binding. `MBMotionRtv4Ensure` validates it, creates an add-on-owned SRV, and checks that dimensions match depth before world temporal passes use it. | GTVBAO/VBGI, RTXDI temporal DI, and the default motion-blur input. If it conflicts with TAA t3, world temporal reuse is rejected; see `UpdateRtMotion` in [`addon.cpp`](addon.cpp). |
 | Motion vectors: TAA t3 | Captured from t3 only on recognized Sora TAA shader draws; this resource is not assumed ready before lighting. | Custom TAA, motion-adaptive RCAS, and the optional Sora motion-blur input. Kai motion blur uses RTV4. See the t3 capture in [`addon.cpp`](addon.cpp), [`taa_reproject.hlsli`](customshaders/taa/taa_reproject.hlsli), and RCAS/motion-blur dispatch setup there. |
 | World geometry and transforms | Draw callbacks and per-command-list SRV/constant-buffer tracking observe game vertex/index buffers, instance data, and draw-time transforms. The pool and scene builders copy/convert admitted data into add-on-owned CPU/GPU structures. | World BVH and DXR paths. Start at [`world/capture/draw_census.hpp`](world/capture/draw_census.hpp), [`world/capture/cb_tracking.hpp`](world/capture/cb_tracking.hpp), [`world/bvh/bvh_pool.hpp`](world/bvh/bvh_pool.hpp), and [`world/rt12`](world/rt12/). |
 | Sora 2nd lighting and RTXDI inputs | The lighting callback gathers depth, normal, scene constants, color, MRT material buffers, motion, tiled-light indices, local-light records, and deferred data. It validates and packs these views for the separate D3D12 path. | RTXDI local-light/sun visibility and its temporal DI pass. Follow input assembly in [`addon.cpp`](addon.cpp), resource transfer in [`world/rt12/rt12_rtxdi_transfer.hpp`](world/rt12/rt12_rtxdi_transfer.hpp), and shader input contracts in [`world/rtxdi`](world/rtxdi/). |
-| Local-light records | The Sora 2nd lighting path exposes `dynamicLights_g` and `lightIndices_g`; the RTXDI input bridge snapshots the game data for its D3D12 work. | RTGI local lights and RTXDI direct-light sampling. Kai hero-light records are handled separately by [`kai_hero_light.hpp`](kai_hero_light.hpp) and the Kai lighting path. |
+| Local-light records | The Sora 2nd lighting path exposes `dynamicLights_g` and `lightIndices_g`; the RTXDI input bridge snapshots the game data for its D3D12 work. | RTXDI direct-light sampling and the game lamp layouts in [`world/game_lights.hpp`](world/game_lights.hpp). Kai hero-light records are handled separately by [`kai_hero_light.hpp`](kai_hero_light.hpp) and the Kai lighting path. |
 | IS-FAST blue noise | The precomputed `fast_noise_ea.dds` data is embedded in [`fast_noise_ea.h`](fast_noise_ea.h), so no external game-folder texture is needed. Add-on helpers create/bind the texture for features that opt in. | Contact shadows, DoF, fog, VBGI/GTVBAO, SSR, shadows, and other sampling passes; search `isfast_noise_srv` and `IS-FAST` in [`addon.cpp`](addon.cpp) for a consumer's exact binding. |
-| Effect histories and intermediate outputs | Allocated by the effect that owns them; they are not game-provided textures. Per-feature resource headers define their formats, lifetime, and ping-pong/history slots. | See `*_resources.hpp` beside each world effect, [`world/rtgi/rtgi.hpp`](world/rtgi/rtgi.hpp) for shared denoising resources, and each effect's resource setup in [`addon.cpp`](addon.cpp). |
+| Effect histories and intermediate outputs | Allocated by the effect that owns them; they are not game-provided textures. Per-feature resource headers define their formats, lifetime, and ping-pong/history slots. | See `*_resources.hpp` beside each world effect, [`world/compute/compute_resources.hpp`](world/compute/compute_resources.hpp) for the shared pass layout, [`world/denoise/denoise.hpp`](world/denoise/denoise.hpp) for shared denoising resources, [`world/shaders/world_svgf_upsample.cs_5_0.hlsl`](world/shaders/world_svgf_upsample.cs_5_0.hlsl) for the shared upsample, and each effect's resource setup in [`addon.cpp`](addon.cpp). |
 
 ### Motion vectors versus camera reprojection
 
-Do not assume every temporal effect samples the same motion texture. World temporal effects, including custom ReSTIR/RTXDI paths, use validated RTV4; motion blur can select RTV4 or TAA t3, and RCAS reads TAA t3 for motion-adaptive sharpening. SSR shader variants reproject with previous view/projection constants, so they do not consume either shared motion texture for that step.
+Do not assume every temporal effect samples the same motion texture. World temporal effects, including RTXDI paths, use validated RTV4; motion blur can select RTV4 or TAA t3, and RCAS reads TAA t3 for motion-adaptive sharpening. SSR shader variants reproject with previous view/projection constants, so they do not consume either shared motion texture for that step.
 
 ## Reference library
 

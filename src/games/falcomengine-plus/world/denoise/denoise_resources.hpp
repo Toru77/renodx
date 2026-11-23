@@ -40,7 +40,7 @@ inline constexpr uint32_t kSvgfAtrousTileSteps = 3u;
 inline constexpr uint32_t kSvgfPushCount = 20u;
 inline constexpr uint32_t kSvgfMaxIterations = 5u;
 inline constexpr float kSvgfLuminanceRgb[3] = {0.2126f, 0.7152f, 0.0722f};  // GTVBGI and the shared denoise chain luminance weights
-inline constexpr float kSvgfLuminanceShadow[3] = {1.f, 1.f, 0.f};          // RT Local Shadows and RT Sun
+inline constexpr float kSvgfLuminanceShadow[3] = {1.f, 1.f, 0.f};          // legacy shadow-chain luminance weights
 // GTVBAO: scalar AO (rgb equal), l = r
 inline constexpr float kSvgfLuminanceAo[3] = {1.f, 0.f, 0.f};
 // Upsample: t0 depth, t1 MRT normal, t2 input, t3 G-buffer colour (Debug 7); u0 final GI, u1 debug.
