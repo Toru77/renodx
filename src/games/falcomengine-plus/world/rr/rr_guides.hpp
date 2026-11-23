@@ -14,9 +14,9 @@
 #include <unordered_map>
 #include <utility>
 
-#include "../rtao/rtao.hpp"
-#include "../rtao/rtao_resources.hpp"
-#include "../rtgi/rtgi_resources.hpp"
+#include "../compute/compute.hpp"
+#include "../compute/compute_resources.hpp"
+#include "../denoise/denoise_resources.hpp"
 #include "../world_state.hpp"
 #include "rr_state.hpp"
 
@@ -32,7 +32,7 @@ inline constexpr uint32_t kRrGuidesSrvCount = 5u;   // t0 color, t1 mrt0, t2 mrt
 inline constexpr uint32_t kRrGuidesUavCount = 4u;   // u0 NormalRoughness, u1 Albedo, u2 SpecularAlbedo, u3 Depth copy
 inline constexpr uint32_t kRrGuidesPushCount = 4u;  // width, height (floats), 2 unused
 
-inline constexpr rtgi::RtgiPipelineDesc kRrGuidesPipelineDesc = {.srv_count = kRrGuidesSrvCount,
+inline constexpr denoise::ComputePipelineDesc kRrGuidesPipelineDesc = {.srv_count = kRrGuidesSrvCount,
                                                                  .uav_count = kRrGuidesUavCount,
                                                                  .sampler_count = 0u,
                                                                  .push_count = kRrGuidesPushCount,
@@ -61,11 +61,11 @@ struct RrGuideResources {
 };
 
 struct RrDeviceData {
-  rtgi::RtgiPipeline pipeline;
-  rtgi::RtgiTextureSet<1> normal_roughness;  // r16g16b16a16_float: view-space normal xyz, roughness w
-  rtgi::RtgiTextureSet<1> albedo;            // r8g8b8a8_unorm
-  rtgi::RtgiTextureSet<1> specular;          // r8g8b8a8_unorm: SpecularAlbedo
-  rtgi::RtgiTextureSet<1> depth;             // r32_float: raw hardware depth copy (RR's Depth input)
+  denoise::ComputePipeline pipeline;
+  denoise::TextureSet<1> normal_roughness;  // r16g16b16a16_float: view-space normal xyz, roughness w
+  denoise::TextureSet<1> albedo;            // r8g8b8a8_unorm
+  denoise::TextureSet<1> specular;          // r8g8b8a8_unorm: SpecularAlbedo
+  denoise::TextureSet<1> depth;             // r32_float: raw hardware depth copy (RR's Depth input)
   std::shared_ptr<const RrGuideResources> published_resources;
 };
 
@@ -86,13 +86,13 @@ inline std::atomic<uint32_t> g_rr_guides_attempt_frame{UINT32_MAX};
 // Builds the guides for this frame from the lighting inputs. The caller runs it once per frame (g_rr_guides_attempt_frame).
 inline void DispatchGuides(reshade::api::device* device, reshade::api::command_list* cmd_list, const GuideInputs& in) {
   RrDeviceData& rd = g_rr_devices[device];
-  if (!rtgi::EnsureRtgiPipeline(device, &rd.pipeline, kRrGuidesPipelineDesc)) {
+  if (!denoise::EnsureComputePipeline(device, &rd.pipeline, kRrGuidesPipelineDesc)) {
     SetGuideReason(GuideReason::PipelineFailed);
     return;
   }
   const uint32_t w = in.width;
   const uint32_t h = in.height;
-  if (!rtgi::EnsureRtgiTextureSet(device, &rd.normal_roughness, reshade::api::format::r16g16b16a16_float, 8u, w, h) || !rtgi::EnsureRtgiTextureSet(device, &rd.albedo, reshade::api::format::r8g8b8a8_unorm, 4u, w, h) || !rtgi::EnsureRtgiTextureSet(device, &rd.specular, reshade::api::format::r8g8b8a8_unorm, 4u, w, h) || !rtgi::EnsureRtgiTextureSet(device, &rd.depth, reshade::api::format::r32_float, 4u, w, h)) {
+  if (!denoise::EnsureTextureSet(device, &rd.normal_roughness, reshade::api::format::r16g16b16a16_float, 8u, w, h) || !denoise::EnsureTextureSet(device, &rd.albedo, reshade::api::format::r8g8b8a8_unorm, 4u, w, h) || !denoise::EnsureTextureSet(device, &rd.specular, reshade::api::format::r8g8b8a8_unorm, 4u, w, h) || !denoise::EnsureTextureSet(device, &rd.depth, reshade::api::format::r32_float, 4u, w, h)) {
     SetGuideReason(GuideReason::TextureFailed);
     return;
   }
@@ -100,7 +100,7 @@ inline void DispatchGuides(reshade::api::device* device, reshade::api::command_l
   const reshade::api::descriptor_type kCbv = reshade::api::descriptor_type::constant_buffer;
   const reshade::api::descriptor_type kSrv = reshade::api::descriptor_type::shader_resource_view;
   const reshade::api::descriptor_type kUav = reshade::api::descriptor_type::unordered_access_view;
-  const reshade::api::buffer_range scene_cbv = rtao::SceneCbvRange(in.scene_cbv_view);
+  const reshade::api::buffer_range scene_cbv = compute::SceneCbvRange(in.scene_cbv_view);
   const reshade::api::resource_view srvs[kRrGuidesSrvCount] = {in.color_view, in.mrt0_view, in.mrt2_view, in.deferred_view,
                                                                in.depth_view};
   const reshade::api::resource_view uavs[kRrGuidesUavCount] = {
@@ -117,7 +117,7 @@ inline void DispatchGuides(reshade::api::device* device, reshade::api::command_l
   const float push[kRrGuidesPushCount] = {static_cast<float>(w), static_cast<float>(h), 0.f, 0.f};
   cmd_list->push_constants(reshade::api::shader_stage::all_compute, rd.pipeline.layout, 3, 0, kRrGuidesPushCount, push);
   cmd_list->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
-  rtao::NullComputeSlots(cmd_list, kRrGuidesSrvCount, kRrGuidesUavCount, 0u);
+  compute::NullComputeSlots(cmd_list, kRrGuidesSrvCount, kRrGuidesUavCount, 0u);
   cmd_list->barrier(rd.normal_roughness.texture[0], reshade::api::resource_usage::unordered_access,
                     reshade::api::resource_usage::shader_resource);
   cmd_list->barrier(rd.albedo.texture[0], reshade::api::resource_usage::unordered_access,
@@ -165,11 +165,11 @@ inline void DestroyRrDeviceData(reshade::api::device* device) {
     retired_resources = std::move(g_rr_guides.resources);
   }
   RrDeviceData& rd = found->second;
-  rtgi::DestroyRtgiTextureSet(device, &rd.normal_roughness);
-  rtgi::DestroyRtgiTextureSet(device, &rd.albedo);
-  rtgi::DestroyRtgiTextureSet(device, &rd.specular);
-  rtgi::DestroyRtgiTextureSet(device, &rd.depth);
-  rtgi::DestroyRtgiPipeline(device, rd.pipeline);
+  denoise::DestroyTextureSet(device, &rd.normal_roughness);
+  denoise::DestroyTextureSet(device, &rd.albedo);
+  denoise::DestroyTextureSet(device, &rd.specular);
+  denoise::DestroyTextureSet(device, &rd.depth);
+  denoise::DestroyComputePipeline(device, rd.pipeline);
   g_rr_devices.erase(found);
 }
 

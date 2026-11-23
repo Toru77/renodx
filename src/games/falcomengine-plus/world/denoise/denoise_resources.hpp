@@ -1,7 +1,7 @@
 #pragma once
 
 // Shared GPU resources for the SVGF denoise chain (world_svgf_reproject, world_svgf_variance, world_svgf_atrous) and the
-// upsample (world_rtgi_upsample), plus the pipeline, texture-set and light-buffer helpers used by the surviving effects.
+// upsample (world_svgf_upsample), plus the pipeline, texture-set and light-buffer helpers used by the surviving effects.
 // Created lazily by the owners; no module mutex is held around any graphics call here.
 
 #include <algorithm>
@@ -13,16 +13,16 @@
 
 #include "../../../../utils/log.hpp"
 #include "../bvh/bvh_resources.hpp"
-#include "../rtao/rtao_resources.hpp"
+#include "../compute/compute_resources.hpp"
 
-namespace falcom_world::rtgi {
+namespace falcom_world::denoise {
 
-inline constexpr uint32_t kRtgiStatsCount = 32u;
+inline constexpr uint32_t kSvgfStatsCount = 32u;
 
-// Reprojection pass counters, matching RTGI_STAT_* in world_svgf_reproject.cs_5_0.hlsl.
-inline constexpr uint32_t kRtgiStatTemporalPixels = 20u;
-inline constexpr uint32_t kRtgiStatNoHistory = 21u;
-inline constexpr uint32_t kRtgiStatResetPixels = 22u;
+// Reprojection pass counters, matching SVGF_STAT_* in world_svgf_reproject.cs_5_0.hlsl.
+inline constexpr uint32_t kSvgfStatTemporalPixels = 20u;
+inline constexpr uint32_t kSvgfStatNoHistory = 21u;
+inline constexpr uint32_t kSvgfStatResetPixels = 22u;
 // SVGF (world_svgf.hlsli). Reproject: t0 raw GI, t1 depth, t2 MRT normal, t3 motion, t4 history colour, t5 history
 // moments, t6 history guide, t7 history normal; u0 colour write (or integrated), u1 stats, u2 moments write, u3 guide
 // write, u4 normal write, u5 debug; s0 point, s1 linear.
@@ -41,25 +41,12 @@ inline constexpr uint32_t kSvgfPushCount = 20u;
 inline constexpr uint32_t kSvgfMaxIterations = 5u;
 inline constexpr float kSvgfLuminanceRgb[3] = {0.2126f, 0.7152f, 0.0722f};  // GTVBGI and the shared denoise chain luminance weights
 inline constexpr float kSvgfLuminanceShadow[3] = {1.f, 1.f, 0.f};          // RT Local Shadows and RT Sun
-// GTVBAO and RTAO: scalar AO (rgb equal), l = r
+// GTVBAO: scalar AO (rgb equal), l = r
 inline constexpr float kSvgfLuminanceAo[3] = {1.f, 0.f, 0.f};
 // Upsample: t0 depth, t1 MRT normal, t2 input, t3 G-buffer colour (Debug 7); u0 final GI, u1 debug.
-inline constexpr uint32_t kRtgiUpsampleSrvCount = 4u;
-inline constexpr uint32_t kRtgiUpsampleUavCount = 2u;
-inline constexpr uint32_t kRtgiUpsamplePushCount = 16u;
-// Sora 2nd lighting 0xCA3D8596: t11 dynamicLights_g (LightParam) and t12 lightIndices_g (LightIndexData). Kept for the
-// RTXDI and Kai hero-light readers.
-inline constexpr uint32_t kLightingLightsRegister = 11u;
-inline constexpr uint32_t kLightingLightIndicesRegister = 12u;
-// Sora 2nd lighting 0xCA3D8596 (lighting lines 192, 193, 198, 199): t2 mrtTexture1, t3 mrtTexture2,
-// t6 deferredParams_g, t7 shadowTexture. Kept for the surviving lighting consumers.
-inline constexpr uint32_t kLightingMrt1Register = 2u;
-inline constexpr uint32_t kLightingMrt2Register = 3u;
-inline constexpr uint32_t kLightingDeferredRegister = 6u;
-inline constexpr uint32_t kLightingShadowRegister = 7u;
-inline constexpr uint32_t kLightParamBytes = 112u;
-inline constexpr uint32_t kLightIndexDataBytes = 576u;
-
+inline constexpr uint32_t kUpsampleSrvCount = 4u;
+inline constexpr uint32_t kUpsampleUavCount = 2u;
+inline constexpr uint32_t kUpsamplePushCount = 16u;
 #if defined(__world_svgf_reproject_EMBED_FILE)
 inline constexpr std::span<const std::uint8_t> kSvgfReprojectShader = __world_svgf_reproject;
 #else
@@ -113,7 +100,7 @@ inline constexpr std::span<const std::uint8_t> kSvgfFinalizeAoShader = {};
 // b12 for the SVGF passes (reproject, variance, a-trous), matching cbuffer cb_svgf in world_svgf.hlsli.
 struct SvgfPushConstants {
   float size[4];      // c0: trace width, trace height, full width, full height
-  float params[4];    // c1: trace divisor, debug mode (RTGI numbering), history valid (0 = reset), a-trous step (2^i, 0 otherwise)
+  float params[4];    // c1: trace divisor, debug mode (SVGF numbering), history valid (0 = reset), a-trous step (2^i, 0 otherwise)
   float temporal[4];  // c2: alpha = 1 - History Weight, depth rejection, normal rejection, luminance edge stop sigma_l
   float luminance[4]; // c3: luminance weights rgb, unused
   float spatial[4];    // c4: depth sigma, normal power, history length cap, radius scale
@@ -124,55 +111,18 @@ static_assert(offsetof(SvgfPushConstants, temporal) == 8 * sizeof(float), "svgf 
 static_assert(offsetof(SvgfPushConstants, luminance) == 12 * sizeof(float), "svgf b12 c3 offset");
 static_assert(offsetof(SvgfPushConstants, spatial) == 16 * sizeof(float), "svgf b12 c4 offset");
 
-// b12 for the RTGI upsample, matching cbuffer cb_rtgi_upsample in world_rtgi_upsample.cs_5_0.hlsl.
-struct RtgiUpsamplePushConstants {
+// b12 for the shared upsample, matching cbuffer cb_svgf_upsample in world_svgf_upsample.cs_5_0.hlsl.
+struct UpsamplePushConstants {
   float size[4];     // c0: full width, full height, trace width, trace height
   float params[4];   // c1: trace divisor, debug mode, GI Intensity, Character GI Intensity (Debug 7)
   float extra[4];    // c2: GI Saturation, algorithm, depth-plane sigma, normal edge power
   float upscale[4];  // c3: bilinear weight sharpness, nearest-valid fallback, unused, unused
 };
-static_assert(sizeof(RtgiUpsamplePushConstants) == kRtgiUpsamplePushCount * sizeof(float), "upsample b12 must be 16 floats");
+static_assert(sizeof(UpsamplePushConstants) == kUpsamplePushCount * sizeof(float), "upsample b12 must be 16 floats");
 
-// Mirrors LightParam in lighting_0xCA3D8596.ps_5_0.hlsl (offsets 0 to 108).
-struct LightParamCpu {
-  float pos[3];
-  float radius;
-  float color[3];
-  float radius_inv;
-  float chara_color[3];
-  float attenuation;
-  float vec[3];
-  float spot_angle_inv;
-  float attenuation_angle;
-  float specular_intensity;
-  float specular_glossiness;
-  float scatter_anisotropy;
-  float scatter_color[3];
-  float scatter_density;
-  float translucency;
-  int32_t shadowmap_index;
-  float scatter_offset;
-  float user_param;
-};
-static_assert(sizeof(LightParamCpu) == kLightParamBytes, "LightParam must be 112 bytes");
-static_assert(offsetof(LightParamCpu, spot_angle_inv) == 60, "LightParam spotAngleInv must be at offset 60");
-static_assert(offsetof(LightParamCpu, attenuation_angle) == 64, "LightParam attenuationAngle must be at offset 64");
-
-// Mirrors LightIndexData in lighting_0xCA3D8596.ps_5_0.hlsl (offsets 0 to 572).
-struct LightIndexDataCpu {
-  int32_t point_indices[63];
-  uint32_t point_count;
-  int32_t spot_indices[63];
-  uint32_t spot_count;
-  int32_t probe_indices[14];
-  uint32_t probe_count;
-  float tile_depth_inv;
-};
-static_assert(sizeof(LightIndexDataCpu) == kLightIndexDataBytes, "LightIndexData must be 576 bytes");
-
-// One compute pipeline with the RTGI layout: cbv (0), srv (1), uav (2), an optional sampler table (3), then the push
+// One compute pipeline with the shared layout: cbv (0), srv (1), uav (2), an optional sampler table (3), then the push
 // constants at b12 (param 3, or 4 with samplers).
-struct RtgiPipeline {
+struct ComputePipeline {
   reshade::api::pipeline_layout layout = {0u};
   reshade::api::descriptor_table cbv_table = {0u};
   reshade::api::descriptor_table srv_table = {0u};
@@ -182,7 +132,7 @@ struct RtgiPipeline {
   bool failed = false;  // creation failed: latched for the session, logged once
 };
 
-struct RtgiPipelineDesc {
+struct ComputePipelineDesc {
   uint32_t srv_count;
   uint32_t uav_count;
   uint32_t sampler_count;  // 0: no sampler table
@@ -191,12 +141,12 @@ struct RtgiPipelineDesc {
   const char* name;                    // log name
 };
 
-// Creates one RTGI-layout compute pipeline on first use (RtgiPipeline layout); a failure is latched and logged once.
-inline bool EnsureRtgiPipeline(reshade::api::device* device, RtgiPipeline* p, const RtgiPipelineDesc& desc) {
+// Creates one compute pipeline on first use (ComputePipeline layout); a failure is latched and logged once.
+inline bool EnsureComputePipeline(reshade::api::device* device, ComputePipeline* p, const ComputePipelineDesc& desc) {
   if (p->pipeline.handle != 0u) return true;
   if (p->failed) return false;
   const auto fail = [&](const char* stage) {
-    renodx::utils::log::w("[world-rtgi] ", desc.name, " pipeline creation failed: ", stage);
+    renodx::utils::log::w("[world-denoise] ", desc.name, " pipeline creation failed: ", stage);
     p->failed = true;
     return false;
   };
@@ -211,7 +161,7 @@ inline bool EnsureRtgiPipeline(reshade::api::device* device, RtgiPipeline* p, co
   DR sampler_range = {0, 0, 0, desc.sampler_count, DS::all_compute, 1, DT::sampler};
   reshade::api::constant_range push_range = {};
   push_range.binding = 0;
-  push_range.dx_register_index = rtao::kRtaoPushRegister;
+  push_range.dx_register_index = compute::kPassPushRegister;
   push_range.dx_register_space = 0;
   push_range.count = desc.push_count;
   push_range.visibility = DS::all_compute;
@@ -247,13 +197,13 @@ inline bool EnsureRtgiPipeline(reshade::api::device* device, RtgiPipeline* p, co
   shader.entry_point = "main";
   reshade::api::pipeline_subobject subobject = {reshade::api::pipeline_subobject_type::compute_shader, 1, &shader};
   if (!device->create_pipeline(p->layout, 1, &subobject, &p->pipeline)) return fail("compute pipeline");
-  renodx::utils::log::i("[world-rtgi] ", desc.name, " pipeline ready");
+  renodx::utils::log::i("[world-denoise] ", desc.name, " pipeline ready");
   return true;
 }
 
-// Count textures of one format and size, each with an SRV and a UAV, zero-initialised (rtao::CreateRtaoTexture).
+// Count textures of one format and size, each with an SRV and a UAV, zero-initialised (compute::CreateZeroedTexture).
 template <size_t Count>
-struct RtgiTextureSet {
+struct TextureSet {
   reshade::api::resource texture[Count] = {};
   reshade::api::resource_view srv[Count] = {};
   reshade::api::resource_view uav[Count] = {};
@@ -262,7 +212,7 @@ struct RtgiTextureSet {
 };
 
 template <size_t Count>
-inline void DestroyRtgiTextureSet(reshade::api::device* device, RtgiTextureSet<Count>* set) {
+inline void DestroyTextureSet(reshade::api::device* device, TextureSet<Count>* set) {
   for (size_t i = 0; i < Count; ++i) {
     bvh::DestroyBuffer(device, &set->srv[i], &set->texture[i]);
     bvh::DestroyBuffer(device, &set->uav[i], nullptr);
@@ -273,13 +223,13 @@ inline void DestroyRtgiTextureSet(reshade::api::device* device, RtgiTextureSet<C
 
 // Creates the set at width x height; a size change replaces it. On a failure the set is destroyed and false returned.
 template <size_t Count>
-inline bool EnsureRtgiTextureSet(reshade::api::device* device, RtgiTextureSet<Count>* set, reshade::api::format format,
+inline bool EnsureTextureSet(reshade::api::device* device, TextureSet<Count>* set, reshade::api::format format,
                                  uint32_t bytes_per_pixel, uint32_t width, uint32_t height) {
   if (set->texture[0].handle != 0u && set->width == width && set->height == height) return true;
-  DestroyRtgiTextureSet(device, set);
+  DestroyTextureSet(device, set);
   for (size_t i = 0; i < Count; ++i) {
-    if (!rtao::CreateRtaoTexture(device, format, width, height, bytes_per_pixel, &set->texture[i], &set->srv[i], &set->uav[i])) {
-      DestroyRtgiTextureSet(device, set);
+    if (!compute::CreateZeroedTexture(device, format, width, height, bytes_per_pixel, &set->texture[i], &set->srv[i], &set->uav[i])) {
+      DestroyTextureSet(device, set);
       return false;
     }
   }
@@ -289,28 +239,28 @@ inline bool EnsureRtgiTextureSet(reshade::api::device* device, RtgiTextureSet<Co
 }
 
 // The objects of the shared denoise chain (SVGF reproject, variance, a-trous, upsample); each owner keeps one.
-struct RtgiDenoiseSet {
-  RtgiPipeline reproject_pipeline;
-  RtgiPipeline variance_pipeline;
-  RtgiPipeline atrous_pipeline;
-  RtgiPipeline atrous_tile_pipeline[kSvgfAtrousTileSteps];
-  RtgiPipeline upsample_pipeline;
-  RtgiPipeline reconstruct_pipeline;
-  RtgiPipeline finalize_pipeline;
-  RtgiTextureSet<1> reconstructed;
+struct DenoiseSet {
+  ComputePipeline reproject_pipeline;
+  ComputePipeline variance_pipeline;
+  ComputePipeline atrous_pipeline;
+  ComputePipeline atrous_tile_pipeline[kSvgfAtrousTileSteps];
+  ComputePipeline upsample_pipeline;
+  ComputePipeline reconstruct_pipeline;
+  ComputePipeline finalize_pipeline;
+  TextureSet<1> reconstructed;
   bool full_resolution = false;
   bool mode_valid = false;
   uint32_t radius_scale = 1u;
   reshade::api::sampler point_sampler = {0u};
   reshade::api::sampler linear_sampler = {0u};
-  RtgiTextureSet<2> history_color;   // rgba16f, trace size: rgb colour, a = variance
-  RtgiTextureSet<2> history_normal;  // r16g16_float, trace size: octahedral normal
-  RtgiTextureSet<2> history_moments; // r32g32b32a32_float, trace size: mu1, mu2, h (history length), 0
-  RtgiTextureSet<2> history_guide;   // r32g32b32a32_float, trace size: z, dz/dx, dz/dy, dist (z = 0: no surface)
+  TextureSet<2> history_color;   // rgba16f, trace size: rgb colour, a = variance
+  TextureSet<2> history_normal;  // r16g16_float, trace size: octahedral normal
+  TextureSet<2> history_moments; // r32g32b32a32_float, trace size: mu1, mu2, h (history length), 0
+  TextureSet<2> history_guide;   // r32g32b32a32_float, trace size: z, dz/dx, dz/dy, dist (z = 0: no surface)
   uint32_t history_index = 0u;       // history[history_index] is read by the reproject pass; the other one is written
-  RtgiTextureSet<1> integrated;      // rgba16f, trace size: integrated colour C' and sigma'^2 (a = -1: not traced)
-  RtgiTextureSet<2> atrous;          // rgba16f, trace size: a-trous ping-pong
-  RtgiTextureSet<2> output;          // full size, the owner's output format
+  TextureSet<1> integrated;      // rgba16f, trace size: integrated colour C' and sigma'^2 (a = -1: not traced)
+  TextureSet<2> atrous;          // rgba16f, trace size: a-trous ping-pong
+  TextureSet<2> output;          // full size, the owner's output format
   uint32_t output_index = 0u;        // output[output_index] is the newest
   uint32_t atrous_iterations = 0u;   // effective a-trous iterations of the last run
   bvh::GpuTimer timer = {};          // reproject, variance, a-trous and upsample
@@ -339,7 +289,7 @@ inline uint32_t SvgfEffectiveIterations(float iterations, uint32_t divisor) {
 }
 
 // Bytes of the denoise textures: the trace-size sets, and the full-size output (4 bytes per pixel, two sets).
-inline uint64_t RtgiDenoiseTextureBytes(const RtgiDenoiseSet& set) {
+inline uint64_t DenoiseTextureBytes(const DenoiseSet& set) {
   const auto bytes = [](const auto& s, uint32_t bpp) { return static_cast<uint64_t>(s.width) * s.height * bpp; };
   return bytes(set.history_color, 8u * 2u) + bytes(set.history_normal, 4u * 2u) + bytes(set.history_moments, 16u * 2u)
       + bytes(set.history_guide, 16u * 2u) + bytes(set.integrated, 8u) + bytes(set.atrous, 8u * 2u)
@@ -347,8 +297,8 @@ inline uint64_t RtgiDenoiseTextureBytes(const RtgiDenoiseSet& set) {
       + bytes(set.output, 4u * 2u);
 }
 
-// Destroys one RTGI-layout compute pipeline and its descriptor tables.
-inline void DestroyRtgiPipeline(reshade::api::device* device, const RtgiPipeline& p) {
+// Destroys one compute pipeline and its descriptor tables.
+inline void DestroyComputePipeline(reshade::api::device* device, const ComputePipeline& p) {
   if (p.pipeline.handle != 0u) device->destroy_pipeline(p.pipeline);
   if (p.srv_table.handle != 0u) device->free_descriptor_table(p.srv_table);
   if (p.uav_table.handle != 0u) device->free_descriptor_table(p.uav_table);
@@ -358,34 +308,34 @@ inline void DestroyRtgiPipeline(reshade::api::device* device, const RtgiPipeline
 }
 
 // Destroys the denoise textures and the history; the pipelines, samplers and timer stay. The next run recreates them.
-inline void ReleaseRtgiDenoiseTextures(reshade::api::device* device, RtgiDenoiseSet* set) {
-  DestroyRtgiTextureSet(device, &set->reconstructed);
+inline void ReleaseDenoiseTextures(reshade::api::device* device, DenoiseSet* set) {
+  DestroyTextureSet(device, &set->reconstructed);
   set->mode_valid = false;
-  DestroyRtgiTextureSet(device, &set->history_color);
-  DestroyRtgiTextureSet(device, &set->history_normal);
-  DestroyRtgiTextureSet(device, &set->history_moments);
-  DestroyRtgiTextureSet(device, &set->history_guide);
-  DestroyRtgiTextureSet(device, &set->integrated);
-  DestroyRtgiTextureSet(device, &set->atrous);
-  DestroyRtgiTextureSet(device, &set->output);
+  DestroyTextureSet(device, &set->history_color);
+  DestroyTextureSet(device, &set->history_normal);
+  DestroyTextureSet(device, &set->history_moments);
+  DestroyTextureSet(device, &set->history_guide);
+  DestroyTextureSet(device, &set->integrated);
+  DestroyTextureSet(device, &set->atrous);
+  DestroyTextureSet(device, &set->output);
   set->history_index = 0u;
   set->output_index = 0u;
   set->atrous_iterations = 0u;
 }
 
 // Destroys a denoise set owned by an effect.
-inline void DestroyRtgiDenoiseSet(reshade::api::device* device, RtgiDenoiseSet* set) {
-  ReleaseRtgiDenoiseTextures(device, set);
+inline void DestroyDenoiseSet(reshade::api::device* device, DenoiseSet* set) {
+  ReleaseDenoiseTextures(device, set);
   bvh::DestroyGpuTimer(&set->timer);
   if (set->point_sampler.handle != 0u) device->destroy_sampler(set->point_sampler);
   if (set->linear_sampler.handle != 0u) device->destroy_sampler(set->linear_sampler);
-  DestroyRtgiPipeline(device, set->reproject_pipeline);
-  DestroyRtgiPipeline(device, set->variance_pipeline);
-  DestroyRtgiPipeline(device, set->atrous_pipeline);
-  for (RtgiPipeline& tile : set->atrous_tile_pipeline) DestroyRtgiPipeline(device, tile);
-  DestroyRtgiPipeline(device, set->upsample_pipeline);
-  DestroyRtgiPipeline(device, set->reconstruct_pipeline);
-  DestroyRtgiPipeline(device, set->finalize_pipeline);
+  DestroyComputePipeline(device, set->reproject_pipeline);
+  DestroyComputePipeline(device, set->variance_pipeline);
+  DestroyComputePipeline(device, set->atrous_pipeline);
+  for (ComputePipeline& tile : set->atrous_tile_pipeline) DestroyComputePipeline(device, tile);
+  DestroyComputePipeline(device, set->upsample_pipeline);
+  DestroyComputePipeline(device, set->reconstruct_pipeline);
+  DestroyComputePipeline(device, set->finalize_pipeline);
 }
 
-}  // namespace falcom_world::rtgi
+}  // namespace falcom_world::denoise

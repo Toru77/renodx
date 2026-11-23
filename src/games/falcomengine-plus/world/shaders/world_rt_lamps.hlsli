@@ -1,6 +1,6 @@
 // Game lamp layouts and falloff (Sora 2nd lighting 0xCA3D8596) and the lamp type bits, shared by the RTXDI and PT shaders.
-#define RTGI_LAMP_TYPE_POINT 1u
-#define RTGI_LAMP_TYPE_SPOT 2u
+#define LAMP_TYPE_POINT 1u
+#define LAMP_TYPE_SPOT 2u
 
 // The game's LightParam (games/sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl): 112 bytes. The full layout sets the stride.
 struct LightParam

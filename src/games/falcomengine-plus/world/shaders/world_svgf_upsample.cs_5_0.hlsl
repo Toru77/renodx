@@ -1,10 +1,10 @@
-// world_rtgi_upsample.cs_5_0.hlsl - RTGI upsample to the depth size (world/docs/ROADMAP.md, RTGI M3b).
+// world_svgf_upsample.cs_5_0.hlsl - shared SVGF upsample to the depth size.
 //
 // One thread per full pixel. Algorithm 0 preserves the existing 2x2 joint-bilateral upsample. Algorithms 1 and 2 use
 // the same 2x2 taps for bilinear and nearest-valid reconstruction; algorithm 3 uses a 4x4 joint-bilateral footprint.
 // Every tap is checked against its representative full-resolution surface. With d = 1, every algorithm uses the
 // existing pass-through path. Writes the final GI (u0, r11g11b10_float; 0 where there is no surface or valid tap) and
-// debug views 6 and 7 (u1). RTGI_UPSAMPLE_AO_BYTE writes the AO byte to r32_uint; no surface or valid tap = 255.
+// debug views 6 and 7 (u1). SVGF_UPSAMPLE_AO_BYTE writes the AO byte to r32_uint; no surface or valid tap = 255.
 
 #include "../../include/mrt_normal.hlsli"
 #include "world_rt_denoise.hlsli"
@@ -14,12 +14,12 @@ Texture2D<uint4> g_mrt_normal : register(t1);
 Texture2D<float4> g_in : register(t2);
 Texture2D<float4> g_albedo : register(t3);  // the lighting draw's colorTexture (G-buffer colour), for Debug 7
 
-#if defined(RTGI_UPSAMPLE_AO_BYTE)
+#if defined(SVGF_UPSAMPLE_AO_BYTE)
 RWTexture2D<uint> g_final : register(u0);
 #else
 RWTexture2D<float4> g_final : register(u0);
 #endif
-RWTexture2D<float4> g_rtgi_debug : register(u1);
+RWTexture2D<float4> g_svgf_debug : register(u1);
 
 cbuffer cb_scene : register(b0)
 {
@@ -28,8 +28,8 @@ cbuffer cb_scene : register(b0)
     float2 resolutionScaling_g : packoffset(c49);
 };
 
-// Push constants (rtgi.hpp fills these; 16 floats).
-cbuffer cb_rtgi_upsample : register(b12)
+// Push constants (denoise.hpp fills these; 16 floats).
+cbuffer cb_svgf_upsample : register(b12)
 {
     float4 u_size : packoffset(c0);      // full width, full height, trace width, trace height
     float4 u_params : packoffset(c1);    // trace divisor d, debug mode, GI Intensity, Character GI Intensity (Debug 7)
@@ -56,13 +56,13 @@ void main(uint3 id : SV_DispatchThreadID)
     const float depth = g_game_depth.Load(int3(px, 0)).x;
     const float3 N = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(px, 0)).xy);
     const bool surface = depth > 0.0 && dot(N, N) >= 0.5 && all(resolutionScaling_g == float2(1.0, 1.0));
-#if defined(RTGI_UPSAMPLE_AO_BYTE)
+#if defined(SVGF_UPSAMPLE_AO_BYTE)
     float3 gi = float3(1.0, 1.0, 1.0);  // AO: no surface or no valid tap = no occlusion
 #else
     float3 gi = float3(0.0, 0.0, 0.0);
 #endif
     bool valid = false;
-#if defined(RTGI_UPSAMPLE_FINAL)
+#if defined(SVGF_UPSAMPLE_FINAL)
     if (surface)
     {
         const float4 v = g_in[px];
@@ -81,7 +81,7 @@ void main(uint3 id : SV_DispatchThreadID)
         const float2 f = lp - floor(lp);
         float sum_w = 0.0;
         float3 sum_v = float3(0.0, 0.0, 0.0);
-#if defined(RTGI_UPSAMPLE_NEAREST_FALLBACK)
+#if defined(SVGF_UPSAMPLE_NEAREST_FALLBACK)
         // GTVBAO and GTVBGI use this only when their fallback setting is on and all bilateral weights are edge-stopped.
         float best_w = -1.0;
         float3 best_v = float3(0.0, 0.0, 0.0);
@@ -106,7 +106,7 @@ void main(uint3 id : SV_DispatchThreadID)
                     const float rep_depth = g_game_depth.Load(int3(rep, 0)).x;
                     const float3 Nt = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(rep, 0)).xy);
                     if (RtUpsampleTapRejected(rep_depth, Nt)) continue;
-#if defined(RTGI_UPSAMPLE_NEAREST_FALLBACK)
+#if defined(SVGF_UPSAMPLE_NEAREST_FALLBACK)
                     if (w > best_w)
                     {
                         best_w = w;
@@ -126,7 +126,7 @@ void main(uint3 id : SV_DispatchThreadID)
             [unroll]
             for (int t = 0; t < 4; ++t)
             {
-#if defined(RTGI_UPSAMPLE_AO_BYTE) && defined(RTGI_UPSAMPLE_NEAREST_FALLBACK)
+#if defined(SVGF_UPSAMPLE_AO_BYTE) && defined(SVGF_UPSAMPLE_NEAREST_FALLBACK)
                 // d = 1: f = 0, so only tap 0 has a weight (1). Once used, later zero-weight taps cannot replace it.
                 if (d == 1u && best_w >= 0.0) continue;
 #endif
@@ -139,7 +139,7 @@ void main(uint3 id : SV_DispatchThreadID)
                 const float rep_depth = g_game_depth.Load(int3(rep, 0)).x;
                 const float3 Nt = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(rep, 0)).xy);
                 if (RtUpsampleTapRejected(rep_depth, Nt)) continue;
-#if defined(RTGI_UPSAMPLE_NEAREST_FALLBACK)
+#if defined(SVGF_UPSAMPLE_NEAREST_FALLBACK)
                 if (w > best_w)
                 {
                     best_w = w;
@@ -184,7 +184,7 @@ void main(uint3 id : SV_DispatchThreadID)
             gi = sum_v / sum_w;
             valid = true;
         }
-#if defined(RTGI_UPSAMPLE_NEAREST_FALLBACK)
+#if defined(SVGF_UPSAMPLE_NEAREST_FALLBACK)
         else if (algorithm != 1 && nearest_fallback && best_w >= 0.0)
         {
             gi = best_v;
@@ -193,7 +193,7 @@ void main(uint3 id : SV_DispatchThreadID)
 #endif
     }
 #endif
-#if defined(RTGI_UPSAMPLE_SVGF_INPUT)
+#if defined(SVGF_UPSAMPLE_INPUT)
     g_final[px] = float4(gi, valid ? 1.0 : -1.0);
     return;
 #endif
@@ -202,7 +202,7 @@ void main(uint3 id : SV_DispatchThreadID)
         float luma = dot(gi, float3(0.2126, 0.7152, 0.0722));
         gi = max(0.0, luma + (gi - luma) * u_extra.x);
     }
-#if defined(RTGI_UPSAMPLE_AO_BYTE)
+#if defined(SVGF_UPSAMPLE_AO_BYTE)
     g_final[px] = (uint)(saturate(gi.r) * 255.0 + 0.5);
 #else
     g_final[px] = float4(gi, 1.0);
@@ -210,7 +210,7 @@ void main(uint3 id : SV_DispatchThreadID)
     if (debug_mode == 6)
     {
         // Not traced (no surface): dark purple, as in the other debug views.
-        g_rtgi_debug[px] = float4(surface ? gi / (1.0 + gi) : float3(0.25, 0.0, 0.25), 1.0);
+        g_svgf_debug[px] = float4(surface ? gi / (1.0 + gi) : float3(0.25, 0.0, 0.25), 1.0);
     }
     else if (debug_mode == 7)
     {
@@ -222,6 +222,6 @@ void main(uint3 id : SV_DispatchThreadID)
             * g_albedo.Load(int3(min(uint2((float2(px) + 0.5) / float2(full_size) * float2(aw, ah)), uint2(aw, ah) - 1u), 0)).rgb
             * u_params.z * ((flags & 8u) == 0u && (flags & 1u) != 0u ? saturate(u_params.w) : 1.0);
         // No surface, or no colour captured this frame (t3 null, width 0): dark purple, as in the other debug views.
-        g_rtgi_debug[px] = float4(surface && aw > 0u ? applied / (1.0 + applied) : float3(0.25, 0.0, 0.25), 1.0);
+        g_svgf_debug[px] = float4(surface && aw > 0u ? applied / (1.0 + applied) : float3(0.25, 0.0, 0.25), 1.0);
     }
 }

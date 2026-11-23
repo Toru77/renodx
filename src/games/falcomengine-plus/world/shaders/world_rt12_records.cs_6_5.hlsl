@@ -1,9 +1,9 @@
-// world_rt12_records.cs_6_5.hlsl - M5: one D3D12_RAYTRACING_INSTANCE_DESC per P2b record (rt12_backend.hpp RunRtaoPassA
-// 13.1c) and the record itself into the instance table at g_table_base + r (InstanceID), so the RTAO trace reads it like
+// world_rt12_records.cs_6_5.hlsl - M5: one D3D12_RAYTRACING_INSTANCE_DESC per P2b record (rt12_backend.hpp RunSceneTransaction
+// 13.1c) and the record itself into the instance table at g_table_base + r (InstanceID), so the scene transaction reads it like
 // a static instance. The packing is transcribed on the CPU as rt12::Rt12RecordDescWords (harness TestRt12Records).
 // A record that is invalid (header.w < 0.5), whose slot is out of range or has no D3D12 BLAS gets mask 0 and a null
 // BLAS address (an inactive instance); otherwise the mask follows MakeRt12InstanceFields: not camera-visible -> 4,
-// foliage or alpha-tested -> 2, else 1 (RTAO's rays never include 4: the compute SKIP_HIDDEN rule).
+// foliage or alpha-tested -> 2, else 1 (scene rays never include 4: the compute SKIP_HIDDEN rule).
 #include "world_bvh_types.hlsli"
 
 Texture2D<uint4> g_records : register(t0);

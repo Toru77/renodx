@@ -15,7 +15,7 @@ Texture2D<float4> g_history_guide : register(t2);
 Texture2D<float2> g_history_normal : register(t3);
 
 RWTexture2D<float4> g_atrous_write : register(u0);
-RWTexture2D<float4> g_rtgi_debug : register(u1);
+RWTexture2D<float4> g_svgf_debug : register(u1);
 
 #define SVGF_VAR_TILE_SIDE 14
 
@@ -59,7 +59,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 g
     {
         // Not traced: copied through, dark purple in the debug view.
         g_atrous_write[p] = c;
-        if (debug_mode == 11) SvgfWriteDebugBlock(g_rtgi_debug, uint2(p), float3(0.25, 0.0, 0.25));
+        if (debug_mode == 11) SvgfWriteDebugBlock(g_svgf_debug, uint2(p), float3(0.25, 0.0, 0.25));
         return;
     }
     const float4 gp = g_history_guide[p];
@@ -109,6 +109,6 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 g
         // Debug 11: sigma / (1 + sigma) grey, blue set to 1 where h < 4.
         const float s = sigma2 / (1.0 + sigma2);
         const float blue = mp.z < kSvgfVarianceHistory ? 1.0 : s;
-        SvgfWriteDebugBlock(g_rtgi_debug, uint2(p), float3(s, s, blue));
+        SvgfWriteDebugBlock(g_svgf_debug, uint2(p), float3(s, s, blue));
     }
 }

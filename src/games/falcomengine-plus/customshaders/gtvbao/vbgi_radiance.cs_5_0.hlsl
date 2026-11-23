@@ -143,7 +143,7 @@ void main(uint2 p : SV_DispatchThreadID)
   g_radiance.GetDimensions(ow, oh);
   if (p.x >= ow || p.y >= oh) return;
 
-  // Representative full-res pixel of this texel (block centre, clamped), as the RTGI and GTVBAO passes use.
+  // Representative full-res pixel of this texel (block centre, clamped), as the GTVBAO passes use.
   uint dw, dh;
   g_depth.GetDimensions(dw, dh);
   const uint d_div = (uint)max(g_divisor, 1.0f);

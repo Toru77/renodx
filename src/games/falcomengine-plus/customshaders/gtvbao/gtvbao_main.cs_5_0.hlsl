@@ -238,7 +238,7 @@ void main(uint2 p : SV_DispatchThreadID)
   g_outWorkingAOTerm.GetDimensions(width, height);
   if (p.x >= width || p.y >= height) return;
 #ifndef GTVBAO_GI
-  // Texels the AO upsample (world_rtgi_upsample.cs_5_0.hlsl) does not read skip the pass. Mode 2 is the upsample's own
+  // Texels the AO upsample (world_svgf_upsample.cs_5_0.hlsl) does not read skip the pass. Mode 2 is the upsample's own
   // test: its tap test at the texel's representative pixel, or no surface anywhere while resolution scaling is active.
   // Mode 1 (the SVGF chain reprojects) skips only texels without depth: their guide z is 0, so no SVGF pass reads them
   // as a neighbour or as history, while a texel with depth can still be read. Off while a debug view (22 and up) is shown.

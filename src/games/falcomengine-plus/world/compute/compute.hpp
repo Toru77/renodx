@@ -2,15 +2,15 @@
 
 #include "../debug/crash_log.hpp"
 
-// Shared compute-pass hub: null-slot clearing and the D3D11 helper-pass layout used by the rt12 passes and RR guides.
+// Shared compute-pass helpers: null-slot clearing, the D3D11 helper-pass layout used by the rt12 passes, and the temporal reset rule.
 
 #include <cstdint>
 
 #include "../bvh/bvh_trace.hpp"
-#include "rtao_resources.hpp"
-#include "rtao_state.hpp"
+#include "compute_resources.hpp"
+#include "compute_state.hpp"
 
-namespace falcom_world::rtao {
+namespace falcom_world::compute {
 
 // Null-array sizes: upper bounds of the SRV, UAV and sampler counts of every pass that calls NullComputeSlots.
 // 8 is the D3D11 compute UAV slot count.
@@ -39,11 +39,11 @@ inline void NullComputeSlots(reshade::api::command_list* cmd_list, uint32_t srv_
 }
 
 #if !defined(FALCOM_WINDOWS_HARNESS)
-}  // namespace falcom_world::rtao
+}  // namespace falcom_world::compute
 #include "../rt12/rt12_backend.hpp"
 #include "../rt12/rt12_rtxdi.hpp"
 #include "../rt12/rt12_rtxdi_transfer.hpp"
-namespace falcom_world::rtao {
+namespace falcom_world::compute {
 #endif
 
-}  // namespace falcom_world::rtao
+}  // namespace falcom_world::compute

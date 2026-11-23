@@ -3,7 +3,7 @@
 //
 // One iteration i with step s = 2^i (params.w) times the radius scale. Input t0 (rgb colour, a = variance; a < 0 = not traced), guide t1, normal
 // t2 of the history (current frame). Output u0. The centre is copied through when not traced or when the resolution
-// scaling is not 1 (as the RTAO and RTGI filters).
+// scaling is not 1 (as the other denoise consumers).
 //   Eq. 1: C'(p) = sum(h w C(q)) / sum(h w)
 //   Eq. 2: w = w_z w_n w_l, centre weight 1
 //   Eq. 3: Var'(p) = sum(h^2 w^2 Var(q)) / (sum(h w))^2

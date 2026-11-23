@@ -1,6 +1,6 @@
 #pragma once
 
-// world_rt_denoise.hlsli - denoiser math shared by the SVGF passes (world_svgf.hlsli), the upsample (world_rtgi_upsample) and the GTVBAO main pass (gtvbao_main, upsample skip).
+// world_rt_denoise.hlsli - denoiser math shared by the SVGF passes (world_svgf.hlsli), the upsample (world_svgf_upsample) and the GTVBAO main pass (gtvbao_main, upsample skip).
 // Pure functions; no resources or constant buffers.
 
 // Soft normal weight: a history tap counts fully at dot >= the Normal Rejection value and falls linearly to 0 over this width.

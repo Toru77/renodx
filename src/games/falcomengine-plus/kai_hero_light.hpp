@@ -13,7 +13,7 @@
 #include <iterator>
 
 #include "./kai_player_light_table.h"
-#include "./world/rtgi/rtgi_resources.hpp"
+#include "./world/game_lights.hpp"
 
 namespace falcom_world::kai {
 
@@ -21,7 +21,7 @@ inline constexpr size_t kHeroConfigCount = std::size(kKaiPlayerLightTable);
 inline constexpr float kHeroMatchTolerance = 0.006f;
 inline constexpr uint16_t kHeroLatchFrames = 60u;
 inline constexpr size_t kHeroLightCount = 512u;  // t11 dynamicLights_g records
-inline constexpr uint64_t kHeroLightBufferBytes = kHeroLightCount * sizeof(rtgi::LightParamCpu);
+inline constexpr uint64_t kHeroLightBufferBytes = kHeroLightCount * sizeof(game_lights::LightParamCpu);
 
 struct KaiHeroLightState {
   std::array<uint16_t, kHeroConfigCount> run = {};           // consecutive frames with exactly one active match
@@ -31,7 +31,7 @@ struct KaiHeroLightState {
   uint64_t evaluated_frame = UINT64_MAX;
   void* mapped = nullptr;  // light buffer pointer of the current map
   uint64_t mapped_bytes = 0u;
-  std::array<rtgi::LightParamCpu, kHeroLightCount> copy = {};  // records read from the mapped buffer before patching
+  std::array<game_lights::LightParamCpu, kHeroLightCount> copy = {};  // records read from the mapped buffer before patching
   uint32_t maps_in_frame = 0u;
   uint32_t max_maps_per_frame = 0u;
   uint32_t patched = 0u;
@@ -47,11 +47,11 @@ inline bool NearHeroValue(float value, float target) {
 
 // Index of the single active point light (radius > 0, spot fields zero) matching the config, or -1 when no light or two
 // or more lights match.
-inline int32_t FindUniqueHeroMatch(const rtgi::LightParamCpu* lights, size_t count, const KaiPlayerLightConfig& config) {
+inline int32_t FindUniqueHeroMatch(const game_lights::LightParamCpu* lights, size_t count, const KaiPlayerLightConfig& config) {
   int32_t match = -1;
   uint32_t matches = 0u;
   for (size_t i = 0; i < count; ++i) {
-    const rtgi::LightParamCpu& light = lights[i];
+    const game_lights::LightParamCpu& light = lights[i];
     if (light.spot_angle_inv != 0.f || light.attenuation_angle != 0.f) {
       continue;
     }
@@ -68,7 +68,7 @@ inline int32_t FindUniqueHeroMatch(const rtgi::LightParamCpu* lights, size_t cou
 
 // Runs on every unmap, before any patch. A new frame advances the run counters; further maps in the same frame only
 // refresh the latched indices.
-inline void EvaluateKaiHeroLights(const rtgi::LightParamCpu* lights, size_t count, bool new_frame) {
+inline void EvaluateKaiHeroLights(const game_lights::LightParamCpu* lights, size_t count, bool new_frame) {
   g_kai_hero_light.first_latched_config = -1;
   for (size_t c = 0; c < kHeroConfigCount; ++c) {
     const int32_t match = FindUniqueHeroMatch(lights, count, kKaiPlayerLightTable[c]);
@@ -93,12 +93,12 @@ inline void ResetKaiHeroLight() {
 }
 
 // Zeroes color, chara_color, scatter_color and specular_intensity of the latched lights only.
-inline uint32_t PatchKaiHeroLights(rtgi::LightParamCpu* lights, size_t count) {
+inline uint32_t PatchKaiHeroLights(game_lights::LightParamCpu* lights, size_t count) {
   uint32_t patched = 0u;
   for (size_t c = 0; c < kHeroConfigCount; ++c) {
     const int32_t index = g_kai_hero_light.latched_index[c];
     if (index >= 0 && static_cast<size_t>(index) < count) {
-      rtgi::LightParamCpu& light = lights[index];
+      game_lights::LightParamCpu& light = lights[index];
       std::memset(light.color, 0, sizeof(light.color));
       std::memset(light.chara_color, 0, sizeof(light.chara_color));
       std::memset(light.scatter_color, 0, sizeof(light.scatter_color));

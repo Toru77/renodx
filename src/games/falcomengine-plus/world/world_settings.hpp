@@ -22,8 +22,8 @@
 #include "pt/pt_state.hpp"
 #include "rr/rr_interop.hpp"
 #include "rr/rr_state.hpp"
-#include "rtao/rtao.hpp"
-#include "rtgi/rtgi.hpp"
+#include "compute/compute.hpp"
+#include "denoise/denoise.hpp"
 #include "rtxdi/rtxdi_config.hpp"
 #include "rtxdi/rtxdi_debug_layout.h"
 #include "rtxdi/rtxdi_diagnostics.hpp"
@@ -1892,7 +1892,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "Path Traced GI",
       .section = "Path Tracing",
-      .tooltip = "Sora 2nd. Needs DXR with shader model 6.6 and RTXDI Local (scene transfer and lamps); works with RTXDI Sun off. Replaces probe ambient, SSAO, GTVBAO/VBGI and RTGI in the image. Raw (no denoiser) unless Ray Reconstruction is on.",
+      .tooltip = "Sora 2nd. Needs DXR with shader model 6.6 and RTXDI Local (scene transfer and lamps); works with RTXDI Sun off. Replaces probe ambient, SSAO and GTVBAO/VBGI in the image. Raw (no denoiser) unless Ray Reconstruction is on.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });

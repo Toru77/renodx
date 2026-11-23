@@ -9,14 +9,14 @@
 
 #include "../../../../utils/log.hpp"
 
-namespace falcom_world::rtao {
+namespace falcom_world::compute {
 
-inline constexpr uint32_t kRtaoSrvCount = 20u;
-inline constexpr uint32_t kRtaoUavCount = 3u;
-inline constexpr uint32_t kRtaoPushRegister = 12u;
-inline constexpr uint32_t kRtaoPushConstantCount = 24u;
+inline constexpr uint32_t kPassSrvCount = 20u;
+inline constexpr uint32_t kPassUavCount = 3u;
+inline constexpr uint32_t kPassPushRegister = 12u;
+inline constexpr uint32_t kPassPushConstantCount = 24u;
 
-struct RtaoDeviceData {
+struct PassLayout {
   reshade::api::pipeline_layout layout = {0u};
   reshade::api::descriptor_table cbv_table = {0u};
   reshade::api::descriptor_table srv_table = {0u};
@@ -25,11 +25,11 @@ struct RtaoDeviceData {
 };
 
 // One entry per device (destroyed with the device).
-inline std::unordered_map<reshade::api::device*, RtaoDeviceData> g_rtao_devices;
+inline std::unordered_map<reshade::api::device*, PassLayout> g_pass_layouts;
 
-inline RtaoDeviceData& GetRtaoDeviceData(reshade::api::device* device) { return g_rtao_devices[device]; }
+inline PassLayout& GetPassLayout(reshade::api::device* device) { return g_pass_layouts[device]; }
 
-inline void DestroyRtaoLayout(reshade::api::device* device, RtaoDeviceData* data) {
+inline void DestroyPassLayoutTables(reshade::api::device* device, PassLayout* data) {
   if (data->srv_table.handle != 0u) device->free_descriptor_table(data->srv_table);
   if (data->uav_table.handle != 0u) device->free_descriptor_table(data->uav_table);
   if (data->cbv_table.handle != 0u) device->free_descriptor_table(data->cbv_table);
@@ -40,7 +40,7 @@ inline void DestroyRtaoLayout(reshade::api::device* device, RtaoDeviceData* data
   data->layout = {0u};
 }
 
-inline bool EnsureRtaoLayout(reshade::api::device* device, RtaoDeviceData* data) {
+inline bool EnsurePassLayout(reshade::api::device* device, PassLayout* data) {
   if (data->layout.handle != 0u && data->cbv_table.handle != 0u && data->srv_table.handle != 0u
       && data->uav_table.handle != 0u) return true;
   if (data->layout_failed) return false;
@@ -51,13 +51,13 @@ inline bool EnsureRtaoLayout(reshade::api::device* device, RtaoDeviceData* data)
   using P = reshade::api::pipeline_layout_param;
 
   DR cbv_range = {0, 0, 0, 1, DS::all_compute, 1, DT::constant_buffer};
-  DR srv_range = {0, 0, 0, kRtaoSrvCount, DS::all_compute, 1, DT::shader_resource_view};
-  DR uav_range = {0, 0, 0, kRtaoUavCount, DS::all_compute, 1, DT::unordered_access_view};
+  DR srv_range = {0, 0, 0, kPassSrvCount, DS::all_compute, 1, DT::shader_resource_view};
+  DR uav_range = {0, 0, 0, kPassUavCount, DS::all_compute, 1, DT::unordered_access_view};
   reshade::api::constant_range push_range = {};
   push_range.binding = 0;
-  push_range.dx_register_index = kRtaoPushRegister;
+  push_range.dx_register_index = kPassPushRegister;
   push_range.dx_register_space = 0;
-  push_range.count = kRtaoPushConstantCount;
+  push_range.count = kPassPushConstantCount;
   push_range.visibility = DS::all_compute;
   P params[4] = {};
   params[0].type = reshade::api::pipeline_layout_param_type::descriptor_table;
@@ -72,8 +72,8 @@ inline bool EnsureRtaoLayout(reshade::api::device* device, RtaoDeviceData* data)
   params[3].type = reshade::api::pipeline_layout_param_type::push_constants;
   params[3].push_constants = push_range;
   const auto fail = [&](const char* stage) {
-    renodx::utils::log::w("[world-rtao] shared layout creation failed: ", stage);
-    DestroyRtaoLayout(device, data);
+    renodx::utils::log::w("[world-compute] shared layout creation failed: ", stage);
+    DestroyPassLayoutTables(device, data);
     data->layout_failed = true;
     return false;
   };
@@ -85,7 +85,7 @@ inline bool EnsureRtaoLayout(reshade::api::device* device, RtaoDeviceData* data)
 }
 
 // Creates a 2D target with zero contents (history starts invalid: distance 0).
-inline bool CreateRtaoTexture(
+inline bool CreateZeroedTexture(
     reshade::api::device* device, reshade::api::format format, uint32_t width, uint32_t height, uint32_t bytes_per_pixel,
     reshade::api::resource* texture, reshade::api::resource_view* srv, reshade::api::resource_view* uav) {
   reshade::api::resource_desc desc = {};
@@ -109,12 +109,12 @@ inline reshade::api::buffer_range SceneCbvRange(reshade::api::resource_view view
   return {reshade::api::resource{view.handle}, 0u, UINT64_MAX};
 }
 
-inline void DestroyRtaoDeviceData(reshade::api::device* device) {
-  const auto found = g_rtao_devices.find(device);
-  if (found == g_rtao_devices.end()) return;
-  RtaoDeviceData& data = found->second;
-  DestroyRtaoLayout(device, &data);
-  g_rtao_devices.erase(found);
+inline void DestroyPassLayout(reshade::api::device* device) {
+  const auto found = g_pass_layouts.find(device);
+  if (found == g_pass_layouts.end()) return;
+  PassLayout& data = found->second;
+  DestroyPassLayoutTables(device, &data);
+  g_pass_layouts.erase(found);
 }
 
-}  // namespace falcom_world::rtao
+}  // namespace falcom_world::compute

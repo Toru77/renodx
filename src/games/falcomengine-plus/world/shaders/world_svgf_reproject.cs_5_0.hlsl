@@ -4,7 +4,7 @@
 // One thread per trace pixel tp. Its representative full-res pixel is rep = min(tp * d + d / 2, full - 1). Writes the
 // integrated colour C' and the temporal variance sigma'^2 (u0: the integrated target when the spatial filter is on, else
 // history colour), the moments mu1', mu2', h (u2), the guide (u3: z, dz/dx, dz/dy, dist) and the octahedral normal (u4).
-// Counters (u1, RTGI_STAT_*) and debug views 4 and 5 (u5). Not traced (raw.a < 0) writes a = -1 and zero guide data.
+// Counters (u1, SVGF_STAT_*) and debug views 4 and 5 (u5). Not traced (raw.a < 0) writes a = -1 and zero guide data.
 
 #include "world_svgf.hlsli"
 
@@ -18,21 +18,21 @@ Texture2D<float4> g_history_guide : register(t6);
 Texture2D<float2> g_history_normal : register(t7);
 
 RWTexture2D<float4> g_colour_write : register(u0);
-RWStructuredBuffer<uint> g_rtgi_stats : register(u1);
+RWStructuredBuffer<uint> g_svgf_stats : register(u1);
 RWTexture2D<float4> g_moments_write : register(u2);
 RWTexture2D<float4> g_guide_write : register(u3);
 RWTexture2D<float2> g_normal_write : register(u4);
-RWTexture2D<float4> g_rtgi_debug : register(u5);
+RWTexture2D<float4> g_svgf_debug : register(u5);
 
 SamplerState g_samp_point : register(s0);
 SamplerState g_samp_linear : register(s1);
 
-#define RTGI_STAT_TEMPORAL_PIXELS 20u
-#define RTGI_STAT_NO_HISTORY 21u
-#define RTGI_STAT_RESET_PIXELS 22u
-#define RTGI_TSTAT_COUNT 3u
+#define SVGF_STAT_TEMPORAL_PIXELS 20u
+#define SVGF_STAT_NO_HISTORY 21u
+#define SVGF_STAT_RESET_PIXELS 22u
+#define SVGF_TSTAT_COUNT 3u
 
-groupshared uint gs_tstats[RTGI_TSTAT_COUNT];
+groupshared uint gs_tstats[SVGF_TSTAT_COUNT];
 
 // Centre and its four neighbours, for the one-sided depth gradients of the guide.
 static const int2 kNeighbour[5] = {int2(0, 0), int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1)};
@@ -41,7 +41,7 @@ static const int2 kNeighbour[5] = {int2(0, 0), int2(1, 0), int2(-1, 0), int2(0, 
 void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
 {
     const uint group_index = gid.y * 8u + gid.x;
-    if (group_index < RTGI_TSTAT_COUNT) gs_tstats[group_index] = 0u;
+    if (group_index < SVGF_TSTAT_COUNT) gs_tstats[group_index] = 0u;
     GroupMemoryBarrierWithGroupSync();
     if (id.x < (uint)s_size.x && id.y < (uint)s_size.y)
     {
@@ -110,7 +110,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
             bool blended = false;
             if (history_valid_frame)
             {
-                // Sec. 4.1: bilinear 2x2 history taps at the reprojected position (CustomTAA_Reproject as the RTGI pass).
+                // Sec. 4.1: bilinear 2x2 history taps at the reprojected position (CustomTAA_Reproject as the SVGF chain).
                 float motion_px = 0.0;
                 float depth_spread = 0.0;
                 const float2 hist_uv = CustomTAA_Reproject(
@@ -238,9 +238,9 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
         }
         if (debug_mode == 4 || debug_mode == 5)
         {
-            SvgfWriteDebugBlock(g_rtgi_debug, uint2(tp), debug_color);
+            SvgfWriteDebugBlock(g_svgf_debug, uint2(tp), debug_color);
         }
     }
     GroupMemoryBarrierWithGroupSync();
-    if (group_index < RTGI_TSTAT_COUNT) InterlockedAdd(g_rtgi_stats[RTGI_STAT_TEMPORAL_PIXELS + group_index], gs_tstats[group_index]);
+    if (group_index < SVGF_TSTAT_COUNT) InterlockedAdd(g_svgf_stats[SVGF_STAT_TEMPORAL_PIXELS + group_index], gs_tstats[group_index]);
 }

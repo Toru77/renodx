@@ -7,6 +7,7 @@
 #include <numbers>
 
 #include "../rr/rr_state.hpp"
+#include "../game_lights.hpp"
 #include "../rtxdi/rtxdi_di_contract.h"
 #include "../rtxdi/rtxdi_di_layout.h"
 #include "../rtxdi/rtxdi_input_d3d11.hpp"
@@ -1284,8 +1285,8 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
             device->destroy_resource_view(shared->uav11);
           }
         }
-        rtgi::DestroyRtgiPipeline(device, candidate.pack_inputs);
-        rtgi::DestroyRtgiPipeline(device, candidate.pack_records);
+        denoise::DestroyComputePipeline(device, candidate.pack_inputs);
+        denoise::DestroyComputePipeline(device, candidate.pack_records);
       };
       std::unique_ptr<Rt12DiTransferSlot, decltype(destroy_candidate)> candidate_guard(&candidate, destroy_candidate);
       HRESULT allocation_error = S_OK;
@@ -1397,10 +1398,10 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       }
 #if defined(__world_rtxdi_pack_inputs_EMBED_FILE) && defined(__world_rtxdi_pack_records_EMBED_FILE)
       if (ok) {
-        ok = rtgi::EnsureRtgiPipeline(device, &candidate.pack_inputs, {.srv_count = 6u, .uav_count = 7u, .sampler_count = 0u, .push_count = 5u, .code = __world_rtxdi_pack_inputs, .name = "rtxdi input pack"});
+        ok = denoise::EnsureComputePipeline(device, &candidate.pack_inputs, {.srv_count = 6u, .uav_count = 7u, .sampler_count = 0u, .push_count = 5u, .code = __world_rtxdi_pack_inputs, .name = "rtxdi input pack"});
       }
       if (ok && in.local) {
-        ok = rtgi::EnsureRtgiPipeline(device, &candidate.pack_records, {.srv_count = 3u, .uav_count = 3u, .sampler_count = 0u, .push_count = 4u, .code = __world_rtxdi_pack_records, .name = "rtxdi record pack"});
+        ok = denoise::EnsureComputePipeline(device, &candidate.pack_records, {.srv_count = 3u, .uav_count = 3u, .sampler_count = 0u, .push_count = 4u, .code = __world_rtxdi_pack_records, .name = "rtxdi record pack"});
       }
 #else
       ok = false;
@@ -1438,8 +1439,8 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
           device->destroy_resource_view(shared->uav11);
         }
       }
-      rtgi::DestroyRtgiPipeline(device, slot.pack_inputs);
-      rtgi::DestroyRtgiPipeline(device, slot.pack_records);
+      denoise::DestroyComputePipeline(device, slot.pack_inputs);
+      denoise::DestroyComputePipeline(device, slot.pack_records);
       candidate.width = in.width;
       candidate.height = in.height;
       candidate.local = in.local;
@@ -1767,7 +1768,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     }
     slot.source_scene = current_scene;
     current_scene.Reset();
-    const auto clear_tables = [&](const rtgi::RtgiPipeline& pipeline, uint32_t srv_count, uint32_t uav_count) {
+    const auto clear_tables = [&](const denoise::ComputePipeline& pipeline, uint32_t srv_count, uint32_t uav_count) {
       const reshade::api::buffer_range null_cb = {};
       const reshade::api::resource_view null_views[7] = {};
       const reshade::api::descriptor_table_update updates[3] = {
@@ -1777,7 +1778,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       };
       device->update_descriptor_tables(3u, updates);
     };
-    const auto bind = [&](const rtgi::RtgiPipeline& pipeline, uint32_t srv_count, const reshade::api::resource_view* srvs,
+    const auto bind = [&](const denoise::ComputePipeline& pipeline, uint32_t srv_count, const reshade::api::resource_view* srvs,
                           uint32_t uav_count, const reshade::api::resource_view* uavs) {
       const reshade::api::descriptor_table_update updates[3] = {
           {pipeline.cbv_table, 0, 0, 1, DT::constant_buffer, &scene_range},
@@ -1796,7 +1797,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                                       allocation_copy_window.copied_rows};
     cmd_list->push_constants(DS::all_compute, slot.pack_inputs.layout, 3u, 0u, 5u, pixel_params);
     cmd_list->dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
-    rtao::NullComputeSlots(cmd_list, 6u, 7u, 0u);
+    compute::NullComputeSlots(cmd_list, 6u, 7u, 0u);
     clear_tables(slot.pack_inputs, 6u, 7u);
     if (in.local) {
       const reshade::api::resource_view records[3] = {in.lights, in.tiles, in.deferred};
@@ -1808,7 +1809,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       if (texels) {
         cmd_list->dispatch((texels + 63u) / 64u, 1u, 1u);
       }
-      rtao::NullComputeSlots(cmd_list, 3u, 3u, 0u);
+      compute::NullComputeSlots(cmd_list, 3u, 3u, 0u);
       clear_tables(slot.pack_records, 3u, 3u);
     }
     result.stage = rtxdi::InputStage::SignalA;
@@ -2658,7 +2659,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     }
     if (!slot.light_readback
         && FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_READBACK,
-                                   uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * sizeof(rtgi::LightParamCpu),
+                                   uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * sizeof(game_lights::LightParamCpu),
                                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, slot.light_readback))) {
       slot.light_readback.Reset();
     }
@@ -3702,7 +3703,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                D3D12_RESOURCE_STATE_COPY_SOURCE);
     transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
     transfer.di_list->CopyBufferRegion(slot.light_readback.Get(), 0u, slot.lights_buffer.Get(), 0u,
-                                       uint64_t{light_count} * sizeof(rtgi::LightParamCpu));
+                                       uint64_t{light_count} * sizeof(game_lights::LightParamCpu));
     barriers.clear();
     Transition(barriers, slot.lights_buffer.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

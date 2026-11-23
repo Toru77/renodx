@@ -139,7 +139,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
           const RAB_LightSample sample = RAB_SamplePolymorphicLight(light, surface, float2(0.5, 0.5));
           const float3 to_light = sample.position - surface.world_position;
           const float attenuation = LampDistanceAttenuation(light.lamp, to_light);
-          const float spot = light.type == RTGI_LAMP_TYPE_SPOT ? LampSpotCone(light.lamp, sample.direction) : 1.0;
+          const float spot = light.type == LAMP_TYPE_SPOT ? LampSpotCone(light.lamp, sample.direction) : 1.0;
           const float lamp_attenuation = attenuation * spot;
           const float3 lamp_color = max(character ? light.lamp.charaColor : light.lamp.color, 0.0);
           const float ndotl_raw = dot(surface.shading_normal, sample.direction);

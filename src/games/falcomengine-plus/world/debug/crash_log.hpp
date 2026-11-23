@@ -97,8 +97,6 @@ inline CrashLogState g_crash_log;
 
 enum class GpuWorkKind : uint32_t { P2b,
                                     Tlas,
-                                    Rtao,
-                                    Rtgi,
                                     Rt12,
                                     GpuCapture,
                                     GcCheck, Pt };
@@ -139,8 +137,7 @@ enum class GpuEvidenceEvent : uint8_t { RrBegin,
                                         DeviceRemoved };
 enum class GpuEvidenceSource : uint8_t { None,
                                          Present,
-                                         Rtao,
-                                         Rtgi,
+                                         SceneTransaction,
                                          GcCheck,
                                          GcBuild,
                                          RrPre,
@@ -255,8 +252,7 @@ inline const char* GpuEvidenceSourceName(GpuEvidenceSource source) {
   switch (source) {
     case GpuEvidenceSource::None:    return "none";
     case GpuEvidenceSource::Present: return "present";
-    case GpuEvidenceSource::Rtao:    return "rtao";
-    case GpuEvidenceSource::Rtgi:    return "rtgi";
+    case GpuEvidenceSource::SceneTransaction: return "scene_transaction";
     case GpuEvidenceSource::GcCheck: return "gc_check";
     case GpuEvidenceSource::GcBuild: return "gc_build";
     case GpuEvidenceSource::RrPre:   return "rr_pre";
@@ -314,8 +310,6 @@ inline const char* GpuWorkKindName(uint32_t kind) {
   switch (static_cast<GpuWorkKind>(kind)) {
     case GpuWorkKind::P2b:        return "P2b";
     case GpuWorkKind::Tlas:       return "TLAS";
-    case GpuWorkKind::Rtao:       return "RTAO";
-    case GpuWorkKind::Rtgi:       return "RTGI";
     case GpuWorkKind::Rt12:       return "RT12";
     case GpuWorkKind::GpuCapture: return "GPU-capture";
     case GpuWorkKind::GcCheck:    return "GC-check";

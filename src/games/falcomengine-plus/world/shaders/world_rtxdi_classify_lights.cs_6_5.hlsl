@@ -23,7 +23,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   for (uint i = 0u; i < point_count; ++i) {
     const int source_index = tile.pointLightIndices[i];
     if (source_index >= 0 && (uint)source_index < g_light_count) {
-      InterlockedOr(g_lamp_types[source_index], RTGI_LAMP_TYPE_POINT);
+      InterlockedOr(g_lamp_types[source_index], LAMP_TYPE_POINT);
     }
   }
 
@@ -31,7 +31,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   for (uint i = 0u; i < spot_count; ++i) {
     const int source_index = tile.spotLightIndices[i];
     if (source_index >= 0 && (uint)source_index < g_light_count) {
-      InterlockedOr(g_lamp_types[source_index], RTGI_LAMP_TYPE_SPOT);
+      InterlockedOr(g_lamp_types[source_index], LAMP_TYPE_SPOT);
     }
   }
 }

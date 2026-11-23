@@ -48,7 +48,8 @@
 #include "./world/bvh/gpu_timer.hpp"     // GpuTimer (Dynamic Cubemaps GPU Timing Log)
 #include "./world/rr/rr_state.hpp"
 #include "./world/pt/pt_rt12.hpp"  // path-traced diffuse GI (world/pt)
-#include "./world/rtao/rtao.hpp"  // shared compute-pass helpers (D3D12 helper-pass layout and null slots)
+#include "./world/game_lights.hpp"
+#include "./world/compute/compute.hpp"  // shared compute-pass helpers (D3D12 helper-pass layout and null slots)
 #include "./world/rtxdi/rtxdi_debug_layout.h"
 #include "./world/world.hpp"  // Phase 0 world-space research module (DevKit-only)
 
@@ -1082,15 +1083,15 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view vbgi_radiance_mip_srv[4] = {};
   reshade::api::resource_view vbgi_radiance_mip_uav[5] = {};
   uint64_t vbgi_radiance_frame = UINT64_MAX;
-  falcom_world::rtgi::RtgiDenoiseSet vbgi_denoise = {};
-  falcom_world::rtgi::RtgiDenoiseSet vbgi_far_color_denoise = {};
+  falcom_world::denoise::DenoiseSet vbgi_denoise = {};
+  falcom_world::denoise::DenoiseSet vbgi_far_color_denoise = {};
   bool vbgi_far_color_last = false;
   uint64_t vbgi_far_color_frame = UINT64_MAX;
   uint32_t vbgi_far_color_full_width = 0u, vbgi_far_color_full_height = 0u;
   std::array<float, 6> vbgi_far_color_prev_params = {};
   bool vbgi_far_color_prev_params_valid = false;
-  falcom_world::rtgi::RtgiDenoiseSet gtvbao_denoise = {};
-  falcom_world::rtgi::RtgiTextureSet<1> gtvbao_svgf_raw = {};  // rgba16f, AO size: rgb = visibility, a = 1
+  falcom_world::denoise::DenoiseSet gtvbao_denoise = {};
+  falcom_world::denoise::TextureSet<1> gtvbao_svgf_raw = {};  // rgba16f, AO size: rgb = visibility, a = 1
   reshade::api::resource vbgi_stats_buffer = {};
   reshade::api::resource_view vbgi_stats_uav = {};
   uint64_t vbgi_gi_frame = UINT64_MAX;
@@ -1106,26 +1107,26 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   GTVBAODescriptorTableSet vbgi_far_tables = {};
   reshade::api::pipeline vbgi_far_resolve_pipeline = {};
   reshade::api::pipeline vbgi_far_compose_pipeline = {};
-  falcom_world::rtgi::RtgiTextureSet<1> vbgi_far_cand_pos = {};  // rgba32f, trace size: world sample point, W
-  falcom_world::rtgi::RtgiTextureSet<1> vbgi_far_cand_rad = {};  // rgba16f, trace size: sender radiance, M
-  falcom_world::rtgi::RtgiTextureSet<1> vbgi_far_cand_nrm = {};  // rgba16f, trace size: world sender normal, mismatch
-  falcom_world::rtgi::RtgiTextureSet<1> vbgi_far_raw = {};       // rgba16f, trace size: far raw GI
-  falcom_world::rtgi::RtgiTextureSet<1> vbgi_far_joint = {};     // rgba16f, trace size: near raw + far (denoise input)
+  falcom_world::denoise::TextureSet<1> vbgi_far_cand_pos = {};  // rgba32f, trace size: world sample point, W
+  falcom_world::denoise::TextureSet<1> vbgi_far_cand_rad = {};  // rgba16f, trace size: sender radiance, M
+  falcom_world::denoise::TextureSet<1> vbgi_far_cand_nrm = {};  // rgba16f, trace size: world sender normal, mismatch
+  falcom_world::denoise::TextureSet<1> vbgi_far_raw = {};       // rgba16f, trace size: far raw GI
+  falcom_world::denoise::TextureSet<1> vbgi_far_joint = {};     // rgba16f, trace size: near raw + far (denoise input)
   bool vbgi_far_was_on = false;                                  // far state last RunVBGI (near history resets on a change)
   uint64_t vbgi_far_frame = UINT64_MAX;                          // last frame the far resolve ran
   bool vbgi_far_prev_params_valid = false;
   std::array<float, 11> vbgi_far_prev_params = {};
   reshade::api::pipeline vbgi_far_temporal_pipeline = {};
-  falcom_world::rtgi::RtgiTextureSet<2> vbgi_far_res_pos = {};  // rgba32f, trace size: temporal reservoir sample point, W
-  falcom_world::rtgi::RtgiTextureSet<2> vbgi_far_res_rad = {};  // rgba16f, trace size: sender radiance, M
-  falcom_world::rtgi::RtgiTextureSet<2> vbgi_far_res_nrm = {};  // rgba16f, trace size: sender normal, refreshed flag
+  falcom_world::denoise::TextureSet<2> vbgi_far_res_pos = {};  // rgba32f, trace size: temporal reservoir sample point, W
+  falcom_world::denoise::TextureSet<2> vbgi_far_res_rad = {};  // rgba16f, trace size: sender radiance, M
+  falcom_world::denoise::TextureSet<2> vbgi_far_res_nrm = {};  // rgba16f, trace size: sender normal, refreshed flag
   uint32_t vbgi_far_res_index = 0u;                             // [index] holds last frame's temporal reservoir
   bool vbgi_far_reuse_last = false;                             // temporal reuse ran in the last far frame
   uint64_t vbgi_far_reuse_frame = UINT64_MAX;                   // last frame the far reservoir step ran
   reshade::api::pipeline vbgi_far_spatial_pipeline = {};
-  falcom_world::rtgi::RtgiTextureSet<1> vbgi_far_sp_pos = {};  // rgba32f, trace size: spatial reservoir sample point, W
-  falcom_world::rtgi::RtgiTextureSet<1> vbgi_far_sp_rad = {};  // rgba16f, trace size: sender radiance, M
-  falcom_world::rtgi::RtgiTextureSet<1> vbgi_far_sp_nrm = {};  // rgba16f, trace size: sender normal, accepted fraction
+  falcom_world::denoise::TextureSet<1> vbgi_far_sp_pos = {};  // rgba32f, trace size: spatial reservoir sample point, W
+  falcom_world::denoise::TextureSet<1> vbgi_far_sp_rad = {};  // rgba16f, trace size: sender radiance, M
+  falcom_world::denoise::TextureSet<1> vbgi_far_sp_nrm = {};  // rgba16f, trace size: sender normal, accepted fraction
 
   reshade::api::resource_view captured_depth_srv = {};
   std::atomic<bool> captured_depth_live{true};            // destroy-event driven; false = target freed since capture
@@ -8592,13 +8593,13 @@ static void OnKaiHeroMapBuffer(reshade::api::device*, reshade::api::resource res
 static void OnKaiHeroUnmapBuffer(reshade::api::device* device, reshade::api::resource resource) {
   auto& hero = falcom_world::kai::g_kai_hero_light;
   if (hero.mapped != nullptr && resource.handle == g_kai_lights_resource.load(std::memory_order_relaxed)) {
-    auto* lights = static_cast<falcom_world::rtgi::LightParamCpu*>(hero.mapped);
-    const size_t count = (std::min)(hero.mapped_bytes / sizeof(falcom_world::rtgi::LightParamCpu),
+    auto* lights = static_cast<falcom_world::game_lights::LightParamCpu*>(hero.mapped);
+    const size_t count = (std::min)(hero.mapped_bytes / sizeof(falcom_world::game_lights::LightParamCpu),
                                     falcom_world::kai::kHeroLightCount);
     auto* d = device->get_private_data<DeviceData>();
     if (d != nullptr) {
       // Matching reads only the copy; the copy is taken before the patch below writes the mapped records.
-      std::memcpy(hero.copy.data(), lights, count * sizeof(falcom_world::rtgi::LightParamCpu));
+      std::memcpy(hero.copy.data(), lights, count * sizeof(falcom_world::game_lights::LightParamCpu));
       const bool new_frame = d->frame_index != hero.evaluated_frame;
       if (new_frame) {
         hero.evaluated_frame = d->frame_index;
@@ -11263,14 +11264,14 @@ static bool OnReplaceKaiSSRDraw(reshade::api::command_list* cmd_list) {
 // its size against the depth; checks RTV4 against TAA t3 (a conflict stops Temporal for the session). The state is
 // function-local and logged once. Returns whether the motion view can be used.
 static bool UpdateRtMotion(reshade::api::device* dev, DeviceData* dd, bool temporal_on) {
-  namespace rtao = falcom_world::rtao;
+  namespace compute = falcom_world::compute;
   static bool motion_conflict = false;
   static bool motion_dims_ok = true;
   if (temporal_on) MBMotionRtv4Ensure(dev, dd);
   const uint64_t mb_rtv4_res = dd->mb_rtv4_res.load(std::memory_order_acquire);
   // Motion source (round 2). TAA t3 and RTV4 are different resources: t3 is not proven to be written before
   // lighting, so Temporal stops for the session. Unknown on either side: no decision yet.
-  const rtao::MotionCheck motion_check = rtao::CheckMotionResources(dd->rcas_motion_res, mb_rtv4_res);
+  const compute::MotionCheck motion_check = compute::CheckMotionResources(dd->rcas_motion_res, mb_rtv4_res);
   if (temporal_on && dd->mb_rtv4_live.load()
       && dd->mb_rtv4_owned_srv.handle != 0u) {
     const auto motion_desc = dev->get_resource_desc(dev->get_resource_from_view(dd->mb_rtv4_owned_srv));
@@ -11287,14 +11288,14 @@ static bool UpdateRtMotion(reshade::api::device* dev, DeviceData* dd, bool tempo
       }
     }
   }
-  if (motion_check == rtao::MotionCheck::Conflict && !motion_conflict) {
+  if (motion_check == compute::MotionCheck::Conflict && !motion_conflict) {
     motion_conflict = true;
     renodx::utils::log::w("[world-compute] motion CONFLICT: rcas_motion_res=", dd->rcas_motion_res,
                           " mb_rtv4_res=", mb_rtv4_res,
                           " differ. TAA t3 is not proven written before lighting; Temporal is off for this session (no_motion).");
   }
   static bool motion_logged = false;
-  if (!motion_logged && motion_check == rtao::MotionCheck::Ok && dd->rcas_motion_res != 0u && mb_rtv4_res != 0u) {
+  if (!motion_logged && motion_check == compute::MotionCheck::Ok && dd->rcas_motion_res != 0u && mb_rtv4_res != 0u) {
     motion_logged = true;
     renodx::utils::log::i("[world-compute] motion: rcas_motion_res=", dd->rcas_motion_res,
                           " mb_rtv4_res=", mb_rtv4_res, " same resource: RTV4 owned SRV used");
@@ -11511,7 +11512,7 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
                      static_cast<float>(RTXDI_DEBUG_VIEW_SUN_VISIBILITY)));
       const uint32_t effective_debug_view = ResolveRtxdiDebugEffectiveView(
           requested_debug_view, falcom_world::bvh::g_bvh_debug.mode.load(std::memory_order_relaxed) != 0);
-      input_views = {.depth = dd->captured_depth_srv, .normal = dd->captured_mrt_normal_srv, .color = (dd->captured_color_live.load() && dd->captured_color_frame == dd->frame_index && view(0u).handle == dd->captured_color_srv.handle ? dd->captured_color_srv : reshade::api::resource_view{}), .mrt1 = view(falcom_world::rtgi::kLightingMrt1Register), .mrt2 = view(falcom_world::rtgi::kLightingMrt2Register), .motion = motion_ready ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{}, .lights = view(falcom_world::rtgi::kLightingLightsRegister), .tiles = view(falcom_world::rtgi::kLightingLightIndicesRegister), .deferred = view(falcom_world::rtgi::kLightingDeferredRegister), .scene_tracker = &dd->rtxdi_scene_range, .capture_frame = dd->frame_index, .frame = frame, .width = input_width, .height = input_height, .lights_register = falcom_world::rtgi::kLightingLightsRegister, .tiles_register = falcom_world::rtgi::kLightingLightIndicesRegister, .deferred_register = falcom_world::rtgi::kLightingDeferredRegister, .effective_debug_view = effective_debug_view, .sun_detail_view = static_cast<uint32_t>(std::clamp(std::isfinite(falcom_world::rtxdi::g_sun_detail_view) ? falcom_world::rtxdi::g_sun_detail_view : 0.f, 0.f, static_cast<float>(RTXDI_SUN_DETAIL_BLOCKER))), .n1_brdf_config = {shader_injection.brdf_hammon_diffuse_enabled, shader_injection.brdf_diffuse_strength, shader_injection.brdf_multiscatter_specular_enabled, shader_injection.brdf_specular_strength, shader_injection.brdf_specular_peak_clamp, shader_injection.brdf_roughness_min, shader_injection.brdf_roughness_max}, .effective_settings = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings(), .scene_slot = result.slot, .scene_fence = result.fence_b, .local = (request_mask & 1u) != 0u, .sun = falcom_world::rtxdi::SunVisibilityRequested(request_mask)};
+      input_views = {.depth = dd->captured_depth_srv, .normal = dd->captured_mrt_normal_srv, .color = (dd->captured_color_live.load() && dd->captured_color_frame == dd->frame_index && view(0u).handle == dd->captured_color_srv.handle ? dd->captured_color_srv : reshade::api::resource_view{}), .mrt1 = view(falcom_world::game_lights::kLightingMrt1Register), .mrt2 = view(falcom_world::game_lights::kLightingMrt2Register), .motion = motion_ready ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{}, .lights = view(falcom_world::game_lights::kLightingLightsRegister), .tiles = view(falcom_world::game_lights::kLightingLightIndicesRegister), .deferred = view(falcom_world::game_lights::kLightingDeferredRegister), .scene_tracker = &dd->rtxdi_scene_range, .capture_frame = dd->frame_index, .frame = frame, .width = input_width, .height = input_height, .lights_register = falcom_world::game_lights::kLightingLightsRegister, .tiles_register = falcom_world::game_lights::kLightingLightIndicesRegister, .deferred_register = falcom_world::game_lights::kLightingDeferredRegister, .effective_debug_view = effective_debug_view, .sun_detail_view = static_cast<uint32_t>(std::clamp(std::isfinite(falcom_world::rtxdi::g_sun_detail_view) ? falcom_world::rtxdi::g_sun_detail_view : 0.f, 0.f, static_cast<float>(RTXDI_SUN_DETAIL_BLOCKER))), .n1_brdf_config = {shader_injection.brdf_hammon_diffuse_enabled, shader_injection.brdf_diffuse_strength, shader_injection.brdf_multiscatter_specular_enabled, shader_injection.brdf_specular_strength, shader_injection.brdf_specular_peak_clamp, shader_injection.brdf_roughness_min, shader_injection.brdf_roughness_max}, .effective_settings = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings(), .scene_slot = result.slot, .scene_fence = result.fence_b, .local = (request_mask & 1u) != 0u, .sun = falcom_world::rtxdi::SunVisibilityRequested(request_mask)};
       input_result = rt12::TransferRtxdiInputs(dev, cmd_list, input_views);
     }
     {
@@ -12375,7 +12376,7 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
 static void RunRrGuidesInline(reshade::api::command_list* cmd_list) {
   if (falcom_world::rr::g_rr_perf_guides < 0.5f) return;  // TEMP perf test (remove)
   namespace rr = falcom_world::rr;
-  namespace rtgi = falcom_world::rtgi;
+  namespace denoise = falcom_world::denoise;
   if (!rr::RrRequested() || !IsSora2nd()) return;
   auto* dev = cmd_list->get_device();
   auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
@@ -12389,8 +12390,8 @@ static void RunRrGuidesInline(reshade::api::command_list* cmd_list) {
                             && dd->captured_depth_srv.handle != 0u && dd->captured_depth_live.load()
                             && dd->captured_mrt_normal_srv.handle != 0u && dd->captured_mrt_live.load()
                             && dd->captured_scene_cbv_valid
-                            && world_cl->ps_srv_view[rtgi::kLightingMrt2Register].handle != 0u
-                            && world_cl->ps_srv_view[rtgi::kLightingDeferredRegister].handle != 0u;
+                            && world_cl->ps_srv_view[falcom_world::game_lights::kLightingMrt2Register].handle != 0u
+                            && world_cl->ps_srv_view[falcom_world::game_lights::kLightingDeferredRegister].handle != 0u;
   if (!inputs_ready) {
     rr::SetGuideReason(rr::GuideReason::InputsMissing);
     return;
@@ -12398,8 +12399,8 @@ static void RunRrGuidesInline(reshade::api::command_list* cmd_list) {
   rr::DispatchGuides(dev, cmd_list, {
                                         .color_view = dd->captured_color_srv,
                                         .mrt0_view = dd->captured_mrt_normal_srv,
-                                        .mrt2_view = world_cl->ps_srv_view[rtgi::kLightingMrt2Register],
-                                        .deferred_view = world_cl->ps_srv_view[rtgi::kLightingDeferredRegister],
+                                        .mrt2_view = world_cl->ps_srv_view[falcom_world::game_lights::kLightingMrt2Register],
+                                        .deferred_view = world_cl->ps_srv_view[falcom_world::game_lights::kLightingDeferredRegister],
                                         .depth_view = dd->captured_depth_srv,
                                         .scene_cbv_view = dd->captured_scene_cbv_view,
                                         .width = dd->captured_depth_w,
@@ -12488,7 +12489,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   if (IsKai() && g_kai_hero_light_toggle > 0.5f) {
     auto* context11 = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());  // NOLINT(performance-no-int-to-ptr)
     ID3D11ShaderResourceView* srv = nullptr;
-    if (context11 != nullptr) context11->PSGetShaderResources(falcom_world::rtgi::kLightingLightsRegister, 1, &srv);
+    if (context11 != nullptr) context11->PSGetShaderResources(falcom_world::game_lights::kLightingLightsRegister, 1, &srv);
     if (srv != nullptr) {
       ID3D11Resource* resource = nullptr;
       srv->GetResource(&resource);
@@ -12658,13 +12659,13 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   if ((!vbgi_active || g_vbgi_temporal_enabled > 0.5f || g_vbgi_temporal_far_only < 0.5f
        || g_vbgi_far_enabled < 0.5f || g_cpuopt_deferred_dispatch > 0.5f)
       && dd->vbgi_far_color_denoise.history_color.texture[0].handle != 0u) {
-    falcom_world::rtgi::ReleaseRtgiDenoiseTextures(dev, &dd->vbgi_far_color_denoise);
+    falcom_world::denoise::ReleaseDenoiseTextures(dev, &dd->vbgi_far_color_denoise);
     dd->vbgi_far_color_last = false;
     dd->vbgi_far_color_prev_params_valid = false;
   }
   if (!gtvbao_active && dd->gtvbao_svgf_raw.texture[0].handle != 0u) {
-    falcom_world::rtgi::ReleaseRtgiDenoiseTextures(dev, &dd->gtvbao_denoise);
-    falcom_world::rtgi::DestroyRtgiTextureSet(dev, &dd->gtvbao_svgf_raw);
+    falcom_world::denoise::ReleaseDenoiseTextures(dev, &dd->gtvbao_denoise);
+    falcom_world::denoise::DestroyTextureSet(dev, &dd->gtvbao_svgf_raw);
   }
 
   // Push the GTVBAO AO result at t22.
@@ -13156,7 +13157,7 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
   d->last_created_gtvbao_resolution = std::log2((float)div);
   mk(aw, ah, reshade::api::format::r32_uint, &d->ao_term_a_texture, &d->ao_term_a_srv, &d->ao_term_a_uav);
   // VBGI raw gather target: always allocated; RunVBGI never resizes it.
-  const uint32_t vdiv = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex);
+  const uint32_t vdiv = falcom_world::compute::TraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex);
   const uint32_t vw = (w + vdiv - 1u) / vdiv;
   const uint32_t vh = (h + vdiv - 1u) / vdiv;
   d->vbgi_width = vw;
@@ -13234,22 +13235,22 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   for (auto& u : d->vbgi_radiance_mip_uav) dv(u);
   dv(d->vbgi_radiance_srv);
   dr(d->vbgi_radiance_texture);
-  falcom_world::rtgi::DestroyRtgiDenoiseSet(dev, &d->vbgi_far_color_denoise);
+  falcom_world::denoise::DestroyDenoiseSet(dev, &d->vbgi_far_color_denoise);
   d->vbgi_far_color_denoise = {};
   d->vbgi_far_color_last = false;
   d->vbgi_far_color_frame = UINT64_MAX;
   d->vbgi_far_color_full_width = d->vbgi_far_color_full_height = 0u;
   d->vbgi_far_color_prev_params_valid = false;
-  falcom_world::rtgi::DestroyRtgiDenoiseSet(dev, &d->vbgi_denoise);
-  d->vbgi_denoise = falcom_world::rtgi::RtgiDenoiseSet{};
+  falcom_world::denoise::DestroyDenoiseSet(dev, &d->vbgi_denoise);
+  d->vbgi_denoise = falcom_world::denoise::DenoiseSet{};
   falcom_world::bvh::DestroyBuffer(dev, &d->vbgi_stats_uav, &d->vbgi_stats_buffer);
   d->vbgi_gi_frame = UINT64_MAX;
   d->vbgi_temporal_last = false;
   d->vbgi_last_frame = UINT64_MAX;
   d->vbgi_prev_params_valid = false;
-  falcom_world::rtgi::DestroyRtgiDenoiseSet(dev, &d->gtvbao_denoise);
-  d->gtvbao_denoise = falcom_world::rtgi::RtgiDenoiseSet{};
-  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->gtvbao_svgf_raw);
+  falcom_world::denoise::DestroyDenoiseSet(dev, &d->gtvbao_denoise);
+  d->gtvbao_denoise = falcom_world::denoise::DenoiseSet{};
+  falcom_world::denoise::DestroyTextureSet(dev, &d->gtvbao_svgf_raw);
   dp(d->vbgi_far_main_pipeline);
   dp(d->vbgi_far_resolve_pipeline);
   dp(d->vbgi_far_compose_pipeline);
@@ -13257,25 +13258,25 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   dl(d->vbgi_far_layout);
   DestroyGTVBAODescriptorTables(dev, &d->vbgi_far_main_tables);
   DestroyGTVBAODescriptorTables(dev, &d->vbgi_far_tables);
-  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_cand_pos);
-  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_cand_rad);
-  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_cand_nrm);
-  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_raw);
-  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_joint);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->vbgi_far_cand_pos);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->vbgi_far_cand_rad);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->vbgi_far_cand_nrm);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->vbgi_far_raw);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->vbgi_far_joint);
   d->vbgi_far_was_on = false;
   d->vbgi_far_frame = UINT64_MAX;
   d->vbgi_far_prev_params_valid = false;
   dp(d->vbgi_far_temporal_pipeline);
-  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_res_pos);
-  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_res_rad);
-  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_res_nrm);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->vbgi_far_res_pos);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->vbgi_far_res_rad);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->vbgi_far_res_nrm);
   d->vbgi_far_res_index = 0u;
   d->vbgi_far_reuse_last = false;
   d->vbgi_far_reuse_frame = UINT64_MAX;
   dp(d->vbgi_far_spatial_pipeline);
-  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_sp_pos);
-  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_sp_rad);
-  falcom_world::rtgi::DestroyRtgiTextureSet(dev, &d->vbgi_far_sp_nrm);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->vbgi_far_sp_pos);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->vbgi_far_sp_rad);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->vbgi_far_sp_nrm);
   DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
   DestroyGTVBAODescriptorTables(dev, &d->main_tables);
   DestroyGTVBAODescriptorTables(dev, &d->foliage_mask_tables);
@@ -13656,8 +13657,8 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
         const uint64_t light_bytes = dev->get_resource_desc(dev->get_resource_from_view(d->vbgi_in_srv[4])).buffer.size;
         const uint64_t cell_bytes = dev->get_resource_desc(dev->get_resource_from_view(d->vbgi_in_srv[5])).buffer.size;
         CSLog("shadows", "local first dispatch ok at " + std::to_string(w) + "x" + std::to_string(h)
-                             + " (lamps=" + std::to_string(light_bytes / falcom_world::rtgi::kLightParamBytes)
-                             + " cells=" + std::to_string(cell_bytes / falcom_world::rtgi::kLightIndexDataBytes)
+                             + " (lamps=" + std::to_string(light_bytes / falcom_world::game_lights::kLightParamBytes)
+                             + " cells=" + std::to_string(cell_bytes / falcom_world::game_lights::kLightIndexDataBytes)
                              + " material_slot=" + std::to_string(material_k)
                              + " isfast=" + (isfast_ready ? "ready" : "missing") + ")");
       }
@@ -14749,7 +14750,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
 // barriers after the reduction do not encounter its SRV/UAV views still bound.
 static void UnbindDynCubeComputeState(reshade::api::command_list* cl) {
   if (!cl) return;
-  falcom_world::rtao::NullComputeSlots(cl, 8u, 6u, 1u);
+  falcom_world::compute::NullComputeSlots(cl, 8u, 6u, 1u);
 }
 
 class DynCubeComputeDispatchScope final {
@@ -15628,7 +15629,7 @@ static std::array<float, kVbgiFarPushConstantFloats> BuildVbgiFarPushConstants(D
   std::copy(base.begin(), base.end(), c.begin());
   c[48] = std::max(g_vbgi_far_distance, 0.1f);
   c[49] = std::max(g_vbgi_far_history_length, 1.f);
-  c[50] = std::max(2.f, 30.f / static_cast<float>(falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex)))
+  c[50] = std::max(2.f, 30.f / static_cast<float>(falcom_world::compute::TraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex)))
           * std::clamp(g_vbgi_far_spatial_radius, 0.5f, 2.f);
   c[51] = std::max(g_vbgi_far_intensity, 0.f);
   c[52] = g_vbgi_far_hit_window > 0.5f ? 1.f : 0.f;
@@ -15971,7 +15972,7 @@ static void RunGTVBAOSharedPrep(reshade::api::command_list* cl, DeviceData* d) {
 // -- Dispatch --
 
 static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
-  namespace rtao = falcom_world::rtao;
+  namespace compute = falcom_world::compute;
   if (!d->captured_depth_srv.handle) return false;
 
   auto* dev = cl->get_device();
@@ -16031,17 +16032,17 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
   const auto CS = reshade::api::shader_stage::all_compute;
-  namespace rtgi = falcom_world::rtgi;
-  static constexpr rtgi::RtgiPipelineDesc kGtvbaoUpsampleDesc = {.srv_count = rtgi::kRtgiUpsampleSrvCount, .uav_count = rtgi::kRtgiUpsampleUavCount, .sampler_count = 0u, .push_count = rtgi::kRtgiUpsamplePushCount, .code = __gtvbao_svgf_upsample, .name = "gtvbao upsample"};
+  namespace denoise = falcom_world::denoise;
+  static constexpr denoise::ComputePipelineDesc kGtvbaoUpsampleDesc = {.srv_count = denoise::kUpsampleSrvCount, .uav_count = denoise::kUpsampleUavCount, .sampler_count = 0u, .push_count = denoise::kUpsamplePushCount, .code = __gtvbao_svgf_upsample, .name = "gtvbao upsample"};
   const bool motion_ok = temporal_wanted && UpdateRtMotion(dev, d, true);
   const uint32_t divisor = low_res ? 2u : 1u;
   const uint32_t full_w = d->captured_depth_w, full_h = d->captured_depth_h;
-  rtgi::RtgiDenoiseReady ready = {};
+  denoise::DenoiseReady ready = {};
   if (d->captured_mrt_normal_srv.handle != 0u && d->captured_scene_cbv_view.handle != 0u && full_w != 0u && full_h != 0u
-      && aw == rtao::RtgiTraceExtent(full_w, divisor) && ah == rtao::RtgiTraceExtent(full_h, divisor)
-      && rtgi::EnsureRtgiPipeline(dev, &d->gtvbao_denoise.upsample_pipeline, kGtvbaoUpsampleDesc)
-      && rtgi::EnsureRtgiTextureSet(dev, &d->gtvbao_svgf_raw, reshade::api::format::r16g16b16a16_float, 8u, aw, ah)) {
-    ready = rtgi::EnsureRtgiDenoise(dev, &d->gtvbao_denoise, {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = aw, .trace_height = ah, .full_width = full_w, .full_height = full_h, .temporal = motion_ok, .spatial = g_gtvbao_svgf_spatial_enabled > 0.5f, .log_prefix = "[gtvbao]", .full_resolution = g_gtvbao_full_res_denoise > 0.5f, .nearest_fallback = true, .bypass_svgf = rr_bypass});
+      && aw == compute::TraceExtent(full_w, divisor) && ah == compute::TraceExtent(full_h, divisor)
+      && denoise::EnsureComputePipeline(dev, &d->gtvbao_denoise.upsample_pipeline, kGtvbaoUpsampleDesc)
+      && denoise::EnsureTextureSet(dev, &d->gtvbao_svgf_raw, reshade::api::format::r16g16b16a16_float, 8u, aw, ah)) {
+    ready = denoise::EnsureDenoise(dev, &d->gtvbao_denoise, {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = aw, .trace_height = ah, .full_width = full_w, .full_height = full_h, .temporal = motion_ok, .spatial = g_gtvbao_svgf_spatial_enabled > 0.5f, .log_prefix = "[gtvbao]", .full_resolution = g_gtvbao_full_res_denoise > 0.5f, .nearest_fallback = true, .bypass_svgf = rr_bypass});
   }
   if (!ready.ok) {
     CSLog("gtvbao", "svgf chain not ready (normal, cbv, size, pipelines or targets)", true);
@@ -16073,11 +16074,11 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   // Temporal accumulation: the reset rule shared with GTVBAO and VBGI over this pass's own state.
   // Motion is checked only while Temporal is wanted; without motion the AO stays spatial only.
   std::array<float, kGtvbaoSnapshotFloats> snapshot = {};
-  rtao::ResetReason reset = rtao::ResetReason::Disabled;
+  compute::ResetReason reset = compute::ResetReason::Disabled;
   if (temporal_wanted) {
     const auto pc_all = BuildGTVBAOPushConstants(d);
     for (uint32_t i = 0; i < kGtvbaoSnapshotFloats; ++i) snapshot[i] = pc_all[kGtvbaoSnapshotIndex[i]];
-    reset = rtao::TemporalResetReason(rtao::TemporalFrame{
+    reset = compute::TemporalResetReason(compute::TemporalFrame{
         .temporal_on = true,
         .was_on = d->gtvbao_temporal_last,
         .resized = d->temporal_seen_w != aw || d->temporal_seen_h != ah,
@@ -16089,10 +16090,10 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
                           && (!(snapshot == d->gtvbao_prev_params) || d->gtvbao_prev_svgf_history_length != g_gtvbao_svgf_history_length
                               || d->gtvbao_prev_svgf_radius_scale != svgf_radius_scale),
         .motion_ok = motion_ok});
-    if (!rr_bypass && reset != rtao::ResetReason::None)
-      CSLog("gtvbao", std::string("temporal reset: ") + rtao::ResetReasonName(reset), true);
+    if (!rr_bypass && reset != compute::ResetReason::None)
+      CSLog("gtvbao", std::string("temporal reset: ") + compute::ResetReasonName(reset), true);
   }
-  const bool history_valid = !rr_bypass && reset == rtao::ResetReason::None;
+  const bool history_valid = !rr_bypass && reset == compute::ResetReason::None;
 
   // Pass 2: Main
   reshade::api::pipeline mp = d->main_pipeline;
@@ -16143,9 +16144,9 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   {
     std::vector<reshade::api::descriptor_table_update> table_nulls;
     const bool gt_conf = GtvbaoDebugMode() == 23 && d->debug_uav.handle != 0u;
-    // Half: DispatchRtgiDenoise subtracts log2(divisor) = 1, so + 1 makes Half Res Iterations the effective count.
+    // Half: DispatchDenoise subtracts log2(divisor) = 1, so + 1 makes Half Res Iterations the effective count.
     const float svgf_iterations = low_res ? g_gtvbao_svgf_half_res_iterations + (g_gtvbao_full_res_denoise > 0.5f ? 0.f : 1.f) : g_gtvbao_svgf_iterations;
-    rtgi::DispatchRtgiDenoise(dev, cl, &d->gtvbao_denoise,
+    denoise::DispatchDenoise(dev, cl, &d->gtvbao_denoise,
                               {.raw_view = d->gtvbao_svgf_raw.srv[0],
                                .depth_view = d->captured_depth_srv,
                                .mrt_normal_view = d->captured_mrt_normal_srv,
@@ -16164,7 +16165,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
                                .svgf = {g_gtvbao_history_weight, g_gtvbao_depth_rejection, g_gtvbao_normal_rejection,
                                         history_valid, svgf_iterations, g_gtvbao_svgf_luminance_edge_stop,
                                         g_gtvbao_svgf_depth_sigma, g_gtvbao_svgf_normal_power, g_gtvbao_full_res_denoise > 0.5f, g_gtvbao_svgf_history_length, svgf_radius_scale},
-                               .luminance_weights = rtgi::kSvgfLuminanceAo,
+                               .luminance_weights = denoise::kSvgfLuminanceAo,
                                .upsample_intensity = 1.f,
                                .upsample_char_intensity = 1.f,
                                .upsample_saturation = 1.f,
@@ -16194,7 +16195,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
 
 // VBGI radiance prepass (M7.4 step 3): sender radiance and its mip chain, once per frame, from the lighting draw.
 constexpr float kVbgiRadianceClamp = 16.f;    // HDR cap per channel
-constexpr float kVbgiFeedbackMax = 0.9f;      // Multi-Bounce Strength x Intensity limit (RTGI rule)
+constexpr float kVbgiFeedbackMax = 0.9f;      // Multi-Bounce Strength x Intensity limit (GTVBGI rule)
 constexpr float kVbgiFarFeedbackMax = 0.75f;  // Far Multi-Bounce Strength x Intensity limit (M4)
 constexpr float kVbgiFireflyK = 4.0f;         // fed-back luminance limit, x the 8-neighbour mean (M4)
 static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
@@ -16226,7 +16227,7 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
   const uint32_t w = d->vbgi_width, h = d->vbgi_height;
-  const uint32_t div = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex);
+  const uint32_t div = falcom_world::compute::TraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex);
   const bool kai = IsKai();
 
   // Multi-Bounce (M7.6): last frame's denoised GI (the newest output, not written until this frame's denoise) re-enters as
@@ -16352,8 +16353,8 @@ static bool RunVbgiRadiance(reshade::api::command_list* cl, DeviceData* d) {
     cl->dispatch((std::max(1u, w >> m) + 7u) / 8u, (std::max(1u, h >> m) + 7u) / 8u, 1);
   }
 
-  falcom_world::rtao::NullComputeSlots(cl, 12, 1, 1);
-  if (far_fb) falcom_world::rtao::NullComputeSlots(cl, 14, 1, 1);
+  falcom_world::compute::NullComputeSlots(cl, 12, 1, 1);
+  if (far_fb) falcom_world::compute::NullComputeSlots(cl, 14, 1, 1);
   GtvbaoBarrier(cl, d->vbgi_radiance_texture, UA, SR);
   d->vbgi_radiance_frame = d->frame_index;
   static bool s_logged = false;
@@ -16397,11 +16398,11 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     const bool far_tables = far_psos && EnsureGTVBAODescriptorTables(dev, d->vbgi_far_main_layout, &d->vbgi_far_main_tables)
                             && EnsureGTVBAODescriptorTables(dev, d->vbgi_far_layout, &d->vbgi_far_tables);
     const bool far_textures = far_tables
-                              && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_cand_pos, reshade::api::format::r32g32b32a32_float, 16u, tw, th)
-                              && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_cand_rad, reshade::api::format::r16g16b16a16_float, 8u, tw, th)
-                              && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_cand_nrm, reshade::api::format::r16g16b16a16_float, 8u, tw, th)
-                              && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_raw, reshade::api::format::r16g16b16a16_float, 8u, tw, th)
-                              && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_joint, reshade::api::format::r16g16b16a16_float, 8u, tw, th);
+                              && falcom_world::denoise::EnsureTextureSet(dev, &d->vbgi_far_cand_pos, reshade::api::format::r32g32b32a32_float, 16u, tw, th)
+                              && falcom_world::denoise::EnsureTextureSet(dev, &d->vbgi_far_cand_rad, reshade::api::format::r16g16b16a16_float, 8u, tw, th)
+                              && falcom_world::denoise::EnsureTextureSet(dev, &d->vbgi_far_cand_nrm, reshade::api::format::r16g16b16a16_float, 8u, tw, th)
+                              && falcom_world::denoise::EnsureTextureSet(dev, &d->vbgi_far_raw, reshade::api::format::r16g16b16a16_float, 8u, tw, th)
+                              && falcom_world::denoise::EnsureTextureSet(dev, &d->vbgi_far_joint, reshade::api::format::r16g16b16a16_float, 8u, tw, th);
     far_on = far_textures;
     if (!far_on) {
       CSLog("vbgi", "far skipped: psos=" + std::to_string(far_psos) + " tables=" + std::to_string(far_tables) + " textures=" + std::to_string(far_textures), true);
@@ -16415,7 +16416,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     d->vbgi_far_prev_params_valid = true;
   }
   if (!far_on && d->vbgi_far_color_denoise.history_color.texture[0].handle != 0u) {
-    falcom_world::rtgi::ReleaseRtgiDenoiseTextures(dev, &d->vbgi_far_color_denoise);
+    falcom_world::denoise::ReleaseDenoiseTextures(dev, &d->vbgi_far_color_denoise);
     d->vbgi_far_color_last = false;
     d->vbgi_far_color_prev_params_valid = false;
   }
@@ -16435,7 +16436,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     const auto pc = BuildVbgiFarPushConstants(d, history_valid);
     cl->push_constants(reshade::api::shader_stage::all_compute, d->vbgi_far_layout, kGtvbaoPushConstantsLayoutParam, 0, kVbgiFarPushConstantFloats, pc.data());
     cl->dispatch((gw + 7u) / 8u, (gh + 7u) / 8u, 1);
-    falcom_world::rtao::NullComputeSlots(cl, 12, 4, 1);
+    falcom_world::compute::NullComputeSlots(cl, 12, 4, 1);
   };
 
   if (!prefilter_done) RunGTVBAOSharedPrep(cl, d);
@@ -16486,12 +16487,12 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
   }
   cl->dispatch((d->vbgi_width + 7) / 8, (d->vbgi_height + 7) / 8, 1);
   GtvbaoBarrier(cl, d->vbgi_raw_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
-  falcom_world::rtao::NullComputeSlots(cl, 5, 2, 1);
+  falcom_world::compute::NullComputeSlots(cl, 5, 2, 1);
   if (far_on) {
-    namespace rtao = falcom_world::rtao;
+    namespace compute = falcom_world::compute;
     const auto UA = reshade::api::resource_usage::unordered_access;
     const auto SR = reshade::api::resource_usage::shader_resource;
-    rtao::NullComputeSlots(cl, 5, 5, 1);
+    compute::NullComputeSlots(cl, 5, 5, 1);
     GtvbaoBarrier(cl, d->vbgi_far_cand_pos.texture[0], UA, SR);
     GtvbaoBarrier(cl, d->vbgi_far_cand_rad.texture[0], UA, SR);
     GtvbaoBarrier(cl, d->vbgi_far_cand_nrm.texture[0], UA, SR);
@@ -16504,14 +16505,14 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
       const bool res_resized = d->vbgi_far_res_pos.width != tw || d->vbgi_far_res_pos.height != th;
       const bool temporal_pso = d->vbgi_far_temporal_pipeline.handle != 0u;
       const bool res_textures = temporal_pso
-                                && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_res_pos, reshade::api::format::r32g32b32a32_float, 16u, tw, th)
-                                && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_res_rad, reshade::api::format::r16g16b16a16_float, 8u, tw, th)
-                                && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_res_nrm, reshade::api::format::r16g16b16a16_float, 8u, tw, th);
+                                && falcom_world::denoise::EnsureTextureSet(dev, &d->vbgi_far_res_pos, reshade::api::format::r32g32b32a32_float, 16u, tw, th)
+                                && falcom_world::denoise::EnsureTextureSet(dev, &d->vbgi_far_res_rad, reshade::api::format::r16g16b16a16_float, 8u, tw, th)
+                                && falcom_world::denoise::EnsureTextureSet(dev, &d->vbgi_far_res_nrm, reshade::api::format::r16g16b16a16_float, 8u, tw, th);
       if (!res_textures) {
         CSLog("vbgi", "far temporal skipped: pso=" + std::to_string(temporal_pso) + " textures=" + std::to_string(res_textures), true);
       } else {
         const bool far_motion_ok = UpdateRtMotion(dev, d, true);
-        const rtao::ResetReason far_res_reset = rtao::TemporalResetReason(rtao::TemporalFrame{
+        const compute::ResetReason far_res_reset = compute::TemporalResetReason(compute::TemporalFrame{
             .temporal_on = true,
             .was_on = d->vbgi_far_reuse_last,
             .resized = res_resized,
@@ -16529,7 +16530,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
                       d->vbgi_far_cand_pos.srv[0], d->vbgi_far_cand_rad.srv[0], d->vbgi_far_cand_nrm.srv[0],
                       d->vbgi_far_res_pos.srv[rd], d->vbgi_far_res_rad.srv[rd], d->vbgi_far_res_nrm.srv[rd]},
                      {d->vbgi_far_res_pos.uav[wr], d->vbgi_far_res_rad.uav[wr], d->vbgi_far_res_nrm.uav[wr], d->fallback_uav},
-                     far_res_reset == rtao::ResetReason::None, tw, th);
+                     far_res_reset == compute::ResetReason::None, tw, th);
         GtvbaoBarrier(cl, d->vbgi_far_res_pos.texture[wr], UA, SR);
         GtvbaoBarrier(cl, d->vbgi_far_res_rad.texture[wr], UA, SR);
         GtvbaoBarrier(cl, d->vbgi_far_res_nrm.texture[wr], UA, SR);
@@ -16549,9 +16550,9 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
       const uint32_t tw = d->vbgi_width, th = d->vbgi_height;
       const bool spatial_pso = d->vbgi_far_spatial_pipeline.handle != 0u;
       const bool sp_textures = spatial_pso
-                               && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_sp_pos, reshade::api::format::r32g32b32a32_float, 16u, tw, th)
-                               && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_sp_rad, reshade::api::format::r16g16b16a16_float, 8u, tw, th)
-                               && falcom_world::rtgi::EnsureRtgiTextureSet(dev, &d->vbgi_far_sp_nrm, reshade::api::format::r16g16b16a16_float, 8u, tw, th);
+                               && falcom_world::denoise::EnsureTextureSet(dev, &d->vbgi_far_sp_pos, reshade::api::format::r32g32b32a32_float, 16u, tw, th)
+                               && falcom_world::denoise::EnsureTextureSet(dev, &d->vbgi_far_sp_rad, reshade::api::format::r16g16b16a16_float, 8u, tw, th)
+                               && falcom_world::denoise::EnsureTextureSet(dev, &d->vbgi_far_sp_nrm, reshade::api::format::r16g16b16a16_float, 8u, tw, th);
       if (!sp_textures) {
         CSLog("vbgi", "far spatial skipped: pso=" + std::to_string(spatial_pso) + " textures=" + std::to_string(sp_textures), true);
       } else {
@@ -16584,24 +16585,24 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
     GtvbaoBarrier(cl, d->debug_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   }
 
-  // VBGI denoise (M7.5): the shared RTGI chain (temporal, spatial filter, upsample) on the raw GI, into VBGI's own set.
+  // VBGI denoise (M7.5): the shared SVGF chain (temporal, spatial filter, upsample) on the raw GI, into VBGI's own set.
   {
-    namespace rtgi = falcom_world::rtgi;
-    namespace rtao = falcom_world::rtao;
+    namespace denoise = falcom_world::denoise;
+    namespace compute = falcom_world::compute;
     // GTVBGI's upsample uses the shared reconstruction modes and runtime-controlled nearest-valid fallback.
-    static constexpr rtgi::RtgiPipelineDesc kVbgiUpsamplePipelineDesc = {
-        .srv_count = rtgi::kRtgiUpsampleSrvCount, .uav_count = rtgi::kRtgiUpsampleUavCount, .sampler_count = 0u, .push_count = rtgi::kRtgiUpsamplePushCount, .code = __vbgi_upsample, .name = "vbgi upsample"};
-    const uint32_t divisor = falcom_world::rtao::RtgiTraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex);
+    static constexpr denoise::ComputePipelineDesc kVbgiUpsamplePipelineDesc = {
+        .srv_count = denoise::kUpsampleSrvCount, .uav_count = denoise::kUpsampleUavCount, .sampler_count = 0u, .push_count = denoise::kUpsamplePushCount, .code = __vbgi_upsample, .name = "vbgi upsample"};
+    const uint32_t divisor = falcom_world::compute::TraceDivisor(g_vbgi_resolution, kVbgiMaxResolutionIndex);
     const uint32_t full_w = d->captured_depth_w, full_h = d->captured_depth_h;
     bool denoise_ok = full_w != 0u && full_h != 0u
-                      && d->vbgi_width == rtao::RtgiTraceExtent(full_w, divisor) && d->vbgi_height == rtao::RtgiTraceExtent(full_h, divisor);
+                      && d->vbgi_width == compute::TraceExtent(full_w, divisor) && d->vbgi_height == compute::TraceExtent(full_h, divisor);
     if (!denoise_ok) CSLog("vbgi", "denoise skipped: size mismatch", true);
-    if (denoise_ok && !rtgi::EnsureRtgiPipeline(dev, &d->vbgi_denoise.upsample_pipeline, kVbgiUpsamplePipelineDesc)) {
+    if (denoise_ok && !denoise::EnsureComputePipeline(dev, &d->vbgi_denoise.upsample_pipeline, kVbgiUpsamplePipelineDesc)) {
       denoise_ok = false;
       CSLog("vbgi", "denoise skipped: upsample pipeline", true);
     }
     if (denoise_ok && d->vbgi_stats_buffer.handle == 0u) {
-      const uint32_t zeros[rtgi::kRtgiStatsCount] = {};
+      const uint32_t zeros[denoise::kSvgfStatsCount] = {};
       denoise_ok = falcom_world::bvh::CreatePoolBuffer(dev, zeros, sizeof(zeros), sizeof(uint32_t),
                                                        &d->vbgi_stats_buffer, &d->vbgi_stats_uav,
                                                        reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::copy_source);
@@ -16620,7 +16621,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
       const bool params_changed = d->vbgi_prev_params_valid && !(params == d->vbgi_prev_params);
       d->vbgi_prev_params = params;
       d->vbgi_prev_params_valid = true;
-      const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
+      const compute::ResetReason reset = compute::TemporalResetReason(compute::TemporalFrame{
           .temporal_on = temporal_on,
           .was_on = d->vbgi_temporal_last,
           .resized = d->vbgi_denoise.history_color.width != 0u
@@ -16640,7 +16641,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
         const std::array<float, 6> far_color_params = {g_vbgi_far_intensity, g_vbgi_far_candidates, g_vbgi_far_temporal,
                                                        g_vbgi_far_spatial, g_vbgi_far_spatial_neighbors, g_vbgi_far_spatial_radius};
         const bool far_color_params_changed = d->vbgi_far_color_prev_params_valid && far_color_params != d->vbgi_far_color_prev_params;
-        const rtao::ResetReason far_reset = rtao::TemporalResetReason(rtao::TemporalFrame{
+        const compute::ResetReason far_reset = compute::TemporalResetReason(compute::TemporalFrame{
             .temporal_on = true,
             .was_on = d->vbgi_far_color_last,
             .resized = far_color.history_color.width != 0u
@@ -16652,12 +16653,12 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
             .scaled = false,
             .params_changed = params_changed || far_toggled || far_params_changed || far_color_params_changed,
             .motion_ok = motion_ok});
-        const rtgi::RtgiDenoiseReady far_ready = rtgi::EnsureRtgiDenoise(dev, &far_color,
+        const denoise::DenoiseReady far_ready = denoise::EnsureDenoise(dev, &far_color,
                                                                          {.output_format = reshade::api::format::r16g16b16a16_float, .output_bytes_per_pixel = 8u, .trace_width = d->vbgi_width, .trace_height = d->vbgi_height, .full_width = full_w, .full_height = full_h, .temporal = true, .spatial = false, .log_prefix = "[vbgi-far-color]", .history_only = true, .bypass_svgf = falcom_world::rr::RrOwnsDenoise()});
         if (far_ready.ok && far_ready.temporal) {
           std::vector<reshade::api::descriptor_table_update> far_nulls;
           if (vbgi_conf) GtvbaoBarrier(cl, d->debug_texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
-          rtgi::DispatchRtgiDenoise(dev, cl, &far_color,
+          denoise::DispatchDenoise(dev, cl, &far_color,
                                     {.raw_view = d->vbgi_far_raw.srv[0],
                                      .depth_view = d->captured_depth_srv,
                                      .mrt_normal_view = d->captured_mrt_normal_srv,
@@ -16674,9 +16675,9 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
                                      .divisor = static_cast<float>(divisor),
                                      .debug_mode = vbgi_conf ? 5 : 0,
                                      .svgf = {g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
-                                              far_reset == rtao::ResetReason::None, g_vbgi_svgf_iterations, g_vbgi_svgf_luminance_edge_stop,
+                                              far_reset == compute::ResetReason::None, g_vbgi_svgf_iterations, g_vbgi_svgf_luminance_edge_stop,
                                               g_vbgi_svgf_depth_sigma, g_vbgi_svgf_normal_power, false, g_vbgi_svgf_history_length, g_vbgi_svgf_radius_scale},
-                                     .luminance_weights = rtgi::kSvgfLuminanceRgb,
+                                     .luminance_weights = denoise::kSvgfLuminanceRgb,
                                      .upsample_intensity = 1.f,
                                      .upsample_char_intensity = 1.f,
                                      .upsample_saturation = 1.f,
@@ -16697,7 +16698,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
         }
       }
       if (!far_only && d->vbgi_far_color_denoise.history_color.texture[0].handle != 0u) {
-        rtgi::ReleaseRtgiDenoiseTextures(dev, &d->vbgi_far_color_denoise);
+        denoise::ReleaseDenoiseTextures(dev, &d->vbgi_far_color_denoise);
         d->vbgi_far_color_prev_params_valid = false;
       }
       if (falcom_world::rr::RrOwnsDenoise()) d->vbgi_far_color_prev_params_valid = false;
@@ -16707,7 +16708,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
         d->vbgi_far_color_full_width = full_w;
         d->vbgi_far_color_full_height = full_h;
       }
-      const rtgi::RtgiDenoiseReady ready = rtgi::EnsureRtgiDenoise(dev, &d->vbgi_denoise,
+      const denoise::DenoiseReady ready = denoise::EnsureDenoise(dev, &d->vbgi_denoise,
                                                                    {.output_format = reshade::api::format::r11g11b10_float,
                                                                     .output_bytes_per_pixel = 4u,
                                                                     .trace_width = d->vbgi_width,
@@ -16728,7 +16729,7 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
         // GTVBAO debug texture; the texture is in shader-read state after the gather, so it goes back to unordered access.
         const bool joint_conf = vbgi_conf && !far_only;
         if (joint_conf) GtvbaoBarrier(cl, d->debug_texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
-        rtgi::DispatchRtgiDenoise(dev, cl, &d->vbgi_denoise,
+        denoise::DispatchDenoise(dev, cl, &d->vbgi_denoise,
                                   {.raw_view = far_on ? d->vbgi_far_joint.srv[0] : d->vbgi_raw_srv,
                                    .depth_view = d->captured_depth_srv,
                                    .mrt_normal_view = d->captured_mrt_normal_srv,
@@ -16745,9 +16746,9 @@ static bool RunVBGI(reshade::api::command_list* cl, DeviceData* d, bool prefilte
                                    .divisor = static_cast<float>(divisor),
                                    .debug_mode = joint_conf ? 5 : 0,
                                    .svgf = {g_vbgi_history_weight, g_vbgi_depth_rejection, g_vbgi_normal_rejection,
-                                            reset == rtao::ResetReason::None, g_vbgi_svgf_iterations,
+                                            reset == compute::ResetReason::None, g_vbgi_svgf_iterations,
                                             g_vbgi_svgf_luminance_edge_stop, g_vbgi_svgf_depth_sigma, g_vbgi_svgf_normal_power, g_vbgi_full_res_denoise > 0.5f, g_vbgi_svgf_history_length, g_vbgi_svgf_radius_scale},
-                                   .luminance_weights = rtgi::kSvgfLuminanceRgb,
+                                   .luminance_weights = denoise::kSvgfLuminanceRgb,
                                    .upsample_intensity = 1.f,
                                    .upsample_char_intensity = 1.f,
                                    .upsample_saturation = 1.f,

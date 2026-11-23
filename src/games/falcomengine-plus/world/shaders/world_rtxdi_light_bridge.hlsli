@@ -78,13 +78,13 @@ bool RtxdiTileContainsLight(uint tile_cell, uint light_index, uint type, bool pr
   LightIndexData tile;
   if (previous) tile = g_rtxdi_prev_tiles[tile_cell];
   else tile = g_rtxdi_tiles[tile_cell];
-  if (type == RTGI_LAMP_TYPE_POINT) {
+  if (type == LAMP_TYPE_POINT) {
     const uint count = min(tile.pointLightCount, 63u);
     [loop]
     for (uint i = 0u; i < count; ++i) {
       if (tile.pointLightIndices[i] >= 0 && uint(tile.pointLightIndices[i]) == light_index) return true;
     }
-  } else if (type == RTGI_LAMP_TYPE_SPOT) {
+  } else if (type == LAMP_TYPE_SPOT) {
     const uint count = min(tile.spotLightCount, 63u);
     [loop]
     for (uint i = 0u; i < count; ++i) {
@@ -181,9 +181,9 @@ RAB_LightInfo RAB_LoadLightInfo(uint light_index, bool previous) {
   const uint type = (previous ? g_rtxdi_prev_light_table[light_index].type : g_rtxdi_light_table[light_index].type);
 #if defined(RTXDI_DIAG_INITIAL_PASS)
   RtxdiDiagAdd(RTXDI_DIAG_CAND_TYPE_NONE, !previous && type == 0u);
-  RtxdiDiagAdd(RTXDI_DIAG_CAND_TYPE_BOTH, !previous && type == (RTGI_LAMP_TYPE_POINT | RTGI_LAMP_TYPE_SPOT));
+  RtxdiDiagAdd(RTXDI_DIAG_CAND_TYPE_BOTH, !previous && type == (LAMP_TYPE_POINT | LAMP_TYPE_SPOT));
 #endif
-  if (type != RTGI_LAMP_TYPE_POINT && type != RTGI_LAMP_TYPE_SPOT) return info;
+  if (type != LAMP_TYPE_POINT && type != LAMP_TYPE_SPOT) return info;
   LightParam lamp;
   if (previous) lamp = g_rtxdi_prev_lights[light_index];
   else lamp = g_rtxdi_lights[light_index];
@@ -196,7 +196,7 @@ RAB_LightInfo RAB_LoadLightInfo(uint light_index, bool previous) {
 #endif
     return info;
   }
-  if (type == RTGI_LAMP_TYPE_SPOT && (lamp.spotAngleInv <= 0.0 || lamp.attenuationAngle < 0.0
+  if (type == LAMP_TYPE_SPOT && (lamp.spotAngleInv <= 0.0 || lamp.attenuationAngle < 0.0
                                       || dot(lamp.vec, lamp.vec) <= 1e-12)) {
 #if defined(RTXDI_DIAG_INITIAL_PASS)
     RtxdiDiagAdd(RTXDI_DIAG_CAND_LAMP_INVALID, previous ? 0u : 1u);
@@ -258,7 +258,7 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
   const float distance = sqrt(distance_squared);
   const float3 direction = delta / distance;
   float spot = 1.0;
-  if (info.type == RTGI_LAMP_TYPE_SPOT) spot = LampSpotCone(info.lamp, direction);
+  if (info.type == LAMP_TYPE_SPOT) spot = LampSpotCone(info.lamp, direction);
   const float attenuation = LampDistanceAttenuation(info.lamp, delta);
   const float cosine = max(0.0, dot(surface.shading_normal, direction));
   const bool character = (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u;

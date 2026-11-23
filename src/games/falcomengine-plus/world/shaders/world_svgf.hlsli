@@ -1,7 +1,7 @@
 #pragma once
 
 // world_svgf.hlsli - SVGF (Schied et al., HPG 2017, "Spatiotemporal Variance-Guided Filtering"; the paper is
-// reference/svgf/svgf_preprint.md) for the shared denoise chain (RTGI, GTVBGI, RT Local Shadows, RT Sun). Three compute
+// reference/svgf/svgf_preprint.md) for the shared denoise chain (GTVBAO, GTVBGI). Three compute
 // passes include this file: world_svgf_reproject (Sec. 4.1 temporal accumulation and the guide data), world_svgf_variance
 // (Sec. 4.2 spatial variance while the history is short) and world_svgf_atrous (Sec. 4.3 a-trous iteration, Eq. 1 to 3,
 // with the Sec. 4.4 edge stops, Eq. 4 to 6). "Non-paper" marks a value the paper does not give. No mesh ID, no MRT0 .w
@@ -19,11 +19,11 @@ cbuffer cb_scene : register(b0)
     float2 resolutionScaling_g : packoffset(c49);
 };
 
-// Push constants (SvgfPushConstants in rtgi_resources.hpp, 20 floats).
+// Push constants (SvgfPushConstants in denoise_resources.hpp, 20 floats).
 cbuffer cb_svgf : register(b12)
 {
     float4 s_size : packoffset(c0);      // trace width, trace height, full width, full height
-    float4 s_params : packoffset(c1);    // trace divisor d, debug mode (RTGI numbering), history valid (1, 0 = reset), a-trous step 2^i (0 otherwise)
+    float4 s_params : packoffset(c1);    // trace divisor d, debug mode (SVGF numbering), history valid (1, 0 = reset), a-trous step 2^i (0 otherwise)
     float4 s_temporal : packoffset(c2);  // alpha = 1 - History Weight, depth rejection, normal rejection, sigma_l
     float4 s_luminance : packoffset(c3); // luminance weights rgb, unused
     float4 s_spatial : packoffset(c4);   // a-trous depth sigma, normal power, history length cap, radius scale

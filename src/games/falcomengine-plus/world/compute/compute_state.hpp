@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace falcom_world::rtao {
+namespace falcom_world::compute {
 
 // Why the temporal history cannot be used this frame (None = history used). Notes, not failures.
 enum class ResetReason : uint8_t {
@@ -13,7 +13,7 @@ enum class ResetReason : uint8_t {
   Disabled,         // Temporal off: pass B does not run
   TemporalEnabled,  // Temporal turned on this frame (off -> on)
   Resize,           // AO / raw / history targets recreated
-  FrameGap,         // a frame without RTAO output in between
+  FrameGap,         // a frame without a compute-pass output in between
   Guard,            // loading wipe pending or resize guard
   Scaled,           // scaled resolution (the shader invalidates those pixels; reserved for the CPU side)
   Parameters,       // a parameter that shapes the AO changed
@@ -77,11 +77,11 @@ inline ResetReason TemporalResetReason(const TemporalFrame& f) {
 
 // Trace Resolution setting (0 Full, 1 Half, 2 Quarter; GTVBGI also 3 = 1/8) to the block side d: one trace
 // pixel per d x d pixels. max_index caps the setting (2 for the RT effects).
-inline uint32_t RtgiTraceDivisor(float setting, int max_index = 2) {
+inline uint32_t TraceDivisor(float setting, int max_index = 2) {
   return 1u << std::clamp(static_cast<int>(setting + 0.5f), 0, max_index);
 }
 
 // Trace pixels along one axis of full pixels (the last block may be partial).
-inline uint32_t RtgiTraceExtent(uint32_t full, uint32_t divisor) { return (full + divisor - 1u) / divisor; }
+inline uint32_t TraceExtent(uint32_t full, uint32_t divisor) { return (full + divisor - 1u) / divisor; }
 
-}  // namespace falcom_world::rtao
+}  // namespace falcom_world::compute

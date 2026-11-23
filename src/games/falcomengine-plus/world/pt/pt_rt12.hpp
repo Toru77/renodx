@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 #include "../debug/crash_log.hpp"
-#include "../rtao/rtao.hpp"  // include order only: defines rtao::NullComputeSlots, which rt12_backend.hpp and rt12_rtxdi_transfer.hpp call; M1 uses no RTAO behaviour (moves to a neutral header in M6)
+#include "../compute/compute.hpp"  // include order only: defines compute::NullComputeSlots, which rt12_backend.hpp and rt12_rtxdi_transfer.hpp call
 #include "../rt12/rt12_backend.hpp"
 #include "../rt12/rt12_rtxdi_transfer.hpp"
 #include "../rr/rr_d3d12.hpp"

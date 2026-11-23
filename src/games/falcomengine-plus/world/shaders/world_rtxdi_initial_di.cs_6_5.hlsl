@@ -78,7 +78,7 @@ void RtxdiWriteInitialRaw(uint pixel_index, RtxdiDiRawResult result) {
 
 bool RtxdiTileEntryUsable(int listed, bool point_entry) {
   return listed >= 0 && uint(listed) < g_light_count
-         && g_rtxdi_light_types[uint(listed)] == (point_entry ? RTGI_LAMP_TYPE_POINT : RTGI_LAMP_TYPE_SPOT);
+         && g_rtxdi_light_types[uint(listed)] == (point_entry ? LAMP_TYPE_POINT : LAMP_TYPE_SPOT);
 }
 
 [numthreads(8, 8, 1)]
@@ -92,9 +92,9 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     const float light_radius = light_thread ? g_rtxdi_lights[pixel_index].radius : 0.0;
     const bool radius_positive = light_thread && isfinite(light_radius) && light_radius > 0.0;
     RtxdiDiagAdd(RTXDI_DIAG_LIGHT_TYPE_NONE, light_thread && light_type == 0u);
-    RtxdiDiagAdd(RTXDI_DIAG_LIGHT_TYPE_POINT, light_thread && light_type == RTGI_LAMP_TYPE_POINT);
-    RtxdiDiagAdd(RTXDI_DIAG_LIGHT_TYPE_SPOT, light_thread && light_type == RTGI_LAMP_TYPE_SPOT);
-    RtxdiDiagAdd(RTXDI_DIAG_LIGHT_TYPE_BOTH, light_thread && light_type == (RTGI_LAMP_TYPE_POINT | RTGI_LAMP_TYPE_SPOT));
+    RtxdiDiagAdd(RTXDI_DIAG_LIGHT_TYPE_POINT, light_thread && light_type == LAMP_TYPE_POINT);
+    RtxdiDiagAdd(RTXDI_DIAG_LIGHT_TYPE_SPOT, light_thread && light_type == LAMP_TYPE_SPOT);
+    RtxdiDiagAdd(RTXDI_DIAG_LIGHT_TYPE_BOTH, light_thread && light_type == (LAMP_TYPE_POINT | LAMP_TYPE_SPOT));
     RtxdiDiagAdd(RTXDI_DIAG_LIGHT_RADIUS_POSITIVE, radius_positive);
     RtxdiDiagAdd(RTXDI_DIAG_LIGHT_TYPED_RADIUS_POSITIVE, radius_positive && light_type != 0u);
     const bool tile_thread = pixel_index < g_tile_count;

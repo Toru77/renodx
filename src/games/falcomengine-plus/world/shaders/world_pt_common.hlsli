@@ -200,11 +200,11 @@ float3 PtHitLight(float3 position, float3 nh, inout uint rng) {
       lamp_scale = g_lamp_count;
     }
     const uint type = g_pt_light_table[i].type;
-    if (type == RTGI_LAMP_TYPE_POINT || type == RTGI_LAMP_TYPE_SPOT) {
+    if (type == LAMP_TYPE_POINT || type == LAMP_TYPE_SPOT) {
       const LightParam lp = g_pt_lights[i];
       const float3 to = lp.pos - position;
       const float3 l = normalize(to);
-      const float e = LampDistanceAttenuation(lp, to) * (type == RTGI_LAMP_TYPE_SPOT ? LampSpotCone(lp, l) : 1.0)
+      const float e = LampDistanceAttenuation(lp, to) * (type == LAMP_TYPE_SPOT ? LampSpotCone(lp, l) : 1.0)
                     * max(lp.translucency, dot(nh, l));
       const float reach = length(to) - g_lamp_clearance;
       const bool vis = reach <= 1e-3 || TraceWorldRayDxr(q, l, 1e-3, reach, true, lamp_view, counters).prim == 0xFFFFFFFFu;

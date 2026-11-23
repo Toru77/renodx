@@ -1,6 +1,6 @@
 #pragma once
 
-// world_rt12_trace.hlsli - shared DXR trace include for RTAO and RTGI: the world BVH trace plus the RT12 instance masks,
+// world_rt12_trace.hlsli - shared DXR trace include for the inline ray-traced passes: the world BVH trace plus the RT12 instance masks,
 // the TLAS binding and TraceWorldClosestDxr (DXR 1.1 inline ray queries, rt12_backend.hpp).
 #include "world_bvh_trace.hlsli"
 
@@ -21,7 +21,7 @@ RaytracingAccelerationStructure g_rt12_tlas : register(RT12_TLAS_REGISTER);
 #define RT12_DYNAMIC_VERTICES_REGISTER t30
 #endif
 StructuredBuffer<float4> g_rt12_dynamic_vertices : register(RT12_DYNAMIC_VERTICES_REGISTER);
-static uint g_rt12_dynamic_mask = 0u;  // RT12_MASK_DYNAMIC while RTAO traces characters
+static uint g_rt12_dynamic_mask = 0u;  // RT12_MASK_DYNAMIC while the scene transaction traces characters
 static float g_rt12_foliage_transmission = 0.0;
 static uint g_rt12_foliage_layers = 0u;
 static float g_rt12_wind_transmission = 0.0;
@@ -101,7 +101,7 @@ WorldTraceHit TraceWorldClosestDxr(float3 origin, float3 direction, float t_min,
     return hit;
 }
 
-// RTGI rays: TraceWorldClosestDxr with any_hit (first hit ends the search) and view.require_flags (hits only on
+// Scene rays: TraceWorldClosestDxr with any_hit (first hit ends the search) and view.require_flags (hits only on
 // instances with all of those INSTANCE_* bits, forced non-opaque). Characters commit as dynamic objects.
 WorldTraceHit TraceWorldRayDxr(float3 origin, float3 direction, float t_min, float t_max, bool any_hit, WorldCameraView view,
                                out WorldTraceCounters counters)

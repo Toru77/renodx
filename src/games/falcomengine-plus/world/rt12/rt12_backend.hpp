@@ -2,8 +2,8 @@
 
 #include "../debug/crash_log.hpp"
 
-// M3 DXR backend: RTAO pass A on a side D3D12 device (DXR 1.1 inline ray queries) against a D3D12 mirror of the live BVH
-// store. Included by rtao.hpp (outside the harness), so everything here runs on the render thread (single-threaded
+// M3 DXR backend: the scene transaction on a side D3D12 device (DXR 1.1 inline ray queries) against a D3D12 mirror of the live BVH
+// store. Included by compute.hpp (outside the harness), so everything here runs on the render thread (single-threaded
 // D3D11). Lock rule: no graphics call while a module mutex is held. Sync is renodx::utils::gpu_fence only; no CPU wait
 // on the GPU per frame (TeardownRt12 and the stuck check are the only waits, both bounded).
 
@@ -38,8 +38,9 @@
 #include "../../../../utils/log.hpp"
 #include "../../../../utils/path.hpp"
 #include "../bvh/bvh_live.hpp"
-#include "../rtao/rtao_resources.hpp"
-#include "../rtgi/rtgi_resources.hpp"
+#include "../compute/compute_resources.hpp"
+#include "../denoise/denoise_resources.hpp"
+#include "../game_lights.hpp"
 #include "../pt/pt_regir_contract.hpp"
 #include "../pt/pt_state.hpp"
 #include "../rtxdi/rtxdi_config.hpp"
@@ -285,7 +286,7 @@ struct Rt12DiTransferSlot {
   Microsoft::WRL::ComPtr<ID3D12Resource> perf_readback;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> descriptors;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> di_descriptors;
-  rtgi::RtgiPipeline pack_inputs, pack_records;
+  denoise::ComputePipeline pack_inputs, pack_records;
   std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>, 9> source_views;
   Microsoft::WRL::ComPtr<ID3D11Buffer> source_scene;
   uint64_t fence_value = 0u;
@@ -481,7 +482,7 @@ struct Rt12PtState {
 
 struct Rt12State {
   uint64_t generation = 0u;
-  rtao::RtaoDeviceData scene_bindings;
+  compute::PassLayout scene_bindings;
   Rt12DiResources di;
   Rt12DiTransferState di_transfer;
   reshade::api::device* device = nullptr;  // the D3D11 device this state belongs to
@@ -626,7 +627,7 @@ struct Rt12Panel {  // copied under g_rt12_panel_mutex for the panel and the JSO
 inline std::mutex g_rt12_panel_mutex;
 inline Rt12Panel g_rt12_panel;
 
-// G4 (D7): the GPU-cache scene, published by rt12_capture.hpp OnGcPresent 12b and read by RunRtaoPassA (render thread).
+// G4 (D7): the GPU-cache scene, published by rt12_capture.hpp OnGcPresent 12b and read by RunSceneTransaction (render thread).
 // Raw pointers, valid until the next OnGcPresent: the cache state owns the objects.
 struct Rt12GcScene {
   bool ready = false;
@@ -1201,11 +1202,11 @@ inline void TeardownRt12(const char* why) {
       if (shared->srv11.handle != 0u) s.device->destroy_resource_view(shared->srv11);
       if (shared->uav11.handle != 0u) s.device->destroy_resource_view(shared->uav11);
     }
-    rtgi::DestroyRtgiPipeline(s.device, slot.pack_inputs);
-    rtgi::DestroyRtgiPipeline(s.device, slot.pack_records);
+    denoise::DestroyComputePipeline(s.device, slot.pack_inputs);
+    denoise::DestroyComputePipeline(s.device, slot.pack_records);
   }
   DestroyRt12Pipelines(s.device, s);
-  rtao::DestroyRtaoLayout(s.device, &s.scene_bindings);
+  compute::DestroyPassLayoutTables(s.device, &s.scene_bindings);
   renodx::utils::log::i("[world-rt12] teardown (", why, ")");
   g_rt12.reset();
 #if defined(FALCOM_NRD_ENABLED)
@@ -1353,7 +1354,7 @@ inline bool CreateRt12(reshade::api::device* device) {
   parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   parameters[0].Constants.ShaderRegister = 12u;
   parameters[0].Constants.RegisterSpace = 0u;
-  parameters[0].Constants.Num32BitValues = rtao::kRtaoPushConstantCount;
+  parameters[0].Constants.Num32BitValues = compute::kPassPushConstantCount;
   parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   parameters[1].DescriptorTable.NumDescriptorRanges = 4u;
@@ -1470,7 +1471,7 @@ inline bool CreateRt12(reshade::api::device* device) {
   if (FAILED(hr)) return fail(Rt12Reason::CreateFailed, "materials", hr);
   s.materials_dirty = true;
 
-  // 15. Fixed shared textures. An atlas failure leaves the alpha mirror off (RTAO falls back while alpha foliage is on).
+  // 15. Fixed shared textures. An atlas failure leaves the alpha mirror off (the inline passes fall back while alpha foliage is on).
   hr = CreateRt12Shared(s, device, DXGI_FORMAT_R32G32B32A32_UINT, 16u, 1u, 1u, true, &s.scene);
   if (FAILED(hr)) return fail(Rt12Reason::CreateFailed, "scene texture", hr);
   hr = CreateRt12Shared(s, device, DXGI_FORMAT_R32_UINT, kRt12StatsWidth, 1u, 1u, true, &s.stats);
@@ -2070,14 +2071,14 @@ inline void OnPresent(reshade::api::device* device) {
     float radius_max = std::numeric_limits<float>::lowest();
     if (slot.light_readback && slot.diag_snapshot.copied_count != 0u) {
       void* light_data = nullptr;
-      const D3D12_RANGE light_read_range = {0u, static_cast<SIZE_T>(slot.diag_snapshot.copied_count) * sizeof(rtgi::LightParamCpu)};
+      const D3D12_RANGE light_read_range = {0u, static_cast<SIZE_T>(slot.diag_snapshot.copied_count) * sizeof(game_lights::LightParamCpu)};
       if (SUCCEEDED(slot.light_readback->Map(0u, &light_read_range, &light_data)) && light_data != nullptr) {
-        const auto* lights = static_cast<const rtgi::LightParamCpu*>(light_data);
+        const auto* lights = static_cast<const game_lights::LightParamCpu*>(light_data);
         std::array<bool, 3> has_position = {};
         std::array<bool, 3> has_colour = {};
         bool has_radius = false;
         for (uint32_t light_index = 0u; light_index < slot.diag_snapshot.copied_count; ++light_index) {
-          const rtgi::LightParamCpu& light = lights[light_index];
+          const game_lights::LightParamCpu& light = lights[light_index];
           if (std::isfinite(light.radius)) {
             radius_min = (std::min)(radius_min, light.radius);
             radius_max = (std::max)(radius_max, light.radius);
@@ -2377,7 +2378,7 @@ struct SceneTransactionInputs {
   bool use_gpu_cache = true;
   uint32_t frame = 0u;
   uint64_t generation = 0u;
-  reshade::api::resource_view isfast_view = {0u};  // RTXDI: IS-FAST view copied into s.noise when no RTAO pass does
+  reshade::api::resource_view isfast_view = {0u};  // RTXDI: IS-FAST view copied into s.noise when no other pass does
   reshade::api::resource_view pt_isfast_view = {0u};
 };
 
@@ -2473,7 +2474,7 @@ inline SceneTransactionResult RunSceneTransaction(reshade::api::device* device, 
   }
   const uint32_t frame = inputs.frame;
 
-  if (!rtao::EnsureRtaoLayout(device, &s.scene_bindings)) return fallback(Rt12Reason::TargetFailed);
+  if (!compute::EnsurePassLayout(device, &s.scene_bindings)) return fallback(Rt12Reason::TargetFailed);
   auto& rd = s.scene_bindings;
   // 8. The D3D11 pipelines.
   const reshade::api::resource_view isfast_view = inputs.isfast_view;
@@ -2549,14 +2550,14 @@ inline SceneTransactionResult RunSceneTransaction(reshade::api::device* device, 
       (static_cast<uint64_t>(data->tlas_instances_cpu.size()) + bvh::kPoolDynamicInstances) * sizeof(bvh::WorldInstanceGPU);
   const bool table_upload = !gc && rebuild && (L.table_key_version != s.static_key_version || L.table_key_blas != s.static_key_blas || L.instance_table == nullptr || (records > 0u && L.table_bytes < table_records_bytes));
 
-  // Binds one of the helper passes on RTAO's layout: cb_scene, then the SRV and UAV tables as given.
+  // Binds one of the helper passes on the shared layout: cb_scene, then the SRV and UAV tables as given.
   const auto bind_pass = [&](reshade::api::pipeline pipeline, const reshade::api::resource_view* srv_views,
                              const reshade::api::resource_view* uav_views) {
-    const reshade::api::buffer_range scene_range = rtao::SceneCbvRange(inputs.scene_cbv_view);
+    const reshade::api::buffer_range scene_range = compute::SceneCbvRange(inputs.scene_cbv_view);
     reshade::api::descriptor_table_update updates[3] = {
         {rd.cbv_table, 0, 0, 1, DT::constant_buffer, &scene_range},
-        {rd.srv_table, 0, 0, rtao::kRtaoSrvCount, DT::shader_resource_view, srv_views},
-        {rd.uav_table, 0, 0, rtao::kRtaoUavCount, DT::unordered_access_view, uav_views},
+        {rd.srv_table, 0, 0, compute::kPassSrvCount, DT::shader_resource_view, srv_views},
+        {rd.uav_table, 0, 0, compute::kPassUavCount, DT::unordered_access_view, uav_views},
     };
     device->update_descriptor_tables(3, updates);
     cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, pipeline);
@@ -2567,50 +2568,50 @@ inline SceneTransactionResult RunSceneTransaction(reshade::api::device* device, 
   const auto passes_start = bvh::PerfNow();
   // 10. D3D11 noise copy (once per IS-FAST source).
   if (isfast_view.handle != 0u && isfast_view.handle != s.noise_source) {
-    reshade::api::resource_view srvs[rtao::kRtaoSrvCount] = {};
+    reshade::api::resource_view srvs[compute::kPassSrvCount] = {};
     srvs[18] = isfast_view;
-    const reshade::api::resource_view uav_views[rtao::kRtaoUavCount] = {s.noise.uav11};
+    const reshade::api::resource_view uav_views[compute::kPassUavCount] = {s.noise.uav11};
     bind_pass(s.noise_pipeline, srvs, uav_views);
     cmd_list->dispatch(16u, 512u, 1u);
-    rtao::NullComputeSlots(cmd_list, rtao::kRtaoSrvCount, rtao::kRtaoUavCount, 0u);
+    compute::NullComputeSlots(cmd_list, compute::kPassSrvCount, compute::kPassUavCount, 0u);
     s.noise_source = isfast_view.handle;
     s.pt_noise_source = isfast_view.handle;
     UpdatePanel([](Rt12Panel& p) { p.noise_copies += 1u; });
   }
   if (inputs.pt_isfast_view.handle != 0u && inputs.pt_isfast_view.handle != s.pt_noise_source
       && s.noise_pipeline.handle != 0u && (s.noise_source == 0u || s.noise_source == inputs.pt_isfast_view.handle)) {
-    reshade::api::resource_view srvs[rtao::kRtaoSrvCount] = {};
+    reshade::api::resource_view srvs[compute::kPassSrvCount] = {};
     srvs[18] = inputs.pt_isfast_view;
-    const reshade::api::resource_view uav_views[rtao::kRtaoUavCount] = {s.noise.uav11};
+    const reshade::api::resource_view uav_views[compute::kPassUavCount] = {s.noise.uav11};
     bind_pass(s.noise_pipeline, srvs, uav_views);
     cmd_list->dispatch(16u, 512u, 1u);
-    rtao::NullComputeSlots(cmd_list, rtao::kRtaoSrvCount, rtao::kRtaoUavCount, 0u);
+    compute::NullComputeSlots(cmd_list, compute::kPassSrvCount, compute::kPassUavCount, 0u);
     s.pt_noise_source = inputs.pt_isfast_view.handle;
     UpdatePanel([](Rt12Panel& p) { p.noise_copies += 1u; });
   }
 
   // 10b. D3D11 carrier: the characters' arena vertices [0, vertex_end) into the shared RGBA32_UINT carrier (t10 = arena).
   if (!characters.empty()) {
-    reshade::api::resource_view srvs[rtao::kRtaoSrvCount] = {};
+    reshade::api::resource_view srvs[compute::kPassSrvCount] = {};
     srvs[10] = arena_srv;
-    const reshade::api::resource_view uav_views[rtao::kRtaoUavCount] = {s.carrier.uav11};
+    const reshade::api::resource_view uav_views[compute::kPassUavCount] = {s.carrier.uav11};
     bind_pass(s.carrier_pipeline, srvs, uav_views);
-    const uint32_t carrier_push[rtao::kRtaoPushConstantCount] = {static_cast<uint32_t>(vertex_end)};
-    cmd_list->push_constants(DS::all_compute, rd.layout, 3, 0, rtao::kRtaoPushConstantCount, carrier_push);
+    const uint32_t carrier_push[compute::kPassPushConstantCount] = {static_cast<uint32_t>(vertex_end)};
+    cmd_list->push_constants(DS::all_compute, rd.layout, 3, 0, compute::kPassPushConstantCount, carrier_push);
     cmd_list->dispatch(static_cast<uint32_t>((vertex_end + 63u) / 64u), 1u, 1u);
-    rtao::NullComputeSlots(cmd_list, rtao::kRtaoSrvCount, rtao::kRtaoUavCount, 0u);
+    compute::NullComputeSlots(cmd_list, compute::kPassSrvCount, compute::kPassUavCount, 0u);
   }
 
   // 10c. D3D11 records carrier: the P2b records of this present (t19) into the shared RGBA32_UINT records texture.
   if (records > 0u) {
-    reshade::api::resource_view srvs[rtao::kRtaoSrvCount] = {};
+    reshade::api::resource_view srvs[compute::kPassSrvCount] = {};
     srvs[19] = (gc ? gc_scene.records_srv : data->dynamic.instances_srv);
-    const reshade::api::resource_view uav_views[rtao::kRtaoUavCount] = {records_carrier.uav11};
+    const reshade::api::resource_view uav_views[compute::kPassUavCount] = {records_carrier.uav11};
     bind_pass(s.records_carrier_pipeline, srvs, uav_views);
-    const uint32_t records_push[rtao::kRtaoPushConstantCount] = {records};
-    cmd_list->push_constants(DS::all_compute, rd.layout, 3, 0, rtao::kRtaoPushConstantCount, records_push);
+    const uint32_t records_push[compute::kPassPushConstantCount] = {records};
+    cmd_list->push_constants(DS::all_compute, rd.layout, 3, 0, compute::kPassPushConstantCount, records_push);
     cmd_list->dispatch((records + 63u) / 64u, 1u, 1u);
-    rtao::NullComputeSlots(cmd_list, rtao::kRtaoSrvCount, rtao::kRtaoUavCount, 0u);
+    compute::NullComputeSlots(cmd_list, compute::kPassSrvCount, compute::kPassUavCount, 0u);
   }
 
   bvh::AddPerfBlockMs(bvh::kPerfBlockRt12D3d11Passes, bvh::LiveElapsedMs(passes_start));
@@ -2625,11 +2626,11 @@ inline SceneTransactionResult RunSceneTransaction(reshade::api::device* device, 
     a = renodx::utils::gpu_fence::NO_SIGNAL;
   }
   if (a == renodx::utils::gpu_fence::NO_SIGNAL) {
-    RecordRt12SignalA(s, a, GpuEvidenceSource::Rtao);
+    RecordRt12SignalA(s, a, GpuEvidenceSource::SceneTransaction);
     FailSession(s, Rt12Reason::FenceError, "fence11 signal");
     return fallback(Rt12Reason::FenceError);
   }
-  RecordRt12SignalA(s, a, GpuEvidenceSource::Rtao);
+  RecordRt12SignalA(s, a, GpuEvidenceSource::SceneTransaction);
 
   const auto record_start = bvh::PerfNow();
   // 13. Lighting submission. 13.1: recording starts; the slot is free (busy rule); timestamp.
@@ -3120,9 +3121,9 @@ inline SceneTransactionResult RunSceneTransaction(reshade::api::device* device, 
     FailSession(s, Rt12Reason::SubmitFailed, "lighting order wait");
     return fallback(Rt12Reason::SubmitFailed);
   }
-  RecordRt12WaitA(s, a, GpuEvidenceSource::Rtao);
+  RecordRt12WaitA(s, a, GpuEvidenceSource::SceneTransaction);
   if (s.last_signal != 0u) {
-    RecordRt12WaitPriorB(s, s.last_signal, GpuEvidenceSource::Rtao);
+    RecordRt12WaitPriorB(s, s.last_signal, GpuEvidenceSource::SceneTransaction);
   }
   ID3D12CommandList* lists[] = {list};
   BeginRt12Submission(s);
@@ -3223,15 +3224,15 @@ inline SceneTransactionResult RunSceneTransaction(reshade::api::device* device, 
     UpdatePanel([](Rt12Panel& p) { p.stuck = true; });
     if (b == renodx::utils::gpu_fence::NO_SIGNAL) {
       s.sync_evidence.signal_b_result = E_FAIL;
-      RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::Rtao);
+      RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::SceneTransaction);
     }
     FailSession(s, Rt12Reason::SubmitFailed, "lighting execution or handoff");
     return fallback(Rt12Reason::SubmitFailed);
   }
   NoteRt12Signal(s, b);
-  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12Submit, GpuEvidenceSource::Rtao);
-  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::Rtao);
-  RecordRt12WaitB(s, b, GpuEvidenceSource::Rtao);
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12Submit, GpuEvidenceSource::SceneTransaction);
+  RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::SceneTransaction);
+  RecordRt12WaitB(s, b, GpuEvidenceSource::SceneTransaction);
   RecordGpuWorkBreadcrumb(GpuWorkKind::Rt12, static_cast<uint32_t>(k));
   if (records > 0u) RecordGpuWorkBreadcrumb(GpuWorkKind::P2b, records);
   if (rebuild) {
