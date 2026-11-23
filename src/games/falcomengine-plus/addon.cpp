@@ -106,10 +106,10 @@ ShaderInjectData shader_injection = {
     .env_sss_bright_reject_fade = 0.5f,
     .env_sss_csm_gate = 0.f,
     .debug_show_env_sss = 0.f,
-    .rtls_flags = 0.f,
-    .rtls_strength = 1.f,
-    .rtls_max_darkening = 1.f,
-    .rtls_char_lamp = 1.f,
+    .reserved_slot_02 = 0.f,
+    .reserved_slot_03 = 1.f,
+    .reserved_slot_04 = 1.f,
+    .reserved_slot_05 = 1.f,
     .rtsun_flags = 0.f,
     .rtsun_strength = 1.f,
     .rtsun_max_darkening = 1.f,
@@ -514,7 +514,6 @@ ShaderInjectData shader_injection = {
 
 constexpr uint32_t kLightingGtvbaoRegister = 22u;
 constexpr uint32_t kLightingVbgiRegister = 23u;     // t23 = vbgiTexture
-constexpr uint32_t kLightingRtlsRegister = 38u;     // t38 = rtlsTexture (RT Local Shadows term, world/rtls)
 constexpr uint32_t kLightingRtSunRegister = 39u;    // t39 = rtsunTexture (RT Sun Shadows term, world/rtsun)
 constexpr uint32_t kLightingPtRegister = 47u;  // t47 = ptGiTexture (world/pt path-traced GI)
 constexpr uint32_t kLightingDepthRegister = 4u;     // t4 = depthTexture (Sora)
@@ -945,9 +944,9 @@ static bool VbgiRowVisible() { return IsAdvancedSettingsMode() && VbgiGameSuppor
 static bool VbgiRunning() { return g_vbgi_enabled > 0.5f && VbgiGameSupported() && !falcom_world::rtao::RtaoRequested(); }
 static bool VbgiFarRunning() { return VbgiRunning() && g_vbgi_far_enabled > 0.5f; }
 // Local contact shadows run as a compute pass (customshaders/shadows/contact_local.cs_5_0.hlsl) on the titles whose lighting shaders
-// read the term at t40. Off while RT Local Shadows is requested, as the Local Lights row is.
+// read the term at t40.
 static bool LocalContactComputeRunning() {
-  return shader_injection.cs_contact_local_enabled > 0.5f && (IsSora1st() || IsSora2nd() || IsKai()) && !falcom_world::rtls::RtlsRequested();
+  return shader_injection.cs_contact_local_enabled > 0.5f && (IsSora1st() || IsSora2nd() || IsKai());
 }
 
 // -- Lighting shader identification (Sora + Kai) --
@@ -5811,9 +5810,8 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Local Lights",
         .section = "Contact Shadows",
-        .tooltip = "Local Light Contact Shadows add subtle shadows around objects and characters where nearby lights would naturally create them, making them feel more grounded in the scene. Greyed out and off while RT Local Shadows is on.",
+        .tooltip = "Local Light Contact Shadows add subtle shadows around objects and characters where nearby lights would naturally create them, making them feel more grounded in the scene.",
         .labels = {"Off", "On"},
-        .is_enabled = []() { return !falcom_world::rtls::RtlsRequested(); },
         .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
@@ -5828,7 +5826,7 @@ renodx::utils::settings::Settings settings = {
                    "only contact detail. A disabled class marches zero times and spends none of the "
                    "Local Light Budget, so the classes left on get all of it.",
         .labels = {"Off", "On"},
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -5844,7 +5842,7 @@ renodx::utils::settings::Settings settings = {
                    "detail a shadow map cannot. A disabled class marches zero times and spends "
                    "none of the Local Light Budget.",
         .labels = {"Off", "On"},
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -5859,7 +5857,7 @@ renodx::utils::settings::Settings settings = {
                    "The march is identical to Point and costs the same. A disabled class marches "
                    "zero times and spends none of the Local Light Budget.",
         .labels = {"Off", "On"},
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -5873,7 +5871,7 @@ renodx::utils::settings::Settings settings = {
                    "counterpart of Spot. The march is identical and costs the same. A disabled "
                    "class marches zero times and spends none of the Local Light Budget.",
         .labels = {"Off", "On"},
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -5885,7 +5883,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 1.f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -5903,7 +5901,7 @@ renodx::utils::settings::Settings settings = {
                    "here than the sun march's equivalents in a crowded scene.",
         .labels = {"Low", "Medium", "High", "Ultra"},
         .min = 0.f,
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
         .parse = [](float value) { return ContactShadowQualitySamples(value); },
         .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
@@ -5918,7 +5916,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.1f,
         .max = 20.f,
         .format = "%.1f",
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -5927,11 +5925,11 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.2f,
         .label = "Light Clearance",
         .section = "Contact Shadows",
-        .tooltip = "Local contact rays stop this far before the light, in world units, so its own housing does not block it. Independent of RT Local Shadows.",
+        .tooltip = "Local contact rays stop this far before the light, in world units, so its own housing does not block it.",
         .min = 0.f,
         .max = 1.f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -5946,7 +5944,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 0.5f,
         .format = "%.3f",
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
@@ -5961,7 +5959,7 @@ renodx::utils::settings::Settings settings = {
         .min = 1.f,
         .max = 16.f,
         .format = "%d",
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -5973,7 +5971,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Contact Shadows",
         .tooltip = "Smooths the IS-FAST grain of the local light contact term with an edge-aware blur that stops at depth and normal edges. Off leaves the term exactly as marched.",
         .labels = {"Off", "On"},
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode() && !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
@@ -5987,7 +5985,7 @@ renodx::utils::settings::Settings settings = {
         .min = 1.f,
         .max = 8.f,
         .format = "%d",
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -6001,7 +5999,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.001f,
         .max = 0.2f,
         .format = "%.3f",
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -6015,7 +6013,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.01f,
         .max = 1.f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -6029,7 +6027,7 @@ renodx::utils::settings::Settings settings = {
         .min = 1.f,
         .max = 4.f,
         .format = "%d",
-        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested() && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
+        .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && shader_injection.cs_contact_local_denoise_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
 
@@ -11335,7 +11333,7 @@ static bool RtFrameInputsReady(const DeviceData* dd, falcom_world::rtao::Reason*
   return true;
 }
 
-// Motion for the inline RT temporal passes (RTAO, RTLS): with Temporal on, ensures the RTV4 owned SRV and checks
+// Motion for the inline RT temporal pass (RTAO): with Temporal on, ensures the RTV4 owned SRV and checks
 // its size against the depth; checks RTV4 against TAA t3 (a conflict stops Temporal for the session). The state lives in
 // rtao::g_rtao_frame and is logged once. Returns whether the motion view can be used.
 static bool UpdateRtMotion(reshade::api::device* dev, DeviceData* dd, bool temporal_on) {
@@ -11583,198 +11581,6 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   frame.texture_bytes = sizeof(uint32_t) * rtao::kRtaoStatsCount + trace_pixels * 2u + trace_pixels * 8u
                         + falcom_world::rtgi::RtgiDenoiseTextureBytes(sd.denoise);
   PushRtaoAo(cmd_list, rtao::OutputSrv(dev));
-}
-
-// RT Local Shadows (world/rtls): independent of RTAO. Binds this frame's term at t38 for the Sora 2nd lighting draw.
-// Kept as a function: its guard returns must end only the RTLS stage, not the lighting hook.
-static void RunRtlsInline(reshade::api::command_list* cmd_list) {
-  namespace rtls = falcom_world::rtls;
-  namespace rtao = falcom_world::rtao;
-  namespace rtgi = falcom_world::rtgi;
-  auto& frame = rtls::g_rtls_frame;
-  frame.producing = false;
-  frame.reason = rtls::Reason::Off;
-  frame.input_reason = rtao::Reason::Off;  // set again only by a failing guard this call
-  frame.isfast_unavailable = false;
-  shader_injection.rtls_flags = 0.f;  // set again below: requested (contact march off), and bound when this draw gets the term
-  if (!rtls::RtlsRequested()) {
-    rtls::ReleaseRtlsTextures(cmd_list->get_device());
-    return;
-  }
-  shader_injection.rtls_flags = static_cast<float>(rtls::kRtlsFlagRequested);
-  if (!IsSora2nd()) {
-    frame.reason = rtls::Reason::NotSora2nd;
-    return;
-  }
-  auto* dev = cmd_list->get_device();
-  auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
-  if (!dd) {
-    frame.reason = rtls::Reason::InputsMissing;
-    frame.input_reason = rtao::Reason::NoDepth;
-    return;
-  }
-  const auto* bvh_data = falcom_world::bvh::GetBvhDeviceData(dev);
-  if (!RtBvhReady(bvh_data, &frame.input_reason)) {
-    frame.reason = rtls::Reason::InputsMissing;
-    return;
-  }
-  if (cmd_list != dd->immediate_cmd_list) {
-    frame.reason = rtls::Reason::DeferredList;
-    return;
-  }
-  // Binds this frame's RTLS term (the denoised output, full size) at t38 for this lighting draw, also on a second
-  // lighting draw of the frame, with the lighting kind bits and the Strength and Max Darkening values.
-  const auto push_rtls = [&]() {
-    const rtls::RtlsDeviceData& data = rtls::GetRtlsDeviceData(dev);
-    const reshade::api::resource_view term_srv = data.denoise.output.srv[data.denoise.output_index];
-    cmd_list->push_descriptors(
-        reshade::api::shader_stage::pixel,
-        reshade::api::pipeline_layout{0},
-        0,
-        reshade::api::descriptor_table_update{
-            {}, kLightingRtlsRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &term_srv});
-    shader_injection.rtls_flags = static_cast<float>(
-        rtls::kRtlsFlagRequested | rtls::kRtlsFlagBound
-        | (rtls::g_rtls_point > 0.5f ? rtls::kRtlsFlagPoint : 0u)
-        | (rtls::g_rtls_spot > 0.5f ? rtls::kRtlsFlagSpot : 0u)
-        | (rtls::g_rtls_env_point > 0.5f ? rtls::kRtlsFlagEnvPoint : 0u)
-        | (rtls::g_rtls_env_spot > 0.5f ? rtls::kRtlsFlagEnvSpot : 0u)
-        | (rtls::g_rtls_characters > 0.5f ? rtls::kRtlsFlagCharacter : 0u));
-    shader_injection.rtls_strength = rtls::g_rtls_strength;
-    shader_injection.rtls_max_darkening = rtls::g_rtls_max_darkening;
-    shader_injection.rtls_char_lamp = rtls::g_rtls_character_lamp;
-  };
-  if (frame.dispatched_frame == dd->frame_index) {
-    frame.producing = true;
-    push_rtls();
-    return;
-  }
-  if (!RtFrameInputsReady(dd, &frame.input_reason)) {
-    frame.reason = rtls::Reason::InputsMissing;
-    return;
-  }
-  const rtao::Fade fade = rtao::RtaoEffectiveFade(bvh_data->tlas_region_range, falcom_world::bvh::g_pool.region_size,
-                                                  rtls::g_rtls_fade_start_pct, rtls::g_rtls_fade_end_pct);
-  frame.fade = fade;
-  frame.fade_valid = true;
-  if (fade.coverage < 1.f) {
-    frame.reason = rtls::Reason::RangeTooSmall;
-    return;
-  }
-  const uint32_t kinds = ((rtls::g_rtls_point > 0.5f || rtls::g_rtls_env_point > 0.5f) ? rtls::kRtlsKindPoint : 0u)
-                         | ((rtls::g_rtls_spot > 0.5f || rtls::g_rtls_env_spot > 0.5f) ? rtls::kRtlsKindSpot : 0u)
-                         | (rtls::g_rtls_characters > 0.5f ? rtls::kRtlsKindCharacters : 0u);
-  if (kinds == 0u) {
-    frame.reason = rtls::Reason::NoKinds;
-    return;
-  }
-  auto* world_cl = falcom_world::GetWorldCommandListData(cmd_list);
-  const reshade::api::resource_view lights_view =
-      world_cl ? world_cl->ps_srv_view[rtgi::kLightingLightsRegister] : reshade::api::resource_view{0u};
-  const reshade::api::resource_view indices_view =
-      world_cl ? world_cl->ps_srv_view[rtgi::kLightingLightIndicesRegister] : reshade::api::resource_view{0u};
-  if (lights_view.handle == 0u || indices_view.handle == 0u) {
-    frame.reason = rtls::Reason::NoLights;
-    return;
-  }
-  frame.lamp_count = static_cast<uint32_t>(std::min<uint64_t>(
-      dev->get_resource_desc(dev->get_resource_from_view(lights_view)).buffer.size / rtgi::kLightParamBytes, rtgi::kRtgiLampCount));
-  const float ray_max = rtgi::RtgiEffectiveRayMax(rtls::g_rtls_ray_max, fade.coverage, fade.end,
-                                                  falcom_world::bvh::kPoolRegionRayMargin);
-  // RTAO's IS-FAST rule: the texture is loaded when this row and the IS-FAST master are on.
-  if (rtls::g_rtls_isfast > 0.5f && g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, dd);
-  const bool isfast_used = rtls::g_rtls_isfast > 0.5f && g_isfast_enabled > 0.5f && dd->isfast_noise_srv.handle != 0u;
-  frame.isfast_unavailable = rtls::g_rtls_isfast > 0.5f && !isfast_used;
-  const float spp = (std::max)(rtls::g_rtls_samples, 1.f);
-  const float max_points = std::clamp(rtls::g_rtls_max_point_lights, 1.f, static_cast<float>(rtls::kRtlsMaxPoints));
-  const rtao::NoiseSample noise =
-      rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>((max_points + rtls::kRtlsMaxSpots) * spp), false);
-  const uint32_t divisor = rtao::RtgiTraceDivisor(rtls::g_rtls_trace_resolution);
-  const uint32_t trace_width = rtao::RtgiTraceExtent(dd->captured_depth_w, divisor);
-  const uint32_t trace_height = rtao::RtgiTraceExtent(dd->captured_depth_h, divisor);
-  // RTLS temporal: the reset rule shared with RTAO (rtao::TemporalResetReason) over RTLS's own state.
-  const bool temporal_on = rtls::g_rtls_temporal_enabled > 0.5f;
-  const bool motion_ok = UpdateRtMotion(dev, dd, temporal_on);
-  const rtls::ParameterSnapshot params = {
-      rtls::g_rtls_samples, rtls::g_rtls_max_point_lights, rtls::g_rtls_ray_max, rtls::g_rtls_light_size,
-      rtls::g_rtls_light_clearance, rtls::g_rtls_normal_bias, rtls::g_rtls_trace_characters, rtls::g_rtls_isfast,
-      rtls::g_rtls_point, rtls::g_rtls_spot, rtls::g_rtls_env_point, rtls::g_rtls_env_spot, rtls::g_rtls_fade_start_pct,
-      rtls::g_rtls_fade_end_pct, rtls::g_rtls_trace_resolution, rtls::g_rtls_temporal_enabled, rtls::g_rtls_history_weight,
-      rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection, rtls::g_rtls_debug, rtls::g_rtls_characters, rtls::g_rtls_character_normal_bias, rtls::g_rtls_svgf_history_length};
-  const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
-  frame.prev_params = params;
-  frame.prev_params_valid = true;
-  auto& rd = rtls::GetRtlsDeviceData(dev);
-  const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
-      .temporal_on = temporal_on,
-      .was_on = frame.temporal_last,
-      .resized = rd.denoise.history_color.width != 0u
-                 && (rd.denoise.history_color.width != (rtls::g_rtls_full_res_denoise > 0.5f ? dd->captured_depth_w : trace_width)
-                     || rd.denoise.history_color.height != (rtls::g_rtls_full_res_denoise > 0.5f ? dd->captured_depth_h : trace_height)
-                     || rd.denoise.output.width != dd->captured_depth_w || rd.denoise.output.height != dd->captured_depth_h),
-      .frame = dd->frame_index,
-      .last_frame = frame.dispatched_frame,
-      .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
-      .scaled = false,
-      .params_changed = params_changed,
-      .motion_ok = motion_ok});
-  frame.reset = reset;
-  if (temporal_on && reset != rtao::ResetReason::None) {
-    frame.last_reset = reset;
-    frame.reset_counts[static_cast<size_t>(reset)] += 1u;
-  }
-  rtls::RtlsDispatchInputs in = {
-      .depth_view = dd->captured_depth_srv,
-      .mrt_normal_view = dd->captured_mrt_normal_srv,
-      .isfast_view = isfast_used ? dd->isfast_noise_srv : reshade::api::resource_view{0u},
-      .scene_cbv_view = dd->captured_scene_cbv_view,
-      .lights_view = lights_view,
-      .light_indices_view = indices_view,
-      .full_width = dd->captured_depth_w,
-      .full_height = dd->captured_depth_h,
-      .trace_width = trace_width,
-      .trace_height = trace_height,
-      .push = {
-          .params = {ray_max, rtls::g_rtls_normal_bias, spp, static_cast<float>(divisor)},
-          .sampling = {isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed, rtls::g_rtls_debug},
-          .fade = {fade.start, fade.end, static_cast<float>(kinds), 0.f},
-          .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
-                     bvh_data->tlas_region_size},
-          .light = {rtls::g_rtls_light_size, rtls::g_rtls_light_clearance, max_points, static_cast<float>(frame.lamp_count)}},
-      .debug_mode = static_cast<int>(rtls::g_rtls_debug),
-      .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
-      .temporal = temporal_on,
-      .spatial = rtls::g_rtls_spatial_enabled > 0.5f,
-      .svgf = {rtls::g_rtls_history_weight, rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection, reset == rtao::ResetReason::None, rtls::g_rtls_svgf_iterations, rtls::g_rtls_svgf_luminance_edge_stop, 1.f, 128.f, rtls::g_rtls_full_res_denoise > 0.5f, rtls::g_rtls_svgf_history_length, rtls::g_rtls_svgf_radius_scale}};
-  if (rtls::g_rtls_trace_characters > 0.5f) {
-    in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
-  }
-  const rtls::RtlsDispatchResult result = rtls::Dispatch(dev, cmd_list, in);
-  if (!result.ok) {
-    frame.reason = rtls::Reason::PipelineFailed;
-    return;
-  }
-  frame.producing = true;
-  frame.debug_written = result.debug_written;
-  frame.dispatched_frame = dd->frame_index;
-  frame.gpu_ms = rd.timer.last_ms;
-  frame.trace_width = trace_width;
-  frame.trace_height = trace_height;
-  frame.divisor = divisor;
-  frame.temporal_ran = result.temporal_ran;
-  frame.temporal_last = temporal_on && result.temporal_ran;
-  frame.filter_ran = result.filter_ran;
-  frame.denoise_gpu_ms = rd.denoise.timer.last_ms;
-  frame.ray_max_requested = rtls::g_rtls_ray_max;
-  frame.ray_max_effective = ray_max;
-  frame.kinds = kinds;
-  frame.character_objects = in.dynamic.count;
-  frame.isfast_used = isfast_used;
-  frame.texture_bytes = static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
-                        + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
-                        + rtgi::RtgiDenoiseTextureBytes(rd.denoise)
-                        + sizeof(uint32_t) * rtls::kRtlsStatsCount;
-  push_rtls();
 }
 
 // RT Sun Shadows (world/rtsun, R3a/R3c): traces the sun shadow rays for the cascade range RT owns, denoises the term (the
@@ -13202,16 +13008,13 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // RT dispatches null most compute slots and rebind their own. Snapshot the game's compute state
   // once here and restore it after the RT dispatches: the engine's volumetric-fog compute reads those bindings.
   std::optional<renodx::utils::state::CommandListSnapshot> game_compute_state;
-  if (falcom_world::rtxdi::SceneRequested() || falcom_world::rtao::RtaoRequested() || falcom_world::rtls::RtlsRequested() || falcom_world::rtsun::RtSunRequested()
+  if (falcom_world::rtxdi::SceneRequested() || falcom_world::rtao::RtaoRequested() || falcom_world::rtsun::RtSunRequested()
       || (falcom_world::rr::RrRequested() && falcom_world::rr::g_rr_perf_guides > 0.5f  // TEMP perf test (remove)
           && falcom_world::rr::g_rr_guides_attempt_frame.load() != falcom_world::g_state.frame.load())) {
     game_compute_state = renodx::utils::state::GetSnapshot(cmd_list);
   }
   // RTAO runs before the shadow pass.
   RunRtaoInline(cmd_list);
-
-  // RT Local Shadows after RTAO (order RTAO -> RTLS); independent of RTAO.
-  RunRtlsInline(cmd_list);
 
   // RT Sun Shadows (R3a): after RT Local Shadows, same guards; the raw term only, the image is not changed.
   if (IsSora2nd() && falcom_world::rtxdi::g_sun_requested > 0.5f) {

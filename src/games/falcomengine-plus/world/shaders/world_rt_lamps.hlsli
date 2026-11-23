@@ -1,4 +1,4 @@
-// Game lamp layouts and falloff (Sora 2nd lighting 0xCA3D8596) and the RTGI lamp type bits, shared by the RTGI and RT Local Shadows shaders.
+// Game lamp layouts and falloff (Sora 2nd lighting 0xCA3D8596) and the lamp type bits, shared by the RTXDI and PT shaders.
 #define RTGI_LAMP_TYPE_POINT 1u
 #define RTGI_LAMP_TYPE_SPOT 2u
 

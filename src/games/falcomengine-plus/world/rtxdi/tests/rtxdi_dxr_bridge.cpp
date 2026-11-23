@@ -4488,7 +4488,7 @@ int RunRtxdiDxrBridge() {
   }
   std::printf("PASS RTXDI debug palette/carrier contract: status/class/type/raw/filtered/distance/sun and unavailable checker\n");
   std::printf("PASS production lighting selection helper point/spot/blocked/unknown/unbound/invalid fallback; post-material application once\n");
-  std::printf("PASS character local DI point/spot charaColor, blocked suppression, unknown/empty/invalid RTLS fallback without double-add\n");
+  std::printf("PASS character local DI point/spot charaColor, blocked suppression, unknown/empty/invalid legacy-lamp fallback without double-add\n");
   std::printf("PASS RTXDI sun consumer helper visible/blocked/unknown/unbound/malformed; CSM and character fallback preserved\n");
   std::printf("PASS N3c shared lighting consumer visible/blocked/class, stale/unbound/malformed raw fallback, base/intensity once, specular preserved\n");
 

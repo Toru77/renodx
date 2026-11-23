@@ -22,7 +22,6 @@
 #include "../rtao/rtao.hpp"
 #include "../rtao/rtao_svgf.hpp"
 #include "../rtgi/rtgi.hpp"
-#include "../rtls/rtls.hpp"
 #include "../rtsun/rtsun.hpp"
 #include "../rtsun/rtsun_range.hpp"
 #include "bvh_build.hpp"
@@ -292,7 +291,7 @@ inline void RefreshPoolCaptureRequest() {
 }
 
 inline bool RtBvhDemanded() {
-  return rtao::RtaoRequested() || rtls::RtlsRequested() || rtsun::RtSunRequested() || rtxdi::SceneRequested();
+  return rtao::RtaoRequested() || rtsun::RtSunRequested() || rtxdi::SceneRequested();
 }
 
 inline void ApplyBvhInputs() {
@@ -368,17 +367,12 @@ inline void OnWorldPresentBvh(
     ClearPerfGathered(GetBvhDeviceData(device));
     rtao::ClearRtaoPerfGathered(device);
     ClearGpuTimerStats(&rtao::GetRtaoSvgfData(device).denoise.timer);
-    rtls::RtlsDeviceData& rtls_data = rtls::GetRtlsDeviceData(device);
-    ClearGpuTimerStats(&rtls_data.timer);
-    ClearGpuTimerStats(&rtls_data.denoise.timer);
     if (rtsun::RtSunDeviceData* rtsun_data = rtsun::FindRtSunDeviceData(device)) {
       ClearGpuTimerStats(&rtsun_data->timer);
       ClearGpuTimerStats(&rtsun_data->denoise.timer);
       rtsun::g_rtsun_frame.gpu_ms = -1.f;
       rtsun::g_rtsun_frame.denoise_gpu_ms = -1.f;
     }
-    rtls::g_rtls_frame.gpu_ms = -1.f;
-    rtls::g_rtls_frame.denoise_gpu_ms = -1.f;
   }
   g_bvh_debug.device.store(device, std::memory_order_relaxed);
   ApplyBvhInputs();
@@ -390,11 +384,6 @@ inline void OnWorldPresentBvh(
       extra.rtao = {rtao_data.timer.ms_sum, rtao_data.timer.samples};
       const rtao::RtaoSvgfData& rtao_svgf = rtao::GetRtaoSvgfData(device);
       extra.rtao_filter = {rtao_svgf.denoise.timer.ms_sum, rtao_svgf.denoise.timer.samples};
-    }
-    {
-      const rtls::RtlsDeviceData& rtls_data = rtls::GetRtlsDeviceData(device);
-      extra.rtls = {rtls_data.timer.ms_sum, rtls_data.timer.samples};
-      extra.rtls_denoise = {rtls_data.denoise.timer.ms_sum, rtls_data.denoise.timer.samples};
     }
     if (const rtsun::RtSunDeviceData* rtsun_data = rtsun::FindRtSunDeviceData(device)) {
       extra.rtsun = {rtsun_data->timer.ms_sum, rtsun_data->timer.samples};
@@ -451,10 +440,9 @@ inline void OnWorldPresentBvh(
   UpdateCacheDiag(device, present_time);
   UpdateDeformLive(device, queue);
   rtao::MaybeCaptureRtaoStats(device, queue);
-  rtls::MaybeCaptureRtlsStats(device, queue);
   rtsun::MaybeCaptureRtSunStats(device, queue);
   RunBvhDebugPass(queue, swapchain);
-  // Draws a debug texture over the whole backbuffer (RTLS and RT Sun debug views).
+  // Draws a debug texture over the whole backbuffer (RT Sun debug view).
   const auto blit_debug = [&](reshade::api::resource_view srv) {
     const auto backbuffer = swapchain->get_current_back_buffer();
     if (backbuffer.handle == 0u) return;
@@ -464,14 +452,6 @@ inline void OnWorldPresentBvh(
     if (cmd_list == nullptr) return;
     BlitDebugTextureToBackbuffer(device, queue, cmd_list, backbuffer, backbuffer_desc.texture.format, srv);
   };
-  // RTLS Debug 1 to 5, when this frame's trace wrote the debug texture and no BVH GPU debug mode is selected.
-  if (rtls::g_rtls_debug > 0.5f && rtls::g_rtls_frame.producing && rtls::g_rtls_frame.debug_written
-      && g_bvh_debug.mode.load(std::memory_order_relaxed) == 0) {
-    const auto found_rtls = rtls::g_rtls_devices.find(device);
-    if (found_rtls != rtls::g_rtls_devices.end() && found_rtls->second.debug.srv[0].handle != 0u) {
-      blit_debug(found_rtls->second.debug.srv[0]);
-    }
-  }
   // RT Sun Debug 1 to 2: the sun trace debug texture, when this frame's trace wrote it and no BVH GPU debug mode is selected.
   if (rtsun::g_rtsun_debug > 0.5f && rtsun::g_rtsun_frame.producing && rtsun::g_rtsun_frame.debug_written
       && g_bvh_debug.mode.load(std::memory_order_relaxed) == 0) {

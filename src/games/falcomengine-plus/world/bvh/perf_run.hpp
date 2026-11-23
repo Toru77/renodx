@@ -59,7 +59,6 @@ enum PerfCost : size_t {
   kPerfPoolHooks,
   kPerfDeformHookCpu,
   kPerfRtaoRecordCpu,
-  kPerfRtlsRecordCpu,
   kPerfRtsunRecordCpu,
   kPerfRtxdiInputCpu,
   kPerfRtxdiDiCpu,
@@ -71,8 +70,6 @@ enum PerfCost : size_t {
   kPerfGpuDeformRefit,
   kPerfGpuRtao,
   kPerfGpuRtaoFilter,
-  kPerfGpuRtls,
-  kPerfGpuRtlsDenoise,
   kPerfGpuRtsun,
   kPerfGpuRtsunDenoise,
   kPerfGpuRtxdiInput,
@@ -119,7 +116,6 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"pool_hooks", false, kPerfDrawTime, false, nullptr},
     {"deform_hook_cpu", false, kPerfDrawTime, false, nullptr},
     {"rtao_record_cpu", true, kPerfDrawTime, false, nullptr},
-    {"rtls_record_cpu", true, kPerfDrawTime, false, nullptr},
     {"rtsun_record_cpu", true, kPerfDrawTime, false, nullptr},
     {"rtxdi_input_cpu", true, kPerfDrawTime, false, nullptr},
     {"rtxdi_di_cpu", true, kPerfDrawTime, false, nullptr},
@@ -131,8 +127,6 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"gpu_deform_refit", true, kPerfGpu, true, nullptr},
     {"gpu_rtao", true, kPerfGpu, true, nullptr},
     {"gpu_rtao_filter", true, kPerfGpu, true, nullptr},
-    {"gpu_rtls", true, kPerfGpu, true, nullptr},
-    {"gpu_rtls_denoise", true, kPerfGpu, true, nullptr},
     {"gpu_rtsun", true, kPerfGpu, true, nullptr},
     {"gpu_rtsun_denoise", true, kPerfGpu, true, nullptr},
     {"gpu_rtxdi_input", true, kPerfGpu, true, nullptr},
@@ -389,7 +383,7 @@ struct PerfTimerSample {
   uint32_t samples = 0u;
 };
 struct PerfExtraGpu {
-  PerfTimerSample rtao, rtao_filter, rtls, rtls_denoise, rtsun, rtsun_denoise, deform_refit;
+  PerfTimerSample rtao, rtao_filter, rtsun, rtsun_denoise, deform_refit;
   PerfTimerSample rtxdi_input, rtxdi_local, rtxdi_distance, rtxdi_nrd;
   double dxr_tlas_ms = 0.0, dxr_records_ms = 0.0, dxr_characters_ms = 0.0, gc_blas_ms = 0.0;  // D3D12 timestamp sums (rt12 panels); inside gpu_rtao, so Subset rows
   PerfTimerSample rtxdi_initial, rtxdi_temporal, rtxdi_spatial, rtxdi_sun, pt_main, pt_water;
@@ -479,7 +473,7 @@ inline PerfTotalsValue PerfTotals(const double* values) {
   // the DynCube t17 swap, so hook_outer over-counts by that nested time when RT passes or DynCube are on. Known limitation.
   const double draw_hook_outer = values[kPerfBlockRow + kPerfBlockDrawHookTotal] - values[kPerfPoolHooks] - values[kPerfDeformHookCpu];
   const double lighting_rt_outer = values[kPerfBlockRow + kPerfBlockLightingRt] - values[kPerfRtaoRecordCpu]
-                                   - values[kPerfRtlsRecordCpu] - values[kPerfRtsunRecordCpu] - values[kPerfRtxdiInputCpu]
+                                   - values[kPerfRtsunRecordCpu] - values[kPerfRtxdiInputCpu]
                                    - values[kPerfRtxdiDiCpu];
   totals.hook_outer = std::max(0.0, draw_hook_outer) + std::max(0.0, lighting_rt_outer) + values[kPerfBlockRow + kPerfBlockBindHook]
                       + values[kPerfBlockRow + kPerfBlockCaptureHook] + values[kPerfBlockRow + kPerfBlockCbHooks]
@@ -557,7 +551,6 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.cost[kPerfPoolHooks] = PerfMsOf(g_pool.cpu_hook_frame_us);
   c.cost[kPerfDeformHookCpu] = PerfMsOf(g_deform_live.cpu_frame_us);
   c.cost[kPerfRtaoRecordCpu] = PerfMsOf(g_perf_gate.rtao_record_us);
-  c.cost[kPerfRtlsRecordCpu] = PerfMsOf(g_perf_gate.rtls_record_us);
   c.cost[kPerfRtsunRecordCpu] = PerfMsOf(g_perf_gate.rtsun_record_us);
   c.cost[kPerfRtxdiInputCpu] = PerfMsOf(g_perf_gate.rtxdi_input_cpu_us);
   c.cost[kPerfRtxdiDiCpu] = PerfMsOf(g_perf_gate.rtxdi_di_cpu_us);
@@ -575,10 +568,6 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.events[kPerfGpuRtao] = extra.rtao.samples;
   c.cost[kPerfGpuRtaoFilter] = extra.rtao_filter.ms_sum;
   c.events[kPerfGpuRtaoFilter] = extra.rtao_filter.samples;
-  c.cost[kPerfGpuRtls] = extra.rtls.ms_sum;
-  c.events[kPerfGpuRtls] = extra.rtls.samples;
-  c.cost[kPerfGpuRtlsDenoise] = extra.rtls_denoise.ms_sum;
-  c.events[kPerfGpuRtlsDenoise] = extra.rtls_denoise.samples;
   c.cost[kPerfGpuRtsun] = extra.rtsun.ms_sum;
   c.events[kPerfGpuRtsun] = extra.rtsun.samples;
   c.cost[kPerfGpuRtsunDenoise] = extra.rtsun_denoise.ms_sum;
@@ -938,8 +927,7 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
 }
 
 // Gathering was switched OFF: clears what it gathered (CPU sums, maxima, last values, phase sums, GPU timer statistics,
-// cache-diag timings) and the tab window. The RTAO and RTLS timers are cleared by rtao::ClearRtaoPerfGathered
-// and OnWorldPresentBvh (RTLS). Runs on the present
+// cache-diag timings) and the tab window. The RTAO timers are cleared by rtao::ClearRtaoPerfGathered. Runs on the present
 // thread, one lock at a time; no graphics call is made under a lock.
 inline void ClearPerfGathered(BvhDeviceData* data) {
   g_pool.cpu_hook_us.store(0u);
@@ -952,7 +940,6 @@ inline void ClearPerfGathered(BvhDeviceData* data) {
   g_perf_gate.present_bvh_us.store(0u);
   g_perf_gate.alpha_sync_us.store(0u);
   g_perf_gate.rtao_record_us.store(0u);
-  g_perf_gate.rtls_record_us.store(0u);
   g_perf_gate.rtxdi_input_cpu_us.store(0u);
   g_perf_gate.rtxdi_di_cpu_us.store(0u);
   g_perf_gate.rtxdi_attempts.store(0u);

@@ -21,13 +21,12 @@
 #include "../rtao/rtao.hpp"
 #include "../world_state.hpp"
 #include "rtgi_resources.hpp"
-#include "rtgi_state.hpp"
 
 namespace falcom_world::rtgi {
 
 // What a trace owner asks the denoise chain to prepare for this frame.
 struct RtgiDenoiseRequest {
-  reshade::api::format output_format;  // RTGI r11g11b10_float, RTLS r8g8b8a8_unorm
+  reshade::api::format output_format;  // RTGI r11g11b10_float
   uint32_t output_bytes_per_pixel;
   uint32_t trace_width;
   uint32_t trace_height;
@@ -35,7 +34,7 @@ struct RtgiDenoiseRequest {
   uint32_t full_height;
   bool temporal;           // Temporal on and a motion view available
   bool spatial;            // Spatial filter on
-  const char* log_prefix;  // "[world-rtgi]" or "[world-rtls]"
+  const char* log_prefix;  // the owning pass's prefix, e.g. "[world-rtao]"
   bool full_resolution = false;
   bool nearest_fallback = false;
   bool history_only = false;
@@ -149,7 +148,7 @@ struct RtgiDenoiseInputs {
   reshade::api::resource_view mrt_normal_view;
   reshade::api::resource_view scene_cbv_view;
   reshade::api::resource_view motion_view;  // RTV4 (read only when ready.temporal)
-  reshade::api::resource_view albedo_view;  // upsample t3 (RTGI Debug 7); null for RTLS
+  reshade::api::resource_view albedo_view;  // upsample t3 (RTGI Debug 7); null when unused
   reshade::api::resource_view stats_uav;    // temporal u1 (stats 20..22)
   reshade::api::resource_view debug_uav;    // null: no debug view this frame
   reshade::api::resource debug_texture;

@@ -77,14 +77,14 @@ struct ShaderInjectData {
   // —— Local Screen Space Shadows (Bend_SSS for point/spot lights) ——
   // These eleven slots were allocated for a per-local-light screen-space shadow that
   // was never implemented; that feature is covered by the Contact Shadows local-light
-  // march (cs_contact_local_*). The first four are reused by RT Local Shadows
-  // (rtls_flags, rtls_strength, rtls_max_darkening, rtls_char_lamp); the next five by RT Sun Shadows (rtsun_flags,
-  // rtsun_strength, rtsun_max_darkening, rtsun_spare, rtsun_char_max_darkening); the last two are cs_contact_local_bound and cs_contact_local_normal_bias (local contact shadows). All eleven stay in place
-  // so the packoffset of every later field is unchanged.
-  float rtls_flags;                    // RT Local Shadows: RTLS_FLAG_* bits for this lighting draw (RunRtlsInline); 0 = game behaviour
-  float rtls_strength;                 // RTLS Strength [0..1]; read only while rtls_flags has RTLS_FLAG_BOUND
-  float rtls_max_darkening;            // RTLS Max Darkening [0..1]: the shadow amount is capped at this
-  float rtls_char_lamp;                // RTLS Character Lamp Light [0..2]; read only while rtls_flags has RTLS_FLAG_CHARACTER
+  // march (cs_contact_local_*). The first four are reserved, the next five are used by
+  // RT Sun Shadows, and the last two are cs_contact_local_bound and
+  // cs_contact_local_normal_bias. All eleven stay in place so the packoffset of every
+  // later field is unchanged.
+  float reserved_slot_02;              // reserved: unused slot kept so later packoffsets do not move
+  float reserved_slot_03;              // reserved: unused slot kept so later packoffsets do not move
+  float reserved_slot_04;              // reserved: unused slot kept so later packoffsets do not move
+  float reserved_slot_05;              // reserved: unused slot kept so later packoffsets do not move
   float rtsun_flags;                   // RT Sun Shadows bits: 1 (applied) = the lighting shader multiplies the RT sun term (t39) into the CSM visibility this draw (RunRtSunInline); 2 (receive) = characters take it too; 0 = CSM only
   float rtsun_strength;                // RTSUN Strength [0..1]; read only while rtsun_flags is 1
   float rtsun_max_darkening;           // RTSUN Max Darkening [0..1]: the RT sun darkening is capped at this

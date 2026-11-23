@@ -11,7 +11,6 @@
 #include <unordered_map>
 
 #include "../rtgi/rtgi_resources.hpp"
-#include "../rtls/rtls_resources.hpp"
 
 namespace falcom_world::rtsun {
 

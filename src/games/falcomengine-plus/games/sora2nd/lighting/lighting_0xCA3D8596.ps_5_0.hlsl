@@ -206,9 +206,6 @@ Texture2D<float4> ptGiTexture : register(t47);
 // t48 is the path-traced reflection (rgba16f, depth size; world/pt M4): rgb reflection, a = hit distance (0 = none).
 // Bound while pt_refl_bound.
 Texture2D<float4> ptReflTexture : register(t48);
-// t38 is the RT Local Shadows term (world/rtls; depth size): x point shadow, y spot shadow, z RT coverage (1 inside Fade
-// Start). Bound by RunRtlsInline while rtls_flags has RTLS_FLAG_BOUND. Flag bits mirror rtls::kRtlsFlag*.
-Texture2D<float4> rtlsTexture : register(t38);
 // t39 is the RT Sun Shadows term (world/rtsun; depth size): x shadow darkening inside the RT cascade range, already
 // weighted. Bound by RunRtSunInline while rtsun_flags is 1.
 Texture2D<float4> rtsunTexture : register(t39);
@@ -216,13 +213,6 @@ Texture2D<float4> rtsunTexture : register(t39);
 // Mirrors rtsun::kRtSunFlagApplied and rtsun::kRtSunFlagReceive.
 #define RTSUN_FLAG_APPLIED 1u
 #define RTSUN_FLAG_RECEIVE 2u
-#define RTLS_FLAG_REQUESTED 1u
-#define RTLS_FLAG_BOUND 2u
-#define RTLS_FLAG_POINT 4u
-#define RTLS_FLAG_SPOT 8u
-#define RTLS_FLAG_ENV_POINT 16u
-#define RTLS_FLAG_ENV_SPOT 32u
-#define RTLS_FLAG_CHARACTER 64u
 
 #include "../../../shared.h"
 #include "../../../world/shaders/world_rtxdi_debug.hlsli"
@@ -787,9 +777,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     r5.yzw = r5.yzw + -r9.xyz;
     r5.yzw = combineAlpha_g * r5.yzw + r9.xyz;
     float3 charColor = r3.www ? r9.xyz : r5.yzw;
-    // RT Local Shadows on characters (world/rtls): add the game's point and spot lamp light (charaColor) times RTLS
-    // visibility and the RT coverage, so it fades out with the RT range. Flag clear: charColor unchanged.
-    const uint rtlsCharFlags = (uint)shader_injection_data.rtls_flags;
+    // RTXDI character lamp fallback: add unshadowed point and spot lamp light (charaColor) when no staged local-DI
+    // tuple resolved this pixel. Resolved pixels keep their RTXDI contribution and take no fallback term.
     bool rtxdiCharResolved = false;
     bool rtxdiCharTileValid = false;
     bool rtxdiCharEmpty = false;
@@ -863,40 +852,31 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         }
       }
     }
-    const bool rtlsCharLamp = !rtxdiCharResolved
-        && (rtlsCharFlags & (RTLS_FLAG_BOUND | RTLS_FLAG_CHARACTER)) == (RTLS_FLAG_BOUND | RTLS_FLAG_CHARACTER);
-    const bool rtxdiCharFallback = !rtxdiCharResolved && !rtlsCharLamp && shader_injection_data.rtxdi_local_bound > 0.5f
+    const bool rtxdiCharFallback = !rtxdiCharResolved && shader_injection_data.rtxdi_local_bound > 0.5f
         && shader_injection_data.rtxdi_local_character_fallback > 0.5f && rtxdiCharTileValid && !rtxdiCharEmpty;
-    if (rtlsCharLamp || rtxdiCharFallback) {
-      if (rtxdiCharFallback) rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FALLBACK;
-      const float3 rtlsCharTerm = rtlsCharLamp ? rtlsTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz : float3(0.0, 0.0, 1.0);
-      if (rtlsCharTerm.z > 0.0) {
-        const float rtlsCharPointVis = rtlsCharTerm.z
-            - min(rtlsCharTerm.x * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening * rtlsCharTerm.z);
-        const float rtlsCharSpotVis = rtlsCharTerm.z
-            - min(rtlsCharTerm.y * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening * rtlsCharTerm.z);
-        const float3 rtlsCharN = DecodeFalcomMrtNormalAsGame((uint2)r1.xy);
-        // Tile cell and depth slice match the environment path; the pixel branch above also bounds-checks these indices.
-        const uint2 rtlsTile = (uint2)(lightTileSizeInv_g.xy * v0.xy);
-        const uint rtlsRow = rtlsTile.y << 5;
-        const uint rtlsSlice = (uint)clamp(lightIndices_g[rtlsTile.x + rtlsRow].tileDepthInv * -r1.w, 0.0, 7.0);
-        const uint rtlsCell = min(4607u, rtlsSlice * 576u + rtlsRow + rtlsTile.x);
-        const uint rtlsPoints = (rtxdiCharFallback || (rtlsCharFlags & RTLS_FLAG_POINT) != 0u) ? min(63u, lightIndices_g[rtlsCell].pointLightCount) : 0u;
-        const uint rtlsSpots = (rtxdiCharFallback || (rtlsCharFlags & RTLS_FLAG_SPOT) != 0u) ? min(63u, lightIndices_g[rtlsCell].spotLightCount) : 0u;
-        float3 rtlsLamp = float3(0, 0, 0);
-        for (uint i = 0u; i < rtlsPoints + rtlsSpots; ++i) {
-          const bool spot = i >= rtlsPoints;
-          const LightParam lamp = dynamicLights_g[spot ? lightIndices_g[rtlsCell].spotLightIndices[i - rtlsPoints]
-                                                       : lightIndices_g[rtlsCell].pointLightIndices[i]];
-          if (lamp.radius <= 0.0) continue;
-          const float3 toLamp = lamp.pos - r4.xyz;
-          const float3 lampDir = normalize(toLamp);
-          const float att = LampDistanceAttenuation(lamp, toLamp) * (spot ? LampSpotCone(lamp, lampDir) : 1.0);
-          if (att <= 0.0) continue;
-          rtlsLamp += lamp.charaColor * (att * max(lamp.translucency, dot(rtlsCharN, lampDir)) * (spot ? rtlsCharSpotVis : rtlsCharPointVis));
-        }
-        charColor += r0.xyz * rtlsLamp * (rtlsCharLamp ? shader_injection_data.rtls_char_lamp : shader_injection_data.rtxdi_local_character_intensity);
+    if (rtxdiCharFallback) {
+      rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FALLBACK;
+      const float3 rtxdiCharN = DecodeFalcomMrtNormalAsGame((uint2)r1.xy);
+      // Tile cell and depth slice match the environment path; the pixel branch above also bounds-checks these indices.
+      const uint2 rtxdiCharTile = (uint2)(lightTileSizeInv_g.xy * v0.xy);
+      const uint rtxdiCharRow = rtxdiCharTile.y << 5;
+      const uint rtxdiCharSlice = (uint)clamp(lightIndices_g[rtxdiCharTile.x + rtxdiCharRow].tileDepthInv * -r1.w, 0.0, 7.0);
+      const uint rtxdiCharCell = min(4607u, rtxdiCharSlice * 576u + rtxdiCharRow + rtxdiCharTile.x);
+      const uint rtxdiCharPoints = rtxdiCharFallback ? min(63u, lightIndices_g[rtxdiCharCell].pointLightCount) : 0u;
+      const uint rtxdiCharSpots = rtxdiCharFallback ? min(63u, lightIndices_g[rtxdiCharCell].spotLightCount) : 0u;
+      float3 rtxdiCharLampLight = float3(0, 0, 0);
+      for (uint i = 0u; i < rtxdiCharPoints + rtxdiCharSpots; ++i) {
+        const bool spot = i >= rtxdiCharPoints;
+        const LightParam lamp = dynamicLights_g[spot ? lightIndices_g[rtxdiCharCell].spotLightIndices[i - rtxdiCharPoints]
+                                                     : lightIndices_g[rtxdiCharCell].pointLightIndices[i]];
+        if (lamp.radius <= 0.0) continue;
+        const float3 toLamp = lamp.pos - r4.xyz;
+        const float3 lampDir = normalize(toLamp);
+        const float att = LampDistanceAttenuation(lamp, toLamp) * (spot ? LampSpotCone(lamp, lampDir) : 1.0);
+        if (att <= 0.0) continue;
+        rtxdiCharLampLight += lamp.charaColor * (att * max(lamp.translucency, dot(rtxdiCharN, lampDir)));
       }
+      charColor += r0.xyz * rtxdiCharLampLight * shader_injection_data.rtxdi_local_character_intensity;
     }
     // RTAO on characters, whatever "Allow GTVBAO" says: RTAO replaces GTVBAO, whose character settings do not
     // apply while it produces. Character Intensity scales it after the temporal pass and the filter.
@@ -1504,22 +1484,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r0.w = exp2(r0.w);
   r0.w = min(1, r0.w);
   r3.xyz = r12.xyz * r0.www + r11.xyz;
-  // -- RT Local Shadows (world/rtls): x point shadow, y spot shadow, z RT coverage. 0 everywhere = the game's behaviour.
-  // The material path (r20.y) is read here because the spot loop below overwrites r20.xy.
-  const uint rtlsFlags = (uint)shader_injection_data.rtls_flags;
-  float3 rtlsTerm = float3(0, 0, 0);
-  if ((rtlsFlags & RTLS_FLAG_BOUND) != 0u) {
-    rtlsTerm = rtlsTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;
-  }
-  const bool rtlsPointOn = (rtlsFlags & (r20.y != 0 ? RTLS_FLAG_POINT : RTLS_FLAG_ENV_POINT)) != 0u;
-  const bool rtlsSpotOn = (rtlsFlags & (r20.y != 0 ? RTLS_FLAG_SPOT : RTLS_FLAG_ENV_SPOT)) != 0u;
-  const float rtlsPointVis = rtlsPointOn
-      ? 1.0 - min(rtlsTerm.x * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening) : 1.0;
-  const float rtlsSpotVis = rtlsSpotOn
-      ? 1.0 - min(rtlsTerm.y * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening) : 1.0;
-  const float rtlsSpotCover = rtlsSpotOn ? rtlsTerm.z : 0.0;
   // -- Local contact shadows (customshaders/shadows/contact_local.cs_5_0.hlsl): x point, z spot share of the lamp light the march
-  // blocks; 0 = the game's behaviour. The material path (r20.y) picks Point/Spot or Env Point/Env Spot, as RTLS does.
+  // blocks; 0 = the game's behaviour. The material path (r20.y) picks Point/Spot or Env Point/Env Spot.
   float2 csLocalShare = float2(0, 0);
   if (shader_injection_data.cs_contact_local_bound > 0.5f) {
     csLocalShare = csLocalContactTex.SampleLevel(samPoint_s, v1.xy, 0).xz;
@@ -1581,9 +1547,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         if (rtxdi_output_valid) {
           r13.xyz *= rtxdi_inverse_pdf;
         } else {
-          if (rtlsPointVis < 1.0) {
-            r13.xyz *= rtlsPointVis;
-          }
           r13.xyz *= csLocalPointVis;
         }
         // ── BRDF Point Light ──
@@ -1675,7 +1638,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r19.x = dynamicLights_g[r2.w].translucency;
           r19.y = dynamicLights_g[r2.w].shadowmapIndex;
           r5.z = cmp((int)r19.y != -1);
-          if (r5.z != 0 && !rtxdi_output_valid && rtlsSpotCover < 1.0) {
+          if (r5.z != 0 && !rtxdi_output_valid) {
             r21.xyzw = spotShadowMatrices_g[r19.y]._m00_m10_m20_m30;
             r23.xyzw = spotShadowMatrices_g[r19.y]._m01_m11_m21_m31;
             r24.xyzw = spotShadowMatrices_g[r19.y]._m02_m12_m22_m32;
@@ -1701,9 +1664,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             r20.xy = r21.xy + r12.zw;
             r6.w = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r20.xyz, r21.z).x;
             r5.z = r6.w * 0.200000003 + r5.z;
-            if (rtlsSpotCover > 0.0) {
-              r5.z = lerp(r5.z, 1.0, rtlsSpotCover);
-            }
             r5.y = r5.y * r5.z;
           }
           r5.z = dot(r16.xyz, r8.xyw);
@@ -1717,9 +1677,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           if (rtxdi_output_valid) {
             r19.xyz *= rtxdi_inverse_pdf;
           } else {
-            if (rtlsSpotVis < 1.0) {
-              r19.xyz *= rtlsSpotVis;
-            }
             r19.xyz *= csLocalSpotVis;
           }
           // ── BRDF Spot Light ──
@@ -1802,9 +1759,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         if (rtxdi_output_valid) {
           r11.xyz *= rtxdi_inverse_pdf;
         } else {
-          if (rtlsPointVis < 1.0) {
-            r11.xyz *= rtlsPointVis;
-          }
           r11.xyz *= csLocalPointVis;
         }
         r11.xyz = r11.xyz * r5.zzz;
@@ -1865,7 +1819,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r13.x = dynamicLights_g[r1.y].translucency;
           r13.y = dynamicLights_g[r1.y].shadowmapIndex;
           r5.z = cmp((int)r13.y != -1);
-          if (r5.z != 0 && !rtxdi_output_valid && rtlsSpotCover < 1.0) {
+          if (r5.z != 0 && !rtxdi_output_valid) {
             r19.xyzw = spotShadowMatrices_g[r13.y]._m00_m10_m20_m30;
             r21.xyzw = spotShadowMatrices_g[r13.y]._m01_m11_m21_m31;
             r23.xyzw = spotShadowMatrices_g[r13.y]._m02_m12_m22_m32;
@@ -1891,9 +1845,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             r14.xy = r19.xy + r10.zw;
             r6.w = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r14.xyz, r19.z).x;
             r5.z = r6.w * 0.200000003 + r5.z;
-            if (rtlsSpotCover > 0.0) {
-              r5.z = lerp(r5.z, 1.0, rtlsSpotCover);
-            }
             r5.y = r5.y * r5.z;
           }
           r5.z = dot(r12.xyz, r8.xyw);
@@ -1908,9 +1859,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           if (rtxdi_output_valid) {
             r12.xyz *= rtxdi_inverse_pdf;
           } else {
-            if (rtlsSpotVis < 1.0) {
-              r12.xyz *= rtlsSpotVis;
-            }
             r12.xyz *= csLocalSpotVis;
           }
           r12.xyz = r12.xyz * r5.yyy;

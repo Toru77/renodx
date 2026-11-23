@@ -1120,7 +1120,7 @@ void main(
   r1.w = min(1, r1.w);
   r8.xyz = r10.xyz * r1.www + r9.xyz;
   // -- Local contact shadows (customshaders/shadows/contact_local.cs_5_0.hlsl): x point, z spot share of the lamp light the march
-  // blocks; 0 = the game's behaviour. The material path (r16.y) picks Point/Spot or Env Point/Env Spot, as RTLS does.
+  // blocks; 0 = the game's behaviour. The material path (r16.y) picks Point/Spot or Env Point/Env Spot.
   float2 csLocalShare = float2(0, 0);
   if (shader_injection_data.cs_contact_local_bound > 0.5f) {
     csLocalShare = csLocalContactTex.SampleLevel(samPoint_s, v1.xy, 0).xz;

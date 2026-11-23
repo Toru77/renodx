@@ -1,7 +1,7 @@
 // ── falcomengine-plus Local (point / spot) Contact Shadows ──
 //
 // One thread per depth texel. For the point and spot lamps of the pixel's light tile cell, keeps the strongest lamps
-// (diffuse weight, as world/shaders/world_rtls.cs_5_0.hlsl weighs them), runs the shared contact march toward each and
+// (diffuse weight), runs the shared contact march toward each and
 // writes, per kind, the diffuse-weighted share of the kind's lamp light the march blocks. Lamps past the Local Light
 // Budget count as unblocked. The lighting shaders scale every lamp of a kind by 1 - Local Strength x share (t40).
 //

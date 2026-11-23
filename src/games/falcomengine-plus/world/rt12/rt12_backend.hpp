@@ -40,7 +40,6 @@
 #include "../bvh/bvh_live.hpp"
 #include "../rtao/rtao_resources.hpp"
 #include "../rtgi/rtgi_resources.hpp"
-#include "../rtgi/rtgi_state.hpp"
 #include "../pt/pt_regir_contract.hpp"
 #include "../pt/pt_state.hpp"
 #include "../rtxdi/rtxdi_config.hpp"

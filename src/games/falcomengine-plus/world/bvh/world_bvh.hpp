@@ -36,7 +36,6 @@ inline void OnDestroyDeviceBvh(reshade::api::device* device) {
   DestroyBvhDebugResources(device);
   rtao::DestroyRtaoSvgfData(device);
   rtao::DestroyRtaoDeviceData(device);
-  rtls::DestroyRtlsDeviceData(device);
   rtsun::DestroyRtSunDeviceData(device);
   rr::DestroyRrDeviceData(device);
   DestroyBvhDeviceData(device);

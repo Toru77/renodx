@@ -58,7 +58,6 @@ inline constexpr uint32_t kLightingDeferredRegister = 6u;
 inline constexpr uint32_t kLightingShadowRegister = 7u;
 inline constexpr uint32_t kLightParamBytes = 112u;
 inline constexpr uint32_t kLightIndexDataBytes = 576u;
-inline constexpr uint32_t kRtgiLampCount = 1024u;
 
 #if defined(__world_svgf_reproject_EMBED_FILE)
 inline constexpr std::span<const std::uint8_t> kSvgfReprojectShader = __world_svgf_reproject;
