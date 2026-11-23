@@ -64,7 +64,7 @@ static_assert(static_cast<uint64_t>(kRt12CarrierWidth) * kRt12RecordCarrierHeigh
 static_assert(sizeof(D3D12_RAYTRACING_INSTANCE_DESC) == 64u);
 static_assert(static_cast<uint64_t>(kRt12CarrierWidth) * kRt12GcRecordCarrierHeight >= static_cast<uint64_t>(bvh::kGcSetCapacity + bvh::kGcMovingRecords) * kRt12RecordTexels);
 
-inline constexpr uint32_t kRt12Slots = 3u;          // allocators per submission kind (frames in flight)
+inline constexpr uint32_t kRt12Slots = 4u;          // ring depth per submission kind: frames in flight plus one (observed GPU completion lag is 3 to 4 frames)
 inline constexpr uint32_t kRt12StuckMs = 2000u;     // no fence progress this long with work pending: stuck
 inline constexpr uint32_t kRt12TeardownMs = 2000u;  // CPU wait budget for a teardown
 // Shader-visible descriptors per lighting slot (Step 10.5); 14 carrier SRV and 15 dynamic vertices UAV (13.1b); 16..19

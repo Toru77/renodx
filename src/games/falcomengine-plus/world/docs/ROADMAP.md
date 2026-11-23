@@ -226,6 +226,8 @@ RTXDI M18: Boiling Filter (Local) (default On) and Boiling Filter Strength (Loca
 
 RTXDI M19: Spatial disocclusion samples work as in the SDK: targetHistoryLength is 2 with temporal reuse (0 without), so pixels whose temporal reuse found no history (M = 1) take max(disocclusion, spatial samples) neighbours; default 8, presets 4/8/16. Not validated in game.
 
+Ring depth `kRt12Slots` is 4. At 3 the scene and RTXDI transfer slots were still in flight when reused 3 frames later, so the frame was skipped (Busy). Raise it again if the RTXDI report shows `reason=16` growing.
+
 ## Reference
 
 ### Code map (`world/`)
