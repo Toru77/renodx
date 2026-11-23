@@ -292,7 +292,7 @@ inline void RefreshPoolCaptureRequest() {
 }
 
 inline bool RtBvhDemanded() {
-  return rtao::RtaoRequested() || rtgi::g_rtgi_enabled > 0.5f || rtls::RtlsRequested() || rtsun::RtSunRequested() || rtxdi::SceneRequested();
+  return rtao::RtaoRequested() || rtls::RtlsRequested() || rtsun::RtSunRequested() || rtxdi::SceneRequested();
 }
 
 inline void ApplyBvhInputs() {
@@ -368,7 +368,6 @@ inline void OnWorldPresentBvh(
     ClearPerfGathered(GetBvhDeviceData(device));
     rtao::ClearRtaoPerfGathered(device);
     ClearGpuTimerStats(&rtao::GetRtaoSvgfData(device).denoise.timer);
-    rtgi::ClearRtgiPerfGathered(device);
     rtls::RtlsDeviceData& rtls_data = rtls::GetRtlsDeviceData(device);
     ClearGpuTimerStats(&rtls_data.timer);
     ClearGpuTimerStats(&rtls_data.denoise.timer);
@@ -393,11 +392,6 @@ inline void OnWorldPresentBvh(
       extra.rtao_filter = {rtao_svgf.denoise.timer.ms_sum, rtao_svgf.denoise.timer.samples};
     }
     {
-      const rtgi::RtgiDeviceData& rtgi_data = rtgi::GetRtgiDeviceData(device);
-      extra.rtgi = {rtgi_data.timer.ms_sum, rtgi_data.timer.samples};
-      extra.rtgi_denoise = {rtgi_data.denoise.timer.ms_sum, rtgi_data.denoise.timer.samples};
-    }
-    {
       const rtls::RtlsDeviceData& rtls_data = rtls::GetRtlsDeviceData(device);
       extra.rtls = {rtls_data.timer.ms_sum, rtls_data.timer.samples};
       extra.rtls_denoise = {rtls_data.denoise.timer.ms_sum, rtls_data.denoise.timer.samples};
@@ -419,10 +413,6 @@ inline void OnWorldPresentBvh(
     {
       std::lock_guard<std::mutex> lock(rt12::g_gc_panel_mutex);
       extra.gc_blas_ms = rt12::g_gc_panel.build_ms_sum;
-    }
-    {
-      std::lock_guard<std::mutex> lock(rt12::g_rt12_rtgi_panel_mutex);
-      extra.dxr_rtgi_ms = rt12::g_rt12_rtgi_panel.gpu_ms_sum;
     }
     if (rt12::g_rt12 && rt12::g_rt12->device == device) {
       rt12::Rt12State& rt12_state = *rt12::g_rt12;
@@ -461,11 +451,10 @@ inline void OnWorldPresentBvh(
   UpdateCacheDiag(device, present_time);
   UpdateDeformLive(device, queue);
   rtao::MaybeCaptureRtaoStats(device, queue);
-  rtgi::MaybeCaptureRtgiStats(device, queue);
   rtls::MaybeCaptureRtlsStats(device, queue);
   rtsun::MaybeCaptureRtSunStats(device, queue);
   RunBvhDebugPass(queue, swapchain);
-  // Draws a debug texture over the whole backbuffer (RTLS and RTGI debug views).
+  // Draws a debug texture over the whole backbuffer (RTLS and RT Sun debug views).
   const auto blit_debug = [&](reshade::api::resource_view srv) {
     const auto backbuffer = swapchain->get_current_back_buffer();
     if (backbuffer.handle == 0u) return;
@@ -476,7 +465,6 @@ inline void OnWorldPresentBvh(
     BlitDebugTextureToBackbuffer(device, queue, cmd_list, backbuffer, backbuffer_desc.texture.format, srv);
   };
   // RTLS Debug 1 to 5, when this frame's trace wrote the debug texture and no BVH GPU debug mode is selected.
-  // RTGI Debug, below, draws over it when both are set.
   if (rtls::g_rtls_debug > 0.5f && rtls::g_rtls_frame.producing && rtls::g_rtls_frame.debug_written
       && g_bvh_debug.mode.load(std::memory_order_relaxed) == 0) {
     const auto found_rtls = rtls::g_rtls_devices.find(device);
@@ -492,15 +480,6 @@ inline void OnWorldPresentBvh(
       blit_debug(found_rtsun->second.debug.srv[0]);
     }
   }
-  // RTGI Debug 1 to 14: the RTGI debug texture over the whole backbuffer, when the pass that owns the view wrote it this
-  // frame. Skipped while a BVH GPU debug mode is selected (that view owns the backbuffer). Last in this handler: the
-  // returns below end only the RTGI blit.
-  if (rtgi::g_rtgi_debug < 0.5f || rtgi::g_rtgi_debug > 14.5f) return;
-  if (!rtgi::g_rtgi_frame.producing || !rtgi::g_rtgi_frame.debug_written) return;
-  if (g_bvh_debug.mode.load(std::memory_order_relaxed) != 0) return;
-  const auto found = rtgi::g_rtgi_devices.find(device);
-  if (found == rtgi::g_rtgi_devices.end() || found->second.debug.srv[0].handle == 0u) return;
-  blit_debug(found->second.debug.srv[0]);
 }
 
 // Performance segments (diagnostic): the present call, from OnWorldPresentBvh to the end of the native Present (other

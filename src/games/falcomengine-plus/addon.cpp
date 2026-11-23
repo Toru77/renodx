@@ -514,7 +514,6 @@ ShaderInjectData shader_injection = {
 
 constexpr uint32_t kLightingGtvbaoRegister = 22u;
 constexpr uint32_t kLightingVbgiRegister = 23u;     // t23 = vbgiTexture
-constexpr uint32_t kLightingRtgiRegister = 37u;     // t37 = rtgiTexture (RTGI final GI, world/rtgi)
 constexpr uint32_t kLightingRtlsRegister = 38u;     // t38 = rtlsTexture (RT Local Shadows term, world/rtls)
 constexpr uint32_t kLightingRtSunRegister = 39u;    // t39 = rtsunTexture (RT Sun Shadows term, world/rtsun)
 constexpr uint32_t kLightingPtRegister = 47u;  // t47 = ptGiTexture (world/pt path-traced GI)
@@ -1707,7 +1706,7 @@ static void ResetPresentWindow(DeviceData* d) {
 
 // VBGI gather: see RunVBGI
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
-// Defined with RunRtgiInline below; the CustomShader table needs it first.
+// Defined below; the CustomShader table needs it first.
 static void OnDrawnLightingShader(reshade::api::command_list* cmd_list);
 static bool OnBeforeSoraSSR1Draw(reshade::api::command_list* cmd_list);
 static bool OnReplaceSoraSSR1Draw(reshade::api::command_list* cmd_list);
@@ -11336,7 +11335,7 @@ static bool RtFrameInputsReady(const DeviceData* dd, falcom_world::rtao::Reason*
   return true;
 }
 
-// Motion for the inline RT temporal passes (RTAO, RTLS, RTGI): with Temporal on, ensures the RTV4 owned SRV and checks
+// Motion for the inline RT temporal passes (RTAO, RTLS): with Temporal on, ensures the RTV4 owned SRV and checks
 // its size against the depth; checks RTV4 against TAA t3 (a conflict stops Temporal for the session). The state lives in
 // rtao::g_rtao_frame and is logged once. Returns whether the motion view can be used.
 static bool UpdateRtMotion(reshade::api::device* dev, DeviceData* dd, bool temporal_on) {
@@ -11552,11 +11551,10 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
     return;
   }
 
-  const bool rtgi_characters = falcom_world::rtgi::g_rtgi_enabled > 0.5f && falcom_world::rtgi::g_rtgi_trace_characters > 0.5f;
-  if (rtao::g_rtao_trace_characters > 0.5f || rtgi_characters) {
+  if (rtao::g_rtao_trace_characters > 0.5f) {
     const falcom_world::bvh::DynamicTraceInputs characters = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
     in.scene_characters = characters.count;
-    if (rtao::g_rtao_trace_characters > 0.5f) in.dynamic = characters;
+    in.dynamic = characters;
   }
   const rtao::RtaoDispatchResult result = rtao::Dispatch(dev, cmd_list, in);
   if (!result.ok) {
@@ -11587,7 +11585,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   PushRtaoAo(cmd_list, rtao::OutputSrv(dev));
 }
 
-// RT Local Shadows (world/rtls): independent of RTAO and RTGI. Binds this frame's term at t38 for the Sora 2nd lighting draw.
+// RT Local Shadows (world/rtls): independent of RTAO. Binds this frame's term at t38 for the Sora 2nd lighting draw.
 // Kept as a function: its guard returns must end only the RTLS stage, not the lighting hook.
 static void RunRtlsInline(reshade::api::command_list* cmd_list) {
   namespace rtls = falcom_world::rtls;
@@ -11694,7 +11692,7 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
   const uint32_t divisor = rtao::RtgiTraceDivisor(rtls::g_rtls_trace_resolution);
   const uint32_t trace_width = rtao::RtgiTraceExtent(dd->captured_depth_w, divisor);
   const uint32_t trace_height = rtao::RtgiTraceExtent(dd->captured_depth_h, divisor);
-  // RTLS temporal: the reset rule shared with RTAO and RTGI (rtao::TemporalResetReason) over RTLS's own state.
+  // RTLS temporal: the reset rule shared with RTAO (rtao::TemporalResetReason) over RTLS's own state.
   const bool temporal_on = rtls::g_rtls_temporal_enabled > 0.5f;
   const bool motion_ok = UpdateRtMotion(dev, dd, temporal_on);
   const rtls::ParameterSnapshot params = {
@@ -11780,7 +11778,7 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
 }
 
 // RT Sun Shadows (world/rtsun, R3a/R3c): traces the sun shadow rays for the cascade range RT owns, denoises the term (the
-// shared rtgi chain) and binds the denoised output at t39 for the lighting draw. Dispatched inline after RT Local Shadows
+// shared SVGF chain) and binds the denoised output at t39 for the lighting draw. Dispatched inline after RT Local Shadows
 // with the same guards; the guard returns end only this stage.
 static void RunRtSunInline(reshade::api::command_list* cmd_list) {
   namespace rtsun = falcom_world::rtsun;
@@ -11965,256 +11963,6 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
                         + falcom_world::rtgi::RtgiDenoiseTextureBytes(rd.denoise)
                         + sizeof(uint32_t) * rtsun::kRtSunStatsCount;
   push_rtsun();
-}
-
-// RTGI (world/rtgi, ROADMAP "RTGI"). Runs only on a lighting draw where RTAO dispatched this frame on the immediate
-// list, so RTAO's guards (live BVH, depth, normals, scene CBV, startup and resize guard) hold for it too.
-// Kept as a function: its guard returns must end only the RTGI stage, not the lighting hook.
-static void RunRtgiInline(reshade::api::command_list* cmd_list) {
-  namespace rtao = falcom_world::rtao;
-  namespace rtgi = falcom_world::rtgi;
-  namespace rtls = falcom_world::rtls;
-  auto& frame = rtgi::g_rtgi_frame;
-  frame.producing = false;
-  frame.reason = rtgi::Reason::Off;
-  shader_injection.rtgi_gi_bound = 0.f;  // set again by push_gi when this lighting draw gets the bounce
-  if (rtgi::g_rtgi_enabled < 0.5f) {
-    rtgi::ReleaseRtgiTextures(cmd_list->get_device());
-    return;
-  }
-  if (!rtao::RtaoRequested()) {
-    rtgi::ReleaseRtgiTextures(cmd_list->get_device());
-    frame.reason = rtgi::Reason::RtaoOff;
-    return;
-  }
-  auto* dev = cmd_list->get_device();
-  auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
-  const auto* bvh_data = dev ? falcom_world::bvh::GetBvhDeviceData(dev) : nullptr;
-  if (dd == nullptr || bvh_data == nullptr || cmd_list != dd->immediate_cmd_list
-      || rtao::g_rtao_frame.dispatched_frame != dd->frame_index) {
-    frame.reason = rtgi::Reason::RtaoNotProducing;
-    return;
-  }
-  // The game's lighting shaders fix the scene-buffer layout; RTGI reads prevViewProj_g at that variant's register.
-  rtgi::SceneLayout scene_layout = rtgi::SceneLayout::Unknown;
-  if (IsSora2nd()) {
-    scene_layout = rtgi::SceneLayout::Sora2nd;
-  } else if (IsSora1st()) {
-    scene_layout = rtgi::SceneLayout::Sora1st;
-  } else if (IsKai()) {
-    scene_layout = rtgi::SceneLayout::Kai;
-  }
-  const uint32_t prev_view_proj_register = rtgi::RtgiPrevViewProjRegister(scene_layout);
-  if (prev_view_proj_register == 0u) {
-    frame.reason = rtgi::Reason::SceneLayoutUnknown;
-    return;
-  }
-  auto& rd = rtgi::GetRtgiDeviceData(dev);
-  // GI Intensity > 0 on Sora 2nd (the only lighting shader with the composite): binds this frame's final GI at t37 for
-  // this lighting draw, also on a second lighting draw of the frame. Otherwise rtgi_gi_bound stays 0 and the lighting
-  // shader takes its pre-RTGI path.
-  const auto push_gi = [&]() {
-    if (rtgi::g_rtgi_intensity <= 0.f || scene_layout != rtgi::SceneLayout::Sora2nd) return;
-    cmd_list->push_descriptors(
-        reshade::api::shader_stage::pixel,
-        reshade::api::pipeline_layout{0},
-        0,
-        reshade::api::descriptor_table_update{
-            {}, kLightingRtgiRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &rd.denoise.output.srv[rd.denoise.output_index]});
-    shader_injection.rtgi_gi_bound = 1.f;
-    shader_injection.rtgi_intensity = rtgi::g_rtgi_intensity;
-    shader_injection.rtgi_char_intensity = rtgi::g_rtgi_char_intensity;
-    // PushRtaoAo wrote RTAO's own value for this draw; the bounce draw gets 1.8x (at most 1).
-    shader_injection.rtao_max_darkening = rtgi::RtgiRtaoMaxDarkening(rtao::g_rtao_max_darkening);
-    frame.applied_frame = dd->frame_index;
-    frame.applied_intensity = rtgi::g_rtgi_intensity;
-  };
-  if (frame.dispatched_frame == dd->frame_index) {
-    frame.producing = true;
-    push_gi();
-    return;
-  }
-  const rtao::Fade fade = rtao::RtaoEffectiveFade(bvh_data->tlas_region_range, falcom_world::bvh::g_pool.region_size,
-                                                  rtgi::g_rtgi_fade_start_pct, rtgi::g_rtgi_fade_end_pct);
-  const float ray_max = rtgi::RtgiEffectiveRayMax(rtgi::g_rtgi_ray_max, fade.coverage, fade.end,
-                                                  falcom_world::bvh::kPoolRegionRayMargin);
-  const uint32_t divisor = rtao::RtgiTraceDivisor(rtgi::g_rtgi_trace_resolution);
-  const float spp = (std::max)(rtgi::g_rtgi_samples, 1.f);
-  // RTAO loaded the IS-FAST texture this frame when its own row is on; RTGI follows RTAO's IS-FAST row.
-  const bool isfast_used = rtao::g_rtao_isfast > 0.5f && g_isfast_enabled > 0.5f && dd->isfast_noise_srv.handle != 0u;
-  const rtao::NoiseSample noise = rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>(spp), false);
-  // RTGI temporal: the same reset rule as RTAO (rtao::TemporalResetReason) over RTGI's own state and parameters.
-  const bool temporal_on = rtgi::g_rtgi_temporal_enabled > 0.5f;
-  const bool motion_ok = UpdateRtMotion(dev, dd, temporal_on);
-  const rtgi::ParameterSnapshot params = {
-      rtgi::g_rtgi_samples, rtgi::g_rtgi_ray_max, rtao::g_rtao_normal_bias, rtgi::g_rtgi_trace_resolution, rtao::g_rtao_isfast,
-      rtgi::g_rtgi_fade_start_pct, rtgi::g_rtgi_fade_end_pct, rtgi::g_rtgi_radiance_clamp, rtgi::g_rtgi_ambient,
-      rtgi::g_rtgi_temporal_enabled, rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
-      rtgi::g_rtgi_debug, rtgi::g_rtgi_sun_distance, rtgi::g_rtgi_trace_characters,
-      rtgi::g_rtgi_sun_casters_only, rtgi::g_rtgi_sun_contribution, rtgi::g_rtgi_fallback_no_albedo,
-      rtgi::g_rtgi_dynamic_lights, rtgi::g_rtgi_dynamic_light_contribution, rtgi::g_rtgi_game_sun, rtgi::g_rtgi_lamp_shadows,
-      rtgi::g_rtgi_extra_bounces, rtgi::g_rtgi_feedback_strength,
-      rtgi::g_rtgi_extra_bounce_rays, rtgi::g_rtgi_bounce_saturation, rtgi::g_rtgi_restir, rtgi::g_rtgi_restir_spatial, rtgi::g_rtgi_svgf_history_length};
-  const bool svgf_history_changed = frame.prev_params_valid && params.svgf_history_length != frame.prev_params.svgf_history_length;
-  rtgi::ParameterSnapshot restir_previous = frame.prev_params;
-  restir_previous.svgf_history_length = params.svgf_history_length;
-  const bool params_changed = frame.prev_params_valid && !(params == restir_previous);
-  frame.prev_params = params;
-  frame.prev_params_valid = true;
-  const uint32_t trace_width = rtao::RtgiTraceExtent(dd->captured_depth_w, divisor);
-  const uint32_t trace_height = rtao::RtgiTraceExtent(dd->captured_depth_h, divisor);
-  rtao::TemporalFrame reset_frame = {
-      .temporal_on = temporal_on,
-      .was_on = frame.temporal_last,
-      .resized = rd.denoise.history_color.width != 0u && (rd.denoise.history_color.width != (rtgi::g_rtgi_full_res_denoise > 0.5f ? dd->captured_depth_w : trace_width) || rd.denoise.history_color.height != (rtgi::g_rtgi_full_res_denoise > 0.5f ? dd->captured_depth_h : trace_height) || rd.denoise.output.width != dd->captured_depth_w || rd.denoise.output.height != dd->captured_depth_h),
-      .frame = dd->frame_index,
-      .last_frame = frame.dispatched_frame,
-      .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
-      .scaled = false,
-      .params_changed = params_changed,
-      .motion_ok = motion_ok};
-  const rtao::ResetReason restir_reset = rtao::TemporalResetReason(reset_frame);
-  reset_frame.params_changed = params_changed || svgf_history_changed;
-  const rtao::ResetReason reset = rtao::TemporalResetReason(reset_frame);
-  frame.reset = reset;
-  if (temporal_on && reset != rtao::ResetReason::None) {
-    frame.last_reset = reset;
-    frame.reset_counts[static_cast<size_t>(reset)] += 1u;
-  }
-  // The copy holds the previous frame's lighting output only when that frame produced it on this list. When that frame
-  // got the bounce (push_gi), the copy contains it: the trace subtracts it (one bounce) with the previous final GI (kept
-  // only while the depth size is unchanged) and this frame's G-buffer colour, and does not read the copy when it cannot
-  // (an input is missing). The colour also feeds RTGI Debug 7 in the upsample.
-  const bool applied_last = frame.applied_frame != UINT64_MAX && frame.applied_frame + 1u == dd->frame_index;
-  const bool color_ok = dd->captured_color_srv.handle != 0u && dd->captured_color_live.load()
-                        && dd->captured_color_frame == dd->frame_index;
-  const bool subtract = applied_last && color_ok && rd.denoise.output.width == dd->captured_depth_w
-                        && rd.denoise.output.height == dd->captured_depth_h;
-  const bool radiance_valid = rd.radiance_srv.handle != 0u && rd.radiance_frame != UINT64_MAX
-                              && rd.radiance_frame + 1u == dd->frame_index && (!applied_last || subtract);
-  // The light buffers are copied for a stats request or while a lamp sequence runs (Sora 2nd lighting draw, bound at this draw).
-  auto* world_cl = falcom_world::GetWorldCommandListData(cmd_list);
-  const bool copy_lights = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr
-                           && (rtgi::g_rtgi_stats.requested.load(std::memory_order_relaxed)
-                               || rtgi::g_rtgi_stats.sequence_left.load(std::memory_order_relaxed) > 0u);
-  const bool dynamic_lights = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr
-                              && rtgi::g_rtgi_dynamic_lights > 0.5f;
-  const bool lamp_shadows = dynamic_lights && rtgi::g_rtgi_lamp_shadows > 0.5f;
-  const bool sora2nd_bindings = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr;
-  const float feedback_strength = rtgi::RtgiFeedbackStrengthEffective();
-  const uint32_t extra_rays = rtgi::RtgiExtraBounceRaysEffective();
-  const bool restir_on = rtgi::g_rtgi_restir > 0.5f;
-  static_assert((falcom_world::kPsSrvResourceSlots & (1u << rtgi::kLightingLightsRegister)) != 0u
-                    && (falcom_world::kPsSrvResourceSlots & (1u << rtgi::kLightingLightIndicesRegister)) != 0u,
-                "the bind hook resolves the RTGI light buffers");
-  rtgi::RtgiDispatchInputs in = {
-      .depth_view = dd->captured_depth_srv,
-      .mrt_normal_view = dd->captured_mrt_normal_srv,
-      .isfast_view = isfast_used ? dd->isfast_noise_srv : reshade::api::resource_view{0u},
-      .scene_cbv_view = dd->captured_scene_cbv_view,
-      .radiance_view = radiance_valid ? rd.radiance_srv : reshade::api::resource_view{0u},
-      .prev_gi_view = subtract ? rd.denoise.output.srv[rd.denoise.output_index] : reshade::api::resource_view{0u},
-      .albedo_view = color_ok ? dd->captured_color_srv : reshade::api::resource_view{0u},
-      .full_width = dd->captured_depth_w,
-      .full_height = dd->captured_depth_h,
-      .trace_width = trace_width,
-      .trace_height = trace_height,
-      .push = {
-          .params = {ray_max, rtao::g_rtao_normal_bias, spp, static_cast<float>(divisor)},
-          .sampling = {isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed, rtgi::g_rtgi_debug},
-          .fade = {fade.start, fade.end,
-                   static_cast<float>((radiance_valid ? rtgi::kRtgiFlagRadianceValid : 0u)
-                                      | (subtract ? rtgi::kRtgiFlagSubtractPrevious : 0u)
-                                      | (rtgi::g_rtgi_sun_casters_only > 0.5f ? rtgi::kRtgiFlagSunCastersOnly : 0u)
-                                      | (rtgi::g_rtgi_fallback_no_albedo > 0.5f ? rtgi::kRtgiFlagFallbackNoAlbedo : 0u)
-                                      | (dynamic_lights ? rtgi::kRtgiFlagDynamicLights : 0u)
-                                      | (rtgi::g_rtgi_game_sun > 0.5f ? rtgi::kRtgiFlagGameSun : 0u)
-                                      | (feedback_strength > 0.f ? rtgi::kRtgiFlagFeedback : 0u)
-                                      | (extra_rays > 0u ? rtgi::kRtgiFlagRealRays : 0u)
-                                      | (lamp_shadows ? rtgi::kRtgiFlagLampShadows : 0u)
-                                      | (restir_on ? rtgi::kRtgiFlagRestir : 0u)),
-                   0.f},
-          .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
-                     bvh_data->tlas_region_size},
-          .shading = {rtgi::g_rtgi_ambient, rtgi::g_rtgi_radiance_clamp, subtract ? frame.applied_intensity : 0.f,
-                      static_cast<float>(prev_view_proj_register)},
-          .sun = {rtgi::g_rtgi_sun_distance, 0.f, rtgi::g_rtgi_sun_contribution, (lamp_shadows ? rtls::g_rtls_light_clearance : 0.f)},
-          .extra = {rtgi::g_rtgi_dynamic_light_contribution, feedback_strength, static_cast<float>(extra_rays),
-                    rtgi::g_rtgi_bounce_saturation},
-      },
-      .debug_mode = static_cast<int>(rtgi::g_rtgi_debug),
-      .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
-      .temporal = temporal_on,
-      .svgf = {rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection, reset == rtao::ResetReason::None, rtgi::g_rtgi_svgf_iterations, rtgi::g_rtgi_svgf_luminance_edge_stop, rtgi::g_rtgi_svgf_depth_sigma, rtgi::g_rtgi_svgf_normal_power, rtgi::g_rtgi_full_res_denoise > 0.5f, rtgi::g_rtgi_svgf_history_length, rtgi::g_rtgi_svgf_radius_scale},
-      .restir_history_valid = restir_reset == rtao::ResetReason::None,
-      .spatial = rtgi::g_rtgi_spatial_enabled > 0.5f,
-      .restir_spatial = restir_on && rtgi::g_rtgi_restir_spatial > 0.5f,
-      .lights = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightsRegister] : reshade::api::resource{0u},
-      .light_indices = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightIndicesRegister] : reshade::api::resource{0u},
-      .lights_view = dynamic_lights ? world_cl->ps_srv_view[rtgi::kLightingLightsRegister] : reshade::api::resource_view{0u},
-      .light_indices_view = dynamic_lights ? world_cl->ps_srv_view[rtgi::kLightingLightIndicesRegister] : reshade::api::resource_view{0u},
-      .mrt1_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingMrt1Register] : reshade::api::resource_view{0u},
-      .shadow_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingShadowRegister] : reshade::api::resource_view{0u},
-      .mrt2_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingMrt2Register] : reshade::api::resource_view{0u},
-      .deferred_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingDeferredRegister] : reshade::api::resource_view{0u},
-  };
-  if (rtgi::g_rtgi_trace_characters > 0.5f) {
-    in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
-  }
-  const rtgi::RtgiDispatchResult result = rtgi::Dispatch(dev, cmd_list, in);
-  if (!result.ok) {
-    frame.reason = result.dxr_unavailable ? rtgi::Reason::DxrUnavailable : rtgi::Reason::PipelineFailed;
-    return;
-  }
-  frame.producing = true;
-  frame.debug_written = result.debug_written;
-  frame.temporal_ran = result.temporal_ran;
-  frame.temporal_last = temporal_on && result.temporal_ran;
-  frame.filter_ran = result.filter_ran;
-  frame.denoise_gpu_ms = rd.denoise.timer.last_ms;
-  frame.dispatched_frame = dd->frame_index;
-  frame.gpu_ms = rd.timer.last_ms;
-  frame.divisor = divisor;
-  frame.trace_width = in.trace_width;
-  frame.trace_height = in.trace_height;
-  frame.full_width = in.full_width;
-  frame.full_height = in.full_height;
-  frame.ray_max_requested = rtgi::g_rtgi_ray_max;
-  frame.ray_max_effective = ray_max;
-  frame.fade_valid = true;
-  frame.fade = fade;
-  frame.samples = spp;
-  frame.character_objects = in.dynamic.count;
-  frame.isfast_used = isfast_used;
-  frame.prev_view_proj_register = prev_view_proj_register;
-  frame.radiance_valid = radiance_valid;
-  frame.subtracted = subtract && radiance_valid;
-  frame.restir = restir_on;
-  frame.restir_temporal = result.restir_temporal_ran;
-  frame.restir_gpu_ms = result.restir_temporal_ran ? rd.restir_timer.last_ms : -1.f;
-  frame.restir_spatial = result.restir_spatial_ran;
-  frame.restir_spatial_gpu_ms = result.restir_spatial_ran ? rd.restir_spatial_timer.last_ms : -1.f;
-  frame.radiance_width = rd.radiance_width;
-  frame.radiance_height = rd.radiance_height;
-  frame.radiance_format = static_cast<uint32_t>(rd.radiance_format);
-  frame.texture_bytes = sizeof(uint32_t) * rtgi::kRtgiStatsCount
-                        + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
-                        + static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
-                        + static_cast<uint64_t>(rd.restir_sample_pos.width) * rd.restir_sample_pos.height * 16u
-                        + static_cast<uint64_t>(rd.restir_sample_data.width) * rd.restir_sample_data.height * 16u
-                        + static_cast<uint64_t>(rd.restir_raw.width) * rd.restir_raw.height * 8u
-                        + static_cast<uint64_t>(rd.restir_res_sample.width) * rd.restir_res_sample.height * 16u * 2u
-                        + static_cast<uint64_t>(rd.restir_res_visible.width) * rd.restir_res_visible.height * 16u * 2u
-                        + static_cast<uint64_t>(rd.restir_res_data.width) * rd.restir_res_data.height * 16u * 2u
-                        + static_cast<uint64_t>(rd.restir_sp_raw.width) * rd.restir_sp_raw.height * 8u
-                        + static_cast<uint64_t>(rd.restir_sp_sample.width) * rd.restir_sp_sample.height * 16u
-                        + static_cast<uint64_t>(rd.restir_sp_visible.width) * rd.restir_sp_visible.height * 16u
-                        + static_cast<uint64_t>(rd.restir_sp_data.width) * rd.restir_sp_data.height * 16u
-                        + rtgi::RtgiDenoiseTextureBytes(rd.denoise)
-                        + (rd.radiance_texture.handle != 0u
-                               ? static_cast<uint64_t>(reshade::api::format_row_pitch(rd.radiance_format, rd.radiance_width)) * rd.radiance_height
-                               : 0u);
-  push_gi();
 }
 
 static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
@@ -13321,7 +13069,7 @@ static void RunRrGuidesInline(reshade::api::command_list* cmd_list) {
                                     });
 }
 
-// RTGI: copies the lighting output after the draw; the next frame's RTGI trace reads it for on-screen hits.
+// Records the lighting draw in the RTXDI diagnostics.
 static void OnDrawnLightingShader(reshade::api::command_list* cmd_list) {
   auto* dev = cmd_list->get_device();
   auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
@@ -13394,11 +13142,6 @@ static void OnDrawnLightingShader(reshade::api::command_list* cmd_list) {
                             .operation = di::DiagnosticOperation::LightingCallback});
     }
   }
-  const auto& frame = falcom_world::rtgi::g_rtgi_frame;
-  if (!frame.producing || frame.dispatched_frame != dd->frame_index) return;
-  auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
-  if (cs == nullptr || cs->render_targets.empty() || cs->render_targets[0].handle == 0u) return;
-  falcom_world::rtgi::CaptureRtgiRadiance(dev, cmd_list, cs->render_targets[0], dd->frame_index);
 }
 
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
@@ -13457,7 +13200,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     perf::g_perf_gate.rt_seen = true;
   }
   // RT dispatches null most compute slots and rebind their own. Snapshot the game's compute state
-  // once here and restore it after RTGI: the engine's volumetric-fog compute reads those bindings.
+  // once here and restore it after the RT dispatches: the engine's volumetric-fog compute reads those bindings.
   std::optional<renodx::utils::state::CommandListSnapshot> game_compute_state;
   if (falcom_world::rtxdi::SceneRequested() || falcom_world::rtao::RtaoRequested() || falcom_world::rtls::RtlsRequested() || falcom_world::rtsun::RtSunRequested()
       || (falcom_world::rr::RrRequested() && falcom_world::rr::g_rr_perf_guides > 0.5f  // TEMP perf test (remove)
@@ -13467,7 +13210,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // RTAO runs before the shadow pass.
   RunRtaoInline(cmd_list);
 
-  // RT Local Shadows after RTAO and before RTGI (order RTAO -> RTLS -> RTGI); independent of both.
+  // RT Local Shadows after RTAO (order RTAO -> RTLS); independent of RTAO.
   RunRtlsInline(cmd_list);
 
   // RT Sun Shadows (R3a): after RT Local Shadows, same guards; the raw term only, the image is not changed.
@@ -13477,8 +13220,6 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     RunRtSunInline(cmd_list);
   }
 
-  // RTGI after RTAO: it runs only on a frame where RTAO dispatched.
-  RunRtgiInline(cmd_list);
   PrepareRtxdiSceneInline(cmd_list);
   auto* lighting_device = cmd_list ? cmd_list->get_device() : nullptr;
   BindRtxdiLocalOutput(cmd_list, lighting_device ? lighting_device->get_private_data<DeviceData>() : nullptr);

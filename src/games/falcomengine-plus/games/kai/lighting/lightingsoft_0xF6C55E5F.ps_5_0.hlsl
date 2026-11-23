@@ -2320,7 +2320,7 @@ void main(
   }
   o0.xyz = FalcomApplyShadowTerms(r3.xyz, v1.xy, is_character_pixel, samPoint_s,
                                   contactShadowTex);
-  // GTVBGI (M7.7): after the shadow terms, attenuated by the fog and haze transmittance like the Sora RTGI bounce.
+  // GTVBGI (M7.7): after the shadow terms, attenuated by the fog and haze transmittance.
   o0.xyz += r24.xyz * vbgi_plain_scale * kaiFogKeep * kaiExtinction;
   o0.w = 1;
   o1.z = r0.y;

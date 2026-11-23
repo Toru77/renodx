@@ -201,8 +201,6 @@ Texture2D<float4> csDepthTex : register(t36);
 // t40 is the local contact term (customshaders/shadows/contact_local.cs_5_0.hlsl; depth size): x point, z spot share of the lamp
 // light the march blocks. Bound by DeployShadows while cs_contact_local_bound is set.
 Texture2D<float4> csLocalContactTex : register(t40);
-// t37 is the RTGI final GI (r11g11b10_float, depth size; world/rtgi), bound by RunRtgiInline while rtgi_gi_bound.
-Texture2D<float4> rtgiTexture : register(t37);
 // t47 is the path-traced diffuse GI (rgba16f, depth size; world/pt): rgb irradiance, a = valid. Bound while pt_gi_bound.
 Texture2D<float4> ptGiTexture : register(t47);
 // t48 is the path-traced reflection (rgba16f, depth size; world/pt M4): rgb reflection, a = hit distance (0 = none).
@@ -398,15 +396,8 @@ void main(
     cachedVBGILuma = dot(cachedVBGI, float3(0.333, 0.333, 0.333));
   }
 
-  // RTGI bounce (world/rtgi): final GI (t37) x the G-buffer colour (r0.xyz, colorTexture above) x GI Intensity. Added
-  // after FalcomApplyShadowTerms at both output sites, so neither RTAO nor the shadow terms darken it. The non-character
-  // site also attenuates it by the fog and haze transmittance.
-  float3 cachedRTGI = float3(0, 0, 0);
-  if (shader_injection_data.rtgi_gi_bound > 0.5f) {
-    cachedRTGI = rtgiTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb * r0.xyz * shader_injection_data.rtgi_intensity;
-  }
 // Path-traced diffuse GI (world/pt): t47 rgb = irradiance, a = valid. Where valid it replaces the AO (r5.x) and,
-// through cachedVBGI/cachedRTGI = 0, the VBGI and RTGI bounce at later sites; RTGI/RTAO code is removed in M5/M6.
+// through cachedVBGI = 0, the VBGI bounce at later sites.
 bool ptGiValid = false;
 float3 ptGiIrradiance = float3(0, 0, 0);
 float3 cachedPtGi = float3(0, 0, 0);
@@ -419,7 +410,6 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
     r5.x = 1.0;
     cachedVBGI = float3(0, 0, 0);
     cachedVBGILuma = 0;
-    cachedRTGI = float3(0, 0, 0);
   }
 }
 
@@ -937,13 +927,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     // bug that put contact shadows in interiors.
     o0.xyz = FalcomApplyShadowTerms(charColor, v1.xy, csIsCharacter > 0.5, samPoint_s,
                                     contactShadowTex);
-    // RTGI bounce: Character GI Intensity on the character shading path (csCharacterShading, which RTAO's Character
-    // Intensity also scales above); the map-AO pixels of characters get the full bounce.
-    if (shader_injection_data.rtgi_gi_bound > 0.5f) {
-      o0.xyz += cachedRTGI * (csCharacterShading ? saturate(shader_injection_data.rtgi_char_intensity) : 1.0);
-    }
     if (ptGiValid) o0.xyz += cachedPtGi * (csCharacterShading ? saturate(shader_injection_data.pt_char_intensity) : 1.0);
-    // VBGI (M7.5): added after the shadow terms like the RTGI bounce; Character Mask Strength scales it on this path.
+    // VBGI (M7.5): added after the shadow terms; Character Mask Strength scales it on this path.
     if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
       o0.xyz += cachedVBGI * (1.0 - saturate(shader_injection_data.char_gtvbgi_mask_strength));
     }
@@ -1984,7 +1969,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r1.yz = r1.yy ? r2.xy : r18.wy;
   r1.x = r1.x * r15.x;
   r1.x = r1.x * r1.y;
-  const float rtgiFogKeep = 1.0 - r1.x;
+  const float giFogKeep = 1.0 - r1.x;
   r2.xyz = fogColor_g.xyz + -r0.xyz;
   r0.xyz = r1.xxx * r2.xyz + r0.xyz;
   r1.x = -r1.w / skyLutCameraFarClip_g;
@@ -2011,13 +1996,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
       return;
   }
-  // RTGI bounce (see cachedRTGI); no character pixel reaches this site. The VBGI block below never runs while RTGI is
-  // bound (RTAO on clears gtvbao_vbgi_bound).
-  if (shader_injection_data.rtgi_gi_bound > 0.5f) {
-    o0.xyz += cachedRTGI * rtgiFogKeep * r2.xyz * (1.0 - r1.z + r1.z * r7.w);
-  }
   if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
-    o0.xyz += cachedVBGI * rtgiFogKeep * r2.xyz * (1.0 - r1.z + r1.z * r7.w);
+    o0.xyz += cachedVBGI * giFogKeep * r2.xyz * (1.0 - r1.z + r1.z * r7.w);
   }
   // SSR replacement debug views (read-only overrides, evaluated first).
   // Visualize SSR chain stages fullscreen on lit surfaces: 1 = ssr1 input scene

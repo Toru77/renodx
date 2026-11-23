@@ -81,10 +81,6 @@ static const std::unordered_map<std::string_view, std::string_view> kSectionCate
     {"Temporal Accumulation", "Ray Tracing"},
     {"Denoising", "Ray Tracing"},
     {"Distance Fade", "Ray Tracing"},
-    {"RTGI", "Ray Tracing"},
-    {"RTGI Temporal Accumulation", "Ray Tracing"},
-    {"RTGI Denoising", "Ray Tracing"},
-    {"RTGI Distance Fade", "Ray Tracing"},
     {"RT Local Shadows", "Ray Tracing"},
     {"RTLS Temporal Accumulation", "Ray Tracing"},
     {"RTLS Denoising", "Ray Tracing"},
@@ -154,7 +150,6 @@ static const std::unordered_map<std::string_view, FeatureCost> kSectionCosts = {
     {"Character Outline", FeatureCost::None},
     {"Custom TAA", FeatureCost::Low},
     {"RTAO", FeatureCost::High},
-    {"RTGI", FeatureCost::High},
 };
 
 // Individual costs are shown on the setting row itself.

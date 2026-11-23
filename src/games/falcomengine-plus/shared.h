@@ -44,7 +44,7 @@ struct ShaderInjectData {
   float rtao_debug_show;                    // RTAO: 1 = the lighting shader shows the RTAO texel (t22) as an image (RunRtaoInline); 0 off
   float rtxdi_sun_character_darkening;      // RTXDI Sun Character Shadow Darkening [0..1]
   float rtxdi_local_darkening;              // RTXDI Local Shadow Darkening [0..1] (reuses retired offset 76)
-  float cs_contact_local_light_clearance;   // [0..1] world units; reuses retired rtgi_reserved without moving later fields
+  float cs_contact_local_light_clearance;   // [0..1] world units; reuses a retired slot without moving later fields
   float rtxdi_local_character_darkening;    // RTXDI Local Character Shadow Darkening [0..1] (reuses retired offset 84)
   float rtxdi_local_character_keep;         // RTXDI blocked-lamp light kept on characters [0..1] (reuses retired offset 88)
   float rtxdi_local_character_intensity;   // RTXDI character lamp light scale [0..2] (reuses retired offset 92)
@@ -331,9 +331,9 @@ struct ShaderInjectData {
   float rtao_char_intensity;  // RTAO Character Intensity [0..1], set by PushRtaoAo; read only while rtao_ao_bound
   float rtao_max_darkening;  // RTAO Max Darkening [0..1], set by PushRtaoAo; AO floor = 1 - this
   float rtao_ao_bound;  // 1 = t22 holds the RTAO output for this lighting draw (PushRtaoAo); 0 = not (RunRtaoInline)
-  float rtgi_gi_bound;  // RTGI: 1 = t37 holds this frame's final GI for this lighting draw and GI Intensity > 0 (RunRtgiInline); 0 = not
-  float rtgi_intensity;  // RTGI GI Intensity [0..2]; read only while rtgi_gi_bound
-  float rtgi_char_intensity;  // RTGI Character GI Intensity [0..1]; read only while rtgi_gi_bound
+  float reserved_slot_14;  // reserved: unused slot kept so later packoffsets do not move
+  float reserved_slot_15;  // reserved: unused slot kept so later packoffsets do not move
+  float reserved_slot_16;  // reserved: unused slot kept so later packoffsets do not move
   float dynCube_ssr_enabled;                     // 0=off 1=on (simple screen-space SSR)
   float dynCube_ssr_samples;                     // SSR march sample count [4..96], default 16
   float dynCube_ssr_distance;                    // SSR search distance, world units [4..192], default 20
@@ -429,8 +429,8 @@ struct ShaderInjectData {
   float fxaa_edge_threshold_min;             // default 0.0625 — dark trim (0 = process darks fully)
   // —— GTVBAO low-resolution spatial pipeline (appended last: do not insert above) ——
   float gtvbao_resolution;                   // 0=Full (existing behavior), 1=Half (low-res AO/GI + full-res reconstruction)
-  float gtvbao_upscale_plane_sigma;          // RETIRED: unread (the upscale uses the shared RTGI-structured weights)
-  float gtvbao_upscale_normal_power;         // RETIRED: unread (the upscale uses the shared RTGI-structured weights)
+  float gtvbao_upscale_plane_sigma;          // RETIRED: unread (the upscale uses the shared SVGF weights)
+  float gtvbao_upscale_normal_power;         // RETIRED: unread (the upscale uses the shared SVGF weights)
   float gtvbao_upscale_debug;                // RETIRED: never set by the host; the upscale diagnostics are removed
   // —— DOF IS-FAST rotated gather (appended last: do not insert above) ——
   float dof_isfast_enabled;                  // 0/1 — per-pixel rotated bokeh gather (Improved mode)

@@ -140,10 +140,6 @@ struct Rt12Slot {
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
   uint64_t fence_value = 0u;                            // 0 = never submitted
   std::vector<D3D12_RESOURCE_BARRIER> barrier_scratch;  // reused after this slot fence completes
-  std::array<ID3D12Resource*, 6> rtgi_scene_resources = {};
-  std::array<uint64_t, 5> rtgi_scene_counts = {};
-  std::array<uint64_t, 3> rtgi_scene_versions = {};
-  bool rtgi_scene_descriptors_valid = false;
   Microsoft::WRL::ComPtr<ID3D12Resource> upload;  // UPLOAD heap, persistently mapped
   uint8_t* upload_data = nullptr;
   uint64_t upload_bytes = 0u;
@@ -201,23 +197,6 @@ struct Rt12SyncEvidence {
   bool d3d11_wait_b_accepted = false;
   bool d3d12_wait_a_accepted = false;
   bool d3d12_wait_prior_b_accepted = false;
-};
-
-// RTGI on DXR (B): its own slots, list, PSO, heaps, timestamps and textures. The scene (TLAS, instance table) is pass A's.
-struct Rt12RtgiState {
-  bool created = false;
-  Rt12Slot slots[kRt12Slots];
-  uint32_t next = 0u;
-  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> list;
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
-  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;                             // shader visible, kRt12Slots * kRt12RtgiDescriptors
-  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> cpu_heap;                         // not shader visible, 1 (stats UAV for the clear)
-  Microsoft::WRL::ComPtr<ID3D12QueryHeap> queries;                               // kRt12Slots * kRt12RtgiTimestamps
-  Microsoft::WRL::ComPtr<ID3D12Resource> query_readback;                         // kRt12Slots * kRt12RtgiTimestamps * 8 bytes
-  Microsoft::WRL::ComPtr<ID3D12Resource> scene_cb, lamps, lamp_types, deferred;  // DEFAULT, COMMON
-  Rt12Shared shared[17];                                                         // the RTGI D3D11 textures (fixed and per frame, by format and size)
-  rtgi::RtgiPipeline pack, pack_lights, resolve;
 };
 
 struct Rt12DiResources {
@@ -570,8 +549,8 @@ struct Rt12State {
   std::unordered_map<uint64_t, Rt12DynamicBlas> dynamic_blas;                 // by deform identity key
   uint32_t scene_dynamic_count = 0u;                                          // character instances in the TLAS of scene_slot
   uint32_t scene_record_count = 0u;                                           // P2b records in the TLAS of scene_slot
-  uint32_t scene_frame = UINT32_MAX;                                          // g_state.frame of scene_slot (RTGI)
-  uint32_t scene_instance_count = 0u;                                         // instances of scene_slot (RTGI)
+  uint32_t scene_frame = UINT32_MAX;                                          // g_state.frame of scene_slot
+  uint32_t scene_instance_count = 0u;                                         // instances of scene_slot
   uint64_t scene_generation = 0u;
   uint64_t scene_character_snapshot = 0u;
   uint64_t scene_gc_version = 0u;
@@ -585,7 +564,6 @@ struct Rt12State {
   bool scene_coverage_valid = false;
   PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serialize = nullptr;
   Rt12PtState path_trace;
-  Rt12RtgiState rtgi;
   uint64_t address_generation = ~0ull;                       // blas_generation the per-slot address tables were last written for (see Rt12Slot)
   std::vector<D3D12_RAYTRACING_INSTANCE_DESC> static_descs;  // the static part of the TLAS, cached by its key
   uint64_t static_key_version = ~0ull, static_key_blas = ~0ull;
@@ -927,7 +905,7 @@ inline void UavBarrier(std::vector<D3D12_RESOURCE_BARRIER>& barriers, ID3D12Reso
   barriers.push_back(barrier);
 }
 
-// Descriptor descriptions of the DXR passes (RunRtaoPassA and the RTGI trace).
+// Descriptor descriptions of the DXR passes.
 inline D3D12_SHADER_RESOURCE_VIEW_DESC Rt12BufferSrv(uint32_t stride, uint64_t count) {
   D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
   view.Format = DXGI_FORMAT_UNKNOWN;
@@ -1218,10 +1196,6 @@ inline void TeardownRt12(const char* why) {
   }
   s.path_trace.water_frame = UINT32_MAX;
   s.path_trace.water_frame_inputs = {};
-  for (Rt12Shared& shared : s.rtgi.shared) {
-    if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
-    if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
-  }
   for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {
     for (Rt12Shared* shared : {
              &slot.depth,
@@ -1252,9 +1226,6 @@ inline void TeardownRt12(const char* why) {
   }
   DestroyRt12Pipelines(s.device, s);
   rtao::DestroyRtaoLayout(s.device, &s.scene_bindings);
-  rtgi::DestroyRtgiPipeline(s.device, s.rtgi.pack);
-  rtgi::DestroyRtgiPipeline(s.device, s.rtgi.pack_lights);
-  rtgi::DestroyRtgiPipeline(s.device, s.rtgi.resolve);
   renodx::utils::log::i("[world-rt12] teardown (", why, ")");
   g_rt12.reset();
 #if defined(FALCOM_NRD_ENABLED)
@@ -2327,25 +2298,6 @@ inline void OnPresent(reshade::api::device* device) {
         });
       }
       s.lighting_slots[k].timestamps = false;
-    }
-  }
-
-  // 4b. RTGI slot timestamps: gpu = t2 - t0 and trace = t2 - t1.
-  for (uint32_t k = 0u; k < kRt12Slots; ++k) {
-    if (s.rtgi.slots[k].timestamps && s.rtgi.slots[k].fence_value <= completed) {
-      uint64_t t[kRt12RtgiTimestamps] = {};
-      if (ReadRt12Timestamps(s.rtgi.query_readback.Get(), k * kRt12RtgiTimestamps, kRt12RtgiTimestamps, t)) {
-        const float gpu_ms = TicksToMs(t[2] - t[0], s.timestamp_frequency);
-        const float trace_ms = TicksToMs(t[2] - t[1], s.timestamp_frequency);
-        std::lock_guard lock(g_rt12_rtgi_panel_mutex);
-        g_rt12_rtgi_panel.gpu_ms = gpu_ms;
-        g_rt12_rtgi_panel.gpu_ms_sum += gpu_ms;
-        g_rt12_rtgi_panel.gpu_ms_n += 1u;
-        g_rt12_rtgi_panel.trace_ms = trace_ms;
-        g_rt12_rtgi_panel.trace_ms_sum += trace_ms;
-        g_rt12_rtgi_panel.trace_ms_n += 1u;
-      }
-      s.rtgi.slots[k].timestamps = false;
     }
   }
 

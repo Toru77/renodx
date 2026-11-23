@@ -33,7 +33,7 @@ inline constexpr uint32_t kCensusRingSize = 4096u;
 inline constexpr uint32_t kLightingHashSora2nd = 0xCA3D8596u;
 inline constexpr uint32_t kLightingDepthRegisterSora2nd = 4u;
 // PS SRV slots whose resource the bind hook resolves (WorldCommandListData::ps_srv): alpha t0 (pool), lighting depth t4,
-// RTGI lights t11 and light indices t12. Other PS slots keep only their view; a new ps_srv reader must add its slot here.
+// RTXDI local lights t11 and light indices t12, kept for the RTXDI and Kai hero-light readers. Other PS slots keep only their view; a new ps_srv reader must add its slot here.
 inline constexpr uint32_t kPsSrvResourceSlots = (1u << 0u) | (1u << kLightingDepthRegisterSora2nd) | (1u << 11u) | (1u << 12u);
 
 // Instance transform layout (the pool stores Inst4x3Row; see bvh/pool_transform.hpp).
