@@ -110,11 +110,11 @@ ShaderInjectData shader_injection = {
     .reserved_slot_03 = 1.f,
     .reserved_slot_04 = 1.f,
     .reserved_slot_05 = 1.f,
-    .rtsun_flags = 0.f,
-    .rtsun_strength = 1.f,
-    .rtsun_max_darkening = 1.f,
-    .rtsun_spare = 0.f,
-    .rtsun_char_max_darkening = 1.f,
+    .reserved_slot_06 = 0.f,
+    .reserved_slot_07 = 1.f,
+    .reserved_slot_08 = 1.f,
+    .reserved_slot_09 = 0.f,
+    .reserved_slot_10 = 1.f,
     .cs_contact_local_bound = 0.f,
     .cs_contact_local_normal_bias = 0.05f,
     .gtvbao_mode = 1.f,
@@ -499,7 +499,7 @@ ShaderInjectData shader_injection = {
     .char_cam_max_darkening = 0.6f,
     .char_cam_isfast_enabled = 1.f,
     .char_cam_debug = 0.f,
-    .rt_sun_cascades = 0.f,
+    .reserved_slot_18 = 0.f,
     .rtxdi_diffuse_bound = 0.f,
     .rtxdi_debug_view = 0.f,
     .rtxdi_debug_bound = 0.f,
@@ -514,7 +514,6 @@ ShaderInjectData shader_injection = {
 
 constexpr uint32_t kLightingGtvbaoRegister = 22u;
 constexpr uint32_t kLightingVbgiRegister = 23u;     // t23 = vbgiTexture
-constexpr uint32_t kLightingRtSunRegister = 39u;    // t39 = rtsunTexture (RT Sun Shadows term, world/rtsun)
 constexpr uint32_t kLightingPtRegister = 47u;  // t47 = ptGiTexture (world/pt path-traced GI)
 constexpr uint32_t kLightingDepthRegister = 4u;     // t4 = depthTexture (Sora)
 constexpr uint32_t kLightingPtReflectionRegister = 48u;  // t48 = ptReflTexture (lighting and ssr2, world/pt M4)
@@ -1901,7 +1900,6 @@ static CapturedViewInfo CSResolveCapture(reshade::api::device* dev, reshade::api
 
 // -- IS-FAST sync helpers (sync g_isfast_* globals ? shader_injection) --
 static void SyncISFASTToShaderInjection(reshade::api::command_list* cmd_list) {
-  shader_injection.rt_sun_cascades = static_cast<float>(falcom_world::g_state.rt_sun_cascades.load(std::memory_order_relaxed));
   shader_injection.shadow_isfast_enabled = g_isfast_enabled;
   shader_injection.shadow_isfast_spatial_scale = g_isfast_spatial_scale;
   shader_injection.shadow_isfast_temporal_speed = g_isfast_temporal_speed;
@@ -11583,194 +11581,6 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   PushRtaoAo(cmd_list, rtao::OutputSrv(dev));
 }
 
-// RT Sun Shadows (world/rtsun, R3a/R3c): traces the sun shadow rays for the cascade range RT owns, denoises the term (the
-// shared SVGF chain) and binds the denoised output at t39 for the lighting draw. Dispatched inline after RT Local Shadows
-// with the same guards; the guard returns end only this stage.
-static void RunRtSunInline(reshade::api::command_list* cmd_list) {
-  namespace rtsun = falcom_world::rtsun;
-  namespace rtao = falcom_world::rtao;
-  auto& frame = rtsun::g_rtsun_frame;
-  frame.producing = false;
-  frame.reason = rtsun::Reason::Off;
-  frame.input_reason = rtao::Reason::Off;  // set again only by a failing guard this call
-  frame.isfast_unavailable = false;
-  shader_injection.rtsun_flags = 0.f;  // set again by push_rtsun when this lighting draw gets the term
-  if (!rtsun::RtSunRequested()) {
-    rtsun::ReleaseRtSunTextures(cmd_list->get_device());
-    return;
-  }
-  if (!IsSora2nd()) {
-    frame.reason = rtsun::Reason::NotSora2nd;
-    return;
-  }
-  auto* dev = cmd_list->get_device();
-  auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
-  if (!dd) {
-    frame.reason = rtsun::Reason::InputsMissing;
-    frame.input_reason = rtao::Reason::NoDepth;
-    return;
-  }
-  // World_rtsun.json gate block: the camera's lighting constants and the depth sizes, for the GPU values read back with them.
-  const auto& gate_camera = falcom_world::g_state.camera;
-  frame.cpu_has_scaling = gate_camera.has_scaling;
-  std::memcpy(frame.cpu_scaling, gate_camera.resolution_scaling, sizeof(frame.cpu_scaling));
-  frame.cpu_camera_x = gate_camera.view_inv[3];
-  frame.cached_w = dd->captured_depth_w;
-  frame.cached_h = dd->captured_depth_h;
-  if (dd->captured_depth_srv.handle != 0u) {
-    const auto depth_desc = dev->get_resource_desc(dev->get_resource_from_view(dd->captured_depth_srv));
-    frame.actual_w = depth_desc.texture.width;
-    frame.actual_h = depth_desc.texture.height;
-  }
-  const auto* bvh_data = falcom_world::bvh::GetBvhDeviceData(dev);
-  if (!RtBvhReady(bvh_data, &frame.input_reason)) {
-    frame.reason = rtsun::Reason::InputsMissing;
-    return;
-  }
-  frame.built_range = bvh_data->tlas_region_range;
-  if (frame.built_range <= 0.f) {
-    frame.reason = rtsun::Reason::NoCascades;  // no built range yet: not ready, so no cascades (not unlimited)
-    return;
-  }
-  if (cmd_list != dd->immediate_cmd_list) {
-    frame.reason = rtsun::Reason::DeferredList;
-    return;
-  }
-  // Binds this frame's RT sun term (the denoised output, full size) at t39 for this lighting draw, also on a second
-  // lighting draw of the frame. Only while the latched count is nonzero: the CSM is then skipped in range this frame and the term replaces it.
-  const auto push_rtsun = [&]() {
-    if (falcom_world::g_state.rt_sun_cascades.load(std::memory_order_relaxed) == 0) return;
-    const rtsun::RtSunDeviceData& data = rtsun::GetRtSunDeviceData(dev);
-    const reshade::api::resource_view term_srv = data.denoise.output.srv[data.denoise.output_index];
-    cmd_list->push_descriptors(
-        reshade::api::shader_stage::pixel,
-        reshade::api::pipeline_layout{0},
-        0,
-        reshade::api::descriptor_table_update{
-            {}, kLightingRtSunRegister, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &term_srv});
-    shader_injection.rtsun_flags = static_cast<float>(rtsun::kRtSunFlagApplied
-                                                      | (rtsun::g_rtsun_receive_characters > 0.5f ? rtsun::kRtSunFlagReceive : 0u));
-    shader_injection.rtsun_strength = rtsun::g_rtsun_strength;
-    shader_injection.rtsun_max_darkening = rtsun::g_rtsun_max_darkening;
-    shader_injection.rtsun_spare = rtsun::g_rtsun_character_intensity;
-    shader_injection.rtsun_char_max_darkening = rtsun::g_rtsun_character_max_darkening;
-  };
-  if (frame.dispatched_frame == dd->frame_index) {
-    frame.producing = true;
-    push_rtsun();
-    return;
-  }
-  if (!RtFrameInputsReady(dd, &frame.input_reason)) {
-    frame.reason = rtsun::Reason::InputsMissing;
-    return;
-  }
-  const auto& camera = falcom_world::g_state.camera;
-  frame.cascades_requested = static_cast<int>(rtsun::g_rtsun_cascade_range);
-  frame.cascades_camera = camera.has_sun ? camera.shadow_cascade_count : 0;
-  // The latched count (set in ApplyBvhInputs from last frame's trace) is the one the CSM skip uses; the trace keeps it
-  // while nonzero, and computes its own count only before a frame has been latched.
-  const int latched_cascades = falcom_world::g_state.rt_sun_cascades.load(std::memory_order_relaxed);
-  frame.cascades_effective = latched_cascades != 0
-                                 ? latched_cascades
-                                 : rtsun::RtSunEffectiveCascades(frame.cascades_requested, camera, bvh_data->tlas_region_range);
-  if (frame.cascades_effective == 0) {
-    frame.reason = rtsun::Reason::NoCascades;
-    return;
-  }
-  frame.covered_m = rtsun::RtSunBoundary(static_cast<uint32_t>(frame.cascades_effective), camera.shadow_cascade_count,
-                                         camera.shadow_split_distance, camera.shadow_fade_near, camera.shadow_fade_range_inv);
-  // RTAO's IS-FAST rule: the texture is loaded when this row and the IS-FAST master are on.
-  if (rtsun::g_rtsun_isfast > 0.5f && g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, dd);
-  const bool isfast_used = rtsun::g_rtsun_isfast > 0.5f && g_isfast_enabled > 0.5f && dd->isfast_noise_srv.handle != 0u;
-  frame.isfast_unavailable = rtsun::g_rtsun_isfast > 0.5f && !isfast_used;
-  const float spp = (std::max)(rtsun::g_rtsun_samples, 1.f);
-  const rtao::NoiseSample noise = rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>(spp), false);
-  const uint32_t divisor = rtao::RtgiTraceDivisor(rtsun::g_rtsun_trace_resolution);
-  const uint32_t trace_width = rtao::RtgiTraceExtent(dd->captured_depth_w, divisor);
-  const uint32_t trace_height = rtao::RtgiTraceExtent(dd->captured_depth_h, divisor);
-  // RT sun temporal: the reset rule shared with RT Local Shadows (rtao::TemporalResetReason) over the RT sun snapshot.
-  // Strength, Max Darkening and the spatial filter act after the history and are not in it.
-  const bool temporal_on = rtsun::g_rtsun_temporal_enabled > 0.5f;
-  const bool motion_ok = UpdateRtMotion(dev, dd, temporal_on);
-  const rtsun::ParameterSnapshot params = {
-      rtsun::g_rtsun_cascade_range, rtsun::g_rtsun_samples, rtsun::g_rtsun_ray_max, rtsun::g_rtsun_light_size,
-      rtsun::g_rtsun_normal_bias, rtsun::g_rtsun_trace_characters, rtsun::g_rtsun_isfast, rtsun::g_rtsun_trace_resolution,
-      rtsun::g_rtsun_temporal_enabled, rtsun::g_rtsun_history_weight, rtsun::g_rtsun_depth_rejection,
-      rtsun::g_rtsun_normal_rejection, rtsun::g_rtsun_debug,
-      rtsun::g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias, rtsun::g_rtsun_foliage_intensity, rtsun::g_rtsun_svgf_history_length};
-  const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
-  frame.prev_params = params;
-  frame.prev_params_valid = true;
-  auto& rd = rtsun::GetRtSunDeviceData(dev);
-  const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
-      .temporal_on = temporal_on,
-      .was_on = frame.temporal_last,
-      .resized = rd.denoise.history_color.width != 0u
-                 && (rd.denoise.history_color.width != (rtsun::g_rtsun_full_res_denoise > 0.5f ? dd->captured_depth_w : trace_width)
-                     || rd.denoise.history_color.height != (rtsun::g_rtsun_full_res_denoise > 0.5f ? dd->captured_depth_h : trace_height)
-                     || rd.denoise.output.width != dd->captured_depth_w || rd.denoise.output.height != dd->captured_depth_h),
-      .frame = dd->frame_index,
-      .last_frame = frame.dispatched_frame,
-      .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
-      .scaled = false,
-      .params_changed = params_changed,
-      .motion_ok = motion_ok});
-  frame.reset = reset;
-  if (temporal_on && reset != rtao::ResetReason::None) {
-    frame.last_reset = reset;
-    frame.reset_counts[static_cast<size_t>(reset)] += 1u;
-  }
-  rtsun::RtSunDispatchInputs in = {
-      .depth_view = dd->captured_depth_srv,
-      .mrt_normal_view = dd->captured_mrt_normal_srv,
-      .isfast_view = isfast_used ? dd->isfast_noise_srv : reshade::api::resource_view{0u},
-      .scene_cbv_view = dd->captured_scene_cbv_view,
-      .full_width = dd->captured_depth_w,
-      .full_height = dd->captured_depth_h,
-      .trace_width = trace_width,
-      .trace_height = trace_height,
-      .push = {
-          .params = {rtsun::g_rtsun_ray_max, rtsun::g_rtsun_normal_bias, spp, static_cast<float>(frame.cascades_effective)},
-          .sampling = {isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed, rtsun::g_rtsun_debug},
-          .sun = {rtsun::g_rtsun_light_size, 0.f, 0.f, static_cast<float>(divisor)},
-          .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
-                     bvh_data->tlas_region_size},
-          .size = {0.f, 0.f, falcom_world::bvh::kPoolRegionRayMargin, rtsun::g_rtsun_foliage_intensity},
-          .character = {rtsun::g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias}},
-      .debug_mode = static_cast<int>(rtsun::g_rtsun_debug),
-      .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
-      .temporal = temporal_on,
-      .spatial = rtsun::g_rtsun_spatial_enabled > 0.5f,
-      .svgf = {rtsun::g_rtsun_history_weight, rtsun::g_rtsun_depth_rejection, rtsun::g_rtsun_normal_rejection, reset == rtao::ResetReason::None, rtsun::g_rtsun_svgf_iterations, rtsun::g_rtsun_svgf_luminance_edge_stop, 1.f, 128.f, rtsun::g_rtsun_full_res_denoise > 0.5f, rtsun::g_rtsun_svgf_history_length, rtsun::g_rtsun_svgf_radius_scale},
-  };
-  if (rtsun::g_rtsun_trace_characters > 0.5f) {
-    in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
-  }
-  const rtsun::RtSunDispatchResult result = rtsun::Dispatch(dev, cmd_list, in);
-  if (!result.ok) {
-    frame.reason = rtsun::Reason::PipelineFailed;
-    return;
-  }
-  frame.producing = true;
-  frame.debug_written = result.debug_written;
-  frame.dispatched_frame = dd->frame_index;
-  frame.gpu_ms = rd.timer.last_ms;
-  frame.width = trace_width;
-  frame.height = trace_height;
-  frame.divisor = divisor;
-  frame.temporal_ran = result.temporal_ran;
-  frame.temporal_last = temporal_on && result.temporal_ran;
-  frame.filter_ran = result.filter_ran;
-  frame.denoise_gpu_ms = rd.denoise.timer.last_ms;
-  frame.character_objects = in.dynamic.count;
-  frame.isfast_used = isfast_used;
-  frame.texture_bytes = static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
-                        + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
-                        + falcom_world::rtgi::RtgiDenoiseTextureBytes(rd.denoise)
-                        + sizeof(uint32_t) * rtsun::kRtSunStatsCount;
-  push_rtsun();
-}
-
 static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
   namespace di = falcom_world::rtxdi;
   namespace rt12 = falcom_world::rt12;
@@ -13008,20 +12818,13 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // RT dispatches null most compute slots and rebind their own. Snapshot the game's compute state
   // once here and restore it after the RT dispatches: the engine's volumetric-fog compute reads those bindings.
   std::optional<renodx::utils::state::CommandListSnapshot> game_compute_state;
-  if (falcom_world::rtxdi::SceneRequested() || falcom_world::rtao::RtaoRequested() || falcom_world::rtsun::RtSunRequested()
+  if (falcom_world::rtxdi::SceneRequested() || falcom_world::rtao::RtaoRequested()
       || (falcom_world::rr::RrRequested() && falcom_world::rr::g_rr_perf_guides > 0.5f  // TEMP perf test (remove)
           && falcom_world::rr::g_rr_guides_attempt_frame.load() != falcom_world::g_state.frame.load())) {
     game_compute_state = renodx::utils::state::GetSnapshot(cmd_list);
   }
   // RTAO runs before the shadow pass.
   RunRtaoInline(cmd_list);
-
-  // RT Sun Shadows (R3a): after RT Local Shadows, same guards; the raw term only, the image is not changed.
-  if (IsSora2nd() && falcom_world::rtxdi::g_sun_requested > 0.5f) {
-    shader_injection.rtsun_flags = 0.f;
-  } else {
-    RunRtSunInline(cmd_list);
-  }
 
   PrepareRtxdiSceneInline(cmd_list);
   auto* lighting_device = cmd_list ? cmd_list->get_device() : nullptr;

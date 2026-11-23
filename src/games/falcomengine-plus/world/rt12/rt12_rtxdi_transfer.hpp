@@ -7,7 +7,6 @@
 #include <numbers>
 
 #include "../rr/rr_state.hpp"
-#include "../rtsun/rtsun_state.hpp"
 #include "../rtxdi/rtxdi_di_contract.h"
 #include "../rtxdi/rtxdi_di_layout.h"
 #include "../rtxdi/rtxdi_input_d3d11.hpp"
@@ -1985,7 +1984,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       transfer.list->SetDescriptorHeaps(1u, query_heaps);
       transfer.list->SetComputeRootSignature(transfer.sun_root.Get());
       transfer.list->SetPipelineState(transfer.sun_pso.Get());
-      const float maximum_distance = rtsun::g_rtsun_ray_max;
+      const float maximum_distance = rtxdi::FiniteClamped(rtxdi::g_sun_max_ray_distance, 100.f, 1.f, 500.f);
       const float environment_bias = rtxdi::FiniteClamped(rtxdi::g_sun_normal_bias, 0.02f, 0.f, 0.5f);
       const float character_bias = rtxdi::FiniteClamped(rtxdi::g_sun_character_normal_bias, 0.02f, 0.f, 0.5f);
       const bool sun_half = rtxdi::FiniteClamped(rtxdi::g_sun_trace_resolution, 0.f, 0.f, 1.f) > 0.5f;

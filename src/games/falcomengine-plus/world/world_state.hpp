@@ -197,10 +197,6 @@ struct State {
   // observed (pool capture, live camera) without the research census.
   std::atomic_bool pool_capture_requested{false};
   std::atomic<uint32_t> depth_log_start_frame{UINT32_MAX};
-  // RT sun cascades the draw hooks read (rtsun/rtsun_range.hpp): nonzero only while RT sun is requested and produced last frame.
-  std::atomic_int rt_sun_cascades{0};
-  // Frame index at which each sun cascade slice was last cleared to lit (draw_census.hpp).
-  std::atomic<uint32_t> rt_sun_cleared_frame[4]{UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
   std::atomic<uint32_t> tracking_epoch{0u};
   std::atomic<uint32_t> view_generation{0u};  // moves at every resource-view destroy; cb_tracking reuses an SRV slot's resource only within one generation
   uint32_t draw_counter = 0u;
@@ -243,8 +239,7 @@ inline bool CaptureActive() {
 }
 
 inline bool WorldDrawHookNeeded() {
-  return CaptureActive() || g_state.depth_log_start_frame.load(std::memory_order_relaxed) != UINT32_MAX
-         || g_state.rt_sun_cascades.load(std::memory_order_relaxed) != 0;
+  return CaptureActive() || g_state.depth_log_start_frame.load(std::memory_order_relaxed) != UINT32_MAX;
 }
 
 inline const char* FamilyLabelName(uint8_t label) {

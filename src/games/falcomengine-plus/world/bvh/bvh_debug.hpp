@@ -22,8 +22,6 @@
 #include "../rtao/rtao.hpp"
 #include "../rtao/rtao_svgf.hpp"
 #include "../rtgi/rtgi.hpp"
-#include "../rtsun/rtsun.hpp"
-#include "../rtsun/rtsun_range.hpp"
 #include "bvh_build.hpp"
 #include "bvh_live.hpp"
 #include "bvh_resources.hpp"
@@ -291,7 +289,7 @@ inline void RefreshPoolCaptureRequest() {
 }
 
 inline bool RtBvhDemanded() {
-  return rtao::RtaoRequested() || rtsun::RtSunRequested() || rtxdi::SceneRequested();
+  return rtao::RtaoRequested() || rtxdi::SceneRequested();
 }
 
 inline void ApplyBvhInputs() {
@@ -317,13 +315,6 @@ inline void ApplyBvhInputs() {
   store(g_live_bvh.enabled, demand || (diagnostic && g_live_bvh.enabled_setting > 0.5f));
   store(g_deform.enabled, demand || (diagnostic && deform_setting));
   store(g_deform_live.enabled, demand || (diagnostic && deform_setting));
-  // RT sun count latched for the draw hooks (CSM skip) and the trace: nonzero only while RT sun is requested and produced
-  // last frame, with a built BVH range (0 = not ready, never unlimited).
-  const bool rtsun_produced = rtsun::RtSunRequested() && rtxdi::g_sun_requested < 0.5f
-                              && rtsun::g_rtsun_frame.producing && rtsun::g_rtsun_frame.built_range > 0.f;
-  g_state.rt_sun_cascades.store(
-      rtsun_produced ? rtsun::RtSunEffectiveCascades(static_cast<int>(rtsun::g_rtsun_cascade_range), g_state.camera, rtsun::g_rtsun_frame.built_range) : 0,
-      std::memory_order_relaxed);
   // G5: reduce the CPU pool while DXR RTAO, tracing the GPU scene, is the only RT consumer.
   const rt12::Rt12State* rt12_state = rt12::g_rt12.get();
   UpdateGcPoolReduce(GcPoolReduceInputs{.switch_on = g_gpu_capture.reduce_pool.load(std::memory_order_relaxed),
@@ -367,12 +358,6 @@ inline void OnWorldPresentBvh(
     ClearPerfGathered(GetBvhDeviceData(device));
     rtao::ClearRtaoPerfGathered(device);
     ClearGpuTimerStats(&rtao::GetRtaoSvgfData(device).denoise.timer);
-    if (rtsun::RtSunDeviceData* rtsun_data = rtsun::FindRtSunDeviceData(device)) {
-      ClearGpuTimerStats(&rtsun_data->timer);
-      ClearGpuTimerStats(&rtsun_data->denoise.timer);
-      rtsun::g_rtsun_frame.gpu_ms = -1.f;
-      rtsun::g_rtsun_frame.denoise_gpu_ms = -1.f;
-    }
   }
   g_bvh_debug.device.store(device, std::memory_order_relaxed);
   ApplyBvhInputs();
@@ -384,10 +369,6 @@ inline void OnWorldPresentBvh(
       extra.rtao = {rtao_data.timer.ms_sum, rtao_data.timer.samples};
       const rtao::RtaoSvgfData& rtao_svgf = rtao::GetRtaoSvgfData(device);
       extra.rtao_filter = {rtao_svgf.denoise.timer.ms_sum, rtao_svgf.denoise.timer.samples};
-    }
-    if (const rtsun::RtSunDeviceData* rtsun_data = rtsun::FindRtSunDeviceData(device)) {
-      extra.rtsun = {rtsun_data->timer.ms_sum, rtsun_data->timer.samples};
-      extra.rtsun_denoise = {rtsun_data->denoise.timer.ms_sum, rtsun_data->denoise.timer.samples};
     }
     {
       std::lock_guard<std::mutex> lock(g_deform_live.mutex);
@@ -440,26 +421,7 @@ inline void OnWorldPresentBvh(
   UpdateCacheDiag(device, present_time);
   UpdateDeformLive(device, queue);
   rtao::MaybeCaptureRtaoStats(device, queue);
-  rtsun::MaybeCaptureRtSunStats(device, queue);
   RunBvhDebugPass(queue, swapchain);
-  // Draws a debug texture over the whole backbuffer (RT Sun debug view).
-  const auto blit_debug = [&](reshade::api::resource_view srv) {
-    const auto backbuffer = swapchain->get_current_back_buffer();
-    if (backbuffer.handle == 0u) return;
-    const auto backbuffer_desc = device->get_resource_desc(backbuffer);
-    if (backbuffer_desc.type != reshade::api::resource_type::texture_2d) return;
-    auto* cmd_list = queue->get_immediate_command_list();
-    if (cmd_list == nullptr) return;
-    BlitDebugTextureToBackbuffer(device, queue, cmd_list, backbuffer, backbuffer_desc.texture.format, srv);
-  };
-  // RT Sun Debug 1 to 2: the sun trace debug texture, when this frame's trace wrote it and no BVH GPU debug mode is selected.
-  if (rtsun::g_rtsun_debug > 0.5f && rtsun::g_rtsun_frame.producing && rtsun::g_rtsun_frame.debug_written
-      && g_bvh_debug.mode.load(std::memory_order_relaxed) == 0) {
-    const auto found_rtsun = rtsun::g_rtsun_devices.find(device);
-    if (found_rtsun != rtsun::g_rtsun_devices.end() && found_rtsun->second.debug.srv[0].handle != 0u) {
-      blit_debug(found_rtsun->second.debug.srv[0]);
-    }
-  }
 }
 
 // Performance segments (diagnostic): the present call, from OnWorldPresentBvh to the end of the native Present (other

@@ -25,7 +25,6 @@
 #include "rtao/rtao.hpp"
 #include "rtao/rtao_panel.hpp"
 #include "rtgi/rtgi.hpp"
-#include "rtsun/rtsun_panel.hpp"
 #include "rtxdi/rtxdi_config.hpp"
 #include "rtxdi/rtxdi_debug_layout.h"
 #include "rtxdi/rtxdi_diagnostics.hpp"
@@ -56,11 +55,11 @@ inline bool IsDevkitPresent() {
   return file_present;
 }
 
-// Adds the SVGF rows of RTAO, GTVBAO, GTVBGI and RT Sun: Temporal Accumulation (the reprojection,
+// Adds the SVGF rows of RTAO, GTVBAO and GTVBGI: Temporal Accumulation (the reprojection,
 // paper Sec. 4.1) and Denoising (Iterations, the a-trous count of Sec. 4.3; Luminance Edge Stop, sigma_l of Sec. 4.4). The
 // Optional spatial depth and normal edge stops are exposed independently of temporal rejection.
 struct SvgfRows {
-  const char* prefix;  // key prefix: "Rtao", "Gtvbao", "Vbgi" or "RtSun"
+  const char* prefix;  // key prefix: "Rtao", "Gtvbao" or "Vbgi"
   const char* temporal_section;
   const char* temporal_enabled_tooltip;
   float* temporal_enabled;
@@ -1108,7 +1107,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RTXDI Sun Shadows",
       .section = "RTXDI Sun",
-      .tooltip = "Traces one directional DXR sun visibility query per valid surface. Unknown results keep the CSM fallback. Ray length: RT Sun Shadows > Max Ray Distance.",
+      .tooltip = "Traces one directional DXR sun visibility query per valid surface. Unknown results keep the CSM fallback. Ray length: Max Ray Distance (Sun).",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });
@@ -1540,6 +1539,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .format = "%.3f",
       .is_visible = visible,
       .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
+      .key = "RtxdiSunMaxRayDistance",
+      .binding = &rtxdi::g_sun_max_ray_distance,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 100.f,
+      .label = "Max Ray Distance (Sun)",
+      .section = "RTXDI Sun",
+      .tooltip = "Longest distance a sun shadow ray travels. Occluders farther away than this do not cast RTXDI sun shadows.",
+      .min = 1.f,
+      .max = 500.f,
+      .format = "%.0f",
+      .is_visible = visible,
   });
   settings->push_back(new Setting{
       .key = "RtxdiSunCharacterNormalBias",
@@ -2775,231 +2787,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .format = "%.2f",
       .is_visible = visible,
   });
-  settings->push_back(new Setting{
-      .key = "RtSunEnabled",
-      .binding = &rtsun::g_rtsun_enabled,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 0.f,
-      .label = "RT Sun Shadows",
-      .section = "RT Sun Shadows",
-      .tooltip = "Ray-traced sun shadows over the cascade range RT owns (Cascade Range), traced through the live BVH. This stage records the raw sun term and its debug view; the image is not changed yet. Off = no cost. While on, the BVH inputs run.",
-      .labels = {"Off", "On"},
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunStatus",
-      .value_type = SettingValueType::CUSTOM,
-      .can_reset = false,
-      .label = "RT sun status",
-      .section = "RT Sun Shadows",
-      .on_draw = []() {
-        rtsun::DrawRtSunPanel();
-        return false;
-      },
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "",
-      .binding = &rtsun::g_rtsun_debug,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 0.f,
-      .label = "RT Sun Debug",
-      .section = "RT Sun Shadows",
-      .tooltip = "Session only (not saved). 1 raw sun term (grey = shadow x cascade weight). 2 pixel classes (grey scaled, dark blue sky, magenta no normal, olive character, dark green outside the region, dark purple beyond the cascade range, white traced). 3 unused. 4 accumulated term after the temporal pass, 5 history confidence (both need RT Sun Temporal Accumulation on), 6 final denoised term (the value the lighting shader reads). 7 SVGF variance (needs RT Sun Denoising on): grey = sigma / (1 + sigma) of the luminance variance the a-trous filter steers by; blue = 1 where the history is shorter than 4 frames.",
-      .labels = {"Off", "Raw shadow", "Pixel classes", "Unused", "Accumulated", "History confidence", "Final", "SVGF variance"},
-      .is_visible = advanced,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunCascadeRange",
-      .binding = &rtsun::g_rtsun_cascade_range,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 2.f,
-      .label = "Cascade Range",
-      .section = "RT Sun Shadows",
-      .tooltip = "Number of sun cascades RT owns, counted from the nearest. Capped by the camera's cascade count and by the BVH region; the status line shows the effective count.",
-      .min = 1.f,
-      .max = 4.f,
-      .format = "%d",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunKeepCascadeMaps",
-      .binding = &rtsun::g_rtsun_keep_cascade_maps,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
-      .label = "Keep Cascade Maps For Fog",
-      .section = "RT Sun Shadows",
-      .tooltip = "The game's volumetric fog reads the sun cascade maps. On keeps those maps drawn so fog matches no-RT-sun, at the cost of drawing the RT-owned cascades. Off saves that cost but fog gets thicker. The sun shadow resolve is skipped either way.",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunStrength",
-      .binding = &rtsun::g_rtsun_strength,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 1.f,
-      .label = "Strength",
-      .section = "RT Sun Shadows",
-      .tooltip = "Scales only the RT sun shadow inside the RT range. 0 means no RT sun shadow inside the range.",
-      .min = 0.f,
-      .max = 1.f,
-      .format = "%.2f",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunMaxDarkening",
-      .binding = &rtsun::g_rtsun_max_darkening,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 1.f,
-      .label = "Max Darkening",
-      .section = "RT Sun Shadows",
-      .tooltip = "Caps the darkest RT sun shadow: the sun loses no more than this share of its light inside the RT range; lighter shadows are unchanged. 1 = no cap.",
-      .min = 0.f,
-      .max = 1.f,
-      .format = "%.2f",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunTraceCharacters",
-      .binding = &rtsun::g_rtsun_trace_characters,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
-      .label = "Trace characters",
-      .section = "RT Sun Shadows",
-      .tooltip = "Character casters block the sun ray.",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunReceiveCharacters",
-      .binding = &rtsun::g_rtsun_receive_characters,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
-      .label = "Receive on characters",
-      .section = "RT Sun Shadows",
-      .tooltip = "Character pixels take the RT sun shadow, traced with the sun direction, so cast and receive agree.",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunCharacterNormalBias",
-      .binding = &rtsun::g_rtsun_character_normal_bias,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 0.02f,
-      .label = "Character Normal Bias",
-      .section = "RT Sun Shadows",
-      .min = 0.f,
-      .max = 0.5f,
-      .format = "%.3f",
-      .is_visible = visible,
-      .is_logarithmic = true,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunCharacterIntensity",
-      .binding = &rtsun::g_rtsun_character_intensity,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 1.f,
-      .label = "Character Intensity",
-      .section = "RT Sun Shadows",
-      .min = 0.f,
-      .max = 1.f,
-      .format = "%.2f",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunCharacterMaxDarkening",
-      .binding = &rtsun::g_rtsun_character_max_darkening,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 1.f,
-      .label = "Character Max Darkening",
-      .section = "RT Sun Shadows",
-      .tooltip = "Caps the darkest RT sun shadow on characters when Receive on characters is on. Characters lose no more than this share of sun light. Lighter shadows are unchanged, unlike Character Intensity. 1 = no cap. Environment shadows use Max Darkening.",
-      .min = 0.f,
-      .max = 1.f,
-      .format = "%.2f",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunFoliageIntensity",
-      .binding = &rtsun::g_rtsun_foliage_intensity,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 1.f,
-      .label = "Foliage Shadow Intensity",
-      .section = "RT Sun Shadows",
-      .tooltip = "How much sun light cutout foliage (leaves, grass, fences) blocks. 1 = full shadow as before; lower lets part of the sun through, like light through leaves. Characters, buildings and trunks are unchanged.",
-      .min = 0.f,
-      .max = 1.f,
-      .format = "%.2f",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunSamples",
-      .binding = &rtsun::g_rtsun_samples,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 1.f,
-      .label = "Samples",
-      .section = "RT Sun Shadows",
-      .min = 1.f,
-      .max = 10.f,
-      .format = "%d",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunRayMax",
-      .binding = &rtsun::g_rtsun_ray_max,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 100.f,
-      .label = "Max Ray Distance",
-      .section = "RT Sun Shadows",
-      .min = 1.f,
-      .max = 500.f,
-      .format = "%.0f",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunLightSize",
-      .binding = &rtsun::g_rtsun_light_size,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 0.53f,
-      .label = "Light Size (degrees)",
-      .section = "RT Sun Shadows",
-      .tooltip = "Full angular diameter of the sun (about 0.53 degrees) for soft shadows; 0 = hard.",
-      .min = 0.f,
-      .max = 5.f,
-      .format = "%.2f",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunNormalBias",
-      .binding = &rtsun::g_rtsun_normal_bias,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 0.02f,
-      .label = "Normal Bias",
-      .section = "RT Sun Shadows",
-      .min = 0.f,
-      .max = 0.5f,
-      .format = "%.3f",
-      .is_visible = visible,
-      .is_logarithmic = true,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunIsfast",
-      .binding = &rtsun::g_rtsun_isfast,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
-      .label = "IS-FAST Noise",
-      .section = "RT Sun Shadows",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtSunTraceResolution",
-      .binding = &rtsun::g_rtsun_trace_resolution,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 1.f,
-      .label = "Trace Resolution",
-      .section = "RT Sun Shadows",
-      .tooltip = "Resolution of the RT sun trace: Full = one trace pixel per pixel, Half = one per 2 x 2 block, Quarter = one per 4 x 4 block. The denoiser upsamples to full size.",
-      .labels = {"Full", "Half", "Quarter"},
-      .is_visible = visible,
-  });
-  AddSvgfRows(settings, visible, advanced, {.prefix = "RtSun", .temporal_section = "RT Sun Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's RT sun term with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes (Trace Resolution, Cascade Range, samples and the other trace settings).", .temporal_enabled = &rtsun::g_rtsun_temporal_enabled, .full_res_denoise = &rtsun::g_rtsun_full_res_denoise, .history_weight = &rtsun::g_rtsun_history_weight, .depth_rejection = &rtsun::g_rtsun_depth_rejection, .normal_rejection = &rtsun::g_rtsun_normal_rejection, .spatial_section = "RT Sun Denoising", .spatial_enabled_tooltip = "Denoises the RT sun term at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered term. Off = no filter.", .spatial_enabled = &rtsun::g_rtsun_spatial_enabled, .iterations = &rtsun::g_rtsun_svgf_iterations, .luminance_edge_stop = &rtsun::g_rtsun_svgf_luminance_edge_stop, .history_length = &rtsun::g_rtsun_svgf_history_length, .radius_scale = &rtsun::g_rtsun_svgf_radius_scale, .default_temporal_enabled = 1.f, .default_history_weight = 0.8f, .default_depth_rejection = 0.2f, .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f, .default_luminance_edge_stop = 4.f});
 }
 
 }  // namespace falcom_world

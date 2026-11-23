@@ -77,19 +77,18 @@ struct ShaderInjectData {
   // —— Local Screen Space Shadows (Bend_SSS for point/spot lights) ——
   // These eleven slots were allocated for a per-local-light screen-space shadow that
   // was never implemented; that feature is covered by the Contact Shadows local-light
-  // march (cs_contact_local_*). The first four are reserved, the next five are used by
-  // RT Sun Shadows, and the last two are cs_contact_local_bound and
-  // cs_contact_local_normal_bias. All eleven stay in place so the packoffset of every
-  // later field is unchanged.
+  // march (cs_contact_local_*). The first nine are reserved, and the last two are
+  // cs_contact_local_bound and cs_contact_local_normal_bias. All eleven stay in place so
+  // the packoffset of every later field is unchanged.
   float reserved_slot_02;              // reserved: unused slot kept so later packoffsets do not move
   float reserved_slot_03;              // reserved: unused slot kept so later packoffsets do not move
   float reserved_slot_04;              // reserved: unused slot kept so later packoffsets do not move
   float reserved_slot_05;              // reserved: unused slot kept so later packoffsets do not move
-  float rtsun_flags;                   // RT Sun Shadows bits: 1 (applied) = the lighting shader multiplies the RT sun term (t39) into the CSM visibility this draw (RunRtSunInline); 2 (receive) = characters take it too; 0 = CSM only
-  float rtsun_strength;                // RTSUN Strength [0..1]; read only while rtsun_flags is 1
-  float rtsun_max_darkening;           // RTSUN Max Darkening [0..1]: the RT sun darkening is capped at this
-  float rtsun_spare;                   // RT Sun Character Intensity [0..1]: scales the character RT term; read only while rtsun_flags is 1
-  float rtsun_char_max_darkening;      // RT Sun Character Max Darkening [0..1]: hard cap on the character RT darkening (min form); read only while rtsun_flags has the receive bit
+  float reserved_slot_06;              // reserved: unused slot kept so later packoffsets do not move
+  float reserved_slot_07;              // reserved: unused slot kept so later packoffsets do not move
+  float reserved_slot_08;              // reserved: unused slot kept so later packoffsets do not move
+  float reserved_slot_09;              // reserved: unused slot kept so later packoffsets do not move
+  float reserved_slot_10;              // reserved: unused slot kept so later packoffsets do not move
   float cs_contact_local_bound;        // runtime 0/1: t40 holds this frame's local contact term (DeployShadows)
   float cs_contact_local_normal_bias;  // [0..0.5] world units to lift the local march origin along N (contact_local.cs_5_0.hlsl)
 
@@ -721,7 +720,7 @@ struct ShaderInjectData {
   // a pre-scaled vector (the Sora/Kai 10-step march needs it to be), and the Ray
   // Length default should be set against a measured number rather than a guess.
   float char_cam_debug;
-  float rt_sun_cascades;  // 0-4 runtime, session only: sun cascade slices below this index are RT-owned and skipped by Sora 2nd shadow resolve (include/rt_sun_range.hlsli); set in SyncISFASTToShaderInjection
+  float reserved_slot_18;  // reserved: unused slot kept so later packoffsets do not move
   // Appended runtime gate; preserves all existing injection offsets.
   float rtxdi_diffuse_bound;         // 0/1: Sora 2nd t43 holds a matching staged RELAX diffuse publication this draw
   float rtxdi_debug_view;            // session-only selector; does not affect RTXDI production or history

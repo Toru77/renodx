@@ -40,6 +40,7 @@ inline float g_local_normal_bias = 0.02f;
 inline float g_local_character_normal_bias = 0.02f;
 inline float g_local_light_clearance = 0.2f;
 inline float g_sun_normal_bias = 0.02f;
+inline float g_sun_max_ray_distance = 100.f;
 inline float g_sun_character_normal_bias = 0.02f;
 inline float g_sun_casters_only = 1.f;
 inline float g_sun_shadow_darkening = 1.f;

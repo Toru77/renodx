@@ -59,7 +59,6 @@ enum PerfCost : size_t {
   kPerfPoolHooks,
   kPerfDeformHookCpu,
   kPerfRtaoRecordCpu,
-  kPerfRtsunRecordCpu,
   kPerfRtxdiInputCpu,
   kPerfRtxdiDiCpu,
   kPerfPresentWorldCpu,
@@ -70,8 +69,6 @@ enum PerfCost : size_t {
   kPerfGpuDeformRefit,
   kPerfGpuRtao,
   kPerfGpuRtaoFilter,
-  kPerfGpuRtsun,
-  kPerfGpuRtsunDenoise,
   kPerfGpuRtxdiInput,
   kPerfGpuRtxdiLocal,
   kPerfGpuRtxdiDistance,
@@ -116,7 +113,6 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"pool_hooks", false, kPerfDrawTime, false, nullptr},
     {"deform_hook_cpu", false, kPerfDrawTime, false, nullptr},
     {"rtao_record_cpu", true, kPerfDrawTime, false, nullptr},
-    {"rtsun_record_cpu", true, kPerfDrawTime, false, nullptr},
     {"rtxdi_input_cpu", true, kPerfDrawTime, false, nullptr},
     {"rtxdi_di_cpu", true, kPerfDrawTime, false, nullptr},
     {"present_world_cpu", true, kPerfBracket, false, nullptr},
@@ -127,8 +123,6 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"gpu_deform_refit", true, kPerfGpu, true, nullptr},
     {"gpu_rtao", true, kPerfGpu, true, nullptr},
     {"gpu_rtao_filter", true, kPerfGpu, true, nullptr},
-    {"gpu_rtsun", true, kPerfGpu, true, nullptr},
-    {"gpu_rtsun_denoise", true, kPerfGpu, true, nullptr},
     {"gpu_rtxdi_input", true, kPerfGpu, true, nullptr},
     {"gpu_rtxdi_local", true, kPerfGpu, true, nullptr},
     {"gpu_rtxdi_distance", true, kPerfSubset, true, "N3b distance subset"},
@@ -383,7 +377,7 @@ struct PerfTimerSample {
   uint32_t samples = 0u;
 };
 struct PerfExtraGpu {
-  PerfTimerSample rtao, rtao_filter, rtsun, rtsun_denoise, deform_refit;
+  PerfTimerSample rtao, rtao_filter, deform_refit;
   PerfTimerSample rtxdi_input, rtxdi_local, rtxdi_distance, rtxdi_nrd;
   double dxr_tlas_ms = 0.0, dxr_records_ms = 0.0, dxr_characters_ms = 0.0, gc_blas_ms = 0.0;  // D3D12 timestamp sums (rt12 panels); inside gpu_rtao, so Subset rows
   PerfTimerSample rtxdi_initial, rtxdi_temporal, rtxdi_spatial, rtxdi_sun, pt_main, pt_water;
@@ -473,8 +467,7 @@ inline PerfTotalsValue PerfTotals(const double* values) {
   // the DynCube t17 swap, so hook_outer over-counts by that nested time when RT passes or DynCube are on. Known limitation.
   const double draw_hook_outer = values[kPerfBlockRow + kPerfBlockDrawHookTotal] - values[kPerfPoolHooks] - values[kPerfDeformHookCpu];
   const double lighting_rt_outer = values[kPerfBlockRow + kPerfBlockLightingRt] - values[kPerfRtaoRecordCpu]
-                                   - values[kPerfRtsunRecordCpu] - values[kPerfRtxdiInputCpu]
-                                   - values[kPerfRtxdiDiCpu];
+                                   - values[kPerfRtxdiInputCpu] - values[kPerfRtxdiDiCpu];
   totals.hook_outer = std::max(0.0, draw_hook_outer) + std::max(0.0, lighting_rt_outer) + values[kPerfBlockRow + kPerfBlockBindHook]
                       + values[kPerfBlockRow + kPerfBlockCaptureHook] + values[kPerfBlockRow + kPerfBlockCbHooks]
                       + values[kPerfBlockRow + kPerfBlockPoolWriteHooks];
@@ -551,7 +544,6 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.cost[kPerfPoolHooks] = PerfMsOf(g_pool.cpu_hook_frame_us);
   c.cost[kPerfDeformHookCpu] = PerfMsOf(g_deform_live.cpu_frame_us);
   c.cost[kPerfRtaoRecordCpu] = PerfMsOf(g_perf_gate.rtao_record_us);
-  c.cost[kPerfRtsunRecordCpu] = PerfMsOf(g_perf_gate.rtsun_record_us);
   c.cost[kPerfRtxdiInputCpu] = PerfMsOf(g_perf_gate.rtxdi_input_cpu_us);
   c.cost[kPerfRtxdiDiCpu] = PerfMsOf(g_perf_gate.rtxdi_di_cpu_us);
   c.cost[kPerfPresentWorldCpu] = PerfMsOf(g_perf_gate.present_world_us);
@@ -568,10 +560,6 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.events[kPerfGpuRtao] = extra.rtao.samples;
   c.cost[kPerfGpuRtaoFilter] = extra.rtao_filter.ms_sum;
   c.events[kPerfGpuRtaoFilter] = extra.rtao_filter.samples;
-  c.cost[kPerfGpuRtsun] = extra.rtsun.ms_sum;
-  c.events[kPerfGpuRtsun] = extra.rtsun.samples;
-  c.cost[kPerfGpuRtsunDenoise] = extra.rtsun_denoise.ms_sum;
-  c.events[kPerfGpuRtsunDenoise] = extra.rtsun_denoise.samples;
   c.cost[kPerfGpuRtxdiInput] = extra.rtxdi_input.ms_sum;
   c.events[kPerfGpuRtxdiInput] = extra.rtxdi_input.samples;
   c.cost[kPerfGpuRtxdiLocal] = extra.rtxdi_local.ms_sum;

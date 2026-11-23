@@ -46,7 +46,7 @@ enum PerfBlock : size_t {
   kPerfBlockBindHook,           // OnPushDescriptorsWorld
   kPerfBlockPoolWriteHooks,     // NotePoolBufferWrite
   kPerfBlockRtaoInline,         // RunRtaoInline, whole (rtao_record_cpu is inside)
-  kPerfBlockLightingRt,         // the RT block of the lighting hook (snapshot, RTAO, RT sun, restore)
+  kPerfBlockLightingRt,         // the RT block of the lighting hook (snapshot, RTAO, restore)
   kPerfBlockRt12SignalFlush,    // RunRtaoPassA: fence11 signal A and ctx11 Flush
   kPerfBlockRt12Submit,         // RunRtaoPassA: D3D12 waits, ExecuteCommandLists, signal B
   kPerfBlockRt12WaitB,          // RunRtaoPassA: D3D11 wait on fence B
@@ -98,7 +98,6 @@ struct PerfGate {
   std::atomic_uint64_t present_bvh_us{0u};      // cumulative CPU time of OnWorldPresentBvh (bracket)
   std::atomic_uint64_t alpha_sync_us{0u};       // SyncLiveAlpha CPU time of the last present
   std::atomic_uint64_t rtao_record_us{0u};      // rtao::Dispatch CPU time (command recording)
-  std::atomic_uint64_t rtsun_record_us{0u};     // rtsun::Dispatch CPU time (command recording)
   std::atomic_uint64_t rtxdi_input_cpu_us{0u};  // RTXDI input validation/allocation/record/submission, nanoseconds
   std::atomic_uint64_t rtxdi_di_cpu_us{0u};     // RTXDI local-DI validation/record/submission, nanoseconds
   std::atomic_uint64_t rtxdi_attempts{0u};
