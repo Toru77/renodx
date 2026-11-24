@@ -59,10 +59,17 @@ StructuredBuffer<RtxdiLightTableEntry> g_pt_prev_light_table : register(t52);
 Texture2D<float4> g_pt_motion : register(t53);
 StructuredBuffer<uint> g_pt_previous_to_current : register(t54);
 StructuredBuffer<uint> g_pt_current_to_previous : register(t55);
+RWTexture2D<uint> g_pt_sample_id : register(u9);
 RWTexture2D<float2> g_pt_duplication_map : register(u10);
 RWTexture2D<float> g_pt_smoothed_duplication : register(u11);
+RWTexture2D<float4> g_pt_neighbor_selection_gbuffer : register(u12);
+RWByteAddressBuffer g_pt_neighbor_selection : register(u13);
+Texture2D<float> g_pt_prev_smoothed_duplication : register(t56);
+#define RTXDI_PT_SAMPLE_ID_TEXTURE g_pt_sample_id
 #define RTXDI_PT_DUPLICATION_MAP g_pt_duplication_map
 #define RTXDI_PT_SMOOTHED_DUPLICATION_MAP g_pt_smoothed_duplication
+#define RTXDI_PT_PREV_SMOOTHED_DUPLICATION_MAP g_pt_prev_smoothed_duplication
+#define RTXDI_SPATIAL_NEIGHBOR_SELECTION_BUFFER g_pt_neighbor_selection
 ConstantBuffer<PtRestirConstants> g_restir : register(b1);
 cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (48 dwords)
   uint2 g_size; uint g_frame; uint g_samples; uint g_max_bounces; uint g_roulette; uint g_roulette_min_bounce;

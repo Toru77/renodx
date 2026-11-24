@@ -2820,6 +2820,33 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RestirPtCompatibilityNeighbors",
+      .binding = &pt::g_restir_compatibility_neighbors,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 0.f,
+      .label = "Compatibility Neighbors",
+      .section = "Path Tracing Resampling",
+      .tooltip = "ReSTIR PT spatial enableSpatialHeuristicMode.",
+      .labels = {"Off", "On"},
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RestirPtDecorrelationFactor",
+      .binding = &pt::g_restir_decorrelation_factor,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.4f,
+      .label = "Decorrelation Factor",
+      .section = "Path Tracing Resampling",
+      .tooltip = "ReSTIR PT decorrelationFactor; mode and firefly replacement follow Ray Reconstruction state.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RestirPtStableLightRemap",
       .binding = &pt::g_restir_stable_light_remap,
       .value_type = SettingValueType::INTEGER,

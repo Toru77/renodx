@@ -83,6 +83,7 @@ inline float g_restir_temporal_depth_threshold = 0.1f, g_restir_temporal_normal_
 inline float g_restir_spatial_samples = 1.f, g_restir_disocclusion_boost_samples = 8.f, g_restir_spatial_radius = 32.f,
              g_restir_spatial_depth_threshold = 0.1f, g_restir_spatial_normal_threshold = 0.6f;
 inline float g_restir_boiling_filter = 1.f, g_restir_boiling_filter_strength = 0.2f;
+inline float g_restir_compatibility_neighbors = 0.f, g_restir_decorrelation_factor = 0.4f;
 inline float g_restir_stable_light_remap = 0.f;
 enum class PtReason : uint32_t { Off, DeferredContext, NeedsRtxdi, InputNotReady, DxrOff, NotCreated, NoShaderModel66,
                                  Failed, SceneMissing, Stuck, SubmitFailed, TargetFailed, Tracing, Count };

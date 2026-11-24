@@ -207,8 +207,40 @@ int2 RAB_ClampSamplePositionIntoView(int2 pixel, bool previous) {
   if (previous && g_restir.history_valid == 0u) return int2(-1, -1);
   return clamp(pixel, int2(0, 0), int2(g_size) - 1);
 }
-// Duplication map count (RestirPT.md "Duplication-Based History Reduction"); 0 until M4 binds the map.
-uint RAB_GetDuplicationMapCount(int2 pixel) { return 0u; }
+// Duplication map count (RestirPT.md "Duplication-Based History Reduction"), as in FullSample RAB_Buffers.hlsli.
+uint RAB_GetDuplicationMapCount(int2 pixel) {
+  if (any(pixel < 0) || any(pixel >= int2(g_size))) return 0u;
+  return uint(round(saturate(RTXDI_PT_DUPLICATION_MAP[pixel].x) * 255.0));
+}
+// Compatibility-guided neighbour surfaces: the dedicated G-buffer stores normal + view depth, as in FullSample
+// RAB_NeighborSelection.hlsli. World position is reconstructed from the current frame's scene matrices.
+bool RAB_GetNeighborSelectionSurface(int2 pixel, out float3 worldNormal, out float3 worldPos, out float viewDepth) {
+  worldNormal = 0.0;
+  worldPos = 0.0;
+  viewDepth = 0.0;
+  if (any(pixel < 0) || any(pixel >= int2(g_size))) return false;
+  const float4 data = g_pt_neighbor_selection_gbuffer[pixel];
+  worldNormal = data.xyz;
+  viewDepth = data.w;
+  if (!isfinite(viewDepth) || viewDepth <= 0.0 || dot(worldNormal, worldNormal) < 0.5) return false;
+  float4x4 view = (float4x4)0;
+  float4x4 inv_view_proj = (float4x4)0;
+  [unroll]
+  for (uint row = 0u; row < 4u; ++row) {
+    view[row] = asfloat(g_pt_scene.Load(int3(RTXDI_SURFACE_VIEW_ROW + row, 0, 0)));
+    inv_view_proj[row] = asfloat(g_pt_scene.Load(int3(RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + row, 0, 0)));
+  }
+  const float2 uv = (float2(pixel) + 0.5) / float2(g_size);
+  const float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  const float4 far_h = mul(inv_view_proj, float4(ndc, 1.0, 1.0));
+  if (!isfinite(far_h.w) || abs(far_h.w) <= 1e-8) return false;
+  const float3 camera = PtSceneCamera(g_pt_scene);
+  const float3 ray_direction = normalize(far_h.xyz / far_h.w - camera);
+  const float ray_depth = dot(ray_direction, -normalize(view[2].xyz));
+  if (!isfinite(ray_depth) || ray_depth <= 1e-6) return false;
+  worldPos = camera + ray_direction * (viewDepth / ray_depth);
+  return all(isfinite(worldPos));
+}
 void RAB_LastBounceDenoiserCallback(float3 lightPos, RAB_Surface surface, inout RAB_PathTracerUserData ptud) {}
 void RAB_ReconnectionDenoiserCallback(RTXDI_PTReservoir reservoir, RAB_Surface surface, inout RAB_PathTracerUserData ptud) {}
 

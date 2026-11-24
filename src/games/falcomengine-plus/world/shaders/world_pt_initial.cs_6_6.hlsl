@@ -24,6 +24,9 @@ void main(uint3 id : SV_DispatchThreadID) {
                                g_restir.restir.bufferIndices.initialPathTracerPreservedBufferIndex);
       }
       PtCount(8u);
+      if (g_restir.restir.spatialResampling.enableSpatialHeuristicMode != 0u) {
+        g_pt_neighbor_selection_gbuffer[id.xy] = float4(0, 0, 0, 0);
+      }
       g_pt_diffuse[id.xy] = float4(0, 0, 0, 1);
       g_pt_specular[id.xy] = float4(0, 0, 0, 1e-3);
       return;
@@ -31,8 +34,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     PtCount(7u);
   }
 #endif
+  const bool needs_neighbor_selection_gbuffer = g_restir.restir.spatialResampling.enableSpatialHeuristicMode != 0u;
   const RAB_Surface surface = RAB_GetGBufferSurface(id.xy, false);
   if (!RAB_IsSurfaceValid(surface)) {
+    if (needs_neighbor_selection_gbuffer) g_pt_neighbor_selection_gbuffer[id.xy] = float4(0, 0, 0, 0);
     RTXDI_StorePTReservoir(RTXDI_EmptyPTReservoir(), g_restir.restir.reservoirBuffer, id.xy,
                            g_restir.restir.bufferIndices.initialPathTracerOutputBufferIndex);
     if (RTXDI_PTNeedsPreservedInitialSample(g_restir.restir.decorrelation)) {
@@ -62,4 +67,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (reservoir.pathLength == 2u) PtCount(22u);
   if (reservoir.pathLength >= 3u) PtCount(23u);
   if (isinf(reservoir.radiance.x)) PtCount(24u);
+  if (needs_neighbor_selection_gbuffer) {
+    g_pt_neighbor_selection_gbuffer[id.xy] = float4(RAB_GetSurfaceNormal(surface), surface.viewDepth);
+  }
 }

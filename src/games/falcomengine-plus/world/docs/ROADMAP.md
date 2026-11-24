@@ -25,6 +25,8 @@ Unified PT M1: RTXDI ReSTIR PT initial sampling and final shading replace the pl
 
 Unified PT M3: RTXDI ReSTIR PT temporal and spatial reuse run between initial sampling and final shading, with a boiling filter, previous-frame surfaces and motion, a PT-owned configuration generation, and history rejection on cache, sparse and identity changes. Sparse-unselected pixels write an empty reservoir and skip both reuse passes. `prevPrevCameraPos = prevCameraPos` because no third scene slot is kept; this only feeds the footprint-threshold jitter. Not validated in game.
 
+Unified PT M4: duplication maps count spatially shared samples and smooth reservoir stagnancy for decorrelation, and compatibility-guided spatial neighbours are preselected from a dedicated G-buffer. Decorrelation mode and firefly replacement follow the SDK's Ray Reconstruction defaults; sparse-unselected pixels write sample ID 0. Not validated in game.
+
 PT M0: SHARC 1.8.3 vendored (`world/sharc/vendor`), licences moved to `licenses/`, SM 6.6 support reported on the DXR panel line and in `world_rt12.json`; no behaviour change. Not validated in game.
 
 PT M1: Sora 2nd diffuse path tracing uses the DXR scene, the game sun and RTXDI Local lamps, and the ambient probe on ray misses; its settings and status are available in the Path Tracing section. Output is raw unless Ray Reconstruction is enabled. It needs RTXDI Local (scene transfer and lamps) and works with RTXDI Sun off; sun light at path vertices comes from scene constants and the path tracer's own shadow rays. Not validated in game.

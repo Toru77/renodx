@@ -8,6 +8,8 @@
 #include <Rtxdi/Utils/RandomSamplerPerPassSeeds.hlsli>
 #include <Rtxdi/PT/TemporalResampling.hlsli>
 #include <Rtxdi/PT/BoilingFilter.hlsli>
+#include <Rtxdi/PT/DuplicationMap.hlsli>
+#include <Rtxdi/PT/Decorrelation.hlsli>
 
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint3 group_id : SV_GroupThreadID) {
@@ -17,6 +19,10 @@ void main(uint3 id : SV_DispatchThreadID, uint3 group_id : SV_GroupThreadID) {
   if (in_bounds) {
     if (g_sparse_enabled != 0u && g_sparse_levels < 256u && !PtSparseSelected(pixel)) {
       PtCount(8u);
+      if (RTXDI_PTNeedsDuplicationInputs(g_restir.restir.bufferIndices.temporalResamplingOutputBufferIndex, g_restir.restir)) {
+        RTXDI_PT_SAMPLE_ID_TEXTURE[pixel] = 0u;
+        RTXDI_PT_DUPLICATION_MAP[pixel].y = 0.0;
+      }
     } else {
       const RAB_Surface surface = RAB_GetGBufferSurface(pixel, false);
       if (RAB_IsSurfaceValid(surface)) {
@@ -63,6 +69,9 @@ void main(uint3 id : SV_DispatchThreadID, uint3 group_id : SV_GroupThreadID) {
     RTXDI_PTBoilingFilter(group_id.xy, g_restir.restir.boilingFilter.boilingFilterStrength, reservoir);
   }
   if (in_bounds) {
+    if (RTXDI_PTNeedsDuplicationInputs(g_restir.restir.bufferIndices.temporalResamplingOutputBufferIndex, g_restir.restir)) {
+      RTXDI_PTStoreDuplicationInputs(pixel, reservoir);
+    }
     RTXDI_StorePTReservoir(reservoir, g_restir.restir.reservoirBuffer, pixel,
                            g_restir.restir.bufferIndices.temporalResamplingOutputBufferIndex);
   }

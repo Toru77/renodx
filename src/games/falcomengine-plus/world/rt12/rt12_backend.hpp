@@ -387,7 +387,7 @@ struct Rt12DiTransferState {
 };
 
 // Path tracing (world/pt): its own submission slots, list, root signature, PSOs, descriptors and outputs.
-inline constexpr uint32_t kRt12PtDescriptors = 45u;
+inline constexpr uint32_t kRt12PtDescriptors = 49u;
 inline constexpr uint32_t kRt12PtConstants = 52u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
 inline constexpr uint32_t kRt12PtCounters = 30u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
 inline constexpr uint32_t kRt12ReGirDescriptors = 5u;
@@ -421,8 +421,11 @@ struct Rt12PtState {
   Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> initial_pso, final_pso;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> temporal_pso, spatial_pso;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> duplication_pso, smoothed_duplication_pso, neighbor_selection_pso;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> water_initial_pso, water_final_pso;
   Microsoft::WRL::ComPtr<ID3D12Resource> reservoirs;
+  Microsoft::WRL::ComPtr<ID3D12Resource> sample_id, duplication_map, smoothed_duplication[2];
+  Microsoft::WRL::ComPtr<ID3D12Resource> neighbor_selection_gbuffer, neighbor_selection;
   Microsoft::WRL::ComPtr<ID3D12Resource> neighbors;
   Microsoft::WRL::ComPtr<ID3D12Resource> constants[kRt12Slots];
   uint64_t reservoirs_last_use = 0u;
