@@ -11596,7 +11596,8 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   reshade::api::resource_view pt_debug_views[3] = {};
   const reshade::api::resource_view view = rt12::RunPtTrace(cmd_list->get_device(), cmd_list, input.transfer_slot, lamps,
                                                             dd->isfast_noise_srv, pt_debug_view, pt_sun_detail_view,
-                                                            &reflection_view, pt_debug_views);
+                                                            &reflection_view, pt_debug_views,
+                                                            static_cast<uint32_t>(di_snapshot.status));
   if (view.handle == 0u) return;
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, kLightingPtRegister, 0u, 1u,

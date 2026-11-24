@@ -63,10 +63,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     RTXDI_StorePTReservoir(reservoir, g_restir.restir.reservoirBuffer, id.xy,
                            g_restir.restir.bufferIndices.initialPathTracerPreservedBufferIndex);
   }
-  PtCount(21u);
-  if (reservoir.pathLength == 2u) PtCount(22u);
-  if (reservoir.pathLength >= 3u) PtCount(23u);
-  if (isinf(reservoir.radiance.x)) PtCount(24u);
+  if (RTXDI_IsValidPTReservoir(reservoir)) {
+    PtCount(21u);
+    if (reservoir.pathLength == 2u) PtCount(22u);
+    if (reservoir.pathLength >= 3u) PtCount(23u);
+    if (isinf(reservoir.radiance.x)) PtCount(24u);
+  }
   if (needs_neighbor_selection_gbuffer) {
     g_pt_neighbor_selection_gbuffer[id.xy] = float4(RAB_GetSurfaceNormal(surface), surface.viewDepth);
   }

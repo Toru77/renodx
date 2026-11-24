@@ -142,7 +142,8 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (direct) debug_status_word |= RTXDI_N1_STATUS_KNOWN_BIT;
 
   // Indicator split of the same estimator: intensity scales the indirect part only, and only while direct is on.
-  if (reservoir.pathLength > 2u && g_restir.direct_enabled != 0u) {
+  // Direct light is only the d = 2 primary-NEE sample (A10); first-bounce SHARC and sky paths are indirect.
+  if (!(isinf(reservoir.radiance.x) && reservoir.rcVertexLength == 2u) && g_restir.direct_enabled != 0u) {
     const float scale = character ? g_restir.pt_char_intensity : g_restir.pt_intensity;
     diffuse *= scale;
     specular *= scale;
@@ -152,7 +153,8 @@ void main(uint3 id : SV_DispatchThreadID) {
   specular = PtInvalidPixelGuard(DemodulateSpecular(surface.material.specularF0, specular));
 
 #if defined(PT_WATER_SURFACE)
-  if (g_sharc_enabled != 0u && reservoir.rcVertexLength == reservoir.pathLength && !isinf(reservoir.radiance.x)) PtCount(26u);
+  if (RTXDI_IsValidPTReservoir(reservoir) && g_sharc_enabled != 0u && reservoir.rcVertexLength == reservoir.pathLength
+      && !isinf(reservoir.radiance.x)) PtCount(26u);
   float3 rgb = g_refl_sample_clamp > 0.0 ? min(specular, g_refl_sample_clamp) : specular;
   rgb = rgb * g_refl_intensity;
   if ((g_refl_flags & 1u) != 0u) rgb = min(rgb, 1.0);
@@ -163,7 +165,8 @@ void main(uint3 id : SV_DispatchThreadID) {
   const float sparse_scale = (g_refl_flags & 32u) != 0u && g_sparse_enabled != 0u && g_sparse_levels < 256u
       ? 256.0 / float(g_sparse_levels) : 1.0;
   g_pt_diffuse[id.xy] = float4(PtInvalidPixelGuard(diffuse * sparse_scale), 1.0);
-  if (g_sharc_enabled != 0u && reservoir.rcVertexLength == reservoir.pathLength && !isinf(reservoir.radiance.x)) PtCount(26u);
+  if (RTXDI_IsValidPTReservoir(reservoir) && g_sharc_enabled != 0u && reservoir.rcVertexLength == reservoir.pathLength
+      && !isinf(reservoir.radiance.x)) PtCount(26u);
   if (g_refl_samples == 0u) {
     g_pt_specular[id.xy] = float4(0, 0, 0, 0);
   } else if (character) {

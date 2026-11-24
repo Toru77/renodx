@@ -288,6 +288,31 @@ struct Rt12DiTransferState {
 
 // Path tracing (world/pt): its own submission slots, list, root signature, PSOs, descriptors and outputs.
 inline constexpr uint32_t kRt12PtDescriptors = 54u;
+
+// PT root-table ranges (register base, count, table offset, UAV); the root signature and the water descriptor copy use this.
+struct Rt12PtRange { uint32_t base, count, offset; bool uav; };
+inline constexpr Rt12PtRange kRt12PtRanges[] = {
+    {0u, 4u, 0u, false},  {14u, 3u, 4u, false}, {29u, 1u, 7u, false},  {30u, 1u, 8u, false},  {31u, 5u, 9u, false},
+    {0u, 4u, 14u, true},  {36u, 4u, 18u, false}, {4u, 4u, 22u, true},  {40u, 3u, 26u, false}, {8u, 1u, 29u, true},
+    {43u, 13u, 30u, false}, {10u, 2u, 43u, true}, {9u, 1u, 45u, true}, {12u, 2u, 46u, true}, {56u, 1u, 48u, false},
+    {57u, 1u, 49u, false}, {14u, 3u, 50u, true}};
+static_assert([] {
+  uint32_t next = 0u;
+  for (const Rt12PtRange& range : kRt12PtRanges) {
+    if (range.offset != next || range.count == 0u) return false;
+    next += range.count;
+  }
+  return next <= kRt12PtDescriptors;
+}(), "kRt12PtRanges must be contiguous from 0 and fit kRt12PtDescriptors");
+constexpr uint32_t kRt12PtUsedDescriptors =
+    kRt12PtRanges[std::size(kRt12PtRanges) - 1].offset + kRt12PtRanges[std::size(kRt12PtRanges) - 1].count;
+// True when PT heap slot `index` is a UAV in kRt12PtRanges (the root signature, descriptor writes and the water copy).
+inline bool Rt12PtDescriptorIsUav(uint32_t index) {
+  for (const Rt12PtRange& range : kRt12PtRanges) {
+    if (index >= range.offset && index < range.offset + range.count) return range.uav;
+  }
+  return false;
+}
 inline constexpr uint32_t kRt12PtConstants = 52u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
 inline constexpr uint32_t kRt12PtCounters = 33u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
 inline constexpr uint32_t kRt12ReGirDescriptors = 5u;

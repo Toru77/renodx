@@ -32,7 +32,6 @@ struct DiSubmissionIdentity {
   bool local_requested = false;
   bool input_ready = false;
   bool transfer_available = false;
-  bool reservoir_available = false;
 };
 
 inline DiSubmissionGate CheckDiSubmissionIdentity(const DiSubmissionIdentity& input) {
@@ -44,7 +43,7 @@ inline DiSubmissionGate CheckDiSubmissionIdentity(const DiSubmissionIdentity& in
       || input.requested_fence != input.transfer_fence) return DiSubmissionGate::StaleIdentity;
   if (input.requested_width == 0u || input.requested_height == 0u || input.requested_width != input.config_width
       || input.requested_height != input.config_height) return DiSubmissionGate::ConfigurationMismatch;
-  if (!input.transfer_available || !input.reservoir_available) return DiSubmissionGate::Busy;
+  if (!input.transfer_available) return DiSubmissionGate::Busy;
   return DiSubmissionGate::Ready;
 }
 

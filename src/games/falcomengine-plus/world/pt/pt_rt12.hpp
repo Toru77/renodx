@@ -19,7 +19,7 @@ namespace falcom_world::rt12 {
 inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, reshade::api::command_list* cmd_list,
                                               int32_t transfer_slot, bool lamps, reshade::api::resource_view isfast_view, uint32_t debug_view, uint32_t sun_detail_view,
                                                reshade::api::resource_view* reflection_view,
-                                               reshade::api::resource_view* debug_views) {
+                                               reshade::api::resource_view* debug_views, uint32_t light_table_status) {
   *reflection_view = reshade::api::resource_view{0u};
   debug_views[0] = debug_views[1] = debug_views[2] = reshade::api::resource_view{0u};
   using Microsoft::WRL::ComPtr;
@@ -98,24 +98,21 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (FAILED(hr)) return fail("pt water list", hr);
     hr = r.water_list->Close();
     if (FAILED(hr)) return fail("pt water close", hr);
-    // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u8 | t40 | t41-t42 | t43-t55 | u10-u11
-    // | u9 | u12-u13 | t56 | t57 | u14-u16.
-    const UINT counts[17] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 5u, 1u, 2u, 13u, 2u, 1u, 2u, 1u, 1u, 3u};
-    const UINT bases[17] = {0u, 14u, 29u, 30u, 31u, 0u, 36u, 4u, 40u, 41u, 43u, 10u, 9u, 12u, 56u, 57u, 14u};
-    const UINT offsets[17] = {0u, 4u, 7u, 8u, 9u, 14u, 18u, 22u, 27u, 28u, 30u, 43u, 45u, 46u, 48u, 49u, 50u};
-    D3D12_DESCRIPTOR_RANGE ranges[17] = {};
-    for (uint32_t i = 0u; i < 17u; ++i) {
-      ranges[i].RangeType = (i == 5u || i == 7u || i == 11u || i == 12u || i == 13u || i == 16u)
-                                ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-      ranges[i].NumDescriptors = counts[i];
-      ranges[i].BaseShaderRegister = bases[i];
-      ranges[i].OffsetInDescriptorsFromTableStart = offsets[i];
+    // Table (kRt12PtRanges): t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u7 | t40-t42 | u8 | t43-t55
+    // | u10-u11 | u9 | u12-u13 | t56 | t57 | u14-u16.
+    D3D12_DESCRIPTOR_RANGE ranges[std::size(kRt12PtRanges)] = {};
+    for (uint32_t i = 0u; i < std::size(kRt12PtRanges); ++i) {
+      const Rt12PtRange& range = kRt12PtRanges[i];
+      ranges[i].RangeType = range.uav ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      ranges[i].NumDescriptors = range.count;
+      ranges[i].BaseShaderRegister = range.base;
+      ranges[i].OffsetInDescriptorsFromTableStart = range.offset;
     }
     D3D12_ROOT_PARAMETER params[3] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.Num32BitValues = kRt12PtConstants;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable.NumDescriptorRanges = 17u;
+    params[1].DescriptorTable.NumDescriptorRanges = static_cast<UINT>(std::size(kRt12PtRanges));
     params[1].DescriptorTable.pDescriptorRanges = ranges;
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[2].Descriptor.ShaderRegister = 1u;
@@ -918,7 +915,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     handle.ptr += static_cast<SIZE_T>(index) * s.descriptor_size;
     return handle;
   };
+  uint32_t layout_mismatch = 0u;
   const auto set_srv = [&](uint32_t index, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view) {
+    if (Rt12PtDescriptorIsUav(index) != false) layout_mismatch = index + 1u;
     device12->CreateShaderResourceView(resource, &view, cpu_at(base + index));
     r.water_frame_inputs.srv_descs[index] = view;
     r.water_frame_inputs.resources[index] = resource;
@@ -941,6 +940,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   tlas_srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
   tlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   tlas_srv.RaytracingAccelerationStructure.Location = scene.tlas->GetGPUVirtualAddress();
+  if (Rt12PtDescriptorIsUav(7u) != false) layout_mismatch = 7u + 1u;
   device12->CreateShaderResourceView(nullptr, &tlas_srv, cpu_at(base + 7u));
   r.water_frame_inputs.srv_descs[7u] = tlas_srv;
   r.water_frame_inputs.tlas = scene.tlas;
@@ -951,11 +951,14 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_srv(12u, lights, Rt12BufferSrv(RTXDI_INPUT_LIGHT_STRIDE, lamps_on ? input.light_count : 1u));
   set_srv(13u, light_table, Rt12BufferSrv(sizeof(RtxdiLightTableEntry), RTXDI_LIGHT_TABLE_CAPACITY));
   const D3D12_UNORDERED_ACCESS_VIEW_DESC out_uav = Rt12TextureUav(DXGI_FORMAT_R16G16B16A16_FLOAT);
+  if (Rt12PtDescriptorIsUav(14u) != true) layout_mismatch = 14u + 1u;
   device12->CreateUnorderedAccessView(out.texture12.Get(), nullptr, &out_uav, cpu_at(base + 14u));
   r.water_frame_inputs.uav_descs[14u] = out_uav;
+  if (Rt12PtDescriptorIsUav(25u) != true) layout_mismatch = 25u + 1u;
   device12->CreateUnorderedAccessView(refl_on ? refl.texture12.Get() : nullptr, nullptr, &out_uav, cpu_at(base + 25u));
   r.water_frame_inputs.uav_descs[25u] = out_uav;
   const auto set_buffer_uav = [&](uint32_t index, ID3D12Resource* resource, uint32_t stride) {
+    if (Rt12PtDescriptorIsUav(index) != true) layout_mismatch = index + 1u;
     D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
     view.Format = DXGI_FORMAT_UNKNOWN;
     view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -998,6 +1001,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_srv(41u, input.previous_to_current.Get(), Rt12BufferSrv(sizeof(uint32_t), RTXDI_LIGHT_TABLE_CAPACITY));
   set_srv(42u, input.current_to_previous.Get(), Rt12BufferSrv(sizeof(uint32_t), RTXDI_LIGHT_TABLE_CAPACITY));
   const auto set_texture_uav = [&](uint32_t index, ID3D12Resource* resource, DXGI_FORMAT format) {
+    if (Rt12PtDescriptorIsUav(index) != true) layout_mismatch = index + 1u;
     D3D12_UNORDERED_ACCESS_VIEW_DESC view = Rt12TextureUav(format);
     device12->CreateUnorderedAccessView(resource, nullptr, &view, cpu_at(base + index));
     r.water_frame_inputs.uav_descs[index] = view;
@@ -1012,6 +1016,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   neighbor_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
   neighbor_uav.Buffer.NumElements = static_cast<UINT>(uint64_t{w} * h * 4u);
   neighbor_uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+  if (Rt12PtDescriptorIsUav(47u) != true) layout_mismatch = 47u + 1u;
   device12->CreateUnorderedAccessView(r.neighbor_selection.Get(), nullptr, &neighbor_uav, cpu_at(base + 47u));
   r.water_frame_inputs.uav_descs[47u] = neighbor_uav;
   r.water_frame_inputs.resources[47u] = r.neighbor_selection;
@@ -1027,10 +1032,12 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   reservoir_uav.Buffer.NumElements = r.restir->GetReservoirBufferParameters().reservoirArrayPitch
                                      * ::rtxdi::c_NumReSTIRPTReservoirBuffers;
   reservoir_uav.Buffer.StructureByteStride = sizeof(RTXDI_PackedPTReservoir);
+  if (Rt12PtDescriptorIsUav(29u) != true) layout_mismatch = 29u + 1u;
   device12->CreateUnorderedAccessView(r.reservoirs.Get(), nullptr, &reservoir_uav, cpu_at(base + 29u));
   r.water_frame_inputs.uav_descs[29u] = reservoir_uav;
   r.water_frame_inputs.resources[29u] = r.reservoirs;
   const auto set_material_uav = [&](uint32_t index, ID3D12Resource* resource, uint32_t stride, uint32_t count) {
+    if (Rt12PtDescriptorIsUav(index) != true) layout_mismatch = index + 1u;
     D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
     view.Format = DXGI_FORMAT_UNKNOWN;
     view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -1043,6 +1050,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_material_uav(22u, mat_on ? r.material_keys.Get() : nullptr, 8u, mat_on ? r.material_capacity : 1u);
   set_material_uav(23u, mat_on ? r.material_values.Get() : nullptr, 4u, mat_on ? r.material_capacity * 4u : 1u);
   set_material_uav(24u, r.counters[k].Get(), 4u, kRt12PtCounters);
+  if (layout_mismatch != 0u) return fail("pt descriptor layout", static_cast<HRESULT>(0x80000000u | (layout_mismatch - 1u)));
   ID3D12Resource* const material_buffers[] = {mat_on ? r.material_keys.Get() : nullptr, mat_on ? r.material_values.Get() : nullptr};
   ID3D12Resource* const material_reads[] = {gbuf_on ? input.color.texture12.Get() : nullptr, gbuf_on ? input.mrt1.texture12.Get() : nullptr,
                                             gbuf_on ? input.mrt2.texture12.Get() : nullptr, deferred};
@@ -1739,6 +1747,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   {
     std::lock_guard lock(pt::g_pt_panel_mutex);
     pt::g_pt_panel.lamps = lamps_on ? input.light_count : 0u;
+    pt::g_pt_panel.resampling_mode = resampling_mode;
+    pt::g_pt_panel.direct_enabled = restir_constants.direct_enabled != 0u;
+    pt::g_pt_panel.light_table_status = light_table_status;
     pt::g_pt_panel.width = w;
     pt::g_pt_panel.height = h;
     pt::g_pt_panel.sparse_policy = sparse_policy;
@@ -2036,9 +2047,9 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   // keys and values); the water dispatch does not write them, since the material write and SHARC update passes never run here.
   const uint32_t water_prev_slot = r.water_history_slot;
   const bool water_history = r.water_history_valid;
-  for (uint32_t i = 0u; i < kRt12PtDescriptors; ++i) {
+  for (uint32_t i = 0u; i < kRt12PtUsedDescriptors; ++i) {
     const D3D12_CPU_DESCRIPTOR_HANDLE handle = cpu_at(base + i);
-    const bool uav_index = (i >= 14u && i <= 17u) || (i >= 22u && i <= 25u) || i == 29u || (i >= 43u && i <= 47u);
+    const bool uav_index = Rt12PtDescriptorIsUav(i);
     if (!uav_index) {
       ID3D12Resource* resource = in.resources[i].Get();
       D3D12_SHADER_RESOURCE_VIEW_DESC view = in.srv_descs[i];
@@ -2069,6 +2080,10 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
         resource = r.water_smoothed_duplication[(frame + 1u) & 1u].Get();
         view = Rt12TextureSrv(DXGI_FORMAT_R32_FLOAT);
       }
+      if (view.ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN) {
+        FailSession(s, Rt12Reason::CreateFailed, "pt water descriptor", static_cast<HRESULT>(0x80000000u | i));
+        return fallback("resources");
+      }
       device12->CreateShaderResourceView(resource, &view, handle);
     } else {
       ID3D12Resource* resource = nullptr;
@@ -2086,6 +2101,11 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
       if (i == 45u) resource = r.water_sample_id.Get();
       if (i == 46u) resource = r.water_neighbor_selection_gbuffer.Get();
       if (i == 47u) resource = r.water_neighbor_selection.Get();
+      if (i >= 50u && i <= 52u) resource = nullptr;
+      if (view.ViewDimension == D3D12_UAV_DIMENSION_UNKNOWN) {
+        FailSession(s, Rt12Reason::CreateFailed, "pt water descriptor", static_cast<HRESULT>(0x80000000u | i));
+        return fallback("resources");
+      }
       device12->CreateUnorderedAccessView(resource, nullptr, &view, handle);
     }
   }

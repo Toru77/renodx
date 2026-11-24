@@ -163,6 +163,9 @@ struct PtPanel {
   uint64_t gpu_frame = 0u;
   bool gpu_available = false, sparse_sample_active = false;
   uint32_t lamps = 0u, width = 0u, height = 0u;
+  uint32_t resampling_mode = 0u;
+  bool direct_enabled = false;
+  uint32_t light_table_status = 0u;
 };
 inline std::mutex g_pt_panel_mutex;
 inline PtPanel g_pt_panel;

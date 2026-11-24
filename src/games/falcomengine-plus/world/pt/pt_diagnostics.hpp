@@ -1,9 +1,11 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <sstream>
 #include <string>
 #include <vector>
 #include "../../../../utils/log.hpp"
+#include "../rtxdi/rtxdi_state.hpp"
 #include "pt_state.hpp"
 namespace falcom_world::pt {
 inline void SetPtDiagnosticCapture(bool enabled) {
@@ -42,6 +44,10 @@ inline std::string SerializePtReport() {
   out << "reason: " << PtReasonName(p.reason) << "\n";
   out << "traced: " << p.frames[static_cast<uint32_t>(PtReason::Tracing)] << "\n";
   out << "lamps: " << p.lamps << "\n";
+  static const char* resampling_names[] = {"None", "Temporal", "Spatial", "Temporal+Spatial"};
+  out << "resampling: " << resampling_names[(std::clamp)(p.resampling_mode, 0u, 3u)]
+      << " | direct: " << (p.direct_enabled ? "on" : "off")
+      << " | light table: " << rtxdi::DiStatusName(static_cast<rtxdi::DiStatus>(p.light_table_status)) << "\n";
   out << "width: " << p.width << "\n";
   out << "height: " << p.height << "\n";
   out << "sparse requested mode: " << (!p.sparse_requested ? "off" : p.sparse_adaptive ? "adaptive" : "fixed") << "\n";

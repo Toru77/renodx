@@ -49,6 +49,10 @@ Unified PT M7: the dead RTXDI local DI, sun and N1/N3/N4 producers and their t41
 
 Unified PT A9: restored the M7-deleted lamp diffuse accumulation in the r20.y branch (interiors with PT off), scalar-only PtRestirConstants padding, a stale-size guard for PT reservoirs, and device-removed reasons in PT failure logs. Not validated in game.
 
+Unified PT A10: light-table gate no longer requires the deleted DI reservoir (lamps reach PT again), water descriptor copy uses the shared PT range table (debug UAV slots 50–52 crashed the water pass), valid-only counters, intensity on all indirect light. Not validated in game.
+
+Unified PT A11: PT root-signature ranges at heap 22–29 disagreed with the heap since M1 (u8 bound to the noise SRV); one range table now drives the root signature, the descriptor writes (runtime-checked) and the water copy. Not validated in game.
+
 ReGIR M4c introduces default-Off GPU pool construction from primary surfaces and lookup at actual path-traced hit positions, falling back to uniform sampling when the current pool is unavailable or invalid. Its discrete mixture PMF assumes an equiprobable 24-bit input; CPU fixtures and GPU readback cover the shared selector, registration reconstruction/deduplication/overflow, reordered two-light weights/build, zero lights, invalid headers, invalid lights, and over-capacity counts; they do not establish game RNG statistics. Runtime diagnostics asynchronously report registered and valid cells and rejected and overflow positions when a readback completes. The CPU identity mismatch matrix does not exercise the production RunPtTrace/RunPtWaterTrace identity gate or bindings. Independent source review of identity, bindings, fallback, barriers, fence publication, last-use extension, quarantine, and teardown is complete; the three P2 blockers identified by review have been corrected and independently re-checked. Production runtime validation of main/water behavior and stale fallback, fence failure injection, and owner in-game validation remain deferred.
 
 

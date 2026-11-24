@@ -723,8 +723,7 @@ int main() {
                                             .config_height = 9u,
                                             .local_requested = true,
                                             .input_ready = true,
-                                            .transfer_available = true,
-                                            .reservoir_available = true};
+                                            .transfer_available = true};
   auto stale_di_identity = di_identity;
   stale_di_identity.transfer_frame++;
   auto stale_di_scene = di_identity;
@@ -739,8 +738,6 @@ int main() {
   config_di_mismatch.config_height++;
   auto busy_transfer = di_identity;
   busy_transfer.transfer_available = false;
-  auto busy_reservoir = di_identity;
-  busy_reservoir.reservoir_available = false;
   auto waiting_di_input = di_identity;
   waiting_di_input.input_ready = false;
   if (CheckDiSubmissionIdentity(di_identity) != DiSubmissionGate::Ready
@@ -751,7 +748,6 @@ int main() {
       || CheckDiSubmissionIdentity(resize_di_config) != DiSubmissionGate::ConfigurationMismatch
       || CheckDiSubmissionIdentity(config_di_mismatch) != DiSubmissionGate::ConfigurationMismatch
       || CheckDiSubmissionIdentity(busy_transfer) != DiSubmissionGate::Busy
-      || CheckDiSubmissionIdentity(busy_reservoir) != DiSubmissionGate::Busy
       || CheckDiSubmissionIdentity(waiting_di_input) != DiSubmissionGate::WaitingInput
       || DiPostSubmitSignalDisposition(true, true) != DiSignalDisposition::KeepSession
       || DiPostSubmitSignalDisposition(false, false) != DiSignalDisposition::KeepSession
