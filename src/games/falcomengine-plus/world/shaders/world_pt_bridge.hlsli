@@ -203,6 +203,19 @@ RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
   return s;
 }
 
+#if defined(PT_WATER_SURFACE)
+// Camera-only reprojection for the SSR-time water surface (RTV4 has no water motion), as the SSR shaders do with the
+// previous view-projection (README "Motion vectors versus camera reprojection").
+float2 PtWaterCameraMotion(uint2 pixel, float3 world_position) {
+  const float4x4 previous_view_projection = float4x4(
+      asfloat(g_pt_prev_scene.Load(int3(16u, 0, 0))), asfloat(g_pt_prev_scene.Load(int3(17u, 0, 0))),
+      asfloat(g_pt_prev_scene.Load(int3(18u, 0, 0))), asfloat(g_pt_prev_scene.Load(int3(19u, 0, 0))));
+  const float4 clip = mul(previous_view_projection, float4(world_position, 1.0));
+  const float2 uv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
+  return uv * float2(g_size) - 0.5 - float2(pixel);
+}
+#endif
+
 int2 RAB_ClampSamplePositionIntoView(int2 pixel, bool previous) {
   if (previous && g_restir.history_valid == 0u) return int2(-1, -1);
   return clamp(pixel, int2(0, 0), int2(g_size) - 1);

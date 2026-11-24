@@ -422,14 +422,20 @@ struct Rt12PtState {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> initial_pso, final_pso;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> temporal_pso, spatial_pso;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> duplication_pso, smoothed_duplication_pso, neighbor_selection_pso;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> water_initial_pso, water_final_pso;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> water_initial_pso, water_temporal_pso, water_spatial_pso, water_final_pso;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> water_neighbor_selection_pso, water_duplication_pso,
+      water_smoothed_duplication_pso;
   Microsoft::WRL::ComPtr<ID3D12Resource> reservoirs;
   Microsoft::WRL::ComPtr<ID3D12Resource> sample_id, duplication_map, smoothed_duplication[2];
   Microsoft::WRL::ComPtr<ID3D12Resource> neighbor_selection_gbuffer, neighbor_selection;
   Microsoft::WRL::ComPtr<ID3D12Resource> neighbors;
   Microsoft::WRL::ComPtr<ID3D12Resource> constants[kRt12Slots];
   uint64_t reservoirs_last_use = 0u;
+  std::unique_ptr<::rtxdi::ReSTIRPTContext> water_restir;
+  uint32_t water_restir_width = 0u, water_restir_height = 0u;
   Microsoft::WRL::ComPtr<ID3D12Resource> water_reservoirs;
+  Microsoft::WRL::ComPtr<ID3D12Resource> water_sample_id, water_duplication_map, water_smoothed_duplication[2];
+  Microsoft::WRL::ComPtr<ID3D12Resource> water_neighbor_selection_gbuffer, water_neighbor_selection;
   Microsoft::WRL::ComPtr<ID3D12Resource> water_constants[kRt12Slots];
   uint64_t water_reservoirs_last_use = 0u;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> regir_root;
@@ -461,6 +467,12 @@ struct Rt12PtState {
   int32_t water_input_slot = -1, water_scene_slot = -1;  // transfer and scene slots of that trace (checked before the water submission)
   uint32_t water_params[kRt12PtConstants] = {};
   Rt12PtWaterFrame water_frame_inputs;  // descriptor inputs of the frame in water_frame (reset by each main trace)
+  uint32_t water_history_frame = UINT32_MAX, water_history_width = 0u, water_history_height = 0u;
+  uint32_t water_history_slot = 0u, water_history_scene_slot = 0u;
+  int32_t water_history_transfer_slot = -1;
+  uint64_t water_history_owner_generation = 0u, water_history_configuration_generation = 0u,
+           water_history_cache_epoch = 0u;
+  bool water_history_valid = false;
   // Water counters (own buffers and readbacks, same rules as the main counters; frame order is water_counter_published_frame).
   Microsoft::WRL::ComPtr<ID3D12Resource> water_counters[kRt12Slots], water_counter_readback[kRt12Slots];
   uint64_t water_counter_fence[kRt12Slots] = {};

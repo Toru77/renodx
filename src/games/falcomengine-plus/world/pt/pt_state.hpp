@@ -139,8 +139,11 @@ struct PtPanel {
   uint32_t gpu_initial_valid = 0u, gpu_path_len2 = 0u, gpu_path_len3plus = 0u, gpu_nee_connected = 0u;
   uint32_t gpu_sharc_terminated = 0u, gpu_sharc_terminal_rc = 0u, gpu_sharc_replay_rejected = 0u;
   uint32_t temporal_selected = 0u, spatial_selected = 0u;
+  uint32_t water_temporal_selected = 0u, water_spatial_selected = 0u;
   bool history_valid = false;
   const char* history_reason = "none";
+  bool water_history_valid = false;
+  const char* water_history_reason = "none";
   uint32_t regir_fallback_disabled = 0u, regir_fallback_key = 0u, regir_fallback_miss = 0u;
   uint32_t regir_fallback_header = 0u, regir_fallback_slots = 0u;
   uint32_t regir_water_eligible = 0u, regir_water_lookups = 0u, regir_water_matches = 0u, regir_water_misses = 0u;
@@ -226,6 +229,8 @@ inline void DrawPtPanel() {
   }
   ImGui::Text("Water surface: %s, reason %s, pixels %u, traces %u", p.water_on ? "on" : "off", p.water_reason, p.gpu_water_pixels,
               p.gpu_water_traces);
+  ImGui::Text("Water history: %s (%s)", p.water_history_valid ? "valid" : "invalid", p.water_history_reason);
+  ImGui::Text("Water reuse: temporal %u  spatial %u", p.water_temporal_selected, p.water_spatial_selected);
   ImGui::Text("Water roughness: %.2f x scale %.2f", g_pt_reflection_water_roughness, g_pt_reflection_roughness_scale);
   if (p.gpu_available) {
     const uint32_t now = static_cast<uint32_t>(falcom_world::g_state.frame.load());

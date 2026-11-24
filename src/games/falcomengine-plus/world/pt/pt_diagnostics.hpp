@@ -86,6 +86,10 @@ inline std::string SerializePtReport() {
   out << "spatial_selected: " << p.spatial_selected << "\n";
   out << "history_valid: " << p.history_valid << "\n";
   out << "history_reason: " << p.history_reason << "\n";
+  out << "water_temporal_selected: " << p.water_temporal_selected << "\n";
+  out << "water_spatial_selected: " << p.water_spatial_selected << "\n";
+  out << "water_history_valid: " << p.water_history_valid << "\n";
+  out << "water_history_reason: " << p.water_history_reason << "\n";
   out << "material cell scale: " << g_pt_material_cell_scale << "\n";
   out << "samples: " << g_pt_samples << "\n";
   out << "regir requested: " << p.regir_requested << "\n";
@@ -196,6 +200,8 @@ inline std::string SerializePtReport() {
   out << "water surface reason: " << p.water_reason << "\n";
   out << "water surface pixels: " << p.gpu_water_pixels << "\n";
   out << "water surface traces: " << p.gpu_water_traces << "\n";
+  out << "water history: " << (p.water_history_valid ? "valid" : "invalid") << " (" << p.water_history_reason << ")\n";
+  out << "water reuse temporal / spatial: " << p.water_temporal_selected << " / " << p.water_spatial_selected << "\n";
   out << "water roughness: " << g_pt_reflection_water_roughness << "\n";
   out << "debug logging: " << PtDiagnosticCaptureEnabled() << "\n";
   std::vector<PtEvent> events;

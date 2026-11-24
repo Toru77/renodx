@@ -123,7 +123,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (FAILED(hr)) return fail("pt root serialize", hr);
     hr = s.device12->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&r.root));
     if (FAILED(hr)) return fail("pt root", hr);
-#if defined(__world_pt_initial_EMBED_FILE) && defined(__world_pt_final_EMBED_FILE) && defined(__world_pt_temporal_EMBED_FILE) && defined(__world_pt_spatial_EMBED_FILE) && defined(__world_pt_duplication_EMBED_FILE) && defined(__world_pt_smoothed_duplication_EMBED_FILE) && defined(__world_pt_neighbor_selection_EMBED_FILE) && defined(__world_pt_water_initial_EMBED_FILE) && defined(__world_pt_water_final_EMBED_FILE) && defined(__world_pt_sharc_update_EMBED_FILE) && defined(__world_pt_sharc_resolve_EMBED_FILE) && defined(__world_pt_material_write_EMBED_FILE)
+#if defined(__world_pt_initial_EMBED_FILE) && defined(__world_pt_final_EMBED_FILE) && defined(__world_pt_temporal_EMBED_FILE) && defined(__world_pt_spatial_EMBED_FILE) && defined(__world_pt_duplication_EMBED_FILE) && defined(__world_pt_smoothed_duplication_EMBED_FILE) && defined(__world_pt_neighbor_selection_EMBED_FILE) && defined(__world_pt_water_initial_EMBED_FILE) && defined(__world_pt_water_temporal_EMBED_FILE) && defined(__world_pt_water_spatial_EMBED_FILE) && defined(__world_pt_water_neighbor_selection_EMBED_FILE) && defined(__world_pt_water_duplication_EMBED_FILE) && defined(__world_pt_water_smoothed_duplication_EMBED_FILE) && defined(__world_pt_water_final_EMBED_FILE) && defined(__world_pt_sharc_update_EMBED_FILE) && defined(__world_pt_sharc_resolve_EMBED_FILE) && defined(__world_pt_material_write_EMBED_FILE)
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc = {};
     pso_desc.pRootSignature = r.root.Get();
     pso_desc.CS = {__world_pt_initial.data(), __world_pt_initial.size()};
@@ -150,6 +150,21 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     pso_desc.CS = {__world_pt_water_initial.data(), __world_pt_water_initial.size()};
     hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.water_initial_pso));
     if (FAILED(hr)) return fail("pt water initial pso", hr);
+    pso_desc.CS = {__world_pt_water_temporal.data(), __world_pt_water_temporal.size()};
+    hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.water_temporal_pso));
+    if (FAILED(hr)) return fail("pt water temporal pso", hr);
+    pso_desc.CS = {__world_pt_water_spatial.data(), __world_pt_water_spatial.size()};
+    hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.water_spatial_pso));
+    if (FAILED(hr)) return fail("pt water spatial pso", hr);
+    pso_desc.CS = {__world_pt_water_neighbor_selection.data(), __world_pt_water_neighbor_selection.size()};
+    hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.water_neighbor_selection_pso));
+    if (FAILED(hr)) return fail("pt water neighbor selection pso", hr);
+    pso_desc.CS = {__world_pt_water_duplication.data(), __world_pt_water_duplication.size()};
+    hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.water_duplication_pso));
+    if (FAILED(hr)) return fail("pt water duplication pso", hr);
+    pso_desc.CS = {__world_pt_water_smoothed_duplication.data(), __world_pt_water_smoothed_duplication.size()};
+    hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.water_smoothed_duplication_pso));
+    if (FAILED(hr)) return fail("pt water smoothed duplication pso", hr);
     pso_desc.CS = {__world_pt_water_final.data(), __world_pt_water_final.size()};
     hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.water_final_pso));
     if (FAILED(hr)) return fail("pt water final pso", hr);
@@ -470,6 +485,82 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   const bool refl_on = pt::g_pt_reflection_enabled > 0.5f && input.color.texture12 && input.mrt1.texture12 && input.mrt2.texture12;
   const bool water_on = pt::g_pt_reflection_water_surface > 0.5f && refl_on;
+  if ((!water_on || !r.water_restir || r.water_restir_width != w || r.water_restir_height != h)
+      && r.water_reservoirs_last_use <= completed) {
+    RetireObject(s, s.last_signal, r.water_reservoirs);
+    for (const auto& resource : {r.water_sample_id, r.water_duplication_map, r.water_smoothed_duplication[0],
+                                 r.water_smoothed_duplication[1], r.water_neighbor_selection_gbuffer,
+                                 r.water_neighbor_selection}) {
+      RetireObject(s, s.last_signal, resource);
+    }
+    for (auto& constants : r.water_constants) RetireObject(s, s.last_signal, constants);
+    r.water_reservoirs.Reset();
+    r.water_sample_id.Reset();
+    r.water_duplication_map.Reset();
+    r.water_smoothed_duplication[0].Reset();
+    r.water_smoothed_duplication[1].Reset();
+    r.water_neighbor_selection_gbuffer.Reset();
+    r.water_neighbor_selection.Reset();
+    for (auto& constants : r.water_constants) constants.Reset();
+    r.water_restir.reset();
+    r.water_history_valid = false;
+    r.water_history_frame = UINT32_MAX;
+    r.water_history_transfer_slot = -1;
+    if (water_on) {
+      auto context = std::make_unique<::rtxdi::ReSTIRPTContext>(::rtxdi::ReSTIRPTStaticParameters{
+          .RenderWidth = w, .RenderHeight = h, .CheckerboardSamplingMode = ::rtxdi::CheckerboardMode::Off});
+      uint64_t next_configuration = 0u;
+      if (!rtxdi::NextDiConfigurationGeneration(r.configuration_generation, &next_configuration)) {
+        return fail("pt water configuration generation", E_FAIL);
+      }
+      r.configuration_generation = next_configuration;
+      const uint64_t water_bytes = uint64_t{context->GetReservoirBufferParameters().reservoirArrayPitch}
+                                   * ::rtxdi::c_NumReSTIRPTReservoirBuffers * sizeof(RTXDI_PackedPTReservoir);
+      const HRESULT hr_water = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, water_bytes,
+                                                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                r.water_reservoirs);
+      if (FAILED(hr_water)) return fail("pt water reservoirs", hr_water);
+      D3D12_HEAP_PROPERTIES heap = {};
+      heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+      const auto make_texture = [&](DXGI_FORMAT format, ComPtr<ID3D12Resource>* out) {
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = w;
+        desc.Height = h;
+        desc.DepthOrArraySize = 1u;
+        desc.MipLevels = 1u;
+        desc.Format = format;
+        desc.SampleDesc.Count = 1u;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        return s.device12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                   IID_PPV_ARGS(out->ReleaseAndGetAddressOf()));
+      };
+      HRESULT hr_maps = make_texture(DXGI_FORMAT_R32_UINT, &r.water_sample_id);
+      if (FAILED(hr_maps)) return fail("pt water sample id", hr_maps);
+      hr_maps = make_texture(DXGI_FORMAT_R32G32_FLOAT, &r.water_duplication_map);
+      if (FAILED(hr_maps)) return fail("pt water duplication map", hr_maps);
+      hr_maps = make_texture(DXGI_FORMAT_R32_FLOAT, &r.water_smoothed_duplication[0]);
+      if (FAILED(hr_maps)) return fail("pt water smoothed duplication", hr_maps);
+      hr_maps = make_texture(DXGI_FORMAT_R32_FLOAT, &r.water_smoothed_duplication[1]);
+      if (FAILED(hr_maps)) return fail("pt water smoothed duplication prev", hr_maps);
+      hr_maps = make_texture(DXGI_FORMAT_R16G16B16A16_FLOAT, &r.water_neighbor_selection_gbuffer);
+      if (FAILED(hr_maps)) return fail("pt water neighbor selection gbuffer", hr_maps);
+      hr_maps = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, uint64_t{w} * h * 4u * 4u,
+                                 D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                 r.water_neighbor_selection);
+      if (FAILED(hr_maps)) return fail("pt water neighbor selection buffer", hr_maps);
+      for (auto& constants : r.water_constants) {
+        hr_maps = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_UPLOAD, kPtRestirConstantsBytes,
+                                   D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE, constants);
+        if (FAILED(hr_maps)) return fail("pt water restir constants", hr_maps);
+      }
+      r.water_restir = std::move(context);
+      r.water_restir_width = w;
+      r.water_restir_height = h;
+    }
+  }
+  if (water_on && !r.water_restir) return fallback(pt::PtReason::NotCreated);
   Rt12Shared& refl = r.reflection[k];
   if (refl_on && (!refl.texture11 || refl.width != w || refl.height != h)) {
     RetireShared(s, refl, s.last_signal);
@@ -1461,25 +1552,101 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     }
   }
   if (water_on) {  // publish the water block's inputs for RunPtWaterTrace of this frame
-    void* source_constants = nullptr;
+    bool water_history_valid = false;
+    const char* water_history_reason = "valid";
+    const uint32_t water_prev_slot = r.water_history_slot;
+    const int32_t water_prev_transfer = r.water_history_transfer_slot;
+    if (!r.water_history_valid) water_history_reason = "no_history";
+    else if (r.water_history_frame == UINT32_MAX || r.water_history_frame + 1u != frame) water_history_reason = "frame";
+    else if (r.water_history_configuration_generation == 0u
+             || r.water_history_configuration_generation != r.configuration_generation) water_history_reason = "configuration";
+    else if (r.water_history_owner_generation == 0u || r.water_history_owner_generation != s.generation) {
+      water_history_reason = "owner";
+    } else if (r.water_history_width != w || r.water_history_height != h) water_history_reason = "size";
+    else if (water_prev_transfer < 0 || water_prev_transfer >= static_cast<int32_t>(kRt12Slots)
+             || water_prev_transfer == static_cast<int32_t>(transfer_slot)) water_history_reason = "transfer_slot";
+    else if (r.water_history_cache_epoch != r.cache_epoch) water_history_reason = "cache_epoch";
+    else if (water_prev_slot == k) water_history_reason = "water_slot";
+    else if (!r.water_depth[water_prev_slot].texture12 || !r.water_normal[water_prev_slot].texture12
+             || r.water_depth[water_prev_slot].width != w || r.water_depth[water_prev_slot].height != h
+             || r.water_normal[water_prev_slot].width != w || r.water_normal[water_prev_slot].height != h) {
+      water_history_reason = "previous_copies";
+    } else if (r.water_history_scene_slot >= kRt12Slots
+               || !s.di_transfer.slots[r.water_history_scene_slot].scene.texture12) water_history_reason = "previous_scene";
+    if (r.water_history_valid && water_prev_transfer >= 0 && water_prev_transfer < static_cast<int32_t>(kRt12Slots)
+        && water_prev_slot < kRt12Slots && water_prev_slot != k && r.water_history_frame != UINT32_MAX
+        && r.water_history_frame + 1u == frame && r.water_depth[water_prev_slot].texture12
+        && r.water_normal[water_prev_slot].texture12 && r.water_history_scene_slot < kRt12Slots
+        && s.di_transfer.slots[r.water_history_scene_slot].scene.texture12) {
+      Rt12DiTransferSlot& candidate = s.di_transfer.slots[static_cast<uint32_t>(water_prev_transfer)];
+      const bool previous_inputs = candidate.width == w && candidate.height == h
+          && candidate.depth.texture12 && candidate.normal.texture12 && candidate.scene.texture12
+          && candidate.color.texture12 && candidate.mrt1.texture12 && candidate.mrt2.texture12
+          && candidate.deferred_buffer && candidate.lights_buffer && candidate.light_table
+          && candidate.motion.texture12 && candidate.motion_available;
+      if (rtxdi::ValidDiHistoryIdentity({.previous_frame = r.water_history_frame,
+                                         .current_frame = frame,
+                                         .previous_width = r.water_history_width,
+                                         .previous_height = r.water_history_height,
+                                         .current_width = w,
+                                         .current_height = h,
+                                         .previous_transfer_slot = water_prev_transfer,
+                                         .current_transfer_slot = static_cast<int32_t>(transfer_slot),
+                                         .previous_owner_generation = r.water_history_owner_generation,
+                                         .current_owner_generation = s.generation,
+                                         .previous_configuration_generation = r.water_history_configuration_generation,
+                                         .current_configuration_generation = r.configuration_generation,
+                                         .motion_available = true,
+                                         .previous_inputs_available = previous_inputs})) {
+        water_history_valid = true;
+      } else {
+        water_history_reason = "missing_inputs";
+      }
+    }
+    if (!water_history_valid) {
+      r.water_history_frame = UINT32_MAX;
+      r.water_history_width = 0u;
+      r.water_history_height = 0u;
+      r.water_history_transfer_slot = -1;
+      r.water_history_owner_generation = 0u;
+      r.water_history_configuration_generation = 0u;
+      r.water_history_cache_epoch = 0u;
+    }
+    r.water_history_valid = water_history_valid;
+    r.water_restir->SetFrameIndex(frame);
+    r.water_restir->SetResamplingMode(static_cast<::rtxdi::ReSTIRPT_ResamplingMode>(resampling_mode));
+    r.water_restir->SetInitialSamplingParameters({.numInitialSamples = (std::clamp)(
+        static_cast<uint32_t>((std::max)(pt::g_pt_samples, pt::g_pt_reflection_samples)), 1u, 16u),
+        .maxBounceDepth = static_cast<uint32_t>(pt::g_pt_max_bounces) + 1u,
+        .maxRcVertexLength = static_cast<uint32_t>(std::clamp(pt::g_restir_max_rc_vertex_length, 2.f, 8.f))});
+    r.water_restir->SetTemporalResamplingParameters(temporal);
+    r.water_restir->SetSpatialResamplingParameters(spatial);
+    r.water_restir->SetBoilingFilterParameters(boiling);
+    r.water_restir->SetReconnectionParameters(reconnection);
+    r.water_restir->SetHybridShiftParameters({.maxBounceDepth = static_cast<uint32_t>(pt::g_pt_max_bounces) + 1u,
+                                              .maxRcVertexLength = static_cast<uint32_t>(
+                                                  std::clamp(pt::g_restir_max_rc_vertex_length, 2.f, 8.f))});
+    r.water_restir->SetDecorrelationParameters(decorrelation);
     void* water_data = nullptr;
-    if (SUCCEEDED(r.constants[k]->Map(0u, nullptr, &source_constants))
-        && SUCCEEDED(r.water_constants[k]->Map(0u, nullptr, &water_data))) {
-      PtRestirConstants water_restir = {};
-      std::memcpy(&water_restir, source_constants, sizeof(water_restir));
-      water_restir.restir.bufferIndices.initialPathTracerOutputBufferIndex = 0u;
-      water_restir.restir.bufferIndices.temporalResamplingInputBufferIndex = 0u;
-      water_restir.restir.bufferIndices.temporalResamplingOutputBufferIndex = 0u;
-      water_restir.restir.bufferIndices.spatialResamplingInputBufferIndex = 0u;
-      water_restir.restir.bufferIndices.spatialResamplingOutputBufferIndex = 0u;
-      water_restir.restir.bufferIndices.finalShadingInputBufferIndex = 0u;
-      water_restir.restir.bufferIndices.initialPathTracerPreservedBufferIndex = 0u;
-      water_restir.restir.bufferIndices.pad2 = 0u;
-      water_restir.restir.decorrelation.decorrelationFactor = 0.f;
-      water_restir.restir.decorrelation.decorrelationMode = RTXDI_PTDecorrelationMode::None;
+    if (SUCCEEDED(r.water_constants[k]->Map(0u, nullptr, &water_data))) {
+      PtRestirConstants water_restir = restir_constants;
+      water_restir.restir.reservoirBuffer = r.water_restir->GetReservoirBufferParameters();
+      water_restir.restir.bufferIndices = r.water_restir->GetBufferIndices();
+      water_restir.restir.initialSampling = r.water_restir->GetInitialSamplingParameters();
+      water_restir.restir.decorrelation = r.water_restir->GetDecorrelationParameters();
+      water_restir.restir.reconnection = r.water_restir->GetReconnectionParameters();
+      water_restir.restir.temporalResampling = r.water_restir->GetTemporalResamplingParameters();
+      water_restir.restir.hybridShift = r.water_restir->GetHybridShiftParameters();
+      water_restir.restir.boilingFilter = r.water_restir->GetBoilingFilterParameters();
+      water_restir.restir.spatialResampling = r.water_restir->GetSpatialResamplingParameters();
+      water_restir.history_valid = water_history_valid ? 1u : 0u;
       std::memcpy(water_data, &water_restir, sizeof(water_restir));
       r.water_constants[k]->Unmap(0u, nullptr);
-      r.constants[k]->Unmap(0u, nullptr);
+    }
+    {
+      std::lock_guard lock(pt::g_pt_panel_mutex);
+      pt::g_pt_panel.water_history_valid = water_history_valid;
+      pt::g_pt_panel.water_history_reason = water_history_reason;
     }
     std::copy_n(params, kRt12PtConstants, r.water_params);
     r.water_params[46] = 0u;
@@ -1611,6 +1778,8 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
             && static_cast<int32_t>(readback_frame - r.water_counter_published_frame) >= 0) {
           pt::g_pt_panel.gpu_water_pixels = values[5];
           pt::g_pt_panel.gpu_water_traces = values[6];
+          pt::g_pt_panel.water_temporal_selected = values[28];
+          pt::g_pt_panel.water_spatial_selected = values[29];
           pt::g_pt_panel.regir_water_counts_available = true;
           pt::g_pt_panel.regir_water_counts_frame = readback_frame;
           pt::g_pt_panel.regir_water_counts_owner_generation = owner_generation;
@@ -1784,14 +1953,16 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   // Water block (R3): every descriptor is written here, after this slot's fence. Null: 14 and 16 (main output and SHARC
   // accumulation, written only by the main trace). 15, 17, 22 and 23 are the cache reads (SHARC hash and resolved, material
   // keys and values); the water dispatch does not write them, since the material write and SHARC update passes never run here.
+  const uint32_t water_prev_slot = r.water_history_slot;
+  const bool water_history = r.water_history_valid;
   for (uint32_t i = 0u; i < kRt12PtDescriptors; ++i) {
     const D3D12_CPU_DESCRIPTOR_HANDLE handle = cpu_at(base + i);
     const bool uav_index = (i >= 14u && i <= 17u) || (i >= 22u && i <= 25u) || i == 29u || (i >= 43u && i <= 47u);
     if (!uav_index) {
       ID3D12Resource* resource = in.resources[i].Get();
       D3D12_SHADER_RESOURCE_VIEW_DESC view = in.srv_descs[i];
-      if (i == 26u) {
-        resource = nullptr;
+      if (i == 26u || i == 40u) {
+        resource = nullptr;  // sparse noise and RTV4 motion are not inputs to the water passes
       }
       if (i == 9u) {
         resource = depth_copy.texture12.Get();
@@ -1801,14 +1972,40 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
         resource = normal_copy.texture12.Get();
         view = Rt12TextureSrv(mrt_view_format);
       }
+      if (water_history && i == 31u) {
+        resource = r.water_depth[water_prev_slot].texture12.Get();
+        view = Rt12TextureSrv(depth_view_format);
+      }
+      if (water_history && i == 32u) {
+        resource = r.water_normal[water_prev_slot].texture12.Get();
+        view = Rt12TextureSrv(mrt_view_format);
+      }
+      if (water_history && i == 33u) {
+        resource = s.di_transfer.slots[r.water_history_scene_slot].scene.texture12.Get();
+        view = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT);
+      }
+      if (i == 48u) {
+        resource = r.water_smoothed_duplication[(frame + 1u) & 1u].Get();
+        view = Rt12TextureSrv(DXGI_FORMAT_R32_FLOAT);
+      }
       device12->CreateShaderResourceView(resource, &view, handle);
     } else {
       ID3D12Resource* resource = nullptr;
+      D3D12_UNORDERED_ACCESS_VIEW_DESC view = in.uav_descs[i];
       if (i == 15u || i == 17u || i == 22u || i == 23u) resource = in.resources[i].Get();
       if (i == 24u) resource = r.water_counters[k].Get();
       if (i == 25u) resource = refl.texture12.Get();
-      if (i == 29u) resource = r.water_reservoirs.Get();
-      device12->CreateUnorderedAccessView(resource, nullptr, &in.uav_descs[i], handle);
+      if (i == 29u) {
+        resource = r.water_reservoirs.Get();
+        view.Buffer.NumElements = r.water_restir->GetReservoirBufferParameters().reservoirArrayPitch
+                                  * ::rtxdi::c_NumReSTIRPTReservoirBuffers;
+      }
+      if (i == 43u) resource = r.water_duplication_map.Get();
+      if (i == 44u) resource = r.water_smoothed_duplication[frame & 1u].Get();
+      if (i == 45u) resource = r.water_sample_id.Get();
+      if (i == 46u) resource = r.water_neighbor_selection_gbuffer.Get();
+      if (i == 47u) resource = r.water_neighbor_selection.Get();
+      device12->CreateUnorderedAccessView(resource, nullptr, &view, handle);
     }
   }
   // Counters: cleared before the dispatch, copied to the readback after it (only when no readback is pending).
@@ -1821,10 +2018,14 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
                                          in.resources[19].Get(), in.resources[20].Get(), in.resources[21].Get(),
                                          r.water_params[48] ? in.resources[27].Get() : nullptr,
                                          r.water_params[48] ? in.resources[28].Get() : nullptr,
-                                          in.resources[31].Get(), in.resources[32].Get(), in.resources[33].Get(),
-                                          in.resources[34].Get(), in.resources[35].Get(), in.resources[36].Get(),
-                                          in.resources[37].Get(), in.resources[38].Get(), in.resources[39].Get(),
-                                          in.resources[40].Get(), in.resources[41].Get(), in.resources[42].Get(), in.resources[48].Get()};
+                                         water_history ? r.water_depth[water_prev_slot].texture12.Get() : nullptr,
+                                         water_history ? r.water_normal[water_prev_slot].texture12.Get() : nullptr,
+                                         water_history ? s.di_transfer.slots[r.water_history_scene_slot].scene.texture12.Get()
+                                                       : nullptr,
+                                         in.resources[34].Get(), in.resources[35].Get(), in.resources[36].Get(),
+                                         in.resources[37].Get(), in.resources[38].Get(), in.resources[39].Get(),
+                                         in.resources[41].Get(), in.resources[42].Get(),
+                                         r.water_smoothed_duplication[(frame + 1u) & 1u].Get()};
   for (ID3D12Resource* resource : water_reads) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }
@@ -1835,13 +2036,26 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   }
   Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   Transition(barriers, r.water_reservoirs.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  for (ID3D12Resource* resource : {r.water_sample_id.Get(), r.water_duplication_map.Get(),
+                                   r.water_smoothed_duplication[frame & 1u].Get(), r.water_neighbor_selection_gbuffer.Get(),
+                                   r.water_neighbor_selection.Get()}) {
+    Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
   Transition(barriers, r.water_counters[k].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
   list->CopyBufferRegion(r.water_counters[k].Get(), 0u, r.counter_zero.Get(), 0u, kRt12PtCounters * sizeof(uint32_t));
   barriers.clear();
   Transition(barriers, r.water_counters[k].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-  // Dispatch: water initial sampling and final shading on the water reservoir.
+  // Dispatch: the full ReSTIR PT schedule on the water reservoir.
+  const uint32_t water_resampling = static_cast<uint32_t>(r.water_restir->GetResamplingMode());
+  const bool has_temporal = water_resampling == 1u || water_resampling == 3u;
+  const bool has_spatial = water_resampling == 2u || water_resampling == 3u;
+  const bool temporal_ran = has_temporal && water_history;
+  const RTXDI_PTDecorrelationParameters water_decorrelation = r.water_restir->GetDecorrelationParameters();
+  const RTXDI_PTTemporalResamplingParameters water_temporal = r.water_restir->GetTemporalResamplingParameters();
+  const bool needs_smoothed = water_decorrelation.decorrelationMode == RTXDI_PTDecorrelationMode::Stagnancy
+                              && water_decorrelation.decorrelationFactor > 0.f && temporal_ran;
   ID3D12DescriptorHeap* heaps[] = {r.heap.Get()};
   list->SetDescriptorHeaps(1u, heaps);
   list->SetComputeRootSignature(r.root.Get());
@@ -1858,6 +2072,51 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   barriers.clear();
   UavBarrier(barriers, r.water_reservoirs.Get());
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  if (r.water_restir->GetSpatialResamplingParameters().enableSpatialHeuristicMode && has_spatial) {
+    barriers.clear();
+    UavBarrier(barriers, r.water_neighbor_selection_gbuffer.Get());
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    list->SetPipelineState(r.water_neighbor_selection_pso.Get());
+    list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+    barriers.clear();
+    UavBarrier(barriers, r.water_neighbor_selection_gbuffer.Get());
+    UavBarrier(barriers, r.water_neighbor_selection.Get());
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  }
+  if (temporal_ran) {
+    list->SetPipelineState(r.water_temporal_pso.Get());
+    list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+    barriers.clear();
+    UavBarrier(barriers, r.water_reservoirs.Get());
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  }
+  if (has_spatial) {
+    list->SetPipelineState(r.water_spatial_pso.Get());
+    list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+    barriers.clear();
+    UavBarrier(barriers, r.water_reservoirs.Get());
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  }
+  if (::rtxdi::NeedsDuplicationMap(water_temporal, water_decorrelation) && temporal_ran) {
+    barriers.clear();
+    UavBarrier(barriers, r.water_reservoirs.Get());
+    UavBarrier(barriers, r.water_sample_id.Get());
+    UavBarrier(barriers, r.water_duplication_map.Get());
+    UavBarrier(barriers, r.water_smoothed_duplication[frame & 1u].Get());
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    list->SetPipelineState(r.water_duplication_pso.Get());
+    list->Dispatch((w + 15u) / 16u, (h + 15u) / 16u, 1u);
+    if (needs_smoothed) {
+      barriers.clear();
+      UavBarrier(barriers, r.water_duplication_map.Get());
+      list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+      list->SetPipelineState(r.water_smoothed_duplication_pso.Get());
+      list->Dispatch((w + 15u) / 16u, (h + 15u) / 16u, 1u);
+    }
+    barriers.clear();
+    UavBarrier(barriers, r.water_smoothed_duplication[frame & 1u].Get());
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  }
   list->SetPipelineState(r.water_final_pso.Get());
   list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
   if (water_perf_timing) {
@@ -1874,6 +2133,11 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   barriers.clear();
   Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
   Transition(barriers, r.water_reservoirs.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+  for (ID3D12Resource* resource : {r.water_sample_id.Get(), r.water_duplication_map.Get(),
+                                   r.water_smoothed_duplication[frame & 1u].Get(), r.water_neighbor_selection_gbuffer.Get(),
+                                   r.water_neighbor_selection.Get()}) {
+    Transition(barriers, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+  }
   for (ID3D12Resource* resource : water_cache) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
   }
@@ -1924,6 +2188,15 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   s.unfenced_execution = false;
   water_slot.fence_value = b;
   r.water_reservoirs_last_use = b;
+  r.water_history_frame = frame;
+  r.water_history_width = w;
+  r.water_history_height = h;
+  r.water_history_slot = k;
+  r.water_history_transfer_slot = r.water_input_slot;
+  r.water_history_scene_slot = static_cast<uint32_t>(r.water_history_transfer_slot);
+  r.water_history_owner_generation = s.generation;
+  r.water_history_configuration_generation = r.configuration_generation;
+  r.water_history_cache_epoch = r.cache_epoch;
   if (water_perf_timing) {
     r.perf_pending[water_block] = true;
     r.perf_fence[water_block] = b;

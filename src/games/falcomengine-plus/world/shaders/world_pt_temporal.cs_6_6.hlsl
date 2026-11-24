@@ -29,7 +29,11 @@ void main(uint3 id : SV_DispatchThreadID, uint3 group_id : SV_GroupThreadID) {
         reservoir = RTXDI_LoadPTReservoir(g_restir.restir.reservoirBuffer, pixel,
                                           g_restir.restir.bufferIndices.initialPathTracerOutputBufferIndex);
         // RTV4 motion conversion, copied from world_rtxdi_temporal_di.cs_6_5.hlsl:90-104 (the authoritative block).
+#if defined(PT_WATER_SURFACE)
+        const float2 motion_xy = PtWaterCameraMotion(pixel, surface.worldPos);
+#else
         const float2 motion_xy = g_pt_motion.Load(int3(pixel, 0)).xy;
+#endif
         const float2 previous_position = float2(pixel) + motion_xy;
         const float4x4 previous_view = float4x4(
             asfloat(g_pt_prev_scene.Load(int3(RTXDI_SURFACE_VIEW_ROW + 0u, 0, 0))),
