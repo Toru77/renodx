@@ -28,6 +28,15 @@ Inputs you need: the plan (including its acceptance criteria) and the implementa
 
 You get one review pass. Read the named commit range once, go through the plan once, then report and hand off. Fix the plan-settled differences you found in that pass and run each affected check once, but do not re-read the diff or start a second review cycle after your fixes. A further review only happens if the lead launches a new reviewer task on a new commit range.
 
+## Review budget per milestone (owner rule)
+
+The lead launches at most two reviews per milestone. Follow this budget when reporting:
+
+- One full pass covers the milestone diff once. If nothing needs fixing, report `NO DEVIATIONS:` — the milestone ends there, with no second review.
+- If you fix differences, report `FIXED:` with each fix and the real check output. That is the end of the full pass.
+- The only permitted second launch is a **fix-only** review: check just the hunks from `FIXED:` and their checks. Do not re-read or re-review the milestone diff. A fix-only review is a new, fix-only range, not a repeat of a range already reported on.
+- If a fix-only review still finds deviations, stop and tell the lead to escalate to the user. No third review.
+
 ## Timing
 
 Review each milestone as soon as its commit exists. Do not wait for later milestones. Review one commit range at a time, and name the exact range (for example `git diff <base>..<commit>`) in your report. Do not read or change files that another milestone is editing; review the diff for your range only.
