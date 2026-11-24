@@ -2,6 +2,7 @@
 #define FALCOM_WORLD_PT_RESTIR_LAYOUT_H_
 
 #ifdef __cplusplus
+#include <cstddef>
 #include <cstdint>
 #endif
 
@@ -9,6 +10,7 @@
 #include <Rtxdi/DI/ReSTIRDIParameters.h>
 #include <Rtxdi/RtxdiParameters.h>
 
+// No arrays: HLSL cbuffer packing puts each array element in its own 16-byte register, which breaks the C++ mirror.
 struct PtRestirConstants {
   RTXDI_RuntimeParameters runtime;
   RTXDI_LightBufferParameters light_buffer;
@@ -31,7 +33,7 @@ struct PtRestirConstants {
   float char_lamp_intensity;
   float local_char_self_softening, sun_char_self_softening;
   float foliage_transmission, wind_transmission, wind_softening;
-  float foliage_tint_padding[2];
+  float foliage_tint_padding0, foliage_tint_padding1;
 #ifdef __cplusplus
   float foliage_tint[3];
 #else
@@ -49,11 +51,14 @@ struct PtRestirConstants {
 #endif
   float coverage_size;
   uint32_t coverage_valid;
-  uint32_t coverage_padding[3];
+  uint32_t coverage_padding0, coverage_padding1, coverage_padding2;
 };
 
 #ifdef __cplusplus
 static_assert(sizeof(PtRestirConstants) % 16 == 0);
+static_assert(offsetof(PtRestirConstants, sun_angular_radius) % 16 == 0);
+static_assert(offsetof(PtRestirConstants, foliage_tint) % 16 == 0);
+static_assert(offsetof(PtRestirConstants, coverage_min) % 16 == 0);
 inline constexpr uint32_t kPtRestirConstantsBytes = (sizeof(PtRestirConstants) + 255u) & ~255u;
 #endif
 

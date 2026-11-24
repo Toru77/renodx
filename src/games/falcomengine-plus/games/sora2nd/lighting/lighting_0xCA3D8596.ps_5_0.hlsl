@@ -1340,6 +1340,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
               HammonDiffuseCorrection(saturate(brdf_rawNdotL_pt), brdf_NdotV, brdf_NdotH_pt, brdf_VdotH_pt, brdf_roughness),
               brdf_diffuse_str);
         }
+        r11.xyz = brdf_vanilla_diffuse_pt + r11.xyz;
         r12.xyz = r14.xyz * r1.yyy + r12.xyz;
         r5.z = dot(r12.xyz, r12.xyz);
         r5.z = rsqrt(r5.z);
@@ -1464,6 +1465,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                 HammonDiffuseCorrection(saturate(brdf_rawNdotL_sp), brdf_NdotV, brdf_NdotH_sp, brdf_VdotH_sp, brdf_roughness),
                 brdf_diffuse_str);
           }
+          r15.yzw = brdf_vanilla_diffuse_sp + r15.yzw;
           r16.xyz = r14.xyz * r1.yyy + r16.xyz;
           r5.z = dot(r16.xyz, r16.xyz);
           r5.z = rsqrt(r5.z);

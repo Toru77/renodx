@@ -629,7 +629,12 @@ inline void FailSession(Rt12State& s, Rt12Reason reason, const char* stage, HRES
     rtxdi::g_di.snapshot.lighting_draw_seen = false;
   }
   DisableMirror();
-  renodx::utils::log::w("[world-rt12] failed at ", stage, " hr=", renodx::utils::log::AsHex(static_cast<uint32_t>(hr)));
+  std::string removed_log;
+  if (s.device12) {
+    const HRESULT removed = s.device12->GetDeviceRemovedReason();
+    removed_log = " device_removed=" + renodx::utils::log::AsHex(static_cast<uint32_t>(removed));
+  }
+  renodx::utils::log::w("[world-rt12] failed at ", stage, " hr=", renodx::utils::log::AsHex(static_cast<uint32_t>(hr)), removed_log);
   UpdatePanel([reason, stage, hr](Rt12Panel& p) {
     p.reason = reason;
     p.failed_stage = stage;

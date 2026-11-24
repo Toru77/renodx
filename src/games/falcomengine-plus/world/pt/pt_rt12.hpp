@@ -413,8 +413,10 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     }
     if (!done) {
       s.stuck = true;
+      const HRESULT removed = s.device12 ? s.device12->GetDeviceRemovedReason() : S_OK;
       pt::PtLogWarn("[world-rt12] pt stuck: fence at " + std::to_string(Rt12CompletedValue(s)) + ", slot submitted "
-                    + std::to_string(pt_slot.fence_value));
+                    + std::to_string(pt_slot.fence_value) + " device_removed="
+                    + renodx::utils::log::AsHex(static_cast<uint32_t>(removed)));
       DisableMirror();
       return fallback(pt::PtReason::Stuck);
     }
@@ -483,6 +485,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     r.restir_height = h;
   }
   if (!r.restir || !r.reservoirs) return fallback(pt::PtReason::NotCreated);
+  // A resize waits for the reservoirs' last use; until then skip the frame rather than dispatch at the new size.
+  if (r.restir_width != w || r.restir_height != h) return fallback(pt::PtReason::NotCreated);
   Rt12Shared& out = r.output[k];
   if (!out.texture11 || out.width != w || out.height != h) {
     RetireShared(s, out, s.last_signal);
@@ -569,6 +573,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     }
   }
   if (water_on && !r.water_restir) return fallback(pt::PtReason::NotCreated);
+  if (water_on && (r.water_restir_width != w || r.water_restir_height != h)) return fallback(pt::PtReason::NotCreated);
   Rt12Shared& refl = r.reflection[k];
   if (refl_on && (!refl.texture11 || refl.width != w || refl.height != h)) {
     RetireShared(s, refl, s.last_signal);
