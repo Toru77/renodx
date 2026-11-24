@@ -11418,12 +11418,15 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
                                          falcom_world::pt::g_pt_sparse_exponent, falcom_world::pt::g_pt_sparse_quality,
                                          falcom_world::pt::g_pt_sparse_max_rate, dd->captured_depth_w, dd->captured_depth_h)
                                              .dense_reason == falcom_world::pt::PtSparseDenseReason::None;
-    if (pt_isfast_wanted) {
+    const bool pt_light_jitter_wanted = falcom_world::pt::PtRequested() && g_isfast_enabled > 0.5f
+        && ((di::g_sun_isfast > 0.5f && di::g_sun_light_size > 0.f)
+            || (di::g_local_isfast > 0.5f && di::g_local_light_size > 0.f));
+    if (pt_isfast_wanted || pt_light_jitter_wanted) {
       LoadISFASTNoiseTexture(dev, dd);
     }
     result = rt12::PrepareSceneForRtxdi(dev, cmd_list, dd->captured_scene_cbv_view, true,
                                         reshade::api::resource_view{0u},
-                                        pt_isfast_wanted ? dd->isfast_noise_srv : reshade::api::resource_view{0u});
+                                        (pt_isfast_wanted || pt_light_jitter_wanted) ? dd->isfast_noise_srv : reshade::api::resource_view{0u});
     if (result.scene_ready) {
       status = (result.reused ? di::SceneStatus::Reused : di::SceneStatus::Submitted);
     } else if (rt12::g_rt12->unfenced_execution || rt12::g_rt12->stuck) {

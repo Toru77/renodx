@@ -68,6 +68,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (reservoir.pathLength == 2u) PtCount(22u);
     if (reservoir.pathLength >= 3u) PtCount(23u);
     if (isinf(reservoir.radiance.x)) PtCount(24u);
+    const uint energy = uint(min(CalcLuminance(reservoir.weightSum * reservoir.targetFunction), 65535.0) * 16.0);
+    if (reservoir.pathLength == 2u) InterlockedAdd(g_pt_counters[35u], energy);
+    else if (reservoir.pathLength == 3u) InterlockedAdd(g_pt_counters[36u], energy);
+    else if (reservoir.pathLength <= 5u) InterlockedAdd(g_pt_counters[37u], energy);
+    else InterlockedAdd(g_pt_counters[38u], energy);
   }
   if (needs_neighbor_selection_gbuffer) {
     g_pt_neighbor_selection_gbuffer[id.xy] = float4(RAB_GetSurfaceNormal(surface), surface.viewDepth);

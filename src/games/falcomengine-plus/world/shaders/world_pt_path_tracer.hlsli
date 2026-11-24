@@ -12,9 +12,14 @@
 bool IsEmissiveSamplingEnabled() { return g_sharc_enabled != 0u; }
 bool IsNeeSamplingEnabled() { return true; }
 
+float3 PtGiClampLe(float3 le, float3 throughput) {
+  if (g_restir.gi_clamp_per_bounce == 0u) return le;
+  return le * min(1.0, g_gi_clamp / max(CalcLuminance(le * throughput), 1e-6));
+}
+
 template<typename PTContextType>
 bool ShouldRunRussianRoulette(inout RTXDI_PathTracerContext<PTContextType> ctx) {
-  return g_roulette != 0u && ctx.GetBounceDepth() - 1u >= g_roulette_min_bounce;
+  return g_roulette != 0u && ctx.GetBounceDepth() >= g_roulette_min_bounce + 2u;
 }
 
 float CalculateRussianRouletteContinuationProbability(float3 throughput) {
@@ -97,7 +102,8 @@ void HandleHit(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_Pat
 
 #if defined(PT_WATER_SURFACE)
   if (ctx.GetBounceDepth() == 2u && PtWaterHit(pixel, payload.position, surface.normal, surface.viewDir)) {
-    ctx.RecordEnvironmentMapLightSample(PtSky(reflect(-surface.viewDir, surface.normal)), prevSurface,
+    ctx.RecordEnvironmentMapLightSample(PtGiClampLe(PtSky(reflect(-surface.viewDir, surface.normal)),
+                                                     ctx.GetPathThroughput()), prevSurface,
                                         ptRandContext.initialRandomSamplerState);
     ctx.SetPathTermination(true);
     return;
@@ -112,7 +118,8 @@ void HandleHit(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_Pat
 #if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING)
   if (terminal) {
     PtCount(25u);
-    ctx.RecordEmissiveLightSample(cached, prevSurface, ptRandContext.initialRandomSamplerState);
+    ctx.RecordEmissiveLightSample(PtGiClampLe(cached, ctx.GetPathThroughput()), prevSurface,
+                                  ptRandContext.initialRandomSamplerState);
     ctx.SetPathTermination(true);
     return;
   }
@@ -132,8 +139,8 @@ void HandleHit(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_Pat
     PtSampleNee(surface, ptRandContext.initialRandomSamplerState, radiance_from_lights, sampled_light_data, nee_pdf,
                 scatter_pdf, light_sample);
     if (nee_pdf != 0.0) {
-      ctx.RecordNeeLightSample(sampled_light_data, radiance_from_lights, nee_pdf, scatter_pdf, light_sample,
-                               ptRandContext.initialRandomSamplerState);
+      ctx.RecordNeeLightSample(sampled_light_data, PtGiClampLe(radiance_from_lights, ctx.GetPathThroughput()), nee_pdf,
+                               scatter_pdf, light_sample, ptRandContext.initialRandomSamplerState);
     }
   }
 }
@@ -285,8 +292,9 @@ void RAB_PathTrace(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI
       if (ctx.IsPathTerminated()) break;
     } else {
       ctx.RecordPathRadianceMiss(rng.initialRandomSamplerState);
-      ctx.RecordEnvironmentMapLightSample(RAB_GetEnvironmentRadiance(ctx.GetContinuationRay().Direction), prev,
-                                          rng.initialRandomSamplerState);
+      ctx.RecordEnvironmentMapLightSample(
+          PtGiClampLe(RAB_GetEnvironmentRadiance(ctx.GetContinuationRay().Direction), ctx.GetPathThroughput()), prev,
+          rng.initialRandomSamplerState);
       break;
     }
     ctx.IncreaseBounceDepth();

@@ -210,6 +210,7 @@ RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
   s.material.specularF0 = m.f0 * m.spec_scale;
   s.material.character = m.character;
 #if defined(PT_WATER_SURFACE)
+  s.material.diffuseAlbedo = 0.0;
   s.material.roughness = saturate(g_water_roughness * g_refl_roughness_scale);
 #else
   const float mrt_scale = prev ? (g_pt_prev_mrt1.Load(int3(pixel, 0)).y & 255u) * (1.0 / 255.0)
@@ -220,6 +221,10 @@ RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
                     : saturate(m.roughness * mrt_scale * g_refl_roughness_scale));
 #endif
   s.diffuseProbability = PtSurfaceDiffuseProbability(s);
+  // A16.1 B: where the game has specular (specularF0 = f0 x spec_scale > 0, A15), sample the specular lobe at least
+  // half the time at the primary vertex. Throughput is the full BSDF over this mixture pdf, so the estimate stays
+  // unbiased; every RAB sampling/pdf/delta function reads this one field.
+  if (any(s.material.specularF0 > 0.0)) s.diffuseProbability = min(s.diffuseProbability, 0.5);
   return s;
 }
 

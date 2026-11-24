@@ -203,12 +203,13 @@ void main(uint3 id : SV_DispatchThreadID) {
             g_restir.foliage_transmission, g_restir.wind_transmission, g_restir.wind_softening,
             float3(g_restir.foliage_tint.x, g_restir.foliage_tint.y, g_restir.foliage_tint.z), wind_u, T, B,
             transmittance, transmitted_tint);
-        if (shadow.status == RTXDI_SUN_STATUS_VISIBLE) {
+        if (shadow.status == RTXDI_SUN_STATUS_VISIBLE || shadow.status == RTXDI_SUN_STATUS_BLOCKED) {
           const uint layers = (shadow.flags >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK;
           const float darkening = character ? g_restir.sun_char_darkening : g_restir.sun_darkening;
+          const float visibility = shadow.status == RTXDI_SUN_STATUS_VISIBLE ? transmittance : 0.0;
           game_sun_visibility = float4(pow(saturate(float3(g_restir.foliage_tint.x, g_restir.foliage_tint.y,
                                                            g_restir.foliage_tint.z)), float(layers)),
-                                       lerp(1.0, transmittance, darkening));
+                                       lerp(1.0, visibility, darkening));
         }
       }
     }
@@ -257,7 +258,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   const float hit_t = max(length(reservoir.translatedWorldPosition - surface.worldPos), 1e-3);
   g_pt_specular[id.xy] = float4(PtInvalidPixelGuard(rgb), isfinite(hit_t) ? hit_t : 1e-3);
 #else
-  if (!is_direct) diffuse = PtClampLuminance(diffuse, g_gi_clamp);
+  if (!is_direct && g_restir.gi_clamp_per_bounce == 0u) diffuse = PtClampLuminance(diffuse, g_gi_clamp);
   const float sparse_scale = (g_refl_flags & 32u) != 0u && g_sparse_enabled != 0u && g_sparse_levels < 256u
       ? 256.0 / float(g_sparse_levels) : 1.0;
   g_pt_diffuse[id.xy] = float4(PtInvalidPixelGuard(diffuse * sparse_scale), 1.0);

@@ -65,7 +65,7 @@ inline float g_pt_reflection_enabled = 0.f, g_pt_reflection_intensity = 1.f,
              g_pt_reflection_roughness_scale = 1.f;
 inline float g_pt_reflection_sample_clamp = 16.f;
 inline float g_pt_reflection_clamp_enabled = 1.f;
-inline float g_pt_gi_clamp_enabled = 0.f, g_pt_gi_clamp = 16.f;
+inline float g_pt_gi_clamp_enabled = 0.f, g_pt_gi_clamp = 16.f, g_pt_gi_clamp_mode = 0.f;
 inline float g_pt_sharc_firefly_clamp_enabled = 0.f, g_pt_sharc_firefly_clamp = 10.f;
 inline float g_pt_reflection_cap_to_one = 0.f;
 inline float g_pt_reflection_use_sharc = 1.f, g_pt_reflection_footprint = 1.f;
@@ -144,6 +144,7 @@ struct PtPanel {
   uint32_t gpu_sharc_terminated = 0u, gpu_sharc_terminal_rc = 0u, gpu_sharc_replay_rejected = 0u;
   uint32_t gpu_d2_lamp = 0u, gpu_d2_sun = 0u, gpu_shade_transmitted = 0u;
   uint32_t gpu_ao_rays = 0u, gpu_ao_occluded = 0u;
+  uint32_t gpu_energy_len2 = 0u, gpu_energy_len3 = 0u, gpu_energy_len4_5 = 0u, gpu_energy_len6plus = 0u;
   uint32_t temporal_selected = 0u, spatial_selected = 0u;
   uint32_t water_temporal_selected = 0u, water_spatial_selected = 0u;
   bool history_valid = false;
@@ -258,6 +259,8 @@ inline void DrawPtPanel() {
   const float ao_sky = p.gpu_ao_rays != 0u
       ? 100.0f * (1.0f - static_cast<float>(p.gpu_ao_occluded) / static_cast<float>(p.gpu_ao_rays)) : 100.0f;
   ImGui::Text("ao: rays %u | occluded %u | sky visibility %.1f%%", p.gpu_ao_rays, p.gpu_ao_occluded, ao_sky);
+  ImGui::Text("energy by length: 2 / 3 / 4-5 / 6+: %u / %u / %u / %u", p.gpu_energy_len2, p.gpu_energy_len3,
+              p.gpu_energy_len4_5, p.gpu_energy_len6plus);
     static const char* resampling_names[] = {"none", "temporal", "spatial", "temporal_and_spatial"};
     ImGui::Text("ReSTIR PT resampling: %s  history %s  temporal %u  spatial %u",
                 resampling_names[(std::clamp)(static_cast<uint32_t>(g_restir_resampling), 0u, 3u)],

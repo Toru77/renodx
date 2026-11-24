@@ -2028,6 +2028,20 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_logarithmic = true,
   });
   settings->push_back(new Setting{
+      .key = "PtGiClampMode",
+      .binding = &pt::g_pt_gi_clamp_mode,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 0.f,
+      .label = "GI Clamp Mode",
+      .section = "Path Tracing",
+      .tooltip = "Output (current) clamps the final indirect output. Per bounce (pre-unification) clamps each recorded light contribution to GI Clamp instead.",
+      .labels = {"Output (current)", "Per bounce (pre-unification)"},
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "PtReflectionUseSharc",
       .binding = &pt::g_pt_reflection_use_sharc,
       .value_type = SettingValueType::BOOLEAN,

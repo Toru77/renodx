@@ -96,6 +96,10 @@ inline std::string SerializePtReport() {
   const float ao_sky_visibility = p.gpu_ao_rays != 0u
       ? 100.0f * (1.0f - static_cast<float>(p.gpu_ao_occluded) / static_cast<float>(p.gpu_ao_rays)) : 100.0f;
   out << "ao_sky_visibility: " << ao_sky_visibility << "\n";
+  out << "energy_len2: " << p.gpu_energy_len2 << "\n";
+  out << "energy_len3: " << p.gpu_energy_len3 << "\n";
+  out << "energy_len4_5: " << p.gpu_energy_len4_5 << "\n";
+  out << "energy_len6plus: " << p.gpu_energy_len6plus << "\n";
   out << "temporal_selected: " << p.temporal_selected << "\n";
   out << "spatial_selected: " << p.spatial_selected << "\n";
   out << "history_valid: " << p.history_valid << "\n";

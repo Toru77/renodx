@@ -389,6 +389,10 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
           pt::g_pt_panel.gpu_shade_transmitted = values[32];
           pt::g_pt_panel.gpu_ao_rays = values[33];
           pt::g_pt_panel.gpu_ao_occluded = values[34];
+          pt::g_pt_panel.gpu_energy_len2 = values[35];
+          pt::g_pt_panel.gpu_energy_len3 = values[36];
+          pt::g_pt_panel.gpu_energy_len4_5 = values[37];
+          pt::g_pt_panel.gpu_energy_len6plus = values[38];
           pt::g_pt_panel.sparse_sample_active = r.counter_sparse[i];
           pt::g_pt_panel.sparse_selected = values[7];
           pt::g_pt_panel.sparse_valid = values[8];
@@ -864,6 +868,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   if (sparse_policy.dense_reason == pt::PtSparseDenseReason::None && refl_on && !sparse_reflections_requested) {
     sparse_policy.dense_reason = pt::PtSparseDenseReason::ReflectionsDense;
   }
+  const bool light_jitter_ready = isfast_view.handle != 0u && s.pt_noise_source == isfast_view.handle && s.noise.texture12;
   const bool sparse_effective = sparse_policy.dense_reason == pt::PtSparseDenseReason::None && sparse_policy.levels < 256u;
   const bool sparse_reflections_effective = sparse_effective && refl_on && sparse_reflections_requested;
   Rt12DiTransferSlot* previous_slot = nullptr;
@@ -992,7 +997,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_srv(19u, gbuf_on ? input.mrt1.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
   set_srv(20u, gbuf_on ? input.mrt2.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
   set_srv(21u, deferred, Rt12BufferSrv(RTXDI_INPUT_DEFERRED_STRIDE, deferred ? input.deferred_count : 1u));
-  set_srv(26u, sparse_effective ? s.noise.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
+  set_srv(26u, sparse_effective || light_jitter_ready ? s.noise.texture12.Get() : nullptr,
+          Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
   set_srv(27u, regir_on ? r.regir_header[regir_slot].Get() : nullptr, Rt12BufferSrv(kRt12ReGirHeaderStride, 1u));
   set_srv(28u, regir_on ? r.regir_cells[regir_slot].Get() : nullptr, Rt12BufferSrv(kRt12ReGirCellStride, pt::kPtReGirMaxCells));
   D3D12_SHADER_RESOURCE_VIEW_DESC neighbor_srv = {};
@@ -1093,7 +1099,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
                                    input.current_to_previous.Get()}) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }
-  if (sparse_effective) {
+  if (sparse_effective || light_jitter_ready) {
     Transition(barriers, s.noise.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }
   Transition(barriers, out.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1337,7 +1343,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.sun_angular_radius =
       di_clamped(di::g_sun_light_size, 0.f, 0.f, 5.f) * 0.5f * std::numbers::pi_v<float> / 180.f;
   restir_constants.lamp_radius = di_clamped(di::g_local_light_size, 0.f, 0.f, 5.f);
-  restir_constants.isfast_light_jitter = di::g_sun_isfast > 0.5f || di::g_local_isfast > 0.5f ? 1u : 0u;
+  restir_constants.isfast_light_jitter =
+      (di::g_sun_isfast > 0.5f || di::g_local_isfast > 0.5f) && light_jitter_ready ? 1u : 0u;
   restir_constants.local_normal_bias = di_clamped(di::g_local_normal_bias, 0.02f, 0.f, 0.5f);
   restir_constants.local_char_normal_bias = di_clamped(di::g_local_character_normal_bias, 0.02f, 0.f, 0.5f);
   restir_constants.local_clearance = di_clamped(di::g_local_light_clearance, 0.2f, 0.f, 1.f);
@@ -1365,6 +1372,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       ? di_clamped(pt::g_restir_direct_clamp, 16.f, 0.5f, 64.f) : 0.f;
   restir_constants.char_toon = pt::g_restir_char_toon > 0.5f ? 1u : 0u;
   restir_constants.game_sun_shadows = pt::g_restir_game_sun_shadows > 0.5f ? 1u : 0u;
+  restir_constants.gi_clamp_per_bounce =
+      (pt::g_pt_gi_clamp_mode > 0.5f && pt::g_pt_gi_clamp_enabled > 0.5f) ? 1u : 0u;
   restir_constants.tile_count = lamps ? input.tile_count : 0u;
   restir_constants.debug_view = debug_view;
   restir_constants.sun_detail_view = sun_detail_view;
@@ -1545,7 +1554,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
                                    input.current_to_previous.Get()}) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   }
-  if (sparse_effective) {
+  if (sparse_effective || light_jitter_ready) {
     Transition(barriers, s.noise.texture12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   }
   if (regir_on) {
