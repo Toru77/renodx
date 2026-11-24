@@ -85,13 +85,12 @@ inline float g_restir_spatial_samples = 1.f, g_restir_disocclusion_boost_samples
 inline float g_restir_boiling_filter = 1.f, g_restir_boiling_filter_strength = 0.2f;
 inline float g_restir_compatibility_neighbors = 0.f, g_restir_decorrelation_factor = 0.4f;
 inline float g_restir_stable_light_remap = 0.f;
-enum class PtReason : uint32_t { Off, DeferredContext, NeedsRtxdi, InputNotReady, DxrOff, NotCreated, NoShaderModel66,
+enum class PtReason : uint32_t { Off, DeferredContext, InputNotReady, DxrOff, NotCreated, NoShaderModel66,
                                  Failed, SceneMissing, Stuck, SubmitFailed, TargetFailed, Tracing, Count };
 inline const char* PtReasonName(PtReason r) {
   switch (r) {
     case PtReason::Off: return "off";
     case PtReason::DeferredContext: return "deferred_context";
-    case PtReason::NeedsRtxdi: return "needs_rtxdi_local";
     case PtReason::InputNotReady: return "input_not_ready";
     case PtReason::DxrOff: return "dxr_off";
     case PtReason::NotCreated: return "not_created";

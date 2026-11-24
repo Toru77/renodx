@@ -27,6 +27,8 @@ Unified PT M3: RTXDI ReSTIR PT temporal and spatial reuse run between initial sa
 
 Unified PT M4: duplication maps count spatially shared samples and smooth reservoir stagnancy for decorrelation, and compatibility-guided spatial neighbours are preselected from a dedicated G-buffer. Decorrelation mode and firefly replacement follow the SDK's Ray Reconstruction defaults; sparse-unselected pixels write sample ID 0. Not validated in game.
 
+Unified PT M5: Path Tracing owns the scene request and input transfer, so the light table and lamp status are produced with RTXDI Local and Sun off; the local DI passes and the t41 output are skipped unless RTXDI Local is requested. RTXDI Local and Sun keep their previous behavior when enabled, and the Path Tracing `needs_rtxdi_local` reason is gone. Not validated in game.
+
 PT M0: SHARC 1.8.3 vendored (`world/sharc/vendor`), licences moved to `licenses/`, SM 6.6 support reported on the DXR panel line and in `world_rt12.json`; no behaviour change. Not validated in game.
 
 PT M1: Sora 2nd diffuse path tracing uses the DXR scene, the game sun and RTXDI Local lamps, and the ambient probe on ray misses; its settings and status are available in the Path Tracing section. Output is raw unless Ray Reconstruction is enabled. It needs RTXDI Local (scene transfer and lamps) and works with RTXDI Sun off; sun light at path vertices comes from scene constants and the path tracer's own shadow rays. Not validated in game.
