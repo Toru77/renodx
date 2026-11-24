@@ -11568,6 +11568,8 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
                              reshade::api::descriptor_table_update{{}, kLightingPtReflectionRegister, 0u, 1u,
                                                                    reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
   if (!pt::PtRequested()) { pt::SetPtReason(pt::PtReason::Off); return; }
+  if (rt12::g_rt12 && rt12::g_rt12->stuck) { pt::SetPtReason(pt::PtReason::Stuck); return; }
+  if (rt12::g_rt12 && rt12::g_rt12->failed) { pt::SetPtReason(pt::PtReason::Failed); return; }
   if (!dd || cmd_list != dd->immediate_cmd_list) { pt::SetPtReason(pt::PtReason::DeferredContext); return; }
   const uint32_t frame = falcom_world::g_state.frame.load();
   di::InputSnapshot input;

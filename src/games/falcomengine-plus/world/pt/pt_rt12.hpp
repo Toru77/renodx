@@ -893,7 +893,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       previous_slot = &candidate;
       history_valid = true;
     } else {
-      history_reason = "missing_inputs";
+      history_reason = !previous_inputs ? "missing_inputs" : (!input.motion_available ? "motion" : "identity");
     }
   }
   if (!history_valid) {
@@ -1686,7 +1686,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
                                          .previous_inputs_available = previous_inputs})) {
         water_history_valid = true;
       } else {
-        water_history_reason = "missing_inputs";
+        water_history_reason = !previous_inputs ? "missing_inputs" : (!input.motion_available ? "motion" : "identity");
       }
     }
     if (!water_history_valid) {
@@ -1949,24 +1949,7 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
     DisableMirror();
     return fallback("stuck");
   }
-  const bool water_surface_on = pt::g_pt_reflection_water_surface > 0.5f;
-  const uint64_t water_bytes = uint64_t{r.restir->GetReservoirBufferParameters().reservoirArrayPitch}
-                               * sizeof(RTXDI_PackedPTReservoir);
-  if (!water_surface_on && r.water_reservoirs && r.water_reservoirs_last_use <= Rt12CompletedValue(s)) {
-    RetireObject(s, s.last_signal, r.water_reservoirs);
-    r.water_reservoirs.Reset();
-  }
-  if (water_surface_on && (!r.water_reservoirs || r.water_reservoirs->GetDesc().Width != water_bytes)) {
-    if (!r.water_reservoirs || r.water_reservoirs_last_use <= Rt12CompletedValue(s)) {
-      RetireObject(s, s.last_signal, r.water_reservoirs);
-      r.water_reservoirs.Reset();
-      const HRESULT hr_water_reservoirs = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, water_bytes,
-                                                           D3D12_RESOURCE_STATE_COMMON,
-                                                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, r.water_reservoirs);
-      if (FAILED(hr_water_reservoirs)) return fail_water(Rt12Reason::CreateFailed, "pt water reservoirs", "resources");
-    }
-  }
-  if (!r.water_reservoirs) return fallback("resources");
+  if (!r.water_reservoirs || !r.water_restir) return fallback("resources");
   // 4. Copy targets and water reflection at the SSR draw's size (a replaced texture is retired with the last signal).
   if (r.water_depth_format != depth_format) {
     for (Rt12Shared& shared : r.water_depth) RetireShared(s, shared, s.last_signal);

@@ -456,7 +456,10 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
     } else {
       s.solidAnglePdf = 1.0;
     }
-    s.radiance = max(g_pt_sun_color, 0.0);
+    // Game lights are irradiance-normalized (lighting_0xCA3D8596: diffuse = albedo x colour x N.L, no 1/pi). The FullSample
+    // Lambert BRDF divides by pi, and an area light spreads that over its solid angle: radiance = pi x colour / Omega,
+    // where 1 / Omega = solidAnglePdf (delta lights use pdf 1).
+    s.radiance = max(g_pt_sun_color, 0.0) * (3.14159265 * s.solidAnglePdf);
     s.position = surface.worldPos + direction * kPtFarLightDistance;
     return s;
   }
@@ -503,7 +506,7 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
   color *= LampDistanceAttenuation(lp, to);
   if (info.type == LAMP_TYPE_SPOT) color *= LampSpotCone(lp, l);
   if (g_restir.local_clamp_enabled != 0u) color = min(color, float3(g_restir.local_clamp, g_restir.local_clamp, g_restir.local_clamp));
-  s.radiance = color;
+  s.radiance = color * (3.14159265 * s.solidAnglePdf);
   s.position = center;
   return s;
 }
