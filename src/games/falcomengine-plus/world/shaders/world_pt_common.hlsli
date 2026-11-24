@@ -1,9 +1,9 @@
 #pragma once
-// Shared by world_pt_diffuse, world_pt_sharc_update and world_pt_sharc_resolve (world/pt/pt_rt12.hpp). The including
-// file defines SHARC_UPDATE first.
-#ifndef SHARC_UPDATE
-#error "define SHARC_UPDATE before world_pt_common.hlsli"
+// Shared by the unified PT passes (world/pt/pt_rt12.hpp). The including file defines PT_COMMON_PASS first.
+#ifndef PT_COMMON_PASS
+#error "define PT_COMMON_PASS before world_pt_common.hlsli"
 #endif
+// This software contains source code provided by NVIDIA Corporation.
 #define RT12_TLAS_REGISTER t29
 #define RT12_DYNAMIC_VERTICES_REGISTER t30
 #include "world_rt12_trace.hlsli"
@@ -33,12 +33,19 @@ StructuredBuffer<PtReGirHeader> g_pt_regir_header : register(t41);
 StructuredBuffer<PtReGirCell> g_pt_regir_cells : register(t42);
 RWStructuredBuffer<uint64_t> g_pt_material_keys : register(u4);
 globallycoherent RWStructuredBuffer<uint> g_pt_material_values : register(u5);
-RWTexture2D<float4> g_pt_output : register(u0);
+RWTexture2D<float4> g_pt_diffuse : register(u0);
 RWStructuredBuffer<uint64_t> g_pt_sharc_hash : register(u1);
 RWStructuredBuffer<SharcAccumulationData> g_pt_sharc_accumulation : register(u2);
 RWStructuredBuffer<SharcPackedData> g_pt_sharc_resolved : register(u3);
 RWStructuredBuffer<uint> g_pt_counters : register(u6);  // GPU diagnostics: 0 exact G-buffer, 1 cache hit, 2 grey miss (PtHitMaterial)
-RWTexture2D<float4> g_pt_reflection : register(u7);  // traced reflection (rgb), mean hit distance (a)
+RWTexture2D<float4> g_pt_specular : register(u7);  // traced reflection (rgb), mean hit distance (a)
+#ifndef RTXDI_ENABLE_PRESAMPLING
+#define RTXDI_ENABLE_PRESAMPLING 0
+#endif
+#include "../pt/pt_restir_layout.h"
+RWStructuredBuffer<RTXDI_PackedPTReservoir> g_pt_reservoirs : register(u8);
+#define RTXDI_PT_RESERVOIR_BUFFER g_pt_reservoirs
+ConstantBuffer<PtRestirConstants> g_restir : register(b1);
 cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (48 dwords)
   uint2 g_size; uint g_frame; uint g_samples; uint g_max_bounces; uint g_roulette; uint g_roulette_min_bounce;
   uint g_lamp_count; uint g_sun_casters_only; uint g_dynamic_on; float g_ray_max; float g_env_bias; float g_char_bias;
@@ -49,7 +56,7 @@ cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (48 dwords
   uint g_mat_enabled; uint g_mat_capacity; uint g_mat_rate; float g_mat_cell_scale;
   uint g_mat_deferred_count; float g_mat_char_roughness; float g_mat_char_f0; uint g_mat_mode;
   float g_sharc_radiance_scale; uint g_refl_samples; float g_refl_intensity; float g_refl_roughness_scale;
-  float g_refl_sample_clamp; uint g_refl_flags;  // per-sample reflection radiance clamp (0 = off); flags: 1 = cap to one, 2 = reflection uses SHARC, 4 = SHARC footprint test, 8 = water bed test, 16 = water pass (reflection from the SSR-time water surface), 32 = sparse reflections enabled
+  float g_refl_sample_clamp; uint g_refl_flags;  // output clamp (0 = off); flags: 1 = cap to one, 2 = reflection uses SHARC, 4 = SHARC footprint test, 8 = water bed test, 32 = sparse reflections enabled
   float g_water_roughness; float g_gi_clamp;  // base roughness of water reflections; GI luminance clamp (0 = off)
   uint g_sharc_firefly_clamp_enabled; float g_sharc_firefly_clamp;  // SHARC update clamp on (1) / off (0); limit as a multiple of the cell mean (OpenRemix sharcFireflyClamp)
   uint g_sparse_levels; uint g_sparse_enabled;
@@ -97,122 +104,12 @@ float3 PtSky(float3 dir) {
                    + g_pt_probe[8] * (dir.x * dir.x - dir.y * dir.y);
   return g_sky_intensity * max(sky, 0);
 }
-float3 PtCosineDirection(float3 n, inout uint rng) {
-  const float u1 = PtRandom(rng);
-  const float u2 = PtRandom(rng);
-  const float3 up = abs(n.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
-  const float3 t = normalize(cross(up, n));
-  const float3 bt = cross(n, t);
-  return normalize(t * (sqrt(u1) * cos(6.2831853 * u2)) + bt * (sqrt(u1) * sin(6.2831853 * u2)) + n * sqrt(1.0 - u1));
-}
-// Heitz 2018 GGX visible-normal sampling, then reflection (OpenRemix brdf.glsl:159-170). wo and the result are in the
-// tangent frame (z = normal).
-float3 PtSampleGgx(float3 wo, float alpha, float2 u) {
-  const float3 v = normalize(float3(alpha * wo.xy, wo.z));
-  const float lensq = dot(v.xy, v.xy);
-  const float3 t1 = lensq > 0.0 ? float3(-v.y, v.x, 0.0) / sqrt(lensq) : float3(1.0, 0.0, 0.0);
-  const float3 t2 = cross(v, t1);
-  const float radius = sqrt(u.x);
-  const float phi = 6.2831853 * u.y;
-  const float x = radius * cos(phi);
-  const float s = 0.5 * (1.0 + v.z);
-  const float y = lerp(sqrt(max(0.0, 1.0 - x * x)), radius * sin(phi), s);
-  const float3 nh = x * t1 + y * t2 + sqrt(max(0.0, 1.0 - x * x - y * y)) * v;
-  const float3 h = normalize(float3(alpha * nh.xy, max(0.0, nh.z)));
-  return reflect(-wo, h);
-}
 // Scales c down to luminance limit, keeping hue (OpenRemix fireflies.glsl:6-12). limit 0 = off.
 float3 PtClampLuminance(float3 c, float limit) {
   const float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
   return limit > 0.0 && lum > limit ? c * (limit / lum) : c;
 }
 void PtCount(uint index) { uint previous; InterlockedAdd(g_pt_counters[index], 1u, previous); }
-// Light arriving at a bounce hit: the sun with a shadow ray and one lamp sampled uniformly. The caller multiplies by albedo.
-float3 PtHitLight(float3 position, float3 nh, inout uint rng) {
-  WorldTraceCounters counters;
-  const WorldCameraView sun_view = {false, 1.0, 0u, g_sun_casters_only != 0u ? INSTANCE_SHADOW_CASTER : 0u};
-  const WorldCameraView lamp_view = {false, 1.0, 0u, 0u};
-  const float3 q = position + nh * g_env_bias;
-  float3 sun = float3(0, 0, 0);
-  const float ndl = saturate(dot(nh, g_pt_sun_dir));
-  if (ndl > 0.0 && TraceWorldRayDxr(q, g_pt_sun_dir, 1e-3, g_ray_max, true, sun_view, counters).prim == 0xFFFFFFFFu) {
-    sun = g_pt_sun_color * ndl;
-  }
-  float3 lamp = float3(0, 0, 0);
-  if (g_lamp_count > 0u) {
-    const bool regir_eligible = g_regir_enabled != 0u && g_lamp_count <= RTXDI_LIGHT_TABLE_CAPACITY;
-    if (regir_eligible) PtCount(9u);
-    bool pool_valid = false;
-    uint fallback_reason = regir_eligible ? 0u : 1u;
-    PtReGirCell pool = (PtReGirCell)0;
-    int3 key;
-    if (regir_eligible && PtReGirCellKey(position, key)) {
-      PtCount(10u);
-      uint header_count, header_stride, cell_count, cell_stride;
-      g_pt_regir_header.GetDimensions(header_count, header_stride);
-      g_pt_regir_cells.GetDimensions(cell_count, cell_stride);
-      if (header_count != 0u && g_pt_regir_header[0].valid != 0u
-          && g_pt_regir_header[0].cell_count <= min(cell_count, PT_REGIR_MAX_CELLS)) {
-        bool matched = false;
-        for (uint cell_index = 0u; cell_index < g_pt_regir_header[0].cell_count; ++cell_index) {
-          const PtReGirCell candidate = g_pt_regir_cells[cell_index];
-          if (all(candidate.key == key) && candidate.valid != 0u) {
-            matched = true;
-            PtCount(11u);
-            pool = candidate;
-            pool_valid = true;
-            for (uint slot = 0u; slot < PT_REGIR_SLOTS; ++slot) {
-              if (pool.slots[slot] >= g_lamp_count) {
-                pool_valid = false;
-                fallback_reason = 5u;
-                PtCount(14u);
-              }
-            }
-            break;
-          }
-        }
-        if (!matched) PtCount(12u);
-      } else {
-        fallback_reason = 4u;
-        PtCount(13u);
-      }
-      if (fallback_reason == 0u && !pool_valid) fallback_reason = 3u;
-    } else if (regir_eligible) {
-      fallback_reason = 2u;
-    }
-    uint i;
-    float lamp_scale;
-    PtReGirSelection selection = (PtReGirSelection)0;
-    uint next_rng = rng;
-    if (pool_valid) {
-      next_rng = PtHash(rng + 0x9e3779b9u);
-      selection = PtReGirSelect(next_rng >> 8, g_lamp_count, pool.slots);
-    }
-    if (selection.valid != 0u) {
-      PtCount(15u);
-      rng = next_rng;
-      i = selection.light_index;
-      lamp_scale = 1.0 / selection.pmf;
-    } else {
-      if (fallback_reason == 0u) fallback_reason = 3u;
-      PtCount(15u + fallback_reason);
-      i = min(uint(PtRandom(rng) * g_lamp_count), g_lamp_count - 1u);
-      lamp_scale = g_lamp_count;
-    }
-    const uint type = g_pt_light_table[i].type;
-    if (type == LAMP_TYPE_POINT || type == LAMP_TYPE_SPOT) {
-      const LightParam lp = g_pt_lights[i];
-      const float3 to = lp.pos - position;
-      const float3 l = normalize(to);
-      const float e = LampDistanceAttenuation(lp, to) * (type == LAMP_TYPE_SPOT ? LampSpotCone(lp, l) : 1.0)
-                    * max(lp.translucency, dot(nh, l));
-      const float reach = length(to) - g_lamp_clearance;
-      const bool vis = reach <= 1e-3 || TraceWorldRayDxr(q, l, 1e-3, reach, true, lamp_view, counters).prim == 0xFFFFFFFFu;
-      if (e > 0.0 && vis) lamp = max(lp.color, 0.0) * e * lamp_scale;
-    }
-  }
-  return sun + lamp;
-}
 SharcParameters PtSharcParameters() {
   SharcParameters p;
   p.hashGridParameters.cameraPosition = g_sharc_camera;

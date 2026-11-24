@@ -1,3 +1,4 @@
+#define PT_COMMON_PASS 0
 #define SHARC_UPDATE 0
 #include "world_pt_common.hlsli"
 // Material cache (M3): g_mat_mode 1 zeroes every entry; 0 writes one pixel per rate x rate cell (phase rotates per frame).

@@ -31,6 +31,8 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
+#include <Rtxdi/PT/ReSTIRPT.h>
+
 #include <include/reshade.hpp>
 
 #include "../../../../utils/directx.hpp"
@@ -384,10 +386,10 @@ struct Rt12DiTransferState {
 #endif
 };
 
-// Path-traced diffuse GI (world/pt): its own submission slots, list, root signature, PSO, descriptors and outputs.
-inline constexpr uint32_t kRt12PtDescriptors = 29u;
+// Path tracing (world/pt): its own submission slots, list, root signature, PSOs, descriptors and outputs.
+inline constexpr uint32_t kRt12PtDescriptors = 30u;
 inline constexpr uint32_t kRt12PtConstants = 52u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
-inline constexpr uint32_t kRt12PtCounters = 21u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
+inline constexpr uint32_t kRt12PtCounters = 28u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
 inline constexpr uint32_t kRt12ReGirDescriptors = 5u;
 inline constexpr uint32_t kRt12ReGirPasses = 3u;
 inline constexpr uint32_t kRt12ReGirConstants = 2u;
@@ -403,11 +405,21 @@ struct Rt12PtWaterFrame {
 };
 struct Rt12PtState {
   bool created = false;
+  std::unique_ptr<::rtxdi::ReSTIRPTContext> restir;
+  uint32_t restir_width = 0u, restir_height = 0u;
+  uint64_t cache_epoch = 0u;
   Rt12Slot slots[kRt12Slots];
   uint32_t next = 0u;
   Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> list;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> initial_pso, final_pso;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> water_initial_pso, water_final_pso;
+  Microsoft::WRL::ComPtr<ID3D12Resource> reservoirs;
+  Microsoft::WRL::ComPtr<ID3D12Resource> constants[kRt12Slots];
+  uint64_t reservoirs_last_use = 0u;
+  Microsoft::WRL::ComPtr<ID3D12Resource> water_reservoirs;
+  Microsoft::WRL::ComPtr<ID3D12Resource> water_constants[kRt12Slots];
+  uint64_t water_reservoirs_last_use = 0u;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> regir_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> regir_register_pso, regir_weights_pso, regir_build_pso;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> regir_heap;

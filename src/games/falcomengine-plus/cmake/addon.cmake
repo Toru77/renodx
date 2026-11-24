@@ -1,6 +1,7 @@
 set(FALCOM_RTXDI_ROOT "${ADDON_PATH}/world/rtxdi/vendor/rtxdi")
 add_library(falcom-rtxdi-sdk STATIC
   "${FALCOM_RTXDI_ROOT}/Source/ReSTIRDI.cpp"
+  "${FALCOM_RTXDI_ROOT}/Source/ReSTIRPT.cpp"
   "${FALCOM_RTXDI_ROOT}/Source/RtxdiUtils.cpp")
 target_include_directories(falcom-rtxdi-sdk SYSTEM PUBLIC "${FALCOM_RTXDI_ROOT}/Include")
 target_link_libraries(${ADDON} PRIVATE falcom-rtxdi-sdk)

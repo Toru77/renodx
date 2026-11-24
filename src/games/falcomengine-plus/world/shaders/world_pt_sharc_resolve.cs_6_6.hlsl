@@ -1,3 +1,4 @@
+#define PT_COMMON_PASS 0
 #define SHARC_UPDATE 0
 #include "world_pt_common.hlsli"
 // g_sharc_mode 1: zero every entry (cache clear). 0: SHARC resolve (OpenRemix sharc-resolve.comp).

@@ -1,5 +1,8 @@
+#define PT_COMMON_PASS 1
 #define SHARC_UPDATE 1
+// This software contains source code provided by NVIDIA Corporation.
 #include "world_pt_common.hlsli"
+#include "world_pt_bridge.hlsli"
 // SHARC update (OpenRemix pathtrace.comp:1656-1744 updateCache): one path per downscale cell, from the primary surface.
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -21,12 +24,26 @@ void main(uint3 id : SV_DispatchThreadID) {
   float bias = (surface.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u ? g_char_bias : g_env_bias;
   const uint max_bounces = min(g_max_bounces, 8u);
   for (uint b = 0u; b < max_bounces; ++b) {
-    const float3 dir = PtCosineDirection(n, rng);
+    float pdf;
+    float3 tangent, bitangent;
+    ConstructONB(n, tangent, bitangent);
+    const float3 local = SampleCosHemisphere(float2(PtRandom(rng), PtRandom(rng)), pdf);
+    const float3 dir = bitangent * local.x + tangent * local.y + n * local.z;
     const WorldTraceHit hit = TraceWorldRayDxr(p + n * bias, dir, 1e-3, g_ray_max, false, bounce_view, pt_counters);
     if (hit.prim == 0xFFFFFFFFu) { SharcUpdateMiss(sharc, state, PtSky(dir)); break; }
     const float3 nh = dot(hit.normal, dir) > 0.0 ? -hit.normal : hit.normal;
     const float3 albedo = PtHitMaterial(hit.position, nh).albedo;
-    float3 direct = albedo * PtHitLight(hit.position, nh, rng);
+    const RAB_Surface hit_surface = PtHitSurface(hit, dir);
+    RTXDI_RandomSamplerState nee_rng;
+    nee_rng.seed = rng;
+    nee_rng.index = 1u;
+    float3 direct_from_lights;
+    float unused_a, unused_b;
+    RTXDI_SampledLightData unused_data;
+    RAB_LightSample unused_sample;
+    PtSampleNee(hit_surface, nee_rng, direct_from_lights, unused_data, unused_a, unused_b, unused_sample);
+    rng = nee_rng.seed;
+    float3 direct = albedo * direct_from_lights;
     if (any(isnan(direct)) || any(isinf(direct))) direct = float3(0, 0, 0);
     const SharcHitData sharc_hit = PtSharcHit(hit.position, nh, dir, albedo);
     const float random_value = PtRandom(rng);

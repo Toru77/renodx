@@ -75,6 +75,13 @@ inline std::string SerializePtReport() {
   out << "gpu_writes: " << p.gpu_writes << "\n";
   out << "gpu_frame: " << p.gpu_frame << "\n";
   out << "gpu_available: " << p.gpu_available << "\n";
+  out << "initial_valid: " << p.gpu_initial_valid << "\n";
+  out << "path_len2: " << p.gpu_path_len2 << "\n";
+  out << "path_len3plus: " << p.gpu_path_len3plus << "\n";
+  out << "nee_connected: " << p.gpu_nee_connected << "\n";
+  out << "sharc_terminated: " << p.gpu_sharc_terminated << "\n";
+  out << "sharc_terminal_rc: " << p.gpu_sharc_terminal_rc << "\n";
+  out << "sharc_replay_rejected: " << p.gpu_sharc_replay_rejected << "\n";
   out << "material cell scale: " << g_pt_material_cell_scale << "\n";
   out << "samples: " << g_pt_samples << "\n";
   out << "regir requested: " << p.regir_requested << "\n";
