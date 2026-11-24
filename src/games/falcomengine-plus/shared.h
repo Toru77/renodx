@@ -41,7 +41,7 @@ struct ShaderInjectData {
   float rtxdi_local_bound;                  // 0/1: Sora 2nd t41 holds a matching staged local-DI tuple this lighting draw
   float rtxdi_sun_bound;                    // 0/1: Sora 2nd t42 holds matching RTXDI sun visibility for this draw
   float rtxdi_sun_darkening;                // RTXDI Sun Shadow Darkening [0..1]
-  float reserved_slot_01;                   // reserved: unused slot kept so later packoffsets do not move
+  float pt_direct_bound;                    // 0/1: t47/t48 carry unified PT direct light this draw; was reserved_slot_01
   float rtxdi_sun_character_darkening;      // RTXDI Sun Character Shadow Darkening [0..1]
   float rtxdi_local_darkening;              // RTXDI Local Shadow Darkening [0..1] (reuses retired offset 76)
   float cs_contact_local_light_clearance;   // [0..1] world units; reuses a retired slot without moving later fields

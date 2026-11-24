@@ -80,7 +80,7 @@ ShaderInjectData shader_injection = {
     .rtxdi_local_bound = 0.f,
     .rtxdi_sun_bound = 0.f,
     .rtxdi_sun_darkening = 1.f,
-    .reserved_slot_01 = 0.f,
+    .pt_direct_bound = 0.f,
     .rtxdi_sun_character_darkening = 1.f,
     .rtxdi_local_darkening = 1.f,
     .cs_contact_local_light_clearance = 0.2f,
@@ -4536,7 +4536,7 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Full", "1/2", "1/4", "1/8"},
         .min = 1.f,  // index = log2 divisor; Full (0) is hidden and a saved 0 loads as 1/2
         .is_enabled = []() { return g_vbgi_enabled > 0.5f; },
-        .is_visible = []() { return VbgiRowVisible(); },
+        .is_visible = []() { return VbgiGameSupported(); },
     },
     new renodx::utils::settings::Setting{
         .key = "VBGIUpscaleAlgorithm",
@@ -12353,15 +12353,58 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   }
   const bool lamps = di_snapshot.status == di::DiStatus::Submitted && di_snapshot.frame == frame
                      && di_snapshot.transfer_slot == input.transfer_slot;
+  const uint32_t requested_debug_view = static_cast<uint32_t>(
+      std::clamp(std::isfinite(di::g_debug_view) ? di::g_debug_view : 0.f, 0.f,
+                 static_cast<float>(RTXDI_DEBUG_VIEW_SUN_VISIBILITY)));
+  const bool pt_bvh_debug_active = falcom_world::bvh::g_bvh_debug.mode.load(std::memory_order_relaxed) != 0;
+  const uint32_t pt_debug_view = ResolveRtxdiDebugEffectiveView(requested_debug_view, pt_bvh_debug_active);
+  const uint32_t pt_sun_detail_view =
+      pt_debug_view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY
+          ? static_cast<uint32_t>(std::clamp(std::isfinite(di::g_sun_detail_view) ? di::g_sun_detail_view : 0.f, 0.f,
+                                            static_cast<float>(RTXDI_SUN_DETAIL_BLOCKER)))
+          : RTXDI_SUN_DETAIL_STATUS;
   reshade::api::resource_view reflection_view = {};
-  const reshade::api::resource_view view = rt12::RunPtTrace(cmd_list->get_device(), cmd_list, input.transfer_slot, lamps, dd->isfast_noise_srv, &reflection_view);
+  reshade::api::resource_view pt_debug_views[3] = {};
+  const reshade::api::resource_view view = rt12::RunPtTrace(cmd_list->get_device(), cmd_list, input.transfer_slot, lamps,
+                                                            dd->isfast_noise_srv, pt_debug_view, pt_sun_detail_view,
+                                                            &reflection_view, pt_debug_views);
   if (view.handle == 0u) return;
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, kLightingPtRegister, 0u, 1u,
                                                                    reshade::api::descriptor_type::texture_shader_resource_view, &view});
   shader_injection.pt_gi_bound = 1.f;
-  shader_injection.pt_intensity = di::FiniteClamped(pt::g_pt_intensity, 1.f, 0.f, 2.f);
-  shader_injection.pt_char_intensity = di::FiniteClamped(pt::g_pt_char_intensity, 1.f, 0.f, 1.f);
+  const bool pt_direct = pt::g_restir_direct > 0.5f;
+  shader_injection.pt_direct_bound = pt_direct ? 1.f : 0.f;
+  shader_injection.pt_intensity = pt_direct ? 1.f : di::FiniteClamped(pt::g_pt_intensity, 1.f, 0.f, 2.f);
+  shader_injection.pt_char_intensity = pt_direct ? 1.f : di::FiniteClamped(pt::g_pt_char_intensity, 1.f, 0.f, 1.f);
+  shader_injection.rtxdi_debug_bound = 0.f;
+  shader_injection.rtxdi_debug_distance_bound = 0.f;
+  shader_injection.rtxdi_sun_detail_bound = 0.f;
+  shader_injection.rtxdi_debug_view = static_cast<float>(pt_debug_view);
+  shader_injection.rtxdi_sun_detail_view = static_cast<float>(pt_sun_detail_view);
+  if (pt_direct && pt_debug_views[0].handle != 0u) {
+    cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                               reshade::api::descriptor_table_update{{}, 44u, 0u, 1u,
+                                                                     reshade::api::descriptor_type::texture_shader_resource_view,
+                                                                     &pt_debug_views[0]});
+    shader_injection.rtxdi_debug_bound = 1.f;
+    shader_injection.rtxdi_debug_distance_bound =
+        (pt_debug_view == RTXDI_DEBUG_VIEW_DISTANCE_VALIDITY || pt_debug_view == RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE)
+            ? 1.f
+            : 0.f;
+    cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                               reshade::api::descriptor_table_update{{}, 45u, 0u, 1u,
+                                                                     reshade::api::descriptor_type::texture_shader_resource_view,
+                                                                     &pt_debug_views[1]});
+    if ((pt_debug_view == RTXDI_DEBUG_VIEW_SELECTED_LIGHT || pt_debug_view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY)
+        && pt_debug_views[2].handle != 0u) {
+      cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                                 reshade::api::descriptor_table_update{{}, 46u, 0u, 1u,
+                                                                       reshade::api::descriptor_type::texture_shader_resource_view,
+                                                                       &pt_debug_views[2]});
+      shader_injection.rtxdi_sun_detail_bound = 1.f;
+    }
+  }
   if (reflection_view.handle != 0u) {
     cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                                reshade::api::descriptor_table_update{{}, kLightingPtReflectionRegister, 0u, 1u,

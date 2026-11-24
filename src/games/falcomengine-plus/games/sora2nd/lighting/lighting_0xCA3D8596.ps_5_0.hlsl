@@ -175,6 +175,7 @@ Texture2D<uint> rtxdiSunVisibility_g : register(t42);
 Texture2D<float4> rtxdiDenoisedDiffuse_g : register(t43);
 Texture2D<float4> rtxdiDebugValue_g : register(t44);
 Texture2D<uint> rtxdiDebugStatus_g : register(t45);
+// t46: PT final-shading debug words (A6): Selected Light tuple, sun visibility word, sun detail.
 Texture2D<uint4> rtxdiSunDetail_g : register(t46);
 StructuredBuffer<float4x4> spotShadowMatrices_g : register(t14);
 TextureCube<float4> texEnvMap_g : register(t17);
@@ -249,10 +250,10 @@ float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
   uint tuple_width, tuple_height;
   uint4 tuple = 0u;
   bool tuple_bound = false;
-  if (view == RTXDI_DEBUG_VIEW_SELECTED_LIGHT && shader_injection_data.rtxdi_local_bound > 0.5f) {
-    rtxdiResolvedLocal_g.GetDimensions(tuple_width, tuple_height);
+  if (view == RTXDI_DEBUG_VIEW_SELECTED_LIGHT && shader_injection_data.rtxdi_sun_detail_bound > 0.5f) {
+    rtxdiSunDetail_g.GetDimensions(tuple_width, tuple_height);
     tuple_bound = pixel.x < tuple_width && pixel.y < tuple_height;
-    if (tuple_bound) tuple = rtxdiResolvedLocal_g.Load(int3(pixel, 0));
+    if (tuple_bound) tuple = rtxdiSunDetail_g.Load(int3(pixel, 0));
   }
 
   uint filtered_width, filtered_height;
@@ -267,10 +268,12 @@ float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
   uint sun_width, sun_height;
   uint sun_status = RTXDI_SUN_STATUS_UNKNOWN;
   bool sun_bound = false;
-  if (view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY && shader_injection_data.rtxdi_sun_bound > 0.5f) {
-    rtxdiSunVisibility_g.GetDimensions(sun_width, sun_height);
+  if (view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY
+      && (uint)shader_injection_data.rtxdi_sun_detail_view == RTXDI_SUN_DETAIL_STATUS
+      && shader_injection_data.rtxdi_sun_detail_bound > 0.5f) {
+    rtxdiSunDetail_g.GetDimensions(sun_width, sun_height);
     sun_bound = pixel.x < sun_width && pixel.y < sun_height;
-    if (sun_bound) sun_status = rtxdiSunVisibility_g.Load(int3(pixel, 0));
+    if (sun_bound) sun_status = rtxdiSunDetail_g.Load(int3(pixel, 0)).x;
   }
 
   const uint sun_detail_view = (uint)shader_injection_data.rtxdi_sun_detail_view;
@@ -503,6 +506,7 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
           if (sunSelection.known) r3.z *= 1.0 - saturate(shader_injection_data.rtxdi_sun_character_darkening) * (1.0 - sunSelection.visibility);
         }
       }
+      if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) r3.z = 0.0f;
       r5.yzw = -r9.xyz * r8.xyz + r0.xyz;
       r9.xyz = r3.zzz * r5.yzw + r10.xyz;
       r3.z = (int)r1.z & 4;
@@ -755,12 +759,13 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     r5.yzw = r5.yzw + -r9.xyz;
     r5.yzw = combineAlpha_g * r5.yzw + r9.xyz;
     float3 charColor = r3.www ? r9.xyz : r5.yzw;
+    const bool ptDirectCharacter = shader_injection_data.pt_direct_bound > 0.5f && ptGiValid;
     // RTXDI character lamp fallback: add unshadowed point and spot lamp light (charaColor) when no staged local-DI
     // tuple resolved this pixel. Resolved pixels keep their RTXDI contribution and take no fallback term.
     bool rtxdiCharResolved = false;
     bool rtxdiCharTileValid = false;
     bool rtxdiCharEmpty = false;
-    if (shader_injection_data.rtxdi_local_bound > 0.5f) {
+    if (shader_injection_data.rtxdi_local_bound > 0.5f && !ptDirectCharacter) {
       uint resolvedWidth, resolvedHeight, tileCount, tileStride, lightCount, lightStride;
       rtxdiResolvedLocal_g.GetDimensions(resolvedWidth, resolvedHeight);
       lightIndices_g.GetDimensions(tileCount, tileStride);
@@ -832,7 +837,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     }
     const bool rtxdiCharFallback = !rtxdiCharResolved && shader_injection_data.rtxdi_local_bound > 0.5f
         && shader_injection_data.rtxdi_local_character_fallback > 0.5f && rtxdiCharTileValid && !rtxdiCharEmpty;
-    if (rtxdiCharFallback) {
+    if (rtxdiCharFallback && !ptDirectCharacter) {
       rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FALLBACK;
       const float3 rtxdiCharN = DecodeFalcomMrtNormalAsGame((uint2)r1.xy);
       // Tile cell and depth slice match the environment path; the pixel branch above also bounds-checks these indices.
@@ -856,6 +861,12 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       }
       charColor += r0.xyz * rtxdiCharLampLight * shader_injection_data.rtxdi_local_character_intensity;
     }
+    // Unified PT direct (A2.4 Q1): PT diffuse (demodulated, total) x albedo + PT specular radiance replace all character
+    // lighting terms (sun toon, lamps, ambient/SSGI); t47/t48 already include direct and indirect light.
+    if (ptDirectCharacter) {
+      charColor = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb * ptGiTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb
+                + ptReflTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb;
+    }
     if (shader_injection_data.char_gtvbao_mode > 0.5f
         && shader_injection_data.gtvbao_dedicated_bound > 0.5f) {
       // GTVBAO on characters — apply bitmask AO to character pixels
@@ -877,9 +888,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     // the character/SSGI/GI terms with no isolable sun contribution. Contact is
     // therefore not applied here: attaching it to the final colour instead is the
     // bug that put contact shadows in interiors.
-    o0.xyz = FalcomApplyShadowTerms(charColor, v1.xy, csIsCharacter > 0.5, samPoint_s,
-                                    contactShadowTex);
-    if (ptGiValid) o0.xyz += cachedPtGi * (csCharacterShading ? saturate(shader_injection_data.pt_char_intensity) : 1.0);
+    o0.xyz = ptDirectCharacter ? charColor : FalcomApplyShadowTerms(charColor, v1.xy, csIsCharacter > 0.5, samPoint_s,
+                                                                     contactShadowTex);
+    if (ptGiValid && !ptDirectCharacter) {
+      o0.xyz += cachedPtGi * (csCharacterShading ? saturate(shader_injection_data.pt_char_intensity) : 1.0);
+    }
     // VBGI (M7.5): added after the shadow terms; Character Mask Strength scales it on this path.
     if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
       o0.xyz += cachedVBGI * (1.0 - saturate(shader_injection_data.char_gtvbgi_mask_strength));
@@ -911,6 +924,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       if (sunSelection.known) rtxdiSunLayers = sunSelection.layers;
     }
   }
+  if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) r3.z = 0.0f;
   r3.w = min(r3.z, r0.w);
   r1.xy = (uint2)r1.xy;
   r8.zw = r1.xy * float2(3.05180438e-05,3.05180438e-05) + float2(-1,-1);
@@ -1477,6 +1491,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     } else {
       rtxdi_spot_loop_count = 1u;
     }
+  }
+  if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) {
+    rtxdi_point_loop_count = 0u;
+    rtxdi_spot_loop_count = 0u;
   }
   if (r20.y != 0) {
     r0.w = rtxdi_point_loop_count;

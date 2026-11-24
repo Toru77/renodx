@@ -73,9 +73,8 @@ inline bool SunAccumulationRequested() { return g_sun_accumulation > 0.5f && Fin
 inline bool SunAccumulationAllowed(bool relax_selected, bool rr_active) { return relax_selected && !rr_active && SunAccumulationRequested(); }
 inline bool g_applying_quality_preset = false;
 inline uint32_t SceneRequestMask() {
-  const bool local_requested = g_local_requested > 0.5f;
-  return (local_requested || falcom_world::pt::PtRequested() ? 1u : 0u)
-         | (g_sun_requested > 0.5f ? 2u : 0u) | (local_requested ? 4u : 0u);
+  // Unified PT M6: RTXDI Local and Sun are superseded; only path tracing requests the scene (bits 2 and 4 stay clear).
+  return falcom_world::pt::PtRequested() ? 1u : 0u;
 }
 inline bool SceneRequested() { return SceneRequestMask() != 0u; }
 

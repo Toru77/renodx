@@ -3,6 +3,7 @@
 #define RTXDI_ENABLE_PRESAMPLING 0
 #include "world_rt12_trace.hlsli"
 #include "world_rtxdi_surface.hlsli"
+#include "world_rt_shadow_rules.hlsli"
 
 Texture2D<float> g_rtxdi_depth : register(t31);
 Texture2D<uint4> g_rtxdi_normal : register(t32);
@@ -15,13 +16,6 @@ struct RtxdiSunResult {
   uint reason;
   uint flags;
 };
-
-uint RtxdiSunVisibilityWord(RtxdiSunResult r) {
-  return r.status | (((r.flags >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_LAYER_SHIFT)
-      | (r.status == RTXDI_SUN_STATUS_VISIBLE
-             ? (((r.flags >> RTXDI_SUN_WIND_OCCLUSION_SHIFT) & RTXDI_SUN_WIND_OCCLUSION_MASK) << RTXDI_SUN_WIND_OCCLUSION_SHIFT)
-             : 0u);
-}
 
 RWStructuredBuffer<RtxdiSunResult> g_rtxdi_sun_results : register(u0);
 RWTexture2D<uint> g_rtxdi_sun_visibility : register(u1);
@@ -50,20 +44,6 @@ cbuffer RtxdiSunParams : register(b0) {
 
 #include "world_rtxdi_sun_adapter.hlsli"
 #include <Rtxdi/DI/InitialSampling.hlsli>
-
-bool RtxdiSunCoverageEnd(float3 origin, float3 direction, float max_distance, out float coverage_end) {
-  coverage_end = 0.0;
-  if (any(origin < g_region_min) || any(origin > g_region_min + g_region_size)) return false;
-
-  float exit_distance = max_distance;
-  for (uint axis = 0u; axis < 3u; ++axis) {
-    if (abs(direction[axis]) <= 1e-8) continue;
-    const float boundary = (direction[axis] > 0.0 ? g_region_min[axis] + g_region_size : g_region_min[axis]);
-    exit_distance = min(exit_distance, (boundary - origin[axis]) / direction[axis]);
-  }
-  coverage_end = max(exit_distance, 0.0);
-  return isfinite(coverage_end) && coverage_end > 0.0;
-}
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID) {
@@ -182,7 +162,7 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     }
     if (found) {
       g_rtxdi_sun_results[output_index] = g_rtxdi_sun_results[source_index];
-      g_rtxdi_sun_visibility[pixel] = RtxdiSunVisibilityWord(g_rtxdi_sun_results[source_index]);
+      g_rtxdi_sun_visibility[pixel] = Rt12SunVisibilityWord(g_rtxdi_sun_results[source_index].status, g_rtxdi_sun_results[source_index].flags);
       return;
     }
   }
@@ -195,15 +175,13 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
   }
   const float bias_sign = (dot(surface.shading_normal, sun_direction) >= 0.0 ? 1.0 : -1.0);
   float3 origin = surface.world_position + surface.shading_normal * (normal_bias * bias_sign);
-  if (character && g_character_self_softening > 0.0) {
-    const float3 outward = surface.shading_normal * bias_sign;
-    float3 lateral = sun_jitter * g_character_self_softening;
-    lateral -= outward * min(dot(lateral, outward), 0.0);
-    origin += lateral;
+  if (character) {
+    origin += Rt12SelfSofteningOffset(surface.shading_normal * bias_sign, sun_jitter, g_character_self_softening);
   }
   float coverage_end = 0.0;
   bool complete_segment = false;
-  if (g_coverage_valid != 0u && !RtxdiSunCoverageEnd(origin, sun_direction, g_max_distance, coverage_end)) {
+  if (g_coverage_valid != 0u
+      && !Rt12ShadowCoverageEnd(origin, sun_direction, g_max_distance, g_region_min, g_region_size, coverage_end)) {
     result.reason = RTXDI_SUN_REASON_COVERAGE_MISS;
     result.flags |= (character ? RTXDI_SUN_FLAG_CHARACTER : 0u);
     g_rtxdi_sun_results[output_index] = result;
@@ -216,59 +194,23 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     complete_segment = coverage_end >= g_max_distance;
   }
 
-  WorldCameraView view;
-  view.hide = false;
-  view.floor_value = 0.0;
-  view.skip_flags = 0u;
-  view.require_flags = g_require_flags;
-  g_rt12_dynamic_mask = RT12_MASK_DYNAMIC;
-  g_rt12_foliage_transmission = g_foliage_transmission;
-  g_rt12_foliage_layers = 0u;
-  g_rt12_wind_transmission = g_wind_transmission;
-  g_rt12_wind_mode = (g_wind_transmission > 0.0 && g_wind_softening > 0.0) ? RT12_WIND_SKIP : RT12_WIND_COUNT;
-  g_rt12_wind_layers = 0u;
-  WorldTraceCounters counters;
-  const WorldTraceHit hit = TraceWorldRayDxr(origin, sun_direction, 0.0, coverage_end, true, view, counters);
-  result.flags |= (character ? RTXDI_SUN_FLAG_CHARACTER : 0u);
-  if (counters.invalid_refs != 0u) {
-    result.reason = RTXDI_SUN_REASON_INVALID_ALPHA;
-  } else if (counters.hits != 0u) {
-    result.status = RTXDI_SUN_STATUS_BLOCKED;
-    result.distance = hit.t;
-    result.reason = RTXDI_SUN_REASON_NONE;
-    if ((hit.instance & DYNAMIC_INSTANCE_FLAG) != 0u) {
-      result.flags |= RTXDI_SUN_BLOCKER_CHARACTER;
-    } else {
-      const uint blocker_visibility = (uint)(g_trace_instances[hit.instance].visibility.z + 0.5);
-      result.flags |= ((blocker_visibility & INSTANCE_FOLIAGE) != 0u ? RTXDI_SUN_BLOCKER_FOLIAGE : 0u);
-      result.flags |= ((blocker_visibility & INSTANCE_ALPHA_TESTED) != 0u ? RTXDI_SUN_BLOCKER_ALPHA : 0u);
-      result.flags |= ((blocker_visibility & INSTANCE_CAMERA_VISIBLE) == 0u ? RTXDI_SUN_BLOCKER_SHADOW_ONLY : 0u);
-    }
-  } else if (complete_segment) {
-    result.status = RTXDI_SUN_STATUS_VISIBLE;
-    result.distance = g_max_distance;
-    result.reason = RTXDI_SUN_REASON_NONE;
-    result.flags |= min(g_rt12_foliage_layers, RTXDI_SUN_LAYER_MASK) << RTXDI_SUN_LAYER_SHIFT;
-    if (g_rt12_wind_mode == RT12_WIND_SKIP) {
-      float2 wind_u;
-      if (g_noise_mode != 0u) {
-        wind_u = asfloat(g_rtxdi_sun_noise.Load(int3((pixel.x + 64u) % 128u, (pixel.y + 64u) % 128u + 128u * g_noise_slice, 0)).xy);
-      } else {
-        wind_u = float2(RTXDI_GetNextRandom(rng), RTXDI_GetNextRandom(rng));
-      }
-      const float wind_radius = g_wind_softening * sqrt(wind_u.x);
-      const float wind_phi = 6.2831853 * wind_u.y;
-      g_rt12_wind_mode = RT12_WIND_ONLY;
-      g_rt12_wind_layers = 0u;
-      WorldTraceCounters wind_counters;
-      TraceWorldRayDxr(origin + (T * cos(wind_phi) + B * sin(wind_phi)) * wind_radius, sun_direction, 0.0, coverage_end,
-                       true, view, wind_counters);
-    }
-    result.flags |= min(g_rt12_wind_occlusion, RTXDI_SUN_WIND_OCCLUSION_MASK) << RTXDI_SUN_WIND_OCCLUSION_SHIFT;
+  float2 wind_u;
+  if (g_noise_mode != 0u) {
+    wind_u = asfloat(g_rtxdi_sun_noise.Load(int3((pixel.x + 64u) % 128u, (pixel.y + 64u) % 128u + 128u * g_noise_slice, 0)).xy);
   } else {
-    result.reason = RTXDI_SUN_REASON_TRUNCATED;
-    result.flags |= RTXDI_SUN_FLAG_TRUNCATED;
+    wind_u = float2(RTXDI_GetNextRandom(rng), RTXDI_GetNextRandom(rng));
   }
+  float transmittance;
+  float3 transmitted_tint;
+  const Rt12ShadowResult shadow = Rt12TraceSunShadow(origin, sun_direction, coverage_end, complete_segment, character,
+      g_require_flags, g_max_distance, g_foliage_transmission, g_wind_transmission, g_wind_softening, g_foliage_tint,
+      wind_u, T, B, transmittance, transmitted_tint);
+  result.status = shadow.status;
+  result.reason = shadow.reason;
+  result.distance = shadow.distance;
+  result.flags |= shadow.flags;
+  (void)transmittance;
+  (void)transmitted_tint;
   g_rtxdi_sun_results[output_index] = result;
-  g_rtxdi_sun_visibility[pixel] = RtxdiSunVisibilityWord(result);
+  g_rtxdi_sun_visibility[pixel] = Rt12SunVisibilityWord(result.status, result.flags);
 }

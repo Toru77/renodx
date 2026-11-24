@@ -387,9 +387,9 @@ struct Rt12DiTransferState {
 };
 
 // Path tracing (world/pt): its own submission slots, list, root signature, PSOs, descriptors and outputs.
-inline constexpr uint32_t kRt12PtDescriptors = 49u;
+inline constexpr uint32_t kRt12PtDescriptors = 54u;
 inline constexpr uint32_t kRt12PtConstants = 52u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
-inline constexpr uint32_t kRt12PtCounters = 30u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
+inline constexpr uint32_t kRt12PtCounters = 33u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
 inline constexpr uint32_t kRt12ReGirDescriptors = 5u;
 inline constexpr uint32_t kRt12ReGirPasses = 3u;
 inline constexpr uint32_t kRt12ReGirConstants = 2u;
@@ -453,6 +453,12 @@ struct Rt12PtState {
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;  // shader visible, kRt12Slots * kRt12PtDescriptors
   Rt12Shared output[kRt12Slots];                      // RGBA16F, depth size; the lighting draw reads srv11 at t47
   Rt12Shared reflection[kRt12Slots];                  // RGBA16F, depth size: traced reflection, a = hit distance; t48 in lighting and ssr2
+  Rt12Shared debug_value[kRt12Slots];                 // RGBA16F, depth size: debug view value (lighting t44); final shading only
+  Rt12Shared debug_status[kRt12Slots];                // R32_UINT, depth size: debug view status word (lighting t45)
+  Rt12Shared sun_detail[kRt12Slots];                  // R32G32B32A32_UINT, depth size: sun detail data (lighting t46)
+  uint32_t debug_frame[kRt12Slots] = {};              // frame the debug sources were written; UINT32_MAX = none
+  uint32_t debug_view[kRt12Slots] = {};               // view recorded with the debug sources
+  uint32_t sun_detail_view[kRt12Slots] = {};          // sun detail selector recorded with the debug sources
   // Water reflection from the SSR surface (M4): a copy of the SSR-time depth and mrt0 at the SSR draw, traced by a second
   // water dispatch into water_reflection (read by ssr2). Own slots and list; the water block follows the main block.
   Rt12Slot water_slots[kRt12Slots];
@@ -1196,6 +1202,18 @@ inline void TeardownRt12(const char* why) {
     if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
   }
   for (Rt12Shared& shared : s.path_trace.reflection) {
+    if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
+    if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
+  }
+  for (Rt12Shared& shared : s.path_trace.debug_value) {
+    if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
+    if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
+  }
+  for (Rt12Shared& shared : s.path_trace.debug_status) {
+    if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
+    if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
+  }
+  for (Rt12Shared& shared : s.path_trace.sun_detail) {
     if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
     if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
   }

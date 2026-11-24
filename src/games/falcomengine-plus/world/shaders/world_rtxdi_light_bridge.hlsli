@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../rtxdi/rtxdi_diag_layout.h"
+#include "world_rt_shadow_rules.hlsli"
 
 StructuredBuffer<RtxdiLightTableEntry> g_rtxdi_light_table : register(t46);
 StructuredBuffer<RtxdiLightTableEntry> g_rtxdi_prev_light_table : register(t47);
@@ -406,8 +407,8 @@ RtxdiDiRawResult RtxdiTraceLocalLight(RAB_Surface surface, RAB_LightSample sampl
   float3 origin = surface.world_position + surface.shading_normal * (bias * bias_sign);
   if (character && g_character_self_softening > 0.0) {
     const float3 outward = surface.shading_normal * bias_sign;
-    float3 lateral = (sample.shadow_target - sample.position) * min(g_character_self_softening / shadow_distance, 1.0);
-    lateral -= outward * min(dot(lateral, outward), 0.0);
+    const float3 lateral = Rt12SelfSofteningOffset(outward, sample.shadow_target - sample.position,
+                                                   min(g_character_self_softening / shadow_distance, 1.0));
     origin += lateral;
     const float3 shifted_delta = sample.shadow_target - (surface.world_position + lateral);
     const float shifted_distance_squared = dot(shifted_delta, shifted_delta);

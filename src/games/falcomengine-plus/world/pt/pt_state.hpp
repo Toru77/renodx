@@ -72,6 +72,7 @@ inline float g_pt_reflection_use_sharc = 1.f, g_pt_reflection_footprint = 1.f;
 inline float g_pt_reflection_water_rule = 0.f;
 inline float g_pt_reflection_water_surface = 0.f;
 inline float g_pt_reflection_water_roughness = 0.05f;
+inline float g_restir_direct = 1.f;
 inline float g_restir_max_rc_vertex_length = 5.f, g_restir_nee_local_samples = 1.f;
 inline float g_restir_min_connection_footprint = 0.02f, g_restir_min_connection_footprint_sigma = 0.2f;
 inline float g_restir_min_pdf_roughness = 0.1f, g_restir_min_pdf_roughness_sigma = 0.01f;
@@ -137,6 +138,7 @@ struct PtPanel {
   uint32_t regir_invalid_headers = 0u, regir_invalid_slots = 0u, regir_selections = 0u;
   uint32_t gpu_initial_valid = 0u, gpu_path_len2 = 0u, gpu_path_len3plus = 0u, gpu_nee_connected = 0u;
   uint32_t gpu_sharc_terminated = 0u, gpu_sharc_terminal_rc = 0u, gpu_sharc_replay_rejected = 0u;
+  uint32_t gpu_d2_lamp = 0u, gpu_d2_sun = 0u, gpu_shade_transmitted = 0u;
   uint32_t temporal_selected = 0u, spatial_selected = 0u;
   uint32_t water_temporal_selected = 0u, water_spatial_selected = 0u;
   bool history_valid = false;
@@ -243,6 +245,8 @@ inline void DrawPtPanel() {
     ImGui::Text("PT samples: initial valid %u, path len 2 %u, len 3+ %u, NEE %u, SHARC terminal %u/%u, replay rejected %u",
                 p.gpu_initial_valid, p.gpu_path_len2, p.gpu_path_len3plus, p.gpu_nee_connected, p.gpu_sharc_terminated,
                 p.gpu_sharc_terminal_rc, p.gpu_sharc_replay_rejected);
+  ImGui::Text("PT direct: d=2 lamp %u, d=2 sun %u, shading transmitted %u", p.gpu_d2_lamp, p.gpu_d2_sun,
+               p.gpu_shade_transmitted);
     static const char* resampling_names[] = {"none", "temporal", "spatial", "temporal_and_spatial"};
     ImGui::Text("ReSTIR PT resampling: %s  history %s  temporal %u  spatial %u",
                 resampling_names[(std::clamp)(static_cast<uint32_t>(g_restir_resampling), 0u, 3u)],

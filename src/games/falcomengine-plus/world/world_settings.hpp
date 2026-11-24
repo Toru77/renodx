@@ -98,7 +98,7 @@ inline void AddSvgfRows(renodx::utils::settings::Settings* settings, const std::
   using Setting = renodx::utils::settings::Setting;
   using SettingValueType = renodx::utils::settings::SettingValueType;
   const std::string prefix = rows.prefix;
-  settings->push_back(new Setting{
+settings->push_back(new Setting{
       .key = prefix + "TemporalEnabled",
       .binding = rows.temporal_enabled,
       .value_type = SettingValueType::BOOLEAN,
@@ -716,7 +716,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RTXDI Local",
       .tooltip = "Samples the captured local lights and can replace their game lighting terms when a validated RTXDI tuple is bound. Unknown or unavailable tuples keep the game's local-light path.",
       .labels = {"Off", "On"},
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   const auto mark_rtxdi_custom = [](float, float) {
     if (!rtxdi::g_applying_quality_preset && rtxdi::g_quality_preset != 3.f) {
@@ -765,7 +765,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         renodx::utils::settings::UpdateSetting("RtxdiInitialVisibility", rtxdi::g_initial_visibility);
         rtxdi::g_applying_quality_preset = false;
       },
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiLocalCandidates",
@@ -778,7 +778,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .max = 32.f,
       .format = "%d",
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiTemporalReuse",
@@ -789,7 +789,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RTXDI Local",
       .labels = {"Off", "On"},
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiPermutationSampling",
@@ -801,7 +801,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .tooltip = "RTXDI SDK permutation sampling for temporal reuse: history lookups use a permuted pixel instead of random jitter. Needs valid motion vectors. Balanced preset: On.",
       .labels = {"Off", "On"},
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiInitialVisibility",
@@ -813,7 +813,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .tooltip = "Shadow-tests each pixel's initial light sample and drops it when blocked, before temporal and spatial reuse. Costs one extra shadow ray per pixel. Final visibility is unchanged. Balanced preset: On.",
       .labels = {"Off", "On"},
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiStableLightRemap",
@@ -824,7 +824,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RTXDI Local",
       .tooltip = "Match temporal light samples by quantized light identity when game light indices change. Off preserves exact same-index validation.",
       .labels = {"Off", "On"},
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiSpatialReuse",
@@ -835,7 +835,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RTXDI Local",
       .labels = {"Off", "On"},
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiSpatialSamples",
@@ -848,7 +848,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .max = 16.f,
       .format = "%d",
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiSpatialDisocclusion",
@@ -862,7 +862,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .max = 16.f,
       .format = "%d",
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiSpatialRadius",
@@ -875,7 +875,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .max = 32.f,
       .format = "%.0f",
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiHistoryLength",
@@ -889,7 +889,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .max = 32.f,
       .format = "%d",
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiBoilingFilter",
@@ -901,7 +901,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .tooltip = "Drops a lamp reservoir at the end of temporal reuse when its weight is far above the average of its 8x8 pixel group, so rare bright samples do not spread into blotches. RTXDI SDK default: On.",
       .labels = {"Off", "On"},
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiBoilingFilterStrength",
@@ -916,7 +916,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .format = "%.2f",
       .is_enabled = [] { return rtxdi::g_boiling_filter > 0.5f; },
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiTemporalDepthThreshold",
@@ -929,7 +929,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .max = 1.f,
       .format = "%.3f",
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiTemporalNormalThreshold",
@@ -942,7 +942,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .max = 1.f,
       .format = "%.3f",
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiSpatialDepthThreshold",
@@ -955,7 +955,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .max = 1.f,
       .format = "%.3f",
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiSpatialNormalThreshold",
@@ -968,7 +968,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .max = 1.f,
       .format = "%.3f",
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiDiffuseDenoiser",
@@ -989,7 +989,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
 #endif
       },
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiRelaxControlsStatus",
@@ -1039,7 +1039,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
 #endif
         return false;
       },
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
 #if defined(FALCOM_NRD_ENABLED)
   settings->push_back(new Setting{
@@ -1054,7 +1054,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .format = "%d",
       .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiRelaxFastHistory",
@@ -1068,7 +1068,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .format = "%d",
       .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiRelaxPrepassRadius",
@@ -1082,7 +1082,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .format = "%d",
       .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiRelaxAtrousIterations",
@@ -1096,7 +1096,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .format = "%d",
       .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
       .on_change_value = mark_rtxdi_custom,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
 #endif
   settings->push_back(new Setting{
@@ -1108,7 +1108,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RTXDI Sun",
       .tooltip = "Traces one directional DXR sun visibility query per valid surface. Unknown results keep the CSM fallback. Ray length: Max Ray Distance (Sun).",
       .labels = {"Off", "On"},
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "",
@@ -1116,7 +1116,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::INTEGER,
       .default_value = static_cast<float>(RTXDI_DEBUG_VIEW_OFF),
       .label = "RTXDI Debug View",
-      .section = "RTXDI Shared",
+      .section = "Path Tracing Debug",
       .tooltip = "Session only. Observes current RTXDI signals; unavailable sources use a checker. It does not enable sampling or change lighting settings.",
       .labels = {"Off", "Local status", "Receiver class", "Selected light/type", "Raw diffuse", "Filtered diffuse", "Distance validity", "Distance magnitude", "Consumer selection", "Sun visibility"},
       .min = static_cast<float>(RTXDI_DEBUG_VIEW_OFF),
@@ -1129,7 +1129,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::INTEGER,
       .default_value = static_cast<float>(RTXDI_SUN_DETAIL_STATUS),
       .label = "RTXDI Sun Detail",
-      .section = "RTXDI Shared",
+      .section = "Path Tracing Debug",
       .tooltip = "Session only. Status preserves the Sun Visibility view (green = sun reaches the pixel through foliage layers); Reason, Hit distance, Layers and Blocker inspect the matching sun result record.",
       .labels = {"Status", "Reason", "Hit distance", "Layers", "Blocker"},
       .min = static_cast<float>(RTXDI_SUN_DETAIL_STATUS),
@@ -1147,7 +1147,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::CUSTOM,
       .can_reset = false,
       .label = "Scene preparation",
-      .section = "RTXDI Shared",
+      .section = "Path Tracing Debug",
       .on_draw = []() {
         rtxdi::SceneSnapshot snapshot;
         {
@@ -1282,14 +1282,14 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .on_change_value = [](float, float current) {
         rtxdi::SetDiagnosticCapture(rtxdi::GetDiagnosticState(), current > 0.5f);
       },
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiDebugReport",
       .value_type = SettingValueType::CUSTOM,
       .can_reset = false,
       .label = "RTXDI diagnostic report",
-      .section = "RTXDI Shared",
+      .section = "Path Tracing Debug",
       .on_draw = []() {
         auto& diagnostic_state = rtxdi::GetDiagnosticState();
         const bool logging = rtxdi::DiagnosticCaptureEnabled(diagnostic_state);
@@ -1488,12 +1488,25 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
   });
 
   settings->push_back(new Setting{
+      .key = "RestirPtDirect",
+      .binding = &pt::g_restir_direct,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Direct Light from Path Reservoir",
+      .section = "Path Tracing Direct",
+      .tooltip = "Sun and lamp direct light comes from the unified path reservoir for environment and characters.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.0f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiLocalNormalBias",
       .binding = &rtxdi::g_local_normal_bias,
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.02f,
       .label = "Normal Bias (Local)",
-      .section = "RTXDI Local",
+      .section = "Path Tracing Direct",
       .min = 0.f,
       .max = 0.5f,
       .format = "%.4f",
@@ -1506,7 +1519,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.02f,
       .label = "Character Normal Bias (Local)",
-      .section = "RTXDI Local",
+      .section = "Path Tracing Direct",
       .min = 0.f,
       .max = 0.5f,
       .format = "%.3f",
@@ -1519,7 +1532,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.2f,
       .label = "Light Clearance (Local)",
-      .section = "RTXDI Local",
+      .section = "Path Tracing Direct",
       .tooltip = "Shadow rays stop this far short of the lamp. Inside this distance a lamp is treated as visible.",
       .min = 0.f,
       .max = 1.f,
@@ -1532,7 +1545,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.02f,
       .label = "Normal Bias (Sun)",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .min = 0.f,
       .max = 0.5f,
       .format = "%.3f",
@@ -1545,8 +1558,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 100.f,
       .label = "Max Ray Distance (Sun)",
-      .section = "RTXDI Sun",
-      .tooltip = "Longest distance a sun shadow ray travels. Occluders farther away than this do not cast RTXDI sun shadows.",
+      .section = "Path Tracing Direct",
+      .tooltip = "Longest distance a sun shadow ray travels. Occluders farther away than this do not cast path-traced sun shadows.",
       .min = 1.f,
       .max = 500.f,
       .format = "%.0f",
@@ -1558,7 +1571,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.02f,
       .label = "Character Normal Bias (Sun)",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .min = 0.f,
       .max = 0.5f,
       .format = "%.3f",
@@ -1571,7 +1584,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::BOOLEAN,
       .default_value = 1.f,
       .label = "Shadow Casters Only",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .tooltip = "Sun shadows come only from objects the game draws into its shadow maps, matching the game. Off = every object casts.",
       .labels = {"Off", "On"},
       .is_visible = visible,
@@ -1582,7 +1595,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 1.f,
       .label = "Shadow Darkening (Sun)",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .tooltip = "How dark a blocked sun shadow gets. 1 = full shadow; lower values keep more sunlight in shadow.",
       .min = 0.f,
       .max = 1.f,
@@ -1595,7 +1608,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 1.f,
       .label = "Character Shadow Darkening (Sun)",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .tooltip = "How dark a character's blocked sun shadow gets: characters keep at least (1 - value) of their sun light. 1 = full shadow.",
       .min = 0.f,
       .max = 1.f,
@@ -1613,7 +1626,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .labels = {"Full", "Half"},
       .min = 0.f,
       .max = 1.f,
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiSunLightSize",
@@ -1621,7 +1634,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.f,
       .label = "Light Size (Sun, degrees)",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .tooltip = "Angular size of the sun for soft shadows. 0 = a point sun (sharp shadows).",
       .min = 0.f,
       .max = 5.f,
@@ -1634,7 +1647,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::BOOLEAN,
       .default_value = 1.f,
       .label = "IS-FAST Noise (Sun)",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .tooltip = "Uses the blue-noise IS-FAST texture for the sun disk jitter when the IS-FAST texture is loaded (IS-FAST master On); otherwise the SDK random sequence is used. Only has an effect when Light Size > 0.",
       .labels = {"Off", "On"},
       .is_visible = visible,
@@ -1649,7 +1662,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .tooltip = "Averages the sun shadow over recent frames, reprojected with motion vectors, so soft edges from Light Size (Sun) are less noisy. Only has an effect when Light Size > 0; at 0 the sun shadow is unchanged. Off while Diffuse denoiser is Raw or Ray Reconstruction is active.",
       .labels = {"Off", "On"},
       .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiSunAccumulationFrames",
@@ -1663,7 +1676,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .max = 32.f,
       .format = "%d",
       .is_enabled = [] { return rtxdi::g_sun_accumulation > 0.5f && rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiSunAccumulationStatus",
@@ -1679,7 +1692,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         }
         return false;
       },
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiSunCharacterSelfSoftening",
@@ -1687,7 +1700,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.f,
       .label = "Character Self-Shadow Softening (Sun, m)",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .tooltip = "Softens sun shadows on characters as if the blocker were this many metres from the skin, so arm, hair and clothing shadows get soft edges. Scales with Light Size (Sun); no effect at Light Size 0. 0 = off.",
       .min = 0.f,
       .max = 10.f,
@@ -1700,7 +1713,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.f,
       .label = "Foliage Transmission",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .tooltip = "Share of sunlight each alpha-tested leaf layer lets through. 0 = leaves block fully (unchanged).",
       .min = 0.f,
       .max = 1.f,
@@ -1713,7 +1726,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.5f,
       .label = "Wind Foliage Transmission",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .tooltip = "Share of sunlight each wind-moved foliage object (opaque or alpha-tested) lets through, so swaying foliage casts softer shadows. Use Light Size (Sun) for soft edges. 0 = blocks fully (old behaviour).",
       .min = 0.f,
       .max = 1.f,
@@ -1726,7 +1739,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.5f,
       .label = "Wind Foliage Softening (Sun, m)",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .tooltip = "Radius in metres over which each wind-moved foliage shadow is blurred, as if the foliage swayed (noisy like Light Size). 0 = hard per-object shadow. Use with Wind Foliage Transmission.",
       .min = 0.f,
       .max = 4.f,
@@ -1739,7 +1752,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 1.f,
       .label = "Foliage Tint R",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .tooltip = "Red share of sunlight each leaf layer lets through, on top of Foliage Transmission. 1 = no tint.",
       .min = 0.f,
       .max = 1.f,
@@ -1752,7 +1765,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 1.f,
       .label = "Foliage Tint G",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .tooltip = "Green share of sunlight each leaf layer lets through, on top of Foliage Transmission. 1 = no tint.",
       .min = 0.f,
       .max = 1.f,
@@ -1765,7 +1778,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 1.f,
       .label = "Foliage Tint B",
-      .section = "RTXDI Sun",
+      .section = "Path Tracing Direct",
       .tooltip = "Blue share of sunlight each leaf layer lets through, on top of Foliage Transmission. 1 = no tint.",
       .min = 0.f,
       .max = 1.f,
@@ -1778,7 +1791,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.f,
       .label = "Light Size (Local, m)",
-      .section = "RTXDI Local",
+      .section = "Path Tracing Direct",
       .tooltip = "Radius of the local lamp for soft shadows. 0 = a point light (sharp shadows).",
       .min = 0.f,
       .max = 0.5f,
@@ -1791,7 +1804,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::BOOLEAN,
       .default_value = 1.f,
       .label = "IS-FAST Noise (Local)",
-      .section = "RTXDI Local",
+      .section = "Path Tracing Direct",
       .tooltip = "Uses the blue-noise IS-FAST texture for the local light point jitter when the IS-FAST texture is loaded (IS-FAST master On); otherwise the SDK random sequence is used. Only has an effect when Light Size > 0.",
       .labels = {"Off", "On"},
       .is_visible = visible,
@@ -1802,7 +1815,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.f,
       .label = "Character Self-Shadow Softening (Local, m)",
-      .section = "RTXDI Local",
+      .section = "Path Tracing Direct",
       .tooltip = "Softens lamp shadows on characters as if the blocker were this many metres from the skin, so arm, hair and clothing shadows get soft edges. Scales with Light Size (Local); no effect at Light Size 0. 0 = off.",
       .min = 0.f,
       .max = 2.f,
@@ -1815,8 +1828,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::BOOLEAN,
       .default_value = 0.f,
       .label = "Light Sampling Clamp (Local)",
-      .section = "RTXDI Local",
-      .tooltip = "Limits the luminance of the RTXDI-selected lamp at each pixel (diffuse and specular, scaled together). Fewer lamp fireflies, but removes energy. Off = current look.",
+      .section = "Path Tracing Direct",
+      .tooltip = "Limits the luminance of each sampled lamp (diffuse and specular, scaled together). Fewer lamp fireflies, but removes energy. Off = current look.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });
@@ -1826,8 +1839,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 16.f,
       .label = "Light Sampling Clamp Limit (Local)",
-      .section = "RTXDI Local",
-      .tooltip = "Luminance limit for the selected lamp before material colour. Lower = fewer fireflies, less energy.",
+      .section = "Path Tracing Direct",
+      .tooltip = "Limits the luminance of each sampled lamp (diffuse and specular, scaled together). Fewer lamp fireflies, but removes energy. Off = current look.",
       .min = 1.f,
       .max = 1000.f,
       .format = "%.1f",
@@ -1841,8 +1854,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 1.f,
       .label = "Shadow Darkening (Local)",
-      .section = "RTXDI Local",
-      .tooltip = "How dark a blocked RTXDI lamp shadow gets. 1 = full shadow; lower values keep more lamp light in shadow.",
+      .section = "Path Tracing Direct",
+      .tooltip = "Currently has no effect: lamp samples have no partial-shadow term.",
       .min = 0.f,
       .max = 1.f,
       .format = "%.2f",
@@ -1854,8 +1867,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 1.f,
       .label = "Character Shadow Darkening (Local)",
-      .section = "RTXDI Local",
-      .tooltip = "How dark a character's blocked RTXDI lamp shadow gets: characters keep at least (1 - value) of that lamp's light. 1 = full shadow.",
+      .section = "Path Tracing Direct",
+      .tooltip = "Currently has no effect: lamp samples have no partial-shadow term.",
       .min = 0.f,
       .max = 1.f,
       .format = "%.2f",
@@ -1867,8 +1880,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::FLOAT,
       .default_value = 1.f,
       .label = "Character Light Intensity",
-      .section = "RTXDI Local",
-      .tooltip = "Scales the RTXDI lamp light added to characters, including the fallback.",
+      .section = "Path Tracing Direct",
+      .tooltip = "Scales path-traced lamp light on characters.",
       .min = 0.f,
       .max = 2.f,
       .format = "%.2f",
@@ -1883,7 +1896,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RTXDI Local",
       .tooltip = "Pixels whose RTXDI result is unknown or invalid get the game's unshadowed lamp light. Off = they get none.",
       .labels = {"Off", "On"},
-      .is_visible = visible,
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "PtEnabled",

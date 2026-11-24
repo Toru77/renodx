@@ -171,9 +171,106 @@ bool PtDetermineOutgoingRay(inout RTXDI_PathTracerContext<PTContextType> ctx,
   return ctx.AnalyzePathReconnectibilityBeforeTrace();
 }
 
+#if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING) && !defined(PT_WATER_SURFACE)
+template<typename PTContextType>
+void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_PathTracerRandomContext rng) {
+  if (g_restir.direct_enabled == 0u) return;
+  const RAB_Surface surface = ctx.GetIntersectionSurface();
+  if (!RAB_IsSurfaceValid(surface)) return;
+  uint cell = 0u;
+  const bool tile_valid = PtGetLightTileCell(surface, cell);
+  const RTXDI_InitialSamplingMisData mis_data = RTXDI_ComputeInitialSamplingMisData(g_restir.nee);
+  RTXDI_DIReservoir local_reservoir = RTXDI_EmptyDIReservoir();
+  RAB_LightSample local_sample = RAB_EmptyLightSample();
+  // Candidates come from this pixel's game tile cell: the only lights with a non-zero target
+  // (world_rtxdi_initial_di.cs_6_5.hlsl:132-167).
+  if (tile_valid && g_restir.nee.numLocalLightSamples != 0u) {
+    const LightIndexData tile = g_pt_tiles[cell];
+    const uint point_count = min(tile.pointLightCount, 63u);
+    const uint spot_count = min(tile.spotLightCount, 63u);
+    const uint entry_count = point_count + spot_count;
+    uint usable_count = 0u;
+    for (uint entry = 0u; entry < entry_count; ++entry) {
+      const bool point_entry = entry < point_count;
+      const int listed = point_entry ? tile.pointLightIndices[entry] : tile.spotLightIndices[entry - point_count];
+      usable_count += PtTileEntryUsable(listed, point_entry) ? 1u : 0u;
+    }
+    if (usable_count != 0u) {
+      for (uint candidate = 0u; candidate < g_restir.nee.numLocalLightSamples; ++candidate) {
+        const uint selected_rank = min(uint(RTXDI_GetNextRandom(rng.initialRandomSamplerState) * float(usable_count)),
+                                       usable_count - 1u);
+        uint light_index = g_lamp_count;
+        uint rank = 0u;
+        for (uint entry = 0u; entry < entry_count; ++entry) {
+          const bool point_entry = entry < point_count;
+          const int listed = point_entry ? tile.pointLightIndices[entry] : tile.spotLightIndices[entry - point_count];
+          const bool usable = PtTileEntryUsable(listed, point_entry);
+          if (usable && rank == selected_rank) light_index = uint(listed);
+          rank += usable ? 1u : 0u;
+        }
+        const RAB_LightInfo light_info = RAB_LoadLightInfo(light_index, false);
+        float2 uv;
+        if (g_restir.isfast_light_jitter != 0u) {
+          uv = asfloat(g_pt_noise.Load(int3(surface.pixel.x % 128u, surface.pixel.y % 128u + 128u * (g_frame % 32u), 0)).xy);
+        } else {
+          uv = RTXDI_RandomlySelectLocalLightUV(rng.initialRandomSamplerState);
+        }
+        RTXDI_StreamLocalLightAtUVIntoReservoir(rng.initialRandomSamplerState, mis_data, surface,
+            g_restir.nee.brdfCutoff, mis_data.localLightMisWeight, light_index, uv, float(usable_count),
+            light_info, local_reservoir, local_sample);
+      }
+      RTXDI_FinalizeResampling(local_reservoir, 1.0, mis_data.numMisSamples);
+      local_reservoir.M = 1;
+    }
+  }
+  // One infinite-light sample (InitialSampling.hlsli:375-399), keeping the IS-FAST uv source.
+  RTXDI_DIReservoir sun_reservoir = RTXDI_EmptyDIReservoir();
+  RAB_LightSample sun_sample = RAB_EmptyLightSample();
+  const RAB_LightInfo sun_info = RAB_LoadLightInfo(g_lamp_count, false);
+  if (sun_info.index != RTXDI_LIGHT_TABLE_INVALID_INDEX) {
+    const float2 sun_uv = (g_restir.isfast_light_jitter != 0u)
+        ? asfloat(g_pt_noise.Load(int3(surface.pixel.x % 128u, surface.pixel.y % 128u + 128u * (g_frame % 32u), 0)).xy)
+        : RTXDI_RandomlySelectInfiniteLightUV(rng.initialRandomSamplerState);
+    RTXDI_StreamInfiniteLightAtUVIntoReservoir(rng.initialRandomSamplerState, sun_info, surface, g_lamp_count, sun_uv,
+                                               1.0, sun_reservoir, sun_sample);
+    RTXDI_FinalizeResampling(sun_reservoir, 1.0, sun_reservoir.M);
+    sun_reservoir.M = 1;
+  }
+  // InitialSampling.hlsli:637-660.
+  RTXDI_DIReservoir reservoir = RTXDI_EmptyDIReservoir();
+  RTXDI_CombineDIReservoirs(reservoir, local_reservoir, 0.5, local_reservoir.targetPdf);
+  const bool select_sun = RTXDI_CombineDIReservoirs(reservoir, sun_reservoir,
+      RTXDI_GetNextRandom(rng.initialRandomSamplerState), sun_reservoir.targetPdf);
+  RTXDI_FinalizeResampling(reservoir, 1.0, 1.0);
+  reservoir.M = 1;
+  RAB_LightSample light_sample = local_sample;
+  if (select_sun) light_sample = sun_sample;
+  if (reservoir.weightSum <= 0.0 || light_sample.solidAnglePdf <= 0.0) return;
+  const uint light_index = reservoir.lightData & RTXDI_DIReservoir_LightIndexMask;
+  RAB_Surface visible_surface = surface;
+  visible_surface.flags |= light_sample.sun ? 4u : 0u;
+  float3 radiance_from_lights = RAB_GetReflectedBsdfRadianceForSurface(light_sample.position, light_sample.radiance, visible_surface);
+  radiance_from_lights *= RAB_GetConservativeVisibility(visible_surface, light_sample.position);
+  radiance_from_lights *= RTXDI_GetDIReservoirInvPdf(reservoir) / light_sample.solidAnglePdf;
+  if (all(radiance_from_lights <= 0.0)) return;
+  RTXDI_SampledLightData sampled_light_data = RTXDI_SampledLightData_CreateInvalidData();
+  RTXDI_SampledLightData_SetLightData(sampled_light_data, light_index);
+  sampled_light_data.uvData = reservoir.uvData;
+  // Lin 2026 §6.1: primary NEE as a d = 2 path in the unified reservoir; same stream as RecordNeeLightSample case 3
+  // (InitialSamplingPathTracerContext.hlsli:196-247) one vertex earlier.
+  ctx.RISStreamPathSample(2u, radiance_from_lights, rng.initialRandomSamplerState, 2u, true, 1.0 / reservoir.weightSum,
+                          float3(1.f / 0.f, asfloat(sampled_light_data.lightData), asfloat(sampled_light_data.uvData)),
+                          RAB_LightSampleSolidAnglePdf(light_sample));
+  PtCount(light_sample.sun ? 31u : 30u);
+}
+#endif
+
 template<typename PTContextType>
 void RAB_PathTrace(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_PathTracerRandomContext rng,
                    inout RAB_PathTracerUserData ud) {
+#if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING) && !defined(PT_WATER_SURFACE)
+  PtPrimaryNee(ctx, rng);
+#endif
   while (ctx.GetBounceDepth() <= ctx.GetMaxPathBounce()) {
     ctx.BeginPathState();
     if (!PtDetermineOutgoingRay(ctx, rng)) break;

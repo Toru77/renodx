@@ -7,6 +7,7 @@
 #define RT12_TLAS_REGISTER t29
 #define RT12_DYNAMIC_VERTICES_REGISTER t30
 #include "world_rt12_trace.hlsli"
+#include "world_rt_shadow_rules.hlsli"
 #include "world_rtxdi_surface.hlsli"
 #include "world_regir_shared.hlsli"
 #include "world_rt_lamps.hlsli"
@@ -65,6 +66,10 @@ RWTexture2D<float> g_pt_smoothed_duplication : register(u11);
 RWTexture2D<float4> g_pt_neighbor_selection_gbuffer : register(u12);
 RWByteAddressBuffer g_pt_neighbor_selection : register(u13);
 Texture2D<float> g_pt_prev_smoothed_duplication : register(t56);
+StructuredBuffer<LightIndexData> g_pt_tiles : register(t57);
+RWTexture2D<float4> g_pt_debug_value : register(u14);
+RWTexture2D<uint> g_pt_debug_status : register(u15);
+RWTexture2D<uint4> g_pt_sun_detail : register(u16);
 #define RTXDI_PT_SAMPLE_ID_TEXTURE g_pt_sample_id
 #define RTXDI_PT_DUPLICATION_MAP g_pt_duplication_map
 #define RTXDI_PT_SMOOTHED_DUPLICATION_MAP g_pt_smoothed_duplication

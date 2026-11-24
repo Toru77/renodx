@@ -23,6 +23,7 @@ struct RAB_Material {
   float3 specularF0;
   float roughness;
   float3 emissiveColor;
+  bool character;
 };
 
 struct RAB_Surface {
@@ -93,6 +94,22 @@ float3 GGX_times_NdotL(float3 v, float3 l, float3 n, float roughness, float3 f0)
   const float alpha = square(roughness);
   const float d = square(alpha) / (3.14159265 * square(square(ndh) * square(alpha) + (1.0 - square(ndh))));
   return Schlick_Fresnel(f0, vdh) * (d * G_SmithOverNdotV(roughness, saturate(dot(n, v)), ndl) / 4.0);
+}
+// Verbatim from FullSample HelperFunctions.hlsli:40-55.
+#define PT_LIGHT_SAMPLING_EPSILON 1e-10  // FullSample PolymorphicLight.hlsli:20.
+/*https://graphics.pixar.com/library/OrthonormalB/paper.pdf*/
+void BranchlessONB(in float3 n, out float3 b1, out float3 b2)
+{
+    float sign = n.z >= 0.0f ? 1.0f : -1.0f;
+    float a = -1.0f / (sign + n.z);
+    float b = n.x * n.y * a;
+    b1 = float3(1.0f + sign * n.x * n.x * a, sign * b, -sign * n.x);
+    b2 = float3(b, sign + n.y * n.y * a, -n.y);
+}
+
+float3 SphericalDirection(float sinTheta, float cosTheta, float sinPhi, float cosPhi, float3 x, float3 y, float3 z)
+{
+    return sinTheta * cosPhi * x + sinTheta * sinPhi * y + cosTheta * z;
 }
 float2 SampleDisk(float2 random) {
   const float angle = 2.0 * 3.14159265 * random.x;
@@ -174,7 +191,7 @@ RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
   if ((normal_flags & 2u) == 0u) return PtEmptySurface();
 #endif
   RAB_Surface s = (RAB_Surface)0;
-  s.flags = 1u | ((rs.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u ? 2u : 0u);
+  s.flags = 1u | 8u | ((rs.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u ? 2u : 0u);
   s.pixel = pixel;
   s.worldPos = rs.world_position;
   s.viewDepth = rs.linear_view_depth;
@@ -190,6 +207,7 @@ RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
   }
   s.material.diffuseAlbedo = m.albedo;
   s.material.specularF0 = m.f0;
+  s.material.character = m.character;
 #if defined(PT_WATER_SURFACE)
   s.material.roughness = saturate(g_water_roughness * g_refl_roughness_scale);
 #else
@@ -269,6 +287,7 @@ RAB_Surface PtHitSurface(float3 position, float3 normal, float distance, float3 
   s.material.diffuseAlbedo = m.albedo;
   s.material.specularF0 = m.f0;
   s.material.roughness = saturate(m.roughness);
+  s.material.character = m.character;
   s.diffuseProbability = PtSurfaceDiffuseProbability(s);
   return s;
 }
@@ -337,6 +356,28 @@ bool RAB_SurfaceImportanceSampleBsdf(RAB_Surface s, inout RTXDI_RandomSamplerSta
   }
   return dot(s.normal, dir) > 0.0;
 }
+// A tile-list entry is a candidate when it names a light of the list's type (world_rtxdi_initial_di.cs_6_5.hlsl:79-82).
+bool PtTileEntryUsable(int listed, bool point_entry) {
+  return listed >= 0 && uint(listed) < g_lamp_count
+         && g_pt_light_table[uint(listed)].type == (point_entry ? LAMP_TYPE_POINT : LAMP_TYPE_SPOT);
+}
+// Exact per-pixel game tile cell (copied from world_rtxdi_light_bridge.hlsli:59-76; the DI bridge is removed in M7).
+bool PtGetLightTileCell(RAB_Surface surface, out uint cell) {
+  cell = 0u;
+  if (g_restir.tile_count == 0u || !isfinite(surface.viewDepth) || surface.viewDepth <= 0.0) return false;
+  const float2 tile_size_inv = asfloat(g_pt_scene.Load(int3(RTXDI_SURFACE_LIGHT_TILE_SIZE_ROW, 0, 0)).xy);
+  if (!all(isfinite(tile_size_inv)) || any(tile_size_inv <= 0.0)) return false;
+  const uint2 tile = uint2(tile_size_inv * (float2(surface.pixel) + 0.5));
+  if (tile.x >= 32u || tile.y >= 18u) return false;
+  const uint base = tile.x + (tile.y << 5u);
+  if (base >= g_restir.tile_count) return false;
+  const float tile_depth_inv = g_pt_tiles[base].tileDepthInv;
+  if (!isfinite(tile_depth_inv) || tile_depth_inv < 0.0) return false;
+  const uint slice = (uint)clamp(tile_depth_inv * surface.viewDepth, 0.0, 7.0);
+  cell = min(4607u, slice * 576u + base);
+  return cell < g_restir.tile_count;
+}
+
 float3 RAB_GetReflectedBsdfRadianceForSurface(float3 location, float3 radiance, RAB_Surface s) {
   const float3 l = normalize(location - s.worldPos);
   return radiance * RAB_SurfaceEvaluateBsdfTimesNoL(s, l, false);
@@ -345,7 +386,8 @@ float RAB_GetPTSampleTargetPdfForSurface(float3 location, float3 radiance, RAB_S
   return RTXDI_Luminance(RAB_GetReflectedBsdfRadianceForSurface(location, radiance, s));
 }
 float RAB_GetLightSampleTargetPdfForSurface(RAB_LightSample sample, RAB_Surface s) {
-  return RTXDI_Luminance(RAB_GetReflectedBsdfRadianceForSurface(sample.position, sample.radiance, s));
+  if (sample.solidAnglePdf <= 0.0) return 0.0;
+  return RTXDI_Luminance(RAB_GetReflectedBsdfRadianceForSurface(sample.position, sample.radiance, s)) / sample.solidAnglePdf;
 }
 bool RAB_SurfaceImportanceSampleBrdf(RAB_Surface s, inout RTXDI_RandomSamplerState rng, out float3 dir) {
   RTXDI_BrdfRaySampleProperties props = RTXDI_DefaultBrdfRaySampleProperties();
@@ -357,7 +399,8 @@ bool RAB_TraceRayForLocalLight(float3 origin, float3 dir, float t_min, float t_m
   return false;
 }
 bool RAB_AreMaterialsSimilar(RAB_Material a, RAB_Material b) {
-  return abs(a.roughness - b.roughness) < 0.2 && CalcLuminance(abs(a.diffuseAlbedo - b.diffuseAlbedo)) < 0.2;
+  return a.character == b.character && abs(a.roughness - b.roughness) < 0.2
+      && CalcLuminance(abs(a.diffuseAlbedo - b.diffuseAlbedo)) < 0.2;
 }
 
 RAB_LightInfo RAB_EmptyLightInfo() {
@@ -398,37 +441,101 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
   if (info.index == RTXDI_LIGHT_TABLE_INVALID_INDEX) return s;
   if (info.index == g_lamp_count) {
     s.sun = true;
-    s.solidAnglePdf = 1.0;
+    float3 direction = g_pt_sun_dir;
+    const float angular_radius = g_restir.sun_angular_radius;
+    if (angular_radius > 0.0) {
+      // DirectionalLight::CalcSample (PolymorphicLight.hlsli:596-603), not normalized; our direction points toward the sun.
+      float sin_half, cos_half;
+      sincos(angular_radius, sin_half, cos_half);
+      float3 t, b;
+      BranchlessONB(direction, t, b);
+      const float2 disk = SampleDisk(uv);
+      const float3 sample_direction = direction + t * (disk.x * sin_half) + b * (disk.y * sin_half);
+      s.solidAnglePdf = 1.0 / (2.0 * 3.14159265 * (1.0 - cos_half));
+      direction = sample_direction;
+    } else {
+      s.solidAnglePdf = 1.0;
+    }
     s.radiance = max(g_pt_sun_color, 0.0);
-    s.position = surface.worldPos + g_pt_sun_dir * kPtFarLightDistance;
+    s.position = surface.worldPos + direction * kPtFarLightDistance;
     return s;
   }
   const LightParam lp = g_pt_lights[info.index];
-  const float3 to = lp.pos - surface.worldPos;
-  const float d = length(to);
-  const float3 l = d > 1e-6 ? to / d : surface.normal;
-  float3 color = max((surface.flags & 2u) != 0u ? lp.charaColor : lp.color, 0.0);
+  float3 center = lp.pos;
+  const float radius = g_restir.lamp_radius;
+  float3 to = center - surface.worldPos;
+  float d = length(to);
+  float3 l = d > 1e-6 ? to / d : surface.normal;
+  if (radius > 0.0) {
+    // SphereLight::CalcSample (PolymorphicLight.hlsli:131-187) with random = uv and viewer = surface.worldPos.
+    // FullSample assumes the viewer is never inside the sphere (PolymorphicLight.hlsli:120-121); keep the point
+    // convention there so receivers near a large lamp still get its light.
+    if (dot(to, to) <= radius * radius) {
+      center = lp.pos;
+      s.solidAnglePdf = 1.0;
+    } else {
+      const float light_distance2 = dot(to, to);
+      const float radius2 = radius * radius;
+      const float sinThetaMax2 = radius2 / light_distance2;
+      const float cosThetaMax = sqrt(max(0.0, 1.0 - sinThetaMax2));
+      const float phi = 2.0 * 3.14159265 * uv.x;
+      const float cosTheta = lerp(cosThetaMax, 1.0, uv.y);
+      const float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+      const float ds = d * cosTheta - sqrt(max(PT_LIGHT_SAMPLING_EPSILON, radius2 - light_distance2 * sinTheta * sinTheta));
+      const float cosAlpha = (light_distance2 + radius2 - ds * ds) / (2.0 * d * radius);
+      const float sinAlpha = sqrt(max(0.0, 1.0 - cosAlpha * cosAlpha));
+      const float3 normal = normalize(to);
+      float3 tangent, bitangent;
+      BranchlessONB(normal, tangent, bitangent);
+      float sinPhi, cosPhi;
+      sincos(phi, sinPhi, cosPhi);
+      const float3 radiusVector = SphericalDirection(sinAlpha, cosAlpha, sinPhi, cosPhi, -tangent, -bitangent, -normal);
+      center = lp.pos + radius * radiusVector;
+      s.solidAnglePdf = 1.0 / (2.0 * 3.14159265 * (1.0 - cosThetaMax));
+    }
+    to = center - surface.worldPos;
+    d = length(to);
+    l = d > 1e-6 ? to / d : surface.normal;
+  } else {
+    s.solidAnglePdf = 1.0;
+  }
+  float3 color = max(surface.material.character ? lp.charaColor * g_restir.char_lamp_intensity : lp.color, 0.0);
   color *= LampDistanceAttenuation(lp, to);
   if (info.type == LAMP_TYPE_SPOT) color *= LampSpotCone(lp, l);
+  if (g_restir.local_clamp_enabled != 0u) color = min(color, float3(g_restir.local_clamp, g_restir.local_clamp, g_restir.local_clamp));
   s.radiance = color;
-  s.position = lp.pos;
-  s.solidAnglePdf = 1.0;
+  s.position = center;
   return s;
 }
 float RAB_GetConservativeVisibility(RAB_Surface surface, float3 light_position) {
   WorldTraceCounters counters;
   WorldCameraView view = {false, 1.0, 0u, 0u};
-  const float3 bias = (surface.flags & 2u) != 0u ? g_char_bias : g_env_bias;
-  const float3 origin = surface.worldPos + surface.normal * bias;
+  const bool primary = (surface.flags & 8u) != 0u;
+  const bool character = (surface.flags & 2u) != 0u;
+  const bool sun = (surface.flags & 4u) != 0u;
+  float bias;
+  if (primary && sun) bias = character ? g_restir.sun_char_normal_bias : g_restir.sun_normal_bias;
+  else if (primary) bias = character ? g_restir.local_char_normal_bias : g_restir.local_normal_bias;
+  else bias = character ? g_char_bias : g_env_bias;
+  const float bias_sign = dot(surface.normal, normalize(light_position - surface.worldPos)) >= 0.0 ? 1.0 : -1.0;
+  const float3 outward = surface.normal * bias_sign;
+  float3 origin = surface.worldPos + outward * bias;
+  if (primary && character) {
+    const float3 to_light = light_position - surface.worldPos;
+    const float distance_to_light = length(to_light);
+    const float self_softening = sun ? g_restir.sun_char_self_softening : g_restir.local_char_self_softening;
+    const float3 lateral_dir = normalize(to_light - outward * dot(to_light, outward) + float3(1e-5, 0.0, 0.0));
+    origin += Rt12SelfSofteningOffset(outward, lateral_dir, min(self_softening, distance_to_light * 0.5));
+  }
   const float3 to = light_position - origin;
   const float distance = length(to);
   if (distance <= 1e-6) return 1.0;
   const float3 dir = to / distance;
-  const bool sun = (surface.flags & 4u) != 0u;
-  float reach = distance - (sun ? 0.0 : g_lamp_clearance);
+  float reach = distance - (sun ? 0.0 : (primary ? g_restir.local_clearance : g_lamp_clearance));
   if (sun) {
-    view.require_flags = g_sun_casters_only != 0u ? INSTANCE_SHADOW_CASTER : 0u;
-    reach = g_ray_max;
+    view.require_flags = primary && g_restir.sun_casters_only != 0u ? INSTANCE_SHADOW_CASTER : 0u;
+    if (primary) view.skip_flags = INSTANCE_FOLIAGE;
+    reach = primary ? min(g_restir.sun_max_distance, g_ray_max) : g_ray_max;
   }
   if (reach <= 1e-3) return 1.0;
   g_rt12_dynamic_mask = g_dynamic_on != 0u ? RT12_MASK_DYNAMIC : 0u;

@@ -17,14 +17,18 @@
 #include "pt_diagnostics.hpp"
 namespace falcom_world::rt12 {
 inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, reshade::api::command_list* cmd_list,
-                                              int32_t transfer_slot, bool lamps, reshade::api::resource_view isfast_view, reshade::api::resource_view* reflection_view) {
+                                              int32_t transfer_slot, bool lamps, reshade::api::resource_view isfast_view, uint32_t debug_view, uint32_t sun_detail_view,
+                                               reshade::api::resource_view* reflection_view,
+                                               reshade::api::resource_view* debug_views) {
   *reflection_view = reshade::api::resource_view{0u};
+  debug_views[0] = debug_views[1] = debug_views[2] = reshade::api::resource_view{0u};
   using Microsoft::WRL::ComPtr;
   const auto fallback = [](pt::PtReason reason) { pt::SetPtReason(reason); return reshade::api::resource_view{0u}; };
   // 1. Gates.
   if (!g_rt12_enabled.load(std::memory_order_relaxed)) return fallback(pt::PtReason::DxrOff);
   if (!g_rt12 || g_rt12->device != device) return fallback(pt::PtReason::NotCreated);
   Rt12State& s = *g_rt12;
+  namespace di = falcom_world::rtxdi;
   if (s.unfenced_execution) return reshade::api::resource_view{0u};
   if (s.stuck) return fallback(pt::PtReason::Stuck);
   if (s.failed) return fallback(pt::PtReason::Failed);
@@ -95,13 +99,13 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     hr = r.water_list->Close();
     if (FAILED(hr)) return fail("pt water close", hr);
     // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u8 | t40 | t41-t42 | t43-t55 | u10-u11
-    // | u9 | u12-u13 | t56.
-    const UINT counts[15] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 5u, 1u, 2u, 13u, 2u, 1u, 2u, 1u};
-    const UINT bases[15] = {0u, 14u, 29u, 30u, 31u, 0u, 36u, 4u, 40u, 41u, 43u, 10u, 9u, 12u, 56u};
-    const UINT offsets[15] = {0u, 4u, 7u, 8u, 9u, 14u, 18u, 22u, 27u, 28u, 30u, 43u, 45u, 46u, 48u};
-    D3D12_DESCRIPTOR_RANGE ranges[15] = {};
-    for (uint32_t i = 0u; i < 15u; ++i) {
-      ranges[i].RangeType = (i == 5u || i == 7u || i == 11u || i == 12u || i == 13u)
+    // | u9 | u12-u13 | t56 | t57 | u14-u16.
+    const UINT counts[17] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 5u, 1u, 2u, 13u, 2u, 1u, 2u, 1u, 1u, 3u};
+    const UINT bases[17] = {0u, 14u, 29u, 30u, 31u, 0u, 36u, 4u, 40u, 41u, 43u, 10u, 9u, 12u, 56u, 57u, 14u};
+    const UINT offsets[17] = {0u, 4u, 7u, 8u, 9u, 14u, 18u, 22u, 27u, 28u, 30u, 43u, 45u, 46u, 48u, 49u, 50u};
+    D3D12_DESCRIPTOR_RANGE ranges[17] = {};
+    for (uint32_t i = 0u; i < 17u; ++i) {
+      ranges[i].RangeType = (i == 5u || i == 7u || i == 11u || i == 12u || i == 13u || i == 16u)
                                 ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
       ranges[i].NumDescriptors = counts[i];
       ranges[i].BaseShaderRegister = bases[i];
@@ -111,7 +115,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.Num32BitValues = kRt12PtConstants;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable.NumDescriptorRanges = 15u;
+    params[1].DescriptorTable.NumDescriptorRanges = 17u;
     params[1].DescriptorTable.pDescriptorRanges = ranges;
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[2].Descriptor.ShaderRegister = 1u;
@@ -296,6 +300,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (FAILED(hr)) return fail("pt counter zero map", hr);
     std::fill_n(static_cast<uint32_t*>(zeros), kRt12PtCounters, 0u);
     r.counter_zero->Unmap(0u, nullptr);
+    std::fill_n(r.debug_frame, kRt12Slots, UINT32_MAX);
     r.created = true;
   }
   // 2b. GPU counters: a slot's counters are read once its submission's fence is complete. Never waits.
@@ -380,6 +385,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
           pt::g_pt_panel.gpu_sharc_replay_rejected = values[27];
           pt::g_pt_panel.temporal_selected = values[28];
           pt::g_pt_panel.spatial_selected = values[29];
+          pt::g_pt_panel.gpu_d2_lamp = values[30];
+          pt::g_pt_panel.gpu_d2_sun = values[31];
+          pt::g_pt_panel.gpu_shade_transmitted = values[32];
           pt::g_pt_panel.sparse_sample_active = r.counter_sparse[i];
           pt::g_pt_panel.sparse_selected = values[7];
           pt::g_pt_panel.sparse_valid = values[8];
@@ -568,6 +576,26 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       RetireShared(s, refl, s.last_signal);
       return fallback(pt::PtReason::TargetFailed);
     }
+  }
+  const bool debug_on = debug_view != RTXDI_DEBUG_VIEW_OFF;
+  Rt12Shared* debug_outputs[] = {&r.debug_value[k], &r.debug_status[k], &r.sun_detail[k]};
+  const DXGI_FORMAT debug_formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32B32A32_UINT};
+  for (uint32_t i = 0u; i < 3u; ++i) {
+    Rt12Shared& shared = *debug_outputs[i];
+    if (debug_on && (!shared.texture11 || shared.width != w || shared.height != h)) {
+      RetireShared(s, shared, s.last_signal);
+      if (FAILED(CreateRt12Shared(s, device, debug_formats[i], w, h, 1u, true, &shared))) {
+        RetireShared(s, shared, s.last_signal);
+        return fallback(pt::PtReason::TargetFailed);
+      }
+    } else if (!debug_on && shared.texture11) {
+      RetireShared(s, shared, s.last_signal);
+    }
+  }
+  if (!debug_on) {
+    r.debug_frame[k] = UINT32_MAX;
+    r.debug_view[k] = RTXDI_DEBUG_VIEW_OFF;
+    r.sun_detail_view[k] = RTXDI_SUN_DETAIL_STATUS;
   }
   // 4b. SHARC (M2): clear triggers, buffers, update grid and resolve window (OpenRemix sharc.cpp:311-475).
   const uint32_t sharc_capacity_wanted = 1u << std::clamp(static_cast<uint32_t>(pt::g_pt_sharc_capacity_log2), 16u, 22u);
@@ -983,6 +1011,12 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   r.water_frame_inputs.uav_descs[47u] = neighbor_uav;
   r.water_frame_inputs.resources[47u] = r.neighbor_selection;
   set_srv(48u, r.smoothed_duplication[(frame + 1u) & 1u].Get(), Rt12TextureSrv(DXGI_FORMAT_R32_FLOAT));
+  set_srv(49u, lamps ? input.tiles_buffer.Get() : nullptr,
+          Rt12BufferSrv(RTXDI_INPUT_TILE_STRIDE, lamps ? input.tile_count : 1u));
+  ID3D12Resource* const debug_textures[] = {debug_on ? r.debug_value[k].texture12.Get() : nullptr,
+                                            debug_on ? r.debug_status[k].texture12.Get() : nullptr,
+                                            debug_on ? r.sun_detail[k].texture12.Get() : nullptr};
+  for (uint32_t i = 0u; i < 3u; ++i) set_texture_uav(50u + i, debug_textures[i], debug_formats[i]);
   D3D12_UNORDERED_ACCESS_VIEW_DESC reservoir_uav = {};
   reservoir_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
   reservoir_uav.Buffer.NumElements = r.restir->GetReservoirBufferParameters().reservoirArrayPitch
@@ -1269,6 +1303,45 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.prev_deferred_count = history_slot.deferred_count;
   restir_constants.stable_light_remap = pt::g_restir_stable_light_remap > 0.5f ? 1u : 0u;
   restir_constants.history_valid = history_valid ? 1u : 0u;
+  const auto di_clamped = di::FiniteClamped;
+  restir_constants.sun_angular_radius =
+      di_clamped(di::g_sun_light_size, 0.f, 0.f, 5.f) * 0.5f * std::numbers::pi_v<float> / 180.f;
+  restir_constants.lamp_radius = di_clamped(di::g_local_light_size, 0.f, 0.f, 5.f);
+  restir_constants.isfast_light_jitter = di::g_sun_isfast > 0.5f || di::g_local_isfast > 0.5f ? 1u : 0u;
+  restir_constants.local_normal_bias = di_clamped(di::g_local_normal_bias, 0.02f, 0.f, 0.5f);
+  restir_constants.local_char_normal_bias = di_clamped(di::g_local_character_normal_bias, 0.02f, 0.f, 0.5f);
+  restir_constants.local_clearance = di_clamped(di::g_local_light_clearance, 0.2f, 0.f, 1.f);
+  restir_constants.sun_normal_bias = di_clamped(di::g_sun_normal_bias, 0.02f, 0.f, 0.5f);
+  restir_constants.sun_char_normal_bias = di_clamped(di::g_sun_character_normal_bias, 0.02f, 0.f, 0.5f);
+  restir_constants.sun_max_distance = di_clamped(di::g_sun_max_ray_distance, 100.f, 1.f, 10000.f);
+  restir_constants.sun_casters_only = di::g_sun_casters_only > 0.5f ? 1u : 0u;
+  restir_constants.local_clamp = di_clamped(di::g_local_light_clamp, 16.f, 0.f, 1000.f);
+  restir_constants.local_clamp_enabled = di::g_local_light_clamp_enabled > 0.5f ? 1u : 0u;
+  restir_constants.char_lamp_intensity = di_clamped(di::g_local_character_intensity, 1.f, 0.f, 10.f);
+  restir_constants.local_char_self_softening = di_clamped(di::g_local_character_self_softening, 0.f, 0.f, 10.f);
+  restir_constants.sun_char_self_softening = di_clamped(di::g_sun_character_self_softening, 0.f, 0.f, 10.f);
+  restir_constants.foliage_transmission = di_clamped(di::g_sun_foliage_transmission, 0.f, 0.f, 1.f);
+  restir_constants.wind_transmission = di_clamped(di::g_sun_wind_transmission, 0.5f, 0.f, 1.f);
+  restir_constants.wind_softening = di_clamped(di::g_sun_wind_softening, 0.5f, 0.f, 10.f);
+  restir_constants.foliage_tint[0] = di_clamped(di::g_sun_foliage_tint_r, 1.f, 0.f, 1.f);
+  restir_constants.foliage_tint[1] = di_clamped(di::g_sun_foliage_tint_g, 1.f, 0.f, 1.f);
+  restir_constants.foliage_tint[2] = di_clamped(di::g_sun_foliage_tint_b, 1.f, 0.f, 1.f);
+  restir_constants.sun_darkening = di_clamped(di::g_sun_shadow_darkening, 1.f, 0.f, 1.f);
+  restir_constants.sun_char_darkening = di_clamped(di::g_sun_character_shadow_darkening, 1.f, 0.f, 1.f);
+  restir_constants.pt_intensity = di_clamped(pt::g_pt_intensity, 1.f, 0.f, 2.f);
+  restir_constants.pt_char_intensity = di_clamped(pt::g_pt_char_intensity, 1.f, 0.f, 1.f);
+  restir_constants.direct_enabled = pt::g_restir_direct > 0.5f ? 1u : 0u;
+  restir_constants.tile_count = lamps ? input.tile_count : 0u;
+  restir_constants.debug_view = debug_view;
+  restir_constants.sun_detail_view = sun_detail_view;
+  restir_constants.coverage_min[0] = s.scene_coverage_min[0];
+  restir_constants.coverage_min[1] = s.scene_coverage_min[1];
+  restir_constants.coverage_min[2] = s.scene_coverage_min[2];
+  restir_constants.coverage_size = s.scene_coverage_size;
+  restir_constants.coverage_valid = s.scene_coverage_valid ? 1u : 0u;
+  r.debug_view[k] = debug_view;
+  r.sun_detail_view[k] = sun_detail_view;
+  if (debug_on && restir_constants.direct_enabled != 0u) r.debug_frame[k] = frame;
   void* constants_data = nullptr;
   if (FAILED(r.constants[k]->Map(0u, nullptr, &constants_data))) return fail("pt constants map", E_FAIL);
   std::memcpy(constants_data, &restir_constants, sizeof(restir_constants));
@@ -1691,6 +1764,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     pt::g_pt_panel.regir_last_use_fence = r.regir_last_use[regir_slot];
   }
   *reflection_view = refl_on ? refl.srv11 : reshade::api::resource_view{0u};
+  debug_views[0] = debug_on && r.debug_frame[k] == frame ? r.debug_value[k].srv11 : reshade::api::resource_view{0u};
+  debug_views[1] = debug_on && r.debug_frame[k] == frame ? r.debug_status[k].srv11 : reshade::api::resource_view{0u};
+  debug_views[2] = debug_on && r.debug_frame[k] == frame ? r.sun_detail[k].srv11 : reshade::api::resource_view{0u};
   return out.srv11;
 }
 // Water panel state when no water reflection is traced this draw: off, the reason, and no water counters.
