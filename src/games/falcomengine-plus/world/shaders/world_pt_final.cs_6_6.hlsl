@@ -22,6 +22,7 @@ SplitBrdf PtCalculateDirectLighting(RAB_Surface surface, RTXDI_PTReservoir reser
   float3 l = normalize(reservoir.translatedWorldPosition - RAB_GetSurfaceWorldPos(surface));
   light_radiance = 0.0;
   sun_sample = false;
+  bool is_delta = false;
   if (RTXDI_ConnectsToNeeLight(reservoir) && reservoir.rcVertexLength == 2u) {
     const RTXDI_SampledLightData data = RTXDI_GetSampledLightData(reservoir);
     const uint light_index = data.lightData & RTXDI_DIReservoir_LightIndexMask;
@@ -36,9 +37,12 @@ SplitBrdf PtCalculateDirectLighting(RAB_Surface surface, RTXDI_PTReservoir reser
     RTXDI_RandomSamplerState replay_rng = RTXDI_GetRngForShading(reservoir);
     RTXDI_BrdfRaySampleProperties props = RTXDI_DefaultBrdfRaySampleProperties();
     RAB_SurfaceImportanceSampleBsdf(surface, replay_rng, l, props);
+    is_delta = props.IsDelta();
+  } else {
+    is_delta = surface.material.roughness < kMinRoughness && dot(l, reflect(-v, n)) > 0.99999;
   }
   light_direction = l;
-  return EvaluateBrdfPT(surface, n, v, l);
+  return EvaluateBrdfPT(surface, n, v, l, is_delta);
 }
 
 [numthreads(8, 8, 1)]
@@ -141,12 +145,19 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (character) debug_status_word |= RTXDI_N1_STATUS_CHARACTER_BIT;
   if (direct) debug_status_word |= RTXDI_N1_STATUS_KNOWN_BIT;
 
+  const bool is_direct = isinf(reservoir.radiance.x) && reservoir.rcVertexLength == 2u;
+  const bool char_direct = g_restir.direct_enabled != 0u && !(character && g_restir.char_toon != 0u);
+
   // Indicator split of the same estimator: intensity scales the indirect part only, and only while direct is on.
   // Direct light is only the d = 2 primary-NEE sample (A10); first-bounce SHARC and sky paths are indirect.
-  if (!(isinf(reservoir.radiance.x) && reservoir.rcVertexLength == 2u) && g_restir.direct_enabled != 0u) {
+  if (!is_direct && char_direct) {
     const float scale = character ? g_restir.pt_char_intensity : g_restir.pt_intensity;
     diffuse *= scale;
     specular *= scale;
+  }
+  if (is_direct) {
+    diffuse = PtClampLuminance(diffuse, g_restir.direct_clamp);
+    specular = PtClampLuminance(specular, g_restir.direct_clamp);
   }
   const float3 raw_specular = PtInvalidPixelGuard(specular);
   diffuse = PtInvalidPixelGuard(diffuse);
@@ -161,7 +172,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   const float hit_t = max(length(reservoir.translatedWorldPosition - surface.worldPos), 1e-3);
   g_pt_specular[id.xy] = float4(PtInvalidPixelGuard(rgb), isfinite(hit_t) ? hit_t : 1e-3);
 #else
-  diffuse = PtClampLuminance(diffuse, g_gi_clamp);
+  if (!is_direct) diffuse = PtClampLuminance(diffuse, g_gi_clamp);
   const float sparse_scale = (g_refl_flags & 32u) != 0u && g_sparse_enabled != 0u && g_sparse_levels < 256u
       ? 256.0 / float(g_sparse_levels) : 1.0;
   g_pt_diffuse[id.xy] = float4(PtInvalidPixelGuard(diffuse * sparse_scale), 1.0);
@@ -170,11 +181,15 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (g_refl_samples == 0u) {
     g_pt_specular[id.xy] = float4(0, 0, 0, 0);
   } else if (character) {
-    // Characters consume total specular radiance directly, without demodulation (A2.4 step 10). With direct off the
-    // previous zero output is kept byte-for-byte.
-    g_pt_specular[id.xy] = g_restir.direct_enabled != 0u ? float4(raw_specular, 1.0) : float4(0, 0, 0, 0);
+    // Characters consume total specular radiance directly, without demodulation (A2.4 step 10). Indirect samples use
+    // the reflection clamp; direct samples were clamped before demodulation. Toon characters keep the direct-off output.
+    const float3 clamped = (is_direct || g_refl_sample_clamp <= 0.0)
+        ? raw_specular : min(raw_specular, g_refl_sample_clamp);
+    g_pt_specular[id.xy] = char_direct ? float4(clamped, 1.0) : float4(0, 0, 0, 0);
   } else if (direct && reservoir.pathLength == 2u) {
-    g_pt_specular[id.xy] = float4(specular, 1.0);
+    float3 rgb = specular;
+    if ((g_refl_flags & 1u) != 0u) rgb = min(rgb, 1.0);
+    g_pt_specular[id.xy] = float4(PtInvalidPixelGuard(rgb), 1.0);
   } else {
     float3 rgb = g_refl_sample_clamp > 0.0 ? min(specular, g_refl_sample_clamp) : specular;
     rgb = rgb * g_refl_intensity * sparse_scale;

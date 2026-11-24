@@ -43,7 +43,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     RAB_LightSample unused_sample;
     PtSampleNee(hit_surface, nee_rng, direct_from_lights, unused_data, unused_a, unused_b, unused_sample);
     rng = nee_rng.seed;
-    float3 direct = albedo * direct_from_lights;
+    // PtSampleNee radiance already includes the hit BRDF (albedo); the base pass multiplied albedo once (22b0badd).
+    float3 direct = direct_from_lights;
     if (any(isnan(direct)) || any(isinf(direct))) direct = float3(0, 0, 0);
     const SharcHitData sharc_hit = PtSharcHit(hit.position, nh, dir, albedo);
     const float random_value = PtRandom(rng);

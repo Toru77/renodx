@@ -1074,6 +1074,45 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RestirPtDirectClampEnabled",
+      .binding = &pt::g_restir_direct_clamp_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Direct Clamp Enabled",
+      .section = "Path Tracing Direct",
+      .tooltip = "On = clamp direct-light luminance per sample; off = no direct clamp.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RestirPtDirectClamp",
+      .binding = &pt::g_restir_direct_clamp,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 16.f,
+      .label = "Direct Clamp",
+      .section = "Path Tracing Direct",
+      .tooltip = "Luminance clamp applied to direct light from the path reservoir (0 = off).",
+      .min = 0.5f,
+      .max = 64.f,
+      .format = "%.2f",
+      .is_enabled = [] { return pt::g_restir_direct_clamp_enabled > 0.5f; },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RestirPtCharacterShading",
+      .binding = &pt::g_restir_char_toon,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 0.f,
+      .label = "Character Shading",
+      .section = "Path Tracing Direct",
+      .tooltip = "Path traced uses the PT Lambert/GGX BRDF for character direct light; Game toon keeps the game's toon sun and CSM with PT indirect light only.",
+      .labels = {"Path traced (Lambert/GGX)", "Game toon"},
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiLocalNormalBias",
       .binding = &rtxdi::g_local_normal_bias,
       .value_type = SettingValueType::FLOAT,
@@ -2205,6 +2244,20 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .min = 0.f,
       .max = 1.f,
       .format = "%.3f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RestirPtTemporalVisibility",
+      .binding = &pt::g_restir_temporal_visibility,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 1.f,
+      .label = "Temporal Visibility",
+      .section = "Path Tracing Resampling",
+      .tooltip = "Re-tests reused bounce light for blockers after motion (SDK enableVisibilityBeforeCombine).",
+      .labels = {"Off", "On"},
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%d",
       .is_visible = visible,
   });
   settings->push_back(new Setting{

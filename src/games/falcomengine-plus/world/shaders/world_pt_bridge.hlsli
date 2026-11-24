@@ -510,7 +510,7 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
   s.position = center;
   return s;
 }
-float RAB_GetConservativeVisibility(RAB_Surface surface, float3 light_position) {
+float PtLightVisibility(RAB_Surface surface, float3 light_position) {
   WorldTraceCounters counters;
   WorldCameraView view = {false, 1.0, 0u, 0u};
   const bool primary = (surface.flags & 8u) != 0u;
@@ -546,7 +546,21 @@ float RAB_GetConservativeVisibility(RAB_Surface surface, float3 light_position) 
 }
 float RAB_GetConservativeVisibility(RAB_Surface surface, RAB_LightSample sample) {
   if (sample.sun) surface.flags |= 4u;
-  return RAB_GetConservativeVisibility(surface, sample.position);
+  return PtLightVisibility(surface, sample.position);
+}
+// Reconnection visibility (FullSample RAB_VisibilityTest.hlsli:19-30): tight segment to a surface vertex; no lamp
+// clearance, light biases or self-softening (those are light-shadow rules, PtLightVisibility).
+float RAB_GetConservativeVisibility(RAB_Surface surface, float3 sample_position) {
+  WorldTraceCounters counters;
+  const WorldCameraView view = {false, 1.0, 0u, 0u};
+  const float3 to = sample_position - surface.worldPos;
+  const float distance = length(to);
+  if (distance <= 0.003) return 1.0;
+  const float offset = 0.001;
+  const float3 origin = surface.worldPos + surface.geoNormal * ((dot(surface.geoNormal, to) >= 0.0 ? 1.0 : -1.0) * g_env_bias);
+  g_rt12_dynamic_mask = g_dynamic_on != 0u ? RT12_MASK_DYNAMIC : 0u;
+  return TraceWorldRayDxr(origin, to / distance, offset, max(offset, distance - offset * 2.0), true, view, counters).prim
+             == 0xFFFFFFFFu ? 1.0 : 0.0;
 }
 float RAB_GetTemporalConservativeVisibility(RAB_Surface surface, float3 light_position, float3 prev_light_position) {
   return RAB_GetConservativeVisibility(surface, light_position);
@@ -612,10 +626,15 @@ int RAB_TranslateLightIndex(uint lightIndex, bool currentToPrevious) {
 }
 float RAB_GetLightTargetPdfForVolume(float3 pos, RAB_LightSample sample) { return 0.0; }
 
-SplitBrdf EvaluateBrdfPT(RAB_Surface s, float3 n, float3 v, float3 l) {
+SplitBrdf EvaluateBrdfPT(RAB_Surface s, float3 n, float3 v, float3 l, bool isDelta) {
   SplitBrdf brdf = (SplitBrdf)0;
-  brdf.demodulatedDiffuse = Lambert(s.normal, -l);
-  brdf.specular = GGX_times_NdotL(v, l, s.normal, max(s.material.roughness, kMinRoughness), s.material.specularF0);
+  if (isDelta) {
+    brdf.specular = Schlick_Fresnel(s.material.specularF0, saturate(dot(l, n))) / max(1.0 - s.diffuseProbability, 1e-4);
+    return brdf;
+  }
+  brdf.demodulatedDiffuse = Lambert(n, -l);
+  brdf.specular = s.material.roughness >= kMinRoughness
+      ? GGX_times_NdotL(v, l, n, s.material.roughness, s.material.specularF0) : 0.0;
   return brdf;
 }
 float3 DemodulateSpecular(float3 f0, float3 specular) { return specular / max(0.01, f0); }
@@ -746,7 +765,7 @@ void PtSampleNee(RAB_Surface surface, inout RTXDI_RandomSamplerState rng, out fl
   const float3 l = normalize(light_sample.position - surface.worldPos);
   surface.flags |= light_sample.sun ? 4u : 0u;
   radiance_from_lights = RAB_GetReflectedBsdfRadianceForSurface(light_sample.position, light_sample.radiance, surface);
-  radiance_from_lights *= RAB_GetConservativeVisibility(surface, light_sample.position);
+  radiance_from_lights *= PtLightVisibility(surface, light_sample.position);
   radiance_from_lights *= RTXDI_GetDIReservoirInvPdf(reservoir) / light_sample.solidAnglePdf;
   RTXDI_SampledLightData_SetLightData(sampled_light_data, reservoir.lightData & RTXDI_DIReservoir_LightIndexMask);
   sampled_light_data.uvData = reservoir.uvData;

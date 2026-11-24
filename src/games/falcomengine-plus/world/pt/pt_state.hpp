@@ -73,12 +73,15 @@ inline float g_pt_reflection_water_rule = 0.f;
 inline float g_pt_reflection_water_surface = 0.f;
 inline float g_pt_reflection_water_roughness = 0.05f;
 inline float g_restir_direct = 1.f;
+inline float g_restir_direct_clamp_enabled = 1.f, g_restir_direct_clamp = 16.f;
+inline float g_restir_char_toon = 0.f;
 inline float g_restir_max_rc_vertex_length = 5.f, g_restir_nee_local_samples = 1.f;
 inline float g_restir_min_connection_footprint = 0.02f, g_restir_min_connection_footprint_sigma = 0.2f;
 inline float g_restir_min_pdf_roughness = 0.1f, g_restir_min_pdf_roughness_sigma = 0.01f;
 inline float g_restir_roughness_threshold = 0.1f, g_restir_distance_threshold = 0.f;
 inline float g_restir_reconnection_mode = 1.f;
 inline float g_restir_resampling = 3.f;
+inline float g_restir_temporal_visibility = 1.f;
 inline float g_restir_temporal_depth_threshold = 0.1f, g_restir_temporal_normal_threshold = 0.6f,
              g_restir_permutation_sampling = 0.f;
 inline float g_restir_spatial_samples = 1.f, g_restir_disocclusion_boost_samples = 8.f, g_restir_spatial_radius = 32.f,
@@ -139,6 +142,7 @@ struct PtPanel {
   uint32_t gpu_initial_valid = 0u, gpu_path_len2 = 0u, gpu_path_len3plus = 0u, gpu_nee_connected = 0u;
   uint32_t gpu_sharc_terminated = 0u, gpu_sharc_terminal_rc = 0u, gpu_sharc_replay_rejected = 0u;
   uint32_t gpu_d2_lamp = 0u, gpu_d2_sun = 0u, gpu_shade_transmitted = 0u;
+  uint32_t gpu_ao_rays = 0u, gpu_ao_occluded = 0u;
   uint32_t temporal_selected = 0u, spatial_selected = 0u;
   uint32_t water_temporal_selected = 0u, water_spatial_selected = 0u;
   bool history_valid = false;
@@ -250,6 +254,9 @@ inline void DrawPtPanel() {
                 p.gpu_sharc_terminal_rc, p.gpu_sharc_replay_rejected);
   ImGui::Text("PT direct: d=2 lamp %u, d=2 sun %u, shading transmitted %u", p.gpu_d2_lamp, p.gpu_d2_sun,
                p.gpu_shade_transmitted);
+  const float ao_sky = p.gpu_ao_rays != 0u
+      ? 100.0f * (1.0f - static_cast<float>(p.gpu_ao_occluded) / static_cast<float>(p.gpu_ao_rays)) : 100.0f;
+  ImGui::Text("ao: rays %u | occluded %u | sky visibility %.1f%%", p.gpu_ao_rays, p.gpu_ao_occluded, ao_sky);
     static const char* resampling_names[] = {"none", "temporal", "spatial", "temporal_and_spatial"};
     ImGui::Text("ReSTIR PT resampling: %s  history %s  temporal %u  spatial %u",
                 resampling_names[(std::clamp)(static_cast<uint32_t>(g_restir_resampling), 0u, 3u)],

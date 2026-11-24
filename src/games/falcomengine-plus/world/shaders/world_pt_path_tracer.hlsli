@@ -177,6 +177,7 @@ void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_
   if (g_restir.direct_enabled == 0u) return;
   const RAB_Surface surface = ctx.GetIntersectionSurface();
   if (!RAB_IsSurfaceValid(surface)) return;
+  if (g_restir.char_toon != 0u && surface.material.character) return;
   uint cell = 0u;
   const bool tile_valid = PtGetLightTileCell(surface, cell);
   const RTXDI_InitialSamplingMisData mis_data = RTXDI_ComputeInitialSamplingMisData(g_restir.nee);
@@ -250,7 +251,7 @@ void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_
   RAB_Surface visible_surface = surface;
   visible_surface.flags |= light_sample.sun ? 4u : 0u;
   float3 radiance_from_lights = RAB_GetReflectedBsdfRadianceForSurface(light_sample.position, light_sample.radiance, visible_surface);
-  radiance_from_lights *= RAB_GetConservativeVisibility(visible_surface, light_sample.position);
+  radiance_from_lights *= PtLightVisibility(visible_surface, light_sample.position);
   radiance_from_lights *= RTXDI_GetDIReservoirInvPdf(reservoir) / light_sample.solidAnglePdf;
   if (all(radiance_from_lights <= 0.0)) return;
   RTXDI_SampledLightData sampled_light_data = RTXDI_SampledLightData_CreateInvalidData();
@@ -276,6 +277,12 @@ void RAB_PathTrace(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI
     if (!PtDetermineOutgoingRay(ctx, rng)) break;
     const RAB_Surface prev = ctx.GetIntersectionSurface();
     ctx.SetTraceResult(PtTraceNextBounce(ctx.GetContinuationRay()));
+#if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING) && !defined(PT_WATER_SURFACE)
+    if (ctx.GetBounceDepth() == 2u) {
+      PtCount(33u);
+      if (RAB_IsValidHit(ctx.GetTraceResult())) PtCount(34u);
+    }
+#endif
     if (RAB_IsValidHit(ctx.GetTraceResult())) {
       HandleHit(ctx, rng, prev, ud.pixel);
       if (ctx.IsPathTerminated()) break;

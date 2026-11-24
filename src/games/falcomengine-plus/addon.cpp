@@ -11557,6 +11557,7 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   namespace di = falcom_world::rtxdi;
   shader_injection.pt_gi_bound = 0.f;
   shader_injection.pt_refl_bound = 0.f;
+  shader_injection.pt_char_toon = pt::g_restir_char_toon > 0.5f ? 1.f : 0.f;
   shader_injection.pt_refl_override = PtReflectionOverride() ? 1.f : 0.f;
   g_pt_reflection_view = {};
   if (!IsSora2nd() || !cmd_list) return;
@@ -11608,7 +11609,8 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   const bool pt_direct = pt::g_restir_direct > 0.5f;
   shader_injection.pt_direct_bound = pt_direct ? 1.f : 0.f;
   shader_injection.pt_intensity = pt_direct ? 1.f : di::FiniteClamped(pt::g_pt_intensity, 1.f, 0.f, 2.f);
-  shader_injection.pt_char_intensity = pt_direct ? 1.f : di::FiniteClamped(pt::g_pt_char_intensity, 1.f, 0.f, 1.f);
+  shader_injection.pt_char_intensity = pt_direct && shader_injection.pt_char_toon < 0.5f
+      ? 1.f : di::FiniteClamped(pt::g_pt_char_intensity, 1.f, 0.f, 1.f);
   shader_injection.rtxdi_debug_bound = 0.f;
   shader_injection.rtxdi_debug_distance_bound = 0.f;
   shader_injection.rtxdi_sun_detail_bound = 0.f;

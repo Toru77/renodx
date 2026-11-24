@@ -385,6 +385,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
           pt::g_pt_panel.gpu_d2_lamp = values[30];
           pt::g_pt_panel.gpu_d2_sun = values[31];
           pt::g_pt_panel.gpu_shade_transmitted = values[32];
+          pt::g_pt_panel.gpu_ao_rays = values[33];
+          pt::g_pt_panel.gpu_ao_occluded = values[34];
           pt::g_pt_panel.sparse_sample_active = r.counter_sparse[i];
           pt::g_pt_panel.sparse_selected = values[7];
           pt::g_pt_panel.sparse_valid = values[8];
@@ -1265,6 +1267,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   temporal.depthThreshold = rtxdi::FiniteClamped(pt::g_restir_temporal_depth_threshold, 0.1f, 0.f, 1.f);
   temporal.normalThreshold = rtxdi::FiniteClamped(pt::g_restir_temporal_normal_threshold, 0.6f, 0.f, 1.f);
   temporal.enablePermutationSampling = pt::g_restir_permutation_sampling > 0.5f ? 1u : 0u;
+  temporal.enableVisibilityBeforeCombine = pt::g_restir_temporal_visibility > 0.5f ? 1u : 0u;
   r.restir->SetTemporalResamplingParameters(temporal);
   RTXDI_PTSpatialResamplingParameters spatial = ::rtxdi::GetDefaultReSTIRPTSpatialResamplingParams(rr);
   spatial.numSpatialSamples = (std::clamp)(static_cast<uint32_t>(pt::g_restir_spatial_samples), 1u, 8u);
@@ -1344,6 +1347,9 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.pt_intensity = di_clamped(pt::g_pt_intensity, 1.f, 0.f, 2.f);
   restir_constants.pt_char_intensity = di_clamped(pt::g_pt_char_intensity, 1.f, 0.f, 1.f);
   restir_constants.direct_enabled = pt::g_restir_direct > 0.5f ? 1u : 0u;
+  restir_constants.direct_clamp = pt::g_restir_direct_clamp_enabled > 0.5f
+      ? di_clamped(pt::g_restir_direct_clamp, 16.f, 0.5f, 64.f) : 0.f;
+  restir_constants.char_toon = pt::g_restir_char_toon > 0.5f ? 1u : 0u;
   restir_constants.tile_count = lamps ? input.tile_count : 0u;
   restir_constants.debug_view = debug_view;
   restir_constants.sun_detail_view = sun_detail_view;

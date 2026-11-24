@@ -372,6 +372,9 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
   }
 }
 
+  const bool ptDirectCharacter = shader_injection_data.pt_direct_bound > 0.5f && ptGiValid
+                                 && shader_injection_data.pt_char_toon < 0.5f;
+
   // Reduce AO where indirect light exists
   if (shader_injection_data.vbgi_reduce_ao > 0.5f && shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
     r5.x = lerp(r5.x, 1.0, saturate(cachedVBGILuma * shader_injection_data.vbgi_reduce_ao_strength));
@@ -474,7 +477,7 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
       if (shader_injection_data.char_shadow_mode >= 0.5f) {
         r3.z = r3.z * saturate(r5.z);
       }
-      if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) r3.z = 0.0f;
+      if (ptDirectCharacter) r3.z = 0.0f;
       r5.yzw = -r9.xyz * r8.xyz + r0.xyz;
       r9.xyz = r3.zzz * r5.yzw + r10.xyz;
       r3.z = (int)r1.z & 4;
@@ -727,7 +730,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     r5.yzw = r5.yzw + -r9.xyz;
     r5.yzw = combineAlpha_g * r5.yzw + r9.xyz;
     float3 charColor = r3.www ? r9.xyz : r5.yzw;
-    const bool ptDirectCharacter = shader_injection_data.pt_direct_bound > 0.5f && ptGiValid;
     // Unified PT direct (A2.4 Q1): PT diffuse (demodulated, total) x albedo + PT specular radiance replace all character
     // lighting terms (sun toon, lamps, ambient/SSGI); t47/t48 already include direct and indirect light.
     if (ptDirectCharacter) {

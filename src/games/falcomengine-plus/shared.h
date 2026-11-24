@@ -38,7 +38,7 @@ struct ShaderInjectData {
   // read on `char_shadow_mode >= 0.5f` and not on `== 1`. That engine code is
   // still in the Sora and Kai character/SSAO shaders.
   float char_shadow_mode;
-  float reserved_slot_19;  // RETIRED: no remaining consumer; kept for the layout.
+  float pt_char_toon;  // 0/1: characters use game toon direct light under PT direct
   float reserved_slot_20;  // RETIRED: no remaining consumer; kept for the layout.
   float reserved_slot_21;  // RETIRED: no remaining consumer; kept for the layout.
   float pt_direct_bound;                    // 0/1: t47/t48 carry unified PT direct light this draw; was reserved_slot_01

@@ -42,7 +42,7 @@ struct PtRestirConstants {
   float sun_darkening, sun_char_darkening;
   float pt_intensity, pt_char_intensity;
   uint32_t direct_enabled, tile_count, debug_view, sun_detail_view;
-  uint32_t direct_padding;
+  float direct_clamp;
   // Prepared-scene coverage AABB for the shading-time sun ray (rt12_rtxdi_transfer.hpp:1996-2000).
 #ifdef __cplusplus
   float coverage_min[3];
@@ -51,7 +51,7 @@ struct PtRestirConstants {
 #endif
   float coverage_size;
   uint32_t coverage_valid;
-  uint32_t coverage_padding0, coverage_padding1, coverage_padding2;
+  uint32_t char_toon, coverage_padding1, coverage_padding2;
 };
 
 #ifdef __cplusplus
