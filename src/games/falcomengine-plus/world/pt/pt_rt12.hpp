@@ -94,13 +94,13 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (FAILED(hr)) return fail("pt water list", hr);
     hr = r.water_list->Close();
     if (FAILED(hr)) return fail("pt water close", hr);
-    // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u8 | t40 | t41-t42, order 0..29.
-    const UINT counts[10] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 5u, 1u, 2u};
-    const UINT bases[10] = {0u, 14u, 29u, 30u, 31u, 0u, 36u, 4u, 40u, 41u};
-    const UINT offsets[10] = {0u, 4u, 7u, 8u, 9u, 14u, 18u, 22u, 27u, 28u};
-    D3D12_DESCRIPTOR_RANGE ranges[10] = {};
-    for (uint32_t i = 0u; i < 10u; ++i) {
-      ranges[i].RangeType = (i == 5u || i == 7u) ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    // Table: t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u8 | t40 | t41-t42 | t43-t55 | u10-u11.
+    const UINT counts[12] = {4u, 3u, 1u, 1u, 5u, 4u, 4u, 5u, 1u, 2u, 13u, 2u};
+    const UINT bases[12] = {0u, 14u, 29u, 30u, 31u, 0u, 36u, 4u, 40u, 41u, 43u, 10u};
+    const UINT offsets[12] = {0u, 4u, 7u, 8u, 9u, 14u, 18u, 22u, 27u, 28u, 30u, 43u};
+    D3D12_DESCRIPTOR_RANGE ranges[12] = {};
+    for (uint32_t i = 0u; i < 12u; ++i) {
+      ranges[i].RangeType = (i == 5u || i == 7u || i == 11u) ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
       ranges[i].NumDescriptors = counts[i];
       ranges[i].BaseShaderRegister = bases[i];
       ranges[i].OffsetInDescriptorsFromTableStart = offsets[i];
@@ -109,7 +109,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.Num32BitValues = kRt12PtConstants;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable.NumDescriptorRanges = 10u;
+    params[1].DescriptorTable.NumDescriptorRanges = 12u;
     params[1].DescriptorTable.pDescriptorRanges = ranges;
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[2].Descriptor.ShaderRegister = 1u;
@@ -121,12 +121,18 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (FAILED(hr)) return fail("pt root serialize", hr);
     hr = s.device12->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&r.root));
     if (FAILED(hr)) return fail("pt root", hr);
-#if defined(__world_pt_initial_EMBED_FILE) && defined(__world_pt_final_EMBED_FILE) && defined(__world_pt_water_initial_EMBED_FILE) && defined(__world_pt_water_final_EMBED_FILE) && defined(__world_pt_sharc_update_EMBED_FILE) && defined(__world_pt_sharc_resolve_EMBED_FILE) && defined(__world_pt_material_write_EMBED_FILE)
+#if defined(__world_pt_initial_EMBED_FILE) && defined(__world_pt_final_EMBED_FILE) && defined(__world_pt_temporal_EMBED_FILE) && defined(__world_pt_spatial_EMBED_FILE) && defined(__world_pt_water_initial_EMBED_FILE) && defined(__world_pt_water_final_EMBED_FILE) && defined(__world_pt_sharc_update_EMBED_FILE) && defined(__world_pt_sharc_resolve_EMBED_FILE) && defined(__world_pt_material_write_EMBED_FILE)
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc = {};
     pso_desc.pRootSignature = r.root.Get();
     pso_desc.CS = {__world_pt_initial.data(), __world_pt_initial.size()};
     hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.initial_pso));
     if (FAILED(hr)) return fail("pt initial pso", hr);
+    pso_desc.CS = {__world_pt_temporal.data(), __world_pt_temporal.size()};
+    hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.temporal_pso));
+    if (FAILED(hr)) return fail("pt temporal pso", hr);
+    pso_desc.CS = {__world_pt_spatial.data(), __world_pt_spatial.size()};
+    hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.spatial_pso));
+    if (FAILED(hr)) return fail("pt spatial pso", hr);
     pso_desc.CS = {__world_pt_final.data(), __world_pt_final.size()};
     hr = s.device12->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&r.final_pso));
     if (FAILED(hr)) return fail("pt final pso", hr);
@@ -231,6 +237,14 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = s.device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&r.heap));
     if (FAILED(hr)) return fail("pt heap", hr);
+    if (FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_UPLOAD, rtxdi::kNeighborBytes,
+                                D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE, r.neighbors))) {
+      return fail("pt neighbors", E_FAIL);
+    }
+    void* neighbor_mapped = nullptr;
+    if (FAILED(r.neighbors->Map(0u, nullptr, &neighbor_mapped))) return fail("pt neighbors map", E_FAIL);
+    ::rtxdi::FillNeighborOffsetBuffer(static_cast<uint8_t*>(neighbor_mapped), rtxdi::kNeighborCount);
+    r.neighbors->Unmap(0u, nullptr);
     for (uint32_t i = 0u; i < kRt12Slots; ++i) {
       hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_UPLOAD, kPtRestirConstantsBytes, D3D12_RESOURCE_STATE_GENERIC_READ,
                             D3D12_RESOURCE_FLAG_NONE, r.constants[i]);
@@ -338,6 +352,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
           pt::g_pt_panel.gpu_sharc_terminated = values[25];
           pt::g_pt_panel.gpu_sharc_terminal_rc = values[26];
           pt::g_pt_panel.gpu_sharc_replay_rejected = values[27];
+          pt::g_pt_panel.temporal_selected = values[28];
+          pt::g_pt_panel.spatial_selected = values[29];
           pt::g_pt_panel.sparse_sample_active = r.counter_sparse[i];
           pt::g_pt_panel.sparse_selected = values[7];
           pt::g_pt_panel.sparse_valid = values[8];
@@ -384,6 +400,11 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
                                                    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                                                    r.reservoirs);
     if (FAILED(hr_reservoirs)) return fail("pt reservoirs", hr_reservoirs);
+    uint64_t next_configuration = 0u;
+    if (!rtxdi::NextDiConfigurationGeneration(r.configuration_generation, &next_configuration)) {
+      return fail("pt configuration generation", E_FAIL);
+    }
+    r.configuration_generation = next_configuration;
     r.restir = std::move(context);
     r.restir_width = w;
     r.restir_height = h;
@@ -659,6 +680,64 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   const bool sparse_effective = sparse_policy.dense_reason == pt::PtSparseDenseReason::None && sparse_policy.levels < 256u;
   const bool sparse_reflections_effective = sparse_effective && refl_on && sparse_reflections_requested;
+  Rt12DiTransferSlot* previous_slot = nullptr;
+  bool history_valid = false;
+  const char* history_reason = "valid";
+  if (!r.history_valid) history_reason = "no_history";
+  else if (r.history_frame == UINT32_MAX || r.history_frame + 1u != frame) history_reason = "frame";
+  else if (r.history_configuration_generation == 0u || r.history_configuration_generation != r.configuration_generation) history_reason = "configuration";
+  else if (r.history_owner_generation == 0u || r.history_owner_generation != s.generation) history_reason = "owner";
+  else if (r.history_width != w || r.history_height != h) history_reason = "size";
+  else if (r.history_transfer_slot < 0 || r.history_transfer_slot >= static_cast<int32_t>(kRt12Slots)
+           || r.history_transfer_slot == static_cast<int32_t>(transfer_slot)) history_reason = "transfer_slot";
+  else if (r.history_cache_epoch != r.cache_epoch) history_reason = "cache_epoch";
+  else if (r.history_sparse_levels != (sparse_effective ? sparse_policy.levels : 256u)
+           || r.history_sparse_reflections_effective != sparse_reflections_effective) history_reason = "sparse";
+  else if (!input.motion_available) history_reason = "motion";
+  if (r.history_valid && r.history_transfer_slot >= 0 && r.history_transfer_slot < static_cast<int32_t>(kRt12Slots)
+      && r.history_frame != UINT32_MAX && r.history_frame + 1u == frame) {
+    Rt12DiTransferSlot& candidate = s.di_transfer.slots[static_cast<uint32_t>(r.history_transfer_slot)];
+    const bool previous_inputs = candidate.width == w && candidate.height == h
+        && candidate.depth.texture12 && candidate.normal.texture12 && candidate.scene.texture12
+        && candidate.color.texture12 && candidate.mrt1.texture12 && candidate.mrt2.texture12
+        && candidate.deferred_buffer && candidate.lights_buffer && candidate.light_table
+        && candidate.motion.texture12 && candidate.motion_available;
+    if (rtxdi::ValidDiHistoryIdentity({.previous_frame = r.history_frame,
+                                       .current_frame = frame,
+                                       .previous_width = r.history_width,
+                                       .previous_height = r.history_height,
+                                       .current_width = w,
+                                       .current_height = h,
+                                       .previous_transfer_slot = r.history_transfer_slot,
+                                       .current_transfer_slot = static_cast<int32_t>(transfer_slot),
+                                       .previous_owner_generation = r.history_owner_generation,
+                                       .current_owner_generation = s.generation,
+                                       .previous_configuration_generation = r.history_configuration_generation,
+                                       .current_configuration_generation = r.configuration_generation,
+                                       .motion_available = input.motion_available,
+                                       .previous_inputs_available = previous_inputs})
+        && r.history_cache_epoch == r.cache_epoch
+        && r.history_sparse_levels == (sparse_effective ? sparse_policy.levels : 256u)
+        && r.history_sparse_reflections_effective == sparse_reflections_effective) {
+      previous_slot = &candidate;
+      history_valid = true;
+    } else {
+      history_reason = "missing_inputs";
+    }
+  }
+  if (!history_valid) {
+    r.history_frame = UINT32_MAX;
+    r.history_width = 0u;
+    r.history_height = 0u;
+    r.history_transfer_slot = -1;
+    r.history_owner_generation = 0u;
+    r.history_configuration_generation = 0u;
+    r.history_cache_epoch = 0u;
+    r.history_sparse_levels = 256u;
+    r.history_sparse_reflections_effective = false;
+  }
+  r.history_valid = history_valid;
+  Rt12DiTransferSlot& history_slot = previous_slot ? *previous_slot : input;
   const uint32_t base = k * kRt12PtDescriptors;
   const auto cpu_at = [&r, &s](uint32_t index) {
     D3D12_CPU_DESCRIPTOR_HANDLE handle = r.heap->GetCPUDescriptorHandleForHeapStart();
@@ -724,6 +803,36 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_srv(26u, sparse_effective ? s.noise.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
   set_srv(27u, regir_on ? r.regir_header[regir_slot].Get() : nullptr, Rt12BufferSrv(kRt12ReGirHeaderStride, 1u));
   set_srv(28u, regir_on ? r.regir_cells[regir_slot].Get() : nullptr, Rt12BufferSrv(kRt12ReGirCellStride, pt::kPtReGirMaxCells));
+  D3D12_SHADER_RESOURCE_VIEW_DESC neighbor_srv = {};
+  neighbor_srv.Format = DXGI_FORMAT_R8G8_SNORM;
+  neighbor_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  neighbor_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  neighbor_srv.Buffer.NumElements = rtxdi::kNeighborCount;
+  set_srv(30u, r.neighbors.Get(), neighbor_srv);
+  set_srv(31u, history_valid ? history_slot.depth.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32_FLOAT));
+  set_srv(32u, history_valid ? history_slot.normal.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
+  set_srv(33u, history_valid ? history_slot.scene.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
+  set_srv(34u, history_valid ? history_slot.color.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_FLOAT));
+  set_srv(35u, history_valid ? history_slot.mrt1.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
+  set_srv(36u, history_valid ? history_slot.mrt2.texture12.Get() : nullptr, Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT));
+  set_srv(37u, history_valid ? history_slot.deferred_buffer.Get() : nullptr, Rt12BufferSrv(RTXDI_INPUT_DEFERRED_STRIDE,
+                                                                 history_slot.deferred_count ? history_slot.deferred_count : 1u));
+  set_srv(38u, history_valid ? history_slot.lights_buffer.Get() : nullptr, Rt12BufferSrv(RTXDI_INPUT_LIGHT_STRIDE,
+                                                               history_slot.light_count ? history_slot.light_count : 1u));
+  set_srv(39u, history_valid ? history_slot.light_table.Get() : nullptr, Rt12BufferSrv(sizeof(RtxdiLightTableEntry), RTXDI_LIGHT_TABLE_CAPACITY));
+  set_srv(40u, input.motion.texture12.Get(), Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_FLOAT));
+  set_srv(41u, input.previous_to_current.Get(), Rt12BufferSrv(sizeof(uint32_t), RTXDI_LIGHT_TABLE_CAPACITY));
+  set_srv(42u, input.current_to_previous.Get(), Rt12BufferSrv(sizeof(uint32_t), RTXDI_LIGHT_TABLE_CAPACITY));
+  const auto set_null_texture_uav = [&](uint32_t index, DXGI_FORMAT format) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
+    view.Format = format;
+    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device12->CreateUnorderedAccessView(nullptr, nullptr, &view, cpu_at(base + index));
+    r.water_frame_inputs.uav_descs[index] = view;
+    r.water_frame_inputs.resources[index] = nullptr;
+  };
+  set_null_texture_uav(43u, DXGI_FORMAT_R32G32_FLOAT);
+  set_null_texture_uav(44u, DXGI_FORMAT_R32_FLOAT);
   D3D12_UNORDERED_ACCESS_VIEW_DESC reservoir_uav = {};
   reservoir_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
   reservoir_uav.Buffer.NumElements = r.restir->GetReservoirBufferParameters().reservoirArrayPitch
@@ -756,6 +865,19 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   std::vector<D3D12_RESOURCE_BARRIER>& barriers = pt_slot.barrier_scratch;
   barriers.clear();
   for (ID3D12Resource* resource : reads) {
+    if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  }
+  if (previous_slot) {
+    for (ID3D12Resource* resource : {history_slot.depth.texture12.Get(), history_slot.normal.texture12.Get(),
+                                     history_slot.scene.texture12.Get(), history_slot.color.texture12.Get(),
+                                     history_slot.mrt1.texture12.Get(), history_slot.mrt2.texture12.Get(),
+                                     history_slot.deferred_buffer.Get(), history_slot.lights_buffer.Get(),
+                                     history_slot.light_table.Get()}) {
+      if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+  }
+  for (ID3D12Resource* resource : {input.motion.texture12.Get(), input.previous_to_current.Get(),
+                                   input.current_to_previous.Get()}) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }
   if (sparse_effective) {
@@ -928,12 +1050,30 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_sharc_firefly_clamp, 10.f, 1.f, 100.f)),
       sparse_requested ? sparse_policy.levels : 0u, sparse_policy.dense_reason == pt::PtSparseDenseReason::None ? 1u : 0u,
       regir_on ? 1u : 0u, 0u, 0u, 0u};
+  const bool rr = rr::RrRequested() && rr::RrOwnsDenoise();
+  const uint32_t resampling_mode = (std::clamp)(static_cast<uint32_t>(pt::g_restir_resampling), 0u, 3u);
   r.restir->SetFrameIndex(frame);
-  r.restir->SetResamplingMode(::rtxdi::ReSTIRPT_ResamplingMode::None);
+  r.restir->SetResamplingMode(static_cast<::rtxdi::ReSTIRPT_ResamplingMode>(resampling_mode));
   r.restir->SetInitialSamplingParameters({.numInitialSamples = (std::clamp)(
       static_cast<uint32_t>((std::max)(pt::g_pt_samples, pt::g_pt_reflection_samples)), 1u, 16u),
       .maxBounceDepth = static_cast<uint32_t>(pt::g_pt_max_bounces) + 1u,
       .maxRcVertexLength = static_cast<uint32_t>(std::clamp(pt::g_restir_max_rc_vertex_length, 2.f, 8.f))});
+  RTXDI_PTTemporalResamplingParameters temporal = ::rtxdi::GetDefaultReSTIRPTTemporalResamplingParams(rr);
+  temporal.depthThreshold = rtxdi::FiniteClamped(pt::g_restir_temporal_depth_threshold, 0.1f, 0.f, 1.f);
+  temporal.normalThreshold = rtxdi::FiniteClamped(pt::g_restir_temporal_normal_threshold, 0.6f, 0.f, 1.f);
+  temporal.enablePermutationSampling = pt::g_restir_permutation_sampling > 0.5f ? 1u : 0u;
+  r.restir->SetTemporalResamplingParameters(temporal);
+  RTXDI_PTSpatialResamplingParameters spatial = ::rtxdi::GetDefaultReSTIRPTSpatialResamplingParams(rr);
+  spatial.numSpatialSamples = (std::clamp)(static_cast<uint32_t>(pt::g_restir_spatial_samples), 1u, 8u);
+  spatial.numDisocclusionBoostSamples = (std::clamp)(static_cast<uint32_t>(pt::g_restir_disocclusion_boost_samples), 0u, 16u);
+  spatial.samplingRadius = rtxdi::FiniteClamped(pt::g_restir_spatial_radius, 32.f, 1.f, 64.f);
+  spatial.depthThreshold = rtxdi::FiniteClamped(pt::g_restir_spatial_depth_threshold, 0.1f, 0.f, 1.f);
+  spatial.normalThreshold = rtxdi::FiniteClamped(pt::g_restir_spatial_normal_threshold, 0.6f, 0.f, 1.f);
+  r.restir->SetSpatialResamplingParameters(spatial);
+  RTXDI_BoilingFilterParameters boiling = ::rtxdi::GetDefaultReSTIRPTBoilingFilterParams(rr);
+  boiling.enableBoilingFilter = pt::g_restir_boiling_filter > 0.5f ? 1u : 0u;
+  boiling.boilingFilterStrength = rtxdi::FiniteClamped(pt::g_restir_boiling_filter_strength, 0.2f, 0.f, 1.f);
+  r.restir->SetBoilingFilterParameters(boiling);
   RTXDI_PTReconnectionParameters reconnection = ::rtxdi::GetDefaultReSTIRPTReconnectionParameters();
   reconnection.minConnectionFootprint = pt::g_restir_min_connection_footprint;
   reconnection.minConnectionFootprintSigma = pt::g_restir_min_connection_footprint_sigma;
@@ -966,8 +1106,10 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.restir.hybridShift = r.restir->GetHybridShiftParameters();
   restir_constants.restir.boilingFilter = r.restir->GetBoilingFilterParameters();
   restir_constants.restir.spatialResampling = r.restir->GetSpatialResamplingParameters();
-  restir_constants.prev_light_count = input.light_count;
-  restir_constants.history_valid = 0u;
+  restir_constants.prev_light_count = history_slot.light_count;
+  restir_constants.prev_deferred_count = history_slot.deferred_count;
+  restir_constants.stable_light_remap = pt::g_restir_stable_light_remap > 0.5f ? 1u : 0u;
+  restir_constants.history_valid = history_valid ? 1u : 0u;
   void* constants_data = nullptr;
   if (FAILED(r.constants[k]->Map(0u, nullptr, &constants_data))) return fail("pt constants map", E_FAIL);
   std::memcpy(constants_data, &restir_constants, sizeof(restir_constants));
@@ -1037,6 +1179,20 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   barriers.clear();
   UavBarrier(barriers, r.reservoirs.Get());
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  if (resampling_mode == 1u || resampling_mode == 3u) {
+    list->SetPipelineState(r.temporal_pso.Get());
+    list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+    barriers.clear();
+    UavBarrier(barriers, r.reservoirs.Get());
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  }
+  if (resampling_mode == 2u || resampling_mode == 3u) {
+    list->SetPipelineState(r.spatial_pso.Get());
+    list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+    barriers.clear();
+    UavBarrier(barriers, r.reservoirs.Get());
+    list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+  }
   list->SetPipelineState(r.final_pso.Get());
   list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
   if (pt_perf_timing) {
@@ -1067,6 +1223,19 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   }
   for (ID3D12Resource* resource : reads) {
+    if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+  }
+  if (previous_slot) {
+    for (ID3D12Resource* resource : {history_slot.depth.texture12.Get(), history_slot.normal.texture12.Get(),
+                                     history_slot.scene.texture12.Get(), history_slot.color.texture12.Get(),
+                                     history_slot.mrt1.texture12.Get(), history_slot.mrt2.texture12.Get(),
+                                     history_slot.deferred_buffer.Get(), history_slot.lights_buffer.Get(),
+                                     history_slot.light_table.Get()}) {
+      if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
+  }
+  for (ID3D12Resource* resource : {input.motion.texture12.Get(), input.previous_to_current.Get(),
+                                   input.current_to_previous.Get()}) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
   }
   if (sparse_effective) {
@@ -1147,6 +1316,21 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   NoteRt12Signal(s, b);
   RecordRt12Evidence(s, GpuEvidenceEvent::Rt12SignalB, GpuEvidenceSource::Pt);
   r.reservoirs_last_use = b;
+  r.history_frame = frame;
+  r.history_width = w;
+  r.history_height = h;
+  r.history_transfer_slot = static_cast<int32_t>(transfer_slot);
+  r.history_owner_generation = s.generation;
+  r.history_configuration_generation = r.configuration_generation;
+  r.history_cache_epoch = r.cache_epoch;
+  r.history_sparse_levels = sparse_policy.dense_reason == pt::PtSparseDenseReason::None ? sparse_policy.levels : 256u;
+  r.history_sparse_reflections_effective = sparse_reflections_effective;
+  r.history_valid = true;
+  {
+    std::lock_guard lock(pt::g_pt_panel_mutex);
+    pt::g_pt_panel.history_valid = history_valid;
+    pt::g_pt_panel.history_reason = history_reason;
+  }
   r.next = (k + 1u) % kRt12Slots;
   // 8. D3D11 waits for B on the GPU before the lighting draw reads the output.
   bool waited = false;
@@ -1493,7 +1677,7 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
   // keys and values); the water dispatch does not write them, since the material write and SHARC update passes never run here.
   for (uint32_t i = 0u; i < kRt12PtDescriptors; ++i) {
     const D3D12_CPU_DESCRIPTOR_HANDLE handle = cpu_at(base + i);
-    const bool uav_index = (i >= 14u && i <= 17u) || (i >= 22u && i <= 25u) || i == 29u;
+    const bool uav_index = (i >= 14u && i <= 17u) || (i >= 22u && i <= 25u) || i == 29u || i >= 43u;
     if (!uav_index) {
       ID3D12Resource* resource = in.resources[i].Get();
       D3D12_SHADER_RESOURCE_VIEW_DESC view = in.srv_descs[i];
@@ -1527,7 +1711,11 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
                                          in.resources[12].Get(), in.resources[13].Get(), in.resources[18].Get(),
                                          in.resources[19].Get(), in.resources[20].Get(), in.resources[21].Get(),
                                          r.water_params[48] ? in.resources[27].Get() : nullptr,
-                                         r.water_params[48] ? in.resources[28].Get() : nullptr};
+                                         r.water_params[48] ? in.resources[28].Get() : nullptr,
+                                          in.resources[31].Get(), in.resources[32].Get(), in.resources[33].Get(),
+                                          in.resources[34].Get(), in.resources[35].Get(), in.resources[36].Get(),
+                                          in.resources[37].Get(), in.resources[38].Get(), in.resources[39].Get(),
+                                          in.resources[40].Get(), in.resources[41].Get(), in.resources[42].Get()};
   for (ID3D12Resource* resource : water_reads) {
     if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }

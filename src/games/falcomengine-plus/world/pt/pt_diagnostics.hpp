@@ -82,6 +82,10 @@ inline std::string SerializePtReport() {
   out << "sharc_terminated: " << p.gpu_sharc_terminated << "\n";
   out << "sharc_terminal_rc: " << p.gpu_sharc_terminal_rc << "\n";
   out << "sharc_replay_rejected: " << p.gpu_sharc_replay_rejected << "\n";
+  out << "temporal_selected: " << p.temporal_selected << "\n";
+  out << "spatial_selected: " << p.spatial_selected << "\n";
+  out << "history_valid: " << p.history_valid << "\n";
+  out << "history_reason: " << p.history_reason << "\n";
   out << "material cell scale: " << g_pt_material_cell_scale << "\n";
   out << "samples: " << g_pt_samples << "\n";
   out << "regir requested: " << p.regir_requested << "\n";

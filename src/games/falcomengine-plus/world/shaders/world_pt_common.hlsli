@@ -45,6 +45,24 @@ RWTexture2D<float4> g_pt_specular : register(u7);  // traced reflection (rgb), m
 #include "../pt/pt_restir_layout.h"
 RWStructuredBuffer<RTXDI_PackedPTReservoir> g_pt_reservoirs : register(u8);
 #define RTXDI_PT_RESERVOIR_BUFFER g_pt_reservoirs
+Buffer<float2> g_pt_neighbors : register(t43);
+#define RTXDI_NEIGHBOR_OFFSETS_BUFFER g_pt_neighbors
+Texture2D<float> g_pt_prev_depth : register(t44);
+Texture2D<uint4> g_pt_prev_normal : register(t45);
+Texture2D<uint4> g_pt_prev_scene : register(t46);
+Texture2D<float4> g_pt_prev_color : register(t47);
+Texture2D<uint4> g_pt_prev_mrt1 : register(t48);
+Texture2D<uint4> g_pt_prev_mrt2 : register(t49);
+StructuredBuffer<GameDeferredParam> g_pt_prev_deferred : register(t50);
+StructuredBuffer<LightParam> g_pt_prev_lights : register(t51);
+StructuredBuffer<RtxdiLightTableEntry> g_pt_prev_light_table : register(t52);
+Texture2D<float4> g_pt_motion : register(t53);
+StructuredBuffer<uint> g_pt_previous_to_current : register(t54);
+StructuredBuffer<uint> g_pt_current_to_previous : register(t55);
+RWTexture2D<float2> g_pt_duplication_map : register(u10);
+RWTexture2D<float> g_pt_smoothed_duplication : register(u11);
+#define RTXDI_PT_DUPLICATION_MAP g_pt_duplication_map
+#define RTXDI_PT_SMOOTHED_DUPLICATION_MAP g_pt_smoothed_duplication
 ConstantBuffer<PtRestirConstants> g_restir : register(b1);
 cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (48 dwords)
   uint2 g_size; uint g_frame; uint g_samples; uint g_max_bounces; uint g_roulette; uint g_roulette_min_bounce;
@@ -71,30 +89,41 @@ static float3 g_pt_probe[9];
 static float4x4 g_pt_view_proj;
 static float4x4 g_pt_inv_view_proj;
 struct PtMaterial { float3 albedo; float roughness; float3 f0; float spec_scale; bool character; };
-// Loads the scene rows, the sun and the ambient probe, and reconstructs the pixel's primary surface.
-bool PtLoadSurface(uint2 pixel, out RtxdiSurfaceResult surface) {
+// Reconstructs one frame's primary surface without touching the current frame's SHARC/material globals.
+bool PtReconstructSurface(Texture2D<float> depth, Texture2D<uint4> normal, Texture2D<uint4> scene, uint2 pixel,
+                          out RtxdiSurfaceResult surface) {
   uint4 scene_rows[RTXDI_SURFACE_SCENE_ROW_COUNT];
   [unroll]
   for (uint row = 0u; row < 8u; ++row) {
-    scene_rows[row] = g_pt_scene.Load(int3(row, 0, 0));
+    scene_rows[row] = scene.Load(int3(row, 0, 0));
   }
   [unroll]
   for (uint row = 0u; row < 4u; ++row) {
     scene_rows[RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + row] =
-        g_pt_scene.Load(int3(RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + row, 0, 0));
+        scene.Load(int3(RTXDI_SURFACE_INVERSE_VIEW_PROJECTION_ROW + row, 0, 0));
   }
-  scene_rows[RTXDI_SURFACE_SUN_RESERVED_ROW - 1u] = g_pt_scene.Load(int3(RTXDI_SURFACE_SUN_RESERVED_ROW - 1u, 0, 0));
-  scene_rows[RTXDI_SURFACE_SUN_RESERVED_ROW] = g_pt_scene.Load(int3(RTXDI_SURFACE_SUN_RESERVED_ROW, 0, 0));
-  scene_rows[RTXDI_SURFACE_RESOLUTION_SCALING_ROW] = g_pt_scene.Load(int3(RTXDI_SURFACE_RESOLUTION_SCALING_ROW, 0, 0));
-  surface = RtxdiReconstructSurface(g_pt_depth.Load(int3(pixel, 0)), g_pt_normal.Load(int3(pixel, 0)), pixel, g_size, scene_rows);
-  if ((surface.flags & RTXDI_SURFACE_FLAG_VALID) == 0u) return false;
+  scene_rows[RTXDI_SURFACE_SUN_RESERVED_ROW - 1u] = scene.Load(int3(RTXDI_SURFACE_SUN_RESERVED_ROW - 1u, 0, 0));
+  scene_rows[RTXDI_SURFACE_SUN_RESERVED_ROW] = scene.Load(int3(RTXDI_SURFACE_SUN_RESERVED_ROW, 0, 0));
+  scene_rows[RTXDI_SURFACE_RESOLUTION_SCALING_ROW] = scene.Load(int3(RTXDI_SURFACE_RESOLUTION_SCALING_ROW, 0, 0));
+  surface = RtxdiReconstructSurface(depth.Load(int3(pixel, 0)), normal.Load(int3(pixel, 0)), pixel, g_size, scene_rows);
+  return (surface.flags & RTXDI_SURFACE_FLAG_VALID) != 0u;
+}
+float3 PtSceneCamera(Texture2D<uint4> scene) {
+  return float3(asfloat(scene.Load(int3(RTXDI_SURFACE_INVERSE_VIEW_ROW + 0u, 0, 0)).w),
+                asfloat(scene.Load(int3(RTXDI_SURFACE_INVERSE_VIEW_ROW + 1u, 0, 0)).w),
+                asfloat(scene.Load(int3(RTXDI_SURFACE_INVERSE_VIEW_ROW + 2u, 0, 0)).w));
+}
+// Loads the scene rows, the sun and the ambient probe, and reconstructs the pixel's primary surface.
+bool PtLoadSurface(uint2 pixel, out RtxdiSurfaceResult surface) {
+  if (!PtReconstructSurface(g_pt_depth, g_pt_normal, g_pt_scene, pixel, surface)) return false;
   g_pt_sun_color = asfloat(g_pt_scene.Load(int3(25, 0, 0)).xyz);
   g_pt_sun_dir = normalize(-asfloat(g_pt_scene.Load(int3(26, 0, 0)).xyz));
   [unroll]
   for (uint i = 0u; i < 9u; ++i) g_pt_probe[i] = asfloat(g_pt_scene.Load(int3(37 + i, 0, 0)).xyz);
 g_pt_view_proj = float4x4(asfloat(g_pt_scene.Load(int3(16, 0, 0))), asfloat(g_pt_scene.Load(int3(17, 0, 0))),
                           asfloat(g_pt_scene.Load(int3(18, 0, 0))), asfloat(g_pt_scene.Load(int3(19, 0, 0))));
-g_pt_inv_view_proj = float4x4(asfloat(scene_rows[20]), asfloat(scene_rows[21]), asfloat(scene_rows[22]), asfloat(scene_rows[23]));
+g_pt_inv_view_proj = float4x4(asfloat(g_pt_scene.Load(int3(20, 0, 0))), asfloat(g_pt_scene.Load(int3(21, 0, 0))),
+                              asfloat(g_pt_scene.Load(int3(22, 0, 0))), asfloat(g_pt_scene.Load(int3(23, 0, 0))));
 // cb_scene is column-major: mul(M_registers, v), as world_rtxdi_surface.hlsli:41-47.
   return true;
 }
@@ -139,20 +168,25 @@ HashGridParameters PtMaterialGrid() {
 }
 HashGridData PtMaterialData() { HashGridData d; d.capacity = g_mat_capacity; d.hashEntriesBuffer = g_pt_material_keys; return d; }
 // The G-buffer material of one pixel (lighting :334, :994-1016; world_rtxdi_reconstruct :155, :166, :177).
-PtMaterial PtGBufferMaterial(uint2 pixel) {
+PtMaterial PtGBufferMaterialFrom(Texture2D<float4> color, Texture2D<uint4> normal, Texture2D<uint4> mrt1,
+                                 Texture2D<uint4> mrt2, StructuredBuffer<GameDeferredParam> deferred,
+                                 uint deferred_count, uint2 pixel) {
   PtMaterial m;
-  m.albedo = saturate(g_pt_color.Load(int3(pixel, 0)).rgb);
-  m.character = (g_pt_normal.Load(int3(pixel, 0)).w & 8u) == 0u;
+  m.albedo = saturate(color.Load(int3(pixel, 0)).rgb);
+  m.character = (normal.Load(int3(pixel, 0)).w & 8u) == 0u;
   m.roughness = g_mat_char_roughness; m.f0 = g_mat_char_f0; m.spec_scale = 1.0;
   if (!m.character) {
-    m.spec_scale = (g_pt_mrt1.Load(int3(pixel, 0)).z & 255u) * (1.0 / 255.0);
-    const uint index = g_pt_mrt2.Load(int3(pixel, 0)).x;
-    if (index < g_mat_deferred_count) {
-      const GameDeferredParam d = g_pt_deferred[index];
+    m.spec_scale = (mrt1.Load(int3(pixel, 0)).z & 255u) * (1.0 / 255.0);
+    const uint index = mrt2.Load(int3(pixel, 0)).x;
+    if (index < deferred_count) {
+      const GameDeferredParam d = deferred[index];
       if (all(isfinite(float4(d.head[1].xyz, d.tail[0].z)))) { m.roughness = saturate(d.tail[0].z); m.f0 = saturate(d.head[1].xyz); }
     }
   }
   return m;
+}
+PtMaterial PtGBufferMaterial(uint2 pixel) {
+  return PtGBufferMaterialFrom(g_pt_color, g_pt_normal, g_pt_mrt1, g_pt_mrt2, g_pt_deferred, g_mat_deferred_count, pixel);
 }
 uint4 PtPackMaterial(PtMaterial m) {
   return uint4(f32tof16(m.albedo.r) | (f32tof16(m.albedo.g) << 16), f32tof16(m.albedo.b) | (f32tof16(m.roughness) << 16),

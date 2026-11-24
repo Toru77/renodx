@@ -1,13 +1,10 @@
+#define RTXDI_RESTIR_PT_INITIAL_SAMPLING
 #define PT_COMMON_PASS 0
 #define SHARC_UPDATE 0
 // This software contains source code provided by NVIDIA Corporation.
 #include "world_pt_common.hlsli"
 #include "world_pt_path_tracer.hlsli"
 #include <Rtxdi/Utils/RandomSamplerPerPassSeeds.hlsli>
-Texture2D<float2> g_pt_dup_map_stub : register(t43);
-Texture2D<float> g_pt_smoothed_dup_stub : register(t44);
-#define RTXDI_PT_DUPLICATION_MAP g_pt_dup_map_stub
-#define RTXDI_PT_SMOOTHED_DUPLICATION_MAP g_pt_smoothed_dup_stub
 #include <Rtxdi/PT/Decorrelation.hlsli>
 #include <Rtxdi/PT/InitialSampling.hlsli>
 

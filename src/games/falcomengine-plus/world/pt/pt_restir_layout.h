@@ -16,8 +16,8 @@ struct PtRestirConstants {
   RTXDI_PTParameters restir;
   uint32_t prev_light_count;
   uint32_t history_valid;
-  uint32_t pad0;
-  uint32_t pad1;
+  uint32_t prev_deferred_count;
+  uint32_t stable_light_remap;
 };
 
 #ifdef __cplusplus

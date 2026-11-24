@@ -387,9 +387,9 @@ struct Rt12DiTransferState {
 };
 
 // Path tracing (world/pt): its own submission slots, list, root signature, PSOs, descriptors and outputs.
-inline constexpr uint32_t kRt12PtDescriptors = 30u;
+inline constexpr uint32_t kRt12PtDescriptors = 45u;
 inline constexpr uint32_t kRt12PtConstants = 52u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
-inline constexpr uint32_t kRt12PtCounters = 28u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
+inline constexpr uint32_t kRt12PtCounters = 30u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
 inline constexpr uint32_t kRt12ReGirDescriptors = 5u;
 inline constexpr uint32_t kRt12ReGirPasses = 3u;
 inline constexpr uint32_t kRt12ReGirConstants = 2u;
@@ -408,13 +408,22 @@ struct Rt12PtState {
   std::unique_ptr<::rtxdi::ReSTIRPTContext> restir;
   uint32_t restir_width = 0u, restir_height = 0u;
   uint64_t cache_epoch = 0u;
+  uint64_t configuration_generation = 0u;
+  uint32_t history_frame = UINT32_MAX, history_width = 0u, history_height = 0u;
+  int32_t history_transfer_slot = -1;
+  uint64_t history_owner_generation = 0u, history_configuration_generation = 0u, history_cache_epoch = 0u;
+  uint32_t history_sparse_levels = 256u;
+  bool history_sparse_reflections_effective = false;
+  bool history_valid = false;
   Rt12Slot slots[kRt12Slots];
   uint32_t next = 0u;
   Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> list;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> initial_pso, final_pso;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> temporal_pso, spatial_pso;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> water_initial_pso, water_final_pso;
   Microsoft::WRL::ComPtr<ID3D12Resource> reservoirs;
+  Microsoft::WRL::ComPtr<ID3D12Resource> neighbors;
   Microsoft::WRL::ComPtr<ID3D12Resource> constants[kRt12Slots];
   uint64_t reservoirs_last_use = 0u;
   Microsoft::WRL::ComPtr<ID3D12Resource> water_reservoirs;

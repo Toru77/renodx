@@ -11,6 +11,8 @@
 #include <Rtxdi/DI/Reservoir.hlsli>
 #include <Rtxdi/Utils/Color.hlsli>
 #include <Rtxdi/Utils/SampledLightData.hlsli>
+#include <Rtxdi/Utils/Checkerboard.hlsli>
+#include <Rtxdi/PT/Reservoir.hlsli>
 
 static const float kMinRoughness = 0.03f;
 #define RAB_DISTANT_LIGHT_DISTANCE 100000.0f
@@ -163,11 +165,13 @@ float PtSurfaceDiffuseProbability(RAB_Surface s) {
 }
 
 RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
-  if (prev || any(pixel >= g_size)) return PtEmptySurface();
+  if (any(pixel >= g_size) || (prev && g_restir.history_valid == 0u)) return PtEmptySurface();
   RtxdiSurfaceResult rs;
-  if (!PtLoadSurface(pixel, rs)) return PtEmptySurface();
+  if (prev ? !PtReconstructSurface(g_pt_prev_depth, g_pt_prev_normal, g_pt_prev_scene, pixel, rs)
+           : !PtLoadSurface(pixel, rs)) return PtEmptySurface();
+  const uint normal_flags = prev ? g_pt_prev_normal.Load(int3(pixel, 0)).w : g_pt_normal.Load(int3(pixel, 0)).w;
 #if defined(PT_WATER_SURFACE)
-  if ((g_pt_normal.Load(int3(pixel, 0)).w & 2u) == 0u) return PtEmptySurface();
+  if ((normal_flags & 2u) == 0u) return PtEmptySurface();
 #endif
   RAB_Surface s = (RAB_Surface)0;
   s.flags = 1u | ((rs.flags & RTXDI_SURFACE_FLAG_CHARACTER) != 0u ? 2u : 0u);
@@ -177,20 +181,36 @@ RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
   s.normal = rs.shading_normal;
   s.geoNormal = rs.shading_normal;
   s.viewDir = rs.view_direction;
-  const PtMaterial m = PtGBufferMaterial(pixel);
+  PtMaterial m;
+  if (prev) {
+    m = PtGBufferMaterialFrom(g_pt_prev_color, g_pt_prev_normal, g_pt_prev_mrt1, g_pt_prev_mrt2,
+                              g_pt_prev_deferred, g_restir.prev_deferred_count, pixel);
+  } else {
+    m = PtGBufferMaterial(pixel);
+  }
   s.material.diffuseAlbedo = m.albedo;
   s.material.specularF0 = m.f0;
 #if defined(PT_WATER_SURFACE)
   s.material.roughness = saturate(g_water_roughness * g_refl_roughness_scale);
 #else
-  const float mrt_scale = (g_pt_mrt1.Load(int3(pixel, 0)).y & 255u) * (1.0 / 255.0);
-  const bool water_rule = (g_refl_flags & 8u) != 0u && (g_pt_normal.Load(int3(pixel, 0)).w & 2u) != 0u;
+  const float mrt_scale = prev ? (g_pt_prev_mrt1.Load(int3(pixel, 0)).y & 255u) * (1.0 / 255.0)
+                               : (g_pt_mrt1.Load(int3(pixel, 0)).y & 255u) * (1.0 / 255.0);
+  const bool water_rule = (g_refl_flags & 8u) != 0u && (normal_flags & 2u) != 0u;
   s.material.roughness = water_rule ? saturate(g_water_roughness * g_refl_roughness_scale)
                                     : saturate(m.roughness * mrt_scale * g_refl_roughness_scale);
 #endif
   s.diffuseProbability = PtSurfaceDiffuseProbability(s);
   return s;
 }
+
+int2 RAB_ClampSamplePositionIntoView(int2 pixel, bool previous) {
+  if (previous && g_restir.history_valid == 0u) return int2(-1, -1);
+  return clamp(pixel, int2(0, 0), int2(g_size) - 1);
+}
+// Duplication map count (RestirPT.md "Duplication-Based History Reduction"); 0 until M4 binds the map.
+uint RAB_GetDuplicationMapCount(int2 pixel) { return 0u; }
+void RAB_LastBounceDenoiserCallback(float3 lightPos, RAB_Surface surface, inout RAB_PathTracerUserData ptud) {}
+void RAB_ReconnectionDenoiserCallback(RTXDI_PTReservoir reservoir, RAB_Surface surface, inout RAB_PathTracerUserData ptud) {}
 
 RAB_Surface PtHitSurface(float3 position, float3 normal, float distance, float3 dir) {
   RAB_Surface s = (RAB_Surface)0;
@@ -302,17 +322,20 @@ RAB_LightInfo RAB_EmptyLightInfo() {
 }
 RAB_LightInfo RAB_LoadLightInfo(uint index, bool prev) {
   RAB_LightInfo info = RAB_EmptyLightInfo();
-  if (index < g_lamp_count) {
-    const uint type = g_pt_light_table[index].type;
+  const uint lamp_count = prev ? g_restir.prev_light_count : g_lamp_count;
+  if (index < lamp_count) {
+    const uint type = prev ? g_pt_prev_light_table[index].type : g_pt_light_table[index].type;
     if (type == LAMP_TYPE_POINT || type == LAMP_TYPE_SPOT) {
-      const LightParam lp = g_pt_lights[index];
+      LightParam lp;
+      if (prev) lp = g_pt_prev_lights[index];
+      else lp = g_pt_lights[index];
       if (all(isfinite(float3(lp.pos.x, lp.pos.y, lp.pos.z))) && all(isfinite(lp.color))
           && lp.radius > 0.0) {
         info.index = index;
         info.type = type;
       }
     }
-  } else if (index == g_lamp_count) {
+  } else if (index == lamp_count) {
     info.index = index;
     info.type = 2u;  // infinite directional light
   }
@@ -375,6 +398,7 @@ float RAB_GetTemporalConservativeVisibility(RAB_Surface surface, float3 light_po
 }
 float3 RAB_GetEnvironmentRadiance(float3 dir) { return PtSky(dir); }
 float RAB_GetMISWeightForNEE(uint lightIndex, RAB_LightSample lightSample, float3 surfacePos, float scatterPdf) { return 1.0; }
+float RAB_GetMISWeightForNEE(uint lightIndex, RAB_LightSample lightSample, float3 lightDirection, float invPartialJacobian, float scatterPdf) { return 1.0; }
 float RAB_GetMISWeightForNEELight(uint lightIndex, RAB_LightSample lightSample, float3 surfacePos, float scatterPdf) { return 1.0; }
 float GetMISWeightForNEELight(uint lightIndex, RAB_LightSample lightSample, float3 surfacePos, float scatterPdf) { return 1.0; }
 float RAB_GetMISWeightForEnvironmentMap(float3 dir, RAB_Surface surface, RTXDI_BrdfRaySample brs) { return 1.0; }
@@ -391,7 +415,46 @@ void RAB_PathTracerUserDataSetPathType(inout RAB_PathTracerUserData data, uint16
 float RAB_EvaluateLocalLightSourcePdf(uint lightIndex) { return 1.0 / float(max(g_lamp_count, 1u)); }
 float RAB_EvaluateEnvironmentMapSamplingPdf(float3 dir) { return 0.0; }
 float2 RAB_GetEnvironmentMapRandXYFromDir(float3 dir) { return float2(0.5, 0.5); }
-int RAB_TranslateLightIndex(uint lightIndex, bool currentToPrevious) { return int(lightIndex); }
+int RAB_TranslateLightIndex(uint lightIndex, bool currentToPrevious) {
+  const bool source_prev = !currentToPrevious;
+  const uint source_count = source_prev ? g_restir.prev_light_count : g_lamp_count;
+  const uint destination_count = source_prev ? g_lamp_count : g_restir.prev_light_count;
+  if (lightIndex == source_count) {
+    const RAB_LightInfo destination = RAB_LoadLightInfo(destination_count, !source_prev);
+    return destination.type == 2u ? int(destination_count) : -1;
+  }
+  if (lightIndex >= source_count) return -1;
+  if (g_restir.stable_light_remap != 0u) {
+    if (g_restir.history_valid == 0u) return -1;
+    const uint mapped = source_prev ? g_pt_previous_to_current[lightIndex] : g_pt_current_to_previous[lightIndex];
+    if (mapped == RTXDI_LIGHT_TABLE_INVALID_INDEX || mapped >= destination_count) return -1;
+    const RAB_LightInfo source_light = RAB_LoadLightInfo(lightIndex, source_prev);
+    const RAB_LightInfo destination_light = RAB_LoadLightInfo(mapped, !source_prev);
+    if (source_light.type == 0u || destination_light.type == 0u || source_light.type != destination_light.type) return -1;
+    return int(mapped);
+  }
+  const RAB_LightInfo source_light = RAB_LoadLightInfo(lightIndex, source_prev);
+  const RAB_LightInfo destination_light = RAB_LoadLightInfo(lightIndex, !source_prev);
+  if (source_light.type == 0u || destination_light.type == 0u || source_light.type != destination_light.type) return -1;
+  LightParam a, b;
+  if (source_prev) {
+    a = g_pt_prev_lights[lightIndex];
+    b = g_pt_lights[lightIndex];
+  } else {
+    a = g_pt_lights[lightIndex];
+    b = g_pt_prev_lights[lightIndex];
+  }
+  if (any(asuint(float4(a.pos, a.radius)) != asuint(float4(b.pos, b.radius)))
+      || any(asuint(float4(a.color, a.radiusInv)) != asuint(float4(b.color, b.radiusInv)))
+      || any(asuint(float4(a.charaColor, a.attenuation)) != asuint(float4(b.charaColor, b.attenuation)))
+      || any(asuint(float4(a.vec, a.spotAngleInv)) != asuint(float4(b.vec, b.spotAngleInv)))
+      || any(asuint(float4(a.attenuationAngle, a.specularIntensity, a.specularGlossiness, a.scatterAnisotropy))
+             != asuint(float4(b.attenuationAngle, b.specularIntensity, b.specularGlossiness, b.scatterAnisotropy)))
+      || any(asuint(float4(a.scatterColor, a.scatterDensity)) != asuint(float4(b.scatterColor, b.scatterDensity)))
+      || asuint(a.translucency) != asuint(b.translucency) || a.shadowmapIndex != b.shadowmapIndex
+      || asuint(a.scatterOffset) != asuint(b.scatterOffset) || asuint(a.userParam) != asuint(b.userParam)) return -1;
+  return int(lightIndex);
+}
 float RAB_GetLightTargetPdfForVolume(float3 pos, RAB_LightSample sample) { return 0.0; }
 
 SplitBrdf EvaluateBrdfPT(RAB_Surface s, float3 n, float3 v, float3 l) {

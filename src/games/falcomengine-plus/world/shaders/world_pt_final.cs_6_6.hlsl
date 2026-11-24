@@ -5,10 +5,6 @@
 #include "world_pt_bridge.hlsli"
 #include <Rtxdi/Utils/RandomSamplerPerPassSeeds.hlsli>
 
-Texture2D<float2> g_pt_dup_map_stub : register(t43);
-Texture2D<float> g_pt_smoothed_dup_stub : register(t44);
-#define RTXDI_PT_DUPLICATION_MAP g_pt_dup_map_stub
-#define RTXDI_PT_SMOOTHED_DUPLICATION_MAP g_pt_smoothed_dup_stub
 #include <Rtxdi/PT/Decorrelation.hlsli>
 
 float3 PtInvalidPixelGuard(float3 value) {

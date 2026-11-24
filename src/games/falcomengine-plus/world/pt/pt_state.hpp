@@ -77,6 +77,13 @@ inline float g_restir_min_connection_footprint = 0.02f, g_restir_min_connection_
 inline float g_restir_min_pdf_roughness = 0.1f, g_restir_min_pdf_roughness_sigma = 0.01f;
 inline float g_restir_roughness_threshold = 0.1f, g_restir_distance_threshold = 0.f;
 inline float g_restir_reconnection_mode = 1.f;
+inline float g_restir_resampling = 3.f;
+inline float g_restir_temporal_depth_threshold = 0.1f, g_restir_temporal_normal_threshold = 0.6f,
+             g_restir_permutation_sampling = 0.f;
+inline float g_restir_spatial_samples = 1.f, g_restir_disocclusion_boost_samples = 8.f, g_restir_spatial_radius = 32.f,
+             g_restir_spatial_depth_threshold = 0.1f, g_restir_spatial_normal_threshold = 0.6f;
+inline float g_restir_boiling_filter = 1.f, g_restir_boiling_filter_strength = 0.2f;
+inline float g_restir_stable_light_remap = 0.f;
 enum class PtReason : uint32_t { Off, DeferredContext, NeedsRtxdi, InputNotReady, DxrOff, NotCreated, NoShaderModel66,
                                  Failed, SceneMissing, Stuck, SubmitFailed, TargetFailed, Tracing, Count };
 inline const char* PtReasonName(PtReason r) {
@@ -130,6 +137,9 @@ struct PtPanel {
   uint32_t regir_invalid_headers = 0u, regir_invalid_slots = 0u, regir_selections = 0u;
   uint32_t gpu_initial_valid = 0u, gpu_path_len2 = 0u, gpu_path_len3plus = 0u, gpu_nee_connected = 0u;
   uint32_t gpu_sharc_terminated = 0u, gpu_sharc_terminal_rc = 0u, gpu_sharc_replay_rejected = 0u;
+  uint32_t temporal_selected = 0u, spatial_selected = 0u;
+  bool history_valid = false;
+  const char* history_reason = "none";
   uint32_t regir_fallback_disabled = 0u, regir_fallback_key = 0u, regir_fallback_miss = 0u;
   uint32_t regir_fallback_header = 0u, regir_fallback_slots = 0u;
   uint32_t regir_water_eligible = 0u, regir_water_lookups = 0u, regir_water_matches = 0u, regir_water_misses = 0u;
@@ -228,6 +238,10 @@ inline void DrawPtPanel() {
     ImGui::Text("PT samples: initial valid %u, path len 2 %u, len 3+ %u, NEE %u, SHARC terminal %u/%u, replay rejected %u",
                 p.gpu_initial_valid, p.gpu_path_len2, p.gpu_path_len3plus, p.gpu_nee_connected, p.gpu_sharc_terminated,
                 p.gpu_sharc_terminal_rc, p.gpu_sharc_replay_rejected);
+    static const char* resampling_names[] = {"none", "temporal", "spatial", "temporal_and_spatial"};
+    ImGui::Text("ReSTIR PT resampling: %s  history %s  temporal %u  spatial %u",
+                resampling_names[(std::clamp)(static_cast<uint32_t>(g_restir_resampling), 0u, 3u)],
+                p.history_valid ? "valid" : p.history_reason, p.temporal_selected, p.spatial_selected);
     ImGui::Text("ReGIR main hits: eligible %u, lookups %u, matches %u, misses %u, invalid header/slots %u/%u, selected %u",
                 p.regir_eligible, p.regir_lookups, p.regir_matches, p.regir_misses, p.regir_invalid_headers,
                 p.regir_invalid_slots, p.regir_selections);
