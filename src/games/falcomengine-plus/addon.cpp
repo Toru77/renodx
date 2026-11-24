@@ -79,6 +79,7 @@ ShaderInjectData shader_injection = {
     .char_shadow_mode = 0.f,
     .pt_direct_bound = 0.f,
     .cs_contact_local_light_clearance = 0.2f,
+    .pt_sun_vis_bound = 0.f,
     .env_sss_enabled = 1.f,
     .env_sss_strength = 1.0f,
     .env_sss_sample_count = 24.f,
@@ -503,6 +504,7 @@ constexpr uint32_t kLightingVbgiRegister = 23u;     // t23 = vbgiTexture
 constexpr uint32_t kLightingPtRegister = 47u;  // t47 = ptGiTexture (world/pt path-traced GI)
 constexpr uint32_t kLightingDepthRegister = 4u;     // t4 = depthTexture (Sora)
 constexpr uint32_t kLightingPtReflectionRegister = 48u;  // t48 = ptReflTexture (lighting and ssr2, world/pt M4)
+constexpr uint32_t kLightingPtSunVisibilityRegister = 42u;  // t42 = PT world-traced sun visibility for game-lit pixels
 static reshade::api::resource_view g_pt_reflection_view = {};
 static uint32_t g_pt_reflection_frame = UINT32_MAX;
 constexpr uint32_t kLightingDepthRegisterKai = 3u;  // t3 = depthTexture (Kai)
@@ -11557,6 +11559,7 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   namespace di = falcom_world::rtxdi;
   shader_injection.pt_gi_bound = 0.f;
   shader_injection.pt_refl_bound = 0.f;
+  shader_injection.pt_sun_vis_bound = 0.f;
   shader_injection.pt_char_toon = pt::g_restir_char_toon > 0.5f ? 1.f : 0.f;
   shader_injection.pt_refl_override = PtReflectionOverride() ? 1.f : 0.f;
   g_pt_reflection_view = {};
@@ -11567,6 +11570,9 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
                                                                    reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, kLightingPtReflectionRegister, 0u, 1u,
+                                                                   reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
+  cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                             reshade::api::descriptor_table_update{{}, kLightingPtSunVisibilityRegister, 0u, 1u,
                                                                    reshade::api::descriptor_type::texture_shader_resource_view, &empty_view});
   if (!pt::PtRequested()) { pt::SetPtReason(pt::PtReason::Off); return; }
   if (rt12::g_rt12 && rt12::g_rt12->stuck) { pt::SetPtReason(pt::PtReason::Stuck); return; }
@@ -11596,16 +11602,24 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
                                             static_cast<float>(RTXDI_SUN_DETAIL_BLOCKER)))
           : RTXDI_SUN_DETAIL_STATUS;
   reshade::api::resource_view reflection_view = {};
+  reshade::api::resource_view sun_visibility_view = {};
   reshade::api::resource_view pt_debug_views[3] = {};
   const reshade::api::resource_view view = rt12::RunPtTrace(cmd_list->get_device(), cmd_list, input.transfer_slot, lamps,
                                                             dd->isfast_noise_srv, pt_debug_view, pt_sun_detail_view,
-                                                            &reflection_view, pt_debug_views,
+                                                            &reflection_view, &sun_visibility_view, pt_debug_views,
                                                             static_cast<uint32_t>(di_snapshot.status));
   if (view.handle == 0u) return;
   cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                              reshade::api::descriptor_table_update{{}, kLightingPtRegister, 0u, 1u,
                                                                    reshade::api::descriptor_type::texture_shader_resource_view, &view});
   shader_injection.pt_gi_bound = 1.f;
+  if (sun_visibility_view.handle != 0u) {
+    cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+                               reshade::api::descriptor_table_update{{}, kLightingPtSunVisibilityRegister, 0u, 1u,
+                                                                     reshade::api::descriptor_type::texture_shader_resource_view,
+                                                                     &sun_visibility_view});
+    shader_injection.pt_sun_vis_bound = 1.f;
+  }
   const bool pt_direct = pt::g_restir_direct > 0.5f;
   shader_injection.pt_direct_bound = pt_direct ? 1.f : 0.f;
   shader_injection.pt_intensity = pt_direct ? 1.f : di::FiniteClamped(pt::g_pt_intensity, 1.f, 0.f, 2.f);

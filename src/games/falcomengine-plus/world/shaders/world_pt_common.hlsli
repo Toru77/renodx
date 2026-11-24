@@ -70,12 +70,14 @@ StructuredBuffer<LightIndexData> g_pt_tiles : register(t57);
 RWTexture2D<float4> g_pt_debug_value : register(u14);
 RWTexture2D<uint> g_pt_debug_status : register(u15);
 RWTexture2D<uint4> g_pt_sun_detail : register(u16);
+RWTexture2D<float4> g_pt_sun_visibility : register(u17);
 #define RTXDI_PT_SAMPLE_ID_TEXTURE g_pt_sample_id
 #define RTXDI_PT_DUPLICATION_MAP g_pt_duplication_map
 #define RTXDI_PT_SMOOTHED_DUPLICATION_MAP g_pt_smoothed_duplication
 #define RTXDI_PT_PREV_SMOOTHED_DUPLICATION_MAP g_pt_prev_smoothed_duplication
 #define RTXDI_SPATIAL_NEIGHBOR_SELECTION_BUFFER g_pt_neighbor_selection
 ConstantBuffer<PtRestirConstants> g_restir : register(b1);
+// g_refl_enabled: 1 while PT reflection is on (formerly the reflection sample count; A14.1).
 cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (48 dwords)
   uint2 g_size; uint g_frame; uint g_samples; uint g_max_bounces; uint g_roulette; uint g_roulette_min_bounce;
   uint g_lamp_count; uint g_sun_casters_only; uint g_dynamic_on; float g_ray_max; float g_env_bias; float g_char_bias;
@@ -85,7 +87,7 @@ cbuffer PtParams : register(b0) {  // order = params[] in pt_rt12.hpp (48 dwords
   float3 g_sharc_camera_prev; uint g_sharc_mode;
   uint g_mat_enabled; uint g_mat_capacity; uint g_mat_rate; float g_mat_cell_scale;
   uint g_mat_deferred_count; float g_mat_char_roughness; float g_mat_char_f0; uint g_mat_mode;
-  float g_sharc_radiance_scale; uint g_refl_samples; float g_refl_intensity; float g_refl_roughness_scale;
+  float g_sharc_radiance_scale; uint g_refl_enabled; float g_refl_intensity; float g_refl_roughness_scale;
   float g_refl_sample_clamp; uint g_refl_flags;  // output clamp (0 = off); flags: 1 = cap to one, 2 = reflection uses SHARC, 4 = SHARC footprint test, 8 = water bed test, 32 = sparse reflections enabled
   float g_water_roughness; float g_gi_clamp;  // base roughness of water reflections; GI luminance clamp (0 = off)
   uint g_sharc_firefly_clamp_enabled; float g_sharc_firefly_clamp;  // SHARC update clamp on (1) / off (0); limit as a multiple of the cell mean (OpenRemix sharcFireflyClamp)

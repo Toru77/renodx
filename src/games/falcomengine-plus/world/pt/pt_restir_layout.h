@@ -51,7 +51,7 @@ struct PtRestirConstants {
 #endif
   float coverage_size;
   uint32_t coverage_valid;
-  uint32_t char_toon, coverage_padding1, coverage_padding2;
+  uint32_t char_toon, game_sun_shadows, coverage_padding2;
 };
 
 #ifdef __cplusplus

@@ -57,6 +57,18 @@ Unified PT A12: water reservoir has one owner (RunPtTrace; the A3 one-array allo
 
 Unified PT A13/A13.1: final shading uses the reservoir's BSDF split (including delta lobes) with a separate direct clamp and cap-to-one so near-mirror direct light is no longer unclamped; characters can use game toon direct light; reconnection visibility uses a tight segment test with optional temporal re-test; SHARC training applies albedo once; AO rays/occlusion are reported in the PT panel and diagnostics. Not validated in game.
 
+Unified PT A14 F1: bounce and primary NEE combine separately finalized local and sun reservoirs into an empty state with the SDK's rule; local candidates stream with the SDK's UV reservoir helper so the source pdf and solid-angle term are correct on bounces (the old packed-uint uv and double-finalize over-weighted lamps and inflated GI/SHARC). Not validated in game.
+
+Unified PT A14 F2: pixels the game shades itself (Direct off or Game-toon characters) get one world-traced sun visibility sample at shading time, carried at t42 to the game's CSM/toon sun and foliage tint; RT Sun Shadows (Game Lighting) is on by default. Not validated in game.
+
+Unified PT A14 F3: Game-toon characters stream local lamp candidates only at the primary vertex and receive the game's character lamp response times the reservoir weight through the character reflection channel, with indirect light only in the diffuse channel. Not validated in game.
+
+Unified PT A14 F4: character roughness ignores Reflection Roughness Scale; the water and reflection-scale rule applies to environment pixels only. Not validated in game.
+
+Unified PT A14 F5: Character Shading defaults to Game toon. Not validated in game.
+
+Unified PT A14.1 notes: Q15 closed: RtxdiLocalShadowDarkening and RtxdiLocalCharacterShadowDarkening were removed in M7 (791fcbbf). Reflection Samples retired (A14.1): PT Samples is the only path budget; g_refl_samples became the g_refl_enabled flag. Not validated in game.
+
 ReGIR M4c introduces default-Off GPU pool construction from primary surfaces and lookup at actual path-traced hit positions, falling back to uniform sampling when the current pool is unavailable or invalid. Its discrete mixture PMF assumes an equiprobable 24-bit input; CPU fixtures and GPU readback cover the shared selector, registration reconstruction/deduplication/overflow, reordered two-light weights/build, zero lights, invalid headers, invalid lights, and over-capacity counts; they do not establish game RNG statistics. Runtime diagnostics asynchronously report registered and valid cells and rejected and overflow positions when a readback completes. The CPU identity mismatch matrix does not exercise the production RunPtTrace/RunPtWaterTrace identity gate or bindings. Independent source review of identity, bindings, fallback, barriers, fence publication, last-use extension, quarantine, and teardown is complete; the three P2 blockers identified by review have been corrected and independently re-checked. Production runtime validation of main/water behavior and stale fallback, fence failure injection, and owner in-game validation remain deferred.
 
 

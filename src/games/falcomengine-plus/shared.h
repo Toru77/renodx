@@ -45,7 +45,7 @@ struct ShaderInjectData {
   float reserved_slot_22;  // RETIRED: no remaining consumer; kept for the layout.
   float reserved_slot_23;  // RETIRED: no remaining consumer; kept for the layout.
   float cs_contact_local_light_clearance;   // [0..1] world units; reuses a retired slot without moving later fields
-  float reserved_slot_24;  // RETIRED: no remaining consumer; kept for the layout.
+  float pt_sun_vis_bound;  // 0/1: t42 holds world-traced sun visibility for game-lit pixels; was reserved_slot_24
   float reserved_slot_25;  // RETIRED: no remaining consumer; kept for the layout.
   float reserved_slot_26;  // RETIRED: no remaining consumer; kept for the layout.
   float reserved_slot_27;  // RETIRED: no remaining consumer; kept for the layout.

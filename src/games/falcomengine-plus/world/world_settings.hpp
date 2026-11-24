@@ -1102,7 +1102,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .key = "RestirPtCharacterShading",
       .binding = &pt::g_restir_char_toon,
       .value_type = SettingValueType::INTEGER,
-      .default_value = 0.f,
+      .default_value = 1.f,
       .label = "Character Shading",
       .section = "Path Tracing Direct",
       .tooltip = "Path traced uses the PT Lambert/GGX BRDF for character direct light; Game toon keeps the game's toon sun and CSM with PT indirect light only.",
@@ -1110,6 +1110,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .min = 0.f,
       .max = 1.f,
       .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RestirPtGameSunShadows",
+      .binding = &pt::g_restir_game_sun_shadows,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "RT Sun Shadows (Game Lighting)",
+      .section = "Path Tracing Direct",
+      .tooltip = "One world-traced sun ray shades the game's own toon and CSM lighting on pixels path tracing does not light directly.",
+      .labels = {"Off", "On"},
       .is_visible = visible,
   });
   settings->push_back(new Setting{
@@ -1573,7 +1584,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 1.f,
       .label = "Samples Per Pixel",
       .section = "Path Tracing",
-      .tooltip = "Path trees per pixel (ReSTIR PT numInitialSamples).",
+      .tooltip = "Path trees per pixel for GI, reflections and direct light (ReSTIR PT numInitialSamples).",
       .min = 1.f,
       .max = 16.f,
       .format = "%d",
@@ -1925,19 +1936,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "Path Tracing",
       .tooltip = "Sora 2nd: environment reflections and water use one traced reflected ray per sample. While on, dynamic cubemaps and game SSR are switched off at runtime (saved settings unchanged); forward glass and other t17 materials keep the game cube.",
       .labels = {"Off", "On"},
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "PtReflectionSamples",
-      .binding = &pt::g_pt_reflection_samples,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 1.f,
-      .label = "Reflection Samples Per Pixel",
-      .section = "Path Tracing",
-      .tooltip = "Raises path trees per pixel to at least this value.",
-      .min = 1.f,
-      .max = 8.f,
-      .format = "%d",
       .is_visible = visible,
   });
   settings->push_back(new Setting{

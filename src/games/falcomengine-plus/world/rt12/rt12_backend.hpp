@@ -295,7 +295,7 @@ inline constexpr Rt12PtRange kRt12PtRanges[] = {
     {0u, 4u, 0u, false},  {14u, 3u, 4u, false}, {29u, 1u, 7u, false},  {30u, 1u, 8u, false},  {31u, 5u, 9u, false},
     {0u, 4u, 14u, true},  {36u, 4u, 18u, false}, {4u, 4u, 22u, true},  {40u, 3u, 26u, false}, {8u, 1u, 29u, true},
     {43u, 13u, 30u, false}, {10u, 2u, 43u, true}, {9u, 1u, 45u, true}, {12u, 2u, 46u, true}, {56u, 1u, 48u, false},
-    {57u, 1u, 49u, false}, {14u, 3u, 50u, true}};
+    {57u, 1u, 49u, false}, {14u, 3u, 50u, true}, {17u, 1u, 53u, true}};
 static_assert([] {
   uint32_t next = 0u;
   for (const Rt12PtRange& range : kRt12PtRanges) {
@@ -378,6 +378,7 @@ struct Rt12PtState {
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;  // shader visible, kRt12Slots * kRt12PtDescriptors
   Rt12Shared output[kRt12Slots];                      // RGBA16F, depth size; the lighting draw reads srv11 at t47
   Rt12Shared reflection[kRt12Slots];                  // RGBA16F, depth size: traced reflection, a = hit distance; t48 in lighting and ssr2
+  Rt12Shared sun_visibility[kRt12Slots];              // RGBA16F, depth size: world-traced sun visibility for game-lit pixels; t42 in lighting
   Rt12Shared debug_value[kRt12Slots];                 // RGBA16F, depth size: debug view value (lighting t44); final shading only
   Rt12Shared debug_status[kRt12Slots];                // R32_UINT, depth size: debug view status word (lighting t45)
   Rt12Shared sun_detail[kRt12Slots];                  // R32G32B32A32_UINT, depth size: sun detail data (lighting t46)
@@ -1068,6 +1069,10 @@ inline void TeardownRt12(const char* why) {
     if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
   }
   for (Rt12Shared& shared : s.path_trace.reflection) {
+    if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
+    if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
+  }
+  for (Rt12Shared& shared : s.path_trace.sun_visibility) {
     if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
     if (shared.uav11.handle != 0u) s.device->destroy_resource_view(shared.uav11);
   }

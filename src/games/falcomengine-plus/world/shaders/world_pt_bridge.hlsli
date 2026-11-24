@@ -214,8 +214,9 @@ RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
   const float mrt_scale = prev ? (g_pt_prev_mrt1.Load(int3(pixel, 0)).y & 255u) * (1.0 / 255.0)
                                : (g_pt_mrt1.Load(int3(pixel, 0)).y & 255u) * (1.0 / 255.0);
   const bool water_rule = (g_refl_flags & 8u) != 0u && (normal_flags & 2u) != 0u;
-  s.material.roughness = water_rule ? saturate(g_water_roughness * g_refl_roughness_scale)
-                                    : saturate(m.roughness * mrt_scale * g_refl_roughness_scale);
+  s.material.roughness = m.character ? saturate(m.roughness)
+      : (water_rule ? saturate(g_water_roughness * g_refl_roughness_scale)
+                    : saturate(m.roughness * mrt_scale * g_refl_roughness_scale));
 #endif
   s.diffuseProbability = PtSurfaceDiffuseProbability(s);
   return s;
@@ -661,6 +662,20 @@ bool PtSharcTerminal(float3 position, float3 nh, float3 dir, float hit_t, float 
 
 #include <Rtxdi/DI/InitialSampling.hlsli>
 
+// RTXDI_SampleLightsForSurface combination (DI/InitialSampling.hlsli:637-660): local and sun reservoirs into an empty state.
+RTXDI_DIReservoir PtCombineLocalAndSun(RTXDI_DIReservoir local, RAB_LightSample local_sample, RTXDI_DIReservoir sun,
+                                       RAB_LightSample sun_sample, inout RTXDI_RandomSamplerState rng,
+                                       out RAB_LightSample selected) {
+  RTXDI_DIReservoir state = RTXDI_EmptyDIReservoir();
+  RTXDI_CombineDIReservoirs(state, local, 0.5, local.targetPdf);
+  const bool select_sun = RTXDI_CombineDIReservoirs(state, sun, RTXDI_GetNextRandom(rng), sun.targetPdf);
+  RTXDI_FinalizeResampling(state, 1.0, 1.0);
+  state.M = 1;
+  selected = local_sample;
+  if (select_sun) selected = sun_sample;
+  return state;
+}
+
 // NEE at a path vertex: the game's ReGIR pool or uniform local lights, plus the sun.
 void PtSampleNee(RAB_Surface surface, inout RTXDI_RandomSamplerState rng, out float3 radiance_from_lights,
                  out RTXDI_SampledLightData sampled_light_data, out float nee_pdf, out float scatter_pdf,
@@ -671,8 +686,9 @@ void PtSampleNee(RAB_Surface surface, inout RTXDI_RandomSamplerState rng, out fl
   scatter_pdf = 0.0;
   light_sample = RAB_EmptyLightSample();
 
-  RTXDI_DIReservoir reservoir = RTXDI_EmptyDIReservoir();
+  RTXDI_DIReservoir local_reservoir = RTXDI_EmptyDIReservoir();
   RAB_LightSample local_sample = RAB_EmptyLightSample();
+  const RTXDI_InitialSamplingMisData mis_data = RTXDI_ComputeInitialSamplingMisData(g_restir.nee);
   const uint count = g_restir.nee.numLocalLightSamples;
   if (g_lamp_count > 0u && count > 0u) {
     const bool regir_eligible = g_regir_enabled != 0u && g_lamp_count <= RTXDI_LIGHT_TABLE_CAPACITY;
@@ -738,28 +754,19 @@ void PtSampleNee(RAB_Surface surface, inout RTXDI_RandomSamplerState rng, out fl
       }
       const float2 uv = float2(RTXDI_GetNextRandom(rng), RTXDI_GetNextRandom(rng));
       const RAB_LightInfo info = RAB_LoadLightInfo(index, false);
-      const RAB_LightSample sample = RAB_SamplePolymorphicLight(info, surface, uv);
-      const float target_pdf = RTXDI_Luminance(RAB_GetReflectedBsdfRadianceForSurface(sample.position, sample.radiance, surface));
-      const float inv_source_pdf = 1.0 / max(source_pdf * count, 1e-8);
-      const uint packed_uv = uint(saturate(uv.x) * 0xffff) | (uint(saturate(uv.y) * 0xffff) << 16);
-      if (RTXDI_StreamSample(reservoir, index, packed_uv, RTXDI_GetNextRandom(rng), target_pdf, inv_source_pdf)) {
-        local_sample = sample;
-      }
+      RTXDI_StreamLocalLightAtUVIntoReservoir(rng, mis_data, surface, g_restir.nee.brdfCutoff, mis_data.localLightMisWeight,
+                                              index, uv, 1.0 / source_pdf, info, local_reservoir, local_sample);
     }
-    RTXDI_FinalizeResampling(reservoir, 1.0, 1.0);
-    reservoir.M = 1.0;
+    RTXDI_FinalizeResampling(local_reservoir, 1.0, mis_data.numMisSamples);
+    local_reservoir.M = 1.0;
   }
 
-  RAB_LightSample infinite_sample = RAB_EmptyLightSample();
-  const RTXDI_DIReservoir infinite = RTXDI_SampleInfiniteLights(rng, surface, g_restir.nee.numInfiniteLightSamples,
-                                                               g_restir.light_buffer.infiniteLightBufferRegion, infinite_sample);
-  if (RTXDI_CombineDIReservoirs(reservoir, infinite, RTXDI_GetNextRandom(rng), infinite.targetPdf)) {
-    light_sample = infinite_sample;
-  } else if (local_sample.solidAnglePdf > 0.0) {
-    light_sample = local_sample;
-  }
-  RTXDI_FinalizeResampling(reservoir, 1.0, 1.0);
-  reservoir.M = 1.0;
+  RAB_LightSample sun_sample = RAB_EmptyLightSample();
+  const RTXDI_DIReservoir sun_reservoir = RTXDI_SampleInfiniteLights(rng, surface, g_restir.nee.numInfiniteLightSamples,
+                                                               g_restir.light_buffer.infiniteLightBufferRegion, sun_sample);
+  light_sample = RAB_EmptyLightSample();
+  const RTXDI_DIReservoir reservoir =
+      PtCombineLocalAndSun(local_reservoir, local_sample, sun_reservoir, sun_sample, rng, light_sample);
   if (reservoir.weightSum <= 0.0 || light_sample.solidAnglePdf <= 0.0) return;
 
   const float3 l = normalize(light_sample.position - surface.worldPos);

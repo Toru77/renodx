@@ -200,6 +200,9 @@ Texture2D<float4> csDepthTex : register(t36);
 Texture2D<float4> csLocalContactTex : register(t40);
 // t47 is the path-traced diffuse GI (rgba16f, depth size; world/pt): rgb irradiance, a = valid. Bound while pt_gi_bound.
 Texture2D<float4> ptGiTexture : register(t47);
+// t42 is the PT world-traced sun visibility for game-lit pixels: rgb = foliage tint, a = RT visibility (negative = unknown).
+// Bound while pt_sun_vis_bound.
+Texture2D<float4> ptSunVisibility_g : register(t42);
 // t48 is the path-traced reflection (rgba16f, depth size; world/pt M4): rgb reflection, a = hit distance (0 = none).
 // Bound while pt_refl_bound.
 Texture2D<float4> ptReflTexture : register(t48);
@@ -478,6 +481,10 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
         r3.z = r3.z * saturate(r5.z);
       }
       if (ptDirectCharacter) r3.z = 0.0f;
+      if (shader_injection_data.pt_sun_vis_bound > 0.5f && !ptDirectCharacter) {
+        const float4 v = ptSunVisibility_g.Load(int3(v0.xy, 0));
+        if (v.a >= 0.0f) r3.z *= v.a;
+      }
       r5.yzw = -r9.xyz * r8.xyz + r0.xyz;
       r9.xyz = r3.zzz * r5.yzw + r10.xyz;
       r3.z = (int)r1.z & 4;
@@ -736,6 +743,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       charColor = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb * ptGiTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb
                 + ptReflTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb;
     }
+    if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid && shader_injection_data.pt_char_toon > 0.5f) {
+      // Game toon: the reservoir's local-lamp response and shadowed game sun are carried by the reflection channel.
+      charColor += ptReflTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb;
+    }
     if (shader_injection_data.char_gtvbao_mode > 0.5f
         && shader_injection_data.gtvbao_dedicated_bound > 0.5f) {
       // GTVBAO on characters — apply bitmask AO to character pixels
@@ -779,6 +790,15 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r3.zw = min(shadowUVClamp_g.xy, v1.xy);
   r3.z = shadowTexture.SampleLevel(samLinear_s, r3.zw, 0).x;
   if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) r3.z = 0.0f;
+  float4 ptSunVisibility = float4(1, 1, 1, -1);
+  if (shader_injection_data.pt_sun_vis_bound > 0.5f) {
+    ptSunVisibility = ptSunVisibility_g.Load(int3(v0.xy, 0));
+  }
+  if (shader_injection_data.pt_sun_vis_bound > 0.5f
+      && !(shader_injection_data.pt_direct_bound > 0.5f && ptGiValid)
+      && ptSunVisibility.a >= 0.0f) {
+    r3.z = ptSunVisibility.a;
+  }
   r3.w = min(r3.z, r0.w);
   r1.xy = (uint2)r1.xy;
   r8.zw = r1.xy * float2(3.05180438e-05,3.05180438e-05) + float2(-1,-1);
@@ -1248,6 +1268,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r0.w = r2.x * r9.x;
   r9.xyz = r15.yzw + -r10.xyz;
   r9.xyz = r0.www * r9.xyz + r10.xyz;
+  if (shader_injection_data.pt_sun_vis_bound > 0.5f
+      && !(shader_injection_data.pt_direct_bound > 0.5f && ptGiValid)
+      && ptSunVisibility.a >= 0.0f) {
+    r9.xyz *= ptSunVisibility.rgb;
+  }
   // Sun contact shadows apply HERE, to the sun diffuse and before r13.xyz (ambient)
   // is added, gated on real sun visibility. See FalcomApplyContactToSun: scaling the
   // final colour darkened interiors, and scaling the sun term alone still darkened

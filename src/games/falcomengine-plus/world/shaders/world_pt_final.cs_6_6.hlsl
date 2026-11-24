@@ -16,12 +16,13 @@ float3 PtInvalidPixelGuard(float3 value) {
 
 // d = 2 NEE samples carry their light data in the INF radiance marker; the reflected direction is resolved from it.
 SplitBrdf PtCalculateDirectLighting(RAB_Surface surface, RTXDI_PTReservoir reservoir, out float3 light_radiance,
-                                    out bool sun_sample, out float3 light_direction) {
+                                    out bool sun_sample, out float3 light_direction, out uint direct_light_index) {
   const float3 n = RAB_GetSurfaceNormal(surface);
   const float3 v = RAB_GetSurfaceViewDir(surface);
   float3 l = normalize(reservoir.translatedWorldPosition - RAB_GetSurfaceWorldPos(surface));
   light_radiance = 0.0;
   sun_sample = false;
+  direct_light_index = g_lamp_count;
   bool is_delta = false;
   if (RTXDI_ConnectsToNeeLight(reservoir) && reservoir.rcVertexLength == 2u) {
     const RTXDI_SampledLightData data = RTXDI_GetSampledLightData(reservoir);
@@ -32,6 +33,7 @@ SplitBrdf PtCalculateDirectLighting(RAB_Surface surface, RTXDI_PTReservoir reser
       l = normalize(sample.position - surface.worldPos);
       light_radiance = sample.radiance;
       sun_sample = sample.sun;
+      direct_light_index = light_index;
     }
   } else if (reservoir.rcVertexLength > 2u) {
     RTXDI_RandomSamplerState replay_rng = RTXDI_GetRngForShading(reservoir);
@@ -52,8 +54,9 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (g_sparse_enabled != 0u && g_sparse_levels < 256u && !PtSparseSelected(id.xy)) {
     g_pt_diffuse[id.xy] = float4(0, 0, 0, 1);
     const bool character = (RAB_GetGBufferSurface(id.xy, false).flags & 2u) != 0u;
-    g_pt_specular[id.xy] = (g_refl_flags & 32u) != 0u && g_refl_samples != 0u && !character
+    g_pt_specular[id.xy] = (g_refl_flags & 32u) != 0u && g_refl_enabled != 0u && !character
         ? float4(0, 0, 0, 1e-3) : float4(0, 0, 0, 0);
+    g_pt_sun_visibility[id.xy] = float4(1.0, 1.0, 1.0, -1.0);  // unknown: keep the game's CSM result
     return;
   }
 #endif
@@ -64,6 +67,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 #else
     g_pt_diffuse[id.xy] = 0;
     g_pt_specular[id.xy] = float4(0, 0, 0, 0);
+    g_pt_sun_visibility[id.xy] = float4(1.0, 1.0, 1.0, -1.0);  // unknown: keep the game's CSM result
 #endif
     return;
   }
@@ -76,7 +80,9 @@ void main(uint3 id : SV_DispatchThreadID) {
   float3 light_radiance = 0.0;
   bool sun_sample = false;
   float3 light_direction = 0.0;
-  const SplitBrdf brdf = PtCalculateDirectLighting(surface, reservoir, light_radiance, sun_sample, light_direction);
+  uint direct_light_index = g_lamp_count;
+  const SplitBrdf brdf =
+      PtCalculateDirectLighting(surface, reservoir, light_radiance, sun_sample, light_direction, direct_light_index);
   const float3 ucw = reservoir.weightSum * reservoir.targetFunction;
   const float3 total = brdf.demodulatedDiffuse * surface.material.diffuseAlbedo + brdf.specular;
   float3 diffuse = brdf.demodulatedDiffuse * ucw / max(total, 1e-8);
@@ -145,8 +151,86 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (character) debug_status_word |= RTXDI_N1_STATUS_CHARACTER_BIT;
   if (direct) debug_status_word |= RTXDI_N1_STATUS_KNOWN_BIT;
 
+#if !defined(PT_WATER_SURFACE)
+  // A14 F2: one sun ray for pixels the game shades itself (Direct off or Game-toon characters). rgb carries the
+  // foliage tint, a carries RT visibility; a < 0 means unknown and keeps the game's CSM result.
+  float4 game_sun_visibility = float4(1.0, 1.0, 1.0, -1.0);
+  const bool game_lit = g_restir.direct_enabled == 0u || (character && g_restir.char_toon != 0u);
+  if (g_restir.game_sun_shadows != 0u && game_lit) {
+    const RAB_LightInfo sun_info = RAB_LoadLightInfo(g_lamp_count, false);
+    if (sun_info.index != RTXDI_LIGHT_TABLE_INVALID_INDEX) {
+      float2 sun_uv;
+      if (g_restir.isfast_light_jitter != 0u) {
+        sun_uv = asfloat(g_pt_noise.Load(int3(id.xy.x % 128u, id.xy.y % 128u + 128u * (g_frame % 32u), 0)).xy);
+      } else {
+        RTXDI_RandomSamplerState sun_rng = RTXDI_InitRandomSampler(id.xy, g_frame, 9u);
+        sun_uv = float2(RTXDI_GetNextRandom(sun_rng), RTXDI_GetNextRandom(sun_rng));
+      }
+      const RAB_LightSample game_sun = RAB_SamplePolymorphicLight(sun_info, surface, sun_uv);
+      const float3 L = normalize(game_sun.position - surface.worldPos);
+      const float3 C = g_pt_sun_dir;
+      const float3 up = abs(C.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+      const float3 T = normalize(cross(up, C));
+      const float3 B = cross(C, T);
+      const float bias = character ? g_restir.sun_char_normal_bias : g_restir.sun_normal_bias;
+      const float bias_sign = dot(surface.normal, L) >= 0.0 ? 1.0 : -1.0;
+      float3 origin = surface.worldPos + surface.normal * (bias * bias_sign);
+      if (character) {
+        origin += Rt12SelfSofteningOffset(surface.normal * bias_sign, L - C * dot(L, C), g_restir.sun_char_self_softening);
+      }
+      float2 wind_u;
+      if (g_restir.isfast_light_jitter != 0u) {
+        wind_u = asfloat(g_pt_noise.Load(int3((id.xy.x + 64u) % 128u, (id.xy.y + 64u) % 128u + 128u * (g_frame % 32u), 0)).xy);
+      } else {
+        RTXDI_RandomSamplerState wind_rng = RTXDI_InitRandomSampler(id.xy, g_frame, 7u);
+        wind_u = float2(RTXDI_GetNextRandom(wind_rng), RTXDI_GetNextRandom(wind_rng));
+      }
+      float coverage_end = 0.0;
+      bool complete_segment = false;
+      float transmittance = 1.0;
+      float3 transmitted_tint = 1.0;
+      bool coverage_ok = true;
+      if (g_restir.coverage_valid != 0u) {
+        coverage_ok = Rt12ShadowCoverageEnd(origin, L, g_restir.sun_max_distance, g_restir.coverage_min,
+                                            g_restir.coverage_size, coverage_end);
+      } else {
+        coverage_end = g_restir.sun_max_distance;
+      }
+      if (coverage_ok) {
+        complete_segment = coverage_end >= g_restir.sun_max_distance;
+        const Rt12ShadowResult shadow = Rt12TraceSunShadow(origin, L, coverage_end, complete_segment, character,
+            g_restir.sun_casters_only != 0u ? INSTANCE_SHADOW_CASTER : 0u, g_restir.sun_max_distance,
+            g_restir.foliage_transmission, g_restir.wind_transmission, g_restir.wind_softening,
+            float3(g_restir.foliage_tint.x, g_restir.foliage_tint.y, g_restir.foliage_tint.z), wind_u, T, B,
+            transmittance, transmitted_tint);
+        if (shadow.status == RTXDI_SUN_STATUS_VISIBLE) {
+          const uint layers = (shadow.flags >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK;
+          const float darkening = character ? g_restir.sun_char_darkening : g_restir.sun_darkening;
+          game_sun_visibility = float4(pow(saturate(float3(g_restir.foliage_tint.x, g_restir.foliage_tint.y,
+                                                           g_restir.foliage_tint.z)), float(layers)),
+                                       lerp(1.0, transmittance, darkening));
+        }
+      }
+    }
+  }
+  g_pt_sun_visibility[id.xy] = game_sun_visibility;
+#endif
+
   const bool is_direct = isinf(reservoir.radiance.x) && reservoir.rcVertexLength == 2u;
   const bool char_direct = g_restir.direct_enabled != 0u && !(character && g_restir.char_toon != 0u);
+  const bool toon_character = character && g_restir.char_toon != 0u;
+  const bool toon_lamp_direct = toon_character && is_direct && !sun_sample && direct_light_index < g_lamp_count;
+  float3 toon_game_lamp = 0.0;
+  if (toon_lamp_direct) {
+    // The game's character lamp response (translucency included), times the reservoir's unnormalized weight (F3).
+    const LightParam lamp = g_pt_lights[direct_light_index];
+    const float3 to_lamp = lamp.pos - surface.worldPos;
+    const float3 l = normalize(to_lamp);
+    const bool spot = g_pt_light_table[direct_light_index].type == LAMP_TYPE_SPOT;
+    toon_game_lamp = max(lamp.charaColor, 0.0) * g_restir.char_lamp_intensity
+        * LampDistanceAttenuation(lamp, to_lamp) * (spot ? LampSpotCone(lamp, l) : 1.0)
+        * max(lamp.translucency, dot(surface.normal, l)) * reservoir.weightSum;
+  }
 
   // Indicator split of the same estimator: intensity scales the indirect part only, and only while direct is on.
   // Direct light is only the d = 2 primary-NEE sample (A10); first-bounce SHARC and sky paths are indirect.
@@ -159,6 +243,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     diffuse = PtClampLuminance(diffuse, g_restir.direct_clamp);
     specular = PtClampLuminance(specular, g_restir.direct_clamp);
   }
+  if (toon_character && is_direct) diffuse = 0.0;  // toon lamp light is written to the character reflection channel
   const float3 raw_specular = PtInvalidPixelGuard(specular);
   diffuse = PtInvalidPixelGuard(diffuse);
   specular = PtInvalidPixelGuard(DemodulateSpecular(surface.material.specularF0, specular));
@@ -178,7 +263,11 @@ void main(uint3 id : SV_DispatchThreadID) {
   g_pt_diffuse[id.xy] = float4(PtInvalidPixelGuard(diffuse * sparse_scale), 1.0);
   if (RTXDI_IsValidPTReservoir(reservoir) && g_sharc_enabled != 0u && reservoir.rcVertexLength == reservoir.pathLength
       && !isinf(reservoir.radiance.x)) PtCount(26u);
-  if (g_refl_samples == 0u) {
+  if (toon_character) {
+    g_pt_specular[id.xy] = toon_lamp_direct
+        ? float4(surface.material.diffuseAlbedo * PtClampLuminance(toon_game_lamp, g_restir.direct_clamp), 1.0)
+        : float4(0, 0, 0, 0);
+  } else if (g_refl_enabled == 0u) {
     g_pt_specular[id.xy] = float4(0, 0, 0, 0);
   } else if (character) {
     // Characters consume total specular radiance directly, without demodulation (A2.4 step 10). Indirect samples use

@@ -19,8 +19,10 @@ namespace falcom_world::rt12 {
 inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, reshade::api::command_list* cmd_list,
                                               int32_t transfer_slot, bool lamps, reshade::api::resource_view isfast_view, uint32_t debug_view, uint32_t sun_detail_view,
                                                reshade::api::resource_view* reflection_view,
+                                               reshade::api::resource_view* sun_visibility_view,
                                                reshade::api::resource_view* debug_views, uint32_t light_table_status) {
   *reflection_view = reshade::api::resource_view{0u};
+  *sun_visibility_view = reshade::api::resource_view{0u};
   debug_views[0] = debug_views[1] = debug_views[2] = reshade::api::resource_view{0u};
   using Microsoft::WRL::ComPtr;
   const auto fallback = [](pt::PtReason reason) { pt::SetPtReason(reason); return reshade::api::resource_view{0u}; };
@@ -581,6 +583,17 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       return fallback(pt::PtReason::TargetFailed);
     }
   }
+  const bool game_sun_shadows = pt::g_restir_game_sun_shadows > 0.5f;
+  Rt12Shared& sun_vis = r.sun_visibility[k];
+  if (game_sun_shadows && (!sun_vis.texture11 || sun_vis.width != w || sun_vis.height != h)) {
+    RetireShared(s, sun_vis, s.last_signal);
+    if (FAILED(CreateRt12Shared(s, device, DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, 1u, true, &sun_vis))) {
+      RetireShared(s, sun_vis, s.last_signal);
+      return fallback(pt::PtReason::TargetFailed);
+    }
+  } else if (!game_sun_shadows && sun_vis.texture11) {
+    RetireShared(s, sun_vis, s.last_signal);
+  }
   const bool debug_on = debug_view != RTXDI_DEBUG_VIEW_OFF;
   Rt12Shared* debug_outputs[] = {&r.debug_value[k], &r.debug_status[k], &r.sun_detail[k]};
   const DXGI_FORMAT debug_formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32B32A32_UINT};
@@ -1029,6 +1042,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
                                             debug_on ? r.debug_status[k].texture12.Get() : nullptr,
                                             debug_on ? r.sun_detail[k].texture12.Get() : nullptr};
   for (uint32_t i = 0u; i < 3u; ++i) set_texture_uav(50u + i, debug_textures[i], debug_formats[i]);
+  set_texture_uav(53u, game_sun_shadows ? sun_vis.texture12.Get() : nullptr, DXGI_FORMAT_R16G16B16A16_FLOAT);
   D3D12_UNORDERED_ACCESS_VIEW_DESC reservoir_uav = {};
   reservoir_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
   reservoir_uav.Buffer.NumElements = r.restir->GetReservoirBufferParameters().reservoirArrayPitch
@@ -1242,7 +1256,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_char_roughness, 0.5f, 0.05f, 1.f)),
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_char_f0, 0.04f, 0.f, 0.2f)),
       0u, sharc_radiance_wanted,
-      refl_on ? std::clamp(static_cast<uint32_t>(pt::g_pt_reflection_samples), 1u, 8u) : 0u,
+      refl_on ? 1u : 0u,  // g_refl_enabled
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_intensity, 1.f, 0.f, 2.f)),
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_roughness_scale, 1.f, 0.f, 2.f)),
       pt::g_pt_reflection_clamp_enabled > 0.5f ? std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_sample_clamp, 16.f, 1.f, 1000.f)) : 0u,
@@ -1260,7 +1274,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   r.restir->SetFrameIndex(frame);
   r.restir->SetResamplingMode(static_cast<::rtxdi::ReSTIRPT_ResamplingMode>(resampling_mode));
   r.restir->SetInitialSamplingParameters({.numInitialSamples = (std::clamp)(
-      static_cast<uint32_t>((std::max)(pt::g_pt_samples, pt::g_pt_reflection_samples)), 1u, 16u),
+      static_cast<uint32_t>(pt::g_pt_samples), 1u, 16u),
       .maxBounceDepth = static_cast<uint32_t>(pt::g_pt_max_bounces) + 1u,
       .maxRcVertexLength = static_cast<uint32_t>(std::clamp(pt::g_restir_max_rc_vertex_length, 2.f, 8.f))});
   RTXDI_PTTemporalResamplingParameters temporal = ::rtxdi::GetDefaultReSTIRPTTemporalResamplingParams(rr);
@@ -1350,6 +1364,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.direct_clamp = pt::g_restir_direct_clamp_enabled > 0.5f
       ? di_clamped(pt::g_restir_direct_clamp, 16.f, 0.5f, 64.f) : 0.f;
   restir_constants.char_toon = pt::g_restir_char_toon > 0.5f ? 1u : 0u;
+  restir_constants.game_sun_shadows = pt::g_restir_game_sun_shadows > 0.5f ? 1u : 0u;
   restir_constants.tile_count = lamps ? input.tile_count : 0u;
   restir_constants.debug_view = debug_view;
   restir_constants.sun_detail_view = sun_detail_view;
@@ -1708,7 +1723,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     r.water_restir->SetFrameIndex(frame);
     r.water_restir->SetResamplingMode(static_cast<::rtxdi::ReSTIRPT_ResamplingMode>(resampling_mode));
     r.water_restir->SetInitialSamplingParameters({.numInitialSamples = (std::clamp)(
-        static_cast<uint32_t>((std::max)(pt::g_pt_samples, pt::g_pt_reflection_samples)), 1u, 16u),
+        static_cast<uint32_t>(pt::g_pt_samples), 1u, 16u),
         .maxBounceDepth = static_cast<uint32_t>(pt::g_pt_max_bounces) + 1u,
         .maxRcVertexLength = static_cast<uint32_t>(std::clamp(pt::g_restir_max_rc_vertex_length, 2.f, 8.f))});
     r.water_restir->SetTemporalResamplingParameters(temporal);
@@ -1786,6 +1801,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     pt::g_pt_panel.regir_last_use_fence = r.regir_last_use[regir_slot];
   }
   *reflection_view = refl_on ? refl.srv11 : reshade::api::resource_view{0u};
+  *sun_visibility_view = game_sun_shadows ? sun_vis.srv11 : reshade::api::resource_view{0u};
   debug_views[0] = debug_on && r.debug_frame[k] == frame ? r.debug_value[k].srv11 : reshade::api::resource_view{0u};
   debug_views[1] = debug_on && r.debug_frame[k] == frame ? r.debug_status[k].srv11 : reshade::api::resource_view{0u};
   debug_views[2] = debug_on && r.debug_frame[k] == frame ? r.sun_detail[k].srv11 : reshade::api::resource_view{0u};
@@ -2090,7 +2106,7 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
       if (i == 45u) resource = r.water_sample_id.Get();
       if (i == 46u) resource = r.water_neighbor_selection_gbuffer.Get();
       if (i == 47u) resource = r.water_neighbor_selection.Get();
-      if (i >= 50u && i <= 52u) resource = nullptr;
+      if (i >= 50u && i <= 53u) resource = nullptr;
       if (view.ViewDimension == D3D12_UAV_DIMENSION_UNKNOWN) {
         FailSession(s, Rt12Reason::CreateFailed, "pt water descriptor", static_cast<HRESULT>(0x80000000u | i));
         return fallback("resources");

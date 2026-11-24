@@ -61,7 +61,7 @@ inline constexpr uint32_t kPtMaterialValueStride = 16u;
 inline float g_pt_samples = 1.f, g_pt_max_bounces = 16.f, g_pt_russian_roulette = 1.f,
              g_pt_roulette_min_bounce = 1.f, g_pt_intensity = 1.f, g_pt_char_intensity = 1.f, g_pt_sky_intensity = 1.f,
              g_pt_ray_max = 500.f, g_pt_env_bias = 0.02f, g_pt_char_bias = 0.02f, g_pt_lamp_clearance = 0.2f, g_pt_sun_casters = 0.f;
-inline float g_pt_reflection_enabled = 0.f, g_pt_reflection_samples = 1.f, g_pt_reflection_intensity = 1.f,
+inline float g_pt_reflection_enabled = 0.f, g_pt_reflection_intensity = 1.f,
              g_pt_reflection_roughness_scale = 1.f;
 inline float g_pt_reflection_sample_clamp = 16.f;
 inline float g_pt_reflection_clamp_enabled = 1.f;
@@ -74,7 +74,8 @@ inline float g_pt_reflection_water_surface = 0.f;
 inline float g_pt_reflection_water_roughness = 0.05f;
 inline float g_restir_direct = 1.f;
 inline float g_restir_direct_clamp_enabled = 1.f, g_restir_direct_clamp = 16.f;
-inline float g_restir_char_toon = 0.f;
+inline float g_restir_char_toon = 1.f;
+inline float g_restir_game_sun_shadows = 1.f;
 inline float g_restir_max_rc_vertex_length = 5.f, g_restir_nee_local_samples = 1.f;
 inline float g_restir_min_connection_footprint = 0.02f, g_restir_min_connection_footprint_sigma = 0.2f;
 inline float g_restir_min_pdf_roughness = 0.1f, g_restir_min_pdf_roughness_sigma = 0.01f;
