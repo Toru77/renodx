@@ -69,6 +69,8 @@ Unified PT A14 F5: Character Shading defaults to Game toon. Not validated in gam
 
 Unified PT A14.1 notes: Q15 closed: RtxdiLocalShadowDarkening and RtxdiLocalCharacterShadowDarkening were removed in M7 (791fcbbf). Reflection Samples retired (A14.1): PT Samples is the only path budget; g_refl_samples became the g_refl_enabled flag. Not validated in game.
 
+Unified PT A15: specular lobe gated by the game's specular scale (mrt1.z) at primary and bounce hits; delta-bounce pdf is the lobe pdf (weight F/(1−p_d)), fixing energy gain with bounce count and mirror floors. Not validated in game.
+
 ReGIR M4c introduces default-Off GPU pool construction from primary surfaces and lookup at actual path-traced hit positions, falling back to uniform sampling when the current pool is unavailable or invalid. Its discrete mixture PMF assumes an equiprobable 24-bit input; CPU fixtures and GPU readback cover the shared selector, registration reconstruction/deduplication/overflow, reordered two-light weights/build, zero lights, invalid headers, invalid lights, and over-capacity counts; they do not establish game RNG statistics. Runtime diagnostics asynchronously report registered and valid cells and rejected and overflow positions when a readback completes. The CPU identity mismatch matrix does not exercise the production RunPtTrace/RunPtWaterTrace identity gate or bindings. Independent source review of identity, bindings, fallback, barriers, fence publication, last-use extension, quarantine, and teardown is complete; the three P2 blockers identified by review have been corrected and independently re-checked. Production runtime validation of main/water behavior and stale fallback, fence failure injection, and owner in-game validation remain deferred.
 
 

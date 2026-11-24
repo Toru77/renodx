@@ -206,7 +206,8 @@ RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
     m = PtGBufferMaterial(pixel);
   }
   s.material.diffuseAlbedo = m.albedo;
-  s.material.specularF0 = m.f0;
+  // Game specular scale (mrt1.z/255) gates the specular lobe, as the game lighting does; spec_scale 0 means no reflection (A15).
+  s.material.specularF0 = m.f0 * m.spec_scale;
   s.material.character = m.character;
 #if defined(PT_WATER_SURFACE)
   s.material.roughness = saturate(g_water_roughness * g_refl_roughness_scale);
@@ -286,7 +287,7 @@ RAB_Surface PtHitSurface(float3 position, float3 normal, float distance, float3 
   s.viewDir = -dir;
   const PtMaterial m = PtHitMaterial(position, s.normal);
   s.material.diffuseAlbedo = m.albedo;
-  s.material.specularF0 = m.f0;
+  s.material.specularF0 = m.f0 * m.spec_scale;
   s.material.roughness = saturate(m.roughness);
   s.material.character = m.character;
   s.diffuseProbability = PtSurfaceDiffuseProbability(s);
@@ -316,6 +317,8 @@ float RAB_SurfaceEvaluateBrdfPdf(RAB_Surface s, float3 dir) {
   return ndl > 0.0 ? lerp(specularPdf, diffusePdf, s.diffuseProbability) : 0.0;
 }
 float RAB_SurfaceEvaluateBsdfPdf(RAB_Surface s, float3 dir, RTXDI_BrdfRaySampleProperties props) {
+  // A15: FullSample's mixture of a delta "pdf" with a continuous pdf over-weights mirrors when p_d is large.
+  if (props.IsDelta()) return saturate(dot(s.normal, dir)) > 0.0 ? 1.0 : 0.0;  // A15: delta weight = F/(1-p_d), the lobe-selection estimator
   const float ndl = saturate(dot(s.normal, dir));
   const float diffusePdf = ndl / 3.14159265;
   float specularPdf = 0.0;
