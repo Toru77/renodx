@@ -707,409 +707,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
 
-  settings->push_back(new Setting{
-      .key = "RtxdiLocalScenePrep",
-      .binding = &rtxdi::g_local_requested,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 0.f,
-      .label = "RTXDI Local Lighting",
-      .section = "RTXDI Local",
-      .tooltip = "Samples the captured local lights and can replace their game lighting terms when a validated RTXDI tuple is bound. Unknown or unavailable tuples keep the game's local-light path.",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return false; },
-  });
-  const auto mark_rtxdi_custom = [](float, float) {
-    if (!rtxdi::g_applying_quality_preset && rtxdi::g_quality_preset != 3.f) {
-      rtxdi::g_quality_preset = 3.f;
-      renodx::utils::settings::UpdateSetting("RtxdiQualityPreset", 3.f);
-    }
-  };
-  settings->push_back(new Setting{
-      .key = "RtxdiQualityPreset",
-      .binding = &rtxdi::g_quality_preset,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 1.f,
-      .label = "Quality preset",
-      .section = "RTXDI Local",
-      .tooltip = "Starting RTXDI sampling and spatial reuse values; these presets are not performance claims.",
-      .labels = {"Performance", "Balanced", "Quality", "Custom"},
-      .min = 0.f,
-      .max = 3.f,
-      .on_change_value = [](float, float current) {
-        if (current == 3.f) return;
-        const uint32_t preset = static_cast<uint32_t>(std::clamp(std::lround(current), 0l, 3l));
-        constexpr uint32_t candidates[] = {16u, 32u, 32u};
-        constexpr uint32_t spatial[] = {1u, 1u, 2u};
-        constexpr uint32_t disocclusion[] = {4u, 8u, 16u};
-        constexpr float radius[] = {16.f, 30.f, 30.f};
-        constexpr float history[] = {20.f, 20.f, 20.f};
-        constexpr float boiling[] = {0.2f, 0.2f, 0.2f};
-        constexpr float permutation[] = {0.f, 1.f, 1.f};
-        constexpr float visibility[] = {0.f, 1.f, 1.f};
-        rtxdi::g_applying_quality_preset = true;
-        rtxdi::g_local_candidates = static_cast<float>(candidates[preset]);
-        rtxdi::g_spatial_samples = static_cast<float>(spatial[preset]);
-        rtxdi::g_spatial_disocclusion = static_cast<float>(disocclusion[preset]);
-        rtxdi::g_spatial_radius = radius[preset];
-        rtxdi::g_history_length = history[preset];
-        rtxdi::g_boiling_filter_strength = boiling[preset];
-        rtxdi::g_permutation_sampling = permutation[preset];
-        rtxdi::g_initial_visibility = visibility[preset];
-        renodx::utils::settings::UpdateSetting("RtxdiLocalCandidates", rtxdi::g_local_candidates);
-        renodx::utils::settings::UpdateSetting("RtxdiSpatialSamples", rtxdi::g_spatial_samples);
-        renodx::utils::settings::UpdateSetting("RtxdiSpatialDisocclusion", rtxdi::g_spatial_disocclusion);
-        renodx::utils::settings::UpdateSetting("RtxdiSpatialRadius", rtxdi::g_spatial_radius);
-        renodx::utils::settings::UpdateSetting("RtxdiHistoryLength", rtxdi::g_history_length);
-        renodx::utils::settings::UpdateSetting("RtxdiBoilingFilterStrength", rtxdi::g_boiling_filter_strength);
-        renodx::utils::settings::UpdateSetting("RtxdiPermutationSampling", rtxdi::g_permutation_sampling);
-        renodx::utils::settings::UpdateSetting("RtxdiInitialVisibility", rtxdi::g_initial_visibility);
-        rtxdi::g_applying_quality_preset = false;
-      },
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiLocalCandidates",
-      .binding = &rtxdi::g_local_candidates,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 32.f,
-      .label = "Local light candidates",
-      .section = "RTXDI Local",
-      .min = 1.f,
-      .max = 32.f,
-      .format = "%d",
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiTemporalReuse",
-      .binding = &rtxdi::g_temporal_reuse,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
-      .label = "Temporal reservoir reuse",
-      .section = "RTXDI Local",
-      .labels = {"Off", "On"},
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiPermutationSampling",
-      .binding = &rtxdi::g_permutation_sampling,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
-      .label = "Permutation sampling",
-      .section = "RTXDI Local",
-      .tooltip = "RTXDI SDK permutation sampling for temporal reuse: history lookups use a permuted pixel instead of random jitter. Needs valid motion vectors. Balanced preset: On.",
-      .labels = {"Off", "On"},
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiInitialVisibility",
-      .binding = &rtxdi::g_initial_visibility,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
-      .label = "Initial visibility",
-      .section = "RTXDI Local",
-      .tooltip = "Shadow-tests each pixel's initial light sample and drops it when blocked, before temporal and spatial reuse. Costs one extra shadow ray per pixel. Final visibility is unchanged. Balanced preset: On.",
-      .labels = {"Off", "On"},
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiStableLightRemap",
-      .binding = &rtxdi::g_local_stable_light_remap,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 0.f,
-      .label = "Stable Light Remap",
-      .section = "RTXDI Local",
-      .tooltip = "Match temporal light samples by quantized light identity when game light indices change. Off preserves exact same-index validation.",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiSpatialReuse",
-      .binding = &rtxdi::g_spatial_reuse,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
-      .label = "Spatial reservoir reuse",
-      .section = "RTXDI Local",
-      .labels = {"Off", "On"},
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiSpatialSamples",
-      .binding = &rtxdi::g_spatial_samples,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 1.f,
-      .label = "Spatial samples",
-      .section = "RTXDI Local",
-      .min = 1.f,
-      .max = 16.f,
-      .format = "%d",
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiSpatialDisocclusion",
-      .binding = &rtxdi::g_spatial_disocclusion,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 8.f,
-      .label = "Spatial disocclusion samples",
-      .section = "RTXDI Local",
-      .tooltip = "Neighbour samples spatial reuse takes for pixels without temporal history (new or disoccluded areas), as in the RTXDI SDK. Needs Temporal reservoir reuse On; no effect when not above Spatial samples.",
-      .min = 1.f,
-      .max = 16.f,
-      .format = "%d",
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiSpatialRadius",
-      .binding = &rtxdi::g_spatial_radius,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 30.f,
-      .label = "Spatial radius (pixels)",
-      .section = "RTXDI Local",
-      .min = 1.f,
-      .max = 32.f,
-      .format = "%.0f",
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiHistoryLength",
-      .binding = &rtxdi::g_history_length,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 20.f,
-      .label = "Reservoir history cap",
-      .section = "RTXDI Local",
-      .tooltip = "Frames of reservoir history a pixel can keep. Higher values keep each lamp sample longer: lamp shadows lag and noise becomes blotchy and slow instead of fading. 20 is the RTXDI SDK default.",
-      .min = 1.f,
-      .max = 32.f,
-      .format = "%d",
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiBoilingFilter",
-      .binding = &rtxdi::g_boiling_filter,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
-      .label = "Boiling Filter (Local)",
-      .section = "RTXDI Local",
-      .tooltip = "Drops a lamp reservoir at the end of temporal reuse when its weight is far above the average of its 8x8 pixel group, so rare bright samples do not spread into blotches. RTXDI SDK default: On.",
-      .labels = {"Off", "On"},
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiBoilingFilterStrength",
-      .binding = &rtxdi::g_boiling_filter_strength,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 0.2f,
-      .label = "Boiling Filter Strength (Local)",
-      .section = "RTXDI Local",
-      .tooltip = "Higher values drop more bright reservoirs: a reservoir is dropped when its weight exceeds (10 / strength - 9) times the group average. 0.2 is the RTXDI SDK default.",
-      .min = 0.01f,
-      .max = 1.f,
-      .format = "%.2f",
-      .is_enabled = [] { return rtxdi::g_boiling_filter > 0.5f; },
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiTemporalDepthThreshold",
-      .binding = &rtxdi::g_temporal_depth_threshold,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 0.1f,
-      .label = "Temporal depth rejection",
-      .section = "RTXDI Local",
-      .min = 0.f,
-      .max = 1.f,
-      .format = "%.3f",
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiTemporalNormalThreshold",
-      .binding = &rtxdi::g_temporal_normal_threshold,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 0.5f,
-      .label = "Temporal normal rejection",
-      .section = "RTXDI Local",
-      .min = -1.f,
-      .max = 1.f,
-      .format = "%.3f",
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiSpatialDepthThreshold",
-      .binding = &rtxdi::g_spatial_depth_threshold,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 0.05f,
-      .label = "Spatial depth rejection",
-      .section = "RTXDI Local",
-      .min = 0.f,
-      .max = 1.f,
-      .format = "%.3f",
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiSpatialNormalThreshold",
-      .binding = &rtxdi::g_spatial_normal_threshold,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 0.9f,
-      .label = "Spatial normal rejection",
-      .section = "RTXDI Local",
-      .min = -1.f,
-      .max = 1.f,
-      .format = "%.3f",
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiDiffuseDenoiser",
-      .binding = &rtxdi::g_diffuse_denoiser,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 1.f,
-      .label = "Diffuse denoiser",
-      .section = "RTXDI Local",
-      .tooltip = "RELAX is used when the NRD SDK is available and Ray Reconstruction does not own denoising; otherwise raw lighting stays active.",
-      .labels = {"Raw", "RELAX"},
-      .min = 0.f,
-      .max = 1.f,
-      .is_enabled = [] {
 #if defined(FALCOM_NRD_ENABLED)
-        return true;
-#else
-        return false;
 #endif
-      },
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiRelaxControlsStatus",
-      .value_type = SettingValueType::CUSTOM,
-      .can_reset = false,
-      .label = "Denoiser status",
-      .section = "RTXDI Local",
-      .on_draw = []() {
-        rt12::Rt12Panel nrd_panel;
-        {
-          std::lock_guard lock(rt12::g_rt12_panel_mutex);
-          nrd_panel = rt12::g_rt12_panel;
-        }
-        const bool rr_suppressed = rr::RrRequested() || rr::RrOwnsDenoise();
-        const bool relax_requested = rtxdi::g_diffuse_denoiser > 0.5f;
-#if defined(FALCOM_NRD_ENABLED)
-        const char* backend = nrd_panel.nrd_backend_state == 2u   ? "ready"
-                              : nrd_panel.nrd_backend_state == 3u ? "initialization failed"
-                                                                  : "not initialized";
-        const char* policy = !relax_requested ? "Raw selected"
-                             : rr_suppressed  ? "Raw (RELAX suppressed by Ray Reconstruction; local/sun remain)"
-                                              : (nrd_panel.nrd_backend_state == 2u ? "RELAX selected" : "Raw (NRD backend unavailable)");
-        ImGui::Text("NRD SDK: compiled | backend: %s%s", backend,
-                    nrd_panel.nrd_failure_stage == 1u   ? " (SDK/instance)"
-                    : nrd_panel.nrd_failure_stage == 2u ? " (D3D12 backend)"
-                                                        : "");
-        ImGui::Text("RTXDI diffuse policy: %s", policy);
-        rtxdi::DiSnapshot di;
-        {
-          std::shared_lock lock(rtxdi::g_di.mutex);
-          di = rtxdi::g_di.snapshot;
-        }
-        ImGui::Text("Private NRD diffuse output staged: %s (frame %u)", di.nrd_diffuse_staged ? "yes" : "no",
-                    di.nrd_diffuse_frame);
-        const uint32_t gate_blocked = rtxdi::NrdGateFirstNotPass(di.nrd_gate);
-        const bool gate_failed = gate_blocked < rtxdi::kNrdGateLinkCount && di.nrd_gate.status[gate_blocked] == rtxdi::kNrdGateFail;
-        ImGui::Text("RELAX gate: %s",
-                    gate_blocked == rtxdi::kNrdGateLinkCount ? "none"
-                    : gate_failed                            ? rtxdi::NrdGateLinkName(gate_blocked)
-                                                             : "not_evaluated");
-#else
-        ImGui::Text("NRD SDK: not compiled");
-        ImGui::Text("RTXDI diffuse policy: %s", !relax_requested ? "Raw selected"
-                                                                : rr_suppressed ? "Raw (RELAX suppressed by Ray Reconstruction; local/sun remain)"
-                                                                                : "Raw (NRD SDK unavailable)");
-        ImGui::Text("Private NRD diffuse output staged: unavailable");
-#endif
-        return false;
-      },
-      .is_visible = []() { return false; },
-  });
-#if defined(FALCOM_NRD_ENABLED)
-  settings->push_back(new Setting{
-      .key = "RtxdiRelaxDiffuseHistory",
-      .binding = &rtxdi::g_relax_diffuse_history,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 30.f,
-      .label = "RELAX diffuse history",
-      .section = "RTXDI Local",
-      .min = 1.f,
-      .max = 128.f,
-      .format = "%d",
-      .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiRelaxFastHistory",
-      .binding = &rtxdi::g_relax_fast_history,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 6.f,
-      .label = "RELAX fast history",
-      .section = "RTXDI Local",
-      .min = 1.f,
-      .max = 32.f,
-      .format = "%d",
-      .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiRelaxPrepassRadius",
-      .binding = &rtxdi::g_relax_prepass_radius,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 30.f,
-      .label = "RELAX prepass radius",
-      .section = "RTXDI Local",
-      .min = 0.f,
-      .max = 64.f,
-      .format = "%d",
-      .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiRelaxAtrousIterations",
-      .binding = &rtxdi::g_relax_atrous_iterations,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 5.f,
-      .label = "RELAX a-trous iterations",
-      .section = "RTXDI Local",
-      .min = 2.f,
-      .max = 8.f,
-      .format = "%d",
-      .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
-      .on_change_value = mark_rtxdi_custom,
-      .is_visible = []() { return false; },
-  });
-#endif
-  settings->push_back(new Setting{
-      .key = "DxrSunScenePrep",
-      .binding = &rtxdi::g_sun_requested,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 0.f,
-      .label = "RTXDI Sun Shadows",
-      .section = "RTXDI Sun",
-      .tooltip = "Traces one directional DXR sun visibility query per valid surface. Unknown results keep the CSM fallback. Ray length: Max Ray Distance (Sun).",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return false; },
-  });
   settings->push_back(new Setting{
       .key = "",
       .binding = &rtxdi::g_debug_view,
@@ -1214,21 +813,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                       di.stable_light_remap ? "On" : "Off");
           ImGui::Text("Light identity: collisions=unavailable duplicates=unavailable invalid=unavailable incompatible=unavailable");
         }
-        rtxdi::SunSnapshot sun;
-        {
-          std::shared_lock lock(rtxdi::g_sun.mutex);
-          sun = rtxdi::g_sun.snapshot;
-        }
-        ImGui::Text("Sun visibility: %s | frame %u | owner %llu | config %llu (DI %llu) | scene %d | transfer %d | %ux%u | t42 bound %s | lighting draw seen %s | accumulate %s (history %s) | B %llu | C %llu | error 0x%08x",
-                    rtxdi::SunStatusName(sun.status), sun.frame,
-                    static_cast<unsigned long long>(sun.owner_generation),
-                    static_cast<unsigned long long>(sun.configuration_generation),
-                    static_cast<unsigned long long>(sun.di_configuration_generation), sun.scene_slot, sun.transfer_slot,
-                    sun.width, sun.height,
-                    sun.output_bound ? "yes" : "no", sun.lighting_draw_seen ? "yes" : "no",
-                    sun.accumulated ? "yes" : "no", sun.accumulation_history ? "yes" : "no",
-                    static_cast<unsigned long long>(sun.fence_b), static_cast<unsigned long long>(sun.fence_c),
-                    static_cast<unsigned int>(sun.error));
         ImGui::Text("IS-FAST noise copies: %llu (sun uses it only when IS-FAST is On and Light Size > 0; 0 = SDK random sequence)",
                     static_cast<unsigned long long>(rt12_panel.noise_copies));
         const auto isfast_state = [&rt12_panel](float light_size, float isfast) -> const char* {
@@ -1308,11 +892,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           std::shared_lock lock(rtxdi::g_di.mutex);
           di = rtxdi::g_di.snapshot;
         }
-        rtxdi::SunSnapshot sun;
-        {
-          std::shared_lock lock(rtxdi::g_sun.mutex);
-          sun = rtxdi::g_sun.snapshot;
-        }
         rtxdi::DebugSnapshot debug;
         {
           std::shared_lock lock(rtxdi::g_debug.mutex);
@@ -1341,22 +920,18 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                   ? summary.frame - input.ready_frame
                                   : UINT64_MAX;
           summary.di_age = di.frame != UINT32_MAX && di.frame <= summary.frame ? summary.frame - di.frame : UINT64_MAX;
-          summary.sun_age = sun.frame != UINT32_MAX && sun.frame <= summary.frame
-                                ? summary.frame - sun.frame
-                                : UINT64_MAX;
           summary.scene_fence = scene.prepared_fence;
           summary.input_fence_b = input.fence;
           summary.consumer_fence_c = di.output_fence_c;
           summary.attempts = scene.attempts;
           summary.submissions = scene.submissions;
           summary.skips = scene.skips;
+          summary.bindings = static_cast<uint64_t>(di.output_bound);
+          summary.matching_draw_callbacks = static_cast<uint64_t>(di.lighting_draw_seen);
           summary.current_status_reports_failure = scene.status == rtxdi::SceneStatus::Failed
                                                            || input.status == rtxdi::InputStatus::SubmitFailed
                                                        ? 1u
                                                        : 0u;
-          summary.bindings = static_cast<uint64_t>(di.output_bound) + static_cast<uint64_t>(sun.output_bound);
-          summary.matching_draw_callbacks = static_cast<uint64_t>(di.lighting_draw_seen)
-                                            + static_cast<uint64_t>(sun.lighting_draw_seen);
           summary.width = input.width;
           summary.height = input.height;
           summary.scene_slot = scene.prepared_slot >= 0 ? static_cast<uint32_t>(scene.prepared_slot) : UINT32_MAX;
@@ -1365,7 +940,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           summary.input_status = static_cast<uint32_t>(input.status);
           summary.input_stage = static_cast<uint32_t>(input.stage);
           summary.di_status = static_cast<uint32_t>(di.status);
-          summary.sun_status = static_cast<uint32_t>(sun.status);
           summary.debug_observed_requested_view = debug.requested_view;
           summary.debug_observed_effective_view = debug.effective_view;
           summary.debug_source_ready = debug.source_ready ? 1u : 0u;
@@ -1446,8 +1020,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
 #endif
           summary.denoiser_reason = summary.nrd_policy;
           summary.runtime_gates = (falcom_world::g_state.supported ? 1u : 0u)
-                                  | (rtxdi::g_local_requested > 0.5f ? 2u : 0u)
-                                  | (rtxdi::g_sun_requested > 0.5f ? 4u : 0u);
+                                  | (rtxdi::g_local_requested > 0.5f ? 2u : 0u);
           summary.available_mask = rtxdi::DiagnosticStatesAvailable | rtxdi::DiagnosticSettingsAvailable
                                    | rtxdi::DiagnosticRrStateAvailable | rtxdi::DiagnosticNrdStatusAvailable;
           if (summary.frame != UINT32_MAX) summary.available_mask |= rtxdi::DiagnosticFrameAvailable;
@@ -1616,19 +1189,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
-      .key = "RtxdiSunTraceResolution",
-      .binding = &rtxdi::g_sun_trace_resolution,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 0.f,
-      .label = "Trace Resolution (Sun)",
-      .section = "RTXDI Sun",
-      .tooltip = "Traces sun shadows at half resolution and fills the rest from neighbours, with a full-resolution trace at edges. Cheaper; softer details can be lost.",
-      .labels = {"Full", "Half"},
-      .min = 0.f,
-      .max = 1.f,
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
       .key = "RtxdiSunLightSize",
       .binding = &rtxdi::g_sun_light_size,
       .value_type = SettingValueType::FLOAT,
@@ -1651,48 +1211,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .tooltip = "Uses the blue-noise IS-FAST texture for the sun disk jitter when the IS-FAST texture is loaded (IS-FAST master On); otherwise the SDK random sequence is used. Only has an effect when Light Size > 0.",
       .labels = {"Off", "On"},
       .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiSunAccumulation",
-      .binding = &rtxdi::g_sun_accumulation,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
-      .label = "Temporal Accumulation (Sun)",
-      .section = "RTXDI Sun",
-      .tooltip = "Averages the sun shadow over recent frames, reprojected with motion vectors, so soft edges from Light Size (Sun) are less noisy. Only has an effect when Light Size > 0; at 0 the sun shadow is unchanged. Off while Diffuse denoiser is Raw or Ray Reconstruction is active.",
-      .labels = {"Off", "On"},
-      .is_enabled = [] { return rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiSunAccumulationFrames",
-      .binding = &rtxdi::g_sun_accumulation_frames,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 8.f,
-      .label = "Accumulation Frames (Sun)",
-      .section = "RTXDI Sun",
-      .tooltip = "How many frames the sun shadow average spans. Higher is smoother; moving shadows lag more.",
-      .min = 2.f,
-      .max = 32.f,
-      .format = "%d",
-      .is_enabled = [] { return rtxdi::g_sun_accumulation > 0.5f && rtxdi::g_diffuse_denoiser > 0.5f && !rr::RrRequested() && !rr::RrOwnsDenoise(); },
-      .is_visible = []() { return false; },
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiSunAccumulationStatus",
-      .value_type = SettingValueType::CUSTOM,
-      .can_reset = false,
-      .label = "Sun accumulation status",
-      .section = "RTXDI Sun",
-      .on_draw = []() {
-        if (rr::RrRequested() || rr::RrOwnsDenoise()) {
-          ImGui::TextDisabled("Sun accumulation off: Ray Reconstruction denoises.");
-        } else if (rtxdi::g_diffuse_denoiser <= 0.5f) {
-          ImGui::TextDisabled("Sun accumulation off: Diffuse denoiser is Raw.");
-        }
-        return false;
-      },
-      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtxdiSunCharacterSelfSoftening",
@@ -1849,32 +1367,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_logarithmic = true,
   });
   settings->push_back(new Setting{
-      .key = "RtxdiLocalShadowDarkening",
-      .binding = &rtxdi::g_local_shadow_darkening,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 1.f,
-      .label = "Shadow Darkening (Local)",
-      .section = "Path Tracing Direct",
-      .tooltip = "Currently has no effect: lamp samples have no partial-shadow term.",
-      .min = 0.f,
-      .max = 1.f,
-      .format = "%.2f",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiLocalCharacterShadowDarkening",
-      .binding = &rtxdi::g_local_character_shadow_darkening,
-      .value_type = SettingValueType::FLOAT,
-      .default_value = 1.f,
-      .label = "Character Shadow Darkening (Local)",
-      .section = "Path Tracing Direct",
-      .tooltip = "Currently has no effect: lamp samples have no partial-shadow term.",
-      .min = 0.f,
-      .max = 1.f,
-      .format = "%.2f",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
       .key = "RtxdiLocalCharacterIntensity",
       .binding = &rtxdi::g_local_character_intensity,
       .value_type = SettingValueType::FLOAT,
@@ -1886,17 +1378,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .max = 2.f,
       .format = "%.2f",
       .is_visible = visible,
-  });
-  settings->push_back(new Setting{
-      .key = "RtxdiLocalCharacterFallback",
-      .binding = &rtxdi::g_local_character_fallback,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = 1.f,
-      .label = "Character Lamp Fallback",
-      .section = "RTXDI Local",
-      .tooltip = "Pixels whose RTXDI result is unknown or invalid get the game's unshadowed lamp light. Off = they get none.",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "PtEnabled",

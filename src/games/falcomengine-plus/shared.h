@@ -38,17 +38,17 @@ struct ShaderInjectData {
   // read on `char_shadow_mode >= 0.5f` and not on `== 1`. That engine code is
   // still in the Sora and Kai character/SSAO shaders.
   float char_shadow_mode;
-  float rtxdi_local_bound;                  // 0/1: Sora 2nd t41 holds a matching staged local-DI tuple this lighting draw
-  float rtxdi_sun_bound;                    // 0/1: Sora 2nd t42 holds matching RTXDI sun visibility for this draw
-  float rtxdi_sun_darkening;                // RTXDI Sun Shadow Darkening [0..1]
+  float reserved_slot_19;  // RETIRED: no remaining consumer; kept for the layout.
+  float reserved_slot_20;  // RETIRED: no remaining consumer; kept for the layout.
+  float reserved_slot_21;  // RETIRED: no remaining consumer; kept for the layout.
   float pt_direct_bound;                    // 0/1: t47/t48 carry unified PT direct light this draw; was reserved_slot_01
-  float rtxdi_sun_character_darkening;      // RTXDI Sun Character Shadow Darkening [0..1]
-  float rtxdi_local_darkening;              // RTXDI Local Shadow Darkening [0..1] (reuses retired offset 76)
+  float reserved_slot_22;  // RETIRED: no remaining consumer; kept for the layout.
+  float reserved_slot_23;  // RETIRED: no remaining consumer; kept for the layout.
   float cs_contact_local_light_clearance;   // [0..1] world units; reuses a retired slot without moving later fields
-  float rtxdi_local_character_darkening;    // RTXDI Local Character Shadow Darkening [0..1] (reuses retired offset 84)
-  float rtxdi_local_character_keep;         // RTXDI blocked-lamp light kept on characters [0..1] (reuses retired offset 88)
-  float rtxdi_local_character_intensity;   // RTXDI character lamp light scale [0..2] (reuses retired offset 92)
-  float rtxdi_local_character_fallback;    // 0/1: unresolved RTXDI pixels get unshadowed character lamp light (reuses retired offset 96)
+  float reserved_slot_24;  // RETIRED: no remaining consumer; kept for the layout.
+  float reserved_slot_25;  // RETIRED: no remaining consumer; kept for the layout.
+  float reserved_slot_26;  // RETIRED: no remaining consumer; kept for the layout.
+  float reserved_slot_27;  // RETIRED: no remaining consumer; kept for the layout.
   float pt_gi_bound;  // 0/1: Sora 2nd t47 holds this frame's path-traced diffuse GI (world/pt); reuses retired rtxdi_sun_character_csm_gate
 
   // Environment "Sun SSS" ray-march. RETIRED across the whole mod; unread.
@@ -132,10 +132,10 @@ struct ShaderInjectData {
   float vbgi_multibounce_bounce_fraction; // RETIRED: no setting drives it (was SSGIMultiBounceBounceFraction), kept for the layout
   float vbgi_multibounce_saturation;// RETIRED: no setting drives it (was SSGIMultiBounceSaturation), kept for the layout
   float vbgi_multibounce_max_clamp; // RETIRED: no setting drives it (was SSGIMultiBounceMaxClamp), kept for the layout
-  float rtxdi_sun_foliage_tint_r;   // RTXDI Sun Foliage Tint R [0..1] (reuses retired vbgi_adaptive_r)
-  float rtxdi_sun_foliage_tint_g;   // RTXDI Sun Foliage Tint G [0..1] (reuses retired vbgi_adaptive_g)
-  float rtxdi_sun_foliage_tint_b;   // RTXDI Sun Foliage Tint B [0..1] (reuses retired vbgi_adaptive_b)
-  float rtxdi_sun_foliage_transmission; // RTXDI Sun Foliage Transmission [0..1] (reuses retired vbgi_adaptive_mode)
+  float reserved_slot_28;  // RETIRED: no remaining consumer; kept for the layout.
+  float reserved_slot_29;  // RETIRED: no remaining consumer; kept for the layout.
+  float reserved_slot_30;  // RETIRED: no remaining consumer; kept for the layout.
+  float reserved_slot_31;  // RETIRED: no remaining consumer; kept for the layout.
   float vbgi_adaptive_luma_strength;  // RETIRED: no setting drives it, kept for the layout
   float rtxdi_sun_wind_transmission;  // RETIRED: no longer read (the sun trace reads g_sun_wind_transmission), kept for the layout
   float vbgi_max_clamp;             // RETIRED: no UI, neutral default, read only by legacy VBGI blocks (was SSGIMaxClamp), kept for the layout
@@ -721,7 +721,7 @@ struct ShaderInjectData {
   float char_cam_debug;
   float reserved_slot_18;  // reserved: unused slot kept so later packoffsets do not move
   // Appended runtime gate; preserves all existing injection offsets.
-  float rtxdi_diffuse_bound;         // 0/1: Sora 2nd t43 holds a matching staged RELAX diffuse publication this draw
+  float reserved_slot_32;  // RETIRED: no remaining consumer; kept for the layout.
   float rtxdi_debug_view;            // session-only selector; does not affect RTXDI production or history
   float rtxdi_debug_bound;           // 0/1: t44/t45 hold matching N1 raw/status debug sources this draw
   float rtxdi_debug_distance_bound;  // 0/1: t44 is the matching optional N3b distance carrier

@@ -26,6 +26,9 @@
 #include <Rtxdi/RtxdiParameters.h>
 #include <Rtxdi/RtxdiUtils.h>
 
+// Standalone test executable: provides the addon NAME symbol that the shared headers expect.
+extern "C" __declspec(dllexport) const char* const NAME = "falcom-rtxdi-contract";
+
 namespace {
 using SurfaceSceneRows = std::array<std::array<uint32_t, 4>, RTXDI_SURFACE_SCENE_ROW_COUNT>;
 
@@ -880,15 +883,9 @@ int main() {
   using falcom_world::AlphaUvRangeStatus;
   using falcom_world::rtxdi::CanReuseScene;
   using falcom_world::rtxdi::IsDuplicate;
-  using falcom_world::rtxdi::MatchesStagedSunIdentity;
-  using falcom_world::rtxdi::MatchesStagedSunSlotIdentity;
   using falcom_world::rtxdi::SceneReuseInputs;
   using falcom_world::rtxdi::SceneSnapshot;
-  using falcom_world::rtxdi::SunAttemptAction;
-  using falcom_world::rtxdi::SunSnapshot;
-  using falcom_world::rtxdi::SunStatus;
   using falcom_world::rtxdi::SunVisibilityStatus;
-  using falcom_world::rtxdi::TransitionSunAttempt;
   uint32_t alpha_uv_base = 0xA5A5A5A5u;
   const auto validate_alpha_uv = falcom_world::ValidateAlphaUvRange;
   if (falcom_world::ValidAlphaAtlasLayout(falcom_world::kAlphaSliceWords, falcom_world::kAlphaSliceWords,
@@ -979,65 +976,6 @@ int main() {
   falcom_world::rtxdi::RefreshOffState(&failed, 4u);
   if (failed.status != falcom_world::rtxdi::SceneStatus::Off || failed.request_mask != 0u
       || !IsDuplicate(failed, 4u, 3u) || failed.attempts != 1u || failed.skips != 1u) return EXIT_FAILURE;
-  SunSnapshot sun_staged = {.status = SunStatus::Staged,
-                            .frame = 4u,
-                            .width = 1280u,
-                            .height = 720u,
-                            .owner_generation = 3u,
-                            .configuration_generation = 7u,
-                            .fence_b = 9u,
-                            .scene_slot = 1,
-                            .transfer_slot = 2};
-  if (!MatchesStagedSunIdentity(sun_staged, 4u, 3u, 7u, 0u)
-      || MatchesStagedSunIdentity(sun_staged, 5u, 3u, 7u, 0u)
-      || MatchesStagedSunIdentity(sun_staged, 4u, 4u, 7u, 0u)
-      || MatchesStagedSunIdentity(sun_staged, 4u, 3u, 8u, 0u)
-      || MatchesStagedSunIdentity(sun_staged, 4u, 3u, 7u, 1u)) return EXIT_FAILURE;
-  if (!MatchesStagedSunSlotIdentity(sun_staged, 4u, 3u, 7u, 0u, 7u)
-      || MatchesStagedSunSlotIdentity(sun_staged, 4u, 3u, 8u, 0u, 7u)
-      || MatchesStagedSunSlotIdentity(sun_staged, 4u, 3u, 7u, 1u, 7u)
-      || MatchesStagedSunSlotIdentity(sun_staged, 4u, 3u, 7u, 0u, 8u)) return EXIT_FAILURE;
-  std::printf("PASS sun consumer identity rejects transfer config, DI config, and slot config mismatches\n");
-  TransitionSunAttempt(&sun_staged, 4u, SunAttemptAction::PreserveDuplicate);
-  if (sun_staged.status != SunStatus::Staged || sun_staged.frame != 4u || sun_staged.fence_b != 9u
-      || sun_staged.transfer_slot != 2) return EXIT_FAILURE;
-  TransitionSunAttempt(&sun_staged, 5u, SunAttemptAction::Invalidate);
-  if (sun_staged.status != SunStatus::WaitingInput || sun_staged.frame != 5u || sun_staged.fence_b != 0u
-      || sun_staged.transfer_slot != -1) return EXIT_FAILURE;
-  sun_staged = {.status = SunStatus::Staged, .frame = 4u, .owner_generation = 3u, .configuration_generation = 7u, .fence_b = 9u, .transfer_slot = 2};
-  TransitionSunAttempt(&sun_staged, 4u, SunAttemptAction::Invalidate);
-  if (sun_staged.status != SunStatus::WaitingInput || sun_staged.fence_b != 0u) return EXIT_FAILURE;
-  sun_staged = {.status = SunStatus::Staged, .frame = 4u, .owner_generation = 3u, .configuration_generation = 7u, .fence_b = 9u, .transfer_slot = 2};
-  TransitionSunAttempt(&sun_staged, 4u, SunAttemptAction::Off);
-  TransitionSunAttempt(&sun_staged, 4u, SunAttemptAction::PreserveDuplicate);
-  if (sun_staged.status != SunStatus::Off || sun_staged.frame != 4u || sun_staged.fence_b != 0u
-      || sun_staged.transfer_slot != -1) return EXIT_FAILURE;
-  sun_staged = {.status = SunStatus::Staged, .frame = 4u, .owner_generation = 3u, .configuration_generation = 7u, .fence_b = 9u, .transfer_slot = 2};
-  TransitionSunAttempt(&sun_staged, 4u, SunAttemptAction::Invalidate);
-  if (sun_staged.status == SunStatus::Staged || sun_staged.fence_b != 0u) return EXIT_FAILURE;
-  const float saved_sun_accumulation = falcom_world::rtxdi::g_sun_accumulation;
-  const float saved_sun_light_size = falcom_world::rtxdi::g_sun_light_size;
-  falcom_world::rtxdi::g_sun_accumulation = 1.f;
-  falcom_world::rtxdi::g_sun_light_size = 0.f;
-  const bool accumulation_at_zero_size = falcom_world::rtxdi::SunAccumulationRequested();
-  falcom_world::rtxdi::g_sun_light_size = 1.f;
-  const bool accumulation_at_size_one = falcom_world::rtxdi::SunAccumulationRequested();
-  falcom_world::rtxdi::g_sun_light_size = std::numeric_limits<float>::quiet_NaN();
-  const bool accumulation_at_nan_size = falcom_world::rtxdi::SunAccumulationRequested();
-  falcom_world::rtxdi::g_sun_accumulation = 0.f;
-  falcom_world::rtxdi::g_sun_light_size = 1.f;
-  const bool accumulation_off = falcom_world::rtxdi::SunAccumulationRequested();
-  falcom_world::rtxdi::g_sun_accumulation = 1.f;
-  const bool allowed_relax = falcom_world::rtxdi::SunAccumulationAllowed(true, false);
-  const bool allowed_raw = falcom_world::rtxdi::SunAccumulationAllowed(false, false);
-  const bool allowed_rr = falcom_world::rtxdi::SunAccumulationAllowed(true, true);
-  const bool allowed_raw_rr = falcom_world::rtxdi::SunAccumulationAllowed(false, true);
-  falcom_world::rtxdi::g_sun_light_size = 0.f;
-  const bool allowed_at_zero_size = falcom_world::rtxdi::SunAccumulationAllowed(true, false);
-  falcom_world::rtxdi::g_sun_accumulation = saved_sun_accumulation;
-  falcom_world::rtxdi::g_sun_light_size = saved_sun_light_size;
-  if (accumulation_at_zero_size || !accumulation_at_size_one || accumulation_at_nan_size || accumulation_off
-      || !allowed_relax || allowed_raw || allowed_rr || allowed_raw_rr || allowed_at_zero_size) return EXIT_FAILURE;
   falcom_world::rtxdi::DiConfig config;
   if (falcom_world::rtxdi::CalculateDiConfig(0u, 1u, &config)
       || falcom_world::rtxdi::CalculateDiConfig(UINT32_MAX, 1u, &config)

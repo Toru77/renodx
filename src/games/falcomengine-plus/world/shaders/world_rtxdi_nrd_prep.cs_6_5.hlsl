@@ -1,3 +1,4 @@
+// Test fixture for falcom-nrd-bridge (world/rt12/tests/nrd_d3d12_bridge.cpp); not embedded or dispatched by the addon (Unified PT A7).
 #include "../../include/mrt_normal.hlsli"
 #include "world_rt_lamps.hlsli"
 #include "../rtxdi/rtxdi_di_layout.h"

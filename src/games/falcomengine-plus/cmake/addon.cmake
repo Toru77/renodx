@@ -7,41 +7,28 @@ target_include_directories(falcom-rtxdi-sdk SYSTEM PUBLIC "${FALCOM_RTXDI_ROOT}/
 target_link_libraries(${ADDON} PRIVATE falcom-rtxdi-sdk)
 set_property(TARGET ${ADDON} PROPERTY RENODX_DXC_INCLUDE_DIRS "${FALCOM_RTXDI_ROOT}/Include")
 add_executable(falcom-rtxdi-contract EXCLUDE_FROM_ALL "${ADDON_PATH}/world/rtxdi/tests/rtxdi_contract.cpp")
+target_include_directories(falcom-rtxdi-contract PRIVATE $<TARGET_PROPERTY:${ADDON},INCLUDE_DIRECTORIES>)
 target_link_libraries(falcom-rtxdi-contract PRIVATE falcom-rtxdi-sdk)
 add_executable(falcom-rtxdi-bridge EXCLUDE_FROM_ALL
   "${ADDON_PATH}/world/rtxdi/tests/rtxdi_bridge.cpp"
   "${ADDON_PATH}/world/rtxdi/tests/rtxdi_dxr_bridge.cpp")
 target_link_libraries(falcom-rtxdi-bridge PRIVATE d3d11 d3d12 dxgi falcom-rtxdi-sdk)
 target_include_directories(falcom-rtxdi-bridge PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed")
+target_include_directories(falcom-rtxdi-bridge PRIVATE $<TARGET_PROPERTY:${ADDON},INCLUDE_DIRECTORIES>)
 target_sources(falcom-rtxdi-bridge PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_pack_inputs.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_pack_records.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_unpack_records.h"
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/rtxdi_surface_contract.h"
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_sun_visibility.h")
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/rtxdi_surface_contract.h")
 target_sources(falcom-rtxdi-bridge PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_classify_lights.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_light_table.h"
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_initial_di.h"
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_spatial_di.h"
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_temporal_di.h"
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_probe.h"
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/rtxdi_raw_guard_contract.h"
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/rtxdi_lighting_consumer_contract.h"
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_reconstruct.h")
-target_sources(falcom-rtxdi-bridge PRIVATE
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_hitdistance.h")
+  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/rtxdi_raw_guard_contract.h")
 target_sources(falcom-rtxdi-bridge PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_regir_register.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_regir_weights.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_regir_build.h"
   "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_regir_selection_contract.h")
-target_sources(falcom-rtxdi-bridge PRIVATE
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_sampling_contract.h"
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_coverage_contract.h")
-target_sources(falcomengine-plus PRIVATE
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_prep.h"
-  "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_debug_distance.h")
 
 option(FALCOM_NRD_ENABLED "Enable the private NRD path in falcomengine-plus" ON)
 set(FALCOM_NRD_SDK_ROOT "" CACHE PATH "Optional NRD 4.17.1 SDK root for the private D3D12 adapter harness")
@@ -81,6 +68,7 @@ if(FALCOM_NRD_SDK_ROOT)
   add_executable(falcom-nrd-bridge EXCLUDE_FROM_ALL "${ADDON_PATH}/world/rt12/tests/nrd_d3d12_bridge.cpp")
   target_link_libraries(falcom-nrd-bridge PRIVATE d3d12 dxgi falcom-nrd-sdk)
   target_include_directories(falcom-nrd-bridge PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed")
+  target_include_directories(falcom-nrd-bridge PRIVATE $<TARGET_PROPERTY:${ADDON},INCLUDE_DIRECTORIES>)
   target_sources(falcom-nrd-bridge PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_probe.h"
     "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_prep.h"
@@ -89,8 +77,5 @@ if(FALCOM_NRD_SDK_ROOT)
   if(FALCOM_NRD_ENABLED)
     target_link_libraries(${ADDON} PRIVATE d3d12 falcom-nrd-sdk)
     target_compile_definitions(${ADDON} PRIVATE FALCOM_NRD_ENABLED=1)
-    target_sources(${ADDON} PRIVATE
-      "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_hitdistance.h"
-      "${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include/embed/world_rtxdi_nrd_publish.h")
   endif()
 endif()

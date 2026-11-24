@@ -24,12 +24,10 @@ struct Rt12DiInputViews {
   uint32_t frame = UINT32_MAX, width = 0u, height = 0u;
   uint32_t lights_register = UINT32_MAX, tiles_register = UINT32_MAX, deferred_register = UINT32_MAX;
   uint32_t effective_debug_view = RTXDI_DEBUG_VIEW_OFF;
-  uint32_t sun_detail_view = RTXDI_SUN_DETAIL_STATUS;
-  std::array<float, 7> n1_brdf_config = {};
   rtxdi::EffectiveRtxdiSettings effective_settings = {};
   int32_t scene_slot = -1;
   uint64_t scene_fence = 0u;
-  bool local = false, local_di = false, sun = false;
+  bool local = false;
 };
 
 struct Rt12DiInputResult {
@@ -261,681 +259,6 @@ inline bool ValidateBoundDiScene(ID3D11DeviceContext* context, const reshade::ap
          && native.constant_count == expected->native_constant_count && window_valid;
 }
 
-#if defined(FALCOM_NRD_ENABLED)
-inline void CaptureNrdCameraRows(uintptr_t device, const Rt12DiInputViews& in,
-                                 const reshade::api::buffer_range& range, uint32_t copied_rows,
-                                 uint64_t owner_generation,
-                                 Rt12NrdCameraCapture* camera) {
-  if (camera == nullptr) return;
-  *camera = {};
-  const uint64_t copy_bytes = uint64_t{copied_rows} * 16u;
-  if (device == 0u || in.scene_tracker == nullptr || copied_rows < RTXDI_INPUT_SCENE_REQUIRED_ROWS
-      || copied_rows > RTXDI_INPUT_SCENE_ROWS) return;
-  rtxdi::SceneRangeSnapshot promoted;
-  {
-    std::shared_lock lock(in.scene_tracker->mutex);
-    promoted = in.scene_tracker->snapshot;
-  }
-  if (!promoted.live || !promoted.known || promoted.frame != in.capture_frame
-      || promoted.buffer != range.buffer.handle || promoted.offset != range.offset
-      || promoted.size != range.size || promoted.copied_rows != copied_rows || promoted.sequence == 0u) return;
-  uint64_t write_sequence = 0u, write_frame = UINT64_MAX;
-  if (!rtxdi::ReadSceneCpuMirror(device, range.buffer.handle, range.offset, copy_bytes, in.capture_frame,
-                                 promoted.sequence, camera->scene_rows.data(), &write_sequence, &write_frame)) return;
-  camera->resource = range.buffer.handle;
-  camera->offset = range.offset;
-  camera->binding_sequence = promoted.sequence;
-  camera->write_sequence = write_sequence;
-  camera->write_frame = write_frame;
-  camera->owner_generation = owner_generation;
-  camera->capture_frame = in.capture_frame;
-  camera->valid = true;
-}
-
-inline bool EnsureNrdProbePipeline(Rt12State& state) {
-  auto& transfer = state.di_transfer;
-  if (transfer.nrd_probe_root && transfer.nrd_probe_pso) return true;
-#if defined(__world_rtxdi_nrd_probe_EMBED_FILE)
-  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
-  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  ranges[0].NumDescriptors = 5u;
-  ranges[0].BaseShaderRegister = 0u;
-  ranges[0].OffsetInDescriptorsFromTableStart = 0u;
-  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-  ranges[1].NumDescriptors = 1u;
-  ranges[1].BaseShaderRegister = 0u;
-  ranges[1].OffsetInDescriptorsFromTableStart = 0u;
-  D3D12_ROOT_PARAMETER parameters[3] = {};
-  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-  parameters[0].Descriptor.ShaderRegister = 0u;
-  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  parameters[1].DescriptorTable.NumDescriptorRanges = 1u;
-  parameters[1].DescriptorTable.pDescriptorRanges = &ranges[0];
-  parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  parameters[2].DescriptorTable.NumDescriptorRanges = 1u;
-  parameters[2].DescriptorTable.pDescriptorRanges = &ranges[1];
-  D3D12_ROOT_SIGNATURE_DESC desc = {};
-  desc.NumParameters = 3u;
-  desc.pParameters = parameters;
-  ComPtr<ID3DBlob> blob, error;
-  ComPtr<ID3D12RootSignature> root;
-  ComPtr<ID3D12PipelineState> pso;
-  HRESULT hr = state.serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
-  if (SUCCEEDED(hr)) {
-    hr = state.device12->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root));
-  }
-  if (SUCCEEDED(hr)) {
-    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {};
-    pipeline.pRootSignature = root.Get();
-    pipeline.CS = {__world_rtxdi_nrd_probe.data(), __world_rtxdi_nrd_probe.size()};
-    hr = state.device12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&pso));
-  }
-  if (FAILED(hr)) return false;
-  transfer.nrd_probe_root = std::move(root);
-  transfer.nrd_probe_pso = std::move(pso);
-  return true;
-#else
-  return false;
-#endif
-}
-
-inline bool EnsureNrdPrepPipeline(Rt12State& state) {
-  auto& transfer = state.di_transfer;
-  if (transfer.nrd_prep_root && transfer.nrd_prep_pso) return true;
-#if defined(__world_rtxdi_nrd_prep_EMBED_FILE)
-  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
-  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  ranges[0].NumDescriptors = 10u;
-  ranges[0].BaseShaderRegister = 0u;
-  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-  ranges[1].NumDescriptors = 5u;
-  ranges[1].BaseShaderRegister = 0u;
-  D3D12_ROOT_PARAMETER parameters[3] = {};
-  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  parameters[0].Constants.ShaderRegister = 0u;
-  parameters[0].Constants.Num32BitValues = 10u;
-  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  parameters[1].DescriptorTable.NumDescriptorRanges = 1u;
-  parameters[1].DescriptorTable.pDescriptorRanges = &ranges[0];
-  parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  parameters[2].DescriptorTable.NumDescriptorRanges = 1u;
-  parameters[2].DescriptorTable.pDescriptorRanges = &ranges[1];
-  D3D12_ROOT_SIGNATURE_DESC desc = {};
-  desc.NumParameters = 3u;
-  desc.pParameters = parameters;
-  ComPtr<ID3DBlob> blob, error;
-  ComPtr<ID3D12RootSignature> root;
-  ComPtr<ID3D12PipelineState> pso;
-  HRESULT hr = state.serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
-  if (SUCCEEDED(hr)) {
-    hr = state.device12->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root));
-  }
-  if (SUCCEEDED(hr)) {
-    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {};
-    pipeline.pRootSignature = root.Get();
-    pipeline.CS = {__world_rtxdi_nrd_prep.data(), __world_rtxdi_nrd_prep.size()};
-    hr = state.device12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&pso));
-  }
-  if (FAILED(hr)) return false;
-  transfer.nrd_prep_root = std::move(root);
-  transfer.nrd_prep_pso = std::move(pso);
-  return true;
-#else
-  return false;
-#endif
-}
-
-inline DXGI_FORMAT NrdResourceFormat(nrd::ResourceType type) {
-  switch (type) {
-    case nrd::ResourceType::IN_MV:                         return DXGI_FORMAT_R16G16_FLOAT;
-    case nrd::ResourceType::IN_NORMAL_ROUGHNESS:           return DXGI_FORMAT_R10G10B10A2_UNORM;
-    case nrd::ResourceType::IN_VIEWZ:                      return DXGI_FORMAT_R32_FLOAT;
-    case nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST:
-    case nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST:
-    case nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST:
-    case nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST:
-    case nrd::ResourceType::IN_DIFF_SH0:
-    case nrd::ResourceType::IN_DIFF_SH1:
-    case nrd::ResourceType::IN_SPEC_SH0:
-    case nrd::ResourceType::IN_SPEC_SH1:
-    case nrd::ResourceType::OUT_DIFF_SH0:
-    case nrd::ResourceType::OUT_DIFF_SH1:
-    case nrd::ResourceType::OUT_SPEC_SH0:
-    case nrd::ResourceType::OUT_SPEC_SH1:                  return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    case nrd::ResourceType::IN_DIFF_DIRECTION_HITDIST:     return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case nrd::ResourceType::IN_DIFF_CONFIDENCE:
-    case nrd::ResourceType::IN_SPEC_CONFIDENCE:
-    case nrd::ResourceType::IN_DISOCCLUSION_THRESHOLD_MIX:
-    case nrd::ResourceType::IN_SIGNAL:
-    case nrd::ResourceType::OUT_DIFF_HITDIST:
-    case nrd::ResourceType::OUT_SPEC_HITDIST:              return DXGI_FORMAT_R8_UNORM;
-    case nrd::ResourceType::IN_PENUMBRA:                   return DXGI_FORMAT_R16_FLOAT;
-    case nrd::ResourceType::IN_TRANSLUCENCY:               return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case nrd::ResourceType::OUT_VALIDATION:                return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case nrd::ResourceType::OUT_SHADOW_TRANSLUCENCY:       return DXGI_FORMAT_R8G8B8A8_UNORM;
-    default:                                               return DXGI_FORMAT_UNKNOWN;
-  }
-}
-
-inline bool EnsureNrdDispatchResources(Rt12State& state, Rt12NrdSlot* slot, uint32_t width, uint32_t height,
-                                       const nrd::DispatchDesc* dispatches, uint32_t dispatch_count) {
-  if (slot == nullptr || !state.device12 || dispatches == nullptr || dispatch_count == 0u) return false;
-  const nrd::InstanceDesc* instance = nrd::GetInstanceDesc(*state.di_transfer.nrd.Instance());
-  if (instance == nullptr) return false;
-  const bool recreate = slot->width != width || slot->height != height || slot->dispatch_count != dispatch_count
-                        || !slot->dispatch_descriptors || !slot->dispatch_constants;
-  if (recreate) {
-    slot->resources = {};
-    slot->dispatch_descriptors.Reset();
-    slot->dispatch_constants.Reset();
-    slot->prep_descriptors.Reset();
-    slot->publication_descriptors.Reset();
-    slot->publication_constants.Reset();
-    slot->width = width;
-    slot->height = height;
-    slot->dispatch_count = dispatch_count;
-    const uint32_t descriptor_stride = instance->descriptorPoolDesc.perSetTexturesMaxNum
-                                       + instance->descriptorPoolDesc.perSetStorageTexturesMaxNum;
-    if (dispatch_count > UINT32_MAX / descriptor_stride) return false;
-    D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
-    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap_desc.NumDescriptors = dispatch_count * descriptor_stride;
-    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(state.device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&slot->dispatch_descriptors)))) return false;
-    heap_desc.NumDescriptors = 15u;
-    if (FAILED(state.device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&slot->prep_descriptors)))) return false;
-    heap_desc.NumDescriptors = 5u;
-    if (FAILED(state.device12->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&slot->publication_descriptors)))) return false;
-    if (FAILED(CreateRt12Buffer(state.device12.Get(), D3D12_HEAP_TYPE_UPLOAD, 256u,
-                                D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE,
-                                slot->publication_constants))) return false;
-    const uint64_t constant_stride = (instance->constantBufferMaxDataSize + 255u) & ~uint64_t{255u};
-    if (constant_stride == 0u || constant_stride > UINT64_MAX / dispatch_count
-        || FAILED(CreateRt12Buffer(state.device12.Get(), D3D12_HEAP_TYPE_UPLOAD, constant_stride * dispatch_count,
-                                   D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE,
-                                   slot->dispatch_constants))) return false;
-  }
-  for (uint32_t dispatch_index = 0u; dispatch_index < dispatch_count; ++dispatch_index) {
-    for (uint32_t resource_index = 0u; resource_index < dispatches[dispatch_index].resourcesNum; ++resource_index) {
-      const nrd::ResourceDesc& resource = dispatches[dispatch_index].resources[resource_index];
-      const uint32_t resource_index_in_array = static_cast<uint32_t>(resource.type);
-      if (resource_index_in_array >= static_cast<uint32_t>(nrd::ResourceType::TRANSIENT_POOL)) continue;
-      Rt12NrdTexture& texture = slot->resources[resource_index_in_array];
-      if (texture.resource) continue;
-      const DXGI_FORMAT format = NrdResourceFormat(resource.type);
-      if (format == DXGI_FORMAT_UNKNOWN) return false;
-      D3D12_RESOURCE_DESC desc = {};
-      desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-      desc.Width = width;
-      desc.Height = height;
-      desc.DepthOrArraySize = 1u;
-      desc.MipLevels = 1u;
-      desc.Format = format;
-      desc.SampleDesc.Count = 1u;
-      desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-      desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-      D3D12_HEAP_PROPERTIES heap = {};
-      heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-      heap.CreationNodeMask = 1u;
-      heap.VisibleNodeMask = 1u;
-      if (FAILED(state.device12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                         IID_PPV_ARGS(&texture.resource)))) return false;
-      texture.format = format;
-      texture.width = width;
-      texture.height = height;
-      texture.state = D3D12_RESOURCE_STATE_COMMON;
-    }
-  }
-  const std::array<nrd::ResourceType, 7u> prep_resources = {
-      nrd::ResourceType::IN_MV, nrd::ResourceType::IN_NORMAL_ROUGHNESS, nrd::ResourceType::IN_VIEWZ,
-      nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST,
-      nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST};
-  for (nrd::ResourceType type : prep_resources) {
-    Rt12NrdTexture& texture = slot->resources[static_cast<uint32_t>(type)];
-    if (texture.resource) continue;
-    const DXGI_FORMAT format = NrdResourceFormat(type);
-    if (format == DXGI_FORMAT_UNKNOWN) return false;
-    D3D12_RESOURCE_DESC desc = {};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = width;
-    desc.Height = height;
-    desc.DepthOrArraySize = 1u;
-    desc.MipLevels = 1u;
-    desc.Format = format;
-    desc.SampleDesc.Count = 1u;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    D3D12_HEAP_PROPERTIES heap = {};
-    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-    heap.CreationNodeMask = 1u;
-    heap.VisibleNodeMask = 1u;
-    if (FAILED(state.device12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                       D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                       IID_PPV_ARGS(&texture.resource)))) return false;
-    texture.format = format;
-    texture.width = width;
-    texture.height = height;
-    texture.state = D3D12_RESOURCE_STATE_COMMON;
-  }
-  return true;
-}
-
-#if defined(FALCOM_NRD_ENABLED)
-inline bool RecordNrdDiffusePrep(Rt12State& state, Rt12DiTransferSlot& slot, const Rt12DiInputViews& input,
-                                 uint32_t correction_index, bool history_valid) {
-  if (!EnsureNrdPrepPipeline(state) || !slot.nrd.prep_descriptors || !slot.nrd.hit_distance || !slot.nrd.hit_validity
-      || !slot.depth.texture12
-      || !slot.normal.texture12 || !slot.scene.texture12 || !slot.motion.texture12 || !slot.mrt2.texture12
-      || !slot.deferred_buffer || !slot.n1_diffuse.texture12 || !slot.n1_status.texture12) return false;
-  auto& transfer = state.di_transfer;
-  auto& nrd_slot = slot.nrd;
-  ID3D12Device* device = state.device12.Get();
-  ID3D12GraphicsCommandList* list = transfer.di_list.Get();
-  const uint32_t descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-  const D3D12_CPU_DESCRIPTOR_HANDLE cpu = nrd_slot.prep_descriptors->GetCPUDescriptorHandleForHeapStart();
-  const D3D12_GPU_DESCRIPTOR_HANDLE gpu = nrd_slot.prep_descriptors->GetGPUDescriptorHandleForHeapStart();
-  const std::array<ID3D12Resource*, 10u> srvs = {slot.depth.texture12.Get(), slot.normal.texture12.Get(), slot.scene.texture12.Get(),
-                                                 slot.motion.texture12.Get(), slot.mrt2.texture12.Get(), slot.deferred_buffer.Get(),
-                                                 slot.n1_diffuse.texture12.Get(), slot.n1_status.texture12.Get(),
-                                                 slot.nrd.hit_distance.Get(), slot.nrd.hit_validity.Get()};
-  const std::array<DXGI_FORMAT, 10u> srv_formats = {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32B32A32_UINT,
-                                                    DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT,
-                                                    DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_UNKNOWN,
-                                                    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_UINT,
-                                                    DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
-  std::array<D3D12_RESOURCE_BARRIER, 18u> barriers = {};
-  uint32_t barrier_count = 0u;
-  for (uint32_t index = 0u; index < srvs.size(); ++index) {
-    ID3D12Resource* resource = srvs[index];
-    if (resource == nullptr) return false;
-    if (index == 6u || index == 7u) {
-      D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
-      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-      barrier.Transition.pResource = resource;
-      barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    } else if (index >= 8u) {
-      D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
-      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-      barrier.Transition.pResource = resource;
-      barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    }
-    D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
-    view.Format = srv_formats[index];
-    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    if (index == 5u) {
-      view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-      view.Buffer.NumElements = std::max(1u, slot.deferred_count);
-      view.Buffer.StructureByteStride = RTXDI_INPUT_DEFERRED_STRIDE;
-    } else if (index < 8u) {
-      view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-      view.Texture2D.MipLevels = 1u;
-    } else {
-      view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-      view.Buffer.NumElements = static_cast<UINT>(uint64_t{input.width} * input.height);
-      view.Buffer.StructureByteStride = sizeof(uint32_t);
-    }
-    device->CreateShaderResourceView(resource, &view, {cpu.ptr + static_cast<SIZE_T>(index) * descriptor_size});
-  }
-  const std::array<nrd::ResourceType, 5u> uav_types = {nrd::ResourceType::IN_MV,
-                                                       nrd::ResourceType::IN_NORMAL_ROUGHNESS,
-                                                       nrd::ResourceType::IN_VIEWZ,
-                                                       nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST,
-                                                       nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST};
-  const std::array<Rt12NrdTexture*, 5u> uavs = {
-      &nrd_slot.resources[static_cast<uint32_t>(uav_types[0])], &nrd_slot.resources[static_cast<uint32_t>(uav_types[1])],
-      &nrd_slot.resources[static_cast<uint32_t>(uav_types[2])], &nrd_slot.resources[static_cast<uint32_t>(uav_types[3])],
-      &nrd_slot.resources[static_cast<uint32_t>(uav_types[4])]};
-  for (uint32_t index = 0u; index < uavs.size(); ++index) {
-    Rt12NrdTexture* texture = uavs[index];
-    if (texture->resource == nullptr) return false;
-    D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = texture->resource.Get();
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = texture->state;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    texture->state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
-    view.Format = texture->format;
-    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    device->CreateUnorderedAccessView(texture->resource.Get(), nullptr, &view,
-                                      {cpu.ptr + static_cast<SIZE_T>(10u + index) * descriptor_size});
-  }
-  if (barrier_count != 0u) list->ResourceBarrier(barrier_count, barriers.data());
-  ID3D12DescriptorHeap* heaps[] = {nrd_slot.prep_descriptors.Get()};
-  list->SetDescriptorHeaps(1u, heaps);
-  list->SetComputeRootSignature(transfer.nrd_prep_root.Get());
-  list->SetPipelineState(transfer.nrd_prep_pso.Get());
-  const std::array<uint32_t, 10u> constants = {input.width, input.height, slot.deferred_count, correction_index,
-                                               std::bit_cast<uint32_t>(nrd_slot.camera_candidate.motion_correction_candidates[0][0]),
-                                               std::bit_cast<uint32_t>(nrd_slot.camera_candidate.motion_correction_candidates[0][1]),
-                                               std::bit_cast<uint32_t>(nrd_slot.camera_candidate.motion_correction_candidates[1][0]),
-                                               std::bit_cast<uint32_t>(nrd_slot.camera_candidate.motion_correction_candidates[1][1]),
-                                               history_valid ? 1u : 0u, 0u};
-  list->SetComputeRoot32BitConstants(0u, static_cast<UINT>(constants.size()), constants.data(), 0u);
-  list->SetComputeRootDescriptorTable(1u, gpu);
-  list->SetComputeRootDescriptorTable(2u, {gpu.ptr + static_cast<UINT64>(10u) * descriptor_size});
-  list->Dispatch((input.width + 7u) / 8u, (input.height + 7u) / 8u, 1u);
-  barriers = {};
-  barrier_count = 0u;
-  for (uint32_t index = 6u; index < 10u; ++index) {
-    D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = srvs[index];
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    barrier.Transition.StateAfter = index < 8u ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_COMMON;
-  }
-  list->ResourceBarrier(barrier_count, barriers.data());
-  return true;
-}
-
-inline bool BuildNrdCommonSettings(const rtxdi::CameraCandidate& camera, uint32_t width, uint32_t height,
-                                   uint32_t frame_index, bool history_valid, nrd::CommonSettings* settings) {
-  if (settings == nullptr || width == 0u || height == 0u || width > UINT16_MAX || height > UINT16_MAX
-      || !camera.matrices_valid || !camera.absolute_jitter_valid) return false;
-  *settings = {};
-  std::copy(camera.view_to_clip.begin(), camera.view_to_clip.end(), settings->viewToClipMatrix);
-  std::copy(camera.view_to_clip_previous.begin(), camera.view_to_clip_previous.end(), settings->viewToClipMatrixPrev);
-  std::copy(camera.world_to_view.begin(), camera.world_to_view.end(), settings->worldToViewMatrix);
-  std::copy(camera.world_to_view_previous.begin(), camera.world_to_view_previous.end(), settings->worldToViewMatrixPrev);
-  settings->motionVectorScale[0] = 1.0f;
-  settings->motionVectorScale[1] = 1.0f;
-  settings->motionVectorScale[2] = 0.0f;
-  settings->cameraJitter[0] = camera.jitter_pixels[0] / static_cast<float>(width);
-  settings->cameraJitter[1] = camera.jitter_pixels[1] / static_cast<float>(height);
-  settings->cameraJitterPrev[0] = camera.jitter_pixels_previous[0] / static_cast<float>(width);
-  settings->cameraJitterPrev[1] = camera.jitter_pixels_previous[1] / static_cast<float>(height);
-  settings->resourceSize[0] = settings->resourceSizePrev[0] = static_cast<uint16_t>(width);
-  settings->resourceSize[1] = settings->resourceSizePrev[1] = static_cast<uint16_t>(height);
-  settings->rectSize[0] = settings->rectSizePrev[0] = static_cast<uint16_t>(width);
-  settings->rectSize[1] = settings->rectSizePrev[1] = static_cast<uint16_t>(height);
-  settings->frameIndex = frame_index;
-  settings->accumulationMode = history_valid ? nrd::AccumulationMode::CONTINUE : nrd::AccumulationMode::RESTART;
-  settings->isMotionVectorInWorldSpace = false;
-  settings->denoisingRange = 500000.0f;
-  return true;
-}
-
-inline bool RecordNrdDenoise(Rt12State& state, Rt12DiTransferSlot& slot, const Rt12DiInputViews& input,
-                             const rtxdi::EffectiveRtxdiSettings& settings,
-                             Rt12NrdHistoryIdentity* accepted_history) {
-  auto& generation = state.di_transfer.nrd;
-  if (generation.Instance() == nullptr || accepted_history == nullptr || input.width == 0u || input.height == 0u
-      || !slot.nrd.camera_candidate.matrices_valid || !slot.nrd.camera_candidate.absolute_jitter_valid) return false;
-  if (generation.pools.width != input.width || generation.pools.height != input.height) {
-    const uint64_t completed = Rt12CompletedValue(state);
-    if (completed == UINT64_MAX) return false;
-    for (Rt12DiTransferSlot& pending : state.di_transfer.slots) {
-      if (pending.nrd.fence_value > completed) return false;
-    }
-  }
-  if (!generation.CreatePools(state.device12.Get(), input.width, input.height)) return false;
-  nrd::CommonSettings common = {};
-  const uint64_t configuration = state.di_transfer.configuration_generation
-                                 ^ (uint64_t{slot.n1_configuration_version} << 32u)
-                                 ^ state.di_transfer.nrd.qualification.motion_correction_index
-                                 ^ settings.identity;
-  uint64_t configuration_hash = configuration ^ 1469598103934665603ull;
-  for (float value : input.n1_brdf_config) {
-    configuration_hash ^= std::bit_cast<uint32_t>(value);
-    configuration_hash *= 1099511628211ull;
-  }
-  const Rt12NrdHistoryIdentity current = {reinterpret_cast<uint64_t>(state.device), state.generation,
-                                          configuration_hash, input.frame, input.width, input.height, true};
-  const bool history_valid = Rt12NrdCanContinueHistory(generation.history, current)
-                             && generation.qualification.qualified;
-  const uint32_t frame_index = history_valid ? static_cast<uint32_t>(generation.history.frame + 1u) : 0u;
-  if (!BuildNrdCommonSettings(slot.nrd.camera_candidate, input.width, input.height,
-                              frame_index, history_valid, &common)
-      || nrd::SetCommonSettings(*generation.Instance(), common) != nrd::Result::SUCCESS) return false;
-  nrd::RelaxSettings relax = {};
-  relax.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::OFF;
-  relax.minMaterialForDiffuse = 0.0f;
-  relax.minMaterialForSpecular = 0.0f;
-  relax.diffuseMaxAccumulatedFrameNum = settings.relax_diffuse_history;
-  relax.diffuseMaxFastAccumulatedFrameNum = settings.relax_fast_history;
-  relax.diffusePrepassBlurRadius = static_cast<float>(settings.relax_prepass_radius);
-  relax.atrousIterationNum = settings.relax_atrous_iterations;
-  if (nrd::SetDenoiserSettings(*generation.Instance(), 1u, &relax) != nrd::Result::SUCCESS) return false;
-  const nrd::Identifier identifier = 1u;
-  const nrd::DispatchDesc* dispatches = nullptr;
-  uint32_t dispatch_count = 0u;
-  if (nrd::GetComputeDispatches(*generation.Instance(), &identifier, 1u, dispatches, dispatch_count)
-          != nrd::Result::SUCCESS
-      || dispatches == nullptr || dispatch_count == 0u
-      || !EnsureNrdDispatchResources(state, &slot.nrd, input.width, input.height, dispatches, dispatch_count)) return false;
-  const nrd::InstanceDesc* instance = nrd::GetInstanceDesc(*generation.Instance());
-  if (instance == nullptr) return false;
-  if (!RecordNrdDiffusePrep(state, slot, input, generation.qualification.motion_correction_index, history_valid)
-      || !Rt12NrdRecordDispatches(state.device12.Get(), state.di_transfer.di_list.Get(), *instance,
-                                  dispatches, dispatch_count, &generation.pipelines, &generation.pools,
-                                  &slot.nrd,
-                                  instance->descriptorPoolDesc.perSetTexturesMaxNum
-                                      + instance->descriptorPoolDesc.perSetStorageTexturesMaxNum)) return false;
-  *accepted_history = current;
-  return true;
-}
-
-#endif
-
-inline bool EnsureNrdProbeResources(Rt12State& state, Rt12NrdSlot* slot) {
-  if (slot == nullptr || !state.device12) return false;
-  constexpr uint64_t results_bytes = 32u * 18u * 2u * sizeof(uint32_t);
-  Rt12NrdSlot candidate;
-  if (FAILED(CreateRt12Buffer(state.device12.Get(), D3D12_HEAP_TYPE_UPLOAD, 512u,
-                              D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE,
-                              candidate.probe_constants))
-      || FAILED(CreateRt12Buffer(state.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, results_bytes,
-                                 D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                 candidate.probe_results))
-      || FAILED(CreateRt12Buffer(state.device12.Get(), D3D12_HEAP_TYPE_READBACK, results_bytes,
-                                 D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE,
-                                 candidate.probe_readback))
-      || FAILED(CreateRt12Buffer(state.device12.Get(), D3D12_HEAP_TYPE_READBACK, 2u * sizeof(uint64_t),
-                                 D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE,
-                                 candidate.probe_timestamp_readback))) return false;
-  D3D12_QUERY_HEAP_DESC queries = {};
-  queries.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-  queries.Count = 2u;
-  if (FAILED(state.device12->CreateQueryHeap(&queries, IID_PPV_ARGS(&candidate.probe_queries)))) return false;
-  slot->probe_constants = std::move(candidate.probe_constants);
-  slot->probe_results = std::move(candidate.probe_results);
-  slot->probe_readback = std::move(candidate.probe_readback);
-  slot->probe_timestamp_readback = std::move(candidate.probe_timestamp_readback);
-  slot->probe_queries = std::move(candidate.probe_queries);
-  return true;
-}
-
-inline void ProcessNrdProbeReadbacks(Rt12State& state) {
-  const auto start = std::chrono::steady_clock::now();
-  const uint64_t completed = Rt12CompletedValue(state);
-  if (completed == UINT64_MAX) {
-    state.di_transfer.nrd.qualification = {};
-    return;
-  }
-  std::array<Rt12DiTransferSlot*, kRt12Slots> ready = {};
-  uint32_t ready_count = 0u;
-  for (Rt12DiTransferSlot& slot : state.di_transfer.slots) {
-    if (slot.nrd.probe_pending && slot.nrd.probe_fence <= completed) ready[ready_count++] = &slot;
-  }
-  std::sort(ready.begin(), ready.begin() + ready_count, [](const auto* a, const auto* b) {
-    return a->nrd.probe_frame < b->nrd.probe_frame;
-  });
-  for (uint32_t ready_index = 0u; ready_index < ready_count; ++ready_index) {
-    Rt12DiTransferSlot& slot = *ready[ready_index];
-    std::array<std::array<float, 32u * 18u>, 2u> residuals = {};
-    void* mapped = nullptr;
-    const D3D12_RANGE read_range = {0u, 32u * 18u * 2u * sizeof(uint32_t)};
-    if (!slot.nrd.probe_readback || FAILED(slot.nrd.probe_readback->Map(0u, &read_range, &mapped))) {
-      slot.nrd.probe_pending = false;
-      state.di_transfer.nrd.qualification.qualified = false;
-      state.di_transfer.nrd.qualification.consecutive_passes = 0u;
-      continue;
-    }
-    const auto* raw = static_cast<const uint32_t*>(mapped);
-    for (uint32_t sample = 0u; sample < 32u * 18u; ++sample) {
-      for (uint32_t candidate = 0u; candidate < 2u; ++candidate) {
-        residuals[candidate][sample] = std::bit_cast<float>(raw[sample * 2u + candidate]);
-      }
-    }
-    const D3D12_RANGE no_write = {0u, 0u};
-    slot.nrd.probe_readback->Unmap(0u, &no_write);
-    uint32_t selected_correction = UINT32_MAX;
-    float selected_median = INFINITY;
-    for (uint32_t candidate = 0u; candidate < 2u; ++candidate) {
-      uint32_t count = 0u;
-      uint32_t inliers = 0u;
-      for (float error : residuals[candidate]) {
-        if (!std::isfinite(error)) continue;
-        residuals[candidate][count++] = error;
-        if (error <= 1.0f) ++inliers;
-      }
-      if (count < 64u || inliers < 64u) continue;
-      std::sort(residuals[candidate].begin(), residuals[candidate].begin() + count);
-      const float median = (count & 1u) ? residuals[candidate][count / 2u]
-                                        : 0.5f * (residuals[candidate][count / 2u - 1u] + residuals[candidate][count / 2u]);
-      const uint32_t p90_index = ((count * 9u + 9u) / 10u) - 1u;
-      if (median <= 0.35f && residuals[candidate][p90_index] <= 1.0f && median < selected_median) {
-        selected_correction = candidate;
-        selected_median = median;
-      }
-    }
-    const bool candidate_valid = slot.nrd.camera.valid && slot.nrd.camera_candidate.matrices_valid
-                                 && slot.nrd.camera_candidate.absolute_jitter_valid;
-    rtxdi::ObserveCameraProbe(&state.di_transfer.nrd.qualification, slot.nrd.probe_frame,
-                              slot.nrd.camera.owner_generation, state.di_transfer.configuration_generation,
-                              slot.nrd.camera.resource, slot.width, slot.height, candidate_valid,
-                              selected_correction != UINT32_MAX, selected_correction);
-    void* timestamp_data = nullptr;
-    const D3D12_RANGE timestamp_range = {0u, 2u * sizeof(uint64_t)};
-    if (slot.nrd.probe_timestamp_readback
-        && SUCCEEDED(slot.nrd.probe_timestamp_readback->Map(0u, &timestamp_range, &timestamp_data))) {
-      const auto* timestamps = static_cast<const uint64_t*>(timestamp_data);
-      uint64_t frequency = 0u;
-      if (state.queue12 && SUCCEEDED(state.queue12->GetTimestampFrequency(&frequency)) && frequency != 0u) {
-        slot.nrd.probe_gpu_microseconds = static_cast<double>(timestamps[1] - timestamps[0]) * 1.0e6 / frequency;
-      }
-      slot.nrd.probe_timestamp_readback->Unmap(0u, &no_write);
-    }
-    slot.nrd.probe_readback_cpu_microseconds = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
-    slot.nrd.probe_pending = false;
-  }
-}
-
-inline bool RecordNrdCameraProbe(Rt12State& state, Rt12DiTransferSlot& current,
-                                 Rt12DiTransferSlot& previous, const Rt12DiInputViews& input,
-                                 const rtxdi::CameraCandidate& candidate) {
-  if (!EnsureNrdProbePipeline(state) || !EnsureNrdProbeResources(state, &current.nrd)
-      || current.di_descriptors == nullptr || current.width != input.width || current.height != input.height
-      || !previous.depth.texture12 || !previous.normal.texture12 || previous.width != current.width
-      || previous.height != current.height) return false;
-  rtxdi::CameraMatrix current_inverse_view_projection = {}, previous_inverse_view_projection = {};
-  if (!rtxdi::ReadSceneMatrix(current.nrd.camera.scene_rows.data(), 20u, &current_inverse_view_projection)
-      || !rtxdi::ReadSceneMatrix(previous.nrd.camera.scene_rows.data(), 20u, &previous_inverse_view_projection)) return false;
-  Rt12NrdProbeConstants constants = {};
-  constants.resource_size[0] = input.width;
-  constants.resource_size[1] = input.height;
-  constants.current_jitter_pixels[0] = candidate.jitter_pixels[0];
-  constants.current_jitter_pixels[1] = candidate.jitter_pixels[1];
-  constants.previous_jitter_pixels[0] = candidate.jitter_pixels_previous[0];
-  constants.previous_jitter_pixels[1] = candidate.jitter_pixels_previous[1];
-  for (uint32_t index = 0u; index < 2u; ++index) {
-    constants.motion_correction_pixels[index][0] = candidate.motion_correction_candidates[index][0];
-    constants.motion_correction_pixels[index][1] = candidate.motion_correction_candidates[index][1];
-  }
-  std::copy(current_inverse_view_projection.begin(), current_inverse_view_projection.end(),
-            constants.current_inverse_view_projection);
-  std::copy(previous_inverse_view_projection.begin(), previous_inverse_view_projection.end(),
-            constants.previous_inverse_view_projection);
-  const rtxdi::CameraMatrix current_vp = rtxdi::MultiplyCameraMatrices(candidate.world_to_view, candidate.view_to_clip);
-  const rtxdi::CameraMatrix previous_vp = rtxdi::MultiplyCameraMatrices(candidate.world_to_view_previous,
-                                                                        candidate.view_to_clip_previous);
-  std::copy(current_vp.begin(), current_vp.end(), constants.current_view_projection_non_jittered);
-  std::copy(previous_vp.begin(), previous_vp.end(), constants.previous_view_projection_non_jittered);
-  std::copy(candidate.world_to_view_previous.begin(), candidate.world_to_view_previous.end(), constants.previous_view);
-  void* mapped = nullptr;
-  const D3D12_RANGE no_read = {0u, 0u};
-  if (FAILED(current.nrd.probe_constants->Map(0u, &no_read, &mapped))) return false;
-  std::memset(mapped, 0, 512u);
-  std::memcpy(mapped, &constants, sizeof(constants));
-  current.nrd.probe_constants->Unmap(0u, nullptr);
-
-  ID3D12Device5* device = state.device12.Get();
-  const auto cpu_at = [&](uint32_t index) {
-    D3D12_CPU_DESCRIPTOR_HANDLE handle = current.di_descriptors->GetCPUDescriptorHandleForHeapStart();
-    handle.ptr += static_cast<SIZE_T>(index) * state.descriptor_size;
-    return handle;
-  };
-  const auto create_texture_srv = [&](uint32_t index, ID3D12Resource* resource, DXGI_FORMAT format) {
-    D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
-    view.Format = format;
-    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    view.Texture2D.MipLevels = 1u;
-    device->CreateShaderResourceView(resource, &view, cpu_at(index));
-  };
-  create_texture_srv(0u, current.depth.texture12.Get(), DXGI_FORMAT_R32_FLOAT);
-  create_texture_srv(1u, previous.depth.texture12.Get(), DXGI_FORMAT_R32_FLOAT);
-  create_texture_srv(2u, current.motion.texture12.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT);
-  create_texture_srv(3u, current.normal.texture12.Get(), DXGI_FORMAT_R32G32B32A32_UINT);
-  create_texture_srv(4u, previous.normal.texture12.Get(), DXGI_FORMAT_R32G32B32A32_UINT);
-  D3D12_UNORDERED_ACCESS_VIEW_DESC output_view = {};
-  output_view.Format = DXGI_FORMAT_UNKNOWN;
-  output_view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-  output_view.Buffer.NumElements = 32u * 18u * 2u;
-  output_view.Buffer.StructureByteStride = sizeof(uint32_t);
-  device->CreateUnorderedAccessView(current.nrd.probe_results.Get(), nullptr, &output_view, cpu_at(36u));
-
-  D3D12_RESOURCE_BARRIER barrier = {};
-  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  barrier.Transition.pResource = current.nrd.probe_results.Get();
-  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  state.di_transfer.di_list->ResourceBarrier(1u, &barrier);
-  ID3D12DescriptorHeap* heaps[] = {current.di_descriptors.Get()};
-  state.di_transfer.di_list->SetDescriptorHeaps(1u, heaps);
-  state.di_transfer.di_list->SetComputeRootSignature(state.di_transfer.nrd_probe_root.Get());
-  state.di_transfer.di_list->SetComputeRootConstantBufferView(0u, current.nrd.probe_constants->GetGPUVirtualAddress());
-  D3D12_GPU_DESCRIPTOR_HANDLE srv_table = current.di_descriptors->GetGPUDescriptorHandleForHeapStart();
-  state.di_transfer.di_list->SetComputeRootDescriptorTable(1u, srv_table);
-  D3D12_GPU_DESCRIPTOR_HANDLE uav_table = srv_table;
-  uav_table.ptr += static_cast<UINT64>(36u) * state.descriptor_size;
-  state.di_transfer.di_list->SetComputeRootDescriptorTable(2u, uav_table);
-  state.di_transfer.di_list->SetPipelineState(state.di_transfer.nrd_probe_pso.Get());
-  state.di_transfer.di_list->EndQuery(current.nrd.probe_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0u);
-  state.di_transfer.di_list->Dispatch(4u, 3u, 1u);
-  state.di_transfer.di_list->EndQuery(current.nrd.probe_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1u);
-  D3D12_RESOURCE_BARRIER barriers[2] = {};
-  barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-  barriers[0].UAV.pResource = current.nrd.probe_results.Get();
-  barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  barriers[1].Transition.pResource = current.nrd.probe_results.Get();
-  barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-  state.di_transfer.di_list->ResourceBarrier(2u, barriers);
-  state.di_transfer.di_list->CopyBufferRegion(current.nrd.probe_readback.Get(), 0u,
-                                              current.nrd.probe_results.Get(), 0u, 32u * 18u * 2u * sizeof(uint32_t));
-  barrier = {};
-  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  barrier.Transition.pResource = current.nrd.probe_results.Get();
-  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-  state.di_transfer.di_list->ResourceBarrier(1u, &barrier);
-  state.di_transfer.di_list->ResolveQueryData(current.nrd.probe_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-                                              0u, 2u, current.nrd.probe_timestamp_readback.Get(), 0u);
-  return true;
-}
-#endif
-
 inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, reshade::api::command_list* cmd_list,
                                              const Rt12DiInputViews& in) {
   const bvh::PoolCpuTimer cpu_timer{&bvh::g_perf_gate.rtxdi_input_cpu_us};
@@ -1060,17 +383,10 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       forced_diagnostic_reason = rtxdi::DiagnosticReason::StaleFrame;
       return finish();
     }
-    if (in.sun && !rtxdi::SceneCoverageSnapshotMatches(s.scene_slot, s.scene_frame, s.scene_generation, s.scene_fence, s.scene_gc_version, s.scene_coverage_slot, s.scene_coverage_frame, s.scene_coverage_generation, s.scene_coverage_fence, s.scene_coverage_gc_version)) {
-      forced_diagnostic_reason = rtxdi::DiagnosticReason::InvalidRange;
-      return finish();
-    }
     if (reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()) != s.ctx11.Get()) {  // NOLINT(performance-no-int-to-ptr)
       forced_diagnostic_reason = rtxdi::DiagnosticReason::CommandMismatch;
       return finish();
     }
-#if defined(FALCOM_NRD_ENABLED)
-    ProcessNrdProbeReadbacks(s);
-#endif
     auto& transfer = s.di_transfer;
     if (rtxdi::TransferAttemptDuplicate(transfer.attempted_frame, transfer.attempted_generation, in.frame, s.generation)) {
       result.status = rtxdi::InputStatus::AlreadyAttempted;
@@ -1187,50 +503,11 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       return finish();
     }
     const uint64_t consumer_completed = (s.fence11 ? s.fence11->GetCompletedValue() : 0u);
-    if (!rtxdi::CanReuseDiOutput(slot.output_staged
-#if defined(FALCOM_NRD_ENABLED)
-                                     || slot.nrd_diffuse_staged
-#endif
-                                 ,
-                                 slot.output_c_fence, consumer_completed)) {
-      result.status = rtxdi::InputStatus::Busy;
-      return finish();
-    }
     slot.regir_source_identity = {};
     bool perf_timing = false;
     if (perf_gather && slot.perf_pending) {
       rtxdi::RecordGpuTimingSkipEvent(&bvh::g_perf_gate.rtxdi_timing_skip_events);
     }
-    if (diagnostic_enabled && (slot.output_staged
-#if defined(FALCOM_NRD_ENABLED)
-                               || slot.nrd_diffuse_staged
-#endif
-                               )) {
-      rtxdi::RecordDiagnostic(diagnostics, diagnostic_epoch,
-                              {.owner_generation = s.generation,
-                               .frame = in.frame,
-                               .capture_frame = slot.output_frame,
-                               .fence = slot.output_c_fence,
-                               .value0 = slot.output_b_fence,
-                               .scene_slot = slot.output_scene_slot,
-                               .transfer_slot = static_cast<int32_t>(k),
-                               .stage = rtxdi::DiagnosticStage::SlotConsumer,
-                               .reason = rtxdi::DiagnosticReason::None,
-                               .operation = rtxdi::DiagnosticOperation::Retire});
-    }
-    slot.output_staged = false;
-    slot.sun_detail_identity = {};
-#if defined(FALCOM_NRD_ENABLED)
-    slot.debug_distance_identity = {};
-#endif
-#if defined(FALCOM_NRD_ENABLED)
-    slot.nrd_diffuse_staged = false;
-    slot.nrd_diffuse_identity = {};
-    slot.nrd.diffuse_publication_recorded = false;
-#endif
-    slot.n1_staged = false;
-    slot.n1_configuration_version = RTXDI_N1_CONFIG_VERSION;
-    slot.n1_brdf_config = in.n1_brdf_config;
     slot.output_b_fence = 0u;
     slot.output_c_fence = 0u;
     result.stage = rtxdi::InputStage::Allocate;
@@ -1249,7 +526,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       return finish();
     }
     // Each slot is replaced only after its B fence completes.
-    if (!slot.allocator || slot.width != in.width || slot.height != in.height || slot.local != in.local || slot.sun != in.sun
+    if (!slot.allocator || slot.width != in.width || slot.height != in.height || slot.local != in.local
         || slot.motion_available != motion_available) {
       if (transfer.configuration_generation == UINT64_MAX) {
         result.status = rtxdi::InputStatus::AllocationFailed;
@@ -1268,15 +545,6 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                  &candidate.lights,
                  &candidate.tiles,
                  &candidate.deferred,
-                 &candidate.di_resolved,
-                 &candidate.sun_visibility,
-                 &candidate.sun_detail,
-                 &candidate.n1_diffuse,
-                 &candidate.n1_specular,
-                 &candidate.n1_status,
-#if defined(FALCOM_NRD_ENABLED)
-                 &candidate.nrd_diffuse_publication,
-#endif
              }) {
           if (shared->srv11.handle) {
             device->destroy_resource_view(shared->srv11);
@@ -1305,30 +573,8 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
              && make_shared(&candidate.lights, DXGI_FORMAT_R32G32B32A32_UINT, 4096u, RTXDI_INPUT_LIGHT_ROWS)
              && make_shared(&candidate.tiles, DXGI_FORMAT_R32G32B32A32_UINT, 4096u, RTXDI_INPUT_TILE_ROWS)
              && make_shared(&candidate.deferred, DXGI_FORMAT_R32G32B32A32_UINT, 4096u, RTXDI_INPUT_DEFERRED_ROWS);
-        if (ok) ok = make_shared(&candidate.di_resolved, DXGI_FORMAT_R32G32B32A32_UINT, in.width, in.height);
-        if (ok) {
-          // Private N1 reference outputs; they are not bound by the game lighting path.
-          const HRESULT n1_diffuse_hr = CreateRt12Shared(s, device, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                                         in.width, in.height, 1u, true, &candidate.n1_diffuse);
-          const HRESULT n1_specular_hr = SUCCEEDED(n1_diffuse_hr)
-                                             ? CreateRt12Shared(s, device, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                                                in.width, in.height, 1u, true, &candidate.n1_specular)
-                                             : n1_diffuse_hr;
-          if (SUCCEEDED(n1_specular_hr)) {
-            const HRESULT n1_status_hr = CreateRt12Shared(s, device, DXGI_FORMAT_R32_UINT,
-                                                          in.width, in.height, 1u, true, &candidate.n1_status);
-            candidate.n1_resources_ready = SUCCEEDED(n1_status_hr);
-          }
-        }
       }
       if (ok && motion_available) ok = make_shared(&candidate.motion, DXGI_FORMAT_R32G32B32A32_FLOAT, in.width, in.height);
-      if (ok && in.sun) ok = make_shared(&candidate.sun_visibility, DXGI_FORMAT_R32_UINT, in.width, in.height);
-#if defined(FALCOM_NRD_ENABLED)
-      if (ok && in.local) {
-        CreateRt12Shared(s, device, DXGI_FORMAT_R16G16B16A16_FLOAT, in.width, in.height, 1u, true,
-                         &candidate.nrd_diffuse_publication);
-      }
-#endif
       const auto make_buffer = [&](uint64_t bytes, ComPtr<ID3D12Resource>* buffer) {
         allocation_error = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COMMON,
                                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, *buffer);
@@ -1343,19 +589,10 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
              && make_buffer(uint64_t{RTXDI_INPUT_MAX_DEFERRED} * RTXDI_INPUT_DEFERRED_STRIDE, &candidate.deferred_buffer);
       }
       if (ok && in.local) {
-        const uint64_t pixels = uint64_t{in.width} * in.height;
-        ok = pixels <= UINT64_MAX / sizeof(RtxdiDiRawResult)
-             && make_buffer(uint64_t{RTXDI_INPUT_MAX_LIGHTS} * sizeof(uint32_t), &candidate.light_types)
+        ok = make_buffer(uint64_t{RTXDI_INPUT_MAX_LIGHTS} * sizeof(uint32_t), &candidate.light_types)
              && make_buffer(uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * sizeof(RtxdiLightTableEntry), &candidate.light_table)
              && make_buffer(uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * sizeof(uint32_t), &candidate.previous_to_current)
-             && make_buffer(uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * sizeof(uint32_t), &candidate.current_to_previous)
-             && make_buffer(pixels * sizeof(RtxdiDiRawResult), &candidate.di_results);
-        if (ok) {
-          allocation_error = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_UPLOAD,
-                                              kRtxdiFrameCbvBytes, D3D12_RESOURCE_STATE_GENERIC_READ,
-                                              D3D12_RESOURCE_FLAG_NONE, candidate.di_frame_upload);
-          ok = SUCCEEDED(allocation_error);
-        }
+             && make_buffer(uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * sizeof(uint32_t), &candidate.current_to_previous);
         if (ok) {
           allocation_error = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_UPLOAD,
                                               uint64_t{RTXDI_LIGHT_TABLE_CAPACITY} * 2u * sizeof(uint32_t),
@@ -1422,15 +659,6 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                &slot.lights,
                &slot.tiles,
                &slot.deferred,
-               &slot.di_resolved,
-               &slot.sun_visibility,
-               &slot.sun_detail,
-               &slot.n1_diffuse,
-               &slot.n1_specular,
-               &slot.n1_status,
-#if defined(FALCOM_NRD_ENABLED)
-               &slot.nrd_diffuse_publication,
-#endif
            }) {
         if (shared->srv11.handle) {
           device->destroy_resource_view(shared->srv11);
@@ -1444,68 +672,13 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       candidate.width = in.width;
       candidate.height = in.height;
       candidate.local = in.local;
-      candidate.sun = in.sun;
       candidate.motion_available = motion_available;
-      candidate.n1_configuration_version = 1u;
-      candidate.n1_brdf_config = in.n1_brdf_config;
       candidate.tile_count = 0u;
-      candidate.output_staged = false;
       slot = std::move(candidate);
       candidate_guard.release();
       for (Rt12DiTransferSlot& transfer_slot : transfer.slots) transfer_slot.regir_source_identity = {};
       transfer.owner_generation = s.generation;
       ++transfer.configuration_generation;
-    }
-    if (in.sun && !slot.sun_results) {
-      uint64_t output_bytes = 0u;
-      if (!rtxdi::CheckedSunResultBytes(in.width, in.height, &output_bytes)) {
-        result.status = rtxdi::InputStatus::AllocationFailed;
-        result.error = E_INVALIDARG;
-        return finish();
-      }
-      const HRESULT output_hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT,
-                                                 output_bytes, D3D12_RESOURCE_STATE_COMMON,
-                                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, slot.sun_results);
-      if (FAILED(output_hr)) {
-        result.status = rtxdi::InputStatus::AllocationFailed;
-        result.error = output_hr;
-        return finish();
-      }
-    }
-    if (in.sun && rtxdi::SunAccumulationAllowed(in.effective_settings.relax_diffuse, rr::RrRequested() || rr::RrOwnsDenoise()) && !slot.sun_history) {
-      D3D12_RESOURCE_DESC history_desc = {};
-      history_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-      history_desc.Width = in.width;
-      history_desc.Height = in.height;
-      history_desc.DepthOrArraySize = 1u;
-      history_desc.MipLevels = 1u;
-      history_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
-      history_desc.SampleDesc.Count = 1u;
-      history_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-      history_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-      D3D12_HEAP_PROPERTIES history_heap = {};
-      history_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-      history_heap.CreationNodeMask = 1u;
-      history_heap.VisibleNodeMask = 1u;
-      const HRESULT history_hr = s.device12->CreateCommittedResource(&history_heap, D3D12_HEAP_FLAG_NONE, &history_desc,
-                                                                    D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                                    IID_PPV_ARGS(&slot.sun_history));
-      if (FAILED(history_hr)) {
-        result.status = rtxdi::InputStatus::AllocationFailed;
-        result.error = history_hr;
-        return finish();
-      }
-    }
-    const bool sun_detail_requested = in.sun
-                                      && RtxdiSunDetailExportRequested(in.effective_debug_view, in.sun_detail_view);
-    if (sun_detail_requested && (!slot.sun_detail.texture12 || slot.sun_detail.width != in.width
-                                 || slot.sun_detail.height != in.height)) {
-      Rt12Shared detail_candidate;
-      if (SUCCEEDED(CreateRt12Shared(s, device, DXGI_FORMAT_R32G32B32A32_UINT, in.width, in.height, 1u, true,
-                                     &detail_candidate))) {
-        RetireShared(s, slot.sun_detail, slot.output_b_fence);
-        slot.sun_detail = std::move(detail_candidate);
-      }
     }
     if (rtxdi::CanStartGpuTiming(perf_gather
                                      && perf_epoch == bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed),
@@ -1593,117 +766,6 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       transfer.unpack_root = std::move(root);
       transfer.unpack_pso = std::move(pso);
     }
-    if (in.sun && (!transfer.sun_root || !transfer.sun_pso)) {
-      D3D12_DESCRIPTOR_RANGE ranges[8] = {};
-      ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-      ranges[0].NumDescriptors = 4u;
-      ranges[0].BaseShaderRegister = 0u;
-      ranges[0].OffsetInDescriptorsFromTableStart = 0u;
-      ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-      ranges[1].NumDescriptors = 3u;
-      ranges[1].BaseShaderRegister = 14u;
-      ranges[1].OffsetInDescriptorsFromTableStart = 4u;
-      ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-      ranges[2].NumDescriptors = 1u;
-      ranges[2].BaseShaderRegister = 29u;
-      ranges[2].OffsetInDescriptorsFromTableStart = 7u;
-      ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-      ranges[3].NumDescriptors = 1u;
-      ranges[3].BaseShaderRegister = 30u;
-      ranges[3].OffsetInDescriptorsFromTableStart = 8u;
-      ranges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-      ranges[4].NumDescriptors = 3u;
-      ranges[4].BaseShaderRegister = 31u;
-      ranges[4].OffsetInDescriptorsFromTableStart = 9u;
-      ranges[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-      ranges[5].NumDescriptors = 1u;
-      ranges[5].OffsetInDescriptorsFromTableStart = 12u;
-      ranges[6].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-      ranges[6].NumDescriptors = 1u;
-      ranges[6].BaseShaderRegister = 1u;
-      ranges[6].OffsetInDescriptorsFromTableStart = 13u;
-      ranges[7].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-      ranges[7].NumDescriptors = 1u;
-      ranges[7].BaseShaderRegister = 61u;
-      ranges[7].OffsetInDescriptorsFromTableStart = 16u;
-      D3D12_ROOT_PARAMETER params[2] = {};
-      params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-      params[0].Constants.Num32BitValues = 25u;
-      params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-      params[1].DescriptorTable.NumDescriptorRanges = 8u;
-      params[1].DescriptorTable.pDescriptorRanges = ranges;
-      D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-      root_desc.NumParameters = 2u;
-      root_desc.pParameters = params;
-      ComPtr<ID3DBlob> blob, error;
-      ComPtr<ID3D12RootSignature> root;
-      ComPtr<ID3D12PipelineState> pso;
-      HRESULT hr = s.serialize(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
-      if (SUCCEEDED(hr)) {
-        hr = s.device12->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root));
-      }
-#if defined(__world_rtxdi_sun_visibility_EMBED_FILE)
-      if (SUCCEEDED(hr)) {
-        D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
-        desc.pRootSignature = root.Get();
-        desc.CS = {__world_rtxdi_sun_visibility.data(), __world_rtxdi_sun_visibility.size()};
-        hr = s.device12->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso));
-      }
-#else
-      hr = E_FAIL;
-#endif
-      if (FAILED(hr)) {
-        result.status = rtxdi::InputStatus::AllocationFailed;
-        result.error = hr;
-        return finish();
-      }
-      transfer.sun_root = std::move(root);
-      transfer.sun_pso = std::move(pso);
-    }
-    if (in.sun && (!transfer.sun_accumulate_root || !transfer.sun_accumulate_pso)) {
-      D3D12_DESCRIPTOR_RANGE ranges[2] = {};
-      ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-      ranges[0].NumDescriptors = 8u;
-      ranges[0].BaseShaderRegister = 0u;
-      ranges[0].OffsetInDescriptorsFromTableStart = 0u;
-      ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-      ranges[1].NumDescriptors = 3u;
-      ranges[1].BaseShaderRegister = 0u;
-      ranges[1].OffsetInDescriptorsFromTableStart = 8u;
-      D3D12_ROOT_PARAMETER params[2] = {};
-      params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-      params[0].Constants.Num32BitValues = 5u;
-      params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-      params[1].DescriptorTable.NumDescriptorRanges = 2u;
-      params[1].DescriptorTable.pDescriptorRanges = ranges;
-      D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-      root_desc.NumParameters = 2u;
-      root_desc.pParameters = params;
-      ComPtr<ID3DBlob> blob, error;
-      ComPtr<ID3D12RootSignature> root;
-      ComPtr<ID3D12PipelineState> pso;
-      HRESULT hr = s.serialize(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
-      if (SUCCEEDED(hr)) {
-        hr = s.device12->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root));
-      }
-#if defined(__world_rtxdi_sun_accumulate_EMBED_FILE)
-      if (SUCCEEDED(hr)) {
-        D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
-        desc.pRootSignature = root.Get();
-        desc.CS = {__world_rtxdi_sun_accumulate.data(), __world_rtxdi_sun_accumulate.size()};
-        hr = s.device12->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso));
-      }
-#else
-      hr = E_FAIL;
-#endif
-      if (FAILED(hr)) {
-        result.status = rtxdi::InputStatus::AllocationFailed;
-        result.error = hr;
-        return finish();
-      }
-      transfer.sun_accumulate_root = std::move(root);
-      transfer.sun_accumulate_pso = std::move(pso);
-    }
     if (!transfer.list) {
       ComPtr<ID3D12GraphicsCommandList4> list;
       HRESULT hr = s.device12->CreateCommandList(0u, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.allocator.Get(), nullptr, IID_PPV_ARGS(&list));
@@ -1753,10 +815,6 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
                             s.generation, in.frame, in.scene_slot, static_cast<int32_t>(k),
                             allocation_scene_evidence, allocation_native_evidence, true);
     }
-#if defined(FALCOM_NRD_ENABLED)
-    CaptureNrdCameraRows(reinterpret_cast<uintptr_t>(device), in, scene_range, allocation_copy_window.copied_rows,
-                         s.generation, &slot.nrd.camera);
-#endif
     const reshade::api::resource_view retained[9] = {
         in.depth, in.normal, in.local ? in.color : reshade::api::resource_view{},
         in.local ? in.mrt1 : reshade::api::resource_view{}, in.local ? in.mrt2 : reshade::api::resource_view{},
@@ -1901,317 +959,6 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
     transfer.list->SetComputeRootDescriptorTable(1u, slot.descriptors->GetGPUDescriptorHandleForHeapStart());
     const uint32_t texels = (std::max)({96u, counts[0] * 7u, counts[1] * 36u, counts[2] * 9u});
     transfer.list->Dispatch((texels + 63u) / 64u, 1u, 1u);
-    bool sun_detail_recorded = false;
-    bool sun_accumulated = false;
-    bool sun_history_used = false;
-    bool perf_sun_recorded = false;
-    if (in.sun) {
-      const auto sun_cpu_start = bvh::PerfNow();
-      Rt12Slot& scene = s.lighting_slots[static_cast<uint32_t>(in.scene_slot)];
-      const bool gc = s.scene_gc;
-      ID3D12Resource* vertices = gc ? g_rt12_gc_scene.vertices : s.arenas[kRt12ArenaVertices].buffer.Get();
-      const uint64_t vertex_count = gc ? g_rt12_gc_scene.vertex_count : s.arenas[kRt12ArenaVertices].used;
-      ID3D12Resource* indices = gc ? g_rt12_gc_scene.indices : s.arenas[kRt12ArenaIndices].buffer.Get();
-      const uint64_t index_count = gc ? g_rt12_gc_scene.index_count : s.arenas[kRt12ArenaIndices].used;
-      ID3D12Resource* mesh_table = gc ? scene.gc_meshes.Get() : s.mesh_table.Get();
-      const uint64_t mesh_count = gc ? bvh::kGcMaxEntries : s.mesh_count;
-      ID3D12Resource* uv_arena = gc ? g_rt12_gc_scene.uvs : s.arenas[kRt12ArenaUvs].buffer.Get();
-      const uint64_t uv_count = gc ? g_rt12_gc_scene.uv_count : s.arenas[kRt12ArenaUvs].used;
-      ID3D12Resource* dynamic_vertices = s.scene_dynamic_count != 0u ? s.dynamic_vertices.Get() : nullptr;
-      const bool scene_resources_valid = scene.tlas && scene.instance_table && vertices && indices && mesh_table
-                                         && uv_arena && s.atlas.texture12 && s.materials
-                                         && (s.scene_dynamic_count == 0u || dynamic_vertices);
-      const uint64_t pixels = (uint64_t{in.width} * in.height);
-      const auto query_cpu = [&](uint32_t index) {
-        auto handle = slot.descriptors->GetCPUDescriptorHandleForHeapStart();
-        handle.ptr += static_cast<SIZE_T>(index) * s.descriptor_size;
-        return handle;
-      };
-      const auto query_buffer_srv = [&](uint32_t index, ID3D12Resource* resource, uint32_t stride, uint64_t count) {
-        const D3D12_SHADER_RESOURCE_VIEW_DESC view = Rt12BufferSrv(stride, count);
-        native->CreateShaderResourceView(resource, &view, query_cpu(index));
-      };
-      query_buffer_srv(8u, vertices, 16u, vertex_count);
-      query_buffer_srv(9u, indices, kRt12ArenaStride[kRt12ArenaIndices], index_count);
-      query_buffer_srv(10u, mesh_table, sizeof(bvh::WorldMeshGPU), mesh_count);
-      query_buffer_srv(11u, scene.instance_table.Get(), sizeof(bvh::WorldInstanceGPU), scene.instance_count);
-      query_buffer_srv(12u, uv_arena, kRt12ArenaStride[kRt12ArenaUvs], uv_count);
-      D3D12_SHADER_RESOURCE_VIEW_DESC atlas_srv = {};
-      atlas_srv.Format = DXGI_FORMAT_R32_UINT;
-      atlas_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-      atlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      atlas_srv.Texture2DArray.MipLevels = 1u;
-      atlas_srv.Texture2DArray.ArraySize = kRt12AlphaSlices;
-      native->CreateShaderResourceView(s.atlas.texture12.Get(), &atlas_srv, query_cpu(13u));
-      query_buffer_srv(14u, s.materials.Get(), 32u, kRt12AlphaSlices);
-      D3D12_SHADER_RESOURCE_VIEW_DESC tlas_srv = {};
-      tlas_srv.Format = DXGI_FORMAT_UNKNOWN;
-      tlas_srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
-      tlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      tlas_srv.RaytracingAccelerationStructure.Location = (scene.tlas ? scene.tlas->GetGPUVirtualAddress() : 0u);
-      native->CreateShaderResourceView(nullptr, &tlas_srv, query_cpu(15u));
-      query_buffer_srv(16u, dynamic_vertices, 16u,
-                       dynamic_vertices ? uint64_t{kRt12CarrierWidth} * kRt12CarrierHeight : 1u);
-      const D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv = Rt12TextureSrv(DXGI_FORMAT_R32_FLOAT);
-      native->CreateShaderResourceView(slot.depth.texture12.Get(), &depth_srv, query_cpu(17u));
-      native->CreateShaderResourceView(slot.normal.texture12.Get(), &srv, query_cpu(18u));
-      native->CreateShaderResourceView(slot.scene.texture12.Get(), &srv, query_cpu(19u));
-      native->CreateShaderResourceView(s.noise.texture12.Get(), &srv, query_cpu(24u));
-      D3D12_UNORDERED_ACCESS_VIEW_DESC result_uav = {};
-      result_uav.Format = DXGI_FORMAT_UNKNOWN;
-      result_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-      result_uav.Buffer.NumElements = static_cast<UINT>(pixels);
-      result_uav.Buffer.StructureByteStride = RTXDI_SUN_RESULT_STRIDE;
-      native->CreateUnorderedAccessView(slot.sun_results.Get(), nullptr, &result_uav, query_cpu(20u));
-      D3D12_UNORDERED_ACCESS_VIEW_DESC visibility_uav = {};
-      visibility_uav.Format = DXGI_FORMAT_R32_UINT;
-      visibility_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-      native->CreateUnorderedAccessView(slot.sun_visibility.texture12.Get(), nullptr, &visibility_uav, query_cpu(21u));
-
-      std::vector<D3D12_RESOURCE_BARRIER> query_barriers;
-      query_barriers.reserve(16u);
-      for (ID3D12Resource* resource : {slot.depth.texture12.Get(), slot.normal.texture12.Get(), vertices, indices,
-                                       mesh_table, scene.instance_table.Get(), uv_arena,
-                                       s.atlas.texture12.Get(), s.materials.Get(), dynamic_vertices, s.noise.texture12.Get()}) {
-        if (resource) Transition(query_barriers, resource, D3D12_RESOURCE_STATE_COMMON,
-                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-      }
-      Transition(query_barriers, slot.sun_results.Get(), D3D12_RESOURCE_STATE_COMMON,
-                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      Transition(query_barriers, slot.sun_visibility.texture12.Get(), D3D12_RESOURCE_STATE_COMMON,
-                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      transfer.list->ResourceBarrier(static_cast<UINT>(query_barriers.size()), query_barriers.data());
-      ID3D12DescriptorHeap* query_heaps[] = {slot.descriptors.Get()};
-      transfer.list->SetDescriptorHeaps(1u, query_heaps);
-      transfer.list->SetComputeRootSignature(transfer.sun_root.Get());
-      transfer.list->SetPipelineState(transfer.sun_pso.Get());
-      const float maximum_distance = rtxdi::FiniteClamped(rtxdi::g_sun_max_ray_distance, 100.f, 1.f, 500.f);
-      const float environment_bias = rtxdi::FiniteClamped(rtxdi::g_sun_normal_bias, 0.02f, 0.f, 0.5f);
-      const float character_bias = rtxdi::FiniteClamped(rtxdi::g_sun_character_normal_bias, 0.02f, 0.f, 0.5f);
-      const bool sun_half = rtxdi::FiniteClamped(rtxdi::g_sun_trace_resolution, 0.f, 0.f, 1.f) > 0.5f;
-      const float sun_disk_tan = std::tan(rtxdi::FiniteClamped(rtxdi::g_sun_light_size, 0.f, 0.f, 5.f) * 0.5f * std::numbers::pi_v<float> / 180.f);
-      const float foliage_transmission = rtxdi::FiniteClamped(rtxdi::g_sun_foliage_transmission, 0.f, 0.f, 1.f);
-      const uint32_t params[25] = {in.width, in.height, std::bit_cast<uint32_t>(maximum_distance),
-                                   std::bit_cast<uint32_t>(environment_bias), std::bit_cast<uint32_t>(character_bias),
-                                   std::bit_cast<uint32_t>(s.scene_coverage_min[0]),
-                                   std::bit_cast<uint32_t>(s.scene_coverage_min[1]),
-                                   std::bit_cast<uint32_t>(s.scene_coverage_min[2]),
-                                   std::bit_cast<uint32_t>(s.scene_coverage_size),
-                                   scene_resources_valid ? 1u : 0u, s.scene_coverage_valid ? 1u : 0u, in.frame,
-                                   rtxdi::g_sun_casters_only > 0.5f ? bvh::kInstanceShadowCaster : 0u,
-                                   sun_half ? RTXDI_SUN_TRACE_HALF : RTXDI_SUN_TRACE_FULL,
-                                   std::bit_cast<uint32_t>(sun_disk_tan),
-                                   (rtxdi::g_sun_isfast > 0.5f && s.noise_source != 0u) ? 1u : 0u,
-                                   in.frame % 32u,
-                                   std::bit_cast<uint32_t>(foliage_transmission),
-                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_wind_transmission, 0.5f, 0.f, 1.f)), 0u,
-                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_tint_r, 1.f, 0.f, 1.f)),
-                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_tint_g, 1.f, 0.f, 1.f)),
-                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_foliage_tint_b, 1.f, 0.f, 1.f)),
-                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_wind_softening, 0.5f, 0.f, 4.f)),
-                                   std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_sun_character_self_softening, 0.f, 0.f, 10.f))};
-      transfer.list->SetComputeRoot32BitConstants(0u, 25u, params, 0u);
-      auto query_gpu = slot.descriptors->GetGPUDescriptorHandleForHeapStart();
-      query_gpu.ptr += static_cast<UINT64>(8u) * s.descriptor_size;
-      transfer.list->SetComputeRootDescriptorTable(1u, query_gpu);
-      if (perf_timing) transfer.list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 14u);
-      if (sun_half) {
-        transfer.list->Dispatch(((in.width + 1u) / 2u + 7u) / 8u, ((in.height + 1u) / 2u + 7u) / 8u, 1u);
-        query_barriers.clear();
-        UavBarrier(query_barriers, slot.sun_results.Get());
-        UavBarrier(query_barriers, slot.sun_visibility.texture12.Get());
-        transfer.list->ResourceBarrier(static_cast<UINT>(query_barriers.size()), query_barriers.data());
-        transfer.list->SetComputeRoot32BitConstant(0u, RTXDI_SUN_TRACE_RESOLVE, 13u);
-      }
-      transfer.list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
-      query_barriers.clear();
-      UavBarrier(query_barriers, slot.sun_results.Get());
-      UavBarrier(query_barriers, slot.sun_visibility.texture12.Get());
-      if (motion_available && slot.sun_history && rtxdi::SunAccumulationAllowed(in.effective_settings.relax_diffuse, rr::RrRequested() || rr::RrOwnsDenoise())) {
-        transfer.list->ResourceBarrier(static_cast<UINT>(query_barriers.size()), query_barriers.data());
-        query_barriers.clear();
-        Rt12DiTransferSlot* history_slot = nullptr;
-        if (transfer.sun_history_transfer_slot >= 0 && transfer.sun_history_transfer_slot < static_cast<int32_t>(kRt12Slots)) {
-          Rt12DiTransferSlot& candidate = transfer.slots[static_cast<uint32_t>(transfer.sun_history_transfer_slot)];
-          const bool previous_inputs = candidate.sun && candidate.sun_history && candidate.width == in.width
-                                       && candidate.height == in.height && candidate.depth.texture12
-                                       && candidate.normal.texture12 && candidate.scene.texture12;
-          if (rtxdi::ValidDiHistoryIdentity({.previous_frame = transfer.sun_history_frame,
-                                             .current_frame = in.frame,
-                                             .previous_width = transfer.sun_history_width,
-                                             .previous_height = transfer.sun_history_height,
-                                             .current_width = in.width,
-                                             .current_height = in.height,
-                                             .previous_transfer_slot = transfer.sun_history_transfer_slot,
-                                             .current_transfer_slot = static_cast<int32_t>(k),
-                                             .previous_owner_generation = transfer.sun_history_owner_generation,
-                                             .current_owner_generation = s.generation,
-                                             .previous_configuration_generation = transfer.sun_history_configuration_generation,
-                                             .current_configuration_generation = transfer.configuration_generation,
-                                             .motion_available = true,
-                                             .previous_inputs_available = previous_inputs})) {
-            history_slot = &candidate;
-          }
-        }
-        const Rt12DiTransferSlot& history_inputs = (history_slot != nullptr ? *history_slot : slot);
-        const D3D12_SHADER_RESOURCE_VIEW_DESC motion_srv = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_FLOAT);
-        const D3D12_SHADER_RESOURCE_VIEW_DESC history_srv = Rt12TextureSrv(DXGI_FORMAT_R16G16_FLOAT);
-        const D3D12_UNORDERED_ACCESS_VIEW_DESC history_uav = Rt12TextureUav(DXGI_FORMAT_R16G16_FLOAT);
-        native->CreateShaderResourceView(slot.depth.texture12.Get(), &depth_srv, query_cpu(25u));
-        native->CreateShaderResourceView(slot.normal.texture12.Get(), &srv, query_cpu(26u));
-        native->CreateShaderResourceView(slot.scene.texture12.Get(), &srv, query_cpu(27u));
-        native->CreateShaderResourceView(slot.motion.texture12.Get(), &motion_srv, query_cpu(28u));
-        native->CreateShaderResourceView(history_inputs.depth.texture12.Get(), &depth_srv, query_cpu(29u));
-        native->CreateShaderResourceView(history_inputs.normal.texture12.Get(), &srv, query_cpu(30u));
-        native->CreateShaderResourceView(history_inputs.scene.texture12.Get(), &srv, query_cpu(31u));
-        native->CreateShaderResourceView(history_slot != nullptr ? history_slot->sun_history.Get() : nullptr, &history_srv, query_cpu(32u));
-        native->CreateUnorderedAccessView(slot.sun_results.Get(), nullptr, &result_uav, query_cpu(33u));
-        native->CreateUnorderedAccessView(slot.sun_visibility.texture12.Get(), nullptr, &visibility_uav, query_cpu(34u));
-        native->CreateUnorderedAccessView(slot.sun_history.Get(), nullptr, &history_uav, query_cpu(35u));
-        std::vector<D3D12_RESOURCE_BARRIER> accumulate_barriers;
-        Transition(accumulate_barriers, slot.motion.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        Transition(accumulate_barriers, slot.sun_history.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        if (history_slot != nullptr) {
-          for (ID3D12Resource* resource : {history_slot->depth.texture12.Get(), history_slot->normal.texture12.Get(),
-                                           history_slot->scene.texture12.Get(), history_slot->sun_history.Get()}) {
-            Transition(accumulate_barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-          }
-        }
-        transfer.list->ResourceBarrier(static_cast<UINT>(accumulate_barriers.size()), accumulate_barriers.data());
-        transfer.list->SetComputeRootSignature(transfer.sun_accumulate_root.Get());
-        transfer.list->SetPipelineState(transfer.sun_accumulate_pso.Get());
-        const uint32_t accumulate_params[5] = {in.width, in.height, history_slot != nullptr ? 1u : 0u,
-                                               static_cast<uint32_t>(std::lround(rtxdi::FiniteClamped(rtxdi::g_sun_accumulation_frames, 8.f, 2.f, 32.f))),
-                                               std::bit_cast<uint32_t>(foliage_transmission)};
-        transfer.list->SetComputeRoot32BitConstants(0u, 5u, accumulate_params, 0u);
-        auto accumulate_gpu = slot.descriptors->GetGPUDescriptorHandleForHeapStart();
-        accumulate_gpu.ptr += static_cast<UINT64>(25u) * s.descriptor_size;
-        transfer.list->SetComputeRootDescriptorTable(1u, accumulate_gpu);
-        transfer.list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
-        accumulate_barriers.clear();
-        Transition(accumulate_barriers, slot.motion.texture12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-        Transition(accumulate_barriers, slot.sun_history.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-        if (history_slot != nullptr) {
-          for (ID3D12Resource* resource : {history_slot->depth.texture12.Get(), history_slot->normal.texture12.Get(),
-                                           history_slot->scene.texture12.Get(), history_slot->sun_history.Get()}) {
-            Transition(accumulate_barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-          }
-        }
-        transfer.list->ResourceBarrier(static_cast<UINT>(accumulate_barriers.size()), accumulate_barriers.data());
-        UavBarrier(query_barriers, slot.sun_visibility.texture12.Get());
-        sun_accumulated = true;
-        sun_history_used = history_slot != nullptr;
-      }
-      if (sun_detail_requested && slot.sun_detail.texture12) {
-#if defined(__world_rtxdi_sun_detail_EMBED_FILE)
-        if (!transfer.sun_detail_root || !transfer.sun_detail_pso) {
-          D3D12_DESCRIPTOR_RANGE detail_ranges[2] = {};
-          detail_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-          detail_ranges[0].NumDescriptors = 1u;
-          detail_ranges[0].BaseShaderRegister = 0u;
-          detail_ranges[0].OffsetInDescriptorsFromTableStart = 0u;
-          detail_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-          detail_ranges[1].NumDescriptors = 1u;
-          detail_ranges[1].BaseShaderRegister = 0u;
-          detail_ranges[1].OffsetInDescriptorsFromTableStart = 1u;
-          D3D12_ROOT_PARAMETER detail_parameters[2] = {};
-          detail_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-          detail_parameters[0].Constants.Num32BitValues = 3u;
-          detail_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-          detail_parameters[1].DescriptorTable.NumDescriptorRanges = 2u;
-          detail_parameters[1].DescriptorTable.pDescriptorRanges = detail_ranges;
-          D3D12_ROOT_SIGNATURE_DESC detail_desc = {};
-          detail_desc.NumParameters = static_cast<UINT>(std::size(detail_parameters));
-          detail_desc.pParameters = detail_parameters;
-          ComPtr<ID3DBlob> detail_blob, detail_errors;
-          ComPtr<ID3D12RootSignature> detail_root;
-          ComPtr<ID3D12PipelineState> detail_pso;
-          HRESULT detail_hr = s.serialize(&detail_desc, D3D_ROOT_SIGNATURE_VERSION_1, &detail_blob, &detail_errors);
-          if (SUCCEEDED(detail_hr)) {
-            detail_hr = s.device12->CreateRootSignature(0u, detail_blob->GetBufferPointer(), detail_blob->GetBufferSize(),
-                                                        IID_PPV_ARGS(&detail_root));
-          }
-          if (SUCCEEDED(detail_hr)) {
-            D3D12_COMPUTE_PIPELINE_STATE_DESC detail_pipeline = {};
-            detail_pipeline.pRootSignature = detail_root.Get();
-            detail_pipeline.CS = {__world_rtxdi_sun_detail.data(), __world_rtxdi_sun_detail.size()};
-            detail_hr = s.device12->CreateComputePipelineState(&detail_pipeline, IID_PPV_ARGS(&detail_pso));
-          }
-          if (SUCCEEDED(detail_hr)) {
-            transfer.sun_detail_root = std::move(detail_root);
-            transfer.sun_detail_pso = std::move(detail_pso);
-          }
-        }
-        if (transfer.sun_detail_root && transfer.sun_detail_pso) {
-          D3D12_SHADER_RESOURCE_VIEW_DESC detail_srv = {};
-          detail_srv.Format = DXGI_FORMAT_UNKNOWN;
-          detail_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-          detail_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-          detail_srv.Buffer.NumElements = static_cast<UINT>(pixels);
-          detail_srv.Buffer.StructureByteStride = RTXDI_SUN_RESULT_STRIDE;
-          native->CreateShaderResourceView(slot.sun_results.Get(), &detail_srv, query_cpu(22u));
-          D3D12_UNORDERED_ACCESS_VIEW_DESC detail_uav = {};
-          detail_uav.Format = DXGI_FORMAT_R32G32B32A32_UINT;
-          detail_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-          native->CreateUnorderedAccessView(slot.sun_detail.texture12.Get(), nullptr, &detail_uav, query_cpu(23u));
-          std::array<D3D12_RESOURCE_BARRIER, 2u> detail_barriers = {};
-          detail_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-          detail_barriers[0].Transition.pResource = slot.sun_results.Get();
-          detail_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-          detail_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-          detail_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-          detail_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-          detail_barriers[1].Transition.pResource = slot.sun_detail.texture12.Get();
-          detail_barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-          detail_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-          detail_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-          transfer.list->ResourceBarrier(static_cast<UINT>(detail_barriers.size()), detail_barriers.data());
-          transfer.list->SetComputeRootSignature(transfer.sun_detail_root.Get());
-          transfer.list->SetPipelineState(transfer.sun_detail_pso.Get());
-          const std::array<uint32_t, 3u> detail_constants = {in.width, in.height, static_cast<uint32_t>(pixels)};
-          transfer.list->SetComputeRoot32BitConstants(0u, static_cast<UINT>(detail_constants.size()),
-                                                      detail_constants.data(), 0u);
-          auto detail_gpu = slot.descriptors->GetGPUDescriptorHandleForHeapStart();
-          detail_gpu.ptr += static_cast<UINT64>(22u) * s.descriptor_size;
-          transfer.list->SetComputeRootDescriptorTable(1u, detail_gpu);
-          transfer.list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
-          detail_barriers = {};
-          detail_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-          detail_barriers[0].UAV.pResource = slot.sun_detail.texture12.Get();
-          detail_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-          detail_barriers[1].Transition.pResource = slot.sun_results.Get();
-          detail_barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-          detail_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-          detail_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-          transfer.list->ResourceBarrier(static_cast<UINT>(detail_barriers.size()), detail_barriers.data());
-          detail_barriers = {};
-          detail_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-          detail_barriers[0].Transition.pResource = slot.sun_detail.texture12.Get();
-          detail_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-          detail_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-          detail_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-          transfer.list->ResourceBarrier(1u, detail_barriers.data());
-          sun_detail_recorded = true;
-        }
-#endif
-      }
-      for (ID3D12Resource* resource : {slot.depth.texture12.Get(), slot.normal.texture12.Get(), vertices, indices,
-                                       mesh_table, scene.instance_table.Get(), uv_arena,
-                                       s.atlas.texture12.Get(), s.materials.Get(), dynamic_vertices, s.noise.texture12.Get()}) {
-        if (resource) Transition(query_barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                 D3D12_RESOURCE_STATE_COMMON);
-      }
-      Transition(query_barriers, slot.sun_results.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                 D3D12_RESOURCE_STATE_COMMON);
-      Transition(query_barriers, slot.sun_visibility.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                 D3D12_RESOURCE_STATE_COMMON);
-      transfer.list->ResourceBarrier(static_cast<UINT>(query_barriers.size()), query_barriers.data());
-      if (perf_timing) {
-        transfer.list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 15u);
-        perf_sun_recorded = true;
-      }
-      bvh::AddPerfBlockMs(bvh::kPerfBlockRtxdiSunCpu, bvh::LiveElapsedMs(sun_cpu_start));
-    }
     barriers.clear();
     for (auto* buffer : buffers)
       if (buffer) {
@@ -2232,10 +979,6 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       transfer.list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1u);
       transfer.list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0u, 2u,
                                       slot.perf_readback.Get(), 0u);
-      if (perf_sun_recorded) {
-        transfer.list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 14u, 2u,
-                                        slot.perf_readback.Get(), 112u);
-      }
     }
     hr = transfer.list->Close();
     if (FAILED(hr)) {
@@ -2277,7 +1020,6 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
         slot.perf_pending = true;
         slot.perf_fence = b;
         slot.perf_valid_mask = 1u;
-        if (perf_sun_recorded) slot.perf_valid_mask |= 128u;
       }
       Rt12Slot& scene = s.lighting_slots[static_cast<uint32_t>(in.scene_slot)];
       scene.fence_value = (std::max)(scene.fence_value, b);
@@ -2295,48 +1037,6 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
       slot.light_count = result.layout.lights_copied;
       slot.tile_count = result.layout.tiles_copied;
       slot.deferred_count = result.layout.deferred_copied;
-      if (in.sun) {
-        slot.output_b_fence = b;
-        slot.output_c_fence = 0u;
-        slot.output_owner_generation = s.generation;
-        slot.output_configuration_generation = transfer.configuration_generation;
-        slot.sun_configuration_generation = transfer.configuration_generation;
-        slot.output_frame = in.frame;
-        slot.output_width = in.width;
-        slot.output_height = in.height;
-        slot.output_scene_slot = in.scene_slot;
-        slot.output_transfer_slot = static_cast<int32_t>(k);
-        slot.output_staged = true;
-        slot.sun_accumulated = sun_accumulated;
-        slot.sun_history_used = sun_history_used;
-        if (sun_accumulated) {
-          transfer.sun_history_frame = in.frame;
-          transfer.sun_history_width = in.width;
-          transfer.sun_history_height = in.height;
-          transfer.sun_history_transfer_slot = static_cast<int32_t>(k);
-          transfer.sun_history_owner_generation = s.generation;
-          transfer.sun_history_configuration_generation = transfer.configuration_generation;
-        } else {
-          transfer.sun_history_transfer_slot = -1;
-        }
-        if (sun_detail_recorded) {
-          slot.sun_detail_identity = {.source_version = 1u,
-                                      .detail_view = in.sun_detail_view,
-                                      .frame = in.frame,
-                                      .width = in.width,
-                                      .height = in.height,
-                                      .scene_slot = in.scene_slot,
-                                      .transfer_slot = static_cast<int32_t>(k),
-                                      .owner_generation = s.generation,
-                                      .transfer_configuration = transfer.configuration_generation,
-                                      .di_configuration = s.di.configuration_generation,
-                                      .settings_identity = in.effective_settings.identity,
-                                      .sun_configuration = transfer.configuration_generation,
-                                      .producer_fence_b = b,
-                                      .recorded = true,
-                                      .staged = true};
-        }
-      }
       result.fence = b;
       result.status = rtxdi::InputStatus::Ready;
       result.stage = rtxdi::InputStage::Ready;
@@ -2362,7 +1062,7 @@ inline Rt12DiInputResult TransferRtxdiInputs(reshade::api::device* device, resha
   }
 }
 
-inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, reshade::api::command_list* cmd_list,
+inline rtxdi::DiStatus DispatchLightTable(reshade::api::device* device, reshade::api::command_list* cmd_list,
                                               const Rt12DiInputViews& in, const Rt12DiInputResult& input) {
   const bvh::PoolCpuTimer cpu_timer{&bvh::g_perf_gate.rtxdi_di_cpu_us};
   using Microsoft::WRL::ComPtr;
@@ -2394,15 +1094,6 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   }
   Rt12State& s = *g_rt12;
   auto& transfer = s.di_transfer;
-#if defined(FALCOM_NRD_ENABLED)
-  ProcessNrdProbeReadbacks(s);
-  const bool nrd_requested = Rt12NrdSubmissionAllowed(rr::RrRequested(), rr::RrOwnsDenoise(),
-                                                      in.effective_settings.relax_diffuse);
-  if (!nrd_requested) {
-    transfer.nrd.qualification = {};
-    transfer.nrd.history = {};
-  }
-#endif
   const uint32_t slot_index = static_cast<uint32_t>(input.transfer_slot);
   Rt12DiTransferSlot& slot = transfer.slots[slot_index];
   slot.regir_source_identity = {};
@@ -2412,27 +1103,6 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                            && slot.perf_owner_generation == s.generation
                            && slot.perf_frame == in.frame && slot.perf_width == in.width && slot.perf_height == in.height
                            && slot.perf_settings_identity == in.effective_settings.identity;
-  bool perf_distance_recorded = false;
-  bool perf_nrd_recorded = false;
-  bool perf_temporal_recorded = false;
-#if defined(FALCOM_NRD_ENABLED)
-  slot.nrd.dispatch_ready = false;
-  slot.nrd.diffuse_output_valid = false;
-#endif
-  bool spatial_ran = false;
-  bool temporal_ran = false;
-  bool history_valid = false;
-#if defined(FALCOM_NRD_ENABLED)
-  bool nrd_probe_recorded = false;
-  bool nrd_dispatch_recorded = false;
-  bool nrd_history_reset = false;
-  Rt12NrdHistoryIdentity nrd_accepted_history = {};
-  rtxdi::NrdGateSnapshot nrd_gate = {};
-#endif
-  uint32_t spatial_source_index = UINT32_MAX;
-  uint32_t spatial_output_index = UINT32_MAX;
-  uint32_t temporal_source_index = UINT32_MAX;
-  uint32_t temporal_output_index = UINT32_MAX;
   const auto publish = [&](rtxdi::DiStatus status, int32_t error = 0, uint64_t fence = 0u) {
     if (perf_gather && bvh::g_perf_gate.gather.load(std::memory_order_relaxed)
         && bvh::g_perf_gate.gather_epoch.load(std::memory_order_relaxed) == perf_epoch) {
@@ -2459,13 +1129,6 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                               .relax_selected = in.effective_settings.relax_diffuse,
                               .scene_slot = in.scene_slot,
                               .transfer_slot = input.transfer_slot,
-                              .spatial_ran = spatial_ran,
-                              .temporal_ran = temporal_ran,
-                              .history_valid = history_valid,
-                              .temporal_source_index = temporal_source_index,
-                              .temporal_output_index = temporal_output_index,
-                              .spatial_source_index = spatial_source_index,
-                              .spatial_output_index = spatial_output_index,
                               .output_frame = slot.output_frame,
                               .output_width = slot.output_width,
                               .output_height = slot.output_height,
@@ -2475,16 +1138,6 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                               .output_fence_c = slot.output_c_fence,
                               .output_scene_slot = slot.output_scene_slot,
                               .output_transfer_slot = slot.output_transfer_slot,
-                              .output_staged = slot.output_staged && in.local_di,
-#if defined(FALCOM_NRD_ENABLED)
-                              .nrd_diffuse_staged = slot.nrd_diffuse_staged,
-                              .nrd_diffuse_bound = false,
-                              .nrd_diffuse_lighting_draw_seen = false,
-                              .nrd_diffuse_frame = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.frame : UINT32_MAX,
-                              .nrd_diffuse_transfer_slot = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.transfer_slot : -1,
-                              .nrd_diffuse_fence_b = slot.nrd_diffuse_staged ? slot.nrd_diffuse_identity.producer_fence_b : 0u,
-                              .nrd_gate = nrd_gate,
-#endif
                               .output_bound = false,
                               .output_bound_frame = UINT32_MAX,
                               .output_bound_transfer_slot = -1,
@@ -2546,7 +1199,6 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       .input_ready = input.status == rtxdi::InputStatus::Ready,
       .transfer_available = slot.fence_value == input.fence,
       // Same-queue ordering and the reservoir UAV/transition barriers guard reuse, so presence is enough here.
-      .reservoir_available = s.di.reservoirs != nullptr,
   });
   if (gate != rtxdi::DiSubmissionGate::Ready) {
     const rtxdi::DiStatus status = (gate == rtxdi::DiSubmissionGate::Busy                    ? rtxdi::DiStatus::Busy
@@ -2562,10 +1214,10 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       || reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()) != s.ctx11.Get()) {  // NOLINT(performance-no-int-to-ptr)
     return publish(rtxdi::DiStatus::WaitingInput);
   }
-  if (!s.di.context || s.di.settings_identity != in.effective_settings.identity || !slot.local
+  if (s.di.settings_identity != in.effective_settings.identity || !slot.local
       || slot.width != in.width || slot.height != in.height || !slot.di_allocator
       || !slot.di_descriptors || !slot.light_types || !slot.light_table || !slot.previous_to_current
-      || !slot.current_to_previous || !slot.light_map_reset_upload || !slot.di_results || !slot.di_frame_upload) {
+      || !slot.current_to_previous || !slot.light_map_reset_upload) {
     slot.light_table_status = RTXDI_LIGHT_TABLE_STATUS_RESOURCE_FAILED;
     slot.light_table_reason = RTXDI_LIGHT_TABLE_STATUS_RESOURCE_FAILED;
     return publish(rtxdi::DiStatus::Failed, E_FAIL);
@@ -2602,6 +1254,7 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   slot.light_table_truncated = input.layout.lights_truncated;
   slot.light_table_remap_enabled = in.effective_settings.stable_light_remap;
   Rt12DiTransferSlot* previous_slot = nullptr;
+  bool history_valid = false;
   if (s.di.history_valid && s.di.history_transfer_slot >= 0 && s.di.history_transfer_slot < static_cast<int32_t>(kRt12Slots)) {
     Rt12DiTransferSlot& candidate = transfer.slots[static_cast<uint32_t>(s.di.history_transfer_slot)];
     const bool previous_inputs = candidate.local && candidate.width == in.width && candidate.height == in.height
@@ -2626,13 +1279,6 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
       history_valid = true;
     }
   }
-  s.di.frame.parameters = rtxdi::MakeDiFrameParameters(s.di.config, *s.di.context);
-  if (in.effective_settings.stable_light_remap) {
-    s.di.frame.parameters.flags |= RTXDI_FRAME_FLAG_STABLE_LIGHT_REMAP;
-  }
-  s.di.frame.parameters.width = in.width;
-  s.di.frame.parameters.height = in.height;
-  s.di.frame.parameters.history_valid = history_valid ? 1u : 0u;
   bool diag_armed = diagnostic_enabled && !slot.diag_pending && in.frame >= transfer.diag_next_frame;
   if (diag_armed) {
     if (!transfer.diag_zero) {
@@ -2665,15 +1311,6 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     }
     diag_armed = transfer.diag_zero && slot.diag_counters && slot.diag_readback;
   }
-  if (diag_armed) s.di.frame.parameters.flags |= RTXDI_FRAME_FLAG_DIAGNOSTICS;
-  s.di.frame.parameters.lights.localLightBufferRegion = {0u, light_count, 0u, 0u};
-  s.di.frame.parameters.lights.infiniteLightBufferRegion = {};
-  s.di.frame.parameters.lights.environmentLightParams = {};
-  if (!rtxdi::ValidDiBufferIndices(s.di.frame.parameters.di.bufferIndices, in.effective_settings)) {
-    return publish(rtxdi::DiStatus::Failed, E_FAIL);
-  }
-  temporal_source_index = s.di.frame.parameters.di.bufferIndices.temporalResamplingInputBufferIndex;
-  temporal_output_index = s.di.frame.parameters.di.bufferIndices.temporalResamplingOutputBufferIndex;
 
   if (!transfer.classify_root || !transfer.classify_pso) {
     D3D12_DESCRIPTOR_RANGE ranges[2] = {};
@@ -2756,88 +1393,6 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     transfer.light_table_root = std::move(root);
     transfer.light_table_pso = std::move(pso);
   }
-  if (!transfer.initial_di_root || !transfer.initial_di_pso || !transfer.temporal_di_pso || !transfer.spatial_di_pso) {
-    D3D12_DESCRIPTOR_RANGE ranges[14] = {};
-    const auto set_range = [&](uint32_t index, D3D12_DESCRIPTOR_RANGE_TYPE type, uint32_t count,
-                               uint32_t shader_register, uint32_t offset) {
-      ranges[index].RangeType = type;
-      ranges[index].NumDescriptors = count;
-      ranges[index].BaseShaderRegister = shader_register;
-      ranges[index].OffsetInDescriptorsFromTableStart = offset;
-    };
-    set_range(0u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4u, 0u, 0u);
-    set_range(1u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3u, 14u, 4u);
-    set_range(2u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 6u, 17u, 7u);
-    set_range(3u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 29u, 13u);
-    set_range(4u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 30u, 14u);
-    set_range(5u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3u, 31u, 15u);
-    set_range(6u, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3u, 0u, 18u);
-    set_range(7u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 9u, 34u, 22u);
-    set_range(8u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2u, 43u, 31u);
-    set_range(9u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 45u, 35u);
-    set_range(10u, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3u, 3u, 36u);
-    set_range(11u, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1u, 6u, 39u);
-    set_range(12u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1u, 61u, 21u);
-    set_range(13u, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4u, 46u, 40u);
-    D3D12_ROOT_PARAMETER params[4] = {};
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants.Num32BitValues = 22u;
-    params[0].Constants.ShaderRegister = 0u;
-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[1].Descriptor.ShaderRegister = 1u;
-    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[2].DescriptorTable.NumDescriptorRanges = 14u;
-    params[2].DescriptorTable.pDescriptorRanges = ranges;
-    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[3].Constants.Num32BitValues = 10u;
-    params[3].Constants.ShaderRegister = 12u;
-    D3D12_ROOT_SIGNATURE_DESC desc = {};
-    desc.NumParameters = 4u;
-    desc.pParameters = params;
-    ComPtr<ID3DBlob> blob, error;
-    ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> pso, temporal_pso, spatial_pso, n1_resolve_pso;
-    HRESULT hr = s.serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
-    if (SUCCEEDED(hr)) hr = s.device12->CreateRootSignature(0u, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root));
-#if defined(__world_rtxdi_initial_di_EMBED_FILE) && defined(__world_rtxdi_temporal_di_EMBED_FILE) && defined(__world_rtxdi_spatial_di_EMBED_FILE)
-    if (SUCCEEDED(hr)) {
-      D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {};
-      pipeline.pRootSignature = root.Get();
-      pipeline.CS = {__world_rtxdi_temporal_di.data(), __world_rtxdi_temporal_di.size()};
-      hr = s.device12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&temporal_pso));
-    }
-    if (SUCCEEDED(hr)) {
-      D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {};
-      pipeline.pRootSignature = root.Get();
-      pipeline.CS = {__world_rtxdi_initial_di.data(), __world_rtxdi_initial_di.size()};
-      hr = s.device12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&pso));
-    }
-    if (SUCCEEDED(hr)) {
-      D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {};
-      pipeline.pRootSignature = root.Get();
-      pipeline.CS = {__world_rtxdi_spatial_di.data(), __world_rtxdi_spatial_di.size()};
-      hr = s.device12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&spatial_pso));
-    }
-#if defined(__world_rtxdi_reconstruct_EMBED_FILE)
-    if (SUCCEEDED(hr)) {
-      D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {};
-      pipeline.pRootSignature = root.Get();
-      pipeline.CS = {__world_rtxdi_reconstruct.data(), __world_rtxdi_reconstruct.size()};
-      if (FAILED(s.device12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&n1_resolve_pso)))) {
-        n1_resolve_pso.Reset();
-      }
-    }
-#endif
-#else
-    hr = E_FAIL;
-#endif
-    if (FAILED(hr)) return publish(rtxdi::DiStatus::Failed, hr);
-    transfer.initial_di_root = std::move(root);
-    transfer.initial_di_pso = std::move(pso);
-    transfer.temporal_di_pso = std::move(temporal_pso);
-    transfer.spatial_di_pso = std::move(spatial_pso);
-    transfer.n1_resolve_pso = std::move(n1_resolve_pso);
-  }
 
   if (!transfer.di_list) {
     ComPtr<ID3D12GraphicsCommandList4> list;
@@ -2848,16 +1403,10 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     transfer.di_list = std::move(list);
   }
   HRESULT hr = slot.di_allocator->Reset();
-  if (SUCCEEDED(hr)) hr = transfer.di_list->Reset(slot.di_allocator.Get(), transfer.initial_di_pso.Get());
+  if (SUCCEEDED(hr)) hr = transfer.di_list->Reset(slot.di_allocator.Get(), transfer.classify_pso.Get());
   if (FAILED(hr)) return publish(rtxdi::DiStatus::Failed, hr);
   if (perf_timing) transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u);
 
-  void* frame_bytes = nullptr;
-  const D3D12_RANGE no_reads = {0u, 0u};
-  hr = slot.di_frame_upload->Map(0u, &no_reads, &frame_bytes);
-  if (FAILED(hr) || !frame_bytes) return publish(rtxdi::DiStatus::Failed, FAILED(hr) ? hr : E_FAIL);
-  std::memcpy(frame_bytes, &s.di.frame, sizeof(s.di.frame));
-  slot.di_frame_upload->Unmap(0u, nullptr);
 
   ID3D12Device5* native = s.device12.Get();
   const auto cpu_at = [&](uint32_t index) {
@@ -2878,98 +1427,9 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     native->CreateUnorderedAccessView(resource, nullptr, &view, cpu_at(index));
   };
   Rt12Slot& scene = s.lighting_slots[static_cast<uint32_t>(in.scene_slot)];
-  const bool gc = s.scene_gc;
-  ID3D12Resource* vertices = gc ? g_rt12_gc_scene.vertices : s.arenas[kRt12ArenaVertices].buffer.Get();
-  const uint64_t vertex_count = gc ? g_rt12_gc_scene.vertex_count : s.arenas[kRt12ArenaVertices].used;
-  ID3D12Resource* indices = gc ? g_rt12_gc_scene.indices : s.arenas[kRt12ArenaIndices].buffer.Get();
-  const uint64_t index_count = gc ? g_rt12_gc_scene.index_count : s.arenas[kRt12ArenaIndices].used;
-  ID3D12Resource* mesh_table = gc ? scene.gc_meshes.Get() : s.mesh_table.Get();
-  const uint64_t mesh_count = gc ? bvh::kGcMaxEntries : s.mesh_count;
-  ID3D12Resource* uv_arena = gc ? g_rt12_gc_scene.uvs : s.arenas[kRt12ArenaUvs].buffer.Get();
-  const uint64_t uv_count = gc ? g_rt12_gc_scene.uv_count : s.arenas[kRt12ArenaUvs].used;
-  ID3D12Resource* dynamic_vertices = s.scene_dynamic_count != 0u ? s.dynamic_vertices.Get() : nullptr;
-  const bool scene_resources_valid = scene.tlas && scene.instance_table && vertices && indices && mesh_table && uv_arena
-                                     && s.atlas.texture12 && s.materials
-                                     && (s.scene_dynamic_count == 0u || dynamic_vertices);
-  write_buffer_srv(0u, vertices, 16u, vertex_count);
-  write_buffer_srv(1u, indices, kRt12ArenaStride[kRt12ArenaIndices], index_count);
-  write_buffer_srv(2u, mesh_table, sizeof(bvh::WorldMeshGPU), mesh_count);
-  write_buffer_srv(3u, scene.instance_table.Get(), sizeof(bvh::WorldInstanceGPU), scene.instance_count);
-  write_buffer_srv(4u, uv_arena, kRt12ArenaStride[kRt12ArenaUvs], uv_count);
-  D3D12_SHADER_RESOURCE_VIEW_DESC atlas_srv = {};
-  atlas_srv.Format = DXGI_FORMAT_R32_UINT;
-  atlas_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-  atlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  atlas_srv.Texture2DArray.MipLevels = 1u;
-  atlas_srv.Texture2DArray.ArraySize = kRt12AlphaSlices;
-  native->CreateShaderResourceView(s.atlas.texture12.Get(), &atlas_srv, cpu_at(5u));
-  write_buffer_srv(6u, s.materials.Get(), 32u, kRt12AlphaSlices);
-  write_buffer_srv(7u, slot.lights_buffer.Get(), RTXDI_INPUT_LIGHT_STRIDE, light_count);
-  write_buffer_srv(8u, slot.light_types.Get(), sizeof(uint32_t), RTXDI_INPUT_MAX_LIGHTS);
-  const D3D12_SHADER_RESOURCE_VIEW_DESC float4_texture = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_FLOAT);
-  const D3D12_SHADER_RESOURCE_VIEW_DESC uint4_texture = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT);
-  native->CreateShaderResourceView(slot.color.texture12.Get(), &float4_texture, cpu_at(9u));
-  native->CreateShaderResourceView(slot.mrt2.texture12.Get(), &uint4_texture, cpu_at(10u));
-  write_buffer_srv(11u, slot.deferred_buffer.Get(), RTXDI_INPUT_DEFERRED_STRIDE, input.layout.deferred_copied);
-  D3D12_SHADER_RESOURCE_VIEW_DESC tlas_srv = {};
-  tlas_srv.Format = DXGI_FORMAT_UNKNOWN;
-  tlas_srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
-  tlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  tlas_srv.RaytracingAccelerationStructure.Location = (scene.tlas ? scene.tlas->GetGPUVirtualAddress() : 0u);
-  D3D12_SHADER_RESOURCE_VIEW_DESC neighbor_srv = {};
-  neighbor_srv.Format = DXGI_FORMAT_R8G8_SNORM;
-  neighbor_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-  neighbor_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  neighbor_srv.Buffer.NumElements = rtxdi::kNeighborCount;
-  native->CreateShaderResourceView(s.di.neighbors.Get(), &neighbor_srv, cpu_at(12u));
-  native->CreateShaderResourceView(nullptr, &tlas_srv, cpu_at(13u));
-  write_buffer_srv(14u, dynamic_vertices, 16u, dynamic_vertices ? uint64_t{kRt12CarrierWidth} * kRt12CarrierHeight : 1u);
-  const D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv = Rt12TextureSrv(DXGI_FORMAT_R32_FLOAT);
-  native->CreateShaderResourceView(slot.depth.texture12.Get(), &depth_srv, cpu_at(15u));
-  native->CreateShaderResourceView(slot.normal.texture12.Get(), &uint4_texture, cpu_at(16u));
-  native->CreateShaderResourceView(slot.scene.texture12.Get(), &uint4_texture, cpu_at(17u));
-  const uint64_t reservoir_count = s.di.config.reservoir_bytes / sizeof(RTXDI_PackedDIReservoir);
-  const uint64_t pixel_count = uint64_t{in.width} * in.height;
-  write_buffer_uav(18u, s.di.reservoirs.Get(), sizeof(RTXDI_PackedDIReservoir), reservoir_count);
-  write_buffer_uav(19u, slot.di_results.Get(), sizeof(RtxdiDiRawResult), pixel_count);
-  D3D12_UNORDERED_ACCESS_VIEW_DESC resolved_uav = {};
-  resolved_uav.Format = DXGI_FORMAT_R32G32B32A32_UINT;
-  resolved_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-  native->CreateUnorderedAccessView(slot.di_resolved.texture12.Get(), nullptr, &resolved_uav, cpu_at(20u));
   write_buffer_srv(33u, slot.tiles_buffer.Get(), RTXDI_INPUT_TILE_STRIDE, tile_count);
   write_buffer_uav(34u, slot.light_types.Get(), sizeof(uint32_t), RTXDI_INPUT_MAX_LIGHTS);
-  const D3D12_SHADER_RESOURCE_VIEW_DESC motion_srv = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_FLOAT);
-  native->CreateShaderResourceView(slot.motion.texture12.Get(), &motion_srv, cpu_at(22u));
   Rt12DiTransferSlot& history_slot = (previous_slot ? *previous_slot : slot);
-  write_buffer_srv(40u, slot.light_table.Get(), sizeof(RtxdiLightTableEntry), RTXDI_LIGHT_TABLE_CAPACITY);
-  write_buffer_srv(41u, history_slot.light_table.Get(), sizeof(RtxdiLightTableEntry), RTXDI_LIGHT_TABLE_CAPACITY);
-  write_buffer_srv(42u, slot.previous_to_current.Get(), sizeof(uint32_t), RTXDI_LIGHT_TABLE_CAPACITY);
-  write_buffer_srv(43u, slot.current_to_previous.Get(), sizeof(uint32_t), RTXDI_LIGHT_TABLE_CAPACITY);
-  native->CreateShaderResourceView(history_slot.depth.texture12.Get(), &depth_srv, cpu_at(23u));
-  native->CreateShaderResourceView(history_slot.normal.texture12.Get(), &uint4_texture, cpu_at(24u));
-  native->CreateShaderResourceView(history_slot.scene.texture12.Get(), &uint4_texture, cpu_at(25u));
-  native->CreateShaderResourceView(history_slot.color.texture12.Get(), &float4_texture, cpu_at(26u));
-  native->CreateShaderResourceView(history_slot.mrt2.texture12.Get(), &uint4_texture, cpu_at(27u));
-  write_buffer_srv(28u, history_slot.deferred_buffer.Get(), RTXDI_INPUT_DEFERRED_STRIDE, history_slot.deferred_count);
-  write_buffer_srv(29u, history_slot.lights_buffer.Get(), RTXDI_INPUT_LIGHT_STRIDE, history_slot.light_count);
-  write_buffer_srv(30u, history_slot.light_types.Get(), sizeof(uint32_t), RTXDI_INPUT_MAX_LIGHTS);
-  write_buffer_srv(31u, slot.tiles_buffer.Get(), RTXDI_INPUT_TILE_STRIDE, tile_count);
-  write_buffer_srv(32u, history_slot.tiles_buffer.Get(), RTXDI_INPUT_TILE_STRIDE, history_slot.tile_count);
-  const D3D12_SHADER_RESOURCE_VIEW_DESC mrt1_srv = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT);
-  native->CreateShaderResourceView(slot.mrt1.texture12.Get(), &mrt1_srv, cpu_at(35u));
-  const auto write_texture_uav = [&](uint32_t index, ID3D12Resource* resource, DXGI_FORMAT format) {
-    D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
-    view.Format = format;
-    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    native->CreateUnorderedAccessView(resource, nullptr, &view, cpu_at(index));
-  };
-  const bool n1_ready = transfer.n1_resolve_pso && slot.n1_resources_ready && slot.n1_diffuse.texture12 && slot.n1_specular.texture12
-                        && slot.n1_status.texture12;
-  if (n1_ready) {
-    write_texture_uav(36u, slot.n1_diffuse.texture12.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
-    write_texture_uav(37u, slot.n1_specular.texture12.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
-    write_texture_uav(38u, slot.n1_status.texture12.Get(), DXGI_FORMAT_R32_UINT);
-  }
   D3D12_UNORDERED_ACCESS_VIEW_DESC diag_view = {};
   diag_view.Format = DXGI_FORMAT_R32_TYPELESS;
   diag_view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -2985,7 +1445,6 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   write_buffer_uav(55u, slot.previous_to_current.Get(), sizeof(uint32_t), RTXDI_LIGHT_TABLE_CAPACITY);
   write_buffer_uav(56u, slot.current_to_previous.Get(), sizeof(uint32_t), RTXDI_LIGHT_TABLE_CAPACITY);
   write_buffer_uav(57u, diag_armed ? slot.diag_counters.Get() : nullptr, sizeof(uint32_t), RTXDI_DIAG_COUNTER_COUNT);
-  native->CreateShaderResourceView(s.noise.texture12.Get(), &uint4_texture, cpu_at(21u));
 
   ID3D12DescriptorHeap* heaps[] = {slot.di_descriptors.Get()};
   transfer.di_list->SetDescriptorHeaps(1u, heaps);
@@ -3066,687 +1525,6 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   Transition(barriers, slot.current_to_previous.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-  barriers.clear();
-  ID3D12Resource* history_resources[] = {history_slot.depth.texture12.Get(), history_slot.normal.texture12.Get(),
-                                         history_slot.scene.texture12.Get(), history_slot.color.texture12.Get(),
-                                         history_slot.mrt2.texture12.Get(), history_slot.deferred_buffer.Get(),
-                                         history_slot.tiles_buffer.Get()};
-  for (ID3D12Resource* resource : {vertices, indices, mesh_table, scene.instance_table.Get(), uv_arena, s.atlas.texture12.Get(),
-                                   s.materials.Get(), slot.color.texture12.Get(),
-                                   slot.mrt1.texture12.Get(), slot.mrt2.texture12.Get(), slot.deferred_buffer.Get(), dynamic_vertices, slot.depth.texture12.Get(),
-                                   slot.normal.texture12.Get(), slot.scene.texture12.Get(), slot.motion.texture12.Get(), s.noise.texture12.Get()}) {
-    if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-  }
-  if (history_valid) {
-    for (ID3D12Resource* resource : history_resources) {
-      if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    }
-  }
-  Transition(barriers, s.di.reservoirs.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  Transition(barriers, slot.di_results.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  Transition(barriers, slot.di_resolved.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-#if defined(FALCOM_NRD_ENABLED)
-  bool camera_candidate_valid = false;
-  bool projection_compatible = false;
-  const bool nrd_allowed = nrd_requested;
-  nrd_gate.frame = in.frame;
-  bool gate_open = true;
-  const auto nrd_gate_link = [&](rtxdi::NrdGateLink link, bool pass, uint8_t reason) {
-    if (!gate_open) return false;
-    nrd_gate.status[static_cast<uint32_t>(link)] = pass ? rtxdi::kNrdGatePass : rtxdi::kNrdGateFail;
-    nrd_gate.reason[static_cast<uint32_t>(link)] = pass ? 0u : reason;
-    gate_open = pass;
-    return pass;
-  };
-#endif
-  if (in.local_di) {
-    const auto initial_cpu_start = bvh::PerfNow();
-    transfer.di_list->SetComputeRootSignature(transfer.initial_di_root.Get());
-    transfer.di_list->SetPipelineState(transfer.initial_di_pso.Get());
-    const float local_light_size = rtxdi::FiniteClamped(rtxdi::g_local_light_size, 0.f, 0.f, 0.5f);
-    const uint32_t sun_params[22] = {in.width, in.height, scene_resources_valid ? 1u : 0u, s.scene_coverage_valid ? 1u : 0u,
-                                     light_count,
-                                     std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_normal_bias, 0.02f, 0.f, 0.5f)),
-                                     std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_character_normal_bias, 0.02f, 0.f, 0.5f)),
-                                     std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_light_clearance, 0.2f, 0.f, 1.f)),
-                                     std::bit_cast<uint32_t>(s.scene_coverage_min[0]),
-                                     std::bit_cast<uint32_t>(s.scene_coverage_min[1]),
-                                     std::bit_cast<uint32_t>(s.scene_coverage_min[2]),
-                                     std::bit_cast<uint32_t>(s.scene_coverage_size), input.layout.deferred_copied,
-                                     history_slot.deferred_count, history_slot.light_count, tile_count, history_slot.tile_count,
-                                     std::bit_cast<uint32_t>(local_light_size),
-                                     (rtxdi::g_local_isfast > 0.5f && s.noise_source != 0u && local_light_size > 0.f) ? 1u : 0u,
-                                     in.frame % 32u, std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_character_self_softening, 0.f, 0.f, 2.f)),
-                                     rtxdi::g_local_light_clamp_enabled > 0.5f ? std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_light_clamp, 16.f, 1.f, 1000.f)) : 0u};
-    transfer.di_list->SetComputeRoot32BitConstants(0u, 22u, sun_params, 0u);
-    transfer.di_list->SetComputeRootConstantBufferView(1u, slot.di_frame_upload->GetGPUVirtualAddress());
-    transfer.di_list->SetComputeRootDescriptorTable(2u, slot.di_descriptors->GetGPUDescriptorHandleForHeapStart());
-    if (perf_timing) transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 8u);
-    transfer.di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
-    if (perf_timing) transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 9u);
-    barriers.clear();
-    UavBarrier(barriers, s.di.reservoirs.Get());
-    transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-    bvh::AddPerfBlockMs(bvh::kPerfBlockRtxdiInitialCpu, bvh::LiveElapsedMs(initial_cpu_start));
-    if (history_valid && in.effective_settings.temporal_enabled) {
-      const auto temporal_cpu_start = bvh::PerfNow();
-      transfer.di_list->SetPipelineState(transfer.temporal_di_pso.Get());
-      if (perf_timing) transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 10u);
-      transfer.di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
-      if (perf_timing) {
-        transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 11u);
-        perf_temporal_recorded = true;
-      }
-      barriers.clear();
-      UavBarrier(barriers, s.di.reservoirs.Get());
-      transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-      bvh::AddPerfBlockMs(bvh::kPerfBlockRtxdiTemporalCpu, bvh::LiveElapsedMs(temporal_cpu_start));
-    }
-    const auto spatial_cpu_start = bvh::PerfNow();
-    transfer.di_list->SetPipelineState(transfer.spatial_di_pso.Get());
-    if (perf_timing) transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 12u);
-    transfer.di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
-    if (perf_timing) transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 13u);
-    bvh::AddPerfBlockMs(bvh::kPerfBlockRtxdiSpatialCpu, bvh::LiveElapsedMs(spatial_cpu_start));
-    if (n1_ready) {
-      barriers.clear();
-      UavBarrier(barriers, slot.di_results.Get());
-      transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-      barriers.clear();
-      Transition(barriers, slot.n1_diffuse.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      Transition(barriers, slot.n1_specular.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      Transition(barriers, slot.n1_status.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-      transfer.di_list->SetPipelineState(transfer.n1_resolve_pso.Get());
-      const float env_keep = 1.f - rtxdi::FiniteClamped(rtxdi::g_local_shadow_darkening, 1.f, 0.f, 1.f);
-      const float char_keep = 1.f - rtxdi::FiniteClamped(rtxdi::g_local_character_shadow_darkening, 1.f, 0.f, 1.f);
-      const uint32_t n1_constants[10] = {
-          RTXDI_N1_CONFIG_VERSION,
-          std::bit_cast<uint32_t>(in.n1_brdf_config[0]),
-          std::bit_cast<uint32_t>(in.n1_brdf_config[1]),
-          std::bit_cast<uint32_t>(in.n1_brdf_config[2]),
-          std::bit_cast<uint32_t>(in.n1_brdf_config[3]),
-          std::bit_cast<uint32_t>(in.n1_brdf_config[4]),
-          std::bit_cast<uint32_t>(in.n1_brdf_config[5]),
-          std::bit_cast<uint32_t>(in.n1_brdf_config[6]),
-          std::bit_cast<uint32_t>(env_keep),
-          std::bit_cast<uint32_t>(char_keep),
-      };
-      transfer.di_list->SetComputeRoot32BitConstants(3u, 10u, n1_constants, 0u);
-      transfer.di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
-    }
-#if defined(FALCOM_NRD_ENABLED)
-    nrd_gate_link(rtxdi::NrdGateLink::Requested, in.effective_settings.relax_diffuse, 1u);
-    nrd_gate_link(rtxdi::NrdGateLink::RrFree, !rr::RrRequested() && !rr::RrOwnsDenoise(), rr::RrRequested() ? 1u : 2u);
-    nrd_gate_link(rtxdi::NrdGateLink::N1Ready, n1_ready, !transfer.n1_resolve_pso ? 1u : 2u);
-    nrd_gate_link(rtxdi::NrdGateLink::History, history_valid && previous_slot != nullptr, 1u);
-    nrd_gate_link(rtxdi::NrdGateLink::Motion, input.layout.motion_available != 0u, 1u);
-    if (gate_open) {
-      nrd_gate.previous_capture_frame = previous_slot->nrd.camera.capture_frame;
-      uint8_t previous_frame_reason = 0u;
-      if (!slot.nrd.camera.valid || !previous_slot->nrd.camera.valid) {
-        previous_frame_reason = 1u;
-      } else if (slot.nrd.camera.capture_frame != in.frame || previous_slot->nrd.camera.capture_frame == UINT32_MAX
-                 || previous_slot->nrd.camera.capture_frame + 1u != in.frame) {
-        previous_frame_reason = 2u;
-      } else if (slot.nrd.camera.owner_generation != s.generation
-                 || previous_slot->nrd.camera.owner_generation != s.generation) {
-        previous_frame_reason = 3u;
-      } else if (previous_slot->di_fence_value == 0u || previous_slot->fence_value == 0u) {
-        previous_frame_reason = 4u;
-      }
-      nrd_gate_link(rtxdi::NrdGateLink::PreviousFrame, previous_frame_reason == 0u, previous_frame_reason);
-    }
-    if (nrd_allowed && n1_ready && history_valid && previous_slot != nullptr && input.layout.motion_available != 0u
-        && slot.nrd.camera.valid && previous_slot->nrd.camera.valid && slot.nrd.camera.capture_frame == in.frame
-        && previous_slot->nrd.camera.capture_frame != UINT32_MAX
-        && previous_slot->nrd.camera.capture_frame + 1u == in.frame
-        && slot.nrd.camera.owner_generation == s.generation
-        && previous_slot->nrd.camera.owner_generation == s.generation
-        && previous_slot->di_fence_value != 0u && previous_slot->fence_value != 0u) {
-      rtxdi::CameraCandidate camera_candidate;
-      if (rtxdi::BuildCameraCandidate(slot.nrd.camera.scene_rows.data(), previous_slot->nrd.camera.scene_rows.data(),
-                                      in.width, in.height, &camera_candidate)) {
-        camera_candidate_valid = true;
-        slot.nrd.camera_candidate = camera_candidate;
-        const auto& qualification = transfer.nrd.qualification;
-        projection_compatible = previous_slot != nullptr && previous_slot->nrd.camera_candidate.matrices_valid
-                                && rtxdi::CameraMatricesNear(camera_candidate.view_to_clip,
-                                                             previous_slot->nrd.camera_candidate.view_to_clip, 1.0e-4f);
-        const bool qualification_matches = rtxdi::CameraQualificationMatches(
-            qualification, s.generation, transfer.configuration_generation, slot.nrd.camera.resource,
-            in.width, in.height, camera_candidate_valid, projection_compatible);
-        if (!qualification_matches) {
-          const auto probe_record_start = std::chrono::steady_clock::now();
-          nrd_probe_recorded = RecordNrdCameraProbe(s, slot, *previous_slot, in, camera_candidate);
-          slot.nrd.probe_record_cpu_microseconds = std::chrono::duration<double, std::micro>(
-                                                       std::chrono::steady_clock::now() - probe_record_start)
-                                                       .count();
-        }
-      }
-    }
-    const auto& camera_qualification = transfer.nrd.qualification;
-    const bool keep_camera_qualified = rtxdi::CameraQualificationMatches(
-        camera_qualification, s.generation, transfer.configuration_generation, slot.nrd.camera.resource,
-        in.width, in.height, camera_candidate_valid, projection_compatible);
-    if (!nrd_probe_recorded && !keep_camera_qualified) {
-      rtxdi::ObserveCameraProbe(&transfer.nrd.qualification, in.frame, s.generation,
-                                transfer.configuration_generation, slot.nrd.camera.resource, in.width, in.height,
-                                camera_candidate_valid, false, UINT32_MAX);
-    }
-    nrd_gate.camera_passes = transfer.nrd.qualification.consecutive_passes;
-    nrd_gate.camera_correction = transfer.nrd.qualification.motion_correction_index;
-    uint8_t camera_reason = 5u;
-    if (!camera_candidate_valid) {
-      camera_reason = 1u;
-    } else if (!projection_compatible) {
-      camera_reason = 2u;
-    } else if (!transfer.nrd.qualification.qualified) {
-      camera_reason = 3u;
-    } else if (transfer.nrd.qualification.motion_correction_index >= 2u) {
-      camera_reason = 4u;
-    }
-    nrd_gate_link(rtxdi::NrdGateLink::Camera, keep_camera_qualified && transfer.nrd.qualification.motion_correction_index < 2u,
-         camera_reason);
-    if (nrd_allowed && n1_ready && keep_camera_qualified
-        && transfer.nrd.qualification.motion_correction_index < 2u) {
-      Rt12Slot& nrd_scene = s.lighting_slots[static_cast<uint32_t>(in.scene_slot)];
-      Rt12NrdSlot& nrd_slot = slot.nrd;
-      bool hitdistance_recorded = false;
-      uint8_t hitdistance_reason = 1u;
-      if (transfer.nrd_hitdistance_root && transfer.nrd_hitdistance_pso) {
-        hitdistance_recorded = true;
-      } else {
-#if defined(__world_rtxdi_nrd_hitdistance_EMBED_FILE)
-        D3D12_DESCRIPTOR_RANGE hitdistance_ranges[6] = {};
-        hitdistance_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        hitdistance_ranges[0].NumDescriptors = 4u;
-        hitdistance_ranges[0].BaseShaderRegister = 0u;
-        hitdistance_ranges[0].OffsetInDescriptorsFromTableStart = 0u;
-        hitdistance_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        hitdistance_ranges[1].NumDescriptors = 3u;
-        hitdistance_ranges[1].BaseShaderRegister = 14u;
-        hitdistance_ranges[1].OffsetInDescriptorsFromTableStart = 4u;
-        hitdistance_ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        hitdistance_ranges[2].NumDescriptors = 1u;
-        hitdistance_ranges[2].BaseShaderRegister = 29u;
-        hitdistance_ranges[2].OffsetInDescriptorsFromTableStart = 7u;
-        hitdistance_ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        hitdistance_ranges[3].NumDescriptors = 1u;
-        hitdistance_ranges[3].BaseShaderRegister = 30u;
-        hitdistance_ranges[3].OffsetInDescriptorsFromTableStart = 8u;
-        hitdistance_ranges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        hitdistance_ranges[4].NumDescriptors = 4u;
-        hitdistance_ranges[4].BaseShaderRegister = 31u;
-        hitdistance_ranges[4].OffsetInDescriptorsFromTableStart = 9u;
-        hitdistance_ranges[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        hitdistance_ranges[5].NumDescriptors = 2u;
-        hitdistance_ranges[5].BaseShaderRegister = 0u;
-        hitdistance_ranges[5].OffsetInDescriptorsFromTableStart = 13u;
-        D3D12_ROOT_PARAMETER hitdistance_parameters[3] = {};
-        hitdistance_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        hitdistance_parameters[0].Constants.ShaderRegister = 0u;
-        hitdistance_parameters[0].Constants.Num32BitValues = 12u;
-        hitdistance_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        hitdistance_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        hitdistance_parameters[1].DescriptorTable.NumDescriptorRanges = 5u;
-        hitdistance_parameters[1].DescriptorTable.pDescriptorRanges = hitdistance_ranges;
-        hitdistance_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        hitdistance_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        hitdistance_parameters[2].DescriptorTable.NumDescriptorRanges = 1u;
-        hitdistance_parameters[2].DescriptorTable.pDescriptorRanges = &hitdistance_ranges[5];
-        hitdistance_parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC hitdistance_desc = {};
-        hitdistance_desc.NumParameters = 3u;
-        hitdistance_desc.pParameters = hitdistance_parameters;
-        ComPtr<ID3DBlob> hitdistance_blob, hitdistance_errors;
-        ComPtr<ID3D12RootSignature> hitdistance_root;
-        ComPtr<ID3D12PipelineState> hitdistance_pso;
-        HRESULT hitdistance_hr = s.serialize(&hitdistance_desc, D3D_ROOT_SIGNATURE_VERSION_1,
-                                             &hitdistance_blob, &hitdistance_errors);
-        if (SUCCEEDED(hitdistance_hr)) {
-          hitdistance_hr = s.device12->CreateRootSignature(0u, hitdistance_blob->GetBufferPointer(),
-                                                           hitdistance_blob->GetBufferSize(),
-                                                           IID_PPV_ARGS(&hitdistance_root));
-        }
-        if (SUCCEEDED(hitdistance_hr)) {
-          D3D12_COMPUTE_PIPELINE_STATE_DESC hitdistance_pipeline = {};
-          hitdistance_pipeline.pRootSignature = hitdistance_root.Get();
-          hitdistance_pipeline.CS = {__world_rtxdi_nrd_hitdistance.data(),
-                                     __world_rtxdi_nrd_hitdistance.size()};
-          hitdistance_hr = s.device12->CreateComputePipelineState(&hitdistance_pipeline,
-                                                                  IID_PPV_ARGS(&hitdistance_pso));
-        }
-        if (SUCCEEDED(hitdistance_hr)) {
-          transfer.nrd_hitdistance_root = std::move(hitdistance_root);
-          transfer.nrd_hitdistance_pso = std::move(hitdistance_pso);
-          hitdistance_recorded = true;
-        }
-#endif
-      }
-
-      if (hitdistance_recorded && (!nrd_slot.hit_distance || !nrd_slot.hit_validity || !nrd_slot.hitdistance_descriptors || nrd_slot.hitdistance_width != in.width || nrd_slot.hitdistance_height != in.height)) {
-        if (!s.device12 || in.width == 0u || in.height == 0u || uint64_t{in.width} * in.height > UINT32_MAX) {
-          hitdistance_recorded = false;
-          hitdistance_reason = 2u;
-        } else {
-          const uint64_t hitdistance_bytes = uint64_t{in.width} * in.height * sizeof(uint32_t);
-          Rt12NrdSlot hitdistance_candidate;
-          D3D12_DESCRIPTOR_HEAP_DESC hitdistance_heap = {};
-          hitdistance_heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-          hitdistance_heap.NumDescriptors = 15u;
-          hitdistance_heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-          if (FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, hitdistance_bytes,
-                                      D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                      hitdistance_candidate.hit_distance))
-              || FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, hitdistance_bytes,
-                                         D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                         hitdistance_candidate.hit_validity))
-              || FAILED(s.device12->CreateDescriptorHeap(&hitdistance_heap,
-                                                         IID_PPV_ARGS(&hitdistance_candidate.hitdistance_descriptors)))) {
-            hitdistance_recorded = false;
-            hitdistance_reason = 2u;
-          } else {
-            nrd_slot.hit_distance = std::move(hitdistance_candidate.hit_distance);
-            nrd_slot.hit_validity = std::move(hitdistance_candidate.hit_validity);
-            nrd_slot.hitdistance_descriptors = std::move(hitdistance_candidate.hitdistance_descriptors);
-            nrd_slot.hitdistance_width = in.width;
-            nrd_slot.hitdistance_height = in.height;
-          }
-        }
-      }
-
-      if (hitdistance_recorded && nrd_scene.tlas && nrd_scene.instance_table && slot.n1_status.texture12
-          && vertices && indices && mesh_table && uv_arena && s.atlas.texture12 && s.materials
-          && (s.scene_dynamic_count == 0u || dynamic_vertices)) {
-        ID3D12Device* device12 = s.device12.Get();
-        ID3D12GraphicsCommandList* di_list = transfer.di_list.Get();
-        const uint32_t descriptor_stride = device12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        const D3D12_CPU_DESCRIPTOR_HANDLE cpu = nrd_slot.hitdistance_descriptors->GetCPUDescriptorHandleForHeapStart();
-        const D3D12_GPU_DESCRIPTOR_HANDLE gpu = nrd_slot.hitdistance_descriptors->GetGPUDescriptorHandleForHeapStart();
-        const auto cpu_at = [&](uint32_t index) {
-          return D3D12_CPU_DESCRIPTOR_HANDLE{cpu.ptr + static_cast<SIZE_T>(index) * descriptor_stride};
-        };
-        const auto write_buffer_srv = [&](uint32_t index, ID3D12Resource* resource, uint32_t stride, uint64_t count) {
-          const D3D12_SHADER_RESOURCE_VIEW_DESC view = Rt12BufferSrv(stride, count);
-          device12->CreateShaderResourceView(resource, &view, cpu_at(index));
-        };
-        write_buffer_srv(0u, vertices, 16u, vertex_count);
-        write_buffer_srv(1u, indices, kRt12ArenaStride[kRt12ArenaIndices], index_count);
-        write_buffer_srv(2u, mesh_table, sizeof(bvh::WorldMeshGPU), mesh_count);
-        write_buffer_srv(3u, nrd_scene.instance_table.Get(), sizeof(bvh::WorldInstanceGPU), nrd_scene.instance_count);
-        write_buffer_srv(4u, uv_arena, kRt12ArenaStride[kRt12ArenaUvs], uv_count);
-        D3D12_SHADER_RESOURCE_VIEW_DESC atlas_srv = {};
-        atlas_srv.Format = DXGI_FORMAT_R32_UINT;
-        atlas_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-        atlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        atlas_srv.Texture2DArray.MipLevels = 1u;
-        atlas_srv.Texture2DArray.ArraySize = kRt12AlphaSlices;
-        device12->CreateShaderResourceView(s.atlas.texture12.Get(), &atlas_srv, cpu_at(5u));
-        write_buffer_srv(6u, s.materials.Get(), 32u, kRt12AlphaSlices);
-        D3D12_SHADER_RESOURCE_VIEW_DESC tlas_srv = {};
-        tlas_srv.Format = DXGI_FORMAT_UNKNOWN;
-        tlas_srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
-        tlas_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        tlas_srv.RaytracingAccelerationStructure.Location = nrd_scene.tlas->GetGPUVirtualAddress();
-        device12->CreateShaderResourceView(nullptr, &tlas_srv, cpu_at(7u));
-        write_buffer_srv(8u, dynamic_vertices, 16u,
-                         dynamic_vertices ? uint64_t{kRt12CarrierWidth} * kRt12CarrierHeight : 1u);
-        const D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv = Rt12TextureSrv(DXGI_FORMAT_R32_FLOAT);
-        const D3D12_SHADER_RESOURCE_VIEW_DESC uint4_srv = Rt12TextureSrv(DXGI_FORMAT_R32G32B32A32_UINT);
-        device12->CreateShaderResourceView(slot.depth.texture12.Get(), &depth_srv, cpu_at(9u));
-        device12->CreateShaderResourceView(slot.normal.texture12.Get(), &uint4_srv, cpu_at(10u));
-        device12->CreateShaderResourceView(slot.scene.texture12.Get(), &uint4_srv, cpu_at(11u));
-        const D3D12_SHADER_RESOURCE_VIEW_DESC status_srv = Rt12TextureSrv(DXGI_FORMAT_R32_UINT);
-        device12->CreateShaderResourceView(slot.n1_status.texture12.Get(), &status_srv, cpu_at(12u));
-        D3D12_UNORDERED_ACCESS_VIEW_DESC distance_uav = {};
-        distance_uav.Format = DXGI_FORMAT_UNKNOWN;
-        distance_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-        distance_uav.Buffer.NumElements = static_cast<UINT>(uint64_t{in.width} * in.height);
-        distance_uav.Buffer.StructureByteStride = sizeof(float);
-        device12->CreateUnorderedAccessView(nrd_slot.hit_distance.Get(), nullptr, &distance_uav, cpu_at(13u));
-        distance_uav.Buffer.StructureByteStride = sizeof(uint32_t);
-        device12->CreateUnorderedAccessView(nrd_slot.hit_validity.Get(), nullptr, &distance_uav, cpu_at(14u));
-
-        std::array<D3D12_RESOURCE_BARRIER, 3u> hitdistance_barriers = {};
-        hitdistance_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        hitdistance_barriers[0].Transition.pResource = slot.n1_status.texture12.Get();
-        hitdistance_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        hitdistance_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        hitdistance_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        for (uint32_t index = 0u; index < 2u; ++index) {
-          D3D12_RESOURCE_BARRIER& barrier = hitdistance_barriers[index + 1u];
-          barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-          barrier.Transition.pResource = index == 0u ? nrd_slot.hit_distance.Get() : nrd_slot.hit_validity.Get();
-          barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-          barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-          barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        }
-        di_list->ResourceBarrier(static_cast<UINT>(hitdistance_barriers.size()), hitdistance_barriers.data());
-        ID3D12DescriptorHeap* hitdistance_heaps[] = {nrd_slot.hitdistance_descriptors.Get()};
-        di_list->SetDescriptorHeaps(1u, hitdistance_heaps);
-        di_list->SetComputeRootSignature(transfer.nrd_hitdistance_root.Get());
-        di_list->SetPipelineState(transfer.nrd_hitdistance_pso.Get());
-        const std::array<uint32_t, 12u> hitdistance_constants = {
-            in.width, in.height, in.frame, scene_resources_valid ? 1u : 0u,
-            s.scene_coverage_valid ? 1u : 0u,
-            std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_normal_bias, 0.02f, 0.f, 0.5f)),
-            std::bit_cast<uint32_t>(rtxdi::FiniteClamped(rtxdi::g_local_character_normal_bias, 0.02f, 0.f, 0.5f)),
-            std::bit_cast<uint32_t>(65504.0f),
-            std::bit_cast<uint32_t>(s.scene_coverage_min[0]),
-            std::bit_cast<uint32_t>(s.scene_coverage_min[1]),
-            std::bit_cast<uint32_t>(s.scene_coverage_min[2]),
-            std::bit_cast<uint32_t>(s.scene_coverage_size)};
-        di_list->SetComputeRoot32BitConstants(0u, static_cast<UINT>(hitdistance_constants.size()),
-                                              hitdistance_constants.data(), 0u);
-        di_list->SetComputeRootDescriptorTable(1u, gpu);
-        di_list->SetComputeRootDescriptorTable(2u, {gpu.ptr + static_cast<UINT64>(13u) * descriptor_stride});
-        if (perf_timing) di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4u);
-        di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
-        hitdistance_barriers = {};
-        hitdistance_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        hitdistance_barriers[0].UAV.pResource = nrd_slot.hit_distance.Get();
-        hitdistance_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        hitdistance_barriers[1].UAV.pResource = nrd_slot.hit_validity.Get();
-        hitdistance_barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        hitdistance_barriers[2].Transition.pResource = slot.n1_status.texture12.Get();
-        hitdistance_barriers[2].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        hitdistance_barriers[2].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        hitdistance_barriers[2].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        di_list->ResourceBarrier(static_cast<UINT>(hitdistance_barriers.size()), hitdistance_barriers.data());
-        hitdistance_barriers = {};
-        hitdistance_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        hitdistance_barriers[0].Transition.pResource = nrd_slot.hit_distance.Get();
-        hitdistance_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        hitdistance_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        hitdistance_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-        hitdistance_barriers[1] = hitdistance_barriers[0];
-        hitdistance_barriers[1].Transition.pResource = nrd_slot.hit_validity.Get();
-        di_list->ResourceBarrier(2u, hitdistance_barriers.data());
-        if (perf_timing) {
-          di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 5u);
-          perf_distance_recorded = true;
-        }
-      } else {
-        hitdistance_recorded = false;
-        hitdistance_reason = 3u;
-      }
-      const uint32_t debug_view = in.effective_debug_view;
-      const bool distance_debug_requested = RtxdiDebugDistanceExportRequested(debug_view);
-      slot.debug_distance_identity.recorded = false;
-      slot.debug_distance_identity.staged = false;
-      slot.debug_distance_identity.requested_view = debug_view;
-      if (distance_debug_requested && hitdistance_recorded && nrd_slot.hit_distance && nrd_slot.hit_validity
-          && slot.n1_status.texture12 && in.width != 0u && in.height != 0u
-          && uint64_t{in.width} * in.height <= UINT32_MAX) {
-#if defined(__world_rtxdi_debug_distance_EMBED_FILE)
-        if (!transfer.debug_distance_root || !transfer.debug_distance_pso) {
-          D3D12_DESCRIPTOR_RANGE debug_ranges[2] = {};
-          debug_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-          debug_ranges[0].NumDescriptors = 3u;
-          debug_ranges[0].BaseShaderRegister = 0u;
-          debug_ranges[0].OffsetInDescriptorsFromTableStart = 0u;
-          debug_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-          debug_ranges[1].NumDescriptors = 1u;
-          debug_ranges[1].BaseShaderRegister = 0u;
-          debug_ranges[1].OffsetInDescriptorsFromTableStart = 0u;
-          D3D12_ROOT_PARAMETER debug_parameters[3] = {};
-          debug_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-          debug_parameters[0].Constants.ShaderRegister = 0u;
-          debug_parameters[0].Constants.Num32BitValues = 3u;
-          debug_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-          debug_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-          debug_parameters[1].DescriptorTable.NumDescriptorRanges = 1u;
-          debug_parameters[1].DescriptorTable.pDescriptorRanges = &debug_ranges[0];
-          debug_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-          debug_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-          debug_parameters[2].DescriptorTable.NumDescriptorRanges = 1u;
-          debug_parameters[2].DescriptorTable.pDescriptorRanges = &debug_ranges[1];
-          debug_parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-          D3D12_ROOT_SIGNATURE_DESC debug_desc = {};
-          debug_desc.NumParameters = static_cast<UINT>(std::size(debug_parameters));
-          debug_desc.pParameters = debug_parameters;
-          ComPtr<ID3DBlob> debug_blob, debug_errors;
-          ComPtr<ID3D12RootSignature> debug_root;
-          ComPtr<ID3D12PipelineState> debug_pso;
-          HRESULT debug_hr = s.serialize(&debug_desc, D3D_ROOT_SIGNATURE_VERSION_1, &debug_blob, &debug_errors);
-          if (SUCCEEDED(debug_hr)) {
-            debug_hr = s.device12->CreateRootSignature(0u, debug_blob->GetBufferPointer(), debug_blob->GetBufferSize(),
-                                                       IID_PPV_ARGS(&debug_root));
-          }
-          if (SUCCEEDED(debug_hr)) {
-            D3D12_COMPUTE_PIPELINE_STATE_DESC debug_pipeline = {};
-            debug_pipeline.pRootSignature = debug_root.Get();
-            debug_pipeline.CS = {__world_rtxdi_debug_distance.data(), __world_rtxdi_debug_distance.size()};
-            debug_hr = s.device12->CreateComputePipelineState(&debug_pipeline, IID_PPV_ARGS(&debug_pso));
-          }
-          if (SUCCEEDED(debug_hr)) {
-            transfer.debug_distance_root = std::move(debug_root);
-            transfer.debug_distance_pso = std::move(debug_pso);
-          }
-        }
-        if (transfer.debug_distance_root && transfer.debug_distance_pso) {
-          const uint64_t pixel_count = uint64_t{in.width} * in.height;
-          if (!slot.nrd_debug_distance.texture12 || slot.nrd_debug_distance.width != in.width
-              || slot.nrd_debug_distance.height != in.height) {
-            Rt12Shared debug_candidate;
-            const HRESULT debug_texture_hr = CreateRt12Shared(s, device, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                                              in.width, in.height, 1u, true, &debug_candidate);
-            if (SUCCEEDED(debug_texture_hr)) {
-              RetireShared(s, slot.nrd_debug_distance, slot.output_b_fence);
-              slot.nrd_debug_distance = std::move(debug_candidate);
-            }
-          }
-          if (slot.nrd_debug_distance.texture12) {
-            if (!nrd_slot.debug_distance_descriptors || nrd_slot.hitdistance_width != in.width
-                || nrd_slot.hitdistance_height != in.height) {
-              D3D12_DESCRIPTOR_HEAP_DESC debug_heap_desc = {};
-              debug_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-              debug_heap_desc.NumDescriptors = 4u;
-              debug_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-              ComPtr<ID3D12DescriptorHeap> debug_heap;
-              if (SUCCEEDED(s.device12->CreateDescriptorHeap(&debug_heap_desc, IID_PPV_ARGS(&debug_heap)))) {
-                nrd_slot.debug_distance_descriptors = std::move(debug_heap);
-              }
-            }
-            if (nrd_slot.debug_distance_descriptors) {
-              ID3D12Device* device12 = s.device12.Get();
-              ID3D12GraphicsCommandList* di_list = transfer.di_list.Get();
-              const UINT descriptor_stride = device12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-              const D3D12_CPU_DESCRIPTOR_HANDLE cpu = nrd_slot.debug_distance_descriptors->GetCPUDescriptorHandleForHeapStart();
-              const D3D12_GPU_DESCRIPTOR_HANDLE gpu = nrd_slot.debug_distance_descriptors->GetGPUDescriptorHandleForHeapStart();
-              const auto cpu_at = [&](uint32_t index) {
-                return D3D12_CPU_DESCRIPTOR_HANDLE{cpu.ptr + static_cast<SIZE_T>(index) * descriptor_stride};
-              };
-              const D3D12_SHADER_RESOURCE_VIEW_DESC status_srv = Rt12TextureSrv(DXGI_FORMAT_R32_UINT);
-              device12->CreateShaderResourceView(slot.n1_status.texture12.Get(), &status_srv, cpu_at(0u));
-              D3D12_SHADER_RESOURCE_VIEW_DESC hit_srv = {};
-              hit_srv.Format = DXGI_FORMAT_UNKNOWN;
-              hit_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-              hit_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-              hit_srv.Buffer.NumElements = static_cast<UINT>(pixel_count);
-              hit_srv.Buffer.StructureByteStride = sizeof(float);
-              device12->CreateShaderResourceView(nrd_slot.hit_distance.Get(), &hit_srv, cpu_at(1u));
-              hit_srv.Buffer.StructureByteStride = sizeof(uint32_t);
-              device12->CreateShaderResourceView(nrd_slot.hit_validity.Get(), &hit_srv, cpu_at(2u));
-              D3D12_UNORDERED_ACCESS_VIEW_DESC debug_uav = {};
-              debug_uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-              debug_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-              device12->CreateUnorderedAccessView(slot.nrd_debug_distance.texture12.Get(), nullptr, &debug_uav, cpu_at(3u));
-
-              std::array<D3D12_RESOURCE_BARRIER, 4u> debug_barriers = {};
-              debug_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-              debug_barriers[0].Transition.pResource = slot.n1_status.texture12.Get();
-              debug_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-              debug_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-              debug_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-              for (uint32_t index = 0u; index < 2u; ++index) {
-                D3D12_RESOURCE_BARRIER& barrier = debug_barriers[index + 1u];
-                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                barrier.Transition.pResource = index == 0u ? nrd_slot.hit_distance.Get() : nrd_slot.hit_validity.Get();
-                barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-              }
-              debug_barriers[3].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-              debug_barriers[3].Transition.pResource = slot.nrd_debug_distance.texture12.Get();
-              debug_barriers[3].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-              debug_barriers[3].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-              debug_barriers[3].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-              di_list->ResourceBarrier(static_cast<UINT>(debug_barriers.size()), debug_barriers.data());
-              ID3D12DescriptorHeap* debug_heaps[] = {nrd_slot.debug_distance_descriptors.Get()};
-              di_list->SetDescriptorHeaps(1u, debug_heaps);
-              di_list->SetComputeRootSignature(transfer.debug_distance_root.Get());
-              di_list->SetPipelineState(transfer.debug_distance_pso.Get());
-              const std::array<uint32_t, 3u> debug_constants = {in.width, in.height, static_cast<uint32_t>(pixel_count)};
-              di_list->SetComputeRoot32BitConstants(0u, static_cast<UINT>(debug_constants.size()), debug_constants.data(), 0u);
-              di_list->SetComputeRootDescriptorTable(1u, gpu);
-              di_list->SetComputeRootDescriptorTable(2u, {gpu.ptr + static_cast<UINT64>(3u) * descriptor_stride});
-              di_list->Dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
-              debug_barriers = {};
-              debug_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-              debug_barriers[0].UAV.pResource = slot.nrd_debug_distance.texture12.Get();
-              debug_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-              debug_barriers[1].Transition.pResource = slot.n1_status.texture12.Get();
-              debug_barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-              debug_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-              debug_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-              for (uint32_t index = 0u; index < 2u; ++index) {
-                D3D12_RESOURCE_BARRIER& barrier = debug_barriers[index + 2u];
-                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                barrier.Transition.pResource = index == 0u ? nrd_slot.hit_distance.Get() : nrd_slot.hit_validity.Get();
-                barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-              }
-              di_list->ResourceBarrier(static_cast<UINT>(debug_barriers.size()), debug_barriers.data());
-              debug_barriers = {};
-              debug_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-              debug_barriers[0].Transition.pResource = slot.nrd_debug_distance.texture12.Get();
-              debug_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-              debug_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-              debug_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-              di_list->ResourceBarrier(1u, debug_barriers.data());
-              slot.debug_distance_identity.recorded = true;
-            }
-          }
-        }
-#endif
-      }
-      if (perf_timing && hitdistance_recorded) {
-        transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6u);
-      }
-      nrd_gate_link(rtxdi::NrdGateLink::HitDistance, hitdistance_recorded, hitdistance_reason);
-      nrd_dispatch_recorded = hitdistance_recorded
-                              && RecordNrdDenoise(s, slot, in, in.effective_settings, &nrd_accepted_history);
-      nrd_gate_link(rtxdi::NrdGateLink::Denoise, nrd_dispatch_recorded, 1u);
-      slot.nrd.diffuse_publication_recorded = false;
-      uint8_t publication_reason = 4u;
-#if defined(__world_rtxdi_nrd_publish_EMBED_FILE)
-      const bool publication_out_diff = slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST)].resource != nullptr;
-      const bool publication_view_z = slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::IN_VIEWZ)].resource != nullptr;
-      publication_reason = !nrd_dispatch_recorded ? 1u
-                           : !slot.nrd.hit_validity ? 5u
-                           : !slot.nrd_diffuse_publication.texture12 ? 6u
-                           : !publication_out_diff ? 7u
-                           : !publication_view_z ? 8u
-                           : 0u;
-      if (publication_reason == 0u) {
-        publication_reason = 2u;
-        if (!transfer.nrd_publication_root || !transfer.nrd_publication_pso) {
-          Rt12NrdCreateDiffusePublicationPipeline(s.device12.Get(), __world_rtxdi_nrd_publish.data(),
-                                                  __world_rtxdi_nrd_publish.size(), &transfer.nrd_publication_root,
-                                                  &transfer.nrd_publication_pso);
-        }
-        if (transfer.nrd_publication_root && transfer.nrd_publication_pso) {
-          publication_reason = 3u;
-          Rt12NrdTexture status_texture;
-          status_texture.resource = slot.n1_status.texture12;
-          status_texture.format = DXGI_FORMAT_R32_UINT;
-          status_texture.width = in.width;
-          status_texture.height = in.height;
-          status_texture.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-          status_texture.unordered_access_written = true;
-          Rt12NrdTexture hit_validity;
-          hit_validity.resource = slot.nrd.hit_validity;
-          hit_validity.width = in.width;
-          hit_validity.height = in.height;
-          hit_validity.state = D3D12_RESOURCE_STATE_COMMON;
-          Rt12NrdTexture publication;
-          publication.resource = slot.nrd_diffuse_publication.texture12;
-          publication.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-          publication.width = in.width;
-          publication.height = in.height;
-          publication.state = D3D12_RESOURCE_STATE_COMMON;
-          slot.nrd.diffuse_publication_recorded = Rt12NrdRecordDiffusePublication(
-              s.device12.Get(), transfer.di_list.Get(), transfer.nrd_publication_root.Get(),
-              transfer.nrd_publication_pso.Get(), slot.nrd.publication_descriptors.Get(),
-              slot.nrd.publication_constants.Get(),
-              &slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST)],
-              &slot.nrd.resources[static_cast<uint32_t>(nrd::ResourceType::IN_VIEWZ)], &status_texture,
-              &hit_validity, &publication, in.width, in.height);
-        }
-      }
-      if (perf_timing && nrd_dispatch_recorded && slot.nrd.diffuse_publication_recorded) {
-        transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 7u);
-        perf_nrd_recorded = true;
-      }
-#endif
-      nrd_gate_link(rtxdi::NrdGateLink::Publication, slot.nrd.diffuse_publication_recorded, publication_reason);
-      nrd_history_reset = !nrd_dispatch_recorded;
-    } else {
-      slot.nrd.dispatch_ready = false;
-      nrd_history_reset = true;
-    }
-#endif
-  }
-  barriers.clear();
-  if (diag_armed && light_count != 0u && slot.light_readback) {
-    Transition(barriers, slot.lights_buffer.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-               D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-    transfer.di_list->CopyBufferRegion(slot.light_readback.Get(), 0u, slot.lights_buffer.Get(), 0u,
-                                       uint64_t{light_count} * sizeof(game_lights::LightParamCpu));
-    barriers.clear();
-    Transition(barriers, slot.lights_buffer.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
-               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-  }
-  barriers.clear();
-  UavBarrier(barriers, s.di.reservoirs.Get());
-  UavBarrier(barriers, slot.di_results.Get());
-  UavBarrier(barriers, slot.di_resolved.texture12.Get());
-  if (n1_ready) {
-    UavBarrier(barriers, slot.n1_diffuse.texture12.Get());
-    UavBarrier(barriers, slot.n1_specular.texture12.Get());
-    UavBarrier(barriers, slot.n1_status.texture12.Get());
-    Transition(barriers, slot.n1_diffuse.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-    Transition(barriers, slot.n1_specular.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-    Transition(barriers, slot.n1_status.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-  }
-  Transition(barriers, s.di.reservoirs.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-  Transition(barriers, slot.di_results.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-  Transition(barriers, slot.di_resolved.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-  for (ID3D12Resource* resource : {vertices, indices, mesh_table, scene.instance_table.Get(), uv_arena, s.atlas.texture12.Get(),
-                                   s.materials.Get(), slot.lights_buffer.Get(), slot.light_types.Get(), slot.light_table.Get(),
-                                   slot.previous_to_current.Get(), slot.current_to_previous.Get(), slot.color.texture12.Get(),
-                                   slot.mrt2.texture12.Get(), slot.deferred_buffer.Get(), dynamic_vertices, slot.depth.texture12.Get(),
-                                   slot.normal.texture12.Get(), slot.scene.texture12.Get(), slot.motion.texture12.Get(), s.noise.texture12.Get()}) {
-    if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-  }
-  Transition(barriers, slot.tiles_buffer.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-  if (history_valid) {
-    if (&history_slot != &slot) {
-      Transition(barriers, history_slot.lights_buffer.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                 D3D12_RESOURCE_STATE_COMMON);
-      Transition(barriers, history_slot.light_table.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                 D3D12_RESOURCE_STATE_COMMON);
-    }
-    for (ID3D12Resource* resource : history_resources) {
-      if (resource) Transition(barriers, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    }
-  }
   if (diag_armed) Transition(barriers, slot.diag_counters.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
   transfer.di_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
   if (diag_armed) {
@@ -3759,22 +1537,6 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
     transfer.di_list->EndQuery(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3u);
     transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2u, 2u,
                                        slot.perf_readback.Get(), 16u);
-    if (perf_distance_recorded) {
-      transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4u, 2u,
-                                         slot.perf_readback.Get(), 32u);
-    }
-    if (perf_nrd_recorded) {
-      transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6u, 2u,
-                                         slot.perf_readback.Get(), 48u);
-    }
-    transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 8u, 2u,
-                                       slot.perf_readback.Get(), 64u);
-    if (perf_temporal_recorded) {
-      transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 10u, 2u,
-                                         slot.perf_readback.Get(), 80u);
-    }
-    transfer.di_list->ResolveQueryData(slot.perf_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 12u, 2u,
-                                       slot.perf_readback.Get(), 96u);
   }
   hr = transfer.di_list->Close();
   if (FAILED(hr)) {
@@ -3814,15 +1576,6 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                                 .frame = in.frame,
                                 .transfer_slot = slot_index,
                                 .light_count = light_count};
-  if (perf_timing) {
-    slot.perf_fence = di_fence;
-    slot.perf_valid_mask |= 2u;
-    if (perf_distance_recorded) slot.perf_valid_mask |= 4u;
-    if (perf_nrd_recorded) slot.perf_valid_mask |= 8u;
-    slot.perf_valid_mask |= 16u;
-    if (perf_temporal_recorded) slot.perf_valid_mask |= 32u;
-    slot.perf_valid_mask |= 64u;
-  }
   slot.light_table_status = slot.light_table_truncated != 0u ? RTXDI_LIGHT_TABLE_STATUS_TRUNCATED
                                : !history_valid              ? RTXDI_LIGHT_TABLE_STATUS_NO_HISTORY
                                : light_count == 0u            ? RTXDI_LIGHT_TABLE_STATUS_ZERO_LIGHTS
@@ -3837,29 +1590,9 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
                           .truncated_count = slot.light_table_truncated, .fence = di_fence,
                           .remap_enabled = in.effective_settings.stable_light_remap};
     slot.diag_epoch = diagnostic_epoch;
-    slot.diag_flags = (n1_ready ? RTXDI_DIAG_SAMPLE_N1 : 0u) | (in.effective_settings.spatial_enabled ? RTXDI_DIAG_SAMPLE_SPATIAL : 0u)
-                      | (history_valid && in.effective_settings.temporal_enabled ? RTXDI_DIAG_SAMPLE_TEMPORAL : 0u)
-                      | (history_valid ? RTXDI_DIAG_SAMPLE_HISTORY : 0u);
+    slot.diag_flags = history_valid ? RTXDI_DIAG_SAMPLE_HISTORY : 0u;
     transfer.diag_next_frame = in.frame + 30u;
   }
-#if defined(FALCOM_NRD_ENABLED)
-  if (nrd_probe_recorded) {
-    slot.nrd.probe_fence = di_fence;
-    slot.nrd.probe_frame = in.frame;
-    slot.nrd.probe_pending = true;
-  } else {
-    slot.nrd.probe_pending = false;
-  }
-  if (nrd_dispatch_recorded) {
-    slot.nrd.dispatch_ready = true;
-    transfer.nrd.history = nrd_accepted_history;
-    slot.nrd.diffuse_output_valid = true;
-    slot.nrd.fence_value = di_fence;
-  } else if (nrd_history_reset) {
-    transfer.nrd.history = {};
-    slot.nrd.diffuse_output_valid = false;
-  }
-#endif
   if (previous_slot) previous_slot->di_fence_value = (std::max)(previous_slot->di_fence_value, di_fence);
   slot.fence_value = (std::max)(slot.fence_value, di_fence);
   scene.fence_value = (std::max)(scene.fence_value, di_fence);
@@ -3887,64 +1620,6 @@ inline rtxdi::DiStatus DispatchRtxdiInitialDi(reshade::api::device* device, resh
   slot.output_height = in.height;
   slot.output_scene_slot = in.scene_slot;
   slot.output_transfer_slot = input.transfer_slot;
-  if (in.local_di) {
-    slot.output_staged = true;
-  }
-  slot.n1_staged = in.local_di && n1_ready;
-#if defined(FALCOM_NRD_ENABLED)
-  if (slot.debug_distance_identity.recorded) {
-    slot.debug_distance_identity.frame = in.frame;
-    slot.debug_distance_identity.width = in.width;
-    slot.debug_distance_identity.height = in.height;
-    slot.debug_distance_identity.n1_configuration_version = slot.n1_configuration_version;
-    slot.debug_distance_identity.scene_slot = in.scene_slot;
-    slot.debug_distance_identity.transfer_slot = input.transfer_slot;
-    slot.debug_distance_identity.owner_generation = s.generation;
-    slot.debug_distance_identity.transfer_configuration = transfer.configuration_generation;
-    slot.debug_distance_identity.di_configuration = s.di.configuration_generation;
-    slot.debug_distance_identity.settings_identity = in.effective_settings.identity;
-    slot.debug_distance_identity.producer_fence_b = di_fence;
-    slot.debug_distance_identity.n1_brdf_config = slot.n1_brdf_config;
-    slot.debug_distance_identity.staged = true;
-  }
-  slot.nrd_diffuse_staged = nrd_dispatch_recorded && slot.nrd.diffuse_publication_recorded
-                            && slot.nrd_diffuse_publication.srv11.handle != 0u;
-  nrd_gate_link(rtxdi::NrdGateLink::Srv, slot.nrd_diffuse_publication.srv11.handle != 0u, 1u);
-  slot.nrd_diffuse_identity = {};
-  if (slot.nrd_diffuse_staged) {
-    slot.nrd_diffuse_identity = {
-        .owner_generation = s.generation,
-        .transfer_configuration = transfer.configuration_generation,
-        .di_configuration = s.di.configuration_generation,
-        .n1_configuration = Rt12NrdN1ConfigurationIdentity(slot.n1_configuration_version, slot.n1_brdf_config),
-        .nrd_configuration = Rt12NrdConfigurationIdentity(transfer.configuration_generation,
-                                                          s.di.configuration_generation,
-                                                          in.effective_settings.identity,
-                                                          transfer.nrd.qualification.motion_correction_index),
-        .producer_fence_b = di_fence,
-        .frame = in.frame,
-        .width = in.width,
-        .height = in.height,
-        .scene_slot = in.scene_slot,
-        .transfer_slot = input.transfer_slot,
-        .accepted = true,
-    };
-  }
-#endif
-  temporal_ran = in.local_di && history_valid && in.effective_settings.temporal_enabled;
-  s.di.last_use_fence = di_fence;
-  s.di.history_valid = true;
-  s.di.history_frame = in.frame;
-  s.di.history_width = in.width;
-  s.di.history_height = in.height;
-  s.di.history_transfer_slot = input.transfer_slot;
-  s.di.history_scene_slot = in.scene_slot;
-  s.di.history_owner_generation = s.generation;
-  s.di.history_configuration_generation = s.di.configuration_generation;
-  s.di.context->SetFrameIndex(s.di.context->GetFrameIndex() + 1u);
-  spatial_ran = in.local_di && in.effective_settings.spatial_enabled;
-  spatial_source_index = s.di.frame.parameters.di.bufferIndices.spatialResamplingInputBufferIndex;
-  spatial_output_index = s.di.frame.parameters.di.bufferIndices.spatialResamplingOutputBufferIndex;
   return publish(light_count == 0u ? rtxdi::DiStatus::ZeroLights : rtxdi::DiStatus::Submitted, 0, di_fence);
 }
 

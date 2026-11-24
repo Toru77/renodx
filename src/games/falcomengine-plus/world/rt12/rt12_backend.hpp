@@ -206,54 +206,12 @@ struct Rt12DiResources {
   uint64_t settings_identity = 0u;
   uint64_t owner_generation = 0u;
   uint64_t configuration_generation = 0u;
-  std::unique_ptr<::rtxdi::ReSTIRDIContext> context;
-  RtxdiFrameUpload frame = {};
-  Microsoft::WRL::ComPtr<ID3D12Resource> reservoirs;
-  Microsoft::WRL::ComPtr<ID3D12Resource> neighbors;
-  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> neighbor_srv_heap;
   uint64_t last_use_fence = 0u;
   uint32_t history_frame = UINT32_MAX, history_width = 0u, history_height = 0u;
   int32_t history_transfer_slot = -1, history_scene_slot = -1;
   uint64_t history_owner_generation = 0u, history_configuration_generation = 0u;
   bool initialized = false;
   bool history_valid = false;
-};
-
-#if defined(FALCOM_NRD_ENABLED)
-struct Rt12DebugDistanceIdentity {
-  uint32_t source_version = 1u;
-  uint32_t requested_view = RTXDI_DEBUG_VIEW_OFF;
-  uint32_t frame = UINT32_MAX;
-  uint32_t width = 0u;
-  uint32_t height = 0u;
-  uint32_t n1_configuration_version = 0u;
-  int32_t scene_slot = -1;
-  int32_t transfer_slot = -1;
-  uint64_t owner_generation = 0u;
-  uint64_t transfer_configuration = 0u;
-  uint64_t di_configuration = 0u;
-  uint64_t settings_identity = 0u;
-  uint64_t producer_fence_b = 0u;
-  std::array<float, 7u> n1_brdf_config = {};
-  bool recorded = false;
-  bool staged = false;
-};
-#endif
-
-struct Rt12SunDetailIdentity {
-  uint32_t source_version = 1u;
-  uint32_t detail_view = RTXDI_SUN_DETAIL_STATUS;
-  uint32_t frame = UINT32_MAX;
-  uint32_t width = 0u, height = 0u;
-  int32_t scene_slot = -1, transfer_slot = -1;
-  uint64_t owner_generation = 0u;
-  uint64_t transfer_configuration = 0u;
-  uint64_t di_configuration = 0u;
-  uint64_t settings_identity = 0u;
-  uint64_t sun_configuration = 0u;
-  uint64_t producer_fence_b = 0u;
-  bool recorded = false;
-  bool staged = false;
 };
 
 struct Rt12DiDiagnosticSnapshot {
@@ -268,20 +226,9 @@ struct Rt12DiDiagnosticSnapshot {
 struct Rt12DiTransferSlot {
   Rt12Shared depth, normal, scene, color, mrt1, mrt2, motion;
   Rt12Shared lights, tiles, deferred;
-  Rt12Shared di_resolved;
-  Rt12Shared sun_visibility;
-  Rt12Shared sun_detail;
-  Rt12SunDetailIdentity sun_detail_identity = {};
-  Rt12Shared n1_diffuse, n1_specular, n1_status;
-  Rt12Shared nrd_diffuse_publication;
-#if defined(FALCOM_NRD_ENABLED)
-  Rt12Shared nrd_debug_distance;
-  Rt12DebugDistanceIdentity debug_distance_identity = {};
-#endif
-  Microsoft::WRL::ComPtr<ID3D12Resource> scene_buffer, lights_buffer, tiles_buffer, deferred_buffer, sun_results, sun_history;
+  Microsoft::WRL::ComPtr<ID3D12Resource> scene_buffer, lights_buffer, tiles_buffer, deferred_buffer;
   Microsoft::WRL::ComPtr<ID3D12Resource> light_types, light_table, previous_to_current, current_to_previous;
   Microsoft::WRL::ComPtr<ID3D12Resource> light_map_reset_upload;
-  Microsoft::WRL::ComPtr<ID3D12Resource> di_results, di_frame_upload;
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
   Microsoft::WRL::ComPtr<ID3D12CommandAllocator> di_allocator;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> perf_queries;
@@ -308,12 +255,6 @@ struct Rt12DiTransferSlot {
   bool diag_pending = false;
   uint64_t output_b_fence = 0u, output_c_fence = 0u;
   uint64_t output_owner_generation = 0u, output_configuration_generation = 0u;
-  uint64_t sun_configuration_generation = 0u;
-#if defined(FALCOM_NRD_ENABLED)
-  Rt12NrdDiffusePublicationIdentity nrd_diffuse_identity = {};
-#endif
-  uint32_t n1_configuration_version = 0u;
-  std::array<float, 7> n1_brdf_config = {};
   uint32_t output_frame = UINT32_MAX, output_width = 0u, output_height = 0u;
   int32_t output_scene_slot = -1, output_transfer_slot = -1;
   uint32_t light_count = 0u, tile_count = 0u, deferred_count = 0u;
@@ -322,19 +263,7 @@ struct Rt12DiTransferSlot {
   uint32_t light_table_reason = RTXDI_LIGHT_TABLE_STATUS_NO_HISTORY;
   bool light_table_remap_enabled = false;
   bool local = false;
-  bool sun = false;
-  bool sun_accumulated = false;
-  bool sun_history_used = false;
   bool motion_available = false;
-  bool output_staged = false;
-#if defined(FALCOM_NRD_ENABLED)
-  bool nrd_diffuse_staged = false;
-#endif
-  bool n1_resources_ready = false;
-  bool n1_staged = false;
-#if defined(FALCOM_NRD_ENABLED)
-  Rt12NrdSlot nrd;
-#endif
 };
 
 struct Rt12DiTransferState {
@@ -342,34 +271,11 @@ struct Rt12DiTransferState {
   Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> list;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> unpack_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> unpack_pso;
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> sun_root;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> sun_pso;
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> sun_detail_root;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> sun_detail_pso;
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> sun_accumulate_root;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> sun_accumulate_pso;
   Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> di_list;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> classify_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> classify_pso;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> light_table_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> light_table_pso;
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> initial_di_root;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> initial_di_pso;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> temporal_di_pso;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> spatial_di_pso;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> n1_resolve_pso;
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> nrd_probe_root;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> nrd_probe_pso;
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> nrd_prep_root;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> nrd_prep_pso;
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> nrd_hitdistance_root;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> nrd_hitdistance_pso;
-#if defined(FALCOM_NRD_ENABLED)
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> nrd_publication_root;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> nrd_publication_pso;
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> debug_distance_root;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> debug_distance_pso;
-#endif
   Microsoft::WRL::ComPtr<ID3D12Resource> diag_zero;
   uint32_t diag_next_frame = 0u;
   uint64_t owner_generation = 0u, configuration_generation = 0u;
@@ -378,12 +284,6 @@ struct Rt12DiTransferState {
   uint64_t attempted_generation = 0u;
   int32_t scene_slot = -1;
   int32_t input_slot = -1;
-  uint32_t sun_history_frame = UINT32_MAX, sun_history_width = 0u, sun_history_height = 0u;
-  int32_t sun_history_transfer_slot = -1;
-  uint64_t sun_history_owner_generation = 0u, sun_history_configuration_generation = 0u;
-#if defined(FALCOM_NRD_ENABLED)
-  Rt12NrdGeneration nrd;
-#endif
 };
 
 // Path tracing (world/pt): its own submission slots, list, root signature, PSOs, descriptors and outputs.
@@ -728,18 +628,6 @@ inline void FailSession(Rt12State& s, Rt12Reason reason, const char* stage, HRES
     rtxdi::g_di.snapshot.output_bound_fence_b = 0u;
     rtxdi::g_di.snapshot.lighting_draw_seen = false;
   }
-  {
-    std::unique_lock lock(rtxdi::g_sun.mutex);
-    rtxdi::g_sun.snapshot.output_bound = false;
-    rtxdi::g_sun.snapshot.output_bound_frame = UINT32_MAX;
-    rtxdi::g_sun.snapshot.output_bound_transfer_slot = -1;
-    rtxdi::g_sun.snapshot.output_bound_fence_b = 0u;
-    rtxdi::g_sun.snapshot.lighting_draw_seen = false;
-    if (rtxdi::g_sun_requested > 0.5f) {
-      rtxdi::g_sun.snapshot.status = rtxdi::SunStatus::Quarantined;
-      rtxdi::g_sun.snapshot.error = hr;
-    }
-  }
   DisableMirror();
   renodx::utils::log::w("[world-rt12] failed at ", stage, " hr=", renodx::utils::log::AsHex(static_cast<uint32_t>(hr)));
   UpdatePanel([reason, stage, hr](Rt12Panel& p) {
@@ -986,64 +874,23 @@ inline void RetireObject(Rt12State& s, uint64_t fence, const Microsoft::WRL::Com
 }
 
 // Unscheduled resource setup; no command list, fence signal, or scene publication occurs here.
+// Keeps only the light-table configuration identity; the DI reservoir, context and neighbours are gone.
 inline bool EnsureRt12DiResources(Rt12State& s, bool local_requested, uint32_t width, uint32_t height,
-                                  const rtxdi::EffectiveRtxdiSettings& settings) {
+                                   const rtxdi::EffectiveRtxdiSettings& settings) {
   if (!local_requested) return true;
   if (s.failed || s.stuck || s.unfenced_execution || !s.device12) return false;
   rtxdi::DiConfig config;
   if (!rtxdi::CalculateDiConfig(width, height, &config)) return false;
-  const bool present = s.di.context || s.di.reservoirs || s.di.neighbors || s.di.neighbor_srv_heap || s.di.owner_generation != 0u || s.di.last_use_fence != 0u;
-  const bool complete = s.di.context && s.di.reservoirs && s.di.neighbors && s.di.neighbor_srv_heap;
-  const auto action = rtxdi::SelectDiResourceAction(local_requested, s.generation,
-                                                    {.config = s.di.config, .owner_generation = s.di.owner_generation, .configuration_generation = s.di.configuration_generation, .settings_identity = s.di.settings_identity, .present = present, .complete = complete}, config,
-                                                    settings.identity);
-  if (action == rtxdi::DiResourceAction::OwnerMismatch) return false;
-  if (action == rtxdi::DiResourceAction::Reuse) return true;
+  if (s.di.owner_generation == s.generation && s.di.config.width == width && s.di.config.height == height
+      && s.di.settings_identity == settings.identity) return true;
   uint64_t next_generation = 0u;
   if (!rtxdi::NextDiConfigurationGeneration(s.di.configuration_generation, &next_generation)) return false;
-  try {
-    Rt12DiResources candidate;
-    candidate.config = config;
-    candidate.settings_identity = settings.identity;
-    candidate.context = rtxdi::CreateDiContext(config, settings);
-    if (!candidate.context) return false;
-    const auto sdk_pitch = candidate.context->GetReservoirBufferParameters();
-    if (sdk_pitch.reservoirBlockRowPitch != config.row_pitch || sdk_pitch.reservoirArrayPitch != config.array_pitch) return false;
-    candidate.frame.parameters = rtxdi::MakeDiFrameParameters(config, *candidate.context);
-    if (FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, config.reservoir_bytes,
-                                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, candidate.reservoirs))
-        || FAILED(CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_UPLOAD, rtxdi::kNeighborBytes,
-                                   D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE, candidate.neighbors))) return false;
-    void* mapped = nullptr;
-    const D3D12_RANGE no_read = {0u, 0u};
-    if (FAILED(candidate.neighbors->Map(0u, &no_read, &mapped))) return false;
-    ::rtxdi::FillNeighborOffsetBuffer(static_cast<uint8_t*>(mapped), rtxdi::kNeighborCount);
-    candidate.neighbors->Unmap(0u, nullptr);
-    D3D12_DESCRIPTOR_HEAP_DESC heap = {};
-    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap.NumDescriptors = 1u;
-    if (FAILED(s.device12->CreateDescriptorHeap(&heap, IID_PPV_ARGS(candidate.neighbor_srv_heap.ReleaseAndGetAddressOf())))) return false;
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-    srv.Format = DXGI_FORMAT_R8G8_SNORM;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Buffer.NumElements = rtxdi::kNeighborCount;
-    s.device12->CreateShaderResourceView(candidate.neighbors.Get(), &srv, candidate.neighbor_srv_heap->GetCPUDescriptorHandleForHeapStart());
-    if (s.di.last_use_fence != 0u) {
-      s.retired.reserve(s.retired.size() + 3u);
-      RetireObject(s, s.di.last_use_fence, s.di.reservoirs);
-      RetireObject(s, s.di.last_use_fence, s.di.neighbors);
-      RetireObject(s, s.di.last_use_fence, s.di.neighbor_srv_heap);
-    }
-    candidate.owner_generation = s.generation;
-    candidate.configuration_generation = next_generation;
-    s.di = std::move(candidate);
-    return true;
-  } catch (...) {
-    return false;
-  }
+  s.di.config = config;
+  s.di.settings_identity = settings.identity;
+  s.di.owner_generation = s.generation;
+  s.di.configuration_generation = next_generation;
+  return true;
 }
-
 // One shared texture (both APIs) with its ReShade views; the old objects are kept until the last signal completes.
 inline void RetireShared(Rt12State& s, Rt12Shared& shared, uint64_t fence) {
   if (shared.srv11.handle != 0u) s.device->destroy_resource_view(shared.srv11);
@@ -1163,17 +1010,6 @@ inline void TeardownRt12(const char* why) {
     rtxdi::g_di.snapshot.output_bound_fence_b = 0u;
     rtxdi::g_di.snapshot.lighting_draw_seen = false;
   }
-  {
-    std::unique_lock lock(rtxdi::g_sun.mutex);
-    rtxdi::g_sun.snapshot.status = rtxdi::g_sun_requested > 0.5f ? rtxdi::SunStatus::WaitingInput : rtxdi::SunStatus::Off;
-    rtxdi::g_sun.snapshot.output_bound = false;
-    rtxdi::g_sun.snapshot.output_bound_frame = UINT32_MAX;
-    rtxdi::g_sun.snapshot.output_bound_transfer_slot = -1;
-    rtxdi::g_sun.snapshot.output_bound_fence_b = 0u;
-    rtxdi::g_sun.snapshot.lighting_draw_seen = false;
-    rtxdi::g_sun.snapshot.fence_b = 0u;
-    rtxdi::g_sun.snapshot.fence_c = 0u;
-  }
   g_rt12_gc_scene = {};
   {
     std::lock_guard lock(g_rt12_mirror.mutex);
@@ -1243,15 +1079,6 @@ inline void TeardownRt12(const char* why) {
              &slot.lights,
              &slot.tiles,
              &slot.deferred,
-             &slot.di_resolved,
-             &slot.sun_visibility,
-             &slot.sun_detail,
-             &slot.n1_diffuse,
-             &slot.n1_specular,
-             &slot.n1_status,
-#if defined(FALCOM_NRD_ENABLED)
-             &slot.nrd_diffuse_publication,
-#endif
          }) {
       if (shared->srv11.handle != 0u) s.device->destroy_resource_view(shared->srv11);
       if (shared->uav11.handle != 0u) s.device->destroy_resource_view(shared->uav11);
@@ -1538,22 +1365,6 @@ inline bool CreateRt12(reshade::api::device* device) {
     s.atlas = Rt12Shared{};
   }
 
-#if defined(FALCOM_NRD_ENABLED)
-  const bool nrd_instance_ready = s.di_transfer.nrd.CreateRelaxDiffuseSpecular();
-  const bool nrd_backend_ready = nrd_instance_ready
-                                 && s.di_transfer.nrd.CreateD3D12Backend(s.device12.Get(), s.serialize);
-  if (!nrd_backend_ready) {
-    s.di_transfer.nrd.Reset();
-    UpdatePanel([nrd_instance_ready](Rt12Panel& p) {
-      p.nrd_backend_state = 3u;
-      p.nrd_failure_stage = nrd_instance_ready ? 2u : 1u;
-    });
-    renodx::utils::log::w("[world-rt12] NRD 4.17.1 initialization failed; raw RTXDI remains available");
-  } else {
-    UpdatePanel([](Rt12Panel& p) { p.nrd_backend_state = 2u; p.nrd_failure_stage = 0u; });
-    renodx::utils::log::i("[world-rt12] private NRD 4.17.1 RELAX backend initialized; output consumer remains disabled");
-  }
-#endif
 
   // 17. Success: the mirror starts, and the live store re-streams every mesh through its hooks.
   {
@@ -1885,102 +1696,6 @@ inline void OnPresent(reshade::api::device* device) {
   Rt12State& s = *g_rt12;
   if (s.failed || s.stuck || s.unfenced_execution) return;
 
-  bool output_consumer_pending = false;
-  for (const Rt12DiTransferSlot& slot : s.di_transfer.slots) {
-    output_consumer_pending = output_consumer_pending || ((slot.output_staged
-#if defined(FALCOM_NRD_ENABLED)
-                                                           || slot.nrd_diffuse_staged
-#endif
-                                                           )
-                                                          && slot.output_c_fence == 0u);
-  }
-  if (output_consumer_pending) {
-    auto& diagnostics = rtxdi::GetDiagnosticState();
-    const bool diagnostic_enabled = rtxdi::DiagnosticCaptureEnabled(diagnostics);
-    const uint64_t diagnostic_epoch = diagnostic_enabled ? rtxdi::DiagnosticCaptureEpoch(diagnostics) : 0u;
-    uint64_t consumer_fence = renodx::utils::gpu_fence::NO_SIGNAL;
-    try {
-      consumer_fence = renodx::utils::gpu_fence::QueueSignal(s.ctx11.Get(), s.fence11.get());
-    } catch (...) {
-      consumer_fence = renodx::utils::gpu_fence::NO_SIGNAL;
-    }
-    if (consumer_fence == renodx::utils::gpu_fence::NO_SIGNAL) {
-      s.stuck = true;
-      FailSession(s, Rt12Reason::SubmitFailed, "rtxdi output consumer fence C");
-      {
-        std::unique_lock lock(rtxdi::g_di.mutex);
-        rtxdi::g_di.snapshot.status = rtxdi::DiStatus::Quarantined;
-        rtxdi::g_di.snapshot.error = E_FAIL;
-      }
-      if (diagnostic_enabled) {
-        rtxdi::RecordDiagnostic(diagnostics, diagnostic_epoch,
-                                {.owner_generation = s.generation,
-                                 .frame = g_state.frame.load(),
-                                 .hresult = E_FAIL,
-                                 .stage = rtxdi::DiagnosticStage::SlotConsumer,
-                                 .reason = rtxdi::DiagnosticReason::SignalFailed,
-                                 .operation = rtxdi::DiagnosticOperation::SignalC});
-      }
-      return;
-    }
-    for (Rt12DiTransferSlot& slot : s.di_transfer.slots) {
-      if ((slot.output_staged
-#if defined(FALCOM_NRD_ENABLED)
-           || slot.nrd_diffuse_staged
-#endif
-           )
-          && slot.output_c_fence == 0u)
-        slot.output_c_fence = consumer_fence;
-    }
-    {
-      std::unique_lock lock(rtxdi::g_di.mutex);
-      const int32_t transfer_slot = rtxdi::g_di.snapshot.output_transfer_slot;
-      if (transfer_slot >= 0 && transfer_slot < static_cast<int32_t>(kRt12Slots)) {
-        const Rt12DiTransferSlot& slot = s.di_transfer.slots[static_cast<uint32_t>(transfer_slot)];
-        if (slot.output_staged && slot.output_frame == rtxdi::g_di.snapshot.output_frame) {
-          rtxdi::g_di.snapshot.output_fence_c = consumer_fence;
-        }
-      }
-    }
-    {
-      std::unique_lock lock(rtxdi::g_sun.mutex);
-      const int32_t sun_transfer_slot = rtxdi::g_sun.snapshot.transfer_slot;
-      const Rt12DiTransferSlot* sun_slot = nullptr;
-      if (sun_transfer_slot >= 0 && sun_transfer_slot < static_cast<int32_t>(kRt12Slots)) {
-        sun_slot = &s.di_transfer.slots[static_cast<uint32_t>(sun_transfer_slot)];
-      }
-      if (sun_slot && rtxdi::g_sun.snapshot.status == rtxdi::SunStatus::Staged
-          && rtxdi::g_sun.snapshot.frame == g_state.frame.load()
-          && rtxdi::g_sun.snapshot.fence_b == sun_slot->output_b_fence) {
-        rtxdi::g_sun.snapshot.fence_c = consumer_fence;
-      }
-    }
-    if (diagnostic_enabled) {
-      uint32_t accepted_slots = 0u;
-      int32_t first_slot = -1;
-      for (uint32_t index = 0u; index < kRt12Slots; ++index) {
-        const Rt12DiTransferSlot& slot = s.di_transfer.slots[index];
-        if ((slot.output_staged
-#if defined(FALCOM_NRD_ENABLED)
-             || slot.nrd_diffuse_staged
-#endif
-             )
-            && slot.output_c_fence == consumer_fence) {
-          if (first_slot < 0) first_slot = static_cast<int32_t>(index);
-          ++accepted_slots;
-        }
-      }
-      rtxdi::RecordDiagnostic(diagnostics, diagnostic_epoch,
-                              {.owner_generation = s.generation,
-                               .frame = g_state.frame.load(),
-                               .fence = consumer_fence,
-                               .value0 = accepted_slots,
-                               .transfer_slot = first_slot,
-                               .stage = rtxdi::DiagnosticStage::SlotConsumer,
-                               .reason = rtxdi::DiagnosticReason::None,
-                               .operation = rtxdi::DiagnosticOperation::SignalC});
-    }
-  }
 
   // 2. Stuck detection: no fence progress for kRt12StuckMs with work pending.
   ObserveRt12Completion(s);

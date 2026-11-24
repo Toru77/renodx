@@ -1,3 +1,4 @@
+// Test fixture for falcom-nrd-bridge (world/rt12/tests/nrd_d3d12_bridge.cpp); not embedded or dispatched by the addon (Unified PT A7).
 #include "world_rtxdi_debug.hlsli"
 
 cbuffer DebugDistanceConstants : register(b0)

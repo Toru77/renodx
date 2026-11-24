@@ -31,7 +31,6 @@ struct DeferredParam
 };
 
 #include "../../../world/shaders/world_rt_lamps.hlsli"
-#include "../../../world/shaders/world_rtxdi_lighting_consumer.hlsli"
 
 cbuffer cb_scene : register(b0)
 {
@@ -170,9 +169,6 @@ Texture2D<float4> shadowTexture : register(t7);
 Texture2D<float4> outlinePrepareTexture : register(t8);
 StructuredBuffer<LightParam> dynamicLights_g : register(t11);
 StructuredBuffer<LightIndexData> lightIndices_g : register(t12);
-Texture2D<uint4> rtxdiResolvedLocal_g : register(t41);
-Texture2D<uint> rtxdiSunVisibility_g : register(t42);
-Texture2D<float4> rtxdiDenoisedDiffuse_g : register(t43);
 Texture2D<float4> rtxdiDebugValue_g : register(t44);
 Texture2D<uint> rtxdiDebugStatus_g : register(t45);
 // t46: PT final-shading debug words (A6): Selected Light tuple, sun visibility word, sun detail.
@@ -256,14 +252,6 @@ float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
     if (tuple_bound) tuple = rtxdiSunDetail_g.Load(int3(pixel, 0));
   }
 
-  uint filtered_width, filtered_height;
-  float4 filtered = 0.0;
-  bool filtered_bound = false;
-  if (view == RTXDI_DEBUG_VIEW_FILTERED_DIFFUSE && shader_injection_data.rtxdi_diffuse_bound > 0.5f) {
-    rtxdiDenoisedDiffuse_g.GetDimensions(filtered_width, filtered_height);
-    filtered_bound = pixel.x < filtered_width && pixel.y < filtered_height;
-    if (filtered_bound) filtered = rtxdiDenoisedDiffuse_g.Load(int3(pixel, 0));
-  }
 
   uint sun_width, sun_height;
   uint sun_status = RTXDI_SUN_STATUS_UNKNOWN;
@@ -287,7 +275,7 @@ float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
 
   return RtxdiDebugValueColor(view, pixel, status_bound, status_word,
                               value_bound && shader_injection_data.rtxdi_debug_distance_bound <= 0.5f,
-                              value.rgb, tuple_bound, tuple, filtered_bound, filtered,
+                              value.rgb, tuple_bound, tuple, false, float4(0, 0, 0, 0),
                               value_bound && shader_injection_data.rtxdi_debug_distance_bound > 0.5f,
                               value, sun_bound, sun_status, consumer_decision);
 }
@@ -304,15 +292,6 @@ void main(
   uint4 bitmask, uiDest;
   float4 fDest;
   uint width, height, num_levels;
-  uint4 rtxdi_resolved = 0u;
-  RtxdiLightingSelection rtxdi_selection = (RtxdiLightingSelection)0;
-  uint rtxdi_selected_index = 0u;
-  uint rtxdi_selected_type = 0u;
-  uint rtxdi_status = RTXDI_DI_STATUS_EMPTY;
-  float rtxdi_inverse_pdf = 0.0;
-  bool rtxdi_output_valid = false;
-  float3 rtxdi_nrd_diffuse = 0.0;
-  bool rtxdi_nrd_diffuse_valid = false;
   uint rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FALLBACK;
   // Captured here because the flag word in r1.z is consumed and overwritten long
   // before either output site, and the environment/character split needs it.
@@ -494,17 +473,6 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
       r3.z = r5.y;
       if (shader_injection_data.char_shadow_mode >= 0.5f) {
         r3.z = r3.z * saturate(r5.z);
-      }
-      if (shader_injection_data.rtxdi_sun_bound > 0.5f) {
-        uint sunWidth, sunHeight;
-        rtxdiSunVisibility_g.GetDimensions(sunWidth, sunHeight);
-        const uint2 sunPixel = (uint2)v0.xy;
-        if (sunPixel.x < sunWidth && sunPixel.y < sunHeight) {
-          const RtxdiSunLightingSelection sunSelection =
-              RtxdiResolveSunLightingSelection(true, rtxdiSunVisibility_g.Load(int3(sunPixel, 0)),
-                                               shader_injection_data.rtxdi_sun_foliage_transmission);
-          if (sunSelection.known) r3.z *= 1.0 - saturate(shader_injection_data.rtxdi_sun_character_darkening) * (1.0 - sunSelection.visibility);
-        }
       }
       if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) r3.z = 0.0f;
       r5.yzw = -r9.xyz * r8.xyz + r0.xyz;
@@ -760,107 +728,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     r5.yzw = combineAlpha_g * r5.yzw + r9.xyz;
     float3 charColor = r3.www ? r9.xyz : r5.yzw;
     const bool ptDirectCharacter = shader_injection_data.pt_direct_bound > 0.5f && ptGiValid;
-    // RTXDI character lamp fallback: add unshadowed point and spot lamp light (charaColor) when no staged local-DI
-    // tuple resolved this pixel. Resolved pixels keep their RTXDI contribution and take no fallback term.
-    bool rtxdiCharResolved = false;
-    bool rtxdiCharTileValid = false;
-    bool rtxdiCharEmpty = false;
-    if (shader_injection_data.rtxdi_local_bound > 0.5f && !ptDirectCharacter) {
-      uint resolvedWidth, resolvedHeight, tileCount, tileStride, lightCount, lightStride;
-      rtxdiResolvedLocal_g.GetDimensions(resolvedWidth, resolvedHeight);
-      lightIndices_g.GetDimensions(tileCount, tileStride);
-      dynamicLights_g.GetDimensions(lightCount, lightStride);
-      const uint2 pixel = (uint2)v0.xy;
-      const float2 tilePosition = lightTileSizeInv_g.xy * v0.xy;
-      if (all(isfinite(tilePosition)) && all(lightTileSizeInv_g.xy > 0.0)
-          && pixel.x < resolvedWidth && pixel.y < resolvedHeight
-          && tilePosition.x >= 0.0 && tilePosition.y >= 0.0 && tilePosition.x < 32.0 && tilePosition.y < 18.0) {
-        const uint2 tile = (uint2)tilePosition;
-        const uint tileBase = tile.x + (tile.y << 5u);
-        if (tileBase < tileCount) {
-          const float tileDepthInv = lightIndices_g[tileBase].tileDepthInv;
-          if (isfinite(tileDepthInv) && tileDepthInv >= 0.0 && isfinite(r1.w) && -r1.w > 0.0) {
-            const float depthSliceValue = tileDepthInv * -r1.w;
-            if (isfinite(depthSliceValue)) {
-              const uint depthSlice = (uint)clamp(depthSliceValue, 0.0, 7.0);
-              const uint tileCell = min(4607u, depthSlice * 576u + tileBase);
-              if (tileCell < tileCount) {
-                rtxdiCharTileValid = true;
-                const uint4 resolvedTuple = rtxdiResolvedLocal_g.Load(int3(pixel, 0));
-                rtxdiCharEmpty = resolvedTuple.z == RTXDI_DI_STATUS_EMPTY;
-                const LightIndexData tileData = lightIndices_g[tileCell];
-                const RtxdiLightingSelection selection =
-                    RtxdiResolveLightingSelection(true, resolvedTuple, lightCount, tileData);
-                if (selection.valid) {
-                  RtxdiDenoisedDiffuseResult denoised = (RtxdiDenoisedDiffuseResult)0;
-                  uint denoisedWidth, denoisedHeight;
-                  rtxdiDenoisedDiffuse_g.GetDimensions(denoisedWidth, denoisedHeight);
-                  if (shader_injection_data.rtxdi_diffuse_bound > 0.5f
-                      && pixel.x < denoisedWidth && pixel.y < denoisedHeight) {
-                    denoised = RtxdiResolveDenoisedDiffuse(true, selection,
-                                                          rtxdiDenoisedDiffuse_g.Load(int3(pixel, 0)), 2u);
-                  }
-                  if (denoised.valid) {
-                    charColor += r0.xyz * denoised.radiance * shader_injection_data.rtxdi_local_character_intensity;
-                    rtxdiCharResolved = true;
-                    rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FILTERED;
-                  } else if (selection.status == RTXDI_DI_STATUS_BLOCKED) {
-                    if (shader_injection_data.rtxdi_local_character_keep > 0.0) {
-                      RtxdiLightingSelection visibleSelection = selection;
-                      visibleSelection.status = RTXDI_DI_STATUS_VISIBLE;
-                      const RtxdiCharacterLightResult characterLight =
-                          RtxdiEvaluateCharacterLight(visibleSelection, dynamicLights_g[selection.index], r4.xyz, DecodeFalcomMrtNormalAsGame((uint2)r1.xy));
-                      if (characterLight.resolved) {
-                        charColor += r0.xyz * characterLight.diffuse * shader_injection_data.rtxdi_local_character_keep * shader_injection_data.rtxdi_local_character_intensity;
-                      }
-                    }
-                    rtxdiCharResolved = true;
-                    rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_BLOCKED;
-                  } else {
-                    const LightParam lamp = dynamicLights_g[selection.index];
-                    const RtxdiCharacterLightResult characterLight =
-                        RtxdiEvaluateCharacterLight(selection, lamp, r4.xyz, DecodeFalcomMrtNormalAsGame((uint2)r1.xy));
-                    if (characterLight.resolved) {
-                      charColor += r0.xyz * characterLight.diffuse * shader_injection_data.rtxdi_local_character_intensity;
-                      rtxdiCharResolved = true;
-                      rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_RAW;
-                    } else {
-                      rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FALLBACK;
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    const bool rtxdiCharFallback = !rtxdiCharResolved && shader_injection_data.rtxdi_local_bound > 0.5f
-        && shader_injection_data.rtxdi_local_character_fallback > 0.5f && rtxdiCharTileValid && !rtxdiCharEmpty;
-    if (rtxdiCharFallback && !ptDirectCharacter) {
-      rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FALLBACK;
-      const float3 rtxdiCharN = DecodeFalcomMrtNormalAsGame((uint2)r1.xy);
-      // Tile cell and depth slice match the environment path; the pixel branch above also bounds-checks these indices.
-      const uint2 rtxdiCharTile = (uint2)(lightTileSizeInv_g.xy * v0.xy);
-      const uint rtxdiCharRow = rtxdiCharTile.y << 5;
-      const uint rtxdiCharSlice = (uint)clamp(lightIndices_g[rtxdiCharTile.x + rtxdiCharRow].tileDepthInv * -r1.w, 0.0, 7.0);
-      const uint rtxdiCharCell = min(4607u, rtxdiCharSlice * 576u + rtxdiCharRow + rtxdiCharTile.x);
-      const uint rtxdiCharPoints = rtxdiCharFallback ? min(63u, lightIndices_g[rtxdiCharCell].pointLightCount) : 0u;
-      const uint rtxdiCharSpots = rtxdiCharFallback ? min(63u, lightIndices_g[rtxdiCharCell].spotLightCount) : 0u;
-      float3 rtxdiCharLampLight = float3(0, 0, 0);
-      for (uint i = 0u; i < rtxdiCharPoints + rtxdiCharSpots; ++i) {
-        const bool spot = i >= rtxdiCharPoints;
-        const LightParam lamp = dynamicLights_g[spot ? lightIndices_g[rtxdiCharCell].spotLightIndices[i - rtxdiCharPoints]
-                                                     : lightIndices_g[rtxdiCharCell].pointLightIndices[i]];
-        if (lamp.radius <= 0.0) continue;
-        const float3 toLamp = lamp.pos - r4.xyz;
-        const float3 lampDir = normalize(toLamp);
-        const float att = LampDistanceAttenuation(lamp, toLamp) * (spot ? LampSpotCone(lamp, lampDir) : 1.0);
-        if (att <= 0.0) continue;
-        rtxdiCharLampLight += lamp.charaColor * (att * max(lamp.translucency, dot(rtxdiCharN, lampDir)));
-      }
-      charColor += r0.xyz * rtxdiCharLampLight * shader_injection_data.rtxdi_local_character_intensity;
-    }
     // Unified PT direct (A2.4 Q1): PT diffuse (demodulated, total) x albedo + PT specular radiance replace all character
     // lighting terms (sun toon, lamps, ambient/SSGI); t47/t48 already include direct and indirect light.
     if (ptDirectCharacter) {
@@ -909,21 +776,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r0.w = r3.w * r0.w + 1;
   r3.zw = min(shadowUVClamp_g.xy, v1.xy);
   r3.z = shadowTexture.SampleLevel(samLinear_s, r3.zw, 0).x;
-  uint rtxdiSunLayers = 0u;
-  // RTXDI sun visibility replaces the CSM visibility here, before every reader of r3.z.
-  // Non-character pixels only: the character branch returned above.
-  if (shader_injection_data.rtxdi_sun_bound > 0.5f) {
-    uint sunWidth, sunHeight;
-    rtxdiSunVisibility_g.GetDimensions(sunWidth, sunHeight);
-    const uint2 sunPixel = (uint2)v0.xy;
-    if (sunPixel.x < sunWidth && sunPixel.y < sunHeight) {
-      const RtxdiSunLightingSelection sunSelection =
-          RtxdiResolveSunLightingSelection(true, rtxdiSunVisibility_g.Load(int3(sunPixel, 0)),
-                                           shader_injection_data.rtxdi_sun_foliage_transmission);
-      if (sunSelection.known) r3.z = 1.0 - saturate(shader_injection_data.rtxdi_sun_darkening) * (1.0 - sunSelection.visibility);
-      if (sunSelection.known) rtxdiSunLayers = sunSelection.layers;
-    }
-  }
   if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) r3.z = 0.0f;
   r3.w = min(r3.z, r0.w);
   r1.xy = (uint2)r1.xy;
@@ -995,47 +847,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r1.x = mad((int)r3.y, 576, (int)r1.x);
   r1.x = (int)r3.x + (int)r1.x;
   r1.x = min(4607, (uint)r1.x);
-  if (shader_injection_data.rtxdi_local_bound > 0.5f) {
-    uint resolved_width, resolved_height, tile_count, tile_stride, light_count, light_stride;
-    rtxdiResolvedLocal_g.GetDimensions(resolved_width, resolved_height);
-    lightIndices_g.GetDimensions(tile_count, tile_stride);
-    dynamicLights_g.GetDimensions(light_count, light_stride);
-    const uint2 resolved_pixel = (uint2)v0.xy;
-    if (resolved_pixel.x < resolved_width && resolved_pixel.y < resolved_height && (uint)r1.x < tile_count) {
-      rtxdi_resolved = rtxdiResolvedLocal_g.Load(int3(resolved_pixel, 0));
-      rtxdi_selected_index = rtxdi_resolved.x;
-      rtxdi_selected_type = rtxdi_resolved.y;
-      rtxdi_status = rtxdi_resolved.z;
-      rtxdi_inverse_pdf = asfloat(rtxdi_resolved.w);
-      if ((uint)r1.x < tile_count) {
-        const LightIndexData di_tile = lightIndices_g[r1.x];
-        rtxdi_selection = RtxdiResolveLightingSelection(true, rtxdi_resolved, light_count, di_tile);
-        rtxdi_output_valid = rtxdi_selection.valid;
-        if (!rtxdi_output_valid) {
-          rtxdi_debug_consumer = rtxdi_status == RTXDI_DI_STATUS_EMPTY ? RTXDI_DEBUG_CONSUMER_EMPTY
-                                   : rtxdi_status == RTXDI_DI_STATUS_UNKNOWN ? RTXDI_DEBUG_CONSUMER_FALLBACK
-                                                                            : RTXDI_DEBUG_CONSUMER_INVALID;
-        } else if (rtxdi_selection.status == RTXDI_DI_STATUS_BLOCKED) {
-          rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_BLOCKED;
-        }
-        if (rtxdi_output_valid && rtxdi_selection.status == RTXDI_DI_STATUS_BLOCKED) rtxdi_inverse_pdf *= 1.0 - saturate(shader_injection_data.rtxdi_local_darkening);
-        if (rtxdi_output_valid && shader_injection_data.rtxdi_diffuse_bound > 0.5f) {
-          uint denoised_width, denoised_height;
-          rtxdiDenoisedDiffuse_g.GetDimensions(denoised_width, denoised_height);
-          if (resolved_pixel.x < denoised_width && resolved_pixel.y < denoised_height) {
-            const RtxdiDenoisedDiffuseResult denoised =
-                RtxdiResolveDenoisedDiffuse(true, rtxdi_selection,
-                                            rtxdiDenoisedDiffuse_g.Load(int3(resolved_pixel, 0)), 1u);
-            rtxdi_nrd_diffuse_valid = denoised.valid;
-            rtxdi_nrd_diffuse = denoised.radiance;
-            if (denoised.valid) rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_FILTERED;
-          }
-        }
-        if (rtxdi_output_valid && rtxdi_selection.status == RTXDI_DI_STATUS_VISIBLE
-            && !rtxdi_nrd_diffuse_valid) rtxdi_debug_consumer = RTXDI_DEBUG_CONSUMER_RAW;
-      }
-    }
-  }
   r13.xyz = lightProbe_g[1].xyz * r8.xxx + lightProbe_g[0].xyz;
   r13.xyz = lightProbe_g[2].xyz * r8.yyy + r13.xyz;
   r13.xyz = lightProbe_g[3].xyz * r8.www + r13.xyz;
@@ -1435,10 +1246,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r0.w = r2.x * r9.x;
   r9.xyz = r15.yzw + -r10.xyz;
   r9.xyz = r0.www * r9.xyz + r10.xyz;
-  if (rtxdiSunLayers != 0u) {
-    r9.xyz *= pow(saturate(float3(shader_injection_data.rtxdi_sun_foliage_tint_r, shader_injection_data.rtxdi_sun_foliage_tint_g,
-                                  shader_injection_data.rtxdi_sun_foliage_tint_b)), (float)rtxdiSunLayers);
-  }
   // Sun contact shadows apply HERE, to the sun diffuse and before r13.xyz (ambient)
   // is added, gated on real sun visibility. See FalcomApplyContactToSun: scaling the
   // final colour darkened interiors, and scaling the sun term alone still darkened
@@ -1480,31 +1287,21 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                                          : shader_injection_data.cs_contact_local_env_spot) > 0.5f;
   const float csLocalPointVis = csLocalPointOn ? 1.0 - csLocalShare.x * csLocalStrength : 1.0;
   const float csLocalSpotVis = csLocalSpotOn ? 1.0 - csLocalShare.y * csLocalStrength : 1.0;
-  uint rtxdi_point_loop_count = 0u;
-  uint rtxdi_spot_loop_count = 0u;
-  RtxdiEffectiveLightingLoopCounts(rtxdi_selection, min(lightIndices_g[r1.x].pointLightCount, 63u),
-                                  min(lightIndices_g[r1.x].spotLightCount, 63u), rtxdi_point_loop_count,
-                                  rtxdi_spot_loop_count);
-  if (rtxdi_output_valid && rtxdi_selection.status == RTXDI_DI_STATUS_BLOCKED && rtxdi_inverse_pdf > 0.0) {
-    if (rtxdi_selection.type == RTXDI_DI_LIGHT_TYPE_POINT) {
-      rtxdi_point_loop_count = 1u;
-    } else {
-      rtxdi_spot_loop_count = 1u;
-    }
-  }
+  uint pt_point_loop_count = min(lightIndices_g[r1.x].pointLightCount, 63u);
+  uint pt_spot_loop_count = min(lightIndices_g[r1.x].spotLightCount, 63u);
   if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) {
-    rtxdi_point_loop_count = 0u;
-    rtxdi_spot_loop_count = 0u;
+    pt_point_loop_count = 0u;
+    pt_spot_loop_count = 0u;
   }
   if (r20.y != 0) {
-    r0.w = rtxdi_point_loop_count;
+    r0.w = pt_point_loop_count;
     r10.xyz = float3(0,0,0);
     r11.xyz = float3(0,0,0);
     r2.x = 0;
     while (true) {
       r2.w = cmp((uint)r2.x >= (uint)r0.w);
       if (r2.w != 0) break;
-      r2.w = rtxdi_output_valid ? rtxdi_selected_index : lightIndices_g[r1.x].pointLightIndices[r2.x];
+      r2.w = lightIndices_g[r1.x].pointLightIndices[r2.x];
       r12.x = dynamicLights_g[r2.w].pos.x;
       r12.y = dynamicLights_g[r2.w].pos.y;
       r12.z = dynamicLights_g[r2.w].pos.z;
@@ -1531,11 +1328,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         r13.x = dynamicLights_g[r2.w].color.x;
         r13.y = dynamicLights_g[r2.w].color.y;
         r13.z = dynamicLights_g[r2.w].color.z;
-        if (rtxdi_output_valid) {
-          r13.xyz *= rtxdi_inverse_pdf;
-        } else {
-          r13.xyz *= csLocalPointVis;
-        }
+        r13.xyz *= csLocalPointVis;
         // ── BRDF Point Light ──
         float brdf_rawNdotL_pt = r6.w;
         float3 brdf_H_pt = normalize(brdf_V + r12.xyz);
@@ -1547,7 +1340,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
               HammonDiffuseCorrection(saturate(brdf_rawNdotL_pt), brdf_NdotV, brdf_NdotH_pt, brdf_VdotH_pt, brdf_roughness),
               brdf_diffuse_str);
         }
-        if (!rtxdi_nrd_diffuse_valid) r11.xyz = brdf_vanilla_diffuse_pt + r11.xyz;
         r12.xyz = r14.xyz * r1.yyy + r12.xyz;
         r5.z = dot(r12.xyz, r12.xyz);
         r5.z = rsqrt(r5.z);
@@ -1577,7 +1369,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       r2.x = (int)r2.x + 1;
     }
     r11.xyz = r11.xyz * r14.www + r9.xyz;
-    r0.w = rtxdi_spot_loop_count;
+    r0.w = pt_spot_loop_count;
     r12.yw = localShadowResolutionInv_g * float2(1.25,-1.25);
     r12.xz = float2(0,0);
     r13.xyz = r10.xyz;
@@ -1586,7 +1378,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     while (true) {
       r2.w = cmp((uint)r2.x >= (uint)r0.w);
       if (r2.w != 0) break;
-      r2.w = rtxdi_output_valid ? rtxdi_selected_index : lightIndices_g[r1.x].spotLightIndices[r2.x];
+      r2.w = lightIndices_g[r1.x].spotLightIndices[r2.x];
       r16.x = dynamicLights_g[r2.w].pos.x;
       r16.y = dynamicLights_g[r2.w].pos.y;
       r16.z = dynamicLights_g[r2.w].pos.z;
@@ -1625,7 +1417,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r19.x = dynamicLights_g[r2.w].translucency;
           r19.y = dynamicLights_g[r2.w].shadowmapIndex;
           r5.z = cmp((int)r19.y != -1);
-          if (r5.z != 0 && !rtxdi_output_valid) {
+          if (r5.z != 0) {
             r21.xyzw = spotShadowMatrices_g[r19.y]._m00_m10_m20_m30;
             r23.xyzw = spotShadowMatrices_g[r19.y]._m01_m11_m21_m31;
             r24.xyzw = spotShadowMatrices_g[r19.y]._m02_m12_m22_m32;
@@ -1661,11 +1453,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r19.x = dynamicLights_g[r2.w].color.x;
           r19.y = dynamicLights_g[r2.w].color.y;
           r19.z = dynamicLights_g[r2.w].color.z;
-          if (rtxdi_output_valid) {
-            r19.xyz *= rtxdi_inverse_pdf;
-          } else {
-            r19.xyz *= csLocalSpotVis;
-          }
+          r19.xyz *= csLocalSpotVis;
           // ── BRDF Spot Light ──
           float3 brdf_H_sp = normalize(brdf_V + r16.xyz);
           float brdf_NdotH_sp = saturate(dot(brdf_H_sp, r8.xyw));
@@ -1676,7 +1464,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                 HammonDiffuseCorrection(saturate(brdf_rawNdotL_sp), brdf_NdotV, brdf_NdotH_sp, brdf_VdotH_sp, brdf_roughness),
                 brdf_diffuse_str);
           }
-          if (!rtxdi_nrd_diffuse_valid) r15.yzw = brdf_vanilla_diffuse_sp + r15.yzw;
           r16.xyz = r14.xyz * r1.yyy + r16.xyz;
           r5.z = dot(r16.xyz, r16.xyz);
           r5.z = rsqrt(r5.z);
@@ -1709,12 +1496,12 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     r2.xyw = r15.yzw * r14.www + r11.xyz;
     r3.xyz = r13.xyz * r14.www + r3.xyz;
   } else {
-    r0.w = rtxdi_point_loop_count;
+    r0.w = pt_point_loop_count;
     r10.xyzw = float4(0,0,0,0);
     while (true) {
       r1.y = cmp((uint)r10.w >= (uint)r0.w);
       if (r1.y != 0) break;
-      r1.y = rtxdi_output_valid ? rtxdi_selected_index : lightIndices_g[r1.x].pointLightIndices[r10.w];
+      r1.y = lightIndices_g[r1.x].pointLightIndices[r10.w];
       r11.x = dynamicLights_g[r1.y].pos.x;
       r11.y = dynamicLights_g[r1.y].pos.y;
       r11.z = dynamicLights_g[r1.y].pos.z;
@@ -1743,11 +1530,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         r11.x = dynamicLights_g[r1.y].color.x;
         r11.y = dynamicLights_g[r1.y].color.y;
         r11.z = dynamicLights_g[r1.y].color.z;
-        if (rtxdi_output_valid) {
-          r11.xyz *= rtxdi_inverse_pdf;
-        } else {
-          r11.xyz *= csLocalPointVis;
-        }
+        r11.xyz *= csLocalPointVis;
         r11.xyz = r11.xyz * r5.zzz;
         float3 brdf_vanilla_diffuse_pt_env = r11.xyz * r5.yyy;
         if (brdf_use_hammon) {
@@ -1755,19 +1538,19 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
               HammonDiffuseCorrection(saturate(brdf_rawNdotL_pt_env), brdf_NdotV, brdf_NdotH_pt_env, brdf_VdotH_pt_env, brdf_roughness),
               brdf_diffuse_str);
         }
-        if (!rtxdi_nrd_diffuse_valid) r10.xyz = brdf_vanilla_diffuse_pt_env + r10.xyz;
+        r10.xyz = brdf_vanilla_diffuse_pt_env + r10.xyz;
       }
       r10.w = (int)r10.w + 1;
     }
     r9.xyz = r10.xyz * r14.www + r9.xyz;
-    r0.w = rtxdi_spot_loop_count;
+    r0.w = pt_spot_loop_count;
     r10.yw = localShadowResolutionInv_g * float2(1.25,-1.25);
     r10.xz = float2(0,0);
     r11.xyzw = float4(0,0,0,0);
     while (true) {
       r1.y = cmp((uint)r11.w >= (uint)r0.w);
       if (r1.y != 0) break;
-      r1.y = rtxdi_output_valid ? rtxdi_selected_index : lightIndices_g[r1.x].spotLightIndices[r11.w];
+      r1.y = lightIndices_g[r1.x].spotLightIndices[r11.w];
       r12.x = dynamicLights_g[r1.y].pos.x;
       r12.y = dynamicLights_g[r1.y].pos.y;
       r12.z = dynamicLights_g[r1.y].pos.z;
@@ -1806,7 +1589,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r13.x = dynamicLights_g[r1.y].translucency;
           r13.y = dynamicLights_g[r1.y].shadowmapIndex;
           r5.z = cmp((int)r13.y != -1);
-          if (r5.z != 0 && !rtxdi_output_valid) {
+          if (r5.z != 0) {
             r19.xyzw = spotShadowMatrices_g[r13.y]._m00_m10_m20_m30;
             r21.xyzw = spotShadowMatrices_g[r13.y]._m01_m11_m21_m31;
             r23.xyzw = spotShadowMatrices_g[r13.y]._m02_m12_m22_m32;
@@ -1843,11 +1626,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r12.x = dynamicLights_g[r1.y].color.x;
           r12.y = dynamicLights_g[r1.y].color.y;
           r12.z = dynamicLights_g[r1.y].color.z;
-          if (rtxdi_output_valid) {
-            r12.xyz *= rtxdi_inverse_pdf;
-          } else {
-            r12.xyz *= csLocalSpotVis;
-          }
+          r12.xyz *= csLocalSpotVis;
           r12.xyz = r12.xyz * r5.yyy;
           float3 brdf_vanilla_diffuse_sp_env = r12.xyz * r5.zzz;
           if (brdf_use_hammon) {
@@ -1855,14 +1634,13 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                 HammonDiffuseCorrection(saturate(brdf_rawNdotL_sp_env), brdf_NdotV, brdf_NdotH_sp_env, brdf_VdotH_sp_env, brdf_roughness),
                 brdf_diffuse_str);
           }
-          if (!rtxdi_nrd_diffuse_valid) r11.xyz = brdf_vanilla_diffuse_sp_env + r11.xyz;
+          r11.xyz = brdf_vanilla_diffuse_sp_env + r11.xyz;
         }
       }
       r11.w = (int)r11.w + 1;
     }
     r2.xyw = r11.xyz * r14.www + r9.xyz;
   }
-  if (rtxdi_nrd_diffuse_valid) r2.xyw += rtxdi_nrd_diffuse * r14.www;
   r3.xyz = r3.xyz * r9.www;
   r8.xyz = r22.xyz * r2.xyw + r3.xyz;
   r0.w = cmp(0 < r17.x);

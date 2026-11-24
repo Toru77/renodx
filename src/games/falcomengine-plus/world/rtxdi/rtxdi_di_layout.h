@@ -1,3 +1,4 @@
+// Shared layout for the light table, PT final shading, debug views, ReGIR and the NRD bridge test fixtures (Unified PT A7/A8).
 #ifndef FALCOM_WORLD_RTXDI_DI_LAYOUT_H_
 #define FALCOM_WORLD_RTXDI_DI_LAYOUT_H_
 

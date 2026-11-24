@@ -12,7 +12,6 @@
 namespace falcom_world::rtxdi {
 
 inline float g_local_requested = 0.f;
-inline float g_sun_requested = 0.f;
 inline float g_quality_preset = 1.f;
 inline float g_local_candidates = 8.f;
 inline float g_temporal_reuse = 1.f;
@@ -46,22 +45,16 @@ inline float g_sun_character_normal_bias = 0.02f;
 inline float g_sun_casters_only = 1.f;
 inline float g_sun_shadow_darkening = 1.f;
 inline float g_sun_character_shadow_darkening = 1.f;
-inline float g_sun_trace_resolution = 0.f;
 inline float g_sun_light_size = 0.f;
 inline float g_sun_isfast = 1.f;
 inline float g_sun_foliage_transmission = 0.f;
 inline float g_sun_wind_transmission = 0.5f;
 inline float g_sun_wind_softening = 0.5f;
 inline float g_sun_character_self_softening = 0.f;
-inline float g_sun_accumulation = 1.f;
-inline float g_sun_accumulation_frames = 8.f;
 inline float g_sun_foliage_tint_r = 1.f;
 inline float g_sun_foliage_tint_g = 1.f;
 inline float g_sun_foliage_tint_b = 1.f;
-inline float g_local_shadow_darkening = 1.f;
-inline float g_local_character_shadow_darkening = 1.f;
 inline float g_local_character_intensity = 1.f;
-inline float g_local_character_fallback = 1.f;
 inline float g_local_light_size = 0.f;
 inline float g_local_isfast = 1.f;
 inline float g_local_character_self_softening = 0.f;
@@ -69,8 +62,6 @@ inline float g_local_light_clamp_enabled = 0.f;
 inline float g_local_light_clamp = 16.f;
 inline float g_local_stable_light_remap = 0.f;
 inline float FiniteClamped(float value, float fallback, float minimum, float maximum) { return std::clamp(std::isfinite(value) ? value : fallback, minimum, maximum); }
-inline bool SunAccumulationRequested() { return g_sun_accumulation > 0.5f && FiniteClamped(g_sun_light_size, 0.f, 0.f, 5.f) > 0.f; }
-inline bool SunAccumulationAllowed(bool relax_selected, bool rr_active) { return relax_selected && !rr_active && SunAccumulationRequested(); }
 inline bool g_applying_quality_preset = false;
 inline uint32_t SceneRequestMask() {
   // Unified PT M6: RTXDI Local and Sun are superseded; only path tracing requests the scene (bits 2 and 4 stay clear).
@@ -242,74 +233,6 @@ struct DiState {
   DiSnapshot snapshot;
 };
 inline DiState g_di;
-
-enum class SunStatus { Off,
-                       WaitingInput,
-                       Staged,
-                       Failed,
-                       Quarantined };
-struct SunSnapshot {
-  SunStatus status = SunStatus::Off;
-  uint32_t frame = UINT32_MAX, width = 0u, height = 0u;
-  uint64_t owner_generation = 0u, configuration_generation = 0u;
-  uint64_t di_configuration_generation = 0u;
-  uint64_t fence_b = 0u, fence_c = 0u;
-  int32_t scene_slot = -1, transfer_slot = -1;
-  bool output_bound = false;
-  uint32_t output_bound_frame = UINT32_MAX;
-  int32_t output_bound_transfer_slot = -1;
-  uint64_t output_bound_fence_b = 0u;
-  bool lighting_draw_seen = false;
-  bool accumulated = false;
-  bool accumulation_history = false;
-  int32_t error = 0;
-};
-inline bool MatchesStagedSunIdentity(const SunSnapshot& snapshot, uint32_t frame, uint64_t owner_generation,
-                                     uint64_t configuration_generation, uint64_t di_configuration_generation) {
-  return snapshot.status != SunStatus::Staged
-         || (snapshot.frame == frame && snapshot.owner_generation == owner_generation
-             && snapshot.configuration_generation == configuration_generation
-             && snapshot.di_configuration_generation == di_configuration_generation);
-}
-inline bool MatchesStagedSunSlotIdentity(const SunSnapshot& snapshot, uint32_t frame, uint64_t owner_generation,
-                                         uint64_t configuration_generation, uint64_t di_configuration_generation,
-                                         uint64_t slot_configuration_generation) {
-  return MatchesStagedSunIdentity(snapshot, frame, owner_generation, configuration_generation,
-                                  di_configuration_generation)
-         && (snapshot.status != SunStatus::Staged
-             || snapshot.configuration_generation == slot_configuration_generation);
-}
-enum class SunAttemptAction { Off,
-                              PreserveDuplicate,
-                              Invalidate };
-inline void TransitionSunAttempt(SunSnapshot* snapshot, uint32_t frame, SunAttemptAction action) {
-  switch (action) {
-    case SunAttemptAction::Off:
-      *snapshot = {.status = SunStatus::Off, .frame = frame};
-      break;
-    case SunAttemptAction::PreserveDuplicate:
-      break;
-    case SunAttemptAction::Invalidate:
-      *snapshot = {.status = SunStatus::WaitingInput, .frame = frame};
-      break;
-  }
-}
-struct SunState {
-  std::shared_mutex mutex;
-  SunSnapshot snapshot;
-};
-inline SunState g_sun;
-
-inline const char* SunStatusName(SunStatus status) {
-  switch (status) {
-    case SunStatus::Off:          return "off";
-    case SunStatus::WaitingInput: return "waiting input";
-    case SunStatus::Staged:       return "staged";
-    case SunStatus::Failed:       return "failed";
-    case SunStatus::Quarantined:  return "quarantined";
-  }
-  return "unknown";
-}
 
 inline const char* DiStatusName(DiStatus status) {
   switch (status) {
