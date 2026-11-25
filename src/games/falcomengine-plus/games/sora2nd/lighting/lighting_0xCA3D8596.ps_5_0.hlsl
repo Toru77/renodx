@@ -418,7 +418,9 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
     ptAo = saturate(ptSample.a - 1.0);
     ptGiIrradiance = ptSample.rgb * shader_injection_data.pt_intensity;
     cachedPtGi = ptGiIrradiance * r0.xyz;
-    r5.x = lerp(1.0, ptAo, saturate(shader_injection_data.pt_ao_strength));
+    // A33: mrt0.w bit 15 = the mod's foliage marker (games/sora2nd/foliage/*: o1.w |= 0x8000).
+    r5.x = lerp(1.0, ptAo, saturate(((uint)r1.z & 0x8000u) != 0u
+        ? shader_injection_data.pt_foliage_ao_strength : shader_injection_data.pt_ao_strength));
     cachedVBGI = float3(0, 0, 0);
     cachedVBGILuma = 0;
   }

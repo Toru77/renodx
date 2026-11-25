@@ -59,7 +59,8 @@ struct PtRestirConstants {
   float sun_toon, char_sun_toon, char_lamp_toon, sun_intensity;
   float char_terminator_fade, terminator_padding0, terminator_padding1, terminator_padding2;
   uint32_t ao_rays;
-  float ao_radius, ao_strength, ao_padding;
+  float ao_radius, char_self_ao_strength, char_self_ao_gap;
+  float char_self_ao_radius, self_ao_padding0, self_ao_padding1, self_ao_padding2;
 };
 
 #ifdef __cplusplus

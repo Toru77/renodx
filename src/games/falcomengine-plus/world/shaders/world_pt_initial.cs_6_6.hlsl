@@ -76,17 +76,29 @@ void main(uint3 id : SV_DispatchThreadID) {
     const WorldCameraView ao_view = {true, 1.0, 0u, 0u};
     WorldTraceCounters ao_counters;
     uint unoccluded = 0u;
+    const bool character = (surface.flags & 2u) != 0u;
+    uint self_occluded = 0u;
     for (uint ray = 0u; ray < g_restir.ao_rays; ++ray) {
       const float2 u = float2(RTXDI_GetNextRandom(ao_rng), RTXDI_GetNextRandom(ao_rng));
       float pdf;
       const float3 dir = TangentToWorld(surface, SampleCosHemisphere(u, pdf));
       // A32: character receivers take environment-only AO (no proxy self-hit).
-      g_rt12_dynamic_mask = g_dynamic_on != 0u && (surface.flags & 2u) == 0u ? RT12_MASK_DYNAMIC : 0u;
+      g_rt12_dynamic_mask = g_dynamic_on != 0u && !character ? RT12_MASK_DYNAMIC : 0u;
       const WorldTraceHit hit = TraceWorldRayDxr(surface.worldPos + surface.geoNormal * 1e-3, dir, 1e-3,
                                                  g_restir.ao_radius, true, ao_view, ao_counters);
-      if (hit.prim == 0xFFFFFFFFu) ++unoccluded;
+      if (hit.prim == 0xFFFFFFFFu) {
+        ++unoccluded;
+        // A33: character self-AO: character meshes included, hits nearer than the gap ignored (no self-hit blotch).
+        if (character && g_dynamic_on != 0u && g_restir.char_self_ao_strength > 0.0) {
+          g_rt12_dynamic_mask = RT12_MASK_DYNAMIC;
+          if (TraceWorldRayDxr(surface.worldPos + surface.geoNormal * 1e-3, dir, g_restir.char_self_ao_gap,
+                               g_restir.char_self_ao_radius, true, ao_view, ao_counters).prim != 0xFFFFFFFFu) {
+            ++self_occluded;
+          }
+        }
+      }
     }
-    ao = float(unoccluded) / float(g_restir.ao_rays);
+    ao = (float(unoccluded) - g_restir.char_self_ao_strength * float(self_occluded)) / float(g_restir.ao_rays);
   }
   if (g_restir.debug_view == PT_DEBUG_VIEW_AO) PtWriteInitialDebug(id.xy, float4(ao.xxx, 1.0), 0u, 0u);
 #endif
