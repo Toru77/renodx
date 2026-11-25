@@ -38,6 +38,7 @@ struct RAB_Surface {
   uint2 pixel;
   uint material_source;
   uint material_index;
+  float lampScale;
 };
 
 struct RAB_LightInfo {
@@ -229,6 +230,7 @@ RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
   if (!m.character && !m.reflective) s.flags |= 32u;
 #endif
   s.material.character = m.character;
+  s.lampScale = m.character ? 1.0 : m.lamp_scale;
 #if defined(PT_WATER_SURFACE)
   s.material.diffuseAlbedo = 0.0;
   s.material.roughness = saturate(g_water_roughness);
@@ -312,6 +314,7 @@ RAB_Surface PtHitSurface(float3 position, float3 normal, float distance, float3 
   if (!m.character && !m.reflective) s.flags |= 32u;
   s.material.roughness = saturate(m.roughness);
   s.material.character = m.character;
+  s.lampScale = 1.0;
   s.material_source = m.debug_source;
   s.material_index = m.debug_index;
   s.diffuseProbability = PtSurfaceDiffuseProbability(s);
@@ -537,7 +540,7 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
     s.solidAnglePdf = 1.0;
   }
   float3 color = max(surface.material.character ? lp.charaColor * g_restir.char_lamp_intensity : lp.color, 0.0);
-  color *= LampDistanceAttenuation(lp, to);
+  color *= LampDistanceAttenuation(lp, to) * surface.lampScale;
   if (info.type == LAMP_TYPE_SPOT) color *= LampSpotCone(lp, l);
   // The game's environment lamp response is colour x max(N.L, translucency) (lighting_0xCA3D8596); times the Lambert
   // cos this restores the wrap on pure-Lambert surfaces only, so no specular lobe is scaled.

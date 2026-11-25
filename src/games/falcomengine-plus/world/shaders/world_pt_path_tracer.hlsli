@@ -14,7 +14,8 @@ bool IsEmissiveSamplingEnabled() { return g_sharc_enabled != 0u; }
 bool IsNeeSamplingEnabled() { return true; }
 
 float3 PtGiClampLe(float3 le, float3 throughput) {
-  if (g_restir.gi_clamp_per_bounce == 0u) return le;
+  // With Direct on the final pass sees whole-pixel estimates, so the GI clamp applies per bounce (A22 L2).
+  if (g_restir.gi_clamp_per_bounce == 0u && g_restir.direct_enabled == 0u) return le;
   return le * min(1.0, g_gi_clamp / max(CalcLuminance(le * throughput), 1e-6));
 }
 
@@ -245,8 +246,9 @@ void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_
   RTXDI_DIReservoir local_reservoir = RTXDI_EmptyDIReservoir();
   RAB_LightSample local_sample = RAB_EmptyLightSample();
   // Candidates come from this pixel's game tile cell: the only lights with a non-zero target
-  // (world_rtxdi_initial_di.cs_6_5.hlsl:132-167).
-  if (tile_valid && g_restir.nee.numLocalLightSamples != 0u) {
+  // (world_rtxdi_initial_di.cs_6_5.hlsl:132-167). Characters take lamps from the final pass's lamp-only estimator in
+  // both character modes (A22 C1).
+  if (tile_valid && g_restir.nee.numLocalLightSamples != 0u && !surface.material.character) {
     const LightIndexData tile = g_pt_tiles[cell];
     const uint point_count = min(tile.pointLightCount, 63u);
     const uint spot_count = min(tile.spotLightCount, 63u);
@@ -313,6 +315,8 @@ void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_
   radiance_from_lights *= PtLightVisibility(visible_surface, light_sample.position);
   radiance_from_lights *= RTXDI_GetDIReservoirInvPdf(reservoir) / light_sample.solidAnglePdf;
   if (all(radiance_from_lights <= 0.0)) return;
+  // Clamp the direct contribution itself, not the pixel total the unified reservoir estimates (A22 L2).
+  radiance_from_lights = PtClampLuminance(radiance_from_lights, g_restir.direct_clamp);
   RTXDI_SampledLightData sampled_light_data = RTXDI_SampledLightData_CreateInvalidData();
   RTXDI_SampledLightData_SetLightData(sampled_light_data, light_index);
   sampled_light_data.uvData = reservoir.uvData;

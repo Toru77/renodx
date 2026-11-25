@@ -504,7 +504,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   const bool refl_on = pt::g_pt_reflection_enabled > 0.5f && input.color.texture12 && input.mrt1.texture12 && input.mrt2.texture12;
   const bool water_on = pt::g_pt_reflection_water_surface > 0.5f && refl_on;
-  const bool refl_target = refl_on || (pt::g_restir_direct > 0.5f && pt::g_restir_char_toon > 0.5f);
+  const bool refl_target = refl_on || pt::g_restir_direct > 0.5f;
   if ((!water_on || !r.water_restir || r.water_restir_width != w || r.water_restir_height != h)
       && r.water_reservoirs_last_use <= completed) {
     RetireObject(s, s.last_signal, r.water_reservoirs);
@@ -1436,8 +1436,17 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       ++pt::g_pt_panel.mat_clears;
       pt::g_pt_panel.mat_clear_reason = mat_clear_reason ? mat_clear_reason : "allocated";
     }
-    const uint32_t cells = ((w + mat_rate - 1u) / mat_rate) * ((h + mat_rate - 1u) / mat_rate);
-    list->Dispatch((cells + 127u) / 128u, 1u, 1u);
+    // A22 M1: every 32 frames each unrefreshed entry ages one step and is evicted at 15 (about 480 frames off-screen).
+    if (frame % 32u == 0u) {
+      params[35] = 2u;
+      list->SetComputeRoot32BitConstants(0u, kRt12PtConstants, params, 0u);
+      list->Dispatch((r.material_capacity + 127u) / 128u, 1u, 1u);
+      material_barrier();
+      params[35] = 0u;
+      list->SetComputeRoot32BitConstants(0u, kRt12PtConstants, params, 0u);
+    }
+    // A22.1: one thread per pixel, so missing cells are written the frame they appear.
+    list->Dispatch((w * h + 127u) / 128u, 1u, 1u);
     material_barrier();
     list->SetPipelineState(r.initial_pso.Get());
   }

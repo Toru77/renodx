@@ -105,6 +105,7 @@ static float4x4 g_pt_view_proj;
 static float4x4 g_pt_inv_view_proj;
 struct PtMaterial {
   float3 albedo; float roughness; float3 f0; float spec_scale; bool character; bool reflective;
+  float lamp_scale;   // game dynamicLightIntensity (DeferredParam byte 76); 1 for characters, cache entries and misses
   uint debug_source;  // 0 exact G-buffer, 1 world cache hit, 2 miss (grey); bit 2 reflective, bit 3 character (debug views only)
   uint debug_index;   // exact: pixel.x | pixel.y << 16; cache: hash-grid index; miss: 0
 };
@@ -193,7 +194,7 @@ PtMaterial PtGBufferMaterialFrom(Texture2D<float4> color, Texture2D<uint4> norma
   PtMaterial m;
   m.albedo = saturate(color.Load(int3(pixel, 0)).rgb);
   m.character = (normal.Load(int3(pixel, 0)).w & 8u) == 0u;
-  m.roughness = g_mat_char_roughness; m.f0 = g_mat_char_f0; m.spec_scale = 1.0; m.reflective = false;
+  m.roughness = g_mat_char_roughness; m.f0 = g_mat_char_f0; m.spec_scale = 1.0; m.reflective = false; m.lamp_scale = 1.0;
   if (!m.character) {
     m.spec_scale = (mrt1.Load(int3(pixel, 0)).z & 255u) * (1.0 / 255.0);
     const uint index = mrt2.Load(int3(pixel, 0)).x;
@@ -202,6 +203,7 @@ PtMaterial PtGBufferMaterialFrom(Texture2D<float4> color, Texture2D<uint4> norma
       if (all(isfinite(float4(d.head[1].xyz, d.tail[0].z)))) {
         m.roughness = saturate(d.tail[0].z); m.f0 = saturate(d.head[1].xyz);
         m.reflective = (asuint(d.tail[3].z) & 36u) == 4u;
+        m.lamp_scale = d.mid.w;  // byte 76, applied to every game lamp sum (lighting_0xCA3D8596 :881, :1442)
       }
     }
   }
@@ -224,6 +226,7 @@ PtMaterial PtUnpackMaterial(uint4 v) {
   m.f0 = float3(f16tof32(v.z), f16tof32(v.z >> 16), f16tof32(v.w)); m.spec_scale = ((v.w >> 16) & 255u) * (1.0 / 255.0);
   m.character = ((v.w >> 24) & 2u) != 0u;
   m.reflective = ((v.w >> 24) & 4u) != 0u;
+  m.lamp_scale = 1.0;
   m.debug_source = 1u; m.debug_index = 0u;
   return m;
 }
@@ -245,6 +248,7 @@ bool PtCacheMaterial(float3 position, float3 nh, out PtMaterial m) {
 PtMaterial PtHitMaterial(float3 position, float3 nh) {
   PtMaterial m;
   m.albedo = float3(0.5, 0.5, 0.5); m.roughness = 1.0; m.f0 = float3(0.04, 0.04, 0.04); m.spec_scale = 1.0; m.character = false; m.reflective = false;
+  m.lamp_scale = 1.0;
   m.debug_source = 2u; m.debug_index = 0u;
   if (g_mat_enabled == 0u) {
     m.debug_source |= (m.reflective ? 4u : 0u) | (m.character ? 8u : 0u);

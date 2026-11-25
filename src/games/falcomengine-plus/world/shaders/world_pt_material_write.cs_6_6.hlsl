@@ -1,7 +1,8 @@
 #define PT_COMMON_PASS 0
 #define SHARC_UPDATE 0
 #include "world_pt_common.hlsli"
-// Material cache (M3): g_mat_mode 1 zeroes every entry; 0 writes one pixel per rate x rate cell (phase rotates per frame).
+// Material cache (M3): g_mat_mode 1 zeroes every entry; 2 ages every unlocked entry and evicts it at age 15 (A22 M1);
+// 0 writes every pixel whose cell is missing and refreshes existing cells from one pixel per rate x rate block (A22.1).
 [numthreads(128, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   if (g_mat_mode == 1u) {
@@ -12,18 +13,40 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     return;
   }
+  if (g_mat_mode == 2u) {
+    // Value word 3 bits 27-30 hold the entry's age in eviction steps; the write pass stores age 0.
+    // SharcCommon.h:134 sets HASH_GRID_LIMIT_EMPTY_SLOTS = 2: an eviction hole can shadow a later entry; the re-insert fills the hole and the stale copy ages out.
+    if (id.x < g_mat_capacity && g_pt_material_keys[id.x] != 0) {
+      const uint base = id.x * 4u;
+      const uint w = g_pt_material_values[base + 3u];
+      if ((w & 0x80000000u) != 0u) return;
+      const uint age = ((w >> 27) & 15u) + 1u;
+      if (age == 15u) {
+        g_pt_material_keys[id.x] = 0;
+        g_pt_material_values[base] = 0; g_pt_material_values[base + 1u] = 0; g_pt_material_values[base + 2u] = 0; g_pt_material_values[base + 3u] = 0;
+      } else {
+        g_pt_material_values[base + 3u] = (w & ~(15u << 27)) | (age << 27);
+      }
+    }
+    return;
+  }
+  const uint2 pixel = uint2(id.x % g_size.x, id.x / g_size.x);
+  if (pixel.y >= g_size.y) return;
   const uint rate = max(g_mat_rate, 1u);
-  const uint cells_x = (g_size.x + rate - 1u) / rate;
   const uint phase = g_frame % (rate * rate);
-  const uint2 pixel = uint2(id.x % cells_x, id.x / cells_x) * rate + uint2(phase % rate, phase / rate);
-  if (any(pixel >= g_size)) return;
+  const bool refresh = all(pixel % rate == uint2(phase % rate, phase / rate));
   RtxdiSurfaceResult surface;
   if (!PtLoadSurface(pixel, surface)) return;
-  const PtMaterial sample = PtGBufferMaterial(pixel);
+  const float3 cache_position = PtCachePosition(surface.world_position, surface.shading_normal);
+  const float3 key_normal = PtMaterialKeyNormal(surface.shading_normal);
   uint64_t key;
+  if (!refresh) {
+    const uint found = HashGridFindEntry(PtMaterialData(), cache_position, key_normal, PtMaterialGrid(), key);
+    if (found != HASH_GRID_INVALID_CACHE_INDEX && ((PtReadMaterial(found).w >> 24) & 1u) != 0u) return;
+  }
+  const PtMaterial sample = PtGBufferMaterial(pixel);
   uint index;
-  if (!HashGridInsertEntry(PtMaterialData(), PtCachePosition(surface.world_position, surface.shading_normal),
-                           PtMaterialKeyNormal(surface.shading_normal), PtMaterialGrid(), key, index)) return;
+  if (!HashGridInsertEntry(PtMaterialData(), cache_position, key_normal, PtMaterialGrid(), key, index)) return;
   const uint base = index * 4u;
   uint previous;
   InterlockedOr(g_pt_material_values[base + 3u], 0x80000000u, previous);

@@ -240,11 +240,12 @@ void main(uint3 id : SV_DispatchThreadID) {
 
   const bool char_direct = g_restir.direct_enabled != 0u && !(character && g_restir.char_toon != 0u);
   const bool toon_character = character && g_restir.char_toon != 0u;
-  const bool toon_lamp_direct = toon_character && g_restir.direct_enabled != 0u;
-  float3 toon_game_lamp = 0.0;
-  if (toon_lamp_direct) {
+  const bool char_lamp_direct = character && g_restir.direct_enabled != 0u;
+  float3 char_lamp = 0.0;
+  if (char_lamp_direct) {
     // The game's character lamp response (translucency included) from a fresh lamp-only NEE sample (A20 C2), so the
-    // lamp no longer competes with indirect paths inside the unified reservoir.
+    // lamp no longer competes with indirect paths inside the unified reservoir. Every character uses it, so the toon
+    // toggle changes only the sun and shading style (A22 C1).
     RTXDI_RandomSamplerState lamp_rng = RTXDI_InitRandomSampler(id.xy, g_frame, 13u);
     float3 lamp_radiance;
     RTXDI_SampledLightData lamp_data;
@@ -257,7 +258,7 @@ void main(uint3 id : SV_DispatchThreadID) {
       const float3 to_lamp = lamp.pos - surface.worldPos;
       const float3 l = normalize(to_lamp);
       const bool spot = g_pt_light_table[lamp_index].type == LAMP_TYPE_SPOT;
-      toon_game_lamp = max(lamp.charaColor, 0.0) * g_restir.char_lamp_intensity
+      char_lamp = max(lamp.charaColor, 0.0) * g_restir.char_lamp_intensity
           * LampDistanceAttenuation(lamp, to_lamp) * (spot ? LampSpotCone(lamp, l) : 1.0)
           * max(lamp.translucency, dot(surface.normal, l)) * PtLightVisibility(surface, lamp_sample.position) / lamp_pdf;
     }
@@ -269,10 +270,6 @@ void main(uint3 id : SV_DispatchThreadID) {
     const float scale = character ? g_restir.pt_char_intensity : g_restir.pt_intensity;
     diffuse *= scale;
     specular *= scale;
-  }
-  if (is_direct) {
-    diffuse = PtClampLuminance(diffuse, g_restir.direct_clamp);
-    specular = PtClampLuminance(specular, g_restir.direct_clamp);
   }
   if (toon_character && is_direct) diffuse = 0.0;  // toon lamp light is written to the character reflection channel
   const float3 raw_specular = PtInvalidPixelGuard(specular);
@@ -289,24 +286,31 @@ void main(uint3 id : SV_DispatchThreadID) {
   const float hit_t = max(length(reservoir.translatedWorldPosition - surface.worldPos), 1e-3);
   g_pt_specular[id.xy] = float4(PtInvalidPixelGuard(rgb), isfinite(hit_t) ? hit_t : 1e-3);
 #else
-  if (!is_direct && g_restir.gi_clamp_per_bounce == 0u) diffuse = PtClampLuminance(diffuse, g_gi_clamp);
+  // With Direct on the GI clamp runs per bounce in the path tracer (A22 L2).
+  if (!is_direct && g_restir.gi_clamp_per_bounce == 0u && g_restir.direct_enabled == 0u) {
+    diffuse = PtClampLuminance(diffuse, g_gi_clamp);
+  }
   const float sparse_scale = (g_refl_flags & 32u) != 0u && g_sparse_enabled != 0u && g_sparse_levels < 256u
       ? 256.0 / float(g_sparse_levels) : 1.0;
   g_pt_diffuse[id.xy] = float4(PtInvalidPixelGuard(diffuse * sparse_scale), 1.0);
   if (RTXDI_IsValidPTReservoir(reservoir) && g_sharc_enabled != 0u && reservoir.rcVertexLength == reservoir.pathLength
       && !isinf(reservoir.radiance.x)) PtCount(26u);
   if (toon_character) {
-    g_pt_specular[id.xy] = toon_lamp_direct
-        ? float4(surface.material.diffuseAlbedo * PtClampLuminance(toon_game_lamp, g_restir.direct_clamp), 1.0)
+    g_pt_specular[id.xy] = char_lamp_direct
+        ? float4(surface.material.diffuseAlbedo * PtClampLuminance(char_lamp, g_restir.direct_clamp), 1.0)
+        : float4(0, 0, 0, 0);
+  } else if (character) {
+    // Characters consume total specular radiance directly, without demodulation (A2.4 step 10). Indirect samples use
+    // the reflection clamp; direct samples were clamped in primary NEE. The lamp-only estimator adds the character lamps
+    // whatever the Reflections setting, which only gates the specular (A22.2).
+    const float3 clamped = (is_direct || g_refl_sample_clamp <= 0.0)
+        ? raw_specular : min(raw_specular, g_refl_sample_clamp);
+    const float3 char_spec = g_refl_enabled != 0u ? clamped : 0.0;
+    g_pt_specular[id.xy] = char_direct
+        ? float4(char_spec + surface.material.diffuseAlbedo * PtClampLuminance(char_lamp, g_restir.direct_clamp), 1.0)
         : float4(0, 0, 0, 0);
   } else if (g_refl_enabled == 0u) {
     g_pt_specular[id.xy] = float4(0, 0, 0, 0);
-  } else if (character) {
-    // Characters consume total specular radiance directly, without demodulation (A2.4 step 10). Indirect samples use
-    // the reflection clamp; direct samples were clamped before demodulation. Toon characters keep the direct-off output.
-    const float3 clamped = (is_direct || g_refl_sample_clamp <= 0.0)
-        ? raw_specular : min(raw_specular, g_refl_sample_clamp);
-    g_pt_specular[id.xy] = char_direct ? float4(clamped, 1.0) : float4(0, 0, 0, 0);
   } else if ((surface.flags & 16u) != 0u) {
     // A18 design A: reflective primaries trace their reflection here (base 22b0badd world_pt_evaluate.hlsli:47-104); the
     // reservoir carries their diffuse continuation and direct light only. Output is incoming radiance (no F0 division)
