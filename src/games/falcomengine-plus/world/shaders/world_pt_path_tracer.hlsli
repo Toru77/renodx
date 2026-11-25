@@ -63,8 +63,9 @@ float3 SampleEmissiveLightFromSurface(const RTXDI_PathTracerContext<PTContextTyp
   RAB_Surface prev = ctx.GetRcPrevSurface();
   const RTXDI_BrdfRaySample brs = ctx.GetBrdfRaySample();
   float3 cached = 0.0;
-  if (PtSharcTerminal(surface.worldPos, surface.normal, -ctx.GetContinuationRay().Direction, ctx.GetTraceResult().t,
-                      sqrt(max(prev.material.roughness, 0.0)), brs.properties.IsSpecular(), surface.material.diffuseAlbedo, cached)) {
+  if (ctx.GetBounceDepth() >= g_restir.sharc_min_bounce + 1u
+      && PtSharcTerminal(surface.worldPos, surface.normal, -ctx.GetContinuationRay().Direction, ctx.GetTraceResult().t,
+                         sqrt(max(prev.material.roughness, 0.0)), brs.properties.IsSpecular(), surface.material.diffuseAlbedo, cached)) {
     return cached;
   }
   return 0.0;
@@ -92,7 +93,7 @@ bool ShouldSampleNeeLights(const RTXDI_PathTracerContext<PTContextType> ctx) {
 
 template<typename PTContextType>
 void HandleHit(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_PathTracerRandomContext ptRandContext,
-               const RAB_Surface prevSurface, uint2 pixel) {
+               const RAB_Surface prevSurface, inout RAB_PathTracerUserData ud, uint2 pixel) {
   const RAB_RayPayload payload = ctx.GetTraceResult();
   const RayDesc ray = ctx.GetContinuationRay();
   const RAB_Surface surface = PtHitSurface(payload, ray.Direction);
@@ -112,14 +113,16 @@ void HandleHit(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_Pat
 
   const RTXDI_BrdfRaySample brs = ctx.GetBrdfRaySample();
   float3 cached = 0.0;
-  const bool terminal = PtSharcTerminal(surface.worldPos, surface.normal, -ray.Direction, payload.t,
-                                        sqrt(max(prevSurface.material.roughness, 0.0)), brs.properties.IsSpecular(),
-                                        surface.material.diffuseAlbedo, cached);
+  const bool terminal = ctx.GetBounceDepth() >= g_restir.sharc_min_bounce + 1u
+      && PtSharcTerminal(surface.worldPos, surface.normal, -ray.Direction, payload.t,
+                         sqrt(max(prevSurface.material.roughness, 0.0)), brs.properties.IsSpecular(),
+                         surface.material.diffuseAlbedo, cached);
 #if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING)
   if (terminal) {
     PtCount(25u);
-    ctx.RecordEmissiveLightSample(PtGiClampLe(cached, ctx.GetPathThroughput()), prevSurface,
-                                  ptRandContext.initialRandomSamplerState);
+    const float3 le = PtGiClampLe(cached, ctx.GetPathThroughput());
+    ud.color_sum += le * ctx.GetPathThroughput();
+    ctx.RecordEmissiveLightSample(le, prevSurface, ptRandContext.initialRandomSamplerState);
     ctx.SetPathTermination(true);
     return;
   }
@@ -139,8 +142,12 @@ void HandleHit(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_Pat
     PtSampleNee(surface, ptRandContext.initialRandomSamplerState, radiance_from_lights, sampled_light_data, nee_pdf,
                 scatter_pdf, light_sample);
     if (nee_pdf != 0.0) {
-      ctx.RecordNeeLightSample(sampled_light_data, PtGiClampLe(radiance_from_lights, ctx.GetPathThroughput()), nee_pdf,
-                               scatter_pdf, light_sample, ptRandContext.initialRandomSamplerState);
+      const float3 le = PtGiClampLe(radiance_from_lights, ctx.GetPathThroughput());
+#if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING)
+      ud.color_sum += le * ctx.GetPathThroughput();
+#endif
+      ctx.RecordNeeLightSample(sampled_light_data, le, nee_pdf, scatter_pdf, light_sample,
+                               ptRandContext.initialRandomSamplerState);
     }
   }
 }
@@ -180,7 +187,8 @@ bool PtDetermineOutgoingRay(inout RTXDI_PathTracerContext<PTContextType> ctx,
 
 #if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING) && !defined(PT_WATER_SURFACE)
 template<typename PTContextType>
-void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_PathTracerRandomContext rng) {
+void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_PathTracerRandomContext rng,
+                  inout RAB_PathTracerUserData ud) {
   if (g_restir.direct_enabled == 0u) return;
   const RAB_Surface surface = ctx.GetIntersectionSurface();
   if (!RAB_IsSurfaceValid(surface)) return;
@@ -263,6 +271,7 @@ void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_
   sampled_light_data.uvData = reservoir.uvData;
   // Lin 2026 §6.1: primary NEE as a d = 2 path in the unified reservoir; same stream as RecordNeeLightSample case 3
   // (InitialSamplingPathTracerContext.hlsli:196-247) one vertex earlier.
+  ud.color_sum += radiance_from_lights * ctx.GetPathThroughput();
   ctx.RISStreamPathSample(2u, radiance_from_lights, rng.initialRandomSamplerState, 2u, true, 1.0 / reservoir.weightSum,
                           float3(1.f / 0.f, asfloat(sampled_light_data.lightData), asfloat(sampled_light_data.uvData)),
                           RAB_LightSampleSolidAnglePdf(light_sample));
@@ -274,7 +283,7 @@ template<typename PTContextType>
 void RAB_PathTrace(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_PathTracerRandomContext rng,
                    inout RAB_PathTracerUserData ud) {
 #if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING) && !defined(PT_WATER_SURFACE)
-  PtPrimaryNee(ctx, rng);
+  PtPrimaryNee(ctx, rng, ud);
 #endif
   while (ctx.GetBounceDepth() <= ctx.GetMaxPathBounce()) {
     ctx.BeginPathState();
@@ -288,13 +297,15 @@ void RAB_PathTrace(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI
     }
 #endif
     if (RAB_IsValidHit(ctx.GetTraceResult())) {
-      HandleHit(ctx, rng, prev, ud.pixel);
+      HandleHit(ctx, rng, prev, ud, ud.pixel);
       if (ctx.IsPathTerminated()) break;
     } else {
       ctx.RecordPathRadianceMiss(rng.initialRandomSamplerState);
-      ctx.RecordEnvironmentMapLightSample(
-          PtGiClampLe(RAB_GetEnvironmentRadiance(ctx.GetContinuationRay().Direction), ctx.GetPathThroughput()), prev,
-          rng.initialRandomSamplerState);
+      const float3 le = PtGiClampLe(RAB_GetEnvironmentRadiance(ctx.GetContinuationRay().Direction), ctx.GetPathThroughput());
+#if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING)
+      ud.color_sum += le * ctx.GetPathThroughput();
+#endif
+      ctx.RecordEnvironmentMapLightSample(le, prev, rng.initialRandomSamplerState);
       break;
     }
     ctx.IncreaseBounceDepth();

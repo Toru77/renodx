@@ -1738,6 +1738,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "PtSharcMinBounce",
+      .binding = &pt::g_pt_sharc_min_bounce,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 1.f,
+      .label = "SHARC Min Bounce",
+      .section = "Path Tracing",
+      .tooltip = "Bounce from which SHARC may end a path; 2 path-traces the first bounce for finer contact shadows.",
+      .min = 1.f,
+      .max = 3.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "PtSharcAccumulationFrames",
       .binding = &pt::g_pt_sharc_accumulation_frames,
       .value_type = SettingValueType::INTEGER,

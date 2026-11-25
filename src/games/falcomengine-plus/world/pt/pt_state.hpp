@@ -50,6 +50,7 @@ inline PtSparsePolicy ComputePtSparsePolicy(bool enabled, bool adaptive, float b
 inline float g_pt_sharc_enabled = 1.f, g_pt_sharc_accumulation_frames = 32.f, g_pt_sharc_stale_frames = 64.f,
              g_pt_sharc_scene_scale = 15.f, g_pt_sharc_downscale = 5.f, g_pt_sharc_capacity_log2 = 22.f;
 inline float g_pt_sharc_radiance_scale = 100000.f;
+inline float g_pt_sharc_min_bounce = 1.f;
 inline uint32_t g_pt_sharc_reset_request = 0u;  // bumped by the Clear SHARC Cache button
 inline constexpr uint32_t kPtSharcGapFrames = 5u;           // frames without a SHARC trace that clear it (addon.cpp:539 uses 5)
 inline constexpr uint32_t kPtSharcMaxUpdatePaths = 82944u;  // OpenRemix options.h:346 (1920x1080 at downscale 5)

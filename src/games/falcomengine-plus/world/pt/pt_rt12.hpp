@@ -101,7 +101,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     hr = r.water_list->Close();
     if (FAILED(hr)) return fail("pt water close", hr);
     // Table (kRt12PtRanges): t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u7 | t40-t42 | u8 | t43-t55
-    // | u10-u11 | u9 | u12-u13 | t56 | t57 | u14-u16.
+    // | u10-u11 | u9 | u12-u13 | t56 | t57 | u14-u16 | u18.
     D3D12_DESCRIPTOR_RANGE ranges[std::size(kRt12PtRanges)] = {};
     for (uint32_t i = 0u; i < std::size(kRt12PtRanges); ++i) {
       const Rt12PtRange& range = kRt12PtRanges[i];
@@ -598,6 +598,14 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   } else if (!game_sun_shadows && sun_vis.texture11) {
     RetireShared(s, sun_vis, s.last_signal);
   }
+  Rt12Shared& initial_color = r.initial_color[k];
+  if (!initial_color.texture11 || initial_color.width != w || initial_color.height != h) {
+    RetireShared(s, initial_color, s.last_signal);
+    if (FAILED(CreateRt12Shared(s, device, DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, 1u, true, &initial_color))) {
+      RetireShared(s, initial_color, s.last_signal);
+      return fallback(pt::PtReason::TargetFailed);
+    }
+  }
   const bool debug_on = debug_view != RTXDI_DEBUG_VIEW_OFF;
   Rt12Shared* debug_outputs[] = {&r.debug_value[k], &r.debug_status[k], &r.sun_detail[k]};
   const DXGI_FORMAT debug_formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32B32A32_UINT};
@@ -1049,6 +1057,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
                                             debug_on ? r.sun_detail[k].texture12.Get() : nullptr};
   for (uint32_t i = 0u; i < 3u; ++i) set_texture_uav(50u + i, debug_textures[i], debug_formats[i]);
   set_texture_uav(53u, game_sun_shadows ? sun_vis.texture12.Get() : nullptr, DXGI_FORMAT_R16G16B16A16_FLOAT);
+  set_texture_uav(54u, initial_color.texture12.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
   D3D12_UNORDERED_ACCESS_VIEW_DESC reservoir_uav = {};
   reservoir_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
   reservoir_uav.Buffer.NumElements = r.restir->GetReservoirBufferParameters().reservoirArrayPitch
@@ -1374,6 +1383,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.game_sun_shadows = pt::g_restir_game_sun_shadows > 0.5f ? 1u : 0u;
   restir_constants.gi_clamp_per_bounce =
       (pt::g_pt_gi_clamp_mode > 0.5f && pt::g_pt_gi_clamp_enabled > 0.5f) ? 1u : 0u;
+  restir_constants.sharc_min_bounce = std::clamp(static_cast<uint32_t>(pt::g_pt_sharc_min_bounce), 1u, 3u);
+  restir_constants.resampling_none = resampling_mode == 0u ? 1u : 0u;
   restir_constants.tile_count = lamps ? input.tile_count : 0u;
   restir_constants.debug_view = debug_view;
   restir_constants.sun_detail_view = sun_detail_view;
@@ -1453,6 +1464,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   list->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
   barriers.clear();
   UavBarrier(barriers, r.reservoirs.Get());
+  UavBarrier(barriers, initial_color.texture12.Get());
   list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
   const bool has_temporal = resampling_mode == 1u || resampling_mode == 3u;
   const bool has_spatial = resampling_mode == 2u || resampling_mode == 3u;
@@ -2056,9 +2068,10 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
     handle.ptr += static_cast<SIZE_T>(index) * s.descriptor_size;
     return handle;
   };
-  // Water block (R3): every descriptor is written here, after this slot's fence. Null: 14 and 16 (main output and SHARC
-  // accumulation, written only by the main trace). 15, 17, 22 and 23 are the cache reads (SHARC hash and resolved, material
-  // keys and values); the water dispatch does not write them, since the material write and SHARC update passes never run here.
+  // Water block (R3): every descriptor is written here, after this slot's fence. Null: 14, 16 and 54 (main output, SHARC
+  // accumulation and initial colour, written only by the main trace). 15, 17, 22 and 23 are the cache reads (SHARC hash and
+  // resolved, material keys and values); the water dispatch does not write them, since the material write and SHARC update
+  // passes never run here.
   const uint32_t water_prev_slot = r.water_history_slot;
   const bool water_history = r.water_history_valid;
   for (uint32_t i = 0u; i < kRt12PtUsedDescriptors; ++i) {
@@ -2115,7 +2128,7 @@ inline reshade::api::resource_view RunPtWaterTrace(reshade::api::device* device,
       if (i == 45u) resource = r.water_sample_id.Get();
       if (i == 46u) resource = r.water_neighbor_selection_gbuffer.Get();
       if (i == 47u) resource = r.water_neighbor_selection.Get();
-      if (i >= 50u && i <= 53u) resource = nullptr;
+      if (i >= 50u && i <= 54u) resource = nullptr;
       if (view.ViewDimension == D3D12_UAV_DIMENSION_UNKNOWN) {
         FailSession(s, Rt12Reason::CreateFailed, "pt water descriptor", static_cast<HRESULT>(0x80000000u | i));
         return fallback("resources");

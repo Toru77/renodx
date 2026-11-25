@@ -79,6 +79,14 @@ Unified PT A16 R3: Russian roulette starts one bounce later, matching the pre-un
 
 Unified PT A16 R4: per-path-length energy counters and PtGiClampMode restore the pre-unification per-bounce clamp as an option; the default Output keeps the current output clamp. Not validated in game.
 
+Unified PT A17 R: non-character materials reflect only where the game's deferred flag has 4 and not 32; the reflective bit is cached with the material and non-reflective surfaces get zero specular F0 at primary and bounce hits. Not validated in game.
+
+Unified PT A17 A: PtSharcMinBounce (default 1) gates SHARC termination by bounce depth with the same predicate in initial sampling and replay, so higher values path-trace earlier bounces for finer contact shadows. Not validated in game.
+
+Unified PT A17 W1: with resampling None, final shading uses the per-pixel average colour of the initial path trees instead of F(Y)·W; reuse modes keep the SDK weights. Not validated in game.
+
+Unified PT A17 M-a: a per-mesh average-material fallback for cache misses is deferred to owner decision; no textured world-hit material system was added.
+
 ReGIR M4c introduces default-Off GPU pool construction from primary surfaces and lookup at actual path-traced hit positions, falling back to uniform sampling when the current pool is unavailable or invalid. Its discrete mixture PMF assumes an equiprobable 24-bit input; CPU fixtures and GPU readback cover the shared selector, registration reconstruction/deduplication/overflow, reordered two-light weights/build, zero lights, invalid headers, invalid lights, and over-capacity counts; they do not establish game RNG statistics. Runtime diagnostics asynchronously report registered and valid cells and rejected and overflow positions when a readback completes. The CPU identity mismatch matrix does not exercise the production RunPtTrace/RunPtWaterTrace identity gate or bindings. Independent source review of identity, bindings, fallback, barriers, fence publication, last-use extension, quarantine, and teardown is complete; the three P2 blockers identified by review have been corrected and independently re-checked. Production runtime validation of main/water behavior and stale fallback, fence failure injection, and owner in-game validation remain deferred.
 
 

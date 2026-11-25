@@ -83,7 +83,10 @@ void main(uint3 id : SV_DispatchThreadID) {
   uint direct_light_index = g_lamp_count;
   const SplitBrdf brdf =
       PtCalculateDirectLighting(surface, reservoir, light_radiance, sun_sample, light_direction, direct_light_index);
-  const float3 ucw = reservoir.weightSum * reservoir.targetFunction;
+  float3 ucw = reservoir.weightSum * reservoir.targetFunction;
+#if !defined(PT_WATER_SURFACE)
+  if (g_restir.resampling_none != 0u) ucw = g_pt_initial_color[id.xy].rgb;
+#endif
   const float3 total = brdf.demodulatedDiffuse * surface.material.diffuseAlbedo + brdf.specular;
   float3 diffuse = brdf.demodulatedDiffuse * ucw / max(total, 1e-8);
   float3 specular = brdf.specular * ucw / max(total, 1e-8);

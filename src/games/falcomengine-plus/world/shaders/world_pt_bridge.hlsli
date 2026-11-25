@@ -61,6 +61,7 @@ struct RAB_RayPayload {
 struct RAB_PathTracerUserData {
   uint16_t pathType;
   uint2 pixel;
+  float3 color_sum;
 };
 
 struct SplitBrdf {
@@ -206,8 +207,13 @@ RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
     m = PtGBufferMaterial(pixel);
   }
   s.material.diffuseAlbedo = m.albedo;
-  // Game specular scale (mrt1.z/255) gates the specular lobe, as the game lighting does; spec_scale 0 means no reflection (A15).
+#if defined(PT_WATER_SURFACE)
   s.material.specularF0 = m.f0 * m.spec_scale;
+#else
+  // Game specular scale (mrt1.z/255) gates the specular lobe, as the game lighting does; spec_scale 0 means no reflection (A15).
+  // Game reflection rule (lighting_0xCA3D8596 :898,:968): cubemap reflection only where the deferred flag has 4 and not 32 (A17).
+  s.material.specularF0 = (m.character || m.reflective) ? m.f0 * m.spec_scale : 0.0;
+#endif
   s.material.character = m.character;
 #if defined(PT_WATER_SURFACE)
   s.material.diffuseAlbedo = 0.0;
@@ -292,7 +298,11 @@ RAB_Surface PtHitSurface(float3 position, float3 normal, float distance, float3 
   s.viewDir = -dir;
   const PtMaterial m = PtHitMaterial(position, s.normal);
   s.material.diffuseAlbedo = m.albedo;
+#if defined(PT_WATER_SURFACE)
   s.material.specularF0 = m.f0 * m.spec_scale;
+#else
+  s.material.specularF0 = (m.character || m.reflective) ? m.f0 * m.spec_scale : 0.0;
+#endif
   s.material.roughness = saturate(m.roughness);
   s.material.character = m.character;
   s.diffuseProbability = PtSurfaceDiffuseProbability(s);

@@ -63,6 +63,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     RTXDI_StorePTReservoir(reservoir, g_restir.restir.reservoirBuffer, id.xy,
                            g_restir.restir.bufferIndices.initialPathTracerPreservedBufferIndex);
   }
+#if !defined(PT_WATER_SURFACE)
+  g_pt_initial_color[id.xy] = float4(ud.color_sum / float(g_restir.restir.initialSampling.numInitialSamples), 1.0);
+#endif
   if (RTXDI_IsValidPTReservoir(reservoir)) {
     PtCount(21u);
     if (reservoir.pathLength == 2u) PtCount(22u);

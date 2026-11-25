@@ -71,6 +71,7 @@ RWTexture2D<float4> g_pt_debug_value : register(u14);
 RWTexture2D<uint> g_pt_debug_status : register(u15);
 RWTexture2D<uint4> g_pt_sun_detail : register(u16);
 RWTexture2D<float4> g_pt_sun_visibility : register(u17);
+RWTexture2D<float4> g_pt_initial_color : register(u18);
 #define RTXDI_PT_SAMPLE_ID_TEXTURE g_pt_sample_id
 #define RTXDI_PT_DUPLICATION_MAP g_pt_duplication_map
 #define RTXDI_PT_SMOOTHED_DUPLICATION_MAP g_pt_smoothed_duplication
@@ -102,7 +103,7 @@ static float3 g_pt_sun_dir;
 static float3 g_pt_probe[9];
 static float4x4 g_pt_view_proj;
 static float4x4 g_pt_inv_view_proj;
-struct PtMaterial { float3 albedo; float roughness; float3 f0; float spec_scale; bool character; };
+struct PtMaterial { float3 albedo; float roughness; float3 f0; float spec_scale; bool character; bool reflective; };
 // Reconstructs one frame's primary surface without touching the current frame's SHARC/material globals.
 bool PtReconstructSurface(Texture2D<float> depth, Texture2D<uint4> normal, Texture2D<uint4> scene, uint2 pixel,
                           out RtxdiSurfaceResult surface) {
@@ -188,13 +189,16 @@ PtMaterial PtGBufferMaterialFrom(Texture2D<float4> color, Texture2D<uint4> norma
   PtMaterial m;
   m.albedo = saturate(color.Load(int3(pixel, 0)).rgb);
   m.character = (normal.Load(int3(pixel, 0)).w & 8u) == 0u;
-  m.roughness = g_mat_char_roughness; m.f0 = g_mat_char_f0; m.spec_scale = 1.0;
+  m.roughness = g_mat_char_roughness; m.f0 = g_mat_char_f0; m.spec_scale = 1.0; m.reflective = false;
   if (!m.character) {
     m.spec_scale = (mrt1.Load(int3(pixel, 0)).z & 255u) * (1.0 / 255.0);
     const uint index = mrt2.Load(int3(pixel, 0)).x;
     if (index < deferred_count) {
       const GameDeferredParam d = deferred[index];
-      if (all(isfinite(float4(d.head[1].xyz, d.tail[0].z)))) { m.roughness = saturate(d.tail[0].z); m.f0 = saturate(d.head[1].xyz); }
+      if (all(isfinite(float4(d.head[1].xyz, d.tail[0].z)))) {
+        m.roughness = saturate(d.tail[0].z); m.f0 = saturate(d.head[1].xyz);
+        m.reflective = (asuint(d.tail[3].z) & 36u) == 4u;
+      }
     }
   }
   return m;
@@ -205,13 +209,15 @@ PtMaterial PtGBufferMaterial(uint2 pixel) {
 uint4 PtPackMaterial(PtMaterial m) {
   return uint4(f32tof16(m.albedo.r) | (f32tof16(m.albedo.g) << 16), f32tof16(m.albedo.b) | (f32tof16(m.roughness) << 16),
                f32tof16(m.f0.r) | (f32tof16(m.f0.g) << 16),
-               f32tof16(m.f0.b) | (uint(saturate(m.spec_scale) * 255.0 + 0.5) << 16) | ((1u | (m.character ? 2u : 0u)) << 24));
+               f32tof16(m.f0.b) | (uint(saturate(m.spec_scale) * 255.0 + 0.5) << 16)
+                | ((1u | (m.character ? 2u : 0u) | (m.reflective ? 4u : 0u)) << 24));
 }
 PtMaterial PtUnpackMaterial(uint4 v) {
   PtMaterial m;
   m.albedo = float3(f16tof32(v.x), f16tof32(v.x >> 16), f16tof32(v.y)); m.roughness = f16tof32(v.y >> 16);
   m.f0 = float3(f16tof32(v.z), f16tof32(v.z >> 16), f16tof32(v.w)); m.spec_scale = ((v.w >> 16) & 255u) * (1.0 / 255.0);
   m.character = ((v.w >> 24) & 2u) != 0u;
+  m.reflective = ((v.w >> 24) & 4u) != 0u;
   return m;
 }
 uint4 PtReadMaterial(uint index) {
@@ -221,7 +227,7 @@ uint4 PtReadMaterial(uint index) {
 // The material at a bounce hit: the G-buffer when the hit is the visible surface on screen, else the cache, else grey 0.5.
 PtMaterial PtHitMaterial(float3 position, float3 nh) {
   PtMaterial m;
-  m.albedo = float3(0.5, 0.5, 0.5); m.roughness = 1.0; m.f0 = float3(0.04, 0.04, 0.04); m.spec_scale = 1.0; m.character = false;
+  m.albedo = float3(0.5, 0.5, 0.5); m.roughness = 1.0; m.f0 = float3(0.04, 0.04, 0.04); m.spec_scale = 1.0; m.character = false; m.reflective = false;
   if (g_mat_enabled == 0u) return m;
   const float4 clip = mul(g_pt_view_proj, float4(position, 1.0));
   if (clip.w > 1e-6) {
