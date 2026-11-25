@@ -407,20 +407,31 @@ uint PtTileUsableEntries(LightIndexData tile, out uint point_count, out uint ent
   return usable_count;
 }
 // Exact per-pixel game tile cell (copied from world_rtxdi_light_bridge.hlsli:59-76; the DI bridge is removed in M7).
-bool PtGetLightTileCell(RAB_Surface surface, out uint cell) {
+bool PtLightTileCellAt(float2 pixel, float view_depth, out uint cell) {
   cell = 0u;
-  if (g_restir.tile_count == 0u || !isfinite(surface.viewDepth) || surface.viewDepth <= 0.0) return false;
+  if (g_restir.tile_count == 0u || !isfinite(view_depth) || view_depth <= 0.0) return false;
   const float2 tile_size_inv = asfloat(g_pt_scene.Load(int3(RTXDI_SURFACE_LIGHT_TILE_SIZE_ROW, 0, 0)).xy);
   if (!all(isfinite(tile_size_inv)) || any(tile_size_inv <= 0.0)) return false;
-  const uint2 tile = uint2(tile_size_inv * (float2(surface.pixel) + 0.5));
+  const uint2 tile = uint2(tile_size_inv * (pixel + 0.5));
   if (tile.x >= 32u || tile.y >= 18u) return false;
   const uint base = tile.x + (tile.y << 5u);
   if (base >= g_restir.tile_count) return false;
   const float tile_depth_inv = g_pt_tiles[base].tileDepthInv;
   if (!isfinite(tile_depth_inv) || tile_depth_inv < 0.0) return false;
-  const uint slice = (uint)clamp(tile_depth_inv * surface.viewDepth, 0.0, 7.0);
+  const uint slice = (uint)clamp(tile_depth_inv * view_depth, 0.0, 7.0);
   cell = min(4607u, slice * 576u + base);
   return cell < g_restir.tile_count;
+}
+bool PtGetLightTileCell(RAB_Surface surface, out uint cell) {
+  return PtLightTileCellAt(surface.pixel, surface.viewDepth, cell);
+}
+bool PtLightTileCellForPoint(float3 position, out uint cell) {
+  cell = 0u;
+  const float4 clip = mul(g_pt_view_proj, float4(position, 1.0));
+  if (clip.w <= 1e-6) return false;
+  const float2 uv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
+  if (!all(uv >= 0.0) || !all(uv < 1.0)) return false;
+  return PtLightTileCellAt(uv * float2(g_size), clip.w, cell);
 }
 
 float3 RAB_GetReflectedBsdfRadianceForSurface(float3 location, float3 radiance, RAB_Surface s) {
@@ -719,6 +730,30 @@ bool PtSharcTerminal(float3 position, float3 nh, float3 dir, float hit_t, float 
 
 #include <Rtxdi/DI/InitialSampling.hlsli>
 
+void PtStreamTileLamps(RAB_Surface s, LightIndexData tile, inout RTXDI_RandomSamplerState rng,
+                       inout RTXDI_DIReservoir r, inout RAB_LightSample ls) {
+  uint point_count, entry_count;
+  if (PtTileUsableEntries(tile, point_count, entry_count) == 0u) return;
+  RTXDI_InitialSamplingMisData mis_data = RTXDI_ComputeInitialSamplingMisData(g_restir.nee);
+  mis_data.localLightMisWeight = 1.0;
+  mis_data.brdfMisWeight = 0.0;
+  for (uint entry = 0u; entry < entry_count; ++entry) {
+    const int listed = PtTileEntry(tile, entry, point_count);
+    if (listed < 0) continue;
+    float2 uv;
+    if (g_restir.isfast_light_jitter != 0u && (s.flags & 8u) != 0u) {
+      uv = asfloat(g_pt_noise.Load(int3(s.pixel.x % 128u, s.pixel.y % 128u + 128u * (g_frame % 32u), 0)).xy);
+    } else {
+      uv = RTXDI_RandomlySelectLocalLightUV(rng);
+    }
+    RTXDI_StreamLocalLightAtUVIntoReservoir(rng, mis_data, s, g_restir.nee.brdfCutoff,
+        mis_data.localLightMisWeight, uint(listed), uv, /*invSourcePdf*/ 1.0,
+        RAB_LoadLightInfo(uint(listed), false), r, ls);
+  }
+  RTXDI_FinalizeResampling(r, 1.0, 1.0);
+  r.M = 1;
+}
+
 // RTXDI_SampleLightsForSurface combination (DI/InitialSampling.hlsli:637-660): local and sun reservoirs into an empty state.
 RTXDI_DIReservoir PtCombineLocalAndSun(RTXDI_DIReservoir local, RAB_LightSample local_sample, RTXDI_DIReservoir sun,
                                        RAB_LightSample sun_sample, inout RTXDI_RandomSamplerState rng,
@@ -747,7 +782,17 @@ void PtSampleNee(RAB_Surface surface, inout RTXDI_RandomSamplerState rng, out fl
   RAB_LightSample local_sample = RAB_EmptyLightSample();
   const RTXDI_InitialSamplingMisData mis_data = RTXDI_ComputeInitialSamplingMisData(g_restir.nee);
   const uint count = g_restir.nee.numLocalLightSamples;
-  if (g_lamp_count > 0u && count > 0u) {
+  bool tile_sampled = false;
+  uint cell = 0u;
+  if (PtLightTileCellForPoint(surface.worldPos, cell)) {
+    const LightIndexData tile = g_pt_tiles[cell];
+    uint point_count, entry_count;
+    if (PtTileUsableEntries(tile, point_count, entry_count) != 0u) {
+      PtStreamTileLamps(surface, tile, rng, local_reservoir, local_sample);
+      tile_sampled = true;
+    }
+  }
+  if (!tile_sampled && g_lamp_count > 0u && count > 0u) {
     const bool regir_eligible = g_regir_enabled != 0u && g_lamp_count <= RTXDI_LIGHT_TABLE_CAPACITY;
     if (regir_eligible) PtCount(9u);
     bool pool_valid = false;

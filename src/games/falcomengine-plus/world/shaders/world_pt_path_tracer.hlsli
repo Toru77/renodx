@@ -249,28 +249,7 @@ void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_
   // (world_rtxdi_initial_di.cs_6_5.hlsl:132-167). RIS over the full set gives W = sum(target) / target(y), so the
   // local estimate is the tile's unshadowed lamp sum and one shadow ray supplies visibility (A24a).
   if (tile_valid && (character ? g_restir.char_lamp_toon : g_restir.lamp_toon) < 1.0) {
-    const LightIndexData tile = g_pt_tiles[cell];
-    uint point_count, entry_count;
-    if (PtTileUsableEntries(tile, point_count, entry_count) != 0u) {
-      RTXDI_InitialSamplingMisData mis_data = RTXDI_ComputeInitialSamplingMisData(g_restir.nee);
-      mis_data.localLightMisWeight = 1.0;
-      mis_data.brdfMisWeight = 0.0;
-      for (uint entry = 0u; entry < entry_count; ++entry) {
-        const int listed = PtTileEntry(tile, entry, point_count);
-        if (listed < 0) continue;
-        float2 uv;
-        if (g_restir.isfast_light_jitter != 0u) {
-          uv = asfloat(g_pt_noise.Load(int3(surface.pixel.x % 128u, surface.pixel.y % 128u + 128u * (g_frame % 32u), 0)).xy);
-        } else {
-          uv = RTXDI_RandomlySelectLocalLightUV(rng.initialRandomSamplerState);
-        }
-        RTXDI_StreamLocalLightAtUVIntoReservoir(rng.initialRandomSamplerState, mis_data, surface,
-            g_restir.nee.brdfCutoff, mis_data.localLightMisWeight, uint(listed), uv, /*invSourcePdf*/ 1.0,
-            RAB_LoadLightInfo(uint(listed), false), local_reservoir, local_sample);
-      }
-      RTXDI_FinalizeResampling(local_reservoir, 1.0, 1.0);
-      local_reservoir.M = 1;
-    }
+    PtStreamTileLamps(surface, g_pt_tiles[cell], rng.initialRandomSamplerState, local_reservoir, local_sample);
   }
   RTXDI_DIReservoir sun_reservoir = RTXDI_EmptyDIReservoir();
   RAB_LightSample sun_sample = RAB_EmptyLightSample();
