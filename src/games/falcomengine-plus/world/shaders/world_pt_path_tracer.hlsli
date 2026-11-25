@@ -14,8 +14,7 @@ bool IsEmissiveSamplingEnabled() { return g_sharc_enabled != 0u; }
 bool IsNeeSamplingEnabled() { return true; }
 
 float3 PtGiClampLe(float3 le, float3 throughput) {
-  // With Direct on the final pass sees whole-pixel estimates, so the GI clamp applies per bounce (A22 L2).
-  if (g_restir.gi_clamp_per_bounce == 0u && g_restir.direct_enabled == 0u) return le;
+  if (g_restir.gi_clamp_per_bounce == 0u) return le;
   return le * min(1.0, g_gi_clamp / max(CalcLuminance(le * throughput), 1e-6));
 }
 
@@ -315,8 +314,6 @@ void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_
   radiance_from_lights *= PtLightVisibility(visible_surface, light_sample.position);
   radiance_from_lights *= RTXDI_GetDIReservoirInvPdf(reservoir) / light_sample.solidAnglePdf;
   if (all(radiance_from_lights <= 0.0)) return;
-  // Clamp the direct contribution itself, not the pixel total the unified reservoir estimates (A22 L2).
-  radiance_from_lights = PtClampLuminance(radiance_from_lights, g_restir.direct_clamp);
   RTXDI_SampledLightData sampled_light_data = RTXDI_SampledLightData_CreateInvalidData();
   RTXDI_SampledLightData_SetLightData(sampled_light_data, light_index);
   sampled_light_data.uvData = reservoir.uvData;

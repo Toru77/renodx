@@ -271,6 +271,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     diffuse *= scale;
     specular *= scale;
   }
+  if (is_direct) {
+    diffuse = PtClampLuminance(diffuse, g_restir.direct_clamp);
+    specular = PtClampLuminance(specular, g_restir.direct_clamp);
+  }
   if (toon_character && is_direct) diffuse = 0.0;  // toon lamp light is written to the character reflection channel
   const float3 raw_specular = PtInvalidPixelGuard(specular);
   diffuse = PtInvalidPixelGuard(diffuse);
@@ -286,10 +290,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   const float hit_t = max(length(reservoir.translatedWorldPosition - surface.worldPos), 1e-3);
   g_pt_specular[id.xy] = float4(PtInvalidPixelGuard(rgb), isfinite(hit_t) ? hit_t : 1e-3);
 #else
-  // With Direct on the GI clamp runs per bounce in the path tracer (A22 L2).
-  if (!is_direct && g_restir.gi_clamp_per_bounce == 0u && g_restir.direct_enabled == 0u) {
-    diffuse = PtClampLuminance(diffuse, g_gi_clamp);
-  }
+  if (!is_direct && g_restir.gi_clamp_per_bounce == 0u) diffuse = PtClampLuminance(diffuse, g_gi_clamp);
   const float sparse_scale = (g_refl_flags & 32u) != 0u && g_sparse_enabled != 0u && g_sparse_levels < 256u
       ? 256.0 / float(g_sparse_levels) : 1.0;
   g_pt_diffuse[id.xy] = float4(PtInvalidPixelGuard(diffuse * sparse_scale), 1.0);
@@ -301,8 +302,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         : float4(0, 0, 0, 0);
   } else if (character) {
     // Characters consume total specular radiance directly, without demodulation (A2.4 step 10). Indirect samples use
-    // the reflection clamp; direct samples were clamped in primary NEE. The lamp-only estimator adds the character lamps
-    // whatever the Reflections setting, which only gates the specular (A22.2).
+    // the reflection clamp; direct samples were clamped before demodulation. The lamp-only estimator adds the character
+    // lamps whatever the Reflections setting, which only gates the specular (A22.2).
     const float3 clamped = (is_direct || g_refl_sample_clamp <= 0.0)
         ? raw_specular : min(raw_specular, g_refl_sample_clamp);
     const float3 char_spec = g_refl_enabled != 0u ? clamped : 0.0;
