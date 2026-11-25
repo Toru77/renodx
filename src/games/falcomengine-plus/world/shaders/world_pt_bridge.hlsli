@@ -182,6 +182,7 @@ float RAB_RayPayloadGetCommittedHitT(RAB_RayPayload p) { return p.t; }
 bool RAB_RayPayloadIsFrontFace(RAB_RayPayload p) { return p.t < 1e30; }
 
 float PtSurfaceDiffuseProbability(RAB_Surface s) {
+  if ((s.flags & 32u) != 0u) return 1.0;
   const float diffuse = CalcLuminance(s.material.diffuseAlbedo);
   const float specular = CalcLuminance(Schlick_Fresnel(s.material.specularF0, saturate(dot(s.viewDir, s.normal))));
   const float sum = diffuse + specular;
@@ -224,6 +225,8 @@ RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
   // A18 design A: reflective environment primaries continue the path diffuse-only; their reflection is traced in final
   // shading. Light sampling keeps the full BSDF, so direct highlights stay in the reservoir.
   if (m.reflective) s.flags |= 16u;
+  // A19: F0 0 still leaves Schlick's grazing term, so non-reflective environment surfaces drop the specular lobe (32u).
+  if (!m.character && !m.reflective) s.flags |= 32u;
 #endif
   s.material.character = m.character;
 #if defined(PT_WATER_SURFACE)
@@ -305,11 +308,8 @@ RAB_Surface PtHitSurface(float3 position, float3 normal, float distance, float3 
   s.viewDir = -dir;
   const PtMaterial m = PtHitMaterial(position, s.normal);
   s.material.diffuseAlbedo = m.albedo;
-#if defined(PT_WATER_SURFACE)
-  s.material.specularF0 = m.f0 * m.spec_scale;
-#else
   s.material.specularF0 = (m.character || m.reflective) ? m.f0 * m.spec_scale : 0.0;
-#endif
+  if (!m.character && !m.reflective) s.flags |= 32u;
   s.material.roughness = saturate(m.roughness);
   s.material.character = m.character;
   s.material_source = m.debug_source;
@@ -345,7 +345,7 @@ float RAB_SurfaceEvaluateBsdfPdf(RAB_Surface s, float3 dir, RTXDI_BrdfRaySampleP
   if (props.IsDelta()) return saturate(dot(s.normal, dir)) > 0.0 ? 1.0 : 0.0;  // A15: delta weight = F/(1-p_d), the lobe-selection estimator
   const float ndl = saturate(dot(s.normal, dir));
   const float diffusePdf = ndl / 3.14159265;
-  if ((s.flags & 16u) != 0u) return diffusePdf;  // A18: reflective diffuse-only continuation
+  if ((s.flags & 48u) != 0u) return diffusePdf;  // A18 reflective diffuse-only continuation (16u), A19 no specular lobe (32u)
   float specularPdf = 0.0;
   if (s.material.roughness >= kMinRoughness) {
     specularPdf = ImportanceSampleGGX_VNDF_PDF(max(s.material.roughness, kMinRoughness), s.normal, s.viewDir, dir);
@@ -356,11 +356,13 @@ float RAB_SurfaceEvaluateBsdfPdf(RAB_Surface s, float3 dir, RTXDI_BrdfRaySampleP
 }
 float3 RAB_SurfaceEvaluateBsdfTimesNoL(RAB_Surface s, float3 l, bool isDelta) {
   if (dot(l, s.geoNormal) <= 0.0) return 0.0;
+  const bool specular_lobe = (s.flags & 32u) == 0u;
   if (isDelta) {
-    return Schlick_Fresnel(s.material.specularF0, saturate(dot(l, s.normal))) / max(1.0 - s.diffuseProbability, 1e-4);
+    return specular_lobe
+        ? Schlick_Fresnel(s.material.specularF0, saturate(dot(l, s.normal))) / max(1.0 - s.diffuseProbability, 1e-4) : 0.0;
   }
   const float3 diffuse = s.material.diffuseAlbedo * Lambert(s.normal, -l);
-  const float3 specular = s.material.roughness >= kMinRoughness
+  const float3 specular = specular_lobe && s.material.roughness >= kMinRoughness
       ? GGX_times_NdotL(s.viewDir, l, s.normal, s.material.roughness, s.material.specularF0) : 0.0;
   return diffuse + specular;
 }
@@ -369,7 +371,7 @@ bool RAB_SurfaceImportanceSampleBsdf(RAB_Surface s, inout RTXDI_RandomSamplerSta
   const float rnd = RTXDI_GetNextRandom(rng);
   const float2 u = float2(RTXDI_GetNextRandom(rng), RTXDI_GetNextRandom(rng));
   props = RTXDI_DefaultBrdfRaySampleProperties();
-  if ((s.flags & 16u) != 0u || rnd < s.diffuseProbability) {
+  if ((s.flags & 48u) != 0u || rnd < s.diffuseProbability) {
     float pdf;
     dir = TangentToWorld(s, SampleCosHemisphere(u, pdf));
     props.SetDiffuse();
@@ -660,12 +662,15 @@ float RAB_GetLightTargetPdfForVolume(float3 pos, RAB_LightSample sample) { retur
 
 SplitBrdf EvaluateBrdfPT(RAB_Surface s, float3 n, float3 v, float3 l, bool isDelta) {
   SplitBrdf brdf = (SplitBrdf)0;
+  const bool specular_lobe = (s.flags & 32u) == 0u;
   if (isDelta) {
-    brdf.specular = Schlick_Fresnel(s.material.specularF0, saturate(dot(l, n))) / max(1.0 - s.diffuseProbability, 1e-4);
+    if (specular_lobe) {
+      brdf.specular = Schlick_Fresnel(s.material.specularF0, saturate(dot(l, n))) / max(1.0 - s.diffuseProbability, 1e-4);
+    }
     return brdf;
   }
   brdf.demodulatedDiffuse = Lambert(n, -l);
-  brdf.specular = s.material.roughness >= kMinRoughness
+  brdf.specular = specular_lobe && s.material.roughness >= kMinRoughness
       ? GGX_times_NdotL(v, l, n, s.material.roughness, s.material.specularF0) : 0.0;
   return brdf;
 }

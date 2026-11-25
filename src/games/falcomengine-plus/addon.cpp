@@ -11633,7 +11633,7 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   shader_injection.rtxdi_sun_detail_bound = 0.f;
   shader_injection.rtxdi_debug_view = static_cast<float>(pt_debug_view);
   shader_injection.rtxdi_sun_detail_view = static_cast<float>(pt_sun_detail_view);
-  if (pt_direct && pt_debug_views[0].handle != 0u) {
+  if (pt_debug_views[0].handle != 0u) {
     cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                                reshade::api::descriptor_table_update{{}, 44u, 0u, 1u,
                                                                      reshade::api::descriptor_type::texture_shader_resource_view,

@@ -14,6 +14,18 @@ float3 PtInvalidPixelGuard(float3 value) {
   return max(value, 0.0);
 }
 
+#if !defined(PT_WATER_SURFACE)
+// A19: final-pass PT views write every pixel while active, so skipped pixels show no stale data.
+void PtWriteFinalDebug(uint2 pixel, float4 value, uint status, uint4 word) {
+  const uint view = g_restir.debug_view;
+  if (view != PT_DEBUG_VIEW_RAW && view != PT_DEBUG_VIEW_RESTIR && view != PT_DEBUG_VIEW_FINAL_DIFFUSE
+      && view != PT_DEBUG_VIEW_FINAL_SPECULAR) return;
+  g_pt_debug_value[pixel] = value;
+  g_pt_debug_status[pixel] = status;
+  g_pt_sun_detail[pixel] = word;
+}
+#endif
+
 // d = 2 NEE samples carry their light data in the INF radiance marker; the reflected direction is resolved from it.
 SplitBrdf PtCalculateDirectLighting(RAB_Surface surface, RTXDI_PTReservoir reservoir, out float3 light_radiance,
                                     out bool sun_sample, out float3 light_direction, out uint direct_light_index) {
@@ -57,6 +69,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     g_pt_specular[id.xy] = (g_refl_flags & 32u) != 0u && g_refl_enabled != 0u && !character
         ? float4(0, 0, 0, 1e-3) : float4(0, 0, 0, 0);
     g_pt_sun_visibility[id.xy] = float4(1.0, 1.0, 1.0, -1.0);  // unknown: keep the game's CSM result
+    PtWriteFinalDebug(id.xy, 0.0, 0u, 0u);
     return;
   }
 #endif
@@ -68,6 +81,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     g_pt_diffuse[id.xy] = 0;
     g_pt_specular[id.xy] = float4(0, 0, 0, 0);
     g_pt_sun_visibility[id.xy] = float4(1.0, 1.0, 1.0, -1.0);  // unknown: keep the game's CSM result
+    PtWriteFinalDebug(id.xy, 0.0, 0u, 0u);
 #endif
     return;
   }
@@ -321,7 +335,14 @@ void main(uint3 id : SV_DispatchThreadID) {
       distance += hit.t;
     }
     float3 rgb = PtInvalidPixelGuard(sum / float(max(g_samples, 1u))) * g_refl_intensity;
-    if (direct && reservoir.pathLength == 2u) rgb += specular;
+    if (direct && reservoir.pathLength == 2u) {
+      // A19: demodulate by the Fresnel the lobe evaluated (Schlick at v.h), not F0; the game applies its own Fresnel.
+      const float3 f = Schlick_Fresnel(surface.material.specularF0,
+                                       saturate(dot(surface.viewDir, normalize(light_direction + surface.viewDir))));
+      float3 hl = raw_specular / max(f, 1e-4);
+      hl = g_refl_sample_clamp > 0.0 ? min(hl, g_refl_sample_clamp) : hl;
+      rgb += PtInvalidPixelGuard(hl) * g_refl_intensity;
+    }
     if ((g_refl_flags & 1u) != 0u) rgb = min(rgb, 1.0);
     g_pt_specular[id.xy] = float4(PtInvalidPixelGuard(rgb), max(distance / float(max(g_samples, 1u)), 1e-3));
   } else if (direct && reservoir.pathLength == 2u) {
@@ -363,9 +384,7 @@ void main(uint3 id : SV_DispatchThreadID) {
       debug_value = g_pt_specular[id.xy];
       debug_status = 0u;
     }
-    g_pt_debug_value[id.xy] = debug_value;
-    g_pt_debug_status[id.xy] = debug_status;
-    g_pt_sun_detail[id.xy] = debug_word;
+    PtWriteFinalDebug(id.xy, debug_value, debug_status, debug_word);
   } else if (view != RTXDI_DEBUG_VIEW_OFF && view <= RTXDI_DEBUG_VIEW_SUN_VISIBILITY) {
     if (view == RTXDI_DEBUG_VIEW_RAW_DIFFUSE) {
       g_pt_debug_value[id.xy] = float4(raw_diffuse, 1.0);

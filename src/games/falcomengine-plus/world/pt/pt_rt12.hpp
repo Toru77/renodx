@@ -1401,7 +1401,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.coverage_valid = s.scene_coverage_valid ? 1u : 0u;
   r.debug_view[k] = debug_view;
   r.sun_detail_view[k] = sun_detail_view;
-  if (debug_on && restir_constants.direct_enabled != 0u) r.debug_frame[k] = frame;
+  if (debug_on) r.debug_frame[k] = frame;
   void* constants_data = nullptr;
   if (FAILED(r.constants[k]->Map(0u, nullptr, &constants_data))) return fail("pt constants map", E_FAIL);
   std::memcpy(constants_data, &restir_constants, sizeof(restir_constants));
