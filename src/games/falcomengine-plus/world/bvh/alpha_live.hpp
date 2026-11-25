@@ -98,6 +98,209 @@ inline bool EnsureAlphaGpu(reshade::api::device* device, BvhDeviceData* data) {
   return true;
 }
 
+// Creates whatever of the albedo atlas is missing (each object once). False when one cannot be created; the
+// meshes keep their source copies and are retried at the next present.
+inline bool EnsureAlbedoGpu(reshade::api::device* device, BvhDeviceData* data) {
+  AlbedoGpu& albedo = data->albedo;
+  using RU = reshade::api::resource_usage;
+  using DS = reshade::api::shader_stage;
+  using DT = reshade::api::descriptor_type;
+  using F = reshade::api::format;
+  using DR = reshade::api::descriptor_range;
+  using P = reshade::api::pipeline_layout_param;
+  const reshade::api::resource_view_desc array_view(
+      reshade::api::resource_view_type::texture_2d_array, F::r8g8b8a8_unorm, 0u, 1u, 0u, kAlbedoAtlasSlices);
+  const std::vector<uint8_t> zeros(kAlbedoAtlasSlices * sizeof(AlbedoMaterialGPU));
+
+  DR srv_range = {0, 0, 0, 1, DS::all_compute, 1, DT::shader_resource_view};
+  DR sampler_range = {0, 0, 0, 1, DS::all_compute, 1, DT::sampler};
+  DR uav_range = {0, 0, 0, 1, DS::all_compute, 1, DT::unordered_access_view};
+  reshade::api::constant_range push_range = {};
+  push_range.binding = 0;
+  push_range.dx_register_index = 0;
+  push_range.dx_register_space = 0;
+  push_range.count = 1;
+  push_range.visibility = DS::all_compute;
+  P params[4] = {};
+  params[0].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  params[0].descriptor_table.count = 1;
+  params[0].descriptor_table.ranges = &srv_range;
+  params[1].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  params[1].descriptor_table.count = 1;
+  params[1].descriptor_table.ranges = &sampler_range;
+  params[2].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  params[2].descriptor_table.count = 1;
+  params[2].descriptor_table.ranges = &uav_range;
+  params[3].type = reshade::api::pipeline_layout_param_type::push_constants;
+  params[3].push_constants = push_range;
+
+  bool ready =
+      (albedo.atlas.handle != 0u
+       || device->create_resource(reshade::api::resource_desc(reshade::api::resource_type::texture_2d, kAlbedoSliceSize,
+                                                             kAlbedoSliceSize, static_cast<uint16_t>(kAlbedoAtlasSlices), 1,
+                                                             F::r8g8b8a8_unorm, 1, reshade::api::memory_heap::gpu_only,
+                                                             RU::shader_resource | RU::unordered_access),
+                                  nullptr, RU::unordered_access, &albedo.atlas))
+      && (albedo.atlas_srv.handle != 0u
+          || device->create_resource_view(albedo.atlas, RU::shader_resource, array_view, &albedo.atlas_srv))
+      && (albedo.atlas_uav.handle != 0u
+          || device->create_resource_view(albedo.atlas, RU::unordered_access, array_view, &albedo.atlas_uav))
+      && (albedo.materials.handle != 0u
+          || CreatePoolBuffer(device, zeros.data(), zeros.size(), sizeof(AlbedoMaterialGPU), &albedo.materials,
+                              &albedo.materials_srv))
+      && (albedo.sampler.handle != 0u || device->create_sampler(reshade::api::sampler_desc{}, &albedo.sampler))
+      && (albedo.blit_layout.handle != 0u || device->create_pipeline_layout(4, params, &albedo.blit_layout));
+  for (uint32_t i = 0u; i < 3u && ready; ++i) {
+    ready = albedo.blit_tables[i].handle != 0u || device->allocate_descriptor_table(albedo.blit_layout, i, &albedo.blit_tables[i]);
+  }
+#if defined(__world_bvh_albedo_blit_EMBED_FILE)
+  if (ready && albedo.blit_pipeline.handle == 0u) {
+    reshade::api::shader_desc shader = {};
+    shader.code = __world_bvh_albedo_blit.data();
+    shader.code_size = __world_bvh_albedo_blit.size();
+    shader.entry_point = "main";
+    reshade::api::pipeline_subobject subobject = {reshade::api::pipeline_subobject_type::compute_shader, 1, &shader};
+    ready = device->create_pipeline(albedo.blit_layout, 1, &subobject, &albedo.blit_pipeline);
+  }
+#else
+  ready = false;
+#endif
+  if (!ready) {
+    if (!albedo.failure_logged) {
+      albedo.failure_logged = true;
+      renodx::utils::log::w("[world-bvh] albedo atlas: GPU objects not created (atlas ", albedo.atlas.handle != 0u,
+                            ", blit ", albedo.blit_pipeline.handle != 0u, ")");
+    }
+    return false;
+  }
+  const reshade::api::descriptor_table_update updates[2] = {
+      {albedo.blit_tables[1], 0, 0, 1, DT::sampler, &albedo.sampler},
+      {albedo.blit_tables[2], 0, 0, 1, DT::unordered_access_view, &albedo.atlas_uav}};
+  device->update_descriptor_tables(2, updates);
+  return true;
+}
+
+struct AlbedoBlitJob {
+  uint64_t source = 0u;  // source id of the copy (alpha_sources)
+  uint64_t uid = 0u;     // mesh uid that gets the slice
+  reshade::api::resource proxy = {0u};
+  reshade::api::format format = reshade::api::format::unknown;
+  AlbedoMaterialGPU material;
+};
+
+// Fills the albedo atlas for static meshes of the store and keeps slot_of_uid (the PT shaders read it). Runs on the
+// present thread after SyncLiveAlpha: alpha and albedo share the source copies, but own their slices. Dynamic and
+// character meshes are excluded (they have no UV capture path here).
+inline void SyncLiveAlbedo(reshade::api::device* device, reshade::api::command_list* cmd_list, BvhDeviceData* data, uint32_t frame) {
+  AlbedoGpu& albedo = data->albedo;
+  if (pt::g_pt_material_atlas <= 0.5f) {
+    DestroyAlbedoGpu(device, data);
+    return;
+  }
+
+  std::vector<AlbedoBlitJob> jobs;
+  std::unordered_set<uint64_t> ready_uids;  // static meshes with UVs, not dynamic and not alpha-tested
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    for (const WorldMesh& mesh : g_pool.meshes) {
+      if (!mesh.dynamic && !mesh.alpha && !mesh.uvs.empty()) ready_uids.insert(mesh.uid);
+    }
+    for (auto it = g_pool.alpha_sources.begin(); it != g_pool.alpha_sources.end(); ++it) {
+      const PoolAlphaSource& source = it->second;
+      if (source.proxy.handle == 0u) continue;  // its copy is being made (outside the lock)
+      for (const uint64_t key : source.keys) {
+        const auto mesh_it = g_pool.mesh_by_key.find(key);
+        if (mesh_it == g_pool.mesh_by_key.end() || mesh_it->second >= g_pool.meshes.size()) continue;
+        const WorldMesh& mesh = g_pool.meshes[mesh_it->second];
+        if (ready_uids.count(mesh.uid) == 0u || albedo.slot_of_uid.count(mesh.uid) != 0u) continue;
+        bool chosen = false;
+        for (const AlbedoBlitJob& job : jobs) chosen = chosen || job.uid == mesh.uid;
+        if (chosen || data->slot_by_uid.count(mesh.uid) == 0u || jobs.size() >= kAlphaBlitsPerFrame) continue;
+        AlbedoMaterialGPU material;
+        material.scroll[0] = mesh.alpha_state.material.scroll[0];
+        material.scroll[1] = mesh.alpha_state.material.scroll[1];
+        material.swizzle = mesh.alpha_state.material.swizzle;
+        material.uv_slot = mesh.uv_slot;
+        jobs.push_back({it->first, mesh.uid, source.proxy, source.format, material});
+      }
+    }
+  }
+  for (auto it = albedo.slot_of_uid.begin(); it != albedo.slot_of_uid.end();) {
+    if (ready_uids.count(it->first) != 0u) {
+      ++it;
+      continue;
+    }
+    albedo.quarantine.emplace_back(it->second, frame);
+    it = albedo.slot_of_uid.erase(it);
+    data->store_version += 1u;
+  }
+  for (auto it = albedo.quarantine.begin(); it != albedo.quarantine.end();) {
+    if (frame >= it->second + kAlphaSliceQuarantineFrames) {
+      albedo.slices.Release(it->first);
+      it = albedo.quarantine.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (jobs.empty()) return;
+
+  // A job that cannot run keeps its copy (still in the map): the mesh is retried at the next present.
+  if (!EnsureAlbedoGpu(device, data)) return;
+
+  using RU = reshade::api::resource_usage;
+  using DS = reshade::api::shader_stage;
+  using DT = reshade::api::descriptor_type;
+  BeginGpuTimer(device, cmd_list, &albedo.timer);
+  uint32_t blits = 0u;
+  for (const AlbedoBlitJob& job : jobs) {
+    const int32_t slot = albedo.slices.Acquire(job.uid);
+    if (slot < 0) {
+      if (albedo.cap_refused_uids.insert(job.uid).second) albedo.cap_refused += 1u;
+      continue;
+    }
+    const uint32_t slice = static_cast<uint32_t>(slot);
+    AlbedoMaterialGPU material = job.material;
+    material.slice = slice;
+    std::string error;
+    reshade::api::resource_view source = {0u};
+    const bool ok = WriteBufferRange(device, cmd_list, albedo.materials, sizeof(AlbedoMaterialGPU),
+                                     static_cast<uint64_t>(slice) * sizeof(AlbedoMaterialGPU), &material, sizeof(material), &error)
+                    && device->create_resource_view(job.proxy, RU::shader_resource, reshade::api::resource_view_desc(job.format), &source);
+    if (ok) {
+      rt12::MirrorAlbedoMaterial(slice, material);
+      const reshade::api::descriptor_table_update source_update = {albedo.blit_tables[0], 0, 0, 1, DT::shader_resource_view, &source};
+      device->update_descriptor_tables(1, &source_update);
+      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, albedo.blit_pipeline);
+      cmd_list->bind_descriptor_tables(DS::all_compute, albedo.blit_layout, 0, 3, albedo.blit_tables);
+      cmd_list->push_constants(DS::all_compute, albedo.blit_layout, 3, 0, 1, &slice);
+      cmd_list->dispatch(kAlbedoSliceSize / 8u, kAlbedoSliceSize / 8u, 1u);
+    }
+    if (source.handle != 0u) device->destroy_resource_view(source);
+    if (!ok) {
+      albedo.slices.Release(slice);
+      renodx::utils::log::w("[world-bvh] albedo atlas: slice ", slice, " for mesh uid ", job.uid, " not written: ", error);
+      continue;
+    }
+    albedo.slot_of_uid[job.uid] = slice;
+    blits += 1u;
+  }
+  EndGpuTimer(cmd_list, &albedo.timer);
+  if (blits != 0u) {
+    // Unbind the atlas UAV at u0: the PT binds it as SRV t58, and D3D11 nulls an SRV still bound as a UAV.
+    const reshade::api::resource_view null_uav = {0u};
+    const reshade::api::descriptor_table_update unbind = {albedo.blit_tables[2], 0, 0, 1, DT::unordered_access_view, &null_uav};
+    device->update_descriptor_tables(1, &unbind);
+    cmd_list->bind_descriptor_tables(DS::all_compute, albedo.blit_layout, 2, 1, &albedo.blit_tables[2]);
+    const reshade::api::resource atlas = albedo.atlas;
+    const RU before = RU::unordered_access;
+    const RU after = RU::shader_resource;
+    cmd_list->barrier(1, &atlas, &before, &after);
+    data->store_version += 1u;
+  }
+  albedo.blits += blits;
+  albedo.blits_frame = blits;
+}
+
 struct AlphaBlitJob {
   uint64_t source = 0u;  // source id of the copy (alpha_sources)
   uint64_t uid = 0u;     // mesh uid that gets the slice
@@ -143,9 +346,12 @@ inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_li
     gpu.waiting = data->live.tlas_alpha_waiting;
     gpu.blit_ms = alpha.timer.last_ms;
   }
-  for (const reshade::api::resource proxy : TakePoolAlphaProxies(!on)) device->destroy_resource(proxy);
+  for (const reshade::api::resource proxy : TakePoolAlphaProxies(!on && pt::g_pt_material_atlas <= 0.5f)) {
+    device->destroy_resource(proxy);
+  }
   if (!on) {
     DestroyAlphaGpu(device, data);
+    SyncLiveAlbedo(device, cmd_list, data, frame);
     return;
   }
 
@@ -296,5 +502,6 @@ inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_li
   }
   alpha.blits += blits;
   alpha.blits_frame = blits;
+  SyncLiveAlbedo(device, cmd_list, data, frame);
 }
 }  // namespace falcom_world::bvh

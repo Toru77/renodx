@@ -101,7 +101,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     hr = r.water_list->Close();
     if (FAILED(hr)) return fail("pt water close", hr);
     // Table (kRt12PtRanges): t0-t3 | t14-t16 | t29 | t30 | t31-t35 | u0-u3 | t36-t39 | u4-u7 | t40-t42 | u8 | t43-t55
-    // | u10-u11 | u9 | u12-u13 | t56 | t57 | u14-u16 | u18.
+    // | u10-u11 | u9 | u12-u13 | t56 | t57 | u14-u16 | u18 | t58-t59.
     D3D12_DESCRIPTOR_RANGE ranges[std::size(kRt12PtRanges)] = {};
     for (uint32_t i = 0u; i < std::size(kRt12PtRanges); ++i) {
       const Rt12PtRange& range = kRt12PtRanges[i];
@@ -769,9 +769,6 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   const uint32_t mat_scale = std::clamp(static_cast<uint32_t>(pt::g_pt_material_cell_scale), 1u, 200u);
   const bool mat_scale_changed = mat_on && mat_scale != r.material_cell_scale;
   if (mat_on) {
-    if (!mat_clear_reason && (r.material_last_frame == UINT32_MAX || frame - r.material_last_frame > pt::kPtSharcGapFrames)) {
-      mat_clear_reason = "gap";
-    }
     if (!mat_clear_reason && episode != r.material_episode) {
       mat_clear_reason = "map change";
     }
@@ -958,6 +955,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   set_srv(2u, mesh_table, Rt12BufferSrv(sizeof(bvh::WorldMeshGPU), mesh_count));
   set_srv(3u, scene.instance_table.Get(), Rt12BufferSrv(sizeof(bvh::WorldInstanceGPU), scene.instance_count));
   set_srv(4u, uv_arena, Rt12BufferSrv(kRt12ArenaStride[kRt12ArenaUvs], uv_count));
+  const bool albedo_on = pt::g_pt_material_atlas > 0.5f && s.albedo_atlas.texture12 != nullptr && s.albedo_materials != nullptr;
+  ID3D12Resource* const albedo_texture = albedo_on ? s.albedo_atlas.texture12.Get() : nullptr;
   D3D12_SHADER_RESOURCE_VIEW_DESC atlas_srv = {};
   atlas_srv.Format = DXGI_FORMAT_R32_UINT;
   atlas_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -966,6 +965,14 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   atlas_srv.Texture2DArray.ArraySize = kRt12AlphaSlices;
   set_srv(5u, s.atlas.texture12.Get(), atlas_srv);
   set_srv(6u, s.materials.Get(), Rt12BufferSrv(32u, kRt12AlphaSlices));
+  D3D12_SHADER_RESOURCE_VIEW_DESC albedo_srv = {};
+  albedo_srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  albedo_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+  albedo_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  albedo_srv.Texture2DArray.MipLevels = 1u;
+  albedo_srv.Texture2DArray.ArraySize = kAlbedoAtlasSlices;
+  set_srv(55u, albedo_texture, albedo_srv);
+  set_srv(56u, albedo_on ? s.albedo_materials.Get() : nullptr, Rt12BufferSrv(32u, kAlbedoAtlasSlices));
   D3D12_SHADER_RESOURCE_VIEW_DESC tlas_srv = {};
   tlas_srv.Format = DXGI_FORMAT_UNKNOWN;
   tlas_srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
@@ -1092,7 +1099,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   table.ptr += static_cast<UINT64>(base) * s.descriptor_size;
   ID3D12Resource* const reads[] = {vertices, indices, mesh_table, scene.instance_table.Get(), uv_arena, s.atlas.texture12.Get(),
                                    s.materials.Get(), dynamic_vertices, input.depth.texture12.Get(), input.normal.texture12.Get(),
-                                   input.scene.texture12.Get(), lights, light_table};
+                                   input.scene.texture12.Get(), lights, light_table, albedo_texture};
   std::vector<D3D12_RESOURCE_BARRIER>& barriers = pt_slot.barrier_scratch;
   barriers.clear();
   for (ID3D12Resource* resource : reads) {

@@ -314,6 +314,29 @@ struct AlphaGpu {
   bool failure_logged = false;  // EnsureAlphaGpu logs its failure once (re-armed with the GPU objects)
 };
 
+// GPU side of the albedo atlas (alpha_live.hpp), owned by BvhDeviceData::albedo. Created when the material atlas is
+// switched on, destroyed when it goes off or the device goes.
+struct AlbedoGpu {
+  reshade::api::resource atlas = {0u};  // Texture2DArray<R8G8B8A8_UNORM>, kAlbedoAtlasSlices layers of 128 x 128
+  reshade::api::resource_view atlas_srv = {0u};
+  reshade::api::resource_view atlas_uav = {0u};
+  reshade::api::resource materials = {0u};  // AlbedoMaterialGPU per slice (zero-initialised)
+  reshade::api::resource_view materials_srv = {0u};
+  reshade::api::sampler sampler = {0u};
+  reshade::api::pipeline_layout blit_layout = {0u};
+  reshade::api::descriptor_table blit_tables[3] = {};  // t0 source, s0 sampler, u0 atlas
+  reshade::api::pipeline blit_pipeline = {0u};
+  AlbedoSliceTable slices;
+  std::unordered_map<uint64_t, uint32_t> slot_of_uid;  // mesh uid -> slice of its material (read by the PT shaders)
+  std::vector<std::pair<uint32_t, uint32_t>> quarantine;  // (slice, frame released)
+  GpuTimer timer;
+  uint64_t blits = 0u;
+  uint32_t blits_frame = 0u;
+  uint64_t cap_refused = 0u;
+  std::unordered_set<uint64_t> cap_refused_uids;
+  bool failure_logged = false;
+};
+
 // P2b (bvh_live.hpp ExpandLiveDynamic): the flagged draws of a present. The arena takes their instance slices and args
 // at the draw (copy_buffer_region, bvh_pool.hpp); the expansion writes the records the trace reads (t17).
 struct DynamicExpandGpu {
@@ -346,6 +369,7 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   LiveArena blas_nodes = MakeLiveArena(sizeof(BVHNodeGPU));
   LiveArena uvs = MakeLiveArena(sizeof(float) * 2u);  // float2, only meshes with UVs (alpha foliage)
   AlphaGpu alpha;  // atlas, materials and blit (alpha_live.hpp); empty while alpha_foliage is off
+  AlbedoGpu albedo;  // atlas, materials and blit (alpha_live.hpp); empty while the material atlas is off
   DynamicExpandGpu dynamic;  // P2b: flagged draws of the present, expanded (bvh_live.hpp)
   std::vector<LiveMeshSlot> slots;
   std::unordered_map<uint64_t, uint32_t> slot_by_uid;
@@ -553,6 +577,31 @@ inline void DestroyAlphaGpu(reshade::api::device* device, BvhDeviceData* data) {
   alpha.blits_frame = 0u;
 }
 
+// Destroys the albedo atlas and its blit (material atlas off, or the device goes).
+inline void DestroyAlbedoGpu(reshade::api::device* device, BvhDeviceData* data) {
+  AlbedoGpu& albedo = data->albedo;
+  for (reshade::api::descriptor_table& table : albedo.blit_tables) {
+    if (table.handle != 0u) device->free_descriptor_table(table);
+    table = {0u};
+  }
+  if (albedo.blit_pipeline.handle != 0u) device->destroy_pipeline(albedo.blit_pipeline);
+  if (albedo.blit_layout.handle != 0u) device->destroy_pipeline_layout(albedo.blit_layout);
+  if (albedo.sampler.handle != 0u) device->destroy_sampler(albedo.sampler);
+  DestroyBuffer(device, &albedo.atlas_srv, nullptr);
+  DestroyBuffer(device, &albedo.atlas_uav, &albedo.atlas);
+  DestroyBuffer(device, &albedo.materials_srv, &albedo.materials);
+  if (albedo.timer.created) DestroyGpuTimer(&albedo.timer);
+  albedo.blit_pipeline = {0u};
+  albedo.blit_layout = {0u};
+  albedo.sampler = {0u};
+  albedo.slices = {};
+  albedo.slot_of_uid.clear();
+  albedo.quarantine.clear();
+  albedo.cap_refused_uids.clear();
+  albedo.failure_logged = false;
+  albedo.blits_frame = 0u;
+}
+
 // P2b GPU objects. The pool stops copying into the arena first (under its lock), then the objects go.
 inline void DestroyDynamicExpand(reshade::api::device* device, BvhDeviceData* data) {
   DynamicExpandGpu& dynamic = data->dynamic;
@@ -583,6 +632,7 @@ inline void DestroyBvhDeviceData(reshade::api::device* device) {
   BvhDeviceData* data = GetBvhDeviceData(device);
   if (data == nullptr) return;
   DestroyAlphaGpu(device, data);
+  DestroyAlbedoGpu(device, data);
   DestroyDynamicExpand(device, data);
   DestroyLiveStore(device, data);
   if (data->trace_pipeline.handle != 0u) {

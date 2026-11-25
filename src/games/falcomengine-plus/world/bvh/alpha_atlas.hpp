@@ -24,6 +24,10 @@ inline constexpr uint64_t kAlphaSourceBytesMax = 256ull << 20;  // bytes of live
 inline constexpr uint32_t kAlphaSliceQuarantineFrames = 16u;  // a released slice is reused after this many frames
 inline constexpr uint32_t kAlphaOrphanFrames = 600u;  // a keyless copy (indirect draw) is held this many presents for its resolve
 
+// Albedo atlas: one RGBA8 slice per static mesh, sampled at the hit's UV by the path tracer (A35).
+inline constexpr uint32_t kAlbedoAtlasSlices = 512u;
+inline constexpr uint32_t kAlbedoSliceSize = 128u;
+
 enum class AlphaUvRangeStatus { NotRequired,
                                 Valid,
                                 Invalid };
@@ -57,6 +61,38 @@ struct AlphaMaterialGPU {
   uint32_t pad[3] = {};
 };
 static_assert(sizeof(AlphaMaterialGPU) == 32u, "AlphaMaterialGPU is 32 bytes");
+
+// One per albedo slice, read by the PT shaders. 32 bytes, mirroring AlphaMaterialGPU.
+struct AlbedoMaterialGPU {
+  uint32_t slice = 0u;
+  float scroll[2] = {};
+  uint32_t swizzle = 0u;
+  uint32_t uv_slot = 0u;
+  uint32_t pad[3] = {};
+};
+static_assert(sizeof(AlbedoMaterialGPU) == 32u, "AlbedoMaterialGPU is 32 bytes");
+
+// Same bookkeeping as AlphaSliceTable, sized for the albedo atlas.
+struct AlbedoSliceTable {
+  std::array<uint64_t, kAlbedoAtlasSlices> owner = {};
+  uint32_t used = 0u;
+
+  int32_t Acquire(uint64_t mesh_uid) {
+    for (uint32_t slice = 0u; slice < kAlbedoAtlasSlices; ++slice) {
+      if (owner[slice] != 0u) continue;
+      owner[slice] = mesh_uid;
+      used += 1u;
+      return static_cast<int32_t>(slice);
+    }
+    return -1;
+  }
+
+  void Release(uint32_t slice) {
+    if (slice >= kAlbedoAtlasSlices || owner[slice] == 0u) return;
+    owner[slice] = 0u;
+    used -= 1u;
+  }
+};
 
 // Four alpha bytes as the blit packs them (texel 0 in the low byte).
 inline uint32_t PackAlphaTexels(const uint8_t* texels) {

@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include "../bvh/alpha_atlas.hpp"
+
 namespace falcom_world::rt12 {
 
 // Arena element sizes of the live store (bvh_live.hpp): vertices float4, indices uint, UVs float2.
@@ -47,6 +49,9 @@ struct Rt12Mirror {
   // outlive store resets and may exist before the DXR switch goes on); rt12 uploads all of it when the version moves.
   std::array<std::array<uint8_t, 32>, kRt12AlphaSlices> materials = {};
   uint64_t materials_version = 0u;
+  // Albedo materials: the same persistent producer copy, drained into the session by its own version.
+  std::array<AlbedoMaterialGPU, kAlbedoAtlasSlices> albedo_materials = {};
+  uint64_t albedo_material_version = 0u;
   uint64_t sanitized_triangles = 0u;  // total since the scene was created
 };
 inline Rt12Mirror g_rt12_mirror;
@@ -186,6 +191,14 @@ inline void MirrorMaterial(uint32_t slice, const void* bytes32) {
   if (slice < kRt12AlphaSlices) {
     std::memcpy(g_rt12_mirror.materials[slice].data(), bytes32, 32u);
     g_rt12_mirror.materials_version += 1u;
+  }
+}
+
+inline void MirrorAlbedoMaterial(uint32_t slice, const AlbedoMaterialGPU& material) {
+  std::lock_guard lock(g_rt12_mirror.mutex);
+  if (slice < kAlbedoAtlasSlices) {
+    g_rt12_mirror.albedo_materials[slice] = material;
+    g_rt12_mirror.albedo_material_version += 1u;
   }
 }
 

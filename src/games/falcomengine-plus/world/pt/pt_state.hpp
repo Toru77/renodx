@@ -60,6 +60,7 @@ inline constexpr uint32_t kPtSharcAccumulationStride = 32u; // OpenRemix sharc_p
 inline constexpr uint32_t kPtSharcResolvedStride = 24u;     // OpenRemix sharc_policy.h:10
 inline float g_pt_material_enabled = 1.f, g_pt_material_rate = 4.f, g_pt_material_cell_scale = 80.f,
              g_pt_material_capacity_log2 = 22.f, g_pt_char_roughness = 0.5f, g_pt_char_f0 = 0.04f;
+inline float g_pt_material_atlas = 1.f;  // capture t0 and UVs of static meshes into the albedo atlas
 inline constexpr uint32_t kPtMaterialValueStride = 16u;
 inline float g_pt_samples = 1.f, g_pt_max_bounces = 16.f, g_pt_russian_roulette = 1.f,
              g_pt_roulette_min_bounce = 1.f, g_pt_intensity = 1.f, g_pt_char_intensity = 1.f, g_pt_sky_intensity = 1.f,

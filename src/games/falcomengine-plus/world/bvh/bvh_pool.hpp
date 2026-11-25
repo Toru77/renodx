@@ -94,6 +94,7 @@
 #include "../capture/cb_value_tracker.hpp"
 #include "../contract/shader_registry.hpp"
 #include "../debug/pool_stage.hpp"
+#include "../pt/pt_state.hpp"
 #include "../world_state.hpp"
 #include "camera_fade.hpp"
 #include "perf_gate.hpp"
@@ -405,6 +406,7 @@ struct PoolVertexBuffers {
 // vertex range. buffer.handle 0 = no such stream.
 struct PoolUvStream {
   reshade::api::resource buffer = {0u};
+  uint32_t slot = 0u;            // TEXCOORD0's buffer binding (0 = interleaved with the positions)
   uint64_t offset = 0u;          // the slot's byte offset
   uint32_t stride = 0u;          // the slot's stride
   uint32_t element_offset = 0u;  // TEXCOORD0 offset within the stride
@@ -492,6 +494,7 @@ struct WorldMesh {
   float bbox_max[3] = {};
   std::vector<std::array<float, 3>> positions;
   std::vector<std::array<float, 2>> uvs;  // per position; empty when the layout has no UV
+  uint32_t uv_slot = 0u;  // TEXCOORD0 buffer binding of the captured UV stream
   std::vector<uint32_t> indices;  // flat, three per triangle
   uint64_t signature = 0u;        // content hash (positions + indices + UVs)
   uint32_t live_keys = 0u;        // draw keys still mapped to this mesh
@@ -1137,6 +1140,8 @@ struct PoolStats {
   uint64_t alpha_removed = 0u;         // instances removed by the alpha flag or the switch
   uint64_t alpha_uv_requeues = 0u;     // meshes captured without UVs and queued again for them (once per key)
   uint64_t alpha_source_copies = 0u;   // source textures copied for alpha draws (CapturePoolAlphaSource)
+  uint64_t albedo_source_copies = 0u;  // source textures copied for material-atlas (static) draws
+  uint64_t albedo_source_refused = 0u;  // material-atlas draws whose source was not copied
   uint64_t alpha_source_refused = 0u;  // alpha draws whose source was not copied (texture kind, caps, deferred, failure)
   uint64_t alpha_source_refused_bytes = 0u;   // of those: the byte cap (kAlphaSourceBytesMax) was reached
   uint64_t alpha_source_refused_format = 0u;  // of those: the bound view's format is unknown or typeless
@@ -3724,6 +3729,7 @@ inline void ResolvePoolUvStream(reshade::api::device* device, const DrawRecord& 
   if (!FindPoolInputLayout(draw, &layout_info)) return;
   const scene::InputElementCopy* uv = FindPoolTexcoord0(layout_info);
   if (uv == nullptr || uv->buffer_binding == 0u) return;
+  out->slot = uv->buffer_binding;
   const scene::FormatInfo* info = scene::FindFormatInfo(uv->format);
   for (uint32_t i = 0u; i < vbs.count; ++i) {
     const PoolVertexBufferSlot& slot = vbs.slots[i];
@@ -4075,13 +4081,14 @@ inline uint64_t PoolAlphaProxyBytes() {
 // run outside g_pool.mutex. The texture is registered with its draw keys, so destroying it invalidates them (the proxy
 // is freed at the next present). mesh_key 0 is an indirect draw whose args are not read yet: no key is recorded, the
 // copy is held for kAlphaOrphanFrames presents, and its id is returned for AttachPoolAlphaSource at resolve. The keyed
-// path returns 0.
-inline uint64_t CapturePoolAlphaSource(
-    reshade::api::device* device, reshade::api::command_list* cmd_list, uint64_t mesh_key, uint64_t view, bool immediate) {
+// path returns 0. With the material atlas on, static draws use the same copy for their albedo slice; `albedo` selects
+// the separate albedo counters.
+inline uint64_t CapturePoolAlphaSource(reshade::api::device* device, reshade::api::command_list* cmd_list, uint64_t mesh_key,
+                                       uint64_t view, bool immediate, bool albedo = false) {
   const bool keyless = mesh_key == 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    const bool enabled = g_pool.alpha_foliage.load(std::memory_order_relaxed);
+    const bool enabled = g_pool.alpha_foliage.load(std::memory_order_relaxed) || pt::g_pt_material_atlas > 0.5f;
     if (!enabled) g_pool.alpha_capture_logged = false;
     if (!enabled || !g_pool.live_on.load(std::memory_order_relaxed)
         || (!keyless && (g_pool.alpha_source_done.count(mesh_key) != 0u || g_pool.alpha_key_source.count(mesh_key) != 0u))) {
@@ -4096,6 +4103,9 @@ inline uint64_t CapturePoolAlphaSource(
   if (!immediate) {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     g_pool.stats.alpha_source_refused += 1u;
+    if (albedo) {
+      g_pool.stats.albedo_source_refused += 1u;
+    }
     g_pool.stats.alpha_source_refused_deferred += 1u;
     return 0u;
   }
@@ -4106,6 +4116,9 @@ inline uint64_t CapturePoolAlphaSource(
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     if (!keyless) g_pool.alpha_source_done.insert(mesh_key);
     g_pool.stats.alpha_source_refused += 1u;
+    if (albedo) {
+      g_pool.stats.albedo_source_refused += 1u;
+    }
     g_pool.stats.alpha_source_refused_type += 1u;
     return 0u;
   }
@@ -4116,6 +4129,9 @@ inline uint64_t CapturePoolAlphaSource(
       std::lock_guard<std::mutex> lock(g_pool.mutex);
       if (!keyless) g_pool.alpha_source_done.insert(mesh_key);
       g_pool.stats.alpha_source_refused += 1u;
+      if (albedo) {
+        g_pool.stats.albedo_source_refused += 1u;
+      }
       g_pool.stats.alpha_source_refused_type += 1u;
       g_pool.stats.alpha_source_refused_format += 1u;
       first = g_pool.alpha_format_logged.insert(texture.handle).second;
@@ -4155,6 +4171,9 @@ inline uint64_t CapturePoolAlphaSource(
     if (g_pool.alpha_copies_frame >= kAlphaCopiesPerFrame || g_pool.alpha_sources.size() >= kAlphaSourcesMax
         || keyless_sources >= kAlphaKeylessSourcesMax) {
       g_pool.stats.alpha_source_refused += 1u;
+      if (albedo) {
+        g_pool.stats.albedo_source_refused += 1u;
+      }
       g_pool.stats.alpha_source_refused_cap += 1u;
       return 0u;
     }
@@ -4192,6 +4211,9 @@ inline uint64_t CapturePoolAlphaSource(
       it->second.format = format;
       for (const uint64_t key : it->second.keys) AddPoolResourceKey(texture.handle, key);
       g_pool.stats.alpha_source_copies += 1u;
+      if (albedo) {
+        g_pool.stats.albedo_source_copies += 1u;
+      }
       if (keyless) g_pool.stats.alpha_indirect_copies += 1u;
       kept = true;
     } else {
@@ -4204,6 +4226,9 @@ inline uint64_t CapturePoolAlphaSource(
         g_pool.alpha_sources.erase(it);
       }
       g_pool.stats.alpha_source_refused += 1u;
+      if (albedo) {
+        g_pool.stats.albedo_source_refused += 1u;
+      }
       g_pool.stats.alpha_source_refused_failed += 1u;
     }
   }
@@ -4304,14 +4329,21 @@ inline void OnPoolScanDraw(
 
   const auto gate_start = PerfNow();
   const PoolDrawGate gate = GatePoolDraw(draw, true);
+  const bool atlas_draw = pt::g_pt_material_atlas > 0.5f && gate.vs_class == contract::VsClass::Rigid
+                          && gate.skip == PoolSkip::None;
   if (gate.wind_rest) {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     g_pool.stats.wind_rest_draws += 1u;
   }
   PoolAlphaMaterial alpha_material;
-  if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, gate.alpha_threshold_offset, &alpha_material);
+  if (gate.alpha_material) {
+    ReadPoolAlphaDraw(cmd_list, *cl_data, gate.alpha_threshold_offset, &alpha_material);
+  } else if (atlas_draw) {
+    alpha_material.view = cl_data->ps_srv_view[contract::kAlphaTexSlot].handle;
+    alpha_material.resource = cl_data->ps_srv[contract::kAlphaTexSlot].handle;
+  }
   PoolVertexBuffers vbs;
-  const bool vbs_known = gate.alpha_material && CollectPoolVertexBuffers(cmd_list, &vbs);
+  const bool vbs_known = (gate.alpha_material || atlas_draw) && CollectPoolVertexBuffers(cmd_list, &vbs);
   PoolUvStream uv;
   if (vbs_known) ResolvePoolUvStream(device, draw, vbs, &uv);
   PoolSkip skip = gate.skip;
@@ -4464,16 +4496,17 @@ inline void OnPoolScanDraw(
     cmd_list->copy_buffer_region(slice.instance_buffer, static_cast<uint64_t>(dynamic_copy.base) * kPoolInstanceStride,
                                  dynamic_copy.buffer, dynamic_copy.arena, static_cast<uint64_t>(dynamic_copy.count) * kPoolInstanceStride);
   }
-  if (queued && gate.alpha_material && alpha_material.view != 0u) {
+  if (queued && (gate.alpha_material || atlas_draw) && alpha_material.view != 0u) {
     const reshade::api::resource source = device->get_resource_from_view({alpha_material.view});
     if (source.handle != cl_data->ps_srv[contract::kAlphaTexSlot].handle) {
       std::lock_guard<std::mutex> lock(g_pool.mutex);
       g_pool.alpha_source_done.insert(mesh_key);
       g_pool.stats.alpha_source_refused += 1u;
+      if (atlas_draw && !gate.alpha_material) g_pool.stats.albedo_source_refused += 1u;
       g_pool.stats.alpha_source_refused_type += 1u;
       g_pool.stats.alpha_source_refused_view += 1u;
     } else {
-      CapturePoolAlphaSource(device, cmd_list, mesh_key, alpha_material.view, !deferred);
+      CapturePoolAlphaSource(device, cmd_list, mesh_key, alpha_material.view, !deferred, atlas_draw && !gate.alpha_material);
     }
   }
   if (tail_start != std::chrono::steady_clock::time_point{}) {
@@ -4734,7 +4767,7 @@ inline void OnPoolScanIndirectDraw(
       g_pool.stats.alpha_source_refused_type += 1u;
       g_pool.stats.alpha_source_refused_view += 1u;
     } else {
-      source_id = CapturePoolAlphaSource(device, cmd_list, 0u, alpha_material.view, !deferred);
+      source_id = CapturePoolAlphaSource(device, cmd_list, 0u, alpha_material.view, !deferred, false);
     }
     if (source_id != 0u) {
       std::lock_guard<std::mutex> lock(g_pool.mutex);
@@ -5140,6 +5173,7 @@ inline const char* ApplyPoolMesh(
     std::memcpy(world_mesh.bbox_max, mesh.bbox_max.data(), sizeof(float) * 3u);
     world_mesh.positions = std::move(mesh.positions);
     world_mesh.uvs = std::move(mesh.uvs);
+    world_mesh.uv_slot = origin != nullptr ? origin->uv.slot : 0u;
     world_mesh.indices.reserve(mesh.triangles.size() * 3u);
     for (const auto& triangle : mesh.triangles) {
       world_mesh.indices.push_back(triangle[0]);

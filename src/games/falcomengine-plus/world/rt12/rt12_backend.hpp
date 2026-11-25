@@ -287,7 +287,7 @@ struct Rt12DiTransferState {
 };
 
 // Path tracing (world/pt): its own submission slots, list, root signature, PSOs, descriptors and outputs.
-inline constexpr uint32_t kRt12PtDescriptors = 55u;
+inline constexpr uint32_t kRt12PtDescriptors = 57u;
 
 // PT root-table ranges (register base, count, table offset, UAV); the root signature and the water descriptor copy use this.
 struct Rt12PtRange { uint32_t base, count, offset; bool uav; };
@@ -295,7 +295,7 @@ inline constexpr Rt12PtRange kRt12PtRanges[] = {
     {0u, 4u, 0u, false},  {14u, 3u, 4u, false}, {29u, 1u, 7u, false},  {30u, 1u, 8u, false},  {31u, 5u, 9u, false},
     {0u, 4u, 14u, true},  {36u, 4u, 18u, false}, {4u, 4u, 22u, true},  {40u, 3u, 26u, false}, {8u, 1u, 29u, true},
     {43u, 13u, 30u, false}, {10u, 2u, 43u, true}, {9u, 1u, 45u, true}, {12u, 2u, 46u, true}, {56u, 1u, 48u, false},
-    {57u, 1u, 49u, false}, {14u, 3u, 50u, true}, {17u, 1u, 53u, true}, {18u, 1u, 54u, true}};
+    {57u, 1u, 49u, false}, {14u, 3u, 50u, true}, {17u, 1u, 53u, true}, {18u, 1u, 54u, true}, {58u, 2u, 55u, false}};
 static_assert([] {
   uint32_t next = 0u;
   for (const Rt12PtRange& range : kRt12PtRanges) {
@@ -503,10 +503,14 @@ struct Rt12State {
   std::array<std::array<uint8_t, 32>, kRt12AlphaSlices> material_cpu = {};
   bool materials_dirty = true;
   uint64_t materials_version_seen = ~0ull;  // g_rt12_mirror.materials_version last copied (~0: copy at the first present)
+  Microsoft::WRL::ComPtr<ID3D12Resource> albedo_materials;  // DEFAULT, kAlbedoAtlasSlices * 32 bytes
+  std::array<AlbedoMaterialGPU, kAlbedoAtlasSlices> albedo_material_cpu = {};
+  bool albedo_materials_dirty = false;
+  uint64_t albedo_material_version_seen = ~0ull;  // g_rt12_mirror.albedo_material_version last copied
   std::vector<Rt12Blas> blas;               // index = live store slot
   uint64_t blas_generation = 0u;
   uint64_t blas_bytes = 0u;
-  Rt12Shared depth, normal, scene, noise, texel, raw, stats, atlas, carrier, records, gc_records;
+  Rt12Shared depth, normal, scene, noise, texel, raw, stats, atlas, albedo_atlas, carrier, records, gc_records;
   Microsoft::WRL::ComPtr<ID3D12Resource> dynamic_vertices;  // DEFAULT, kRt12CarrierWidth * kRt12CarrierHeight float4, COMMON
   Microsoft::WRL::ComPtr<ID3D12RootSignature> unpack_root;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> unpack_pso;
@@ -543,6 +547,8 @@ struct Rt12State {
   uint64_t pt_noise_source = 0u;
   reshade::api::resource atlas_source = {0u};
   uint64_t atlas_blits = ~0ull;  // data->alpha.blits at the last atlas copy
+  reshade::api::resource albedo_source = {0u};
+  uint64_t albedo_blits = ~0ull;  // data->albedo.blits at the last atlas copy
   std::vector<Rt12Retired> retired;
   bool mirror_dropped = false;  // G4 (D2): the mirror's BLAS and arenas were dropped while the GPU scene traces
   bool stuck = false;
@@ -1061,7 +1067,8 @@ inline void TeardownRt12(const char* why) {
     g_rt12.release();  // leaked on purpose (see above)
     return;
   }
-  for (Rt12Shared* shared : {&s.depth, &s.normal, &s.scene, &s.noise, &s.texel, &s.raw, &s.stats, &s.atlas, &s.carrier, &s.records, &s.gc_records}) {
+  for (Rt12Shared* shared : {&s.depth, &s.normal, &s.scene, &s.noise, &s.texel, &s.raw, &s.stats, &s.atlas, &s.albedo_atlas,
+                             &s.carrier, &s.records, &s.gc_records}) {
     if (shared->srv11.handle != 0u) s.device->destroy_resource_view(shared->srv11);
     if (shared->uav11.handle != 0u) s.device->destroy_resource_view(shared->uav11);
   }
@@ -1404,7 +1411,19 @@ inline bool CreateRt12(reshade::api::device* device) {
     renodx::utils::log::w("[world-rt12] alpha mirror not created hr=", renodx::utils::log::AsHex(static_cast<uint32_t>(hr)));
     s.atlas = Rt12Shared{};
   }
-
+  // 15b. Albedo mirror. A failure leaves the albedo path off (the PT binds null descriptors); it never fails the session.
+  hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, kAlbedoAtlasSlices * 32u, D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_FLAG_NONE, s.albedo_materials);
+  if (FAILED(hr)) {
+    renodx::utils::log::w("[world-rt12] albedo materials not created hr=", renodx::utils::log::AsHex(static_cast<uint32_t>(hr)));
+    s.albedo_materials.Reset();
+  }
+  hr = CreateRt12Shared(s, device, DXGI_FORMAT_R8G8B8A8_UNORM, kAlbedoSliceSize, kAlbedoSliceSize,
+                        kAlbedoAtlasSlices, false, &s.albedo_atlas);
+  if (FAILED(hr)) {
+    renodx::utils::log::w("[world-rt12] albedo mirror not created hr=", renodx::utils::log::AsHex(static_cast<uint32_t>(hr)));
+    s.albedo_atlas = Rt12Shared{};
+  }
 
   // 17. Success: the mirror starts, and the live store re-streams every mesh through its hooks.
   {
@@ -1442,7 +1461,8 @@ inline bool ReadRt12Timestamps(ID3D12Resource* readback, uint32_t first, uint32_
 
 // The present submission (9.1 to 9.9): arenas, mesh table, materials, BLAS builds. Returns false when the session failed.
 inline bool SubmitPresent(Rt12State& s, const bvh::BvhDeviceData* data, const std::vector<Rt12MirrorAppend>& appends,
-                          const std::vector<Rt12MirrorSlot>& new_slots, bool table_upload, bool materials_copy) {
+                          const std::vector<Rt12MirrorSlot>& new_slots, bool table_upload, bool materials_copy,
+                          bool albedo_materials_copy) {
   if (s.unfenced_execution) return false;
   using Microsoft::WRL::ComPtr;
   const uint32_t k = s.present_next;
@@ -1461,6 +1481,8 @@ inline bool SubmitPresent(Rt12State& s, const bvh::BvhDeviceData* data, const st
   if (table_upload) upload_bytes += Align256(table_bytes);
   const uint64_t materials_offset = upload_bytes;
   if (materials_copy) upload_bytes += Align256(sizeof(s.material_cpu));
+  const uint64_t albedo_offset = upload_bytes;
+  if (albedo_materials_copy) upload_bytes += Align256(sizeof(s.albedo_material_cpu));
   if (p.upload == nullptr || p.upload_bytes < upload_bytes) {
     const uint64_t bytes = std::max<uint64_t>({upload_bytes, 2u * p.upload_bytes, 256u});
     ComPtr<ID3D12Resource> upload;
@@ -1482,6 +1504,9 @@ inline bool SubmitPresent(Rt12State& s, const bvh::BvhDeviceData* data, const st
   }
   if (table_upload && table_bytes > 0u) std::memcpy(p.upload_data + table_offset, data->mesh_descriptors.data(), table_bytes);
   if (materials_copy) std::memcpy(p.upload_data + materials_offset, s.material_cpu.data(), sizeof(s.material_cpu));
+  if (albedo_materials_copy) {
+    std::memcpy(p.upload_data + albedo_offset, s.albedo_material_cpu.data(), sizeof(s.albedo_material_cpu));
+  }
 
   // 9.2 Recording starts; timestamp at the start.
   if (FAILED(p.allocator->Reset()) || FAILED(s.present_list->Reset(p.allocator.Get(), nullptr))) {
@@ -1544,6 +1569,9 @@ inline bool SubmitPresent(Rt12State& s, const bvh::BvhDeviceData* data, const st
   }
   if (table_upload) Transition(barriers, s.mesh_table.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
   if (materials_copy) Transition(barriers, s.materials.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (albedo_materials_copy) {
+    Transition(barriers, s.albedo_materials.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+  }
   if (!barriers.empty()) list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
 
   // 9.5 Copies: grown arenas, appends at the D3D11 element offsets, mesh table, materials.
@@ -1564,6 +1592,10 @@ inline bool SubmitPresent(Rt12State& s, const bvh::BvhDeviceData* data, const st
     list->CopyBufferRegion(s.materials.Get(), 0u, p.upload.Get(), materials_offset, sizeof(s.material_cpu));
     s.materials_dirty = false;
   }
+  if (albedo_materials_copy) {
+    list->CopyBufferRegion(s.albedo_materials.Get(), 0u, p.upload.Get(), albedo_offset, sizeof(s.albedo_material_cpu));
+    s.albedo_materials_dirty = false;
+  }
 
   // 9.6 Barrier batch 2: BLAS inputs to NON_PIXEL_SHADER_RESOURCE, everything else back to COMMON.
   bool any_blas = false;
@@ -1578,6 +1610,9 @@ inline bool SubmitPresent(Rt12State& s, const bvh::BvhDeviceData* data, const st
   }
   if (table_upload) Transition(barriers, s.mesh_table.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
   if (materials_copy) Transition(barriers, s.materials.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+  if (albedo_materials_copy) {
+    Transition(barriers, s.albedo_materials.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+  }
   if (!barriers.empty()) list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
 
   // 9.8 One BLAS per new slot with triangles. Scratch is one buffer; each build has its own range.
@@ -2098,9 +2133,15 @@ inline void OnPresent(reshade::api::device* device) {
       s.materials_version_seen = g_rt12_mirror.materials_version;
       s.materials_dirty = true;
     }
+    if (g_rt12_mirror.albedo_material_version != s.albedo_material_version_seen) {
+      s.albedo_material_cpu = g_rt12_mirror.albedo_materials;
+      s.albedo_material_version_seen = g_rt12_mirror.albedo_material_version;
+      s.albedo_materials_dirty = true;
+    }
   }
   UpdatePanel([sanitized_total](Rt12Panel& p) { p.sanitized_triangles = sanitized_total; });
   const bool materials_copy = s.materials_dirty;
+  const bool albedo_materials_copy = s.albedo_materials_dirty && s.albedo_materials && s.albedo_atlas.texture12;
 
   // 6. CPU-side changes: a store reset empties the scene, retired slots drop their BLAS.
   const uint32_t saved_mesh_count = s.mesh_count;
@@ -2135,7 +2176,7 @@ inline void OnPresent(reshade::api::device* device) {
   }
 
   // 8/9. Submission, unless nothing changed or the slot is still busy (then the work is put back, in order).
-  const bool record = !appends.empty() || !new_slots.empty() || table_upload || materials_copy;
+  const bool record = !appends.empty() || !new_slots.empty() || table_upload || materials_copy || albedo_materials_copy;
   if (record && s.present_slots[s.present_next].fence_value > completed) {
     {
       std::lock_guard lock(g_rt12_mirror.mutex);
@@ -2151,7 +2192,7 @@ inline void OnPresent(reshade::api::device* device) {
     s.mesh_store_version = saved_mesh_store_version;
     UpdatePanel([](Rt12Panel& p) { p.present_skipped_busy += 1u; });
   } else if (record) {
-    if (!SubmitPresent(s, data, appends, new_slots, table_upload, materials_copy)) return;
+    if (!SubmitPresent(s, data, appends, new_slots, table_upload, materials_copy, albedo_materials_copy)) return;
   }
 
   // 10. Alpha atlas mirror (D3D11): copied when the live atlas or its contents changed.
@@ -2162,6 +2203,15 @@ inline void OnPresent(reshade::api::device* device) {
     s.atlas_source = data->alpha.atlas;
     s.atlas_blits = data->alpha.blits;
     UpdatePanel([](Rt12Panel& p) { p.atlas_copies += 1u; });
+  }
+
+  // 10b. Albedo atlas mirror (D3D11), on the same shared-texture fence and frame latency as the alpha atlas.
+  if (s.albedo_atlas.texture11 && data != nullptr && data->albedo.atlas.handle != 0u
+      && (data->albedo.atlas.handle != s.albedo_source.handle || data->albedo.blits != s.albedo_blits)) {
+    s.ctx11->CopyResource(s.albedo_atlas.texture11.Get(),
+                          reinterpret_cast<ID3D11Resource*>(data->albedo.atlas.handle));  // NOLINT(performance-no-int-to-ptr)
+    s.albedo_source = data->albedo.atlas;
+    s.albedo_blits = data->albedo.blits;
   }
 
   // 11. Panel counts.

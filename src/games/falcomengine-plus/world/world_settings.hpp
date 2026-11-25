@@ -2131,6 +2131,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "PtMaterialAtlas",
+      .binding = &pt::g_pt_material_atlas,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Material Atlas",
+      .section = "Path Tracing",
+      .tooltip = "Captures the t0 texture and UVs of static meshes into a 128x128 albedo atlas (512 slices) for material reads at off-screen hits.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "PtMaterialRate",
       .binding = &pt::g_pt_material_rate,
       .value_type = SettingValueType::INTEGER,
