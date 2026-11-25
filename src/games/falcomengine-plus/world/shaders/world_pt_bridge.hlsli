@@ -922,8 +922,12 @@ float3 PtGameLamp(RAB_Surface surface, inout RTXDI_RandomSamplerState rng) {
   if (response_sum <= 0.0) return 0.0;
   const float2 uv = float2(RTXDI_GetNextRandom(rng), RTXDI_GetNextRandom(rng));
   const RAB_LightSample light_sample = RAB_SamplePolymorphicLight(RAB_LoadLightInfo(selected_index, false), surface, uv);
-  return selected_response * (response_sum / RTXDI_Luminance(selected_response))
-         * PtLightVisibility(surface, light_sample.position);
+  float visibility = PtLightVisibility(surface, light_sample.position);
+  if (surface.material.character && g_restir.char_terminator_fade > 0.0) {
+    const float ndl = dot(surface.normal, normalize(light_sample.position - surface.worldPos));
+    visibility = lerp(1.0, visibility, saturate(ndl / g_restir.char_terminator_fade));
+  }
+  return selected_response * (response_sum / RTXDI_Luminance(selected_response)) * visibility;
 }
 
 #endif  // FALCOM_WORLD_PT_BRIDGE_HLSLI

@@ -1390,6 +1390,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.sun_toon = di_clamped(pt::g_pt_sun_toon, 1.f, 0.f, 1.f);
   restir_constants.char_sun_toon = di_clamped(pt::g_pt_char_sun_toon, 1.f, 0.f, 1.f);
   restir_constants.char_lamp_toon = di_clamped(pt::g_pt_char_lamp_toon, 1.f, 0.f, 1.f);
+  restir_constants.char_terminator_fade = di_clamped(pt::g_pt_char_terminator_fade, 0.2f, 0.f, 1.f);
   restir_constants.sun_intensity = di_clamped(pt::g_pt_sun_intensity, 1.f, 0.f, 4.f);
   restir_constants.game_sun_shadows = game_sun_shadows ? 1u : 0u;
   restir_constants.char_interior_sun_gate = pt::g_restir_char_interior_sun_gate > 0.5f ? 1u : 0u;

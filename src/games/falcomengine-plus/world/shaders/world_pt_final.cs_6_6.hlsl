@@ -253,7 +253,11 @@ void main(uint3 id : SV_DispatchThreadID) {
           if (shadow.status == RTXDI_SUN_STATUS_VISIBLE || shadow.status == RTXDI_SUN_STATUS_BLOCKED) {
             const uint layers = (shadow.flags >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK;
             const float darkening = character ? g_restir.sun_char_darkening : g_restir.sun_darkening;
-            const float visibility = shadow.status == RTXDI_SUN_STATUS_VISIBLE ? transmittance : 0.0;
+            float visibility = shadow.status == RTXDI_SUN_STATUS_VISIBLE ? transmittance : 0.0;
+            if (character && g_restir.char_terminator_fade > 0.0) {
+              const float ndl = dot(surface.normal, L);
+              visibility = lerp(1.0, visibility, saturate(ndl / g_restir.char_terminator_fade));
+            }
             game_sun_visibility = float4(pow(saturate(float3(g_restir.foliage_tint.x, g_restir.foliage_tint.y,
                                                              g_restir.foliage_tint.z)), float(layers)),
                                          lerp(1.0, visibility, darkening));

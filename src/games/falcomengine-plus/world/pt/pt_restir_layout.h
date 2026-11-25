@@ -57,6 +57,7 @@ struct PtRestirConstants {
   float lamp_wrap_scale, lamp_intensity;
   uint32_t lamp_material_scale, lamp_bands;
   float sun_toon, char_sun_toon, char_lamp_toon, sun_intensity;
+  float char_terminator_fade, terminator_padding0, terminator_padding1, terminator_padding2;
 };
 
 #ifdef __cplusplus

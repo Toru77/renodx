@@ -1659,6 +1659,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "PtCharTerminatorFade",
+      .binding = &pt::g_pt_char_terminator_fade,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.2f,
+      .label = "Character Shadow Terminator Fade",
+      .section = "Path Tracing Shading",
+      .tooltip = "Fades character sun/lamp shadows where the surface turns away from the light, so the face's far side isn't treated as a cast shadow. 0 = hard ray-traced edge. Cast shadows on light-facing skin (bangs, hats, walls) are kept.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "PtEnabled",
       .binding = &pt::g_pt_enabled,
       .value_type = SettingValueType::BOOLEAN,
