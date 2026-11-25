@@ -11564,7 +11564,13 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   shader_injection.pt_gi_bound = 0.f;
   shader_injection.pt_refl_bound = 0.f;
   shader_injection.pt_sun_vis_bound = 0.f;
-  shader_injection.pt_physical_mix = di::FiniteClamped(pt::g_pt_physical_mix, 0.f, 0.f, 1.f);
+  shader_injection.pt_sun_toon = di::FiniteClamped(pt::g_pt_sun_toon, 1.f, 0.f, 1.f);
+  shader_injection.pt_char_sun_toon = di::FiniteClamped(pt::g_pt_char_sun_toon, 1.f, 0.f, 1.f);
+  shader_injection.pt_sun_intensity = di::FiniteClamped(pt::g_pt_sun_intensity, 1.f, 0.f, 4.f);
+  shader_injection.pt_sun_bands = std::round(di::FiniteClamped(pt::g_pt_sun_bands, 0.f, 0.f, 8.f));
+  shader_injection.pt_sun_fill = di::FiniteClamped(pt::g_pt_sun_fill, 1.f, 0.f, 2.f);
+  shader_injection.pt_char_fill = di::FiniteClamped(pt::g_pt_char_fill, 1.f, 0.f, 2.f);
+  shader_injection.pt_sun_specular = di::FiniteClamped(pt::g_pt_sun_specular, 1.f, 0.f, 2.f);
   shader_injection.pt_refl_override = PtReflectionOverride() ? 1.f : 0.f;
   g_pt_reflection_view = {};
   if (!IsSora2nd() || !cmd_list) return;

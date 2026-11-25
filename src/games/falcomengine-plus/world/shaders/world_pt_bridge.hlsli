@@ -507,7 +507,7 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
     // Game lights are irradiance-normalized (lighting_0xCA3D8596: diffuse = albedo x colour x N.L, no 1/pi). The FullSample
     // Lambert BRDF divides by pi, and an area light spreads that over its solid angle: radiance = pi x colour / Omega,
     // where 1 / Omega = solidAnglePdf (delta lights use pdf 1).
-    s.radiance = max(g_pt_sun_color, 0.0) * (3.14159265 * s.solidAnglePdf);
+    s.radiance = max(g_pt_sun_color, 0.0) * (3.14159265 * s.solidAnglePdf) * g_restir.sun_intensity;
     s.position = surface.worldPos + direction * kPtFarLightDistance;
     return s;
   }
@@ -857,8 +857,9 @@ float3 PtGameLamp(RAB_Surface surface, inout RTXDI_RandomSamplerState rng) {
     color *= LampDistanceAttenuation(lp, to_c);
     if (g_pt_light_table[uint(listed)].type == LAMP_TYPE_SPOT) color *= LampSpotCone(lp, l_c);
     if (g_restir.local_clamp_enabled != 0u) color = min(color, float3(g_restir.local_clamp, g_restir.local_clamp, g_restir.local_clamp));
-    const float3 response = color * max(max(dot(surface.normal, l_c), lp.translucency * g_restir.lamp_wrap_scale), 0.0)
-        * g_restir.lamp_intensity;
+    float toon_d = max(max(dot(surface.normal, l_c), lp.translucency * g_restir.lamp_wrap_scale), 0.0);
+    if (g_restir.lamp_bands != 0u) toon_d = floor(toon_d * g_restir.lamp_bands + 0.5) / g_restir.lamp_bands;
+    const float3 response = color * toon_d * g_restir.lamp_intensity;
     const float weight = RTXDI_Luminance(response);
     response_sum += weight;
     if (weight > 0.0 && RTXDI_GetNextRandom(rng) * response_sum < weight) {

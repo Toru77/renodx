@@ -173,11 +173,10 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (direct) debug_status_word |= RTXDI_N1_STATUS_KNOWN_BIT;
 
 #if !defined(PT_WATER_SURFACE)
-  // A14 F2: one sun ray for pixels the game shades itself (Direct off, or Physical Direct Light below 1). rgb carries
-  // the foliage tint, a carries RT visibility; a < 0 means unknown and keeps the game's CSM result.
+  // A14 F2: one sun ray for the game's own sun shading, which every pixel keeps (Direct off, or its toon share under
+  // Direct, A24b). rgb carries the foliage tint, a carries RT visibility; a < 0 means unknown and keeps the game's CSM.
   float4 game_sun_visibility = float4(1.0, 1.0, 1.0, -1.0);
-  const bool game_lit = g_restir.direct_enabled == 0u || g_restir.physical_mix < 1.0;
-  if (g_restir.game_sun_shadows != 0u && game_lit) {
+  if (g_restir.game_sun_shadows != 0u) {
     const RAB_LightInfo sun_info = RAB_LoadLightInfo(g_lamp_count, false);
     if (sun_info.index != RTXDI_LIGHT_TABLE_INVALID_INDEX) {
       float2 sun_uv;
@@ -239,10 +238,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 #endif
 
   const bool pt_direct = g_restir.direct_enabled != 0u;
-  const float game_mix = 1.0 - g_restir.physical_mix;
+  const float lamp_toon = character ? g_restir.char_lamp_toon : g_restir.lamp_toon;
 #if !defined(PT_WATER_SURFACE)
   float3 game_lamp = 0.0;
-  if (pt_direct && game_mix > 0.0) {
+  if (pt_direct && lamp_toon > 0.0) {
     // The game's lamp response over the pixel's tile list with RT visibility (A24a). The estimate is bounded by the
     // unshadowed tile sum, so it is added unclamped. Environment and characters share it.
     RTXDI_RandomSamplerState lamp_rng = RTXDI_InitRandomSampler(id.xy, g_frame, 13u);
@@ -260,9 +259,10 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (is_direct) {
     diffuse = PtClampLuminance(diffuse, g_restir.direct_clamp);
     specular = PtClampLuminance(specular, g_restir.direct_clamp);
-    // Physical Direct Light blends the physical direct part against the game shading (A23b).
-    diffuse *= g_restir.physical_mix;
-    specular *= g_restir.physical_mix;
+    // The physical direct part takes the share the game toon shading leaves (A24b).
+    const float toon = sun_sample ? (character ? g_restir.char_sun_toon : g_restir.sun_toon) : lamp_toon;
+    diffuse *= 1.0 - toon;
+    specular *= 1.0 - toon;
   }
   const float3 raw_specular = PtInvalidPixelGuard(specular);
   diffuse = PtInvalidPixelGuard(diffuse);
@@ -280,7 +280,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 #else
   if (!is_direct && g_restir.gi_clamp_per_bounce == 0u) diffuse = PtClampLuminance(diffuse, g_gi_clamp);
   // Environment game lamps are demodulated like the game's lamp sum, which the lighting shader multiplies by albedo.
-  if (!character) diffuse += game_mix * game_lamp;
+  if (!character) diffuse += lamp_toon * game_lamp;
   const float sparse_scale = (g_refl_flags & 32u) != 0u && g_sparse_enabled != 0u && g_sparse_levels < 256u
       ? 256.0 / float(g_sparse_levels) : 1.0;
   g_pt_diffuse[id.xy] = float4(PtInvalidPixelGuard(diffuse * sparse_scale), 1.0);
@@ -294,7 +294,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         ? raw_specular : min(raw_specular, g_refl_sample_clamp);
     const float3 char_spec = g_refl_enabled != 0u ? clamped : 0.0;
     g_pt_specular[id.xy] = pt_direct
-        ? float4(char_spec + surface.material.diffuseAlbedo * game_lamp * game_mix, 1.0)
+        ? float4(char_spec + surface.material.diffuseAlbedo * game_lamp * lamp_toon, 1.0)
         : float4(0, 0, 0, 0);
   } else if (g_refl_enabled == 0u) {
     g_pt_specular[id.xy] = float4(0, 0, 0, 0);

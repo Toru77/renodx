@@ -39,16 +39,16 @@ struct ShaderInjectData {
   // still in the Sora and Kai character/SSAO shaders.
   float char_shadow_mode;
   float reserved_slot_19;  // RETIRED: no remaining consumer; kept for the layout.
-  float pt_physical_mix;  // Physical Direct Light [0..1]: 0 = game sun shading under PT direct, 1 = PT Lambert/GGX only
-  float reserved_slot_21;  // RETIRED: no remaining consumer; kept for the layout.
+  float pt_sun_toon;  // Sun Toon Amount [0..1]: game sun share of environment sun light under PT direct; was the Physical Direct Light slot
+  float pt_char_sun_toon;  // Character Sun Toon Amount [0..1]: game sun share on characters under PT direct; was reserved_slot_21
   float pt_direct_bound;                    // 0/1: t47/t48 carry unified PT direct light this draw; was reserved_slot_01
-  float reserved_slot_22;  // RETIRED: no remaining consumer; kept for the layout.
-  float reserved_slot_23;  // RETIRED: no remaining consumer; kept for the layout.
+  float pt_sun_intensity;  // Sun Intensity [0..4]: scales the game sun ramp under PT direct; was reserved_slot_22
+  float pt_sun_bands;  // Sun Ramp Bands [0..8]: 0 = smooth game sun ramp, else that many steps; was reserved_slot_23
   float cs_contact_local_light_clearance;   // [0..1] world units; reuses a retired slot without moving later fields
   float pt_sun_vis_bound;  // 0/1: t42 holds world-traced sun visibility for game-lit pixels; was reserved_slot_24
-  float reserved_slot_25;  // RETIRED: no remaining consumer; kept for the layout.
-  float reserved_slot_26;  // RETIRED: no remaining consumer; kept for the layout.
-  float reserved_slot_27;  // RETIRED: no remaining consumer; kept for the layout.
+  float pt_sun_fill;  // Sun Shadow Fill [0..2]: scales the environment sun shadow colour under PT direct; was reserved_slot_25
+  float pt_char_fill;  // Character Shadow Fill [0..2]: scales the character sun shadow colour under PT direct; was reserved_slot_26
+  float pt_sun_specular;  // Sun Specular [0..2]: scales the game sun specular under PT direct; was reserved_slot_27
   float pt_gi_bound;  // 0/1: Sora 2nd t47 holds this frame's path-traced diffuse GI (world/pt); reuses retired rtxdi_sun_character_csm_gate
 
   // Environment "Sun SSS" ray-march. RETIRED across the whole mod; unread.

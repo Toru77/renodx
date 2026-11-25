@@ -77,8 +77,11 @@ inline float g_pt_reflection_water_surface = 0.f;
 inline float g_pt_reflection_water_roughness = 0.05f;
 inline float g_restir_direct = 1.f;
 inline float g_restir_direct_clamp_enabled = 1.f, g_restir_direct_clamp = 16.f;
-inline float g_pt_physical_mix = 0.f, g_pt_lamp_wrap_scale = 1.f, g_pt_lamp_intensity = 1.f,
-             g_pt_lamp_material_scale = 1.f;
+inline float g_pt_lamp_wrap_scale = 1.f, g_pt_lamp_intensity = 1.f, g_pt_lamp_material_scale = 1.f;
+inline float g_pt_sun_toon = 1.f, g_pt_sun_intensity = 1.f, g_pt_sun_bands = 0.f, g_pt_sun_fill = 1.f,
+             g_pt_sun_specular = 1.f;
+inline float g_pt_lamp_toon = 1.f, g_pt_lamp_bands = 0.f;
+inline float g_pt_char_sun_toon = 1.f, g_pt_char_lamp_toon = 1.f, g_pt_char_fill = 1.f;
 inline float g_restir_game_sun_shadows = 1.f;
 inline float g_restir_max_rc_vertex_length = 5.f, g_restir_nee_local_samples = 1.f;
 inline float g_restir_min_connection_footprint = 0.02f, g_restir_min_connection_footprint_sigma = 0.2f;

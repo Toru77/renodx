@@ -51,11 +51,12 @@ struct PtRestirConstants {
 #endif
   float coverage_size;
   uint32_t coverage_valid;
-  float physical_mix;
+  float lamp_toon;
   uint32_t game_sun_shadows, gi_clamp_per_bounce;
   uint32_t sharc_min_bounce, resampling_none, debug_channel, sharc_padding1;
   float lamp_wrap_scale, lamp_intensity;
-  uint32_t lamp_material_scale, lamp_padding0;
+  uint32_t lamp_material_scale, lamp_bands;
+  float sun_toon, char_sun_toon, char_lamp_toon, sun_intensity;
 };
 
 #ifdef __cplusplus

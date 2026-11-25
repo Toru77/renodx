@@ -236,7 +236,7 @@ bool PtDetermineOutgoingRay(inout RTXDI_PathTracerContext<PTContextType> ctx,
 template<typename PTContextType>
 void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_PathTracerRandomContext rng,
                   inout RAB_PathTracerUserData ud) {
-  // Reservoir direct light streams in every mode; Physical Direct Light only weights it at final shading (A24a).
+  // Reservoir direct light streams in every mode; the Toon Amounts only weight it at final shading (A24b).
   if (g_restir.direct_enabled == 0u) return;
   const RAB_Surface surface = ctx.GetIntersectionSurface();
   if (!RAB_IsSurfaceValid(surface)) return;
@@ -247,7 +247,7 @@ void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_
   // Every usable entry of this pixel's game tile cell is a candidate: the only lights with a non-zero target
   // (world_rtxdi_initial_di.cs_6_5.hlsl:132-167). RIS over the full set gives W = sum(target) / target(y), so the
   // local estimate is the tile's unshadowed lamp sum and one shadow ray supplies visibility (A24a).
-  if (tile_valid && g_restir.nee.numLocalLightSamples != 0u) {
+  if (tile_valid) {
     const LightIndexData tile = g_pt_tiles[cell];
     uint point_count, entry_count;
     if (PtTileUsableEntries(tile, point_count, entry_count) != 0u) {

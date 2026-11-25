@@ -590,7 +590,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       return fallback(pt::PtReason::TargetFailed);
     }
   }
-  const bool game_sun_shadows = pt::g_restir_game_sun_shadows > 0.5f;
+  const bool game_sun_shadows = pt::g_restir_game_sun_shadows > 0.5f || pt::g_restir_direct > 0.5f;
   Rt12Shared& sun_vis = r.sun_visibility[k];
   if (game_sun_shadows && (!sun_vis.texture11 || sun_vis.width != w || sun_vis.height != h)) {
     RetireShared(s, sun_vis, s.last_signal);
@@ -1382,11 +1382,16 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.direct_enabled = pt::g_restir_direct > 0.5f ? 1u : 0u;
   restir_constants.direct_clamp = pt::g_restir_direct_clamp_enabled > 0.5f
       ? di_clamped(pt::g_restir_direct_clamp, 16.f, 0.5f, 64.f) : 0.f;
-  restir_constants.physical_mix = di_clamped(pt::g_pt_physical_mix, 0.f, 0.f, 1.f);
+  restir_constants.lamp_toon = di_clamped(pt::g_pt_lamp_toon, 1.f, 0.f, 1.f);
   restir_constants.lamp_wrap_scale = di_clamped(pt::g_pt_lamp_wrap_scale, 1.f, 0.f, 2.f);
   restir_constants.lamp_intensity = di_clamped(pt::g_pt_lamp_intensity, 1.f, 0.f, 4.f);
   restir_constants.lamp_material_scale = pt::g_pt_lamp_material_scale > 0.5f ? 1u : 0u;
-  restir_constants.game_sun_shadows = pt::g_restir_game_sun_shadows > 0.5f ? 1u : 0u;
+  restir_constants.lamp_bands = static_cast<uint32_t>(di_clamped(pt::g_pt_lamp_bands, 0.f, 0.f, 8.f) + 0.5f);
+  restir_constants.sun_toon = di_clamped(pt::g_pt_sun_toon, 1.f, 0.f, 1.f);
+  restir_constants.char_sun_toon = di_clamped(pt::g_pt_char_sun_toon, 1.f, 0.f, 1.f);
+  restir_constants.char_lamp_toon = di_clamped(pt::g_pt_char_lamp_toon, 1.f, 0.f, 1.f);
+  restir_constants.sun_intensity = di_clamped(pt::g_pt_sun_intensity, 1.f, 0.f, 4.f);
+  restir_constants.game_sun_shadows = game_sun_shadows ? 1u : 0u;
   restir_constants.gi_clamp_per_bounce =
       (pt::g_pt_gi_clamp_mode > 0.5f && pt::g_pt_gi_clamp_enabled > 0.5f) ? 1u : 0u;
   restir_constants.sharc_min_bounce = std::clamp(static_cast<uint32_t>(pt::g_pt_sharc_min_bounce), 1u, 3u);

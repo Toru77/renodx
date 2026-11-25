@@ -320,6 +320,12 @@ float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
                               value, sun_bound, sun_status, consumer_decision);
 }
 
+// Path Tracing Shading ramp bands: b > 0.5 quantizes the game sun ramp to b steps, otherwise it is unchanged (A24b).
+float Band(float x, float b)
+{
+  return b > 0.5f ? floor(x * b + 0.5f) / b : x;
+}
+
 
 void main(
   float4 v0 : SV_Position0,
@@ -507,6 +513,9 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
       r9.x = r0.x;
       r9.yz = float2(0.0322580636,0.0322580636);
       r10.xyz = r9.xyz * r8.xyz;
+      if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) {
+        r10.xyz *= shader_injection_data.pt_char_fill;
+      }
       // This was ao.y * ao.z: the character AO gated by the ssao pass's .z channel.
       // That product is the ENGINE's own screen-space character shadow, not the
       // retired SSS raymarch -- the EnvSSS raymarch is gone from every game, but this
@@ -524,9 +533,10 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
         const float4 v = ptSunVisibility_g.Load(int3(v0.xy, 0));
         if (v.a >= 0.0f) r3.z *= v.a;
       }
-      // Physical Direct Light: the game sun is lerp(shadow, lit, V), so scaling V blends it against PT direct (A23b).
+      // Character sun toon share: the game sun is lerp(shadow, lit, V); the physical share comes from t48 (A24b).
       if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) {
-        r3.z *= 1.0f - saturate(shader_injection_data.pt_physical_mix);
+        r3.z = Band(r3.z, shader_injection_data.pt_sun_bands) * shader_injection_data.pt_char_sun_toon
+            * shader_injection_data.pt_sun_intensity;
       }
       r5.yzw = -r9.xyz * r8.xyz + r0.xyz;
       r9.xyz = r3.zzz * r5.yzw + r10.xyz;
@@ -832,10 +842,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   if (shader_injection_data.pt_sun_vis_bound > 0.5f && ptSunVisibility.a >= 0.0f) {
     r3.z = ptSunVisibility.a;
   }
-  // Physical Direct Light: the game sun is sc + (1 - sc) x B x V, so scaling V blends it against PT direct (A23b).
-  if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) {
-    r3.z *= 1.0f - saturate(shader_injection_data.pt_physical_mix);
-  }
   r3.w = min(r3.z, r0.w);
   r1.xy = (uint2)r1.xy;
   r8.zw = r1.xy * float2(3.05180438e-05,3.05180438e-05) + float2(-1,-1);
@@ -930,6 +936,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r19.xyz = r14.xyz * r1.yyy;
   r10.xyz = sceneShadowColor_g.xyz + r10.xyz;
   r10.xyz = min(float3(1,1,1), r10.xyz);
+  if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) {
+    r10.xyz *= shader_injection_data.pt_sun_fill;
+  }
   r3.x = r10.w * r5.w;
   r3.y = dot(r8.xyw, r19.xyz);
   r20.xyzw = (int4)r18.zzzz & int4(1,2,4,16);
@@ -985,6 +994,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r5.y = r20.y ? r5.y : 0;
   r11.xyz = r5.yyy * r11.xyz;
   r11.xyz = lightColor_g.xyz * r11.xyz;
+  if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) {
+    r11.xyz *= shader_injection_data.pt_sun_specular;
+  }
   const bool dynCubeOn = shader_injection_data.dynCube_enabled > 0.5f && shader_injection_data.pt_refl_override < 0.5f;
   // SSR -> Dynamic -> Vanilla reflection source resolution.
   bool dynCubeNewSSRActive = dynCubeOn
@@ -1200,6 +1212,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     }
   }
   r2.x = r9.x * r3.w;
+  if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) {
+    // Environment sun toon share; the physical share comes from t47 (A24b).
+    r2.x = Band(r9.x * r3.w, shader_injection_data.pt_sun_bands) * shader_injection_data.pt_sun_toon
+        * shader_injection_data.pt_sun_intensity;
+  }
   r15.yzw = float3(1,1,1) + -r10.xyz;
   r10.xyz = r2.xxx * r15.yzw + r10.xyz;
   r2.x = log2(r3.z);
