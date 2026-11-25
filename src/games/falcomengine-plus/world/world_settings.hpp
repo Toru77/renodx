@@ -1646,6 +1646,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "PtCharCastShadow",
+      .binding = &pt::g_pt_char_cast_shadow,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.4f,
+      .label = "Character Cast Shadow Strength",
+      .section = "Path Tracing Shading",
+      .tooltip = "How much character parts the game never shades (e.g. face skin) darken when the sun is blocked. 0 = game behaviour. The toon ramp in sunlight is unchanged.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "PtEnabled",
       .binding = &pt::g_pt_enabled,
       .value_type = SettingValueType::BOOLEAN,

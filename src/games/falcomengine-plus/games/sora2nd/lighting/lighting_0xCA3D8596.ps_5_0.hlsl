@@ -530,17 +530,21 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
         r3.z = r3.z * saturate(r5.z);
       }
       const float charCsm = shadowTexture.SampleLevel(samLinear_s, min(shadowUVClamp_g.xy, v1.xy), 0).x;
+      float charSunVis = 1.0f;
       if (shader_injection_data.pt_sun_vis_bound > 0.5f) {
         const float4 v = ptSunVisibility_g.Load(int3(v0.xy, 0));
-        r3.z *= (v.a >= 0.0f) ? v.a : charCsm;
+        charSunVis = (v.a >= 0.0f) ? v.a : charCsm;
       }
+      r3.z *= charSunVis;
       // Character sun toon share: the game sun is lerp(shadow, lit, V); the physical share comes from t48 (A24b).
       if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) {
         r3.z = Band(r3.z, shader_injection_data.pt_sun_bands) * shader_injection_data.pt_char_sun_toon
             * shader_injection_data.pt_sun_intensity;
       }
       r5.yzw = -r9.xyz * r8.xyz + r0.xyz;
-      r9.xyz = r3.zzz * r5.yzw + r10.xyz;
+      const float castS = saturate(shader_injection_data.pt_char_cast_shadow);
+      const float3 castFill = castS > 0.0f ? min(r10.xyz, r0.xyz * (1.0f - castS)) : r10.xyz;
+      r9.xyz = r3.zzz * r5.yzw + lerp(castFill, r10.xyz, charSunVis);
       r3.z = (int)r1.z & 4;
       float outlineScale = saturate(shader_injection_data.character_outline_thickness);
       if (r3.z == 0 && outlineScale > 0.0f) {

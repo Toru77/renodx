@@ -139,6 +139,7 @@ ShaderInjectData shader_injection = {
     .vbgi_multibounce_bounce_fraction = 0.15f,
     .vbgi_multibounce_saturation = 1.f,
     .vbgi_multibounce_max_clamp = 0.f,
+    .pt_char_cast_shadow = 0.4f,
     .vbgi_max_clamp = 0.f,
     .vbgi_reduce_ao = 0.f,
     .vbgi_reduce_ao_strength = 1.f,
@@ -11570,6 +11571,7 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   shader_injection.pt_sun_bands = std::round(di::FiniteClamped(pt::g_pt_sun_bands, 0.f, 0.f, 8.f));
   shader_injection.pt_sun_fill = di::FiniteClamped(pt::g_pt_sun_fill, 1.f, 0.f, 2.f);
   shader_injection.pt_char_fill = di::FiniteClamped(pt::g_pt_char_fill, 1.f, 0.f, 2.f);
+  shader_injection.pt_char_cast_shadow = di::FiniteClamped(pt::g_pt_char_cast_shadow, 0.4f, 0.f, 1.f);
   shader_injection.pt_sun_specular = di::FiniteClamped(pt::g_pt_sun_specular, 1.f, 0.f, 2.f);
   shader_injection.pt_refl_override = PtReflectionOverride() ? 1.f : 0.f;
   g_pt_reflection_view = {};
