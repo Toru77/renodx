@@ -2,7 +2,7 @@
 
 This is the repository handoff for `world/`. Read the relevant "Open problems", "Current state" and "Reference" sections before changing a subsystem. Round-by-round history and the evidence behind past decisions are in `HISTORY.md`. Project entry point and source map: `../../README.md`; project rules: `../../AGENTS.md`.
 
-Four ray-traced screen-space techniques (AO, GI, local-light shadows, sun shadows) were removed. `world/compute` and `world/denoise` hold the shared compute-pass and SVGF denoise infrastructure, and `world/game_lights.hpp` holds the game lamp layouts. GPU-cache ownership of the traced scene follows `rtxdi::SceneRequested()`. RTXDI sun has its own `RtxdiSunMaxRayDistance` setting (default 100 m). `shared.h` slots `reserved_slot_01` to `reserved_slot_32` are reserved so later packoffsets do not move.
+Four ray-traced screen-space techniques (AO, GI, local-light shadows, sun shadows) were removed. `world/compute` and `world/denoise` hold the shared compute-pass and SVGF denoise infrastructure, and `world/game_lights.hpp` holds the game lamp layouts. GPU-cache ownership of the traced scene follows `rtxdi::SceneRequested()`. RTXDI sun has its own `RtxdiSunMaxRayDistance` setting (default 100 m). `shared.h` slots `reserved_slot_01` to `reserved_slot_31` are reserved; `reserved_slot_32` is now `rtxdi_debug_brightness` (A20.2) so later packoffsets do not move.
 
 ## Open problems (owner reports, 2026-10-14)
 

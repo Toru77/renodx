@@ -41,7 +41,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     float unused_a, unused_b;
     RTXDI_SampledLightData unused_data;
     RAB_LightSample unused_sample;
-    PtSampleNee(hit_surface, nee_rng, direct_from_lights, unused_data, unused_a, unused_b, unused_sample);
+    PtSampleNee(hit_surface, nee_rng, direct_from_lights, unused_data, unused_a, unused_b, unused_sample, true);
     rng = nee_rng.seed;
     // PtSampleNee radiance already includes the hit BRDF (albedo); the base pass multiplied albedo once (22b0badd).
     float3 direct = direct_from_lights;

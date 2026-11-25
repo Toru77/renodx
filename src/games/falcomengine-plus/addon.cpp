@@ -488,6 +488,7 @@ ShaderInjectData shader_injection = {
     .char_cam_isfast_enabled = 1.f,
     .char_cam_debug = 0.f,
     .reserved_slot_18 = 0.f,
+    .rtxdi_debug_brightness = 4.f,
     .rtxdi_debug_view = 0.f,
     .rtxdi_debug_bound = 0.f,
     .rtxdi_debug_distance_bound = 0.f,
@@ -11632,6 +11633,7 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   shader_injection.rtxdi_debug_distance_bound = 0.f;
   shader_injection.rtxdi_sun_detail_bound = 0.f;
   shader_injection.rtxdi_debug_view = static_cast<float>(pt_debug_view);
+  shader_injection.rtxdi_debug_brightness = std::clamp(std::isfinite(di::g_debug_brightness) ? di::g_debug_brightness : 4.f, 0.25f, 16.f);
   shader_injection.rtxdi_sun_detail_view = static_cast<float>(pt_sun_detail_view);
   if (pt_debug_views[0].handle != 0u) {
     cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
@@ -11660,9 +11662,12 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
     cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
                                reshade::api::descriptor_table_update{{}, kLightingPtReflectionRegister, 0u, 1u,
                                                                      reshade::api::descriptor_type::texture_shader_resource_view, &reflection_view});
-    shader_injection.pt_refl_bound = 1.f;
-    g_pt_reflection_view = reflection_view;
-    g_pt_reflection_frame = frame;
+    // A20 C1: t48 also carries the toon character lamp light while PT Reflections are off; only reflections feed SSR.
+    if (pt::g_pt_reflection_enabled > 0.5f) {
+      shader_injection.pt_refl_bound = 1.f;
+      g_pt_reflection_view = reflection_view;
+      g_pt_reflection_frame = frame;
+    }
   }
 }
 

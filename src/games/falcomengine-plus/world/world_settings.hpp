@@ -725,6 +725,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
   });
   settings->push_back(new Setting{
       .key = "",
+      .binding = &rtxdi::g_debug_brightness,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 4.f,
+      .label = "Debug View Brightness",
+      .section = "Path Tracing Debug",
+      .tooltip = "Session only. Scales the RTXDI and PT debug view output; 4 matches the GTVBAO debug view brightness.",
+      .min = 0.25f,
+      .max = 16.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "",
       .binding = &rtxdi::g_sun_detail_view,
       .value_type = SettingValueType::INTEGER,
       .default_value = static_cast<float>(RTXDI_SUN_DETAIL_STATUS),

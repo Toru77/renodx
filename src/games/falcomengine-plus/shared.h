@@ -721,7 +721,7 @@ struct ShaderInjectData {
   float char_cam_debug;
   float reserved_slot_18;  // reserved: unused slot kept so later packoffsets do not move
   // Appended runtime gate; preserves all existing injection offsets.
-  float reserved_slot_32;  // RETIRED: no remaining consumer; kept for the layout.
+  float rtxdi_debug_brightness;  // session-only PT debug view brightness (A20.1 D1); replaces retired reserved_slot_32, layout unchanged
   float rtxdi_debug_view;            // session-only selector; does not affect RTXDI production or history
   float rtxdi_debug_bound;           // 0/1: t44/t45 hold matching N1 raw/status debug sources this draw
   float rtxdi_debug_distance_bound;  // 0/1: t44 is the matching optional N3b distance carrier

@@ -240,17 +240,27 @@ void main(uint3 id : SV_DispatchThreadID) {
 
   const bool char_direct = g_restir.direct_enabled != 0u && !(character && g_restir.char_toon != 0u);
   const bool toon_character = character && g_restir.char_toon != 0u;
-  const bool toon_lamp_direct = toon_character && is_direct && !sun_sample && direct_light_index < g_lamp_count;
+  const bool toon_lamp_direct = toon_character && g_restir.direct_enabled != 0u;
   float3 toon_game_lamp = 0.0;
   if (toon_lamp_direct) {
-    // The game's character lamp response (translucency included), times the reservoir's unnormalized weight (F3).
-    const LightParam lamp = g_pt_lights[direct_light_index];
-    const float3 to_lamp = lamp.pos - surface.worldPos;
-    const float3 l = normalize(to_lamp);
-    const bool spot = g_pt_light_table[direct_light_index].type == LAMP_TYPE_SPOT;
-    toon_game_lamp = max(lamp.charaColor, 0.0) * g_restir.char_lamp_intensity
-        * LampDistanceAttenuation(lamp, to_lamp) * (spot ? LampSpotCone(lamp, l) : 1.0)
-        * max(lamp.translucency, dot(surface.normal, l)) * reservoir.weightSum;
+    // The game's character lamp response (translucency included) from a fresh lamp-only NEE sample (A20 C2), so the
+    // lamp no longer competes with indirect paths inside the unified reservoir.
+    RTXDI_RandomSamplerState lamp_rng = RTXDI_InitRandomSampler(id.xy, g_frame, 13u);
+    float3 lamp_radiance;
+    RTXDI_SampledLightData lamp_data;
+    float lamp_pdf, lamp_scatter_pdf;
+    RAB_LightSample lamp_sample;
+    PtSampleNee(surface, lamp_rng, lamp_radiance, lamp_data, lamp_pdf, lamp_scatter_pdf, lamp_sample, false);
+    const uint lamp_index = RTXDI_SampledLightData_GetLightIndex(lamp_data);
+    if (lamp_pdf > 0.0 && lamp_index < g_lamp_count) {
+      const LightParam lamp = g_pt_lights[lamp_index];
+      const float3 to_lamp = lamp.pos - surface.worldPos;
+      const float3 l = normalize(to_lamp);
+      const bool spot = g_pt_light_table[lamp_index].type == LAMP_TYPE_SPOT;
+      toon_game_lamp = max(lamp.charaColor, 0.0) * g_restir.char_lamp_intensity
+          * LampDistanceAttenuation(lamp, to_lamp) * (spot ? LampSpotCone(lamp, l) : 1.0)
+          * max(lamp.translucency, dot(surface.normal, l)) * PtLightVisibility(surface, lamp_sample.position) / lamp_pdf;
+    }
   }
 
   // Indicator split of the same estimator: intensity scales the indirect part only, and only while direct is on.
@@ -327,7 +337,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         RTXDI_SampledLightData nee_data;
         float nee_pdf, scatter_pdf;
         RAB_LightSample nee_sample;
-        PtSampleNee(hit_surface, refl_rng, lit, nee_data, nee_pdf, scatter_pdf, nee_sample);
+        PtSampleNee(hit_surface, refl_rng, lit, nee_data, nee_pdf, scatter_pdf, nee_sample, true);
         lit += hit_surface.material.diffuseAlbedo * PtSky(hit_surface.normal);
       }
       lit *= sparse_scale;
@@ -375,7 +385,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         case PT_DEBUG_CHANNEL_INITIAL_VS_REUSED: channel = reservoir.age == 0u ? 0.0 : 1.0; break;
         default: break;
       }
-      debug_value = float4(channel, 0.0, 0.0, 1.0);
+      debug_value = float4(channel, float(g_restir.debug_channel), 0.0, 1.0);
       debug_word = uint4(reservoir.randomSeed, reservoir.randomIndex, reservoir.pathLength, reservoir.rcVertexLength);
     } else if (view == PT_DEBUG_VIEW_FINAL_DIFFUSE) {
       debug_value = g_pt_diffuse[id.xy];

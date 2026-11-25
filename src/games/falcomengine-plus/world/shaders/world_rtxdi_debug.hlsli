@@ -5,53 +5,62 @@
 #include "../rtxdi/rtxdi_debug_layout.h"
 #include "../rtxdi/rtxdi_surface_layout.h"
 
+// Debug view brightness (A20.1 D1). The lighting shader binds it to the injected setting; other includers get the default.
+#ifndef RTXDI_DEBUG_BRIGHTNESS
+#define RTXDI_DEBUG_BRIGHTNESS 4.0
+#endif
+float RtxdiDebugScale() { return 0.075 * RTXDI_DEBUG_BRIGHTNESS; }
+
+// Missing data is a full-brightness magenta/black checker, unscaled, like the GTVBAO debug view (A20.1 D1b).
 float3 RtxdiDebugUnavailable(uint2 pixel)
 {
   const bool bright = (((pixel.x >> 3u) ^ (pixel.y >> 3u)) & 1u) != 0u;
-  return (bright ? float3(0.65, 0.0, 0.65) : float3(0.05, 0.05, 0.05)) * 0.05;
+  return bright ? float3(1.0, 0.0, 1.0) : float3(0.0, 0.0, 0.0);
 }
 
 float3 RtxdiDebugStatusColor(uint status_word)
 {
   const uint status = status_word & 0x07u;
-  if (status == RTXDI_N1_STATUS_VISIBLE) return float3(0.1, 1.0, 0.1) * 0.05;
-  if (status == RTXDI_N1_STATUS_BLOCKED) return float3(1.0, 0.1, 0.1) * 0.05;
-  if (status == RTXDI_N1_STATUS_UNKNOWN) return float3(1.0, 0.8, 0.0) * 0.05;
-  if (status == RTXDI_N1_STATUS_EMPTY) return float3(0.1, 0.25, 1.0) * 0.05;
-  return float3(1.0, 0.0, 1.0) * 0.05;
+  if (status == RTXDI_N1_STATUS_VISIBLE) return float3(0.1, 1.0, 0.1) * RtxdiDebugScale();
+  if (status == RTXDI_N1_STATUS_BLOCKED) return float3(1.0, 0.1, 0.1) * RtxdiDebugScale();
+  if (status == RTXDI_N1_STATUS_UNKNOWN) return float3(1.0, 0.8, 0.0) * RtxdiDebugScale();
+  if (status == RTXDI_N1_STATUS_EMPTY) return float3(0.1, 0.25, 1.0) * RtxdiDebugScale();
+  return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
 }
 
 float3 RtxdiDebugRadiance(float3 radiance)
 {
-  if (!all(isfinite(radiance)) || any(radiance < 0.0)) return float3(1.0, 0.0, 1.0) * 0.05;
-  return radiance / (1.0 + radiance) * 0.05;
+  if (!all(isfinite(radiance)) || any(radiance < 0.0)) return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
+  // Log luminance mapping of 0-64 to 0-1 that keeps the hue (A20 D2).
+  const float lum = dot(radiance, float3(0.2126, 0.7152, 0.0722));
+  return radiance * (log2(1.0 + lum) / (max(lum, 1e-6) * log2(65.0))) * RtxdiDebugScale();
 }
 
 // A18 PT initial-pass view status colours (world_pt_path_tracer.hlsli first-hit facts).
 float3 PtDebugStatusColor(uint view, uint status)
 {
   if (view == PT_DEBUG_VIEW_SHARC) {
-    if (status == 0u) return float3(0.1, 0.25, 1.0) * 0.05;  // no hit / sky
-    if (status == 1u) return float3(0.1, 1.0, 0.1) * 0.05;   // terminated by the cache
-    if (status == 2u) return float3(1.0, 0.8, 0.0) * 0.05;   // cached, rejected by the terminal rule
-    if (status == 3u) return float3(1.0, 0.1, 0.1) * 0.05;   // cache miss
-    if (status == 4u) return float3(0.6, 0.0, 1.0) * 0.05;   // SHARC off
+    if (status == 0u) return float3(0.1, 0.25, 1.0) * RtxdiDebugScale();  // no hit / sky
+    if (status == 1u) return float3(0.1, 1.0, 0.1) * RtxdiDebugScale();   // terminated by the cache
+    if (status == 2u) return float3(1.0, 0.8, 0.0) * RtxdiDebugScale();   // cached, rejected by the terminal rule
+    if (status == 3u) return float3(1.0, 0.1, 0.1) * RtxdiDebugScale();   // cache miss
+    if (status == 4u) return float3(0.6, 0.0, 1.0) * RtxdiDebugScale();   // SHARC off
   } else if (view == PT_DEBUG_VIEW_MATERIAL) {
-    if (status == 0u) return float3(0.1, 1.0, 0.1) * 0.05;   // exact G-buffer
-    if (status == 1u) return float3(0.0, 0.8, 1.0) * 0.05;   // material cache hit
-    if (status == 2u) return float3(0.5, 0.5, 0.5) * 0.05;   // miss (grey)
+    if (status == 0u) return float3(0.1, 1.0, 0.1) * RtxdiDebugScale();   // exact G-buffer
+    if (status == 1u) return float3(0.0, 0.8, 1.0) * RtxdiDebugScale();   // material cache hit
+    if (status == 2u) return float3(0.5, 0.5, 0.5) * RtxdiDebugScale();   // miss (grey)
   }
-  return float3(1.0, 0.0, 1.0) * 0.05;
+  return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
 }
 
 float3 RtxdiDebugLight(uint index, uint type)
 {
   if (type != RTXDI_DI_LIGHT_TYPE_POINT && type != RTXDI_DI_LIGHT_TYPE_SPOT) {
-    return float3(1.0, 0.0, 1.0) * 0.05;
+    return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
   }
   const float hash_brightness = 0.35 + 0.65 * ((float)((index * 1664525u + 1013904223u) >> 24u) / 255.0);
   const float3 color = type == RTXDI_DI_LIGHT_TYPE_POINT ? float3(0.0, 0.8, 1.0) : float3(1.0, 0.4, 0.0);
-  return color * hash_brightness * 0.05;
+  return color * hash_brightness * RtxdiDebugScale();
 }
 
 float3 RtxdiDebugDistance(float4 carrier, bool magnitude)
@@ -63,27 +72,27 @@ float3 RtxdiDebugDistance(float4 carrier, bool magnitude)
   const bool valid = carrier.a == 1.0 && carrier.b == 0.0 && carrier.r >= 0.0
                      && isfinite(carrier.r) && flags_valid && (flags & 1u) != 0u
                      && (((flags & 4u) != 0u) ? carrier.r == 65504.0 : carrier.r > 0.0 && carrier.r < 65504.0);
-  if (!valid) return float3(1.0, 0.0, 1.0) * 0.05;
-  if ((flags & 4u) != 0u) return float3(0.0, 0.4, 1.0) * 0.05;
-  if (!magnitude) return float3(0.1, 1.0, 0.1) * 0.05;
+  if (!valid) return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
+  if ((flags & 4u) != 0u) return float3(0.0, 0.4, 1.0) * RtxdiDebugScale();
+  if (!magnitude) return float3(0.1, 1.0, 0.1) * RtxdiDebugScale();
   const float value = log2(1.0 + carrier.r) / log2(1.0 + 65504.0);
-  return value.xxx * 0.05;
+  return value.xxx * RtxdiDebugScale();
 }
 
 float3 RtxdiDebugSunReasonColor(uint status, uint reason)
 {
   if (reason == RTXDI_SUN_REASON_NONE) {
-    if (status == RTXDI_SUN_STATUS_VISIBLE) return float3(1.0, 1.0, 1.0) * 0.05;
+    if (status == RTXDI_SUN_STATUS_VISIBLE) return float3(1.0, 1.0, 1.0) * RtxdiDebugScale();
     if (status == RTXDI_SUN_STATUS_BLOCKED) return 0.0;
-    return float3(1.0, 0.8, 0.0) * 0.05;
+    return float3(1.0, 0.8, 0.0) * RtxdiDebugScale();
   }
-  if (reason == RTXDI_SUN_REASON_INVALID_SURFACE) return float3(1.0, 0.0, 1.0) * 0.05;
-  if (reason == RTXDI_SUN_REASON_INVALID_SCENE) return float3(1.0, 0.4, 0.0) * 0.05;
-  if (reason == RTXDI_SUN_REASON_INVALID_ALPHA) return float3(1.0, 0.1, 0.1) * 0.05;
-  if (reason == RTXDI_SUN_REASON_COVERAGE_MISS) return float3(0.0, 0.4, 1.0) * 0.05;
-  if (reason == RTXDI_SUN_REASON_TRUNCATED) return float3(1.0, 0.8, 0.0) * 0.05;
-  if (reason == RTXDI_SUN_REASON_INVALID_RAY) return float3(0.6, 0.0, 1.0) * 0.05;
-  return float3(1.0, 0.0, 1.0) * 0.05;
+  if (reason == RTXDI_SUN_REASON_INVALID_SURFACE) return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
+  if (reason == RTXDI_SUN_REASON_INVALID_SCENE) return float3(1.0, 0.4, 0.0) * RtxdiDebugScale();
+  if (reason == RTXDI_SUN_REASON_INVALID_ALPHA) return float3(1.0, 0.1, 0.1) * RtxdiDebugScale();
+  if (reason == RTXDI_SUN_REASON_COVERAGE_MISS) return float3(0.0, 0.4, 1.0) * RtxdiDebugScale();
+  if (reason == RTXDI_SUN_REASON_TRUNCATED) return float3(1.0, 0.8, 0.0) * RtxdiDebugScale();
+  if (reason == RTXDI_SUN_REASON_INVALID_RAY) return float3(0.6, 0.0, 1.0) * RtxdiDebugScale();
+  return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
 }
 
 float3 RtxdiDebugSunDetailColor(uint4 carrier, uint detail_view)
@@ -92,32 +101,32 @@ float3 RtxdiDebugSunDetailColor(uint4 carrier, uint detail_view)
   const uint reason = carrier.y;
   const float distance = asfloat(carrier.z);
   if (status > RTXDI_SUN_STATUS_BLOCKED || reason > RTXDI_SUN_REASON_INVALID_RAY) {
-    return float3(1.0, 0.0, 1.0) * 0.05;
+    return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
   }
   if (detail_view == RTXDI_SUN_DETAIL_REASON) return RtxdiDebugSunReasonColor(status, reason);
   if (detail_view == RTXDI_SUN_DETAIL_LAYERS) {
     if (status == RTXDI_SUN_STATUS_VISIBLE && reason == RTXDI_SUN_REASON_NONE) {
-      if (((carrier.w >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) != 0u) return float3(0.0, 1.0, 0.0) * 0.05;
-      if (((carrier.w >> RTXDI_SUN_WIND_OCCLUSION_SHIFT) & RTXDI_SUN_WIND_OCCLUSION_MASK) != 0u) return float3(0.0, 1.0, 1.0) * 0.05;
+      if (((carrier.w >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) != 0u) return float3(0.0, 1.0, 0.0) * RtxdiDebugScale();
+      if (((carrier.w >> RTXDI_SUN_WIND_OCCLUSION_SHIFT) & RTXDI_SUN_WIND_OCCLUSION_MASK) != 0u) return float3(0.0, 1.0, 1.0) * RtxdiDebugScale();
     }
     if (status == RTXDI_SUN_STATUS_BLOCKED && reason == RTXDI_SUN_REASON_NONE) return 0.0;
     return RtxdiDebugSunReasonColor(status, reason);
   }
   if (detail_view == RTXDI_SUN_DETAIL_BLOCKER) {
     if (status == RTXDI_SUN_STATUS_BLOCKED && reason == RTXDI_SUN_REASON_NONE) {
-      if ((carrier.w & RTXDI_SUN_BLOCKER_CHARACTER) != 0u) return float3(1.0, 0.0, 1.0) * 0.05;
-      if ((carrier.w & RTXDI_SUN_BLOCKER_FOLIAGE) != 0u) return float3(0.0, 1.0, 0.0) * 0.05;
-      if ((carrier.w & RTXDI_SUN_BLOCKER_ALPHA) != 0u) return float3(1.0, 1.0, 0.0) * 0.05;
-      if ((carrier.w & RTXDI_SUN_BLOCKER_SHADOW_ONLY) != 0u) return float3(0.0, 0.0, 1.0) * 0.05;
-      return float3(1.0, 0.0, 0.0) * 0.05;
+      if ((carrier.w & RTXDI_SUN_BLOCKER_CHARACTER) != 0u) return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
+      if ((carrier.w & RTXDI_SUN_BLOCKER_FOLIAGE) != 0u) return float3(0.0, 1.0, 0.0) * RtxdiDebugScale();
+      if ((carrier.w & RTXDI_SUN_BLOCKER_ALPHA) != 0u) return float3(1.0, 1.0, 0.0) * RtxdiDebugScale();
+      if ((carrier.w & RTXDI_SUN_BLOCKER_SHADOW_ONLY) != 0u) return float3(0.0, 0.0, 1.0) * RtxdiDebugScale();
+      return float3(1.0, 0.0, 0.0) * RtxdiDebugScale();
     }
     return RtxdiDebugSunReasonColor(status, reason);
   }
   if (detail_view != RTXDI_SUN_DETAIL_HIT_DISTANCE) return RtxdiDebugSunReasonColor(status, reason);
-  if (status == RTXDI_SUN_STATUS_UNKNOWN) return float3(1.0, 0.8, 0.0) * 0.05;
+  if (status == RTXDI_SUN_STATUS_UNKNOWN) return float3(1.0, 0.8, 0.0) * RtxdiDebugScale();
   if (reason != RTXDI_SUN_REASON_NONE) return RtxdiDebugSunReasonColor(status, reason);
-  if (!isfinite(distance) || distance < 0.0) return float3(1.0, 0.0, 1.0) * 0.05;
-  return (log2(1.0 + min(distance, 65504.0)) / log2(1.0 + 65504.0)).xxx * 0.05;
+  if (!isfinite(distance) || distance < 0.0) return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
+  return (log2(1.0 + min(distance, 65504.0)) / log2(1.0 + 65504.0)).xxx * RtxdiDebugScale();
 }
 
 float4 RtxdiDebugPackDistance(uint status_word, float distance, uint flags)
@@ -151,8 +160,8 @@ float3 RtxdiDebugValueColor(uint view, uint2 pixel, bool status_bound, uint stat
                        && (status == RTXDI_N1_STATUS_VISIBLE || status == RTXDI_N1_STATUS_BLOCKED);
     if (!known) return RtxdiDebugStatusColor(status_word);
     return (status_word & RTXDI_N1_STATUS_CHARACTER_BIT) != 0u
-               ? float3(1.0, 0.4, 0.0) * 0.05
-               : float3(0.0, 0.8, 1.0) * 0.05;
+               ? float3(1.0, 0.4, 0.0) * RtxdiDebugScale()
+               : float3(0.0, 0.8, 1.0) * RtxdiDebugScale();
   }
   if (view == RTXDI_DEBUG_VIEW_SELECTED_LIGHT) {
     if (!tuple_bound) return RtxdiDebugUnavailable(pixel);
@@ -177,7 +186,7 @@ float3 RtxdiDebugValueColor(uint view, uint2 pixel, bool status_bound, uint stat
     const float expected_class = (status_word & RTXDI_N1_STATUS_CHARACTER_BIT) != 0u ? 2.0 : 1.0;
     if ((status != RTXDI_N1_STATUS_VISIBLE && status != RTXDI_N1_STATUS_BLOCKED)
         || !isfinite(filtered_radiance.a) || filtered_radiance.a != expected_class) {
-      return float3(1.0, 0.0, 1.0) * 0.05;
+      return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
     }
     return RtxdiDebugRadiance(filtered_radiance.rgb);
   }
@@ -190,28 +199,28 @@ float3 RtxdiDebugValueColor(uint view, uint2 pixel, bool status_bound, uint stat
     const uint flags = isfinite(distance_carrier.g) ? (uint)distance_carrier.g : 0xffffffffu;
     const bool class_matches = (((status_word & RTXDI_N1_STATUS_CHARACTER_BIT) != 0u)
                                 == ((flags & 2u) != 0u));
-    if (!class_matches) return float3(1.0, 0.0, 1.0) * 0.05;
+    if (!class_matches) return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
     return RtxdiDebugDistance(distance_carrier, view == RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE);
   }
   if (view == RTXDI_DEBUG_VIEW_CONSUMER_SELECTION) {
-    if (consumer_decision == RTXDI_DEBUG_CONSUMER_FILTERED) return float3(0.1, 1.0, 0.1) * 0.05;
-    if (consumer_decision == RTXDI_DEBUG_CONSUMER_RAW) return float3(0.0, 0.8, 1.0) * 0.05;
-    if (consumer_decision == RTXDI_DEBUG_CONSUMER_BLOCKED) return float3(1.0, 0.1, 0.1) * 0.05;
-    if (consumer_decision == RTXDI_DEBUG_CONSUMER_EMPTY) return float3(0.1, 0.25, 1.0) * 0.05;
-    if (consumer_decision == RTXDI_DEBUG_CONSUMER_INVALID) return float3(1.0, 0.0, 1.0) * 0.05;
-    if (consumer_decision == RTXDI_DEBUG_CONSUMER_FALLBACK) return float3(1.0, 0.8, 0.0) * 0.05;
+    if (consumer_decision == RTXDI_DEBUG_CONSUMER_FILTERED) return float3(0.1, 1.0, 0.1) * RtxdiDebugScale();
+    if (consumer_decision == RTXDI_DEBUG_CONSUMER_RAW) return float3(0.0, 0.8, 1.0) * RtxdiDebugScale();
+    if (consumer_decision == RTXDI_DEBUG_CONSUMER_BLOCKED) return float3(1.0, 0.1, 0.1) * RtxdiDebugScale();
+    if (consumer_decision == RTXDI_DEBUG_CONSUMER_EMPTY) return float3(0.1, 0.25, 1.0) * RtxdiDebugScale();
+    if (consumer_decision == RTXDI_DEBUG_CONSUMER_INVALID) return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
+    if (consumer_decision == RTXDI_DEBUG_CONSUMER_FALLBACK) return float3(1.0, 0.8, 0.0) * RtxdiDebugScale();
     return RtxdiDebugUnavailable(pixel);
   }
   if (view == RTXDI_DEBUG_VIEW_SUN_VISIBILITY) {
     if (!sun_bound) return RtxdiDebugUnavailable(pixel);
-    if ((sun_status & ~0xFFFFFFu) != 0u) return float3(1.0, 0.8, 0.0) * 0.05;
-    if ((sun_status & 0xFFu) == RTXDI_SUN_STATUS_VISIBLE) return (((sun_status >> RTXDI_SUN_LAYER_SHIFT) & 0xFFu) != 0u ? float3(0.0, 1.0, 0.0) : float3(1.0, 1.0, 1.0)) * 0.05;
+    if ((sun_status & ~0xFFFFFFu) != 0u) return float3(1.0, 0.8, 0.0) * RtxdiDebugScale();
+    if ((sun_status & 0xFFu) == RTXDI_SUN_STATUS_VISIBLE) return (((sun_status >> RTXDI_SUN_LAYER_SHIFT) & 0xFFu) != 0u ? float3(0.0, 1.0, 0.0) : float3(1.0, 1.0, 1.0)) * RtxdiDebugScale();
     if ((sun_status & 0xFFu) == RTXDI_SUN_STATUS_FILTERED) {
       const float filtered_visibility = 1.0 - ((sun_status >> RTXDI_SUN_WIND_OCCLUSION_SHIFT) & RTXDI_SUN_WIND_OCCLUSION_MASK) / 255.0;
-      return (((sun_status >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) != 0u ? float3(0.0, 1.0, 0.0) : float3(1.0, 1.0, 1.0)) * filtered_visibility * 0.05;
+      return (((sun_status >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK) != 0u ? float3(0.0, 1.0, 0.0) : float3(1.0, 1.0, 1.0)) * filtered_visibility * RtxdiDebugScale();
     }
     if ((sun_status & 0xFFu) == RTXDI_SUN_STATUS_BLOCKED) return 0.0;
-    return float3(1.0, 0.8, 0.0) * 0.05;
+    return float3(1.0, 0.8, 0.0) * RtxdiDebugScale();
   }
   return RtxdiDebugUnavailable(pixel);
 }

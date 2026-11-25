@@ -504,6 +504,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   const bool refl_on = pt::g_pt_reflection_enabled > 0.5f && input.color.texture12 && input.mrt1.texture12 && input.mrt2.texture12;
   const bool water_on = pt::g_pt_reflection_water_surface > 0.5f && refl_on;
+  const bool refl_target = refl_on || (pt::g_restir_direct > 0.5f && pt::g_restir_char_toon > 0.5f);
   if ((!water_on || !r.water_restir || r.water_restir_width != w || r.water_restir_height != h)
       && r.water_reservoirs_last_use <= completed) {
     RetireObject(s, s.last_signal, r.water_reservoirs);
@@ -582,7 +583,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   if (water_on && !r.water_restir) return fallback(pt::PtReason::NotCreated);
   if (water_on && (r.water_restir_width != w || r.water_restir_height != h)) return fallback(pt::PtReason::NotCreated);
   Rt12Shared& refl = r.reflection[k];
-  if (refl_on && (!refl.texture11 || refl.width != w || refl.height != h)) {
+  if (refl_target && (!refl.texture11 || refl.width != w || refl.height != h)) {
     RetireShared(s, refl, s.last_signal);
     if (FAILED(CreateRt12Shared(s, device, DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, 1u, true, &refl))) {
       RetireShared(s, refl, s.last_signal);
@@ -985,7 +986,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   device12->CreateUnorderedAccessView(out.texture12.Get(), nullptr, &out_uav, cpu_at(base + 14u));
   r.water_frame_inputs.uav_descs[14u] = out_uav;
   if (Rt12PtDescriptorIsUav(25u) != true) layout_mismatch = 25u + 1u;
-  device12->CreateUnorderedAccessView(refl_on ? refl.texture12.Get() : nullptr, nullptr, &out_uav, cpu_at(base + 25u));
+  device12->CreateUnorderedAccessView(refl_target ? refl.texture12.Get() : nullptr, nullptr, &out_uav, cpu_at(base + 25u));
   r.water_frame_inputs.uav_descs[25u] = out_uav;
   const auto set_buffer_uav = [&](uint32_t index, ID3D12Resource* resource, uint32_t stride) {
     if (Rt12PtDescriptorIsUav(index) != true) layout_mismatch = index + 1u;
@@ -1114,7 +1115,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     Transition(barriers, s.noise.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }
   Transition(barriers, out.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  if (refl_on) Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (refl_target) Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   for (ID3D12Resource* resource : sharc_buffers) {
     if (resource) {
       Transition(barriers, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1537,7 +1538,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   }
   barriers.clear();
   Transition(barriers, out.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-  if (refl_on) Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+  if (refl_target) Transition(barriers, refl.texture12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
   for (ID3D12Resource* resource : sharc_buffers) {
     if (resource) {
       Transition(barriers, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -1829,7 +1830,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     pt::g_pt_panel.regir_build_fence = regir_on ? b : 0u;
     pt::g_pt_panel.regir_last_use_fence = r.regir_last_use[regir_slot];
   }
-  *reflection_view = refl_on ? refl.srv11 : reshade::api::resource_view{0u};
+  *reflection_view = refl_target ? refl.srv11 : reshade::api::resource_view{0u};
   *sun_visibility_view = game_sun_shadows ? sun_vis.srv11 : reshade::api::resource_view{0u};
   debug_views[0] = debug_on && r.debug_frame[k] == frame ? r.debug_value[k].srv11 : reshade::api::resource_view{0u};
   debug_views[1] = debug_on && r.debug_frame[k] == frame ? r.debug_status[k].srv11 : reshade::api::resource_view{0u};

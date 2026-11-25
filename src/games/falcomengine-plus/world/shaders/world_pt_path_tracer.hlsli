@@ -180,7 +180,7 @@ void HandleHit(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_Pat
     float nee_pdf = 0.0;
     float scatter_pdf = 0.0;
     PtSampleNee(surface, ptRandContext.initialRandomSamplerState, radiance_from_lights, sampled_light_data, nee_pdf,
-                scatter_pdf, light_sample);
+                scatter_pdf, light_sample, true);
     if (nee_pdf != 0.0) {
       const float3 le = PtGiClampLe(radiance_from_lights, ctx.GetPathThroughput());
 #if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING)

@@ -31,6 +31,7 @@ inline float g_initial_visibility = 0.f;
 inline float g_diffuse_denoiser = 1.f;
 inline float g_debug_logging = 0.f;
 inline float g_debug_view = static_cast<float>(RTXDI_DEBUG_VIEW_OFF);
+inline float g_debug_brightness = 4.f;
 inline float g_sun_detail_view = static_cast<float>(RTXDI_SUN_DETAIL_STATUS);
 inline float g_relax_diffuse_history = 30.f;
 inline float g_relax_fast_history = 6.f;

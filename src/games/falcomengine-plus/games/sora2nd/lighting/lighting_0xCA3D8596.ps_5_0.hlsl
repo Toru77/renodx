@@ -207,6 +207,7 @@ Texture2D<float4> ptSunVisibility_g : register(t42);
 // Bound while pt_refl_bound.
 Texture2D<float4> ptReflTexture : register(t48);
 #include "../../../shared.h"
+#define RTXDI_DEBUG_BRIGHTNESS (shader_injection_data.rtxdi_debug_brightness)
 #include "../../../world/shaders/world_rtxdi_debug.hlsli"
 #include "../../../customshaders/shadows/shadows_common.hlsli"
 #include "../../../customshaders/dyncube/dyncube_sample.hlsli"
@@ -254,10 +255,22 @@ float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
     if (view == PT_DEBUG_VIEW_SHARC && status_word != 1u) return PtDebugStatusColor(view, status_word);
     if (view == PT_DEBUG_VIEW_MATERIAL && status_word > 1u) return PtDebugStatusColor(view, status_word);
     if (view == PT_DEBUG_VIEW_RESTIR) {
-      if (!isfinite(value.r) || value.r < 0.0) return float3(1.0, 0.0, 1.0) * 0.05;
-      const float heat = value.r / (1.0 + value.r);
-      return (heat < 0.5 ? lerp(float3(0.0, 0.0, 1.0), float3(0.0, 1.0, 0.0), heat * 2.0)
-                         : lerp(float3(0.0, 1.0, 0.0), float3(1.0, 0.0, 0.0), heat * 2.0 - 1.0)) * 0.05;
+      if (!isfinite(value.r) || value.r < 0.0) return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
+      // A20.3: the final pass writes the selected channel id into value.g.
+      const uint channel = (uint)round(value.g);
+      if (channel == PT_DEBUG_CHANNEL_PATH_LENGTH || channel == PT_DEBUG_CHANNEL_RC_LENGTH
+          || channel == PT_DEBUG_CHANNEL_INITIAL_VS_REUSED) {
+        const float3 palette[8] = {float3(0.0, 0.0, 0.0), float3(0.0, 0.25, 1.0), float3(0.0, 1.0, 0.0),
+                                   float3(1.0, 1.0, 0.0), float3(1.0, 0.5, 0.0), float3(1.0, 0.0, 0.0),
+                                   float3(1.0, 0.0, 1.0), float3(1.0, 1.0, 1.0)};
+        return palette[min((uint)round(value.r), 7u)] * RtxdiDebugScale();
+      }
+      if (channel == PT_DEBUG_CHANNEL_M || channel == PT_DEBUG_CHANNEL_AGE) {
+        const float heat = value.r / (value.r + 8.0);
+        return (heat < 0.5 ? lerp(float3(0.0, 0.0, 1.0), float3(0.0, 1.0, 0.0), heat * 2.0)
+                           : lerp(float3(0.0, 1.0, 0.0), float3(1.0, 0.0, 0.0), heat * 2.0 - 1.0)) * RtxdiDebugScale();
+      }
+      return RtxdiDebugRadiance(value.rrr);
     }
     return RtxdiDebugRadiance(value.rgb);
   }
@@ -435,6 +448,12 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
       if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
       return;
     }
+  }
+  // A20.1 D3: the PT views do not report a consumer decision, so they leave early like the GTVBAO views.
+  if (shader_injection_data.rtxdi_debug_view >= PT_DEBUG_VIEW_SHARC - 0.5f) {
+    o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+    o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy;
+    return;
   }
   r4.xy = v1.zw * float2(2,-2) + float2(-1,1);
   r4.w = 1;

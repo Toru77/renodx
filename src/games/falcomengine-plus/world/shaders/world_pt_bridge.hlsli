@@ -77,7 +77,7 @@ struct SplitBrdf {
 
 float CalcLuminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 float square(float v) { return v * v; }
-float Lambert(float3 normal, float3 lightIncident) { return max(0.0, -dot(normal, lightIncident)); }
+float Lambert(float3 normal, float3 lightIncident) { return max(0.0, -dot(normal, lightIncident)) / 3.14159265; }
 void ConstructONB(float3 normal, out float3 tangent, out float3 bitangent) {
   const float sign = normal.z >= 0.0 ? 1.0 : -1.0;
   const float a = -1.0 / (sign + normal.z);
@@ -715,7 +715,7 @@ RTXDI_DIReservoir PtCombineLocalAndSun(RTXDI_DIReservoir local, RAB_LightSample 
 // NEE at a path vertex: the game's ReGIR pool or uniform local lights, plus the sun.
 void PtSampleNee(RAB_Surface surface, inout RTXDI_RandomSamplerState rng, out float3 radiance_from_lights,
                  out RTXDI_SampledLightData sampled_light_data, out float nee_pdf, out float scatter_pdf,
-                 out RAB_LightSample light_sample) {
+                 out RAB_LightSample light_sample, bool sample_sun) {
   radiance_from_lights = 0.0;
   sampled_light_data = RTXDI_SampledLightData_CreateInvalidData();
   nee_pdf = 0.0;
@@ -798,8 +798,11 @@ void PtSampleNee(RAB_Surface surface, inout RTXDI_RandomSamplerState rng, out fl
   }
 
   RAB_LightSample sun_sample = RAB_EmptyLightSample();
-  const RTXDI_DIReservoir sun_reservoir = RTXDI_SampleInfiniteLights(rng, surface, g_restir.nee.numInfiniteLightSamples,
-                                                               g_restir.light_buffer.infiniteLightBufferRegion, sun_sample);
+  RTXDI_DIReservoir sun_reservoir = RTXDI_EmptyDIReservoir();
+  if (sample_sun) {
+    sun_reservoir = RTXDI_SampleInfiniteLights(rng, surface, g_restir.nee.numInfiniteLightSamples,
+                                               g_restir.light_buffer.infiniteLightBufferRegion, sun_sample);
+  }
   light_sample = RAB_EmptyLightSample();
   const RTXDI_DIReservoir reservoir =
       PtCombineLocalAndSun(local_reservoir, local_sample, sun_reservoir, sun_sample, rng, light_sample);
