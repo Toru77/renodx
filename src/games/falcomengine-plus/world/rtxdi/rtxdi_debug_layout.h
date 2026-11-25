@@ -11,13 +11,14 @@
 #define RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE 7u
 #define RTXDI_DEBUG_VIEW_CONSUMER_SELECTION 8u
 #define RTXDI_DEBUG_VIEW_SUN_VISIBILITY     9u
-// Unified PT views (A18): SHARC and Material are written by the initial pass, the others by final shading.
+// Unified PT views (A18): SHARC, Material and AO are written by the initial pass, the others by final shading.
 #define PT_DEBUG_VIEW_SHARC                 10u
 #define PT_DEBUG_VIEW_MATERIAL              11u
 #define PT_DEBUG_VIEW_RAW                   12u
 #define PT_DEBUG_VIEW_RESTIR                13u
 #define PT_DEBUG_VIEW_FINAL_DIFFUSE         14u
 #define PT_DEBUG_VIEW_FINAL_SPECULAR        15u
+#define PT_DEBUG_VIEW_AO                    16u
 
 // PT ReSTIR view channel (PtDebugChannel).
 #define PT_DEBUG_CHANNEL_UCW               0u
@@ -71,13 +72,14 @@ enum class RtxdiDebugView : uint32_t {
   PtRestir = PT_DEBUG_VIEW_RESTIR,
   PtFinalDiffuse = PT_DEBUG_VIEW_FINAL_DIFFUSE,
   PtFinalSpecular = PT_DEBUG_VIEW_FINAL_SPECULAR,
+  PtAo = PT_DEBUG_VIEW_AO,
 };
 
 inline constexpr const char* kRtxdiDebugViewNames[] = {
     "Off", "Local status", "Receiver class", "Selected light/type", "Raw diffuse", "Filtered diffuse",
     "Distance validity", "Distance magnitude", "Consumer selection", "Sun visibility", "PT SHARC", "PT Material",
-    "PT Raw", "PT ReSTIR", "PT Final Diffuse", "PT Final Specular"};
-static_assert(sizeof(kRtxdiDebugViewNames) / sizeof(kRtxdiDebugViewNames[0]) == PT_DEBUG_VIEW_FINAL_SPECULAR + 1u);
+    "PT Raw", "PT ReSTIR", "PT Final Diffuse", "PT Final Specular", "PT AO"};
+static_assert(sizeof(kRtxdiDebugViewNames) / sizeof(kRtxdiDebugViewNames[0]) == PT_DEBUG_VIEW_AO + 1u);
 
 inline constexpr const char* kPtDebugChannelNames[] = {"UCW", "M", "Age", "Path length", "Rc length",
                                                        "Initial vs reused"};

@@ -140,6 +140,7 @@ ShaderInjectData shader_injection = {
     .vbgi_multibounce_saturation = 1.f,
     .vbgi_multibounce_max_clamp = 0.f,
     .pt_char_cast_shadow = 0.4f,
+    .pt_ao_strength = 1.f,
     .vbgi_max_clamp = 0.f,
     .vbgi_reduce_ao = 0.f,
     .vbgi_reduce_ao_strength = 1.f,
@@ -11465,7 +11466,7 @@ static void PrepareRtxdiSceneInline(reshade::api::command_list* cmd_list) {
                                 && dd->mb_rtv4_frame == dd->frame_index;
       const uint32_t requested_debug_view = static_cast<uint32_t>(
           std::clamp(std::isfinite(di::g_debug_view) ? di::g_debug_view : 0.f, 0.f,
-                     static_cast<float>(PT_DEBUG_VIEW_FINAL_SPECULAR)));
+                     static_cast<float>(PT_DEBUG_VIEW_AO)));
       const uint32_t effective_debug_view = ResolveRtxdiDebugEffectiveView(
           requested_debug_view, falcom_world::bvh::g_bvh_debug.mode.load(std::memory_order_relaxed) != 0);
       input_views = {.depth = dd->captured_depth_srv, .normal = dd->captured_mrt_normal_srv, .color = (dd->captured_color_live.load() && dd->captured_color_frame == dd->frame_index && view(0u).handle == dd->captured_color_srv.handle ? dd->captured_color_srv : reshade::api::resource_view{}), .mrt1 = view(falcom_world::game_lights::kLightingMrt1Register), .mrt2 = view(falcom_world::game_lights::kLightingMrt2Register), .motion = motion_ready ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{}, .lights = view(falcom_world::game_lights::kLightingLightsRegister), .tiles = view(falcom_world::game_lights::kLightingLightIndicesRegister), .deferred = view(falcom_world::game_lights::kLightingDeferredRegister), .scene_tracker = &dd->rtxdi_scene_range, .capture_frame = dd->frame_index, .frame = frame, .width = input_width, .height = input_height, .lights_register = falcom_world::game_lights::kLightingLightsRegister, .tiles_register = falcom_world::game_lights::kLightingLightIndicesRegister, .deferred_register = falcom_world::game_lights::kLightingDeferredRegister, .effective_debug_view = effective_debug_view, .effective_settings = falcom_world::rtxdi::CaptureEffectiveRtxdiSettings(), .scene_slot = result.slot, .scene_fence = result.fence_b, .local = (request_mask & 1u) != 0u};
@@ -11572,6 +11573,7 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
   shader_injection.pt_sun_fill = di::FiniteClamped(pt::g_pt_sun_fill, 1.f, 0.f, 2.f);
   shader_injection.pt_char_fill = di::FiniteClamped(pt::g_pt_char_fill, 1.f, 0.f, 2.f);
   shader_injection.pt_char_cast_shadow = di::FiniteClamped(pt::g_pt_char_cast_shadow, 0.4f, 0.f, 1.f);
+  shader_injection.pt_ao_strength = di::FiniteClamped(pt::g_pt_ao_strength, 1.f, 0.f, 1.f);
   shader_injection.pt_sun_specular = di::FiniteClamped(pt::g_pt_sun_specular, 1.f, 0.f, 2.f);
   shader_injection.pt_refl_override = PtReflectionOverride() ? 1.f : 0.f;
   g_pt_reflection_view = {};
@@ -11605,7 +11607,7 @@ static void RunPtInline(reshade::api::command_list* cmd_list, DeviceData* dd) {
                      && di_snapshot.transfer_slot == input.transfer_slot;
   const uint32_t requested_debug_view = static_cast<uint32_t>(
       std::clamp(std::isfinite(di::g_debug_view) ? di::g_debug_view : 0.f, 0.f,
-                 static_cast<float>(PT_DEBUG_VIEW_FINAL_SPECULAR)));
+                 static_cast<float>(PT_DEBUG_VIEW_AO)));
   const bool pt_bvh_debug_active = falcom_world::bvh::g_bvh_debug.mode.load(std::memory_order_relaxed) != 0;
   const uint32_t pt_debug_view = ResolveRtxdiDebugEffectiveView(requested_debug_view, pt_bvh_debug_active);
   const uint32_t pt_sun_detail_view =

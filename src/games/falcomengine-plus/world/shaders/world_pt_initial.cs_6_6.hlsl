@@ -11,7 +11,8 @@
 #if !defined(PT_WATER_SURFACE)
 // Initial-pass PT debug views own u14-u16 and write every pixel while active, so they never show stale data (A18.2).
 void PtWriteInitialDebug(uint2 pixel, float4 value, uint status, uint4 word) {
-  if (g_restir.debug_view != PT_DEBUG_VIEW_SHARC && g_restir.debug_view != PT_DEBUG_VIEW_MATERIAL) return;
+  if (g_restir.debug_view != PT_DEBUG_VIEW_SHARC && g_restir.debug_view != PT_DEBUG_VIEW_MATERIAL
+      && g_restir.debug_view != PT_DEBUG_VIEW_AO) return;
   g_pt_debug_value[pixel] = value;
   g_pt_debug_status[pixel] = status;
   g_pt_sun_detail[pixel] = word;
@@ -68,6 +69,26 @@ void main(uint3 id : SV_DispatchThreadID) {
   // keeps status 0 (SHARC) or 3 (Material): no hit / sky. Value and word are zeroed by RAB_EmptyPathTracerUserData.
   ud.debug_status = g_restir.debug_view == PT_DEBUG_VIEW_MATERIAL ? 3u : 0u;
 #endif
+#if !defined(PT_WATER_SURFACE)
+  float ao = 1.0;
+  if (g_restir.ao_rays > 0u) {
+    RTXDI_RandomSamplerState ao_rng = RTXDI_InitRandomSampler(id.xy, g_frame, 27u);
+    const WorldCameraView ao_view = {true, 1.0, 0u, 0u};
+    WorldTraceCounters ao_counters;
+    uint unoccluded = 0u;
+    for (uint ray = 0u; ray < g_restir.ao_rays; ++ray) {
+      const float2 u = float2(RTXDI_GetNextRandom(ao_rng), RTXDI_GetNextRandom(ao_rng));
+      float pdf;
+      const float3 dir = TangentToWorld(surface, SampleCosHemisphere(u, pdf));
+      g_rt12_dynamic_mask = g_dynamic_on != 0u ? RT12_MASK_DYNAMIC : 0u;
+      const WorldTraceHit hit = TraceWorldRayDxr(surface.worldPos + surface.geoNormal * 1e-3, dir, 1e-3,
+                                                 g_restir.ao_radius, true, ao_view, ao_counters);
+      if (hit.prim == 0xFFFFFFFFu) ++unoccluded;
+    }
+    ao = float(unoccluded) / float(g_restir.ao_rays);
+  }
+  if (g_restir.debug_view == PT_DEBUG_VIEW_AO) PtWriteInitialDebug(id.xy, float4(ao.xxx, 1.0), 0u, 0u);
+#endif
   const RTXDI_PathTracerRandomContext rc = RTXDI_InitializePathTracerRandomContext(
       id.xy, g_frame, RTXDI_PT_GENERATE_INITIAL_SAMPLES_RANDOM_SEED, RTXDI_PT_GENERATE_INITIAL_SAMPLES_REPLAY_RANDOM_SEED);
   RTXDI_PTInitialSamplingRuntimeParameters isr = RTXDI_EmptyPTInitialSamplingRuntimeParameters();
@@ -83,7 +104,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                            g_restir.restir.bufferIndices.initialPathTracerPreservedBufferIndex);
   }
 #if !defined(PT_WATER_SURFACE)
-  g_pt_initial_color[id.xy] = float4(ud.color_sum / float(g_restir.restir.initialSampling.numInitialSamples), 1.0);
+  g_pt_initial_color[id.xy] = float4(ud.color_sum / float(g_restir.restir.initialSampling.numInitialSamples), ao);
   // Initial-pass PT debug views own u14-u16; world_pt_final leaves them untouched for these views (A18).
   if (g_restir.debug_view == PT_DEBUG_VIEW_MATERIAL) {
     // A21 PT Material channels, written as display colours with status 0: Source, Albedo and Roughness of the first
@@ -114,7 +135,7 @@ void main(uint3 id : SV_DispatchThreadID) {
       color = float3(0.5, 0.5, 0.5);
     }
     PtWriteInitialDebug(id.xy, float4(color, 1.0), 0u, word);
-  } else {
+  } else if (g_restir.debug_view != PT_DEBUG_VIEW_AO) {
     PtWriteInitialDebug(id.xy, ud.debug_value, ud.debug_status, ud.debug_word);
   }
 #endif

@@ -64,7 +64,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (any(id.xy >= g_size)) return;
 #if !defined(PT_WATER_SURFACE)
   if (g_sparse_enabled != 0u && g_sparse_levels < 256u && !PtSparseSelected(id.xy)) {
-    g_pt_diffuse[id.xy] = float4(0, 0, 0, 1);
+    g_pt_diffuse[id.xy] = float4(0, 0, 0, 2.0);
     const bool character = (RAB_GetGBufferSurface(id.xy, false).flags & 2u) != 0u;
     g_pt_specular[id.xy] = (g_refl_flags & 32u) != 0u && g_refl_enabled != 0u && !character
         ? float4(0, 0, 0, 1e-3) : float4(0, 0, 0, 0);
@@ -78,7 +78,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 #if defined(PT_WATER_SURFACE)
     g_pt_specular[id.xy] = float4(0, 0, 0, 0);
 #else
-    g_pt_diffuse[id.xy] = 0;
+    g_pt_diffuse[id.xy] = float4(0, 0, 0, 2.0);
     g_pt_specular[id.xy] = float4(0, 0, 0, 0);
     g_pt_sun_visibility[id.xy] = float4(1.0, 1.0, 1.0, -1.0);  // unknown: keep the game's CSM result
     PtWriteFinalDebug(id.xy, 0.0, 0u, 0u);
@@ -313,7 +313,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (!character) diffuse += lamp_toon * game_lamp;
   const float sparse_scale = (g_refl_flags & 32u) != 0u && g_sparse_enabled != 0u && g_sparse_levels < 256u
       ? 256.0 / float(g_sparse_levels) : 1.0;
-  g_pt_diffuse[id.xy] = float4(PtInvalidPixelGuard(diffuse * sparse_scale), 1.0);
+  g_pt_diffuse[id.xy] = float4(PtInvalidPixelGuard(diffuse * sparse_scale), 1.0 + g_pt_initial_color[id.xy].a);
   if (RTXDI_IsValidPTReservoir(reservoir) && g_sharc_enabled != 0u && reservoir.rcVertexLength == reservoir.pathLength
       && !isinf(reservoir.radiance.x)) PtCount(26u);
   if (character) {

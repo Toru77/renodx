@@ -133,7 +133,7 @@ struct ShaderInjectData {
   float vbgi_multibounce_saturation;// RETIRED: no setting drives it (was SSGIMultiBounceSaturation), kept for the layout
   float vbgi_multibounce_max_clamp; // RETIRED: no setting drives it (was SSGIMultiBounceMaxClamp), kept for the layout
   float pt_char_cast_shadow;  // Character Cast Shadow Strength [0..1]: darkens full-tint character parts in cast shadow; was reserved_slot_28
-  float reserved_slot_29;  // RETIRED: no remaining consumer; kept for the layout.
+  float pt_ao_strength;  // In-PT AO strength [0..1] applied through the game's own AO slot; was reserved_slot_29.
   float reserved_slot_30;  // RETIRED: no remaining consumer; kept for the layout.
   float reserved_slot_31;  // RETIRED: no remaining consumer; kept for the layout.
   float vbgi_adaptive_luma_strength;  // RETIRED: no setting drives it, kept for the layout

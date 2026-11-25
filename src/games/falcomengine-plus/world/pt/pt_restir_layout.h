@@ -58,6 +58,8 @@ struct PtRestirConstants {
   uint32_t lamp_material_scale, lamp_bands;
   float sun_toon, char_sun_toon, char_lamp_toon, sun_intensity;
   float char_terminator_fade, terminator_padding0, terminator_padding1, terminator_padding2;
+  uint32_t ao_rays;
+  float ao_radius, ao_strength, ao_padding;
 };
 
 #ifdef __cplusplus

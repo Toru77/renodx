@@ -720,7 +720,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .tooltip = "Session only. Observes current RTXDI signals; unavailable sources use a checker. It does not enable sampling or change lighting settings.",
       .labels = {std::begin(kRtxdiDebugViewNames), std::end(kRtxdiDebugViewNames)},
       .min = static_cast<float>(RTXDI_DEBUG_VIEW_OFF),
-      .max = static_cast<float>(PT_DEBUG_VIEW_FINAL_SPECULAR),
+      .max = static_cast<float>(PT_DEBUG_VIEW_AO),
       .is_visible = visible,
   });
   settings->push_back(new Setting{
@@ -751,7 +751,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         return visible() && static_cast<uint32_t>(std::clamp(std::isfinite(rtxdi::g_debug_view)
                                                                  ? rtxdi::g_debug_view
                                                                  : 0.f,
-                                                             0.f, static_cast<float>(PT_DEBUG_VIEW_FINAL_SPECULAR)))
+                                                             0.f, static_cast<float>(PT_DEBUG_VIEW_AO)))
                == RTXDI_DEBUG_VIEW_SUN_VISIBILITY;
       },
   });
@@ -770,7 +770,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         return visible() && static_cast<uint32_t>(std::clamp(std::isfinite(rtxdi::g_debug_view)
                                                                  ? rtxdi::g_debug_view
                                                                  : 0.f,
-                                                             0.f, static_cast<float>(PT_DEBUG_VIEW_FINAL_SPECULAR)))
+                                                             0.f, static_cast<float>(PT_DEBUG_VIEW_AO)))
                == PT_DEBUG_VIEW_RESTIR;
       },
   });
@@ -789,7 +789,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         return visible() && static_cast<uint32_t>(std::clamp(std::isfinite(rtxdi::g_debug_view)
                                                                  ? rtxdi::g_debug_view
                                                                  : 0.f,
-                                                             0.f, static_cast<float>(PT_DEBUG_VIEW_FINAL_SPECULAR)))
+                                                             0.f, static_cast<float>(PT_DEBUG_VIEW_AO)))
                == PT_DEBUG_VIEW_MATERIAL;
       },
   });
@@ -952,7 +952,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         if (logging) {
           const uint32_t live_requested_view = static_cast<uint32_t>(
               std::clamp(std::isfinite(rtxdi::g_debug_view) ? rtxdi::g_debug_view : 0.f, 0.f,
-                         static_cast<float>(PT_DEBUG_VIEW_FINAL_SPECULAR)));
+                         static_cast<float>(PT_DEBUG_VIEW_AO)));
           const uint64_t live_world_frame = falcom_world::g_state.frame.load();
           const bool live_bvh_active = bvh::g_bvh_debug.mode.load(std::memory_order_relaxed) != 0;
           const uint32_t live_effective_view = ResolveRtxdiDebugEffectiveView(live_requested_view, live_bvh_active);
@@ -1886,6 +1886,45 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 1.f,
       .label = "Character GI Intensity",
       .section = "Path Tracing",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtAoRays",
+      .binding = &pt::g_pt_ao_rays,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 4.f,
+      .label = "PT AO Rays",
+      .section = "Path Tracing",
+      .tooltip = "Short cosine-hemisphere traces per pixel inside the initial PT pass (0 = off, current behaviour).",
+      .min = 0.f,
+      .max = 8.f,
+      .format = "%.0f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtAoRadius",
+      .binding = &pt::g_pt_ao_radius,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.5f,
+      .label = "PT AO Radius (m)",
+      .section = "Path Tracing",
+      .tooltip = "How far an AO ray travels before counting it as open.",
+      .min = 0.05f,
+      .max = 2.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtAoStrength",
+      .binding = &pt::g_pt_ao_strength,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "PT AO Strength",
+      .section = "Path Tracing",
+      .tooltip = "Blends the in-PT AO into the game's own AO slot (1 = the game's own AO intensity, 0 = off).",
       .min = 0.f,
       .max = 1.f,
       .format = "%.2f",

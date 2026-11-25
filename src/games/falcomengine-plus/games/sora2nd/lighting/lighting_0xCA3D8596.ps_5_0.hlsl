@@ -223,7 +223,7 @@ float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
   const uint view = (uint)shader_injection_data.rtxdi_debug_view;
   if (view == RTXDI_DEBUG_VIEW_OFF) return 0.0;
 
-  const bool pt_view = view >= PT_DEBUG_VIEW_SHARC && view <= PT_DEBUG_VIEW_FINAL_SPECULAR;
+  const bool pt_view = view >= PT_DEBUG_VIEW_SHARC && view <= PT_DEBUG_VIEW_AO;
   uint status_width, status_height;
   uint status_word = RTXDI_N1_STATUS_INVALID;
   bool status_bound = false;
@@ -257,6 +257,10 @@ float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
       // A21: world_pt_initial writes display colours with status 0, or status 4 where the pixel has no surface.
       if (status_word == 4u) return PtDebugStatusColor(view, status_word);
       return value.rgb * RtxdiDebugScale();
+    }
+    if (view == PT_DEBUG_VIEW_AO) {
+      if (status_word == 4u) return float3(0.08, 0.08, 0.08);
+      return saturate(value.r).xxx * RtxdiDebugScale();
     }
     if (view == PT_DEBUG_VIEW_RESTIR) {
       if (!isfinite(value.r) || value.r < 0.0) return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
@@ -412,7 +416,7 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
     ptGiValid = true;
     ptGiIrradiance = ptSample.rgb * shader_injection_data.pt_intensity;
     cachedPtGi = ptGiIrradiance * r0.xyz;
-    r5.x = 1.0;
+    r5.x = lerp(1.0, saturate(ptSample.a - 1.0), saturate(shader_injection_data.pt_ao_strength));
     cachedVBGI = float3(0, 0, 0);
     cachedVBGILuma = 0;
   }
