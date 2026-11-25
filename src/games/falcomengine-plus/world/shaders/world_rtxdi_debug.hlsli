@@ -85,7 +85,7 @@ float3 RtxdiDebugSunReasonColor(uint status, uint reason)
 {
   if (reason == RTXDI_SUN_REASON_NONE) {
     if (status == RTXDI_SUN_STATUS_VISIBLE) return float3(1.0, 1.0, 1.0) * RtxdiDebugScale();
-    if (status == RTXDI_SUN_STATUS_BLOCKED) return 0.0;
+    if (status == RTXDI_SUN_STATUS_BLOCKED) return float3(0.05, 0.1, 0.5) * RtxdiDebugScale();
     return float3(1.0, 0.8, 0.0) * RtxdiDebugScale();
   }
   if (reason == RTXDI_SUN_REASON_INVALID_SURFACE) return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();

@@ -45,9 +45,9 @@ bool Rt12ShadowCoverageEnd(
 
 // Core sun ray: blocker classification, foliage/wind transmission, the wind second ray and the tint.
 Rt12ShadowResult Rt12TraceSunShadow(
-    float3 origin, float3 direction, float coverage_end, bool complete_segment, bool character, uint require_flags,
-    float max_distance, float foliage_transmission, float wind_transmission, float wind_softening, float3 tint,
-    float2 wind_u, float3 tangent, float3 bitangent, out float transmittance, out float3 transmitted_tint) {
+    float3 origin, float3 direction, float coverage_end, bool complete_segment, bool character, bool include_dynamic,
+    uint require_flags, float max_distance, float foliage_transmission, float wind_transmission, float wind_softening,
+    float3 tint, float2 wind_u, float3 tangent, float3 bitangent, out float transmittance, out float3 transmitted_tint) {
   Rt12ShadowResult result = (Rt12ShadowResult)0;
   result.status = RTXDI_SUN_STATUS_UNKNOWN;
   result.reason = RTXDI_SUN_REASON_NONE;
@@ -59,7 +59,7 @@ Rt12ShadowResult Rt12TraceSunShadow(
   view.floor_value = 0.0;
   view.skip_flags = 0u;
   view.require_flags = require_flags;
-  g_rt12_dynamic_mask = RT12_MASK_DYNAMIC;
+  g_rt12_dynamic_mask = include_dynamic ? RT12_MASK_DYNAMIC : 0u;
   g_rt12_foliage_transmission = foliage_transmission;
   g_rt12_foliage_layers = 0u;
   g_rt12_wind_transmission = wind_transmission;
