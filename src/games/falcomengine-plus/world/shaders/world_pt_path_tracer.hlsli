@@ -46,6 +46,9 @@ RAB_RayPayload PtTraceNextBounce(RayDesc ray) {
   const WorldTraceHit hit = TraceWorldRayDxr(ray.Origin, ray.Direction, 1e-3, g_ray_max, false, bounce_view, counters);
   if (hit.prim != 0xFFFFFFFFu) {
     payload.prim = hit.prim;
+    payload.instance = hit.instance;
+    payload.mesh = hit.mesh;
+    payload.bary = hit.bary;
     payload.position = hit.position;
     payload.normal = hit.normal;
     payload.t = hit.t;
@@ -150,11 +153,11 @@ void HandleHit(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_Pat
     }
   }
   if (ctx.GetBounceDepth() == 2u && g_restir.debug_view == PT_DEBUG_VIEW_MATERIAL && ud.debug_status == 3u) {
-    // PT Material view (A18.2): 0 exact G-buffer, 1 world cache, 2 grey miss, 3 sky; word.y holds reflective/character bits.
+    // PT Material view (A18.2): 0 exact G-buffer, 1 world cache, 2 grey miss, 3 sky, 4 no surface, 5 atlas; word.y holds reflective/character bits.
     const RAB_Surface hit = ctx.GetIntersectionSurface();
-    ud.debug_status = hit.material_source & 3u;
+    ud.debug_status = hit.material_source & 7u;
     ud.debug_value = float4(hit.material.diffuseAlbedo, hit.material.roughness);
-    ud.debug_word = uint4(hit.material_index, hit.material_source >> 2, 0u, 0u);
+    ud.debug_word = uint4(hit.material_index, hit.material_source >> 3, 0u, 0u);
   }
 #endif
   if (terminal) {

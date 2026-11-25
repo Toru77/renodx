@@ -395,6 +395,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
           pt::g_pt_panel.gpu_energy_len6plus = values[38];
           pt::g_pt_panel.gpu_sharc_first_hit_cached_lum = values[39];
           pt::g_pt_panel.gpu_first_hit_traced_lum = values[40];
+          pt::g_pt_panel.gpu_atlas_hits = values[41];
           pt::g_pt_panel.sparse_sample_active = r.counter_sparse[i];
           pt::g_pt_panel.sparse_selected = values[7];
           pt::g_pt_panel.sparse_valid = values[8];

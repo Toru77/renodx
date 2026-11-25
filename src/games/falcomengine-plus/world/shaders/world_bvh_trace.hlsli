@@ -69,6 +69,7 @@ struct WorldTraceHit
     uint instance;
     uint mesh;
     uint prim;
+    float2 bary;           // triangle barycentrics of the winning triangle (albedo atlas read)
     float3 position;
     float3 normal;
     uint hidden;           // 1: the game camera does not show the hit surface (only when view.hide is off)
@@ -203,6 +204,28 @@ bool IntersectTriangle(
     return true;
 }
 
+// Interpolates a mesh's UVs at a triangle hit, shared by the alpha cutout and the albedo atlas read.
+// Returns NaN when the UV slot, indices or barycentrics cannot be read.
+float2 MeshHitUv(float uv_slot, uint i0, uint i1, uint i2, float2 bary)
+{
+    const float2 unreadable = float2(asfloat(0x7FC00000u), asfloat(0x7FC00000u));
+    if (!isfinite(uv_slot) || uv_slot < 1.0 || uv_slot != floor(uv_slot) || uv_slot >= 4294967296.0)
+        return unreadable;
+    const uint uv_base = (uint)uv_slot - 1u;
+    const uint max_index = max(i0, max(i1, i2));
+    uint uv_count;
+    uint uv_stride;
+    g_trace_uvs.GetDimensions(uv_count, uv_stride);
+    if (uv_base >= uv_count || max_index >= uv_count - uv_base)
+        return unreadable;
+    const float2 uv0 = g_trace_uvs[uv_base + i0];
+    const float2 uv1 = g_trace_uvs[uv_base + i1];
+    const float2 uv2 = g_trace_uvs[uv_base + i2];
+    if (!all(isfinite(bary)) || !all(isfinite(uv0)) || !all(isfinite(uv1)) || !all(isfinite(uv2)))
+        return unreadable;
+    return (1.0 - bary.x - bary.y) * uv0 + bary.x * uv1 + bary.y * uv2;
+}
+
 // Alpha cutout of a triangle hit (alpha-tested foliage): true when the material's alpha at the hit's UV is
 // below its threshold. The UV is interpolated from the mesh's UVs (uv_slot = bbox_min.w, uv_offset + 1) and
 // transformed as the game's pixel shader does: (u + scroll.x, 1 - (v + scroll.y)), wrapped. The atlas is point
@@ -220,21 +243,6 @@ bool AlphaCutHit(uint material, float uv_slot, uint i0, uint i1, uint i2, float2
     }
     const AlphaMaterialGPU entry = g_alpha_materials[material - 1u];
     if ((entry.swizzle & 1u) != 0u) return false;  // alpha forced to 1: no UV or atlas lookup
-    if (!isfinite(uv_slot) || uv_slot < 1.0 || uv_slot != floor(uv_slot) || uv_slot >= 4294967296.0)
-    {
-        counters.invalid_refs++;
-        return false;
-    }
-    const uint uv_base = (uint)uv_slot - 1u;
-    const uint max_index = max(i0, max(i1, i2));
-    uint uv_count;
-    uint uv_stride;
-    g_trace_uvs.GetDimensions(uv_count, uv_stride);
-    if (uv_base >= uv_count || max_index >= uv_count - uv_base)
-    {
-        counters.invalid_refs++;
-        return false;
-    }
     uint atlas_width;
     uint atlas_height;
     uint atlas_slices;
@@ -246,15 +254,12 @@ bool AlphaCutHit(uint material, float uv_slot, uint i0, uint i1, uint i2, float2
         return false;
     }
     counters.alpha_tests++;
-    const float2 uv0 = g_trace_uvs[uv_base + i0];
-    const float2 uv1 = g_trace_uvs[uv_base + i1];
-    const float2 uv2 = g_trace_uvs[uv_base + i2];
-    if (!all(isfinite(bary)) || !all(isfinite(uv0)) || !all(isfinite(uv1)) || !all(isfinite(uv2)))
+    const float2 uv = MeshHitUv(uv_slot, i0, i1, i2, bary);
+    if (!all(isfinite(uv)))
     {
         counters.invalid_refs++;
         return false;
     }
-    const float2 uv = (1.0 - bary.x - bary.y) * uv0 + bary.x * uv1 + bary.y * uv2;
     const uint x = min((uint)floor(frac(uv.x + entry.scroll.x) * 1024.0), 1023u);
     const uint y = min((uint)floor(frac(1.0 - (uv.y + entry.scroll.y)) * 256.0), 255u);
     const uint word = g_alpha_atlas.Load(int4(x >> 2u, y, entry.slice, 0));
@@ -574,6 +579,7 @@ WorldTraceHit TraceWorldRay(
     hit.instance = 0xFFFFFFFFu;
     hit.mesh = 0xFFFFFFFFu;
     hit.prim = 0xFFFFFFFFu;
+    hit.bary = float2(0.0, 0.0);
     hit.position = float3(0.0, 0.0, 0.0);
     hit.normal = float3(0.0, 0.0, 0.0);
     hit.hidden = 0u;
@@ -743,6 +749,7 @@ WorldTraceHit TraceWorldRay(
             best.instance = DYNAMIC_INSTANCE_FLAG | object_index;
             best.mesh = DYNAMIC_MESH_MARKER;
             best.prim = object_prim;
+            best.bary = float2(0.0, 0.0);
             best.normal = object_normal;
             best.hidden = 0u;
             best.facing = 0.0;

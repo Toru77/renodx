@@ -32,7 +32,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     const WorldTraceHit hit = TraceWorldRayDxr(p + n * bias, dir, 1e-3, g_ray_max, false, bounce_view, pt_counters);
     if (hit.prim == 0xFFFFFFFFu) { SharcUpdateMiss(sharc, state, PtSky(dir)); break; }
     const float3 nh = dot(hit.normal, dir) > 0.0 ? -hit.normal : hit.normal;
-    const float3 albedo = PtHitMaterial(hit.position, nh).albedo;
+    const float3 albedo = PtHitMaterial(hit.position, nh, hit.instance, hit.mesh, hit.prim, hit.bary).albedo;
     const RAB_Surface hit_surface = PtHitSurface(hit, dir);
     RTXDI_RandomSamplerState nee_rng;
     nee_rng.seed = rng;

@@ -79,6 +79,7 @@ inline std::string SerializePtReport() {
   out << "gpu_exact: " << p.gpu_exact << "\n";
   out << "gpu_hits: " << p.gpu_hits << "\n";
   out << "gpu_misses: " << p.gpu_misses << "\n";
+  out << "gpu_atlas_hits: " << p.gpu_atlas_hits << "\n";
   out << "gpu_lock_drops: " << p.gpu_lock_drops << "\n";
   out << "gpu_writes: " << p.gpu_writes << "\n";
   out << "gpu_frame: " << p.gpu_frame << "\n";

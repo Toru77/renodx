@@ -126,6 +126,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     const uint channel = g_restir.debug_channel;
     float3 color;
     uint4 word = ud.debug_word;
+    const uint source = ud.debug_status & 7u;
     if (channel >= 3u) {
       PtMaterial cached;
       const bool cache_hit = PtCacheMaterial(surface.worldPos, surface.normal, cached);
@@ -134,16 +135,18 @@ void main(uint3 id : SV_DispatchThreadID) {
       else if (channel == 3u) color = cached.albedo;
       else color = float3(h & 255u, (h >> 8) & 255u, (h >> 16) & 255u) / 255.0;
       word = uint4(cached.debug_index, cache_hit ? 1u : 0u, 0u, 0u);
-    } else if (ud.debug_status == 3u) {
+    } else if (source == 3u) {
       color = float3(0.1, 0.25, 1.0);
     } else if (channel == 1u) {
       color = ud.debug_value.rgb;
     } else if (channel == 2u) {
       color = saturate(ud.debug_value.w).xxx;
-    } else if (ud.debug_status == 0u) {
+    } else if (source == 0u) {
       color = float3(0.1, 1.0, 0.1);
-    } else if (ud.debug_status == 1u) {
+    } else if (source == 1u) {
       color = float3(0.0, 0.8, 1.0);
+    } else if (source == 5u) {
+      color = float3(1.0, 0.5, 0.0);
     } else {
       color = float3(0.5, 0.5, 0.5);
     }

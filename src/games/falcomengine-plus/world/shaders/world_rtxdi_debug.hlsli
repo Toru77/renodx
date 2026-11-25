@@ -51,6 +51,7 @@ float3 PtDebugStatusColor(uint view, uint status)
     if (status == 2u) return float3(0.5, 0.5, 0.5) * RtxdiDebugScale();   // miss (grey)
     if (status == 3u) return float3(0.1, 0.25, 1.0) * RtxdiDebugScale();  // no hit / sky
     if (status == 4u) return float3(0.08, 0.08, 0.08);                    // no surface or sparse-skipped, flat (A21)
+    if (status == 5u) return float3(1.0, 0.5, 0.0) * RtxdiDebugScale();   // albedo atlas
   }
   return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
 }

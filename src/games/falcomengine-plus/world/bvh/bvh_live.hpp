@@ -706,6 +706,7 @@ inline WorldInstanceGPU MakeLiveInstanceGPU(const LiveTlasInstance& instance, ui
   descriptor.header[0] = static_cast<float>(slot);
   descriptor.header[1] = static_cast<float>(instance.source);
   descriptor.header[2] = static_cast<float>(instance.material);
+  descriptor.header[3] = static_cast<float>(instance.albedo);
   const uint32_t floats = instance.matrix_floats == 0u ? 12u : (std::min)(instance.matrix_floats, 16u);
   float matrix[16] = {};
   std::memcpy(matrix, instance.matrix, sizeof(float) * floats);
@@ -1130,6 +1131,12 @@ inline void RebuildLiveTlas(
       }
       instance.material = material_it->second + 1u;
       alpha_instances += 1u;
+    }
+    if (!instance.alpha && pt::g_pt_material_atlas > 0.5f) {
+      const auto albedo_it = data->albedo.slot_of_uid.find(instance.uid);
+      instance.albedo = albedo_it != data->albedo.slot_of_uid.end() ? albedo_it->second + 1u : 0u;
+    } else {
+      instance.albedo = 0u;
     }
     const WorldInstanceGPU descriptor = MakeLiveInstanceGPU(instance, slot_it->second);
     const uint32_t flags = InstanceVisibilityFlags(descriptor);

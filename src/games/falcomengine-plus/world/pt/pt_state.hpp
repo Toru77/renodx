@@ -151,7 +151,7 @@ struct PtPanel {
   bool water_on = false;
   uint32_t gpu_water_pixels = 0u, gpu_water_traces = 0u;
   const char* water_reason = "off";
-  uint32_t gpu_exact = 0u, gpu_hits = 0u, gpu_misses = 0u, gpu_lock_drops = 0u, gpu_writes = 0u;
+  uint32_t gpu_exact = 0u, gpu_hits = 0u, gpu_misses = 0u, gpu_atlas_hits = 0u, gpu_lock_drops = 0u, gpu_writes = 0u;
   uint32_t regir_eligible = 0u, regir_lookups = 0u, regir_matches = 0u, regir_misses = 0u;
   uint32_t regir_invalid_headers = 0u, regir_invalid_slots = 0u, regir_selections = 0u;
   uint32_t gpu_initial_valid = 0u, gpu_path_len2 = 0u, gpu_path_len3plus = 0u, gpu_nee_connected = 0u;
@@ -266,9 +266,9 @@ inline void DrawPtPanel() {
     const uint32_t age = now - gpu;
     ImGui::Text("Sparse counters (available, active %s), frame %llu (age %u): selected %u, valid %u",
                 p.sparse_sample_active ? "yes" : "no", static_cast<unsigned long long>(p.gpu_frame), age, p.sparse_selected, p.sparse_valid);
-    ImGui::Text("GPU material lookups, frame %llu (age %u): exact %u, hits %u, grey misses %u; writes %u, lock drops %u",
+    ImGui::Text("GPU material lookups, frame %llu (age %u): exact %u, hits %u, grey misses %u, atlas %u; writes %u, lock drops %u",
                 static_cast<unsigned long long>(p.gpu_frame), age,
-                p.gpu_exact, p.gpu_hits, p.gpu_misses, p.gpu_writes, p.gpu_lock_drops);
+                p.gpu_exact, p.gpu_hits, p.gpu_misses, p.gpu_atlas_hits, p.gpu_writes, p.gpu_lock_drops);
     ImGui::Text("PT samples: initial valid %u, path len 2 %u, len 3+ %u, NEE %u, SHARC terminal %u/%u, replay rejected %u",
                 p.gpu_initial_valid, p.gpu_path_len2, p.gpu_path_len3plus, p.gpu_nee_connected, p.gpu_sharc_terminated,
                 p.gpu_sharc_terminal_rc, p.gpu_sharc_replay_rejected);

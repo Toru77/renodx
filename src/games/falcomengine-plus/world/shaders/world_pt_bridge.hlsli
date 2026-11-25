@@ -56,6 +56,9 @@ struct RAB_LightSample {
 
 struct RAB_RayPayload {
   uint prim;
+  uint instance;
+  uint mesh;
+  float2 bary;
   float3 position;
   float3 normal;
   float t;
@@ -300,7 +303,8 @@ bool RAB_GetNeighborSelectionSurface(int2 pixel, out float3 worldNormal, out flo
 void RAB_LastBounceDenoiserCallback(float3 lightPos, RAB_Surface surface, inout RAB_PathTracerUserData ptud) {}
 void RAB_ReconnectionDenoiserCallback(RTXDI_PTReservoir reservoir, RAB_Surface surface, inout RAB_PathTracerUserData ptud) {}
 
-RAB_Surface PtHitSurface(float3 position, float3 normal, float distance, float3 dir) {
+RAB_Surface PtHitSurface(float3 position, float3 normal, float distance, float3 dir,
+                         uint instance, uint mesh, uint prim, float2 bary) {
   RAB_Surface s = (RAB_Surface)0;
   s.flags = 1u;
   s.worldPos = position;
@@ -308,7 +312,7 @@ RAB_Surface PtHitSurface(float3 position, float3 normal, float distance, float3 
   s.normal = dot(normal, dir) > 0.0 ? -normal : normal;
   s.geoNormal = s.normal;
   s.viewDir = -dir;
-  const PtMaterial m = PtHitMaterial(position, s.normal);
+  const PtMaterial m = PtHitMaterial(position, s.normal, instance, mesh, prim, bary);
   s.material.diffuseAlbedo = m.albedo;
   s.material.specularF0 = (m.character || m.reflective) ? m.f0 * m.spec_scale : 0.0;
   if (!m.character && !m.reflective) s.flags |= 32u;
@@ -321,10 +325,10 @@ RAB_Surface PtHitSurface(float3 position, float3 normal, float distance, float3 
   return s;
 }
 RAB_Surface PtHitSurface(WorldTraceHit hit, float3 dir) {
-  return PtHitSurface(hit.position, hit.normal, hit.t, dir);
+  return PtHitSurface(hit.position, hit.normal, hit.t, dir, hit.instance, hit.mesh, hit.prim, hit.bary);
 }
 RAB_Surface PtHitSurface(RAB_RayPayload payload, float3 dir) {
-  return PtHitSurface(payload.position, payload.normal, payload.t, dir);
+  return PtHitSurface(payload.position, payload.normal, payload.t, dir, payload.instance, payload.mesh, payload.prim, payload.bary);
 }
 
 float3 WorldToTangent(RAB_Surface s, float3 w) {

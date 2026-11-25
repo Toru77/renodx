@@ -242,6 +242,7 @@ struct LiveTlasInstance {
   uint64_t uid = 0u;       // WorldMesh::uid
   bool alpha = false;      // alpha-tested mesh (copied under g_pool.mutex); traced through its atlas slice
   uint32_t material = 0u;  // atlas slice + 1 at the TLAS build (descriptor header.z); 0 = not alpha-tested
+  uint32_t albedo = 0u;   // albedo atlas slice + 1 at the TLAS build (descriptor header.w); 0 = none
   uint64_t id = 0u;        // PoolState instance id (ascending in the pool)
   bool dynamic = false;    // moving instance: refitted, not rebuilt
   uint64_t mesh_key = 0u;  // draw key it was admitted through

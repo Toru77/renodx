@@ -39,6 +39,7 @@ WorldTraceHit TraceWorldClosestDxr(float3 origin, float3 direction, float t_min,
     hit.instance = 0xFFFFFFFFu;
     hit.mesh = 0xFFFFFFFFu;
     hit.prim = 0xFFFFFFFFu;
+    hit.bary = float2(0.0, 0.0);
     hit.position = float3(0.0, 0.0, 0.0);
     hit.normal = float3(0.0, 0.0, 0.0);
     hit.hidden = 0u;
@@ -97,6 +98,7 @@ WorldTraceHit TraceWorldClosestDxr(float3 origin, float3 direction, float t_min,
         const WorldInstanceGPU committed = g_trace_instances[hit.instance];
         hit.mesh = (uint)committed.header.x;
         hit.material = (uint)committed.header.z;
+        hit.bary = query.CommittedTriangleBarycentrics();
     }
     return hit;
 }
@@ -112,6 +114,7 @@ WorldTraceHit TraceWorldRayDxr(float3 origin, float3 direction, float t_min, flo
     hit.instance = 0xFFFFFFFFu;
     hit.mesh = 0xFFFFFFFFu;
     hit.prim = 0xFFFFFFFFu;
+    hit.bary = float2(0.0, 0.0);
     hit.position = float3(0.0, 0.0, 0.0);
     hit.normal = float3(0.0, 0.0, 0.0);
     hit.hidden = 0u;
@@ -212,6 +215,7 @@ WorldTraceHit TraceWorldRayDxr(float3 origin, float3 direction, float t_min, flo
     const uint mesh_id = (uint)committed.header.x;
     hit.mesh = mesh_id;
     hit.material = (uint)committed.header.z;
+    hit.bary = query.CommittedTriangleBarycentrics();
     hit.normal = float3(0.0, 1.0, 0.0);
     if (mesh_id >= mesh_count)
     {

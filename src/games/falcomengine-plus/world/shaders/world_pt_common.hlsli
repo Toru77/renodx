@@ -67,6 +67,17 @@ RWTexture2D<float4> g_pt_neighbor_selection_gbuffer : register(u12);
 RWByteAddressBuffer g_pt_neighbor_selection : register(u13);
 Texture2D<float> g_pt_prev_smoothed_duplication : register(t56);
 StructuredBuffer<LightIndexData> g_pt_tiles : register(t57);
+// Albedo atlas (bound at PT heap slots 55/56 by A35a): one RGBA8 slice per static mesh, with a 32-byte material entry.
+struct AlbedoMaterialGPU {
+    uint slice;
+    float2 scroll;
+    uint swizzle;
+    uint uv_slot;
+    uint pad[3];
+};
+static const uint kAlbedoSliceSize = 128u;
+Texture2DArray<float4> g_albedo_atlas : register(t58);
+StructuredBuffer<AlbedoMaterialGPU> g_albedo_materials : register(t59);
 RWTexture2D<float4> g_pt_debug_value : register(u14);
 RWTexture2D<uint> g_pt_debug_status : register(u15);
 RWTexture2D<uint4> g_pt_sun_detail : register(u16);
@@ -106,7 +117,7 @@ static float4x4 g_pt_inv_view_proj;
 struct PtMaterial {
   float3 albedo; float roughness; float3 f0; float spec_scale; bool character; bool reflective;
   float lamp_scale;   // game dynamicLightIntensity (DeferredParam byte 76); 1 for characters, cache entries and misses
-  uint debug_source;  // 0 exact G-buffer, 1 world cache hit, 2 miss (grey); bit 2 reflective, bit 3 character (debug views only)
+  uint debug_source;  // 0 exact G-buffer, 1 world cache hit, 2 miss (grey), 5 atlas; bit 3 reflective, bit 4 character (debug views only)
   uint debug_index;   // exact: pixel.x | pixel.y << 16; cache: hash-grid index; miss: 0
 };
 // Reconstructs one frame's primary surface without touching the current frame's SHARC/material globals.
@@ -244,14 +255,54 @@ bool PtCacheMaterial(float3 position, float3 nh, out PtMaterial m) {
   m.debug_source = 1u; m.debug_index = index;
   return true;
 }
-// The material at a bounce hit: the G-buffer when the hit is the visible surface on screen, else the cache, else grey 0.5.
-PtMaterial PtHitMaterial(float3 position, float3 nh) {
+// Albedo at a static mesh hit from the atlas: the instance descriptor's header.w carries slice + 1 (0 = no slice).
+bool PtAtlasAlbedo(uint instance, uint mesh, uint prim, float2 bary, out float3 albedo) {
+  albedo = 0.0;
+  if (instance == RT12_DYNAMIC_INSTANCE_ID || instance == 0xFFFFFFFFu || mesh == 0xFFFFFFFFu || prim == 0xFFFFFFFFu) return false;
+  uint instance_count;
+  uint instance_stride;
+  g_trace_instances.GetDimensions(instance_count, instance_stride);
+  if (instance >= instance_count) return false;
+  const float encoded_slice = g_trace_instances[instance].header.w;
+  if (!isfinite(encoded_slice)) return false;
+  const uint slice1 = (uint)encoded_slice;
+  if (slice1 == 0u) return false;
+  uint material_count;
+  uint material_stride;
+  g_albedo_materials.GetDimensions(material_count, material_stride);
+  if (slice1 > material_count) return false;
+  uint mesh_count;
+  uint mesh_stride;
+  g_trace_meshes.GetDimensions(mesh_count, mesh_stride);
+  if (mesh >= mesh_count) return false;
+  const WorldMeshGPU mesh_gpu = g_trace_meshes[mesh];
+  const uint index_offset = (uint)mesh_gpu.header.z;
+  const uint index_count = (uint)mesh_gpu.header.w;
+  if (prim * 3u + 2u >= index_count) return false;
+  const uint i0 = g_trace_indices[index_offset + prim * 3u + 0u];
+  const uint i1 = g_trace_indices[index_offset + prim * 3u + 1u];
+  const uint i2 = g_trace_indices[index_offset + prim * 3u + 2u];
+  const float2 uv = MeshHitUv(mesh_gpu.bbox_min.w, i0, i1, i2, bary);
+  if (!all(isfinite(uv))) return false;
+  const AlbedoMaterialGPU material = g_albedo_materials[slice1 - 1u];
+  uint atlas_width;
+  uint atlas_height;
+  uint atlas_slices;
+  g_albedo_atlas.GetDimensions(atlas_width, atlas_height, atlas_slices);
+  if (atlas_width != kAlbedoSliceSize || atlas_height != kAlbedoSliceSize || material.slice >= atlas_slices) return false;
+  const uint x = min((uint)floor(frac(uv.x + material.scroll.x) * kAlbedoSliceSize), kAlbedoSliceSize - 1u);
+  const uint y = min((uint)floor(frac(1.0 - (uv.y + material.scroll.y)) * kAlbedoSliceSize), kAlbedoSliceSize - 1u);
+  albedo = saturate(g_albedo_atlas.Load(int4(x, y, material.slice, 0)).rgb);
+  return true;
+}
+// The material at a bounce hit: the G-buffer at the visible surface, then the albedo atlas, then the cache, else grey 0.5.
+PtMaterial PtHitMaterial(float3 position, float3 nh, uint instance, uint mesh, uint prim, float2 bary) {
   PtMaterial m;
   m.albedo = float3(0.5, 0.5, 0.5); m.roughness = 1.0; m.f0 = float3(0.04, 0.04, 0.04); m.spec_scale = 1.0; m.character = false; m.reflective = false;
   m.lamp_scale = 1.0;
   m.debug_source = 2u; m.debug_index = 0u;
   if (g_mat_enabled == 0u) {
-    m.debug_source |= (m.reflective ? 4u : 0u) | (m.character ? 8u : 0u);
+    m.debug_source |= (m.reflective ? 8u : 0u) | (m.character ? 16u : 0u);
     return m;
   }
   const float4 clip = mul(g_pt_view_proj, float4(position, 1.0));
@@ -267,20 +318,30 @@ PtMaterial PtHitMaterial(float3 position, float3 nh) {
         PtCount(0u);
         m = PtGBufferMaterial(pixel);
         m.debug_source = 0u; m.debug_index = pixel.x | (pixel.y << 16);
-        m.debug_source |= (m.reflective ? 4u : 0u) | (m.character ? 8u : 0u);
+        m.debug_source |= (m.reflective ? 8u : 0u) | (m.character ? 16u : 0u);
         return m;
       }
     }
+  }
+  float3 atlas_albedo;
+  if (PtAtlasAlbedo(instance, mesh, prim, bary, atlas_albedo)) {
+    PtCount(41u);
+    PtMaterial cached;
+    if (PtCacheMaterial(position, nh, cached)) m = cached;  // roughness, F0 and flags stay from the cache when it has an entry
+    m.albedo = atlas_albedo;
+    m.debug_source = 5u;
+    m.debug_source |= (m.reflective ? 8u : 0u) | (m.character ? 16u : 0u);
+    return m;
   }
   PtMaterial cached;
   if (PtCacheMaterial(position, nh, cached)) {
     PtCount(1u);
     m = cached;
-    m.debug_source |= (m.reflective ? 4u : 0u) | (m.character ? 8u : 0u);
+    m.debug_source |= (m.reflective ? 8u : 0u) | (m.character ? 16u : 0u);
     return m;
   }
   PtCount(2u);
-  m.debug_source |= (m.reflective ? 4u : 0u) | (m.character ? 8u : 0u);
+  m.debug_source |= (m.reflective ? 8u : 0u) | (m.character ? 16u : 0u);
   return m;
 }
 // A bounce hit's cache data (OpenRemix pathtrace.comp:1097-1124): placed slightly above the surface, toward the ray.
