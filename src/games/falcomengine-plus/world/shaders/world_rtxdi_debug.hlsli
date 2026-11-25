@@ -27,6 +27,23 @@ float3 RtxdiDebugRadiance(float3 radiance)
   return radiance / (1.0 + radiance) * 0.05;
 }
 
+// A18 PT initial-pass view status colours (world_pt_path_tracer.hlsli first-hit facts).
+float3 PtDebugStatusColor(uint view, uint status)
+{
+  if (view == PT_DEBUG_VIEW_SHARC) {
+    if (status == 0u) return float3(0.1, 0.25, 1.0) * 0.05;  // no hit / sky
+    if (status == 1u) return float3(0.1, 1.0, 0.1) * 0.05;   // terminated by the cache
+    if (status == 2u) return float3(1.0, 0.8, 0.0) * 0.05;   // cached, rejected by the terminal rule
+    if (status == 3u) return float3(1.0, 0.1, 0.1) * 0.05;   // cache miss
+    if (status == 4u) return float3(0.6, 0.0, 1.0) * 0.05;   // SHARC off
+  } else if (view == PT_DEBUG_VIEW_MATERIAL) {
+    if (status == 0u) return float3(0.1, 1.0, 0.1) * 0.05;   // exact G-buffer
+    if (status == 1u) return float3(0.0, 0.8, 1.0) * 0.05;   // material cache hit
+    if (status == 2u) return float3(0.5, 0.5, 0.5) * 0.05;   // miss (grey)
+  }
+  return float3(1.0, 0.0, 1.0) * 0.05;
+}
+
 float3 RtxdiDebugLight(uint index, uint type)
 {
   if (type != RTXDI_DI_LIGHT_TYPE_POINT && type != RTXDI_DI_LIGHT_TYPE_SPOT) {

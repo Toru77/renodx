@@ -393,6 +393,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
           pt::g_pt_panel.gpu_energy_len3 = values[36];
           pt::g_pt_panel.gpu_energy_len4_5 = values[37];
           pt::g_pt_panel.gpu_energy_len6plus = values[38];
+          pt::g_pt_panel.gpu_sharc_first_hit_cached_lum = values[39];
+          pt::g_pt_panel.gpu_first_hit_traced_lum = values[40];
           pt::g_pt_panel.sparse_sample_active = r.counter_sparse[i];
           pt::g_pt_panel.sparse_selected = values[7];
           pt::g_pt_panel.sparse_valid = values[8];
@@ -1388,6 +1390,10 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.tile_count = lamps ? input.tile_count : 0u;
   restir_constants.debug_view = debug_view;
   restir_constants.sun_detail_view = sun_detail_view;
+  restir_constants.debug_channel = debug_view == PT_DEBUG_VIEW_RESTIR
+      ? static_cast<uint32_t>(di_clamped(pt::g_pt_debug_channel, 0.f, 0.f,
+                                         static_cast<float>(PT_DEBUG_CHANNEL_INITIAL_VS_REUSED)))
+      : PT_DEBUG_CHANNEL_UCW;
   restir_constants.coverage_min[0] = s.scene_coverage_min[0];
   restir_constants.coverage_min[1] = s.scene_coverage_min[1];
   restir_constants.coverage_min[2] = s.scene_coverage_min[2];
@@ -1792,6 +1798,8 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
     pt::g_pt_panel.resampling_mode = resampling_mode;
     pt::g_pt_panel.direct_enabled = restir_constants.direct_enabled != 0u;
     pt::g_pt_panel.light_table_status = light_table_status;
+    pt::g_pt_panel.debug_view = debug_view;
+    pt::g_pt_panel.debug_channel = restir_constants.debug_channel;
     pt::g_pt_panel.width = w;
     pt::g_pt_panel.height = h;
     pt::g_pt_panel.sparse_policy = sparse_policy;

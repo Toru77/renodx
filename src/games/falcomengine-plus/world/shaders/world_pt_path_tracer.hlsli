@@ -6,6 +6,7 @@
 #define FALCOM_WORLD_PT_PATH_TRACER_HLSLI
 
 #include "world_pt_bridge.hlsli"
+#include "../rtxdi/rtxdi_debug_layout.h"
 #include <Rtxdi/PT/PathTracerContext.hlsli>
 #include <Rtxdi/PT/PathTracerRandomContext.hlsli>
 
@@ -118,10 +119,49 @@ void HandleHit(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_Pat
                          sqrt(max(prevSurface.material.roughness, 0.0)), brs.properties.IsSpecular(),
                          surface.material.diffuseAlbedo, cached);
 #if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING)
+#if defined(PT_WATER_SURFACE)
+  const bool sharc_debug_hit = false;  // water never writes the PT debug views or their counters
+#else
+  const bool sharc_debug_hit = ctx.GetBounceDepth() == 2u && g_restir.debug_view == PT_DEBUG_VIEW_SHARC;
+  if (sharc_debug_hit) {
+    // PT SHARC view (A18): 1 terminated by the cache, 2 cached but rejected by the terminal rule, 3 miss, 4 SHARC off.
+    ud.debug_status = 4u;
+    if (g_sharc_enabled != 0u) {
+      const SharcParameters sharc = PtSharcParameters();
+      const SharcHitData data = PtSharcHit(surface.worldPos, surface.normal, -ray.Direction, surface.material.diffuseAlbedo);
+      HashGridKey key;
+      const uint cell = HashGridFindEntry(sharc.hashGridData, data.positionWorld, data.normalWorld,
+                                          sharc.hashGridParameters, key);
+      const float cell_samples = cell != HASH_GRID_INVALID_CACHE_INDEX
+          ? SharcGetVoxelData(sharc.resolvedBuffer, cell).accumulatedSampleNum : 0.0;
+      ud.debug_word = uint4(cell, HashGridGetLevel(data.positionWorld, sharc.hashGridParameters), uint(cell_samples), 0u);
+      float3 lookup = 0.0;
+      if (terminal) {
+        ud.debug_status = 1u;
+        ud.debug_value = float4(cached, 1.0);
+      } else if (SharcGetCachedRadiance(sharc, data, lookup, false) && all(isfinite(lookup))) {
+        ud.debug_status = 2u;
+        ud.debug_value = float4(max(lookup, 0.0), 1.0);
+      } else {
+        ud.debug_status = 3u;
+      }
+    }
+  }
+  if (ctx.GetBounceDepth() == 2u && g_restir.debug_view == PT_DEBUG_VIEW_MATERIAL) {
+    // PT Material view (A18.2): 0 exact G-buffer, 1 world cache, 2 grey miss, 3 sky; word.y holds reflective/character bits.
+    const RAB_Surface hit = ctx.GetIntersectionSurface();
+    ud.debug_status = hit.material_source & 3u;
+    ud.debug_value = float4(hit.material.diffuseAlbedo, hit.material.roughness);
+    ud.debug_word = uint4(hit.material_index, hit.material_source >> 2, 0u, 0u);
+  }
+#endif
   if (terminal) {
     PtCount(25u);
     const float3 le = PtGiClampLe(cached, ctx.GetPathThroughput());
     ud.color_sum += le * ctx.GetPathThroughput();
+    if (sharc_debug_hit) {
+      InterlockedAdd(g_pt_counters[39u], uint(min(CalcLuminance(le * ctx.GetPathThroughput()), 65535.0) * 16.0));
+    }
     ctx.RecordEmissiveLightSample(le, prevSurface, ptRandContext.initialRandomSamplerState);
     ctx.SetPathTermination(true);
     return;
@@ -145,6 +185,9 @@ void HandleHit(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_Pat
       const float3 le = PtGiClampLe(radiance_from_lights, ctx.GetPathThroughput());
 #if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING)
       ud.color_sum += le * ctx.GetPathThroughput();
+      if (sharc_debug_hit) {
+        InterlockedAdd(g_pt_counters[40u], uint(min(CalcLuminance(le * ctx.GetPathThroughput()), 65535.0) * 16.0));
+      }
 #endif
       ctx.RecordNeeLightSample(sampled_light_data, le, nee_pdf, scatter_pdf, light_sample,
                                ptRandContext.initialRandomSamplerState);
@@ -160,7 +203,9 @@ RTXDI_BrdfRaySample PtImportanceSampleBrdf(RAB_Surface surface, inout RTXDI_Rand
     brs.outDirection = dir;
     brs.properties = props;
     brs.outPdf = RAB_SurfaceEvaluateBsdfPdf(surface, dir, props);
-    brs.brdfTimesNoL = RAB_SurfaceEvaluateBsdfTimesNoL(surface, dir, props.IsDelta());
+    brs.brdfTimesNoL = (surface.flags & 16u) != 0u  // A18: reflective diffuse-only continuation
+        ? surface.material.diffuseAlbedo * Lambert(surface.normal, -dir)
+        : RAB_SurfaceEvaluateBsdfTimesNoL(surface, dir, props.IsDelta());
   }
   return brs;
 }
@@ -283,6 +328,10 @@ template<typename PTContextType>
 void RAB_PathTrace(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_PathTracerRandomContext rng,
                    inout RAB_PathTracerUserData ud) {
 #if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING) && !defined(PT_WATER_SURFACE)
+  // Each initial path reports its own first hit; no hit keeps status 0 (SHARC) or 3 (Material): no hit / sky.
+  ud.debug_status = g_restir.debug_view == PT_DEBUG_VIEW_MATERIAL ? 3u : 0u;
+  ud.debug_value = 0.0;
+  ud.debug_word = 0u;
   PtPrimaryNee(ctx, rng, ud);
 #endif
   while (ctx.GetBounceDepth() <= ctx.GetMaxPathBounce()) {

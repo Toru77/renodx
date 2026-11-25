@@ -103,7 +103,11 @@ static float3 g_pt_sun_dir;
 static float3 g_pt_probe[9];
 static float4x4 g_pt_view_proj;
 static float4x4 g_pt_inv_view_proj;
-struct PtMaterial { float3 albedo; float roughness; float3 f0; float spec_scale; bool character; bool reflective; };
+struct PtMaterial {
+  float3 albedo; float roughness; float3 f0; float spec_scale; bool character; bool reflective;
+  uint debug_source;  // 0 exact G-buffer, 1 world cache hit, 2 miss (grey); bit 2 reflective, bit 3 character (debug views only)
+  uint debug_index;   // exact: pixel.x | pixel.y << 16; cache: hash-grid index; miss: 0
+};
 // Reconstructs one frame's primary surface without touching the current frame's SHARC/material globals.
 bool PtReconstructSurface(Texture2D<float> depth, Texture2D<uint4> normal, Texture2D<uint4> scene, uint2 pixel,
                           out RtxdiSurfaceResult surface) {
@@ -204,7 +208,9 @@ PtMaterial PtGBufferMaterialFrom(Texture2D<float4> color, Texture2D<uint4> norma
   return m;
 }
 PtMaterial PtGBufferMaterial(uint2 pixel) {
-  return PtGBufferMaterialFrom(g_pt_color, g_pt_normal, g_pt_mrt1, g_pt_mrt2, g_pt_deferred, g_mat_deferred_count, pixel);
+  PtMaterial m = PtGBufferMaterialFrom(g_pt_color, g_pt_normal, g_pt_mrt1, g_pt_mrt2, g_pt_deferred, g_mat_deferred_count, pixel);
+  m.debug_source = 0u; m.debug_index = 0u;
+  return m;
 }
 uint4 PtPackMaterial(PtMaterial m) {
   return uint4(f32tof16(m.albedo.r) | (f32tof16(m.albedo.g) << 16), f32tof16(m.albedo.b) | (f32tof16(m.roughness) << 16),
@@ -218,6 +224,7 @@ PtMaterial PtUnpackMaterial(uint4 v) {
   m.f0 = float3(f16tof32(v.z), f16tof32(v.z >> 16), f16tof32(v.w)); m.spec_scale = ((v.w >> 16) & 255u) * (1.0 / 255.0);
   m.character = ((v.w >> 24) & 2u) != 0u;
   m.reflective = ((v.w >> 24) & 4u) != 0u;
+  m.debug_source = 1u; m.debug_index = 0u;
   return m;
 }
 uint4 PtReadMaterial(uint index) {
@@ -228,7 +235,11 @@ uint4 PtReadMaterial(uint index) {
 PtMaterial PtHitMaterial(float3 position, float3 nh) {
   PtMaterial m;
   m.albedo = float3(0.5, 0.5, 0.5); m.roughness = 1.0; m.f0 = float3(0.04, 0.04, 0.04); m.spec_scale = 1.0; m.character = false; m.reflective = false;
-  if (g_mat_enabled == 0u) return m;
+  m.debug_source = 2u; m.debug_index = 0u;
+  if (g_mat_enabled == 0u) {
+    m.debug_source |= (m.reflective ? 4u : 0u) | (m.character ? 8u : 0u);
+    return m;
+  }
   const float4 clip = mul(g_pt_view_proj, float4(position, 1.0));
   if (clip.w > 1e-6) {
     const float2 uv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
@@ -240,7 +251,10 @@ PtMaterial PtHitMaterial(float3 position, float3 nh) {
       if (depth > 0.0 && depth <= 1.0 && abs(world_h.w) > 1e-8
           && length(world_h.xyz / world_h.w - position) <= 0.05 + 0.02 * length(position - g_sharc_camera)) {
         PtCount(0u);
-        return PtGBufferMaterial(pixel);
+        m = PtGBufferMaterial(pixel);
+        m.debug_source = 0u; m.debug_index = pixel.x | (pixel.y << 16);
+        m.debug_source |= (m.reflective ? 4u : 0u) | (m.character ? 8u : 0u);
+        return m;
       }
     }
   }
@@ -248,9 +262,13 @@ PtMaterial PtHitMaterial(float3 position, float3 nh) {
   const uint index = HashGridFindEntry(PtMaterialData(), PtCachePosition(position, nh), PtMaterialKeyNormal(nh), PtMaterialGrid(), key);
   if (index != HASH_GRID_INVALID_CACHE_INDEX && ((PtReadMaterial(index).w >> 24) & 1u) != 0u) {
     PtCount(1u);
-    return PtUnpackMaterial(PtReadMaterial(index));
+    m = PtUnpackMaterial(PtReadMaterial(index));
+    m.debug_source = 1u; m.debug_index = index;
+    m.debug_source |= (m.reflective ? 4u : 0u) | (m.character ? 8u : 0u);
+    return m;
   }
   PtCount(2u);
+  m.debug_source |= (m.reflective ? 4u : 0u) | (m.character ? 8u : 0u);
   return m;
 }
 // A bounce hit's cache data (OpenRemix pathtrace.comp:1097-1124): placed slightly above the surface, toward the ray.

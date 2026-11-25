@@ -87,6 +87,14 @@ Unified PT A17 W1: with resampling None, final shading uses the per-pixel averag
 
 Unified PT A17 M-a: a per-mesh average-material fallback for cache misses is deferred to owner decision; no textured world-hit material system was added.
 
+Unified PT A18 water: water primaries are a pure mirror (F0 1) with roughness from the Water roughness slider alone, and the water output is incoming radiance without F0 demodulation. Not validated in game.
+
+Unified PT A18 reflections (design A, owner approved): reflective environment primaries continue their path diffuse-only, and final shading traces their reflection with PtSamples GGX rays (the ported pre-unification loop) plus the clamped direct highlight; the A16.1 B1 50% specular floor is removed. Not validated in game.
+
+Unified PT A18 SHARC: owner decision — PtSharcMinBounce stays unchanged against the planner's recommendation to remove it; SHARC work is limited to the PT SHARC view and counters 39/40 (first-hit cached vs traced luminance). Not validated in game.
+
+Unified PT A18 debug views: PT SHARC and PT Material (initial pass), PT Raw, PT ReSTIR (PtDebugChannel), PT Final Diffuse and PT Final Specular (final pass) reuse the t44-t46 debug contract. Not validated in game.
+
 ReGIR M4c introduces default-Off GPU pool construction from primary surfaces and lookup at actual path-traced hit positions, falling back to uniform sampling when the current pool is unavailable or invalid. Its discrete mixture PMF assumes an equiprobable 24-bit input; CPU fixtures and GPU readback cover the shared selector, registration reconstruction/deduplication/overflow, reordered two-light weights/build, zero lights, invalid headers, invalid lights, and over-capacity counts; they do not establish game RNG statistics. Runtime diagnostics asynchronously report registered and valid cells and rejected and overflow positions when a readback completes. The CPU identity mismatch matrix does not exercise the production RunPtTrace/RunPtWaterTrace identity gate or bindings. Independent source review of identity, bindings, fallback, barriers, fence publication, last-use extension, quarantine, and teardown is complete; the three P2 blockers identified by review have been corrected and independently re-checked. Production runtime validation of main/water behavior and stale fallback, fence failure injection, and owner in-game validation remain deferred.
 
 

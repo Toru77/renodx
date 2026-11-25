@@ -314,7 +314,7 @@ inline bool Rt12PtDescriptorIsUav(uint32_t index) {
   return false;
 }
 inline constexpr uint32_t kRt12PtConstants = 52u;  // = PtParams cbuffer (world_pt_common.hlsli), 16-byte padded
-inline constexpr uint32_t kRt12PtCounters = 39u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
+inline constexpr uint32_t kRt12PtCounters = 41u;  // GPU PT counters (uint32 each), world_pt_common.hlsli g_pt_counters
 inline constexpr uint32_t kRt12ReGirDescriptors = 5u;
 inline constexpr uint32_t kRt12ReGirPasses = 3u;
 inline constexpr uint32_t kRt12ReGirConstants = 2u;

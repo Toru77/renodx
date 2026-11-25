@@ -36,6 +36,8 @@ struct RAB_Surface {
   RAB_Material material;
   uint flags;
   uint2 pixel;
+  uint material_source;
+  uint material_index;
 };
 
 struct RAB_LightInfo {
@@ -62,6 +64,10 @@ struct RAB_PathTracerUserData {
   uint16_t pathType;
   uint2 pixel;
   float3 color_sum;
+  // A18 initial-pass debug views: first-hit (bounce depth 2) facts, written to u14-u16 by world_pt_initial.
+  uint debug_status;
+  float4 debug_value;
+  uint4 debug_word;
 };
 
 struct SplitBrdf {
@@ -208,16 +214,21 @@ RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
   }
   s.material.diffuseAlbedo = m.albedo;
 #if defined(PT_WATER_SURFACE)
-  s.material.specularF0 = m.f0 * m.spec_scale;
+  // A18: water is a pure mirror; the reflected value is the incoming radiance and the game's water shader applies its
+  // own Fresnel. m is the main G-buffer pixel under the water, so its F0 is not the water's.
+  s.material.specularF0 = 1.0;
 #else
   // Game specular scale (mrt1.z/255) gates the specular lobe, as the game lighting does; spec_scale 0 means no reflection (A15).
   // Game reflection rule (lighting_0xCA3D8596 :898,:968): cubemap reflection only where the deferred flag has 4 and not 32 (A17).
   s.material.specularF0 = (m.character || m.reflective) ? m.f0 * m.spec_scale : 0.0;
+  // A18 design A: reflective environment primaries continue the path diffuse-only; their reflection is traced in final
+  // shading. Light sampling keeps the full BSDF, so direct highlights stay in the reservoir.
+  if (m.reflective) s.flags |= 16u;
 #endif
   s.material.character = m.character;
 #if defined(PT_WATER_SURFACE)
   s.material.diffuseAlbedo = 0.0;
-  s.material.roughness = saturate(g_water_roughness * g_refl_roughness_scale);
+  s.material.roughness = saturate(g_water_roughness);
 #else
   const float mrt_scale = prev ? (g_pt_prev_mrt1.Load(int3(pixel, 0)).y & 255u) * (1.0 / 255.0)
                                : (g_pt_mrt1.Load(int3(pixel, 0)).y & 255u) * (1.0 / 255.0);
@@ -227,10 +238,6 @@ RAB_Surface RAB_GetGBufferSurface(uint2 pixel, bool prev) {
                     : saturate(m.roughness * mrt_scale * g_refl_roughness_scale));
 #endif
   s.diffuseProbability = PtSurfaceDiffuseProbability(s);
-  // A16.1 B: where the game has specular (specularF0 = f0 x spec_scale > 0, A15), sample the specular lobe at least
-  // half the time at the primary vertex. Throughput is the full BSDF over this mixture pdf, so the estimate stays
-  // unbiased; every RAB sampling/pdf/delta function reads this one field.
-  if (any(s.material.specularF0 > 0.0)) s.diffuseProbability = min(s.diffuseProbability, 0.5);
   return s;
 }
 
@@ -305,6 +312,8 @@ RAB_Surface PtHitSurface(float3 position, float3 normal, float distance, float3 
 #endif
   s.material.roughness = saturate(m.roughness);
   s.material.character = m.character;
+  s.material_source = m.debug_source;
+  s.material_index = m.debug_index;
   s.diffuseProbability = PtSurfaceDiffuseProbability(s);
   return s;
 }
@@ -336,6 +345,7 @@ float RAB_SurfaceEvaluateBsdfPdf(RAB_Surface s, float3 dir, RTXDI_BrdfRaySampleP
   if (props.IsDelta()) return saturate(dot(s.normal, dir)) > 0.0 ? 1.0 : 0.0;  // A15: delta weight = F/(1-p_d), the lobe-selection estimator
   const float ndl = saturate(dot(s.normal, dir));
   const float diffusePdf = ndl / 3.14159265;
+  if ((s.flags & 16u) != 0u) return diffusePdf;  // A18: reflective diffuse-only continuation
   float specularPdf = 0.0;
   if (s.material.roughness >= kMinRoughness) {
     specularPdf = ImportanceSampleGGX_VNDF_PDF(max(s.material.roughness, kMinRoughness), s.normal, s.viewDir, dir);
@@ -359,7 +369,7 @@ bool RAB_SurfaceImportanceSampleBsdf(RAB_Surface s, inout RTXDI_RandomSamplerSta
   const float rnd = RTXDI_GetNextRandom(rng);
   const float2 u = float2(RTXDI_GetNextRandom(rng), RTXDI_GetNextRandom(rng));
   props = RTXDI_DefaultBrdfRaySampleProperties();
-  if (rnd < s.diffuseProbability) {
+  if ((s.flags & 16u) != 0u || rnd < s.diffuseProbability) {
     float pdf;
     dir = TangentToWorld(s, SampleCosHemisphere(u, pdf));
     props.SetDiffuse();
@@ -402,6 +412,9 @@ float3 RAB_GetReflectedBsdfRadianceForSurface(float3 location, float3 radiance, 
   return radiance * RAB_SurfaceEvaluateBsdfTimesNoL(s, l, false);
 }
 float RAB_GetPTSampleTargetPdfForSurface(float3 location, float3 radiance, RAB_Surface s) {
+  if ((s.flags & 16u) != 0u) {  // A18: reconnections at a reflective primary carry the diffuse continuation only
+    return RTXDI_Luminance(radiance * s.material.diffuseAlbedo * Lambert(s.normal, -normalize(location - s.worldPos)));
+  }
   return RTXDI_Luminance(RAB_GetReflectedBsdfRadianceForSurface(location, radiance, s));
 }
 float RAB_GetLightSampleTargetPdfForSurface(RAB_LightSample sample, RAB_Surface s) {

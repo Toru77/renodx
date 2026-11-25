@@ -81,8 +81,12 @@ void main(uint3 id : SV_DispatchThreadID) {
   bool sun_sample = false;
   float3 light_direction = 0.0;
   uint direct_light_index = g_lamp_count;
-  const SplitBrdf brdf =
+  SplitBrdf brdf =
       PtCalculateDirectLighting(surface, reservoir, light_radiance, sun_sample, light_direction, direct_light_index);
+  const bool is_direct = isinf(reservoir.radiance.x) && reservoir.rcVertexLength == 2u;
+  // A18.2: reflective pixels continue diffuse-only in the reservoir (flag 16u), so an indirect sample is a diffuse estimate;
+  // its specular share is carried by the dedicated reflection rays.
+  if ((surface.flags & 16u) != 0u && !is_direct) brdf.specular = 0.0;
   float3 ucw = reservoir.weightSum * reservoir.targetFunction;
 #if !defined(PT_WATER_SURFACE)
   if (g_restir.resampling_none != 0u) ucw = g_pt_initial_color[id.xy].rgb;
@@ -220,7 +224,6 @@ void main(uint3 id : SV_DispatchThreadID) {
   g_pt_sun_visibility[id.xy] = game_sun_visibility;
 #endif
 
-  const bool is_direct = isinf(reservoir.radiance.x) && reservoir.rcVertexLength == 2u;
   const bool char_direct = g_restir.direct_enabled != 0u && !(character && g_restir.char_toon != 0u);
   const bool toon_character = character && g_restir.char_toon != 0u;
   const bool toon_lamp_direct = toon_character && is_direct && !sun_sample && direct_light_index < g_lamp_count;
@@ -255,7 +258,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 #if defined(PT_WATER_SURFACE)
   if (RTXDI_IsValidPTReservoir(reservoir) && g_sharc_enabled != 0u && reservoir.rcVertexLength == reservoir.pathLength
       && !isinf(reservoir.radiance.x)) PtCount(26u);
-  float3 rgb = g_refl_sample_clamp > 0.0 ? min(specular, g_refl_sample_clamp) : specular;
+  // Water is a pure mirror (F0 1): the output is the incoming radiance, without demodulation (A18).
+  float3 rgb = g_refl_sample_clamp > 0.0 ? min(raw_specular, g_refl_sample_clamp) : raw_specular;
   rgb = rgb * g_refl_intensity;
   if ((g_refl_flags & 1u) != 0u) rgb = min(rgb, 1.0);
   const float hit_t = max(length(reservoir.translatedWorldPosition - surface.worldPos), 1e-3);
@@ -279,6 +283,47 @@ void main(uint3 id : SV_DispatchThreadID) {
     const float3 clamped = (is_direct || g_refl_sample_clamp <= 0.0)
         ? raw_specular : min(raw_specular, g_refl_sample_clamp);
     g_pt_specular[id.xy] = char_direct ? float4(clamped, 1.0) : float4(0, 0, 0, 0);
+  } else if ((surface.flags & 16u) != 0u) {
+    // A18 design A: reflective primaries trace their reflection here (base 22b0badd world_pt_evaluate.hlsli:47-104); the
+    // reservoir carries their diffuse continuation and direct light only. Output is incoming radiance (no F0 division)
+    // plus the clamped, demodulated direct highlight, as the game applies its own Fresnel to t48.
+    const float alpha = max(square(surface.material.roughness), 1e-4);
+    const float3 ve = normalize(WorldToTangent(surface, surface.viewDir));
+    RTXDI_RandomSamplerState refl_rng = RTXDI_InitRandomSampler(id.xy, g_frame, 11u);
+    WorldTraceCounters refl_counters;
+    const WorldCameraView bounce_view = {true, 1.0, 0u, 0u};
+    float3 sum = 0.0;
+    float distance = 0.0;
+    for (uint sample = 0u; sample < g_samples; ++sample) {
+      const float2 u = float2(RTXDI_GetNextRandom(refl_rng), RTXDI_GetNextRandom(refl_rng));
+      float3 dir = reflect(-surface.viewDir, TangentToWorld(surface, normalize(ImportanceSampleGGX_VNDF(u, sqrt(alpha), ve, 1.0))));
+      if (dot(dir, surface.normal) <= 0.0) dir = reflect(-surface.viewDir, surface.normal);
+      g_rt12_dynamic_mask = g_dynamic_on != 0u ? RT12_MASK_DYNAMIC : 0u;
+      const WorldTraceHit hit = TraceWorldRayDxr(surface.worldPos + surface.normal * g_env_bias, dir, 1e-3, g_ray_max,
+                                                 false, bounce_view, refl_counters);
+      if (hit.prim == 0xFFFFFFFFu) {
+        sum += PtSky(dir) * sparse_scale;
+        distance += g_ray_max;
+        continue;
+      }
+      const RAB_Surface hit_surface = PtHitSurface(hit, dir);
+      float3 lit = 0.0;
+      if (!PtSharcTerminal(hit_surface.worldPos, hit_surface.normal, dir, hit.t, alpha, true,
+                           hit_surface.material.diffuseAlbedo, lit)) {
+        RTXDI_SampledLightData nee_data;
+        float nee_pdf, scatter_pdf;
+        RAB_LightSample nee_sample;
+        PtSampleNee(hit_surface, refl_rng, lit, nee_data, nee_pdf, scatter_pdf, nee_sample);
+        lit += hit_surface.material.diffuseAlbedo * PtSky(hit_surface.normal);
+      }
+      lit *= sparse_scale;
+      sum += g_refl_sample_clamp > 0.0 ? min(lit, g_refl_sample_clamp) : lit;
+      distance += hit.t;
+    }
+    float3 rgb = PtInvalidPixelGuard(sum / float(max(g_samples, 1u))) * g_refl_intensity;
+    if (direct && reservoir.pathLength == 2u) rgb += specular;
+    if ((g_refl_flags & 1u) != 0u) rgb = min(rgb, 1.0);
+    g_pt_specular[id.xy] = float4(PtInvalidPixelGuard(rgb), max(distance / float(max(g_samples, 1u)), 1e-3));
   } else if (direct && reservoir.pathLength == 2u) {
     float3 rgb = specular;
     if ((g_refl_flags & 1u) != 0u) rgb = min(rgb, 1.0);
@@ -290,8 +335,38 @@ void main(uint3 id : SV_DispatchThreadID) {
     const float hit_t = length(reservoir.translatedWorldPosition - surface.worldPos);
     g_pt_specular[id.xy] = float4(PtInvalidPixelGuard(rgb), isfinite(hit_t) ? max(hit_t, 1e-3) : 1e-3);
   }
-  if (g_restir.debug_view != RTXDI_DEBUG_VIEW_OFF) {
-    const uint view = g_restir.debug_view;
+  const uint view = g_restir.debug_view;
+  if (view == PT_DEBUG_VIEW_RAW || view == PT_DEBUG_VIEW_RESTIR || view == PT_DEBUG_VIEW_FINAL_DIFFUSE
+      || view == PT_DEBUG_VIEW_FINAL_SPECULAR) {
+    // A18 final-pass PT views. PT SHARC and PT Material belong to the initial pass, so u14-u16 stay untouched for them.
+    const uint path_word = reservoir.pathLength | (reservoir.rcVertexLength << 8u)
+                           | ((RTXDI_ConnectsToNeeLight(reservoir) ? 1u : 0u) << 16u);
+    float4 debug_value = float4(reservoir.weightSum * reservoir.targetFunction, 1.0);
+    uint debug_status = path_word;
+    uint4 debug_word = 0u;
+    if (view == PT_DEBUG_VIEW_RESTIR) {
+      float channel = reservoir.weightSum;
+      switch (g_restir.debug_channel) {
+        case PT_DEBUG_CHANNEL_M: channel = reservoir.M; break;
+        case PT_DEBUG_CHANNEL_AGE: channel = float(reservoir.age); break;
+        case PT_DEBUG_CHANNEL_PATH_LENGTH: channel = float(reservoir.pathLength); break;
+        case PT_DEBUG_CHANNEL_RC_LENGTH: channel = float(reservoir.rcVertexLength); break;
+        case PT_DEBUG_CHANNEL_INITIAL_VS_REUSED: channel = reservoir.age == 0u ? 0.0 : 1.0; break;
+        default: break;
+      }
+      debug_value = float4(channel, 0.0, 0.0, 1.0);
+      debug_word = uint4(reservoir.randomSeed, reservoir.randomIndex, reservoir.pathLength, reservoir.rcVertexLength);
+    } else if (view == PT_DEBUG_VIEW_FINAL_DIFFUSE) {
+      debug_value = g_pt_diffuse[id.xy];
+      debug_status = 0u;
+    } else if (view == PT_DEBUG_VIEW_FINAL_SPECULAR) {
+      debug_value = g_pt_specular[id.xy];
+      debug_status = 0u;
+    }
+    g_pt_debug_value[id.xy] = debug_value;
+    g_pt_debug_status[id.xy] = debug_status;
+    g_pt_sun_detail[id.xy] = debug_word;
+  } else if (view != RTXDI_DEBUG_VIEW_OFF && view <= RTXDI_DEBUG_VIEW_SUN_VISIBILITY) {
     if (view == RTXDI_DEBUG_VIEW_RAW_DIFFUSE) {
       g_pt_debug_value[id.xy] = float4(raw_diffuse, 1.0);
     } else if (view == RTXDI_DEBUG_VIEW_DISTANCE_VALIDITY || view == RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE) {

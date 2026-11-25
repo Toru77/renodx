@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include "../rtxdi/rtxdi_debug_layout.h"
 #include "../world_state.hpp"
 #include <deps/imgui/imgui.h>
 namespace falcom_world::pt {
@@ -51,6 +52,7 @@ inline float g_pt_sharc_enabled = 1.f, g_pt_sharc_accumulation_frames = 32.f, g_
              g_pt_sharc_scene_scale = 15.f, g_pt_sharc_downscale = 5.f, g_pt_sharc_capacity_log2 = 22.f;
 inline float g_pt_sharc_radiance_scale = 100000.f;
 inline float g_pt_sharc_min_bounce = 1.f;
+inline float g_pt_debug_channel = static_cast<float>(PT_DEBUG_CHANNEL_UCW);  // session-only PT ReSTIR view channel
 inline uint32_t g_pt_sharc_reset_request = 0u;  // bumped by the Clear SHARC Cache button
 inline constexpr uint32_t kPtSharcGapFrames = 5u;           // frames without a SHARC trace that clear it (addon.cpp:539 uses 5)
 inline constexpr uint32_t kPtSharcMaxUpdatePaths = 82944u;  // OpenRemix options.h:346 (1920x1080 at downscale 5)
@@ -146,6 +148,8 @@ struct PtPanel {
   uint32_t gpu_d2_lamp = 0u, gpu_d2_sun = 0u, gpu_shade_transmitted = 0u;
   uint32_t gpu_ao_rays = 0u, gpu_ao_occluded = 0u;
   uint32_t gpu_energy_len2 = 0u, gpu_energy_len3 = 0u, gpu_energy_len4_5 = 0u, gpu_energy_len6plus = 0u;
+  uint32_t gpu_sharc_first_hit_cached_lum = 0u, gpu_first_hit_traced_lum = 0u;  // recorded only in the PT SHARC view
+  uint32_t debug_view = RTXDI_DEBUG_VIEW_OFF, debug_channel = PT_DEBUG_CHANNEL_UCW;
   uint32_t temporal_selected = 0u, spatial_selected = 0u;
   uint32_t water_temporal_selected = 0u, water_spatial_selected = 0u;
   bool history_valid = false;
@@ -230,6 +234,8 @@ inline void DrawPtPanel() {
   ImGui::Text("Material cache: %s  capacity 2^%u  write 1/%u px  clears %llu (last: %s)", p.mat_on ? "on" : "off",
               p.mat_capacity_log2, p.mat_rate * p.mat_rate, static_cast<unsigned long long>(p.mat_clears), p.mat_clear_reason);
   ImGui::Text("Reflection: %s", p.refl_on ? "on" : "off");
+  ImGui::Text("debug view: %s | channel: %s", kRtxdiDebugViewNames[(std::min)(p.debug_view, PT_DEBUG_VIEW_FINAL_SPECULAR)],
+              kPtDebugChannelNames[(std::min)(p.debug_channel, PT_DEBUG_CHANNEL_INITIAL_VS_REUSED)]);
   static const char* interval_names[] = {"ReGIR register", "ReGIR weights", "ReGIR build", "PT trace"};
   for (uint32_t pass = 0u; pass < 2u; ++pass) {
     for (uint32_t interval = 0u; interval < 4u; ++interval) {
@@ -262,6 +268,8 @@ inline void DrawPtPanel() {
   ImGui::Text("ao: rays %u | occluded %u | sky visibility %.1f%%", p.gpu_ao_rays, p.gpu_ao_occluded, ao_sky);
   ImGui::Text("energy by length: 2 / 3 / 4-5 / 6+: %u / %u / %u / %u", p.gpu_energy_len2, p.gpu_energy_len3,
               p.gpu_energy_len4_5, p.gpu_energy_len6plus);
+  ImGui::Text("first hit (PT SHARC view): cached lum %u | traced lum %u", p.gpu_sharc_first_hit_cached_lum,
+              p.gpu_first_hit_traced_lum);
     static const char* resampling_names[] = {"none", "temporal", "spatial", "temporal_and_spatial"};
     ImGui::Text("ReSTIR PT resampling: %s  history %s  temporal %u  spatial %u",
                 resampling_names[(std::clamp)(static_cast<uint32_t>(g_restir_resampling), 0u, 3u)],

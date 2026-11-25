@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <iterator>
 #include <string>
 
 #include <Windows.h>
@@ -717,9 +718,9 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .label = "RTXDI Debug View",
       .section = "Path Tracing Debug",
       .tooltip = "Session only. Observes current RTXDI signals; unavailable sources use a checker. It does not enable sampling or change lighting settings.",
-      .labels = {"Off", "Local status", "Receiver class", "Selected light/type", "Raw diffuse", "Filtered diffuse", "Distance validity", "Distance magnitude", "Consumer selection", "Sun visibility"},
+      .labels = {std::begin(kRtxdiDebugViewNames), std::end(kRtxdiDebugViewNames)},
       .min = static_cast<float>(RTXDI_DEBUG_VIEW_OFF),
-      .max = static_cast<float>(RTXDI_DEBUG_VIEW_SUN_VISIBILITY),
+      .max = static_cast<float>(PT_DEBUG_VIEW_FINAL_SPECULAR),
       .is_visible = visible,
   });
   settings->push_back(new Setting{
@@ -737,8 +738,27 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         return visible() && static_cast<uint32_t>(std::clamp(std::isfinite(rtxdi::g_debug_view)
                                                                  ? rtxdi::g_debug_view
                                                                  : 0.f,
-                                                             0.f, static_cast<float>(RTXDI_DEBUG_VIEW_SUN_VISIBILITY)))
+                                                             0.f, static_cast<float>(PT_DEBUG_VIEW_FINAL_SPECULAR)))
                == RTXDI_DEBUG_VIEW_SUN_VISIBILITY;
+      },
+  });
+  settings->push_back(new Setting{
+      .key = "",
+      .binding = &pt::g_pt_debug_channel,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = static_cast<float>(PT_DEBUG_CHANNEL_UCW),
+      .label = "PT Debug Channel",
+      .section = "Path Tracing Debug",
+      .tooltip = "Session only. Reservoir value shown by the PT ReSTIR view as a heat ramp.",
+      .labels = {std::begin(kPtDebugChannelNames), std::end(kPtDebugChannelNames)},
+      .min = static_cast<float>(PT_DEBUG_CHANNEL_UCW),
+      .max = static_cast<float>(PT_DEBUG_CHANNEL_INITIAL_VS_REUSED),
+      .is_visible = [visible] {
+        return visible() && static_cast<uint32_t>(std::clamp(std::isfinite(rtxdi::g_debug_view)
+                                                                 ? rtxdi::g_debug_view
+                                                                 : 0.f,
+                                                             0.f, static_cast<float>(PT_DEBUG_VIEW_FINAL_SPECULAR)))
+               == PT_DEBUG_VIEW_RESTIR;
       },
   });
   settings->push_back(new Setting{
@@ -900,7 +920,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         if (logging) {
           const uint32_t live_requested_view = static_cast<uint32_t>(
               std::clamp(std::isfinite(rtxdi::g_debug_view) ? rtxdi::g_debug_view : 0.f, 0.f,
-                         static_cast<float>(RTXDI_DEBUG_VIEW_SUN_VISIBILITY)));
+                         static_cast<float>(PT_DEBUG_VIEW_FINAL_SPECULAR)));
           const uint64_t live_world_frame = falcom_world::g_state.frame.load();
           const bool live_bvh_active = bvh::g_bvh_debug.mode.load(std::memory_order_relaxed) != 0;
           const uint32_t live_effective_view = ResolveRtxdiDebugEffectiveView(live_requested_view, live_bvh_active);
@@ -2107,7 +2127,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.05f,
       .label = "Water roughness",
       .section = "Path Tracing",
-      .tooltip = "Base roughness of water reflections (0 = mirror). Reflection Roughness Scale still multiplies it.",
+      .tooltip = "Roughness of water reflections (0 = mirror). Not scaled by Reflection Roughness Scale.",
       .min = 0.f,
       .max = 1.f,
       .format = "%.2f",

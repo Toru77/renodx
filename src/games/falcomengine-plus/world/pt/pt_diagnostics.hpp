@@ -48,6 +48,8 @@ inline std::string SerializePtReport() {
   out << "resampling: " << resampling_names[(std::clamp)(p.resampling_mode, 0u, 3u)]
       << " | direct: " << (p.direct_enabled ? "on" : "off")
       << " | light table: " << rtxdi::DiStatusName(static_cast<rtxdi::DiStatus>(p.light_table_status)) << "\n";
+  out << "debug view: " << kRtxdiDebugViewNames[(std::min)(p.debug_view, PT_DEBUG_VIEW_FINAL_SPECULAR)]
+      << " | channel: " << kPtDebugChannelNames[(std::min)(p.debug_channel, PT_DEBUG_CHANNEL_INITIAL_VS_REUSED)] << "\n";
   out << "width: " << p.width << "\n";
   out << "height: " << p.height << "\n";
   out << "sparse requested mode: " << (!p.sparse_requested ? "off" : p.sparse_adaptive ? "adaptive" : "fixed") << "\n";
@@ -100,6 +102,8 @@ inline std::string SerializePtReport() {
   out << "energy_len3: " << p.gpu_energy_len3 << "\n";
   out << "energy_len4_5: " << p.gpu_energy_len4_5 << "\n";
   out << "energy_len6plus: " << p.gpu_energy_len6plus << "\n";
+  out << "sharc_first_hit_cached_lum: " << p.gpu_sharc_first_hit_cached_lum << "\n";
+  out << "first_hit_traced_lum: " << p.gpu_first_hit_traced_lum << "\n";
   out << "temporal_selected: " << p.temporal_selected << "\n";
   out << "spatial_selected: " << p.spatial_selected << "\n";
   out << "history_valid: " << p.history_valid << "\n";

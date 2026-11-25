@@ -8,6 +8,16 @@
 #include <Rtxdi/PT/Decorrelation.hlsli>
 #include <Rtxdi/PT/InitialSampling.hlsli>
 
+#if !defined(PT_WATER_SURFACE)
+// Initial-pass PT debug views own u14-u16 and write every pixel while active, so they never show stale data (A18.2).
+void PtWriteInitialDebug(uint2 pixel, float4 value, uint status, uint4 word) {
+  if (g_restir.debug_view != PT_DEBUG_VIEW_SHARC && g_restir.debug_view != PT_DEBUG_VIEW_MATERIAL) return;
+  g_pt_debug_value[pixel] = value;
+  g_pt_debug_status[pixel] = status;
+  g_pt_sun_detail[pixel] = word;
+}
+#endif
+
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   if (any(id.xy >= g_size)) return;
@@ -29,6 +39,7 @@ void main(uint3 id : SV_DispatchThreadID) {
       }
       g_pt_diffuse[id.xy] = float4(0, 0, 0, 1);
       g_pt_specular[id.xy] = float4(0, 0, 0, 1e-3);
+      PtWriteInitialDebug(id.xy, 0.0, 4u, 0u);
       return;
     }
     PtCount(7u);
@@ -44,6 +55,9 @@ void main(uint3 id : SV_DispatchThreadID) {
       RTXDI_StorePTReservoir(RTXDI_EmptyPTReservoir(), g_restir.restir.reservoirBuffer, id.xy,
                              g_restir.restir.bufferIndices.initialPathTracerPreservedBufferIndex);
     }
+#if !defined(PT_WATER_SURFACE)
+    PtWriteInitialDebug(id.xy, 0.0, 4u, 0u);
+#endif
     return;
   }
   RAB_PathTracerUserData ud = RAB_EmptyPathTracerUserData();
@@ -65,6 +79,8 @@ void main(uint3 id : SV_DispatchThreadID) {
   }
 #if !defined(PT_WATER_SURFACE)
   g_pt_initial_color[id.xy] = float4(ud.color_sum / float(g_restir.restir.initialSampling.numInitialSamples), 1.0);
+  // Initial-pass PT debug views own u14-u16; world_pt_final leaves them untouched for these views (A18).
+  PtWriteInitialDebug(id.xy, ud.debug_value, ud.debug_status, ud.debug_word);
 #endif
   if (RTXDI_IsValidPTReservoir(reservoir)) {
     PtCount(21u);

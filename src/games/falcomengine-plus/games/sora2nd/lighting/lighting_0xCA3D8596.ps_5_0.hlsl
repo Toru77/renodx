@@ -222,13 +222,14 @@ float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
   const uint view = (uint)shader_injection_data.rtxdi_debug_view;
   if (view == RTXDI_DEBUG_VIEW_OFF) return 0.0;
 
+  const bool pt_view = view >= PT_DEBUG_VIEW_SHARC && view <= PT_DEBUG_VIEW_FINAL_SPECULAR;
   uint status_width, status_height;
   uint status_word = RTXDI_N1_STATUS_INVALID;
   bool status_bound = false;
   const bool needs_status = view == RTXDI_DEBUG_VIEW_LOCAL_STATUS || view == RTXDI_DEBUG_VIEW_RECEIVER_CLASS
                             || view == RTXDI_DEBUG_VIEW_RAW_DIFFUSE || view == RTXDI_DEBUG_VIEW_FILTERED_DIFFUSE
                             || view == RTXDI_DEBUG_VIEW_DISTANCE_VALIDITY
-                            || view == RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE;
+                            || view == RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE || pt_view;
   if (needs_status && shader_injection_data.rtxdi_debug_bound > 0.5f) {
     rtxdiDebugStatus_g.GetDimensions(status_width, status_height);
     status_bound = pixel.x < status_width && pixel.y < status_height;
@@ -239,11 +240,26 @@ float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
   float4 value = 0.0;
   bool value_bound = false;
   const bool needs_value = view == RTXDI_DEBUG_VIEW_RAW_DIFFUSE || view == RTXDI_DEBUG_VIEW_DISTANCE_VALIDITY
-                           || view == RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE;
+                           || view == RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE || pt_view;
   if (needs_value && shader_injection_data.rtxdi_debug_bound > 0.5f) {
     rtxdiDebugValue_g.GetDimensions(value_width, value_height);
     value_bound = pixel.x < value_width && pixel.y < value_height;
     if (value_bound) value = rtxdiDebugValue_g.Load(int3(pixel, 0));
+  }
+
+  // A18 PT views: SHARC shows cached radiance where the cache answered, Material the hit albedo where it was found,
+  // ReSTIR a heat ramp of the selected channel, Raw and Final the written radiance.
+  if (pt_view) {
+    if (!status_bound || !value_bound) return RtxdiDebugUnavailable(pixel);
+    if (view == PT_DEBUG_VIEW_SHARC && status_word != 1u) return PtDebugStatusColor(view, status_word);
+    if (view == PT_DEBUG_VIEW_MATERIAL && status_word > 1u) return PtDebugStatusColor(view, status_word);
+    if (view == PT_DEBUG_VIEW_RESTIR) {
+      if (!isfinite(value.r) || value.r < 0.0) return float3(1.0, 0.0, 1.0) * 0.05;
+      const float heat = value.r / (1.0 + value.r);
+      return (heat < 0.5 ? lerp(float3(0.0, 0.0, 1.0), float3(0.0, 1.0, 0.0), heat * 2.0)
+                         : lerp(float3(0.0, 1.0, 0.0), float3(1.0, 0.0, 0.0), heat * 2.0 - 1.0)) * 0.05;
+    }
+    return RtxdiDebugRadiance(value.rgb);
   }
 
   uint tuple_width, tuple_height;

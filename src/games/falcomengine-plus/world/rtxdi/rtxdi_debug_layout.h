@@ -11,6 +11,21 @@
 #define RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE 7u
 #define RTXDI_DEBUG_VIEW_CONSUMER_SELECTION 8u
 #define RTXDI_DEBUG_VIEW_SUN_VISIBILITY     9u
+// Unified PT views (A18): SHARC and Material are written by the initial pass, the others by final shading.
+#define PT_DEBUG_VIEW_SHARC                 10u
+#define PT_DEBUG_VIEW_MATERIAL              11u
+#define PT_DEBUG_VIEW_RAW                   12u
+#define PT_DEBUG_VIEW_RESTIR                13u
+#define PT_DEBUG_VIEW_FINAL_DIFFUSE         14u
+#define PT_DEBUG_VIEW_FINAL_SPECULAR        15u
+
+// PT ReSTIR view channel (PtDebugChannel).
+#define PT_DEBUG_CHANNEL_UCW               0u
+#define PT_DEBUG_CHANNEL_M                 1u
+#define PT_DEBUG_CHANNEL_AGE               2u
+#define PT_DEBUG_CHANNEL_PATH_LENGTH       3u
+#define PT_DEBUG_CHANNEL_RC_LENGTH         4u
+#define PT_DEBUG_CHANNEL_INITIAL_VS_REUSED 5u
 
 #define RTXDI_SUN_DETAIL_STATUS       0u
 #define RTXDI_SUN_DETAIL_REASON       1u
@@ -50,7 +65,23 @@ enum class RtxdiDebugView : uint32_t {
   DistanceMagnitude = RTXDI_DEBUG_VIEW_DISTANCE_MAGNITUDE,
   ConsumerSelection = RTXDI_DEBUG_VIEW_CONSUMER_SELECTION,
   SunVisibility = RTXDI_DEBUG_VIEW_SUN_VISIBILITY,
+  PtSharc = PT_DEBUG_VIEW_SHARC,
+  PtMaterial = PT_DEBUG_VIEW_MATERIAL,
+  PtRaw = PT_DEBUG_VIEW_RAW,
+  PtRestir = PT_DEBUG_VIEW_RESTIR,
+  PtFinalDiffuse = PT_DEBUG_VIEW_FINAL_DIFFUSE,
+  PtFinalSpecular = PT_DEBUG_VIEW_FINAL_SPECULAR,
 };
+
+inline constexpr const char* kRtxdiDebugViewNames[] = {
+    "Off", "Local status", "Receiver class", "Selected light/type", "Raw diffuse", "Filtered diffuse",
+    "Distance validity", "Distance magnitude", "Consumer selection", "Sun visibility", "PT SHARC", "PT Material",
+    "PT Raw", "PT ReSTIR", "PT Final Diffuse", "PT Final Specular"};
+static_assert(sizeof(kRtxdiDebugViewNames) / sizeof(kRtxdiDebugViewNames[0]) == PT_DEBUG_VIEW_FINAL_SPECULAR + 1u);
+
+inline constexpr const char* kPtDebugChannelNames[] = {"UCW", "M", "Age", "Path length", "Rc length",
+                                                       "Initial vs reused"};
+static_assert(sizeof(kPtDebugChannelNames) / sizeof(kPtDebugChannelNames[0]) == PT_DEBUG_CHANNEL_INITIAL_VS_REUSED + 1u);
 
 enum class RtxdiDebugPresentationOwner : uint32_t {
   Lighting,
