@@ -236,7 +236,8 @@ bool PtDetermineOutgoingRay(inout RTXDI_PathTracerContext<PTContextType> ctx,
 template<typename PTContextType>
 void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_PathTracerRandomContext rng,
                   inout RAB_PathTracerUserData ud) {
-  if (g_restir.direct_enabled == 0u) return;
+  // Physical Direct Light 0 is pure game shading: the final pass and the lighting shader own all direct light (A23b).
+  if (g_restir.direct_enabled == 0u || g_restir.physical_mix <= 0.0) return;
   const RAB_Surface surface = ctx.GetIntersectionSurface();
   if (!RAB_IsSurfaceValid(surface)) return;
   uint cell = 0u;
@@ -245,8 +246,8 @@ void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_
   RTXDI_DIReservoir local_reservoir = RTXDI_EmptyDIReservoir();
   RAB_LightSample local_sample = RAB_EmptyLightSample();
   // Candidates come from this pixel's game tile cell: the only lights with a non-zero target
-  // (world_rtxdi_initial_di.cs_6_5.hlsl:132-167). Characters take lamps from the final pass's lamp-only estimator in
-  // both character modes (A22 C1).
+  // (world_rtxdi_initial_di.cs_6_5.hlsl:132-167). Characters take lamps from the final pass's game lamp estimator
+  // (A22 C1, A23b).
   if (tile_valid && g_restir.nee.numLocalLightSamples != 0u && !surface.material.character) {
     const LightIndexData tile = g_pt_tiles[cell];
     const uint point_count = min(tile.pointLightCount, 63u);
@@ -288,20 +289,16 @@ void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_
   }
   RTXDI_DIReservoir sun_reservoir = RTXDI_EmptyDIReservoir();
   RAB_LightSample sun_sample = RAB_EmptyLightSample();
-  // Game-toon characters take their sun from the game lighting and its shading-time RT visibility, so only local lamps are
-  // streamed here.
-  if (!(surface.material.character && g_restir.char_toon != 0u)) {
-    // One infinite-light sample (InitialSampling.hlsli:375-399), keeping the IS-FAST uv source.
-    const RAB_LightInfo sun_info = RAB_LoadLightInfo(g_lamp_count, false);
-    if (sun_info.index != RTXDI_LIGHT_TABLE_INVALID_INDEX) {
-      const float2 sun_uv = (g_restir.isfast_light_jitter != 0u)
-          ? asfloat(g_pt_noise.Load(int3(surface.pixel.x % 128u, surface.pixel.y % 128u + 128u * (g_frame % 32u), 0)).xy)
-          : RTXDI_RandomlySelectInfiniteLightUV(rng.initialRandomSamplerState);
-      RTXDI_StreamInfiniteLightAtUVIntoReservoir(rng.initialRandomSamplerState, sun_info, surface, g_lamp_count, sun_uv,
-                                                 1.0, sun_reservoir, sun_sample);
-      RTXDI_FinalizeResampling(sun_reservoir, 1.0, sun_reservoir.M);
-      sun_reservoir.M = 1;
-    }
+  // One infinite-light sample (InitialSampling.hlsli:375-399), keeping the IS-FAST uv source.
+  const RAB_LightInfo sun_info = RAB_LoadLightInfo(g_lamp_count, false);
+  if (sun_info.index != RTXDI_LIGHT_TABLE_INVALID_INDEX) {
+    const float2 sun_uv = (g_restir.isfast_light_jitter != 0u)
+        ? asfloat(g_pt_noise.Load(int3(surface.pixel.x % 128u, surface.pixel.y % 128u + 128u * (g_frame % 32u), 0)).xy)
+        : RTXDI_RandomlySelectInfiniteLightUV(rng.initialRandomSamplerState);
+    RTXDI_StreamInfiniteLightAtUVIntoReservoir(rng.initialRandomSamplerState, sun_info, surface, g_lamp_count, sun_uv,
+                                               1.0, sun_reservoir, sun_sample);
+    RTXDI_FinalizeResampling(sun_reservoir, 1.0, sun_reservoir.M);
+    sun_reservoir.M = 1;
   }
   RAB_LightSample light_sample = RAB_EmptyLightSample();
   const RTXDI_DIReservoir reservoir =

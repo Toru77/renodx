@@ -412,9 +412,6 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
   }
 }
 
-  const bool ptDirectCharacter = shader_injection_data.pt_direct_bound > 0.5f && ptGiValid
-                                 && shader_injection_data.pt_char_toon < 0.5f;
-
   // Reduce AO where indirect light exists
   if (shader_injection_data.vbgi_reduce_ao > 0.5f && shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
     r5.x = lerp(r5.x, 1.0, saturate(cachedVBGILuma * shader_injection_data.vbgi_reduce_ao_strength));
@@ -523,10 +520,13 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
       if (shader_injection_data.char_shadow_mode >= 0.5f) {
         r3.z = r3.z * saturate(r5.z);
       }
-      if (ptDirectCharacter) r3.z = 0.0f;
-      if (shader_injection_data.pt_sun_vis_bound > 0.5f && !ptDirectCharacter) {
+      if (shader_injection_data.pt_sun_vis_bound > 0.5f) {
         const float4 v = ptSunVisibility_g.Load(int3(v0.xy, 0));
         if (v.a >= 0.0f) r3.z *= v.a;
+      }
+      // Physical Direct Light: the game sun is lerp(shadow, lit, V), so scaling V blends it against PT direct (A23b).
+      if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) {
+        r3.z *= 1.0f - saturate(shader_injection_data.pt_physical_mix);
       }
       r5.yzw = -r9.xyz * r8.xyz + r0.xyz;
       r9.xyz = r3.zzz * r5.yzw + r10.xyz;
@@ -780,14 +780,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     r5.yzw = r5.yzw + -r9.xyz;
     r5.yzw = combineAlpha_g * r5.yzw + r9.xyz;
     float3 charColor = r3.www ? r9.xyz : r5.yzw;
-    // Unified PT direct (A2.4 Q1): PT diffuse (demodulated, total) x albedo + PT specular radiance replace all character
-    // lighting terms (sun toon, lamps, ambient/SSGI); t47/t48 already include direct and indirect light.
-    if (ptDirectCharacter) {
-      charColor = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb * ptGiTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb
-                + ptReflTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb;
-    }
-    if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid && shader_injection_data.pt_char_toon > 0.5f) {
-      // Game toon: the reservoir's local-lamp response and shadowed game sun are carried by the reflection channel.
+    if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) {
+      // PT direct: the game lamp response and the physical specular are carried by the reflection channel (A23b).
       charColor += ptReflTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb;
     }
     if (shader_injection_data.char_gtvbao_mode > 0.5f
@@ -811,9 +805,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     // the character/SSGI/GI terms with no isolable sun contribution. Contact is
     // therefore not applied here: attaching it to the final colour instead is the
     // bug that put contact shadows in interiors.
-    o0.xyz = ptDirectCharacter ? charColor : FalcomApplyShadowTerms(charColor, v1.xy, csIsCharacter > 0.5, samPoint_s,
-                                                                     contactShadowTex);
-    if (ptGiValid && !ptDirectCharacter) {
+    o0.xyz = FalcomApplyShadowTerms(charColor, v1.xy, csIsCharacter > 0.5, samPoint_s, contactShadowTex);
+    if (ptGiValid) {
       o0.xyz += cachedPtGi * (csCharacterShading ? saturate(shader_injection_data.pt_char_intensity) : 1.0);
     }
     // VBGI (M7.5): added after the shadow terms; Character Mask Strength scales it on this path.
@@ -832,15 +825,16 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r0.w = r3.w * r0.w + 1;
   r3.zw = min(shadowUVClamp_g.xy, v1.xy);
   r3.z = shadowTexture.SampleLevel(samLinear_s, r3.zw, 0).x;
-  if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) r3.z = 0.0f;
   float4 ptSunVisibility = float4(1, 1, 1, -1);
   if (shader_injection_data.pt_sun_vis_bound > 0.5f) {
     ptSunVisibility = ptSunVisibility_g.Load(int3(v0.xy, 0));
   }
-  if (shader_injection_data.pt_sun_vis_bound > 0.5f
-      && !(shader_injection_data.pt_direct_bound > 0.5f && ptGiValid)
-      && ptSunVisibility.a >= 0.0f) {
+  if (shader_injection_data.pt_sun_vis_bound > 0.5f && ptSunVisibility.a >= 0.0f) {
     r3.z = ptSunVisibility.a;
+  }
+  // Physical Direct Light: the game sun is sc + (1 - sc) x B x V, so scaling V blends it against PT direct (A23b).
+  if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) {
+    r3.z *= 1.0f - saturate(shader_injection_data.pt_physical_mix);
   }
   r3.w = min(r3.z, r0.w);
   r1.xy = (uint2)r1.xy;
@@ -1311,9 +1305,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r0.w = r2.x * r9.x;
   r9.xyz = r15.yzw + -r10.xyz;
   r9.xyz = r0.www * r9.xyz + r10.xyz;
-  if (shader_injection_data.pt_sun_vis_bound > 0.5f
-      && !(shader_injection_data.pt_direct_bound > 0.5f && ptGiValid)
-      && ptSunVisibility.a >= 0.0f) {
+  if (shader_injection_data.pt_sun_vis_bound > 0.5f && ptSunVisibility.a >= 0.0f) {
     r9.xyz *= ptSunVisibility.rgb;
   }
   // Sun contact shadows apply HERE, to the sun diffuse and before r13.xyz (ambient)

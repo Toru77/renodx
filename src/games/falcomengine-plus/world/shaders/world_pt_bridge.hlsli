@@ -423,6 +423,8 @@ float RAB_GetPTSampleTargetPdfForSurface(float3 location, float3 radiance, RAB_S
   return RTXDI_Luminance(RAB_GetReflectedBsdfRadianceForSurface(location, radiance, s));
 }
 float RAB_GetLightSampleTargetPdfForSurface(RAB_LightSample sample, RAB_Surface s) {
+  // Game-response samples (64u) carry a per-light response in (light index x uv) space, so no solid-angle division.
+  if ((s.flags & 64u) != 0u) return sample.solidAnglePdf > 0.0 ? RTXDI_Luminance(sample.radiance) : 0.0;
   if (sample.solidAnglePdf <= 0.0) return 0.0;
   return RTXDI_Luminance(RAB_GetReflectedBsdfRadianceForSurface(sample.position, sample.radiance, s)) / sample.solidAnglePdf;
 }
@@ -539,14 +541,32 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
   } else {
     s.solidAnglePdf = 1.0;
   }
+  if ((surface.flags & 64u) != 0u) {
+    // Game lamp response (lighting_0xCA3D8596 :1378-1442) from the lamp centre: colour x attenuation x cone x
+    // max(N.L, translucency). The sampled position keeps soft shadows; the wrap is clamped at 0 so the RIS target stays
+    // non-negative where a lamp has no translucency.
+    float3 game_color = max(surface.material.character
+        ? lp.charaColor * g_restir.char_lamp_intensity
+        : lp.color * (g_restir.lamp_material_scale != 0u ? surface.lampScale : 1.0), 0.0);
+    const float3 to_c = lp.pos - surface.worldPos;
+    const float3 l_c = normalize(to_c);
+    game_color *= LampDistanceAttenuation(lp, to_c);
+    if (info.type == LAMP_TYPE_SPOT) game_color *= LampSpotCone(lp, l_c);
+    if (g_restir.local_clamp_enabled != 0u) game_color = min(game_color, float3(g_restir.local_clamp, g_restir.local_clamp, g_restir.local_clamp));
+    s.radiance = game_color * max(max(dot(surface.normal, l_c), lp.translucency * g_restir.lamp_wrap_scale), 0.0)
+        * g_restir.lamp_intensity;
+    s.position = center;
+    return s;
+  }
   float3 color = max(surface.material.character ? lp.charaColor * g_restir.char_lamp_intensity : lp.color, 0.0);
   color *= LampDistanceAttenuation(lp, to) * surface.lampScale;
   if (info.type == LAMP_TYPE_SPOT) color *= LampSpotCone(lp, l);
   // The game's environment lamp response is colour x max(N.L, translucency) (lighting_0xCA3D8596); times the Lambert
   // cos this restores the wrap on pure-Lambert surfaces only, so no specular lobe is scaled.
   const float cos_l = dot(surface.normal, l);
-  if ((surface.flags & 32u) != 0u && lp.translucency > 0.0 && cos_l > 1e-4)
-    color *= max(lp.translucency, cos_l) / cos_l;
+  const float wrap = lp.translucency * g_restir.lamp_wrap_scale;
+  if ((surface.flags & 32u) != 0u && wrap > 0.0 && cos_l > 1e-4)
+    color *= max(wrap, cos_l) / cos_l;
   if (g_restir.local_clamp_enabled != 0u) color = min(color, float3(g_restir.local_clamp, g_restir.local_clamp, g_restir.local_clamp));
   s.radiance = color * (3.14159265 * s.solidAnglePdf);
   s.position = center;
@@ -825,6 +845,21 @@ void PtSampleNee(RAB_Surface surface, inout RTXDI_RandomSamplerState rng, out fl
   sampled_light_data.uvData = reservoir.uvData;
   nee_pdf = 1.0 / reservoir.weightSum;
   scatter_pdf = RAB_SurfaceEvaluateBrdfPdf(surface, l);
+}
+
+// The game's lamp response with ray-traced visibility from a fresh lamp-only NEE sample (A23b), for environment and
+// characters. 64u selects the game-response target; it stays on this local copy and never reaches a reservoir.
+// g_restir.nee has no BRDF samples, so the candidate source pdf is the light pmf only.
+float3 PtGameLamp(RAB_Surface surface, inout RTXDI_RandomSamplerState rng) {
+  RAB_Surface game_surface = surface;
+  game_surface.flags |= 64u;
+  float3 radiance_from_lights;
+  RTXDI_SampledLightData light_data;
+  float nee_pdf, scatter_pdf;
+  RAB_LightSample light_sample;
+  PtSampleNee(game_surface, rng, radiance_from_lights, light_data, nee_pdf, scatter_pdf, light_sample, false);
+  if (nee_pdf <= 0.0 || RTXDI_SampledLightData_GetLightIndex(light_data) >= g_lamp_count) return 0.0;
+  return light_sample.radiance * PtLightVisibility(surface, light_sample.position) / nee_pdf;
 }
 
 #endif  // FALCOM_WORLD_PT_BRIDGE_HLSLI

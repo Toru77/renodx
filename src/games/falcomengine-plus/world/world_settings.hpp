@@ -1151,20 +1151,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
-      .key = "RestirPtCharacterShading",
-      .binding = &pt::g_restir_char_toon,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 1.f,
-      .label = "Character Shading",
-      .section = "Path Tracing Direct",
-      .tooltip = "Path traced uses the PT Lambert/GGX BRDF for character direct light; Game toon keeps the game's toon sun and CSM with PT indirect light only.",
-      .labels = {"Path traced (Lambert/GGX)", "Game toon"},
-      .min = 0.f,
-      .max = 1.f,
-      .format = "%d",
-      .is_visible = visible,
-  });
-  settings->push_back(new Setting{
       .key = "RestirPtGameSunShadows",
       .binding = &pt::g_restir_game_sun_shadows,
       .value_type = SettingValueType::BOOLEAN,
@@ -1479,6 +1465,57 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .min = 0.f,
       .max = 2.f,
       .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtPhysicalDirectLight",
+      .binding = &pt::g_pt_physical_mix,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.f,
+      .label = "Physical Direct Light",
+      .section = "Path Tracing Shading",
+      .tooltip = "0 = game shading: anime look (game sun ramp, lamp wrap, material lamp intensity) with ray-traced shadows. 1 = physical Lambert/GGX direct light. In between blends the two. Replaces Character Shading.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .parse = [](float value) { return std::round(value * 20.f) / 20.f; },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtLampWrap",
+      .binding = &pt::g_pt_lamp_wrap_scale,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Lamp Wrap",
+      .section = "Path Tracing Shading",
+      .tooltip = "Scales each lamp's translucency wrap (game = 1). Lights faces turned away from a lamp, including lamp housings. Stylized, not physical.",
+      .min = 0.f,
+      .max = 2.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtLampIntensity",
+      .binding = &pt::g_pt_lamp_intensity,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Lamp Intensity",
+      .section = "Path Tracing Shading",
+      .tooltip = "Global multiplier on game-style lamp light.",
+      .min = 0.f,
+      .max = 4.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "PtLampMaterialScale",
+      .binding = &pt::g_pt_lamp_material_scale,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Material Lamp Intensity",
+      .section = "Path Tracing Shading",
+      .tooltip = "Apply each material's game lamp multiplier (dynamicLightIntensity).",
+      .labels = {"Off", "On"},
       .is_visible = visible,
   });
   settings->push_back(new Setting{
