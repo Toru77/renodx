@@ -539,6 +539,11 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
   float3 color = max(surface.material.character ? lp.charaColor * g_restir.char_lamp_intensity : lp.color, 0.0);
   color *= LampDistanceAttenuation(lp, to);
   if (info.type == LAMP_TYPE_SPOT) color *= LampSpotCone(lp, l);
+  // The game's environment lamp response is colour x max(N.L, translucency) (lighting_0xCA3D8596); times the Lambert
+  // cos this restores the wrap on pure-Lambert surfaces only, so no specular lobe is scaled.
+  const float cos_l = dot(surface.normal, l);
+  if ((surface.flags & 32u) != 0u && lp.translucency > 0.0 && cos_l > 1e-4)
+    color *= max(lp.translucency, cos_l) / cos_l;
   if (g_restir.local_clamp_enabled != 0u) color = min(color, float3(g_restir.local_clamp, g_restir.local_clamp, g_restir.local_clamp));
   s.radiance = color * (3.14159265 * s.solidAnglePdf);
   s.position = center;

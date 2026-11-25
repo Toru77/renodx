@@ -122,7 +122,9 @@ void HandleHit(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_Pat
 #if defined(PT_WATER_SURFACE)
   const bool sharc_debug_hit = false;  // water never writes the PT debug views or their counters
 #else
-  const bool sharc_debug_hit = ctx.GetBounceDepth() == 2u && g_restir.debug_view == PT_DEBUG_VIEW_SHARC;
+  // A21: the first path tree that reaches a hit writes the view; status 0 (SHARC) or 3 (Material) means still unset.
+  const bool sharc_debug_hit = ctx.GetBounceDepth() == 2u && g_restir.debug_view == PT_DEBUG_VIEW_SHARC
+                               && ud.debug_status == 0u;
   if (sharc_debug_hit) {
     // PT SHARC view (A18): 1 terminated by the cache, 2 cached but rejected by the terminal rule, 3 miss, 4 SHARC off.
     ud.debug_status = 4u;
@@ -147,7 +149,7 @@ void HandleHit(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_Pat
       }
     }
   }
-  if (ctx.GetBounceDepth() == 2u && g_restir.debug_view == PT_DEBUG_VIEW_MATERIAL) {
+  if (ctx.GetBounceDepth() == 2u && g_restir.debug_view == PT_DEBUG_VIEW_MATERIAL && ud.debug_status == 3u) {
     // PT Material view (A18.2): 0 exact G-buffer, 1 world cache, 2 grey miss, 3 sky; word.y holds reflective/character bits.
     const RAB_Surface hit = ctx.GetIntersectionSurface();
     ud.debug_status = hit.material_source & 3u;
@@ -328,10 +330,6 @@ template<typename PTContextType>
 void RAB_PathTrace(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_PathTracerRandomContext rng,
                    inout RAB_PathTracerUserData ud) {
 #if defined(RTXDI_RESTIR_PT_INITIAL_SAMPLING) && !defined(PT_WATER_SURFACE)
-  // Each initial path reports its own first hit; no hit keeps status 0 (SHARC) or 3 (Material): no hit / sky.
-  ud.debug_status = g_restir.debug_view == PT_DEBUG_VIEW_MATERIAL ? 3u : 0u;
-  ud.debug_value = 0.0;
-  ud.debug_word = 0u;
   PtPrimaryNee(ctx, rng, ud);
 #endif
   while (ctx.GetBounceDepth() <= ctx.GetMaxPathBounce()) {

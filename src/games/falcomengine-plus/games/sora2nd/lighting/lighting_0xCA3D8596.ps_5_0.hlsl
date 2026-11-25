@@ -253,7 +253,11 @@ float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
   if (pt_view) {
     if (!status_bound || !value_bound) return RtxdiDebugUnavailable(pixel);
     if (view == PT_DEBUG_VIEW_SHARC && status_word != 1u) return PtDebugStatusColor(view, status_word);
-    if (view == PT_DEBUG_VIEW_MATERIAL && status_word > 1u) return PtDebugStatusColor(view, status_word);
+    if (view == PT_DEBUG_VIEW_MATERIAL) {
+      // A21: world_pt_initial writes display colours with status 0, or status 4 where the pixel has no surface.
+      if (status_word == 4u) return PtDebugStatusColor(view, status_word);
+      return value.rgb * RtxdiDebugScale();
+    }
     if (view == PT_DEBUG_VIEW_RESTIR) {
       if (!isfinite(value.r) || value.r < 0.0) return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
       // A20.3: the final pass writes the selected channel id into value.g.
@@ -271,6 +275,10 @@ float3 RtxdiDebugPixel(uint2 pixel, uint consumer_decision)
                            : lerp(float3(0.0, 1.0, 0.0), float3(1.0, 0.0, 0.0), heat * 2.0 - 1.0)) * RtxdiDebugScale();
       }
       return RtxdiDebugRadiance(value.rrr);
+    }
+    // A21: Final Diffuse and Final Specular are shown linearly; Raw keeps the log mapping.
+    if (view == PT_DEBUG_VIEW_FINAL_DIFFUSE || view == PT_DEBUG_VIEW_FINAL_SPECULAR) {
+      return saturate(value.rgb) * RtxdiDebugScale();
     }
     return RtxdiDebugRadiance(value.rgb);
   }

@@ -1391,10 +1391,13 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.tile_count = lamps ? input.tile_count : 0u;
   restir_constants.debug_view = debug_view;
   restir_constants.sun_detail_view = sun_detail_view;
-  restir_constants.debug_channel = debug_view == PT_DEBUG_VIEW_RESTIR
-      ? static_cast<uint32_t>(di_clamped(pt::g_pt_debug_channel, 0.f, 0.f,
-                                         static_cast<float>(PT_DEBUG_CHANNEL_INITIAL_VS_REUSED)))
-      : PT_DEBUG_CHANNEL_UCW;
+  restir_constants.debug_channel = PT_DEBUG_CHANNEL_UCW;
+  if (debug_view == PT_DEBUG_VIEW_RESTIR) {
+    restir_constants.debug_channel = static_cast<uint32_t>(
+        di_clamped(pt::g_pt_debug_channel, 0.f, 0.f, static_cast<float>(PT_DEBUG_CHANNEL_INITIAL_VS_REUSED)));
+  } else if (debug_view == PT_DEBUG_VIEW_MATERIAL) {
+    restir_constants.debug_channel = static_cast<uint32_t>(di_clamped(di::g_pt_material_channel, 3.f, 0.f, 4.f));
+  }
   restir_constants.coverage_min[0] = s.scene_coverage_min[0];
   restir_constants.coverage_min[1] = s.scene_coverage_min[1];
   restir_constants.coverage_min[2] = s.scene_coverage_min[2];

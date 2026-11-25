@@ -49,6 +49,8 @@ float3 PtDebugStatusColor(uint view, uint status)
     if (status == 0u) return float3(0.1, 1.0, 0.1) * RtxdiDebugScale();   // exact G-buffer
     if (status == 1u) return float3(0.0, 0.8, 1.0) * RtxdiDebugScale();   // material cache hit
     if (status == 2u) return float3(0.5, 0.5, 0.5) * RtxdiDebugScale();   // miss (grey)
+    if (status == 3u) return float3(0.1, 0.25, 1.0) * RtxdiDebugScale();  // no hit / sky
+    if (status == 4u) return float3(0.08, 0.08, 0.08);                    // no surface or sparse-skipped, flat (A21)
   }
   return float3(1.0, 0.0, 1.0) * RtxdiDebugScale();
 }

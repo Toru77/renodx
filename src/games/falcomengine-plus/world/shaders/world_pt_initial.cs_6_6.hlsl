@@ -63,6 +63,11 @@ void main(uint3 id : SV_DispatchThreadID) {
   RAB_PathTracerUserData ud = RAB_EmptyPathTracerUserData();
   ud.pixel = id.xy;
   RAB_PathTracerUserDataSetPathType(ud, RTXDI_PTPathTraceInvocationType_Initial);
+#if !defined(PT_WATER_SURFACE)
+  // Debug facts are reset once per pixel, not per path tree, so the first tree that reaches a hit wins (A21); no hit
+  // keeps status 0 (SHARC) or 3 (Material): no hit / sky. Value and word are zeroed by RAB_EmptyPathTracerUserData.
+  ud.debug_status = g_restir.debug_view == PT_DEBUG_VIEW_MATERIAL ? 3u : 0u;
+#endif
   const RTXDI_PathTracerRandomContext rc = RTXDI_InitializePathTracerRandomContext(
       id.xy, g_frame, RTXDI_PT_GENERATE_INITIAL_SAMPLES_RANDOM_SEED, RTXDI_PT_GENERATE_INITIAL_SAMPLES_REPLAY_RANDOM_SEED);
   RTXDI_PTInitialSamplingRuntimeParameters isr = RTXDI_EmptyPTInitialSamplingRuntimeParameters();
@@ -80,7 +85,38 @@ void main(uint3 id : SV_DispatchThreadID) {
 #if !defined(PT_WATER_SURFACE)
   g_pt_initial_color[id.xy] = float4(ud.color_sum / float(g_restir.restir.initialSampling.numInitialSamples), 1.0);
   // Initial-pass PT debug views own u14-u16; world_pt_final leaves them untouched for these views (A18).
-  PtWriteInitialDebug(id.xy, ud.debug_value, ud.debug_status, ud.debug_word);
+  if (g_restir.debug_view == PT_DEBUG_VIEW_MATERIAL) {
+    // A21 PT Material channels, written as display colours with status 0: Source, Albedo and Roughness of the first
+    // hit (sky blue when no tree reached one), then Cache at Surface and Cache Index of the material cache at this
+    // pixel's own surface (no ray, dark red on a miss).
+    const uint channel = g_restir.debug_channel;
+    float3 color;
+    uint4 word = ud.debug_word;
+    if (channel >= 3u) {
+      PtMaterial cached;
+      const bool cache_hit = PtCacheMaterial(surface.worldPos, surface.normal, cached);
+      const uint h = PtHash(cached.debug_index);
+      if (!cache_hit) color = float3(0.35, 0.05, 0.05);
+      else if (channel == 3u) color = cached.albedo;
+      else color = float3(h & 255u, (h >> 8) & 255u, (h >> 16) & 255u) / 255.0;
+      word = uint4(cached.debug_index, cache_hit ? 1u : 0u, 0u, 0u);
+    } else if (ud.debug_status == 3u) {
+      color = float3(0.1, 0.25, 1.0);
+    } else if (channel == 1u) {
+      color = ud.debug_value.rgb;
+    } else if (channel == 2u) {
+      color = saturate(ud.debug_value.w).xxx;
+    } else if (ud.debug_status == 0u) {
+      color = float3(0.1, 1.0, 0.1);
+    } else if (ud.debug_status == 1u) {
+      color = float3(0.0, 0.8, 1.0);
+    } else {
+      color = float3(0.5, 0.5, 0.5);
+    }
+    PtWriteInitialDebug(id.xy, float4(color, 1.0), 0u, word);
+  } else {
+    PtWriteInitialDebug(id.xy, ud.debug_value, ud.debug_status, ud.debug_word);
+  }
 #endif
   if (RTXDI_IsValidPTReservoir(reservoir)) {
     PtCount(21u);

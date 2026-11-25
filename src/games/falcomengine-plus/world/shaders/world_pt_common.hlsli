@@ -231,6 +231,16 @@ uint4 PtReadMaterial(uint index) {
   const uint base = index * 4u;
   return uint4(g_pt_material_values[base], g_pt_material_values[base + 1u], g_pt_material_values[base + 2u], g_pt_material_values[base + 3u]);
 }
+// The material cache entry at a surface point, keyed exactly as world_pt_material_write fills it.
+bool PtCacheMaterial(float3 position, float3 nh, out PtMaterial m) {
+  m = (PtMaterial)0;
+  uint64_t key;
+  const uint index = HashGridFindEntry(PtMaterialData(), PtCachePosition(position, nh), PtMaterialKeyNormal(nh), PtMaterialGrid(), key);
+  if (index == HASH_GRID_INVALID_CACHE_INDEX || ((PtReadMaterial(index).w >> 24) & 1u) == 0u) return false;
+  m = PtUnpackMaterial(PtReadMaterial(index));
+  m.debug_source = 1u; m.debug_index = index;
+  return true;
+}
 // The material at a bounce hit: the G-buffer when the hit is the visible surface on screen, else the cache, else grey 0.5.
 PtMaterial PtHitMaterial(float3 position, float3 nh) {
   PtMaterial m;
@@ -258,12 +268,10 @@ PtMaterial PtHitMaterial(float3 position, float3 nh) {
       }
     }
   }
-  uint64_t key;
-  const uint index = HashGridFindEntry(PtMaterialData(), PtCachePosition(position, nh), PtMaterialKeyNormal(nh), PtMaterialGrid(), key);
-  if (index != HASH_GRID_INVALID_CACHE_INDEX && ((PtReadMaterial(index).w >> 24) & 1u) != 0u) {
+  PtMaterial cached;
+  if (PtCacheMaterial(position, nh, cached)) {
     PtCount(1u);
-    m = PtUnpackMaterial(PtReadMaterial(index));
-    m.debug_source = 1u; m.debug_index = index;
+    m = cached;
     m.debug_source |= (m.reflective ? 4u : 0u) | (m.character ? 8u : 0u);
     return m;
   }

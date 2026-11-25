@@ -775,6 +775,25 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       },
   });
   settings->push_back(new Setting{
+      .key = "",
+      .binding = &rtxdi::g_pt_material_channel,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 3.f,
+      .label = "PT Material Channel",
+      .section = "Path Tracing Debug",
+      .tooltip = "Session only. Source, Albedo and Roughness show the first bounce hit's material; Cache at Surface and Cache Index inspect the material cache at each pixel's own surface (dark red = no cache entry).",
+      .labels = {"Source", "Albedo", "Roughness", "Cache at Surface", "Cache Index"},
+      .min = 0.f,
+      .max = 4.f,
+      .is_visible = [visible] {
+        return visible() && static_cast<uint32_t>(std::clamp(std::isfinite(rtxdi::g_debug_view)
+                                                                 ? rtxdi::g_debug_view
+                                                                 : 0.f,
+                                                             0.f, static_cast<float>(PT_DEBUG_VIEW_FINAL_SPECULAR)))
+               == PT_DEBUG_VIEW_MATERIAL;
+      },
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiScenePrepStatus",
       .value_type = SettingValueType::CUSTOM,
       .can_reset = false,

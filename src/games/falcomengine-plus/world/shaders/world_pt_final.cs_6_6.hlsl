@@ -388,7 +388,8 @@ void main(uint3 id : SV_DispatchThreadID) {
       debug_value = float4(channel, float(g_restir.debug_channel), 0.0, 1.0);
       debug_word = uint4(reservoir.randomSeed, reservoir.randomIndex, reservoir.pathLength, reservoir.rcVertexLength);
     } else if (view == PT_DEBUG_VIEW_FINAL_DIFFUSE) {
-      debug_value = g_pt_diffuse[id.xy];
+      // A21: what the lighting shader adds, the demodulated diffuse times this pixel's own albedo.
+      debug_value = float4(g_pt_diffuse[id.xy].rgb * surface.material.diffuseAlbedo, 1.0);
       debug_status = 0u;
     } else if (view == PT_DEBUG_VIEW_FINAL_SPECULAR) {
       debug_value = g_pt_specular[id.xy];

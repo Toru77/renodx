@@ -33,6 +33,7 @@ inline float g_debug_logging = 0.f;
 inline float g_debug_view = static_cast<float>(RTXDI_DEBUG_VIEW_OFF);
 inline float g_debug_brightness = 4.f;
 inline float g_sun_detail_view = static_cast<float>(RTXDI_SUN_DETAIL_STATUS);
+inline float g_pt_material_channel = 3.f;  // session-only PT Material view channel, default Cache at Surface (A21)
 inline float g_relax_diffuse_history = 30.f;
 inline float g_relax_fast_history = 6.f;
 inline float g_relax_prepass_radius = 30.f;
