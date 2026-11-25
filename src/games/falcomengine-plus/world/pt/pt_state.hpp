@@ -84,7 +84,7 @@ inline float g_pt_lamp_toon = 1.f, g_pt_lamp_bands = 0.f;
 inline float g_pt_char_sun_toon = 1.f, g_pt_char_lamp_toon = 1.f, g_pt_char_fill = 1.f;
 inline float g_pt_char_terminator_fade = 0.2f;
 inline float g_pt_char_cast_shadow = 0.4f;
-inline float g_pt_ao_rays = 4.f, g_pt_ao_radius = 0.5f, g_pt_ao_strength = 1.f;
+inline float g_pt_ao_rays = 4.f, g_pt_ao_radius = 0.5f, g_pt_ao_strength = 1.f, g_pt_char_ao_strength = 1.f;
 inline float g_restir_game_sun_shadows = 1.f;
 inline float g_restir_char_interior_sun_gate = 1.f;
 inline float g_restir_max_rc_vertex_length = 5.f, g_restir_nee_local_samples = 1.f;

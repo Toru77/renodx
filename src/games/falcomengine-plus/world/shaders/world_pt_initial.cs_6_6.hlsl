@@ -80,7 +80,8 @@ void main(uint3 id : SV_DispatchThreadID) {
       const float2 u = float2(RTXDI_GetNextRandom(ao_rng), RTXDI_GetNextRandom(ao_rng));
       float pdf;
       const float3 dir = TangentToWorld(surface, SampleCosHemisphere(u, pdf));
-      g_rt12_dynamic_mask = g_dynamic_on != 0u ? RT12_MASK_DYNAMIC : 0u;
+      // A32: character receivers take environment-only AO (no proxy self-hit).
+      g_rt12_dynamic_mask = g_dynamic_on != 0u && (surface.flags & 2u) == 0u ? RT12_MASK_DYNAMIC : 0u;
       const WorldTraceHit hit = TraceWorldRayDxr(surface.worldPos + surface.geoNormal * 1e-3, dir, 1e-3,
                                                  g_restir.ao_radius, true, ao_view, ao_counters);
       if (hit.prim == 0xFFFFFFFFu) ++unoccluded;

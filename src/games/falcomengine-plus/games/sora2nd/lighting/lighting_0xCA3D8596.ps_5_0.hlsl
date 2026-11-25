@@ -408,15 +408,17 @@ void main(
 // Path-traced diffuse GI (world/pt): t47 rgb = irradiance, a = valid. Where valid it replaces the AO (r5.x) and,
 // through cachedVBGI = 0, the VBGI bounce at later sites.
 bool ptGiValid = false;
+float ptAo = 1.0;
 float3 ptGiIrradiance = float3(0, 0, 0);
 float3 cachedPtGi = float3(0, 0, 0);
 if (shader_injection_data.pt_gi_bound > 0.5f) {
   const float4 ptSample = ptGiTexture.SampleLevel(samPoint_s, v1.xy, 0);
   if (ptSample.a > 0.5f) {
     ptGiValid = true;
+    ptAo = saturate(ptSample.a - 1.0);
     ptGiIrradiance = ptSample.rgb * shader_injection_data.pt_intensity;
     cachedPtGi = ptGiIrradiance * r0.xyz;
-    r5.x = lerp(1.0, saturate(ptSample.a - 1.0), saturate(shader_injection_data.pt_ao_strength));
+    r5.x = lerp(1.0, ptAo, saturate(shader_injection_data.pt_ao_strength));
     cachedVBGI = float3(0, 0, 0);
     cachedVBGILuma = 0;
   }
@@ -502,6 +504,7 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
   r3.z = (int)r1.z & 8;
   csIsCharacter = (r3.z == 0) ? 1.0 : 0.0;
   if (r3.z == 0) {
+    if (ptGiValid) r5.x = lerp(1.0, ptAo, saturate(shader_injection_data.pt_char_ao_strength));
     r8.yz = (uint2)r3.xx >> int2(5,10);
     r8.x = r3.x;
     r8.xyz = (int3)r8.xyz & int3(31,31,31);
@@ -510,8 +513,7 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
     r9.yz = r0.yz;
     r8.xyz = r9.xyz * r8.xyz;
     r3.zw = (int2)r1.zz & int2(1,64);
-    // Bit 0 set: the character shading path below, which never reads the AO (r5.x). Bit 0 clear: the map-AO
-    // path, which applies r5.x itself.
+    // Bit 0 set: character shading; applies the PT AO only (A32).
     const bool csCharacterShading = r3.z != 0;
     if (r3.z != 0) {
       r9.x = r0.x;
@@ -549,6 +551,8 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
       const float castS = saturate(shader_injection_data.pt_char_cast_shadow);
       const float3 castFill = castS > 0.0f ? min(r10.xyz, r0.xyz * (1.0f - castS)) : r10.xyz;
       r9.xyz = r3.zzz * r5.yzw + lerp(castFill, r10.xyz, charSunVis);
+      // A32: PT AO on character shading, tinted like the game's own AO; PT GI is added later and is not darkened again.
+      if (ptGiValid) r9.xyz = lerp(r9.xyz, r9.xyz * mapAOColor_g.xyz, (1.0 - r5.x) * mapAOIntensity_g);
       r3.z = (int)r1.z & 4;
       float outlineScale = saturate(shader_injection_data.character_outline_thickness);
       if (r3.z == 0 && outlineScale > 0.0f) {
