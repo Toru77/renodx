@@ -58,37 +58,37 @@ inline constexpr uint32_t kPtSharcGapFrames = 5u;           // frames without a 
 inline constexpr uint32_t kPtSharcMaxUpdatePaths = 82944u;  // OpenRemix options.h:346 (1920x1080 at downscale 5)
 inline constexpr uint32_t kPtSharcAccumulationStride = 32u; // OpenRemix sharc_policy.h:9
 inline constexpr uint32_t kPtSharcResolvedStride = 24u;     // OpenRemix sharc_policy.h:10
-inline float g_pt_material_enabled = 1.f, g_pt_material_rate = 4.f, g_pt_material_cell_scale = 30.f,
-             g_pt_material_capacity_log2 = 21.f, g_pt_char_roughness = 0.5f, g_pt_char_f0 = 0.04f;
+inline float g_pt_material_enabled = 1.f, g_pt_material_rate = 4.f, g_pt_material_cell_scale = 80.f,
+             g_pt_material_capacity_log2 = 22.f, g_pt_char_roughness = 0.5f, g_pt_char_f0 = 0.04f;
 inline constexpr uint32_t kPtMaterialValueStride = 16u;
 inline float g_pt_samples = 1.f, g_pt_max_bounces = 16.f, g_pt_russian_roulette = 1.f,
              g_pt_roulette_min_bounce = 1.f, g_pt_intensity = 1.f, g_pt_char_intensity = 1.f, g_pt_sky_intensity = 1.f,
              g_pt_ray_max = 500.f, g_pt_env_bias = 0.02f, g_pt_char_bias = 0.02f, g_pt_lamp_clearance = 0.2f, g_pt_sun_casters = 0.f;
-inline float g_pt_reflection_enabled = 0.f, g_pt_reflection_intensity = 1.f,
-             g_pt_reflection_roughness_scale = 1.f;
-inline float g_pt_reflection_sample_clamp = 16.f;
+inline float g_pt_reflection_enabled = 1.f, g_pt_reflection_intensity = 1.f,
+             g_pt_reflection_roughness_scale = 0.f;
+inline float g_pt_reflection_sample_clamp = 1.f;
 inline float g_pt_reflection_clamp_enabled = 1.f;
-inline float g_pt_gi_clamp_enabled = 0.f, g_pt_gi_clamp = 16.f, g_pt_gi_clamp_mode = 0.f;
-inline float g_pt_sharc_firefly_clamp_enabled = 0.f, g_pt_sharc_firefly_clamp = 10.f;
-inline float g_pt_reflection_cap_to_one = 0.f;
+inline float g_pt_gi_clamp_enabled = 1.f, g_pt_gi_clamp = 1.f, g_pt_gi_clamp_mode = 0.f;
+inline float g_pt_sharc_firefly_clamp_enabled = 1.f, g_pt_sharc_firefly_clamp = 10.f;
+inline float g_pt_reflection_cap_to_one = 1.f;
 inline float g_pt_reflection_use_sharc = 1.f, g_pt_reflection_footprint = 1.f;
 inline float g_pt_reflection_water_rule = 0.f;
-inline float g_pt_reflection_water_surface = 0.f;
-inline float g_pt_reflection_water_roughness = 0.05f;
+inline float g_pt_reflection_water_surface = 1.f;
+inline float g_pt_reflection_water_roughness = 0.f;
 inline float g_restir_direct = 1.f;
 inline float g_restir_direct_clamp_enabled = 1.f, g_restir_direct_clamp = 16.f;
-inline float g_pt_lamp_wrap_scale = 1.f, g_pt_lamp_intensity = 1.f, g_pt_lamp_material_scale = 1.f;
+inline float g_pt_lamp_wrap_scale = 1.f, g_pt_lamp_intensity = 1.5f, g_pt_lamp_material_scale = 1.f;
 inline float g_pt_sun_toon = 1.f, g_pt_sun_intensity = 1.f, g_pt_sun_bands = 0.f, g_pt_sun_fill = 1.f,
              g_pt_sun_specular = 1.f;
 inline float g_pt_lamp_toon = 1.f, g_pt_lamp_bands = 0.f;
-inline float g_pt_char_sun_toon = 1.f, g_pt_char_lamp_toon = 1.f, g_pt_char_fill = 1.f;
-inline float g_pt_char_terminator_fade = 0.2f;
+inline float g_pt_char_sun_toon = 0.f, g_pt_char_lamp_toon = 0.f, g_pt_char_fill = 1.f;
+inline float g_pt_char_terminator_fade = 1.f;
 inline float g_pt_char_cast_shadow = 0.4f;
-inline float g_pt_ao_rays = 4.f, g_pt_ao_radius = 0.5f, g_pt_ao_strength = 1.f, g_pt_char_ao_strength = 1.f;
-inline float g_pt_foliage_ao_strength = 1.f;
-inline float g_pt_char_self_ao_strength = 1.f, g_pt_char_self_ao_gap = 0.03f, g_pt_char_self_ao_radius = 0.25f;
+inline float g_pt_ao_rays = 8.f, g_pt_ao_radius = 0.20f, g_pt_ao_strength = 0.5f;
+inline float g_pt_foliage_ao_strength = 0.f;
+inline float g_pt_char_self_ao_strength = 0.5f, g_pt_char_self_ao_gap = 0.020f, g_pt_char_self_ao_radius = 0.05f;
 inline float g_restir_game_sun_shadows = 1.f;
-inline float g_restir_char_interior_sun_gate = 1.f;
+inline float g_restir_char_interior_sun_gate = 0.f;
 inline float g_restir_max_rc_vertex_length = 5.f, g_restir_nee_local_samples = 1.f;
 inline float g_restir_min_connection_footprint = 0.02f, g_restir_min_connection_footprint_sigma = 0.2f;
 inline float g_restir_min_pdf_roughness = 0.1f, g_restir_min_pdf_roughness_sigma = 0.01f;
@@ -97,12 +97,12 @@ inline float g_restir_reconnection_mode = 1.f;
 inline float g_restir_resampling = 3.f;
 inline float g_restir_temporal_visibility = 1.f;
 inline float g_restir_temporal_depth_threshold = 0.1f, g_restir_temporal_normal_threshold = 0.6f,
-             g_restir_permutation_sampling = 0.f;
+             g_restir_permutation_sampling = 1.f;
 inline float g_restir_spatial_samples = 1.f, g_restir_disocclusion_boost_samples = 8.f, g_restir_spatial_radius = 32.f,
              g_restir_spatial_depth_threshold = 0.1f, g_restir_spatial_normal_threshold = 0.6f;
 inline float g_restir_boiling_filter = 1.f, g_restir_boiling_filter_strength = 0.2f;
-inline float g_restir_compatibility_neighbors = 0.f, g_restir_decorrelation_factor = 0.4f;
-inline float g_restir_stable_light_remap = 0.f;
+inline float g_restir_compatibility_neighbors = 1.f, g_restir_decorrelation_factor = 1.f;
+inline float g_restir_stable_light_remap = 1.f;
 enum class PtReason : uint32_t { Off, DeferredContext, InputNotReady, DxrOff, NotCreated, NoShaderModel66,
                                  Failed, SceneMissing, Stuck, SubmitFailed, TargetFailed, Tracing, Count };
 inline const char* PtReasonName(PtReason r) {

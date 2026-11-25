@@ -22,7 +22,7 @@ Sora 2nd uses one RTXDI ReSTIR PT path tree per pixel to shade direct light, dif
 
 #### PT AO
 
-PT AO traces short occlusion rays inside the initial path-tracing pass and applies them through the game's own AO tint. Environment AO Strength controls non-character, non-foliage surfaces and Foliage AO Strength controls the mod's foliage, grass and plants, while Character AO Strength scales the combined contact and self AO on characters. Character self-AO adds a short second ray that includes character meshes beyond a small gap, so chin, hair and arm creases darken without proxy self-hit blotches.
+PT AO traces short occlusion rays inside the initial path-tracing pass and applies them through the game's own AO tint. Environment AO Strength controls non-character, non-foliage surfaces and Foliage AO Strength controls the mod's foliage, grass and plants. Character self-AO adds a short second ray that includes character meshes beyond a small gap, so chin, hair and arm creases darken without proxy self-hit blotches.
 
 **Code:** [AO rays](world/shaders/world_pt_initial.cs_6_6.hlsl), [Sora 2nd lighting](games/sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl), [settings](world/world_settings.hpp), [shared fields](shared.h).
 

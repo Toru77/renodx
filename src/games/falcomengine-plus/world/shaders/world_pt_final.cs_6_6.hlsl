@@ -153,8 +153,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         else complete_segment = coverage_end >= g_restir.sun_max_distance;
         shadow = Rt12TraceSunShadow(origin, L, coverage_end, complete_segment, character, true,
             g_restir.sun_casters_only != 0u ? INSTANCE_SHADOW_CASTER : 0u, g_restir.sun_max_distance,
-            g_restir.foliage_transmission, g_restir.wind_transmission, g_restir.wind_softening,
-            float3(g_restir.foliage_tint.x, g_restir.foliage_tint.y, g_restir.foliage_tint.z), wind_u, T, B,
+            kRt12SunFoliageTransmission, kRt12SunWindTransmission, kRt12SunWindSoftening,
+            float3(1.0, 1.0, 1.0), wind_u, T, B,
             transmittance, transmitted_tint);
       }
       if (transmittance < 1.0) PtCount(32u);
@@ -236,31 +236,28 @@ void main(uint3 id : SV_DispatchThreadID) {
         // A26b: characters first trace against the environment only, so an indoor self-hit cannot darken the face.
         Rt12ShadowResult shadow = Rt12TraceSunShadow(origin, L, coverage_end, complete_segment, character, !character,
             g_restir.sun_casters_only != 0u ? INSTANCE_SHADOW_CASTER : 0u, g_restir.sun_max_distance,
-            g_restir.foliage_transmission, g_restir.wind_transmission, g_restir.wind_softening,
-            float3(g_restir.foliage_tint.x, g_restir.foliage_tint.y, g_restir.foliage_tint.z), wind_u, T, B,
+            kRt12SunFoliageTransmission, kRt12SunWindTransmission, kRt12SunWindSoftening,
+            float3(1.0, 1.0, 1.0), wind_u, T, B,
             transmittance, transmitted_tint);
         const bool environment_visible = shadow.status == RTXDI_SUN_STATUS_VISIBLE;
         if (character && environment_visible) {
           shadow = Rt12TraceSunShadow(origin, L, coverage_end, complete_segment, character, true,
               g_restir.sun_casters_only != 0u ? INSTANCE_SHADOW_CASTER : 0u, g_restir.sun_max_distance,
-              g_restir.foliage_transmission, g_restir.wind_transmission, g_restir.wind_softening,
-              float3(g_restir.foliage_tint.x, g_restir.foliage_tint.y, g_restir.foliage_tint.z), wind_u, T, B,
+              kRt12SunFoliageTransmission, kRt12SunWindTransmission, kRt12SunWindSoftening,
+              float3(1.0, 1.0, 1.0), wind_u, T, B,
               transmittance, transmitted_tint);
         }
         sun_detail_word = uint4(shadow.status, shadow.reason, asuint(shadow.distance), shadow.flags);
         debug_sun_word = Rt12SunVisibilityWord(shadow.status, shadow.flags);
         if (!character || environment_visible) {
           if (shadow.status == RTXDI_SUN_STATUS_VISIBLE || shadow.status == RTXDI_SUN_STATUS_BLOCKED) {
-            const uint layers = (shadow.flags >> RTXDI_SUN_LAYER_SHIFT) & RTXDI_SUN_LAYER_MASK;
             const float darkening = character ? g_restir.sun_char_darkening : g_restir.sun_darkening;
             float visibility = shadow.status == RTXDI_SUN_STATUS_VISIBLE ? transmittance : 0.0;
             if (character && g_restir.char_terminator_fade > 0.0) {
               const float ndl = dot(surface.normal, L);
               visibility = lerp(1.0, visibility, saturate(ndl / g_restir.char_terminator_fade));
             }
-            game_sun_visibility = float4(pow(saturate(float3(g_restir.foliage_tint.x, g_restir.foliage_tint.y,
-                                                             g_restir.foliage_tint.z)), float(layers)),
-                                         lerp(1.0, visibility, darkening));
+            game_sun_visibility = float4(1.0, 1.0, 1.0, lerp(1.0, visibility, darkening));
           }
         } else {
           game_sun_visibility.a = shadow.status == RTXDI_SUN_STATUS_BLOCKED ? -2.0 : -1.0;

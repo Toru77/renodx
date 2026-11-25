@@ -43,6 +43,11 @@ bool Rt12ShadowCoverageEnd(
   return isfinite(coverage_end) && coverage_end > 0.0;
 }
 
+// A34: sun foliage and wind shadow parameters, fixed at their former defaults (settings removed).
+static const float kRt12SunFoliageTransmission = 0.0;
+static const float kRt12SunWindTransmission = 0.5;
+static const float kRt12SunWindSoftening = 0.5;
+
 // Core sun ray: blocker classification, foliage/wind transmission, the wind second ray and the tint.
 Rt12ShadowResult Rt12TraceSunShadow(
     float3 origin, float3 direction, float coverage_end, bool complete_segment, bool character, bool include_dynamic,

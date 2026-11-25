@@ -1276,13 +1276,13 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       0u, sharc_radiance_wanted,
       refl_on ? 1u : 0u,  // g_refl_enabled
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_intensity, 1.f, 0.f, 2.f)),
-      std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_roughness_scale, 1.f, 0.f, 2.f)),
-      pt::g_pt_reflection_clamp_enabled > 0.5f ? std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_sample_clamp, 16.f, 1.f, 1000.f)) : 0u,
+      std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_roughness_scale, 0.f, 0.f, 2.f)),
+      pt::g_pt_reflection_clamp_enabled > 0.5f ? std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_sample_clamp, 1.f, 1.f, 1000.f)) : 0u,
       (pt::g_pt_reflection_cap_to_one > 0.5f ? 1u : 0u) | (pt::g_pt_reflection_use_sharc > 0.5f ? 2u : 0u) |
           (pt::g_pt_reflection_footprint > 0.5f ? 4u : 0u) | (pt::g_pt_reflection_water_rule > 0.5f ? 8u : 0u) |
           (sparse_reflections_requested ? 32u : 0u),
-      std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_water_roughness, 0.05f, 0.f, 1.f)),
-      pt::g_pt_gi_clamp_enabled > 0.5f ? std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_gi_clamp, 16.f, 1.f, 1000.f)) : 0u,  // [42] water roughness, [43] GI clamp (0 = off)
+      std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_reflection_water_roughness, 0.f, 0.f, 1.f)),
+      pt::g_pt_gi_clamp_enabled > 0.5f ? std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_gi_clamp, 1.f, 1.f, 1000.f)) : 0u,  // [42] water roughness, [43] GI clamp (0 = off)
       pt::g_pt_sharc_firefly_clamp_enabled > 0.5f ? 1u : 0u,  // [44] SHARC update clamp on, [45] its limit (multiple of the cell mean)
       std::bit_cast<uint32_t>(rtxdi::FiniteClamped(pt::g_pt_sharc_firefly_clamp, 10.f, 1.f, 100.f)),
       sparse_requested ? sparse_policy.levels : 0u, sparse_policy.dense_reason == pt::PtSparseDenseReason::None ? 1u : 0u,
@@ -1326,7 +1326,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   r.restir->SetHybridShiftParameters({.maxBounceDepth = static_cast<uint32_t>(pt::g_pt_max_bounces) + 1u,
                                       .maxRcVertexLength = static_cast<uint32_t>(std::clamp(pt::g_restir_max_rc_vertex_length, 2.f, 8.f))});
   RTXDI_PTDecorrelationParameters decorrelation = ::rtxdi::GetDefaultReSTIRPTDecorrelationParams(rr);
-  decorrelation.decorrelationFactor = rtxdi::FiniteClamped(pt::g_restir_decorrelation_factor, 0.4f, 0.f, 1.f);
+  decorrelation.decorrelationFactor = rtxdi::FiniteClamped(pt::g_restir_decorrelation_factor, 1.f, 0.f, 1.f);
   r.restir->SetDecorrelationParameters(decorrelation);
   PtRestirConstants restir_constants = {};
   restir_constants.runtime.frameIndex = frame;
@@ -1353,13 +1353,13 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.history_valid = history_valid ? 1u : 0u;
   const auto di_clamped = di::FiniteClamped;
   restir_constants.sun_angular_radius =
-      di_clamped(di::g_sun_light_size, 0.f, 0.f, 5.f) * 0.5f * std::numbers::pi_v<float> / 180.f;
-  restir_constants.lamp_radius = di_clamped(di::g_local_light_size, 0.f, 0.f, 5.f);
+      di_clamped(di::g_sun_light_size, 2.f, 0.f, 5.f) * 0.5f * std::numbers::pi_v<float> / 180.f;
+  restir_constants.lamp_radius = di_clamped(di::g_local_light_size, 0.14f, 0.f, 5.f);
   restir_constants.isfast_light_jitter =
       (di::g_sun_isfast > 0.5f || di::g_local_isfast > 0.5f) && light_jitter_ready ? 1u : 0u;
   restir_constants.local_normal_bias = di_clamped(di::g_local_normal_bias, 0.02f, 0.f, 0.5f);
   restir_constants.local_char_normal_bias = di_clamped(di::g_local_character_normal_bias, 0.02f, 0.f, 0.5f);
-  restir_constants.local_clearance = di_clamped(di::g_local_light_clearance, 0.2f, 0.f, 1.f);
+  restir_constants.local_clearance = di_clamped(di::g_local_light_clearance, 0.13f, 0.f, 1.f);
   restir_constants.sun_normal_bias = di_clamped(di::g_sun_normal_bias, 0.02f, 0.f, 0.5f);
   restir_constants.sun_char_normal_bias = di_clamped(di::g_sun_character_normal_bias, 0.02f, 0.f, 0.5f);
   restir_constants.sun_max_distance = di_clamped(di::g_sun_max_ray_distance, 100.f, 1.f, 10000.f);
@@ -1369,12 +1369,6 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.char_lamp_intensity = di_clamped(di::g_local_character_intensity, 1.f, 0.f, 10.f);
   restir_constants.local_char_self_softening = di_clamped(di::g_local_character_self_softening, 0.f, 0.f, 10.f);
   restir_constants.sun_char_self_softening = di_clamped(di::g_sun_character_self_softening, 0.f, 0.f, 10.f);
-  restir_constants.foliage_transmission = di_clamped(di::g_sun_foliage_transmission, 0.f, 0.f, 1.f);
-  restir_constants.wind_transmission = di_clamped(di::g_sun_wind_transmission, 0.5f, 0.f, 1.f);
-  restir_constants.wind_softening = di_clamped(di::g_sun_wind_softening, 0.5f, 0.f, 10.f);
-  restir_constants.foliage_tint[0] = di_clamped(di::g_sun_foliage_tint_r, 1.f, 0.f, 1.f);
-  restir_constants.foliage_tint[1] = di_clamped(di::g_sun_foliage_tint_g, 1.f, 0.f, 1.f);
-  restir_constants.foliage_tint[2] = di_clamped(di::g_sun_foliage_tint_b, 1.f, 0.f, 1.f);
   restir_constants.sun_darkening = di_clamped(di::g_sun_shadow_darkening, 1.f, 0.f, 1.f);
   restir_constants.sun_char_darkening = di_clamped(di::g_sun_character_shadow_darkening, 1.f, 0.f, 1.f);
   restir_constants.pt_intensity = di_clamped(pt::g_pt_intensity, 1.f, 0.f, 2.f);
@@ -1384,19 +1378,19 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       ? di_clamped(pt::g_restir_direct_clamp, 16.f, 0.5f, 64.f) : 0.f;
   restir_constants.lamp_toon = di_clamped(pt::g_pt_lamp_toon, 1.f, 0.f, 1.f);
   restir_constants.lamp_wrap_scale = di_clamped(pt::g_pt_lamp_wrap_scale, 1.f, 0.f, 2.f);
-  restir_constants.lamp_intensity = di_clamped(pt::g_pt_lamp_intensity, 1.f, 0.f, 4.f);
+  restir_constants.lamp_intensity = di_clamped(pt::g_pt_lamp_intensity, 1.5f, 0.f, 4.f);
   restir_constants.lamp_material_scale = pt::g_pt_lamp_material_scale > 0.5f ? 1u : 0u;
   restir_constants.lamp_bands = static_cast<uint32_t>(di_clamped(pt::g_pt_lamp_bands, 0.f, 0.f, 8.f) + 0.5f);
   restir_constants.sun_toon = di_clamped(pt::g_pt_sun_toon, 1.f, 0.f, 1.f);
-  restir_constants.char_sun_toon = di_clamped(pt::g_pt_char_sun_toon, 1.f, 0.f, 1.f);
-  restir_constants.char_lamp_toon = di_clamped(pt::g_pt_char_lamp_toon, 1.f, 0.f, 1.f);
-  restir_constants.char_terminator_fade = di_clamped(pt::g_pt_char_terminator_fade, 0.2f, 0.f, 1.f);
+  restir_constants.char_sun_toon = di_clamped(pt::g_pt_char_sun_toon, 0.f, 0.f, 1.f);
+  restir_constants.char_lamp_toon = di_clamped(pt::g_pt_char_lamp_toon, 0.f, 0.f, 1.f);
+  restir_constants.char_terminator_fade = di_clamped(pt::g_pt_char_terminator_fade, 1.f, 0.f, 1.f);
   restir_constants.sun_intensity = di_clamped(pt::g_pt_sun_intensity, 1.f, 0.f, 4.f);
-  restir_constants.ao_rays = static_cast<uint32_t>(di_clamped(pt::g_pt_ao_rays, 4.f, 0.f, 8.f) + 0.5f);
-  restir_constants.ao_radius = di_clamped(pt::g_pt_ao_radius, 0.5f, 0.05f, 2.f);
-  restir_constants.char_self_ao_strength = di_clamped(pt::g_pt_char_self_ao_strength, 1.f, 0.f, 1.f);
-  restir_constants.char_self_ao_gap = di_clamped(pt::g_pt_char_self_ao_gap, 0.03f, 0.005f, 0.1f);
-  restir_constants.char_self_ao_radius = di_clamped(pt::g_pt_char_self_ao_radius, 0.25f, 0.05f, 0.5f);
+  restir_constants.ao_rays = static_cast<uint32_t>(di_clamped(pt::g_pt_ao_rays, 8.f, 0.f, 8.f) + 0.5f);
+  restir_constants.ao_radius = di_clamped(pt::g_pt_ao_radius, 0.20f, 0.05f, 2.f);
+  restir_constants.char_self_ao_strength = di_clamped(pt::g_pt_char_self_ao_strength, 0.5f, 0.f, 1.f);
+  restir_constants.char_self_ao_gap = di_clamped(pt::g_pt_char_self_ao_gap, 0.020f, 0.005f, 0.1f);
+  restir_constants.char_self_ao_radius = di_clamped(pt::g_pt_char_self_ao_radius, 0.05f, 0.05f, 0.5f);
   restir_constants.game_sun_shadows = game_sun_shadows ? 1u : 0u;
   restir_constants.char_interior_sun_gate = pt::g_restir_char_interior_sun_gate > 0.5f ? 1u : 0u;
   restir_constants.gi_clamp_per_bounce =

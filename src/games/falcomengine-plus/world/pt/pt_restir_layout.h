@@ -21,7 +21,7 @@ struct PtRestirConstants {
   uint32_t prev_deferred_count;
   uint32_t stable_light_remap;
   // Unified PT direct-light settings (M6). All scalars keep identical C++/HLSL packing; the two padding floats
-  // align foliage_tint to a 16-byte register in both languages (HLSL would insert that padding implicitly).
+  // align retired_sun_pad3 to a 16-byte register in both languages (HLSL would insert that padding implicitly).
   float sun_angular_radius;
   float lamp_radius;
   uint32_t isfast_light_jitter;
@@ -32,12 +32,12 @@ struct PtRestirConstants {
   uint32_t local_clamp_enabled;
   float char_lamp_intensity;
   float local_char_self_softening, sun_char_self_softening;
-  float foliage_transmission, wind_transmission, wind_softening;
+  float retired_sun_pad0, retired_sun_pad1, retired_sun_pad2;
   float foliage_tint_padding0, foliage_tint_padding1;
 #ifdef __cplusplus
-  float foliage_tint[3];
+  float retired_sun_pad3[3];
 #else
-  float3 foliage_tint;
+  float3 retired_sun_pad3;
 #endif
   float sun_darkening, sun_char_darkening;
   float pt_intensity, pt_char_intensity;
@@ -66,7 +66,7 @@ struct PtRestirConstants {
 #ifdef __cplusplus
 static_assert(sizeof(PtRestirConstants) % 16 == 0);
 static_assert(offsetof(PtRestirConstants, sun_angular_radius) % 16 == 0);
-static_assert(offsetof(PtRestirConstants, foliage_tint) % 16 == 0);
+static_assert(offsetof(PtRestirConstants, retired_sun_pad3) % 16 == 0);
 static_assert(offsetof(PtRestirConstants, coverage_min) % 16 == 0);
 inline constexpr uint32_t kPtRestirConstantsBytes = (sizeof(PtRestirConstants) + 255u) & ~255u;
 #endif

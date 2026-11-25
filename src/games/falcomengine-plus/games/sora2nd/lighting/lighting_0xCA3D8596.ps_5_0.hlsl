@@ -506,7 +506,7 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
   r3.z = (int)r1.z & 8;
   csIsCharacter = (r3.z == 0) ? 1.0 : 0.0;
   if (r3.z == 0) {
-    if (ptGiValid) r5.x = lerp(1.0, ptAo, saturate(shader_injection_data.pt_char_ao_strength));
+    if (ptGiValid) r5.x = ptAo;
     r8.yz = (uint2)r3.xx >> int2(5,10);
     r8.x = r3.x;
     r8.xyz = (int3)r8.xyz & int3(31,31,31);
