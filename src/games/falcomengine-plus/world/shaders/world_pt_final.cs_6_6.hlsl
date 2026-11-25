@@ -207,13 +207,31 @@ void main(uint3 id : SV_DispatchThreadID) {
       float transmittance = 1.0;
       float3 transmitted_tint = 1.0;
       bool coverage_ok = true;
+      // A27: a character under a roof gets the game's uniform key light. The overhead ray is environment-only, so neither
+      // the character's own proxy nor the CSM (unreliable past its last cascade) decides indoor shading.
+      bool covered = false;
+      if (g_restir.char_interior_sun_gate != 0u && character) {
+        const float3 up_dir = float3(0.0, 1.0, 0.0);
+        float up_end = g_restir.sun_max_distance;
+        const bool up_ok = g_restir.coverage_valid == 0u
+            || Rt12ShadowCoverageEnd(origin, up_dir, g_restir.sun_max_distance, g_restir.coverage_min, g_restir.coverage_size, up_end);
+        if (up_ok) {
+          float up_transmittance = 1.0;
+          float3 up_tint = 1.0;
+          covered = Rt12TraceSunShadow(origin, up_dir, up_end, up_end >= g_restir.sun_max_distance, false, false, 0u,
+              g_restir.sun_max_distance, 1.0, 0.0, 0.0, float3(1.0, 1.0, 1.0), wind_u, T, B, up_transmittance, up_tint).status
+              == RTXDI_SUN_STATUS_BLOCKED;
+        }
+      }
       if (g_restir.coverage_valid != 0u) {
         coverage_ok = Rt12ShadowCoverageEnd(origin, L, g_restir.sun_max_distance, g_restir.coverage_min,
                                             g_restir.coverage_size, coverage_end);
       } else {
         coverage_end = g_restir.sun_max_distance;
       }
-      if (coverage_ok) {
+      if (covered) {
+        game_sun_visibility = float4(1.0, 1.0, 1.0, 1.0);
+      } else if (coverage_ok) {
         complete_segment = coverage_end >= g_restir.sun_max_distance;
         // A26b: characters first trace against the environment only, so an indoor self-hit cannot darken the face.
         Rt12ShadowResult shadow = Rt12TraceSunShadow(origin, L, coverage_end, complete_segment, character, !character,

@@ -1162,6 +1162,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RestirPtCharInteriorSunGate",
+      .binding = &pt::g_restir_char_interior_sun_gate,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Character Interior Sun Gate",
+      .section = "Path Tracing Direct",
+      .tooltip = "When on, a character under a roof or ceiling uses the game's uniform key light instead of ray-traced sun shadows or the CSM fallback. Turn off to compare with the previous behaviour.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtxdiLocalNormalBias",
       .binding = &rtxdi::g_local_normal_bias,
       .value_type = SettingValueType::FLOAT,

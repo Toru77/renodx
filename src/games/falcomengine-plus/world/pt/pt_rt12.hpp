@@ -1392,6 +1392,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   restir_constants.char_lamp_toon = di_clamped(pt::g_pt_char_lamp_toon, 1.f, 0.f, 1.f);
   restir_constants.sun_intensity = di_clamped(pt::g_pt_sun_intensity, 1.f, 0.f, 4.f);
   restir_constants.game_sun_shadows = game_sun_shadows ? 1u : 0u;
+  restir_constants.char_interior_sun_gate = pt::g_restir_char_interior_sun_gate > 0.5f ? 1u : 0u;
   restir_constants.gi_clamp_per_bounce =
       (pt::g_pt_gi_clamp_mode > 0.5f && pt::g_pt_gi_clamp_enabled > 0.5f) ? 1u : 0u;
   restir_constants.sharc_min_bounce = std::clamp(static_cast<uint32_t>(pt::g_pt_sharc_min_bounce), 1u, 3u);
