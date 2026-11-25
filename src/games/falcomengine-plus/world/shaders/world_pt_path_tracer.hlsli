@@ -236,43 +236,27 @@ bool PtDetermineOutgoingRay(inout RTXDI_PathTracerContext<PTContextType> ctx,
 template<typename PTContextType>
 void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_PathTracerRandomContext rng,
                   inout RAB_PathTracerUserData ud) {
-  // Physical Direct Light 0 is pure game shading: the final pass and the lighting shader own all direct light (A23b).
-  if (g_restir.direct_enabled == 0u || g_restir.physical_mix <= 0.0) return;
+  // Reservoir direct light streams in every mode; Physical Direct Light only weights it at final shading (A24a).
+  if (g_restir.direct_enabled == 0u) return;
   const RAB_Surface surface = ctx.GetIntersectionSurface();
   if (!RAB_IsSurfaceValid(surface)) return;
   uint cell = 0u;
   const bool tile_valid = PtGetLightTileCell(surface, cell);
-  const RTXDI_InitialSamplingMisData mis_data = RTXDI_ComputeInitialSamplingMisData(g_restir.nee);
   RTXDI_DIReservoir local_reservoir = RTXDI_EmptyDIReservoir();
   RAB_LightSample local_sample = RAB_EmptyLightSample();
-  // Candidates come from this pixel's game tile cell: the only lights with a non-zero target
-  // (world_rtxdi_initial_di.cs_6_5.hlsl:132-167). Characters take lamps from the final pass's game lamp estimator
-  // (A22 C1, A23b).
-  if (tile_valid && g_restir.nee.numLocalLightSamples != 0u && !surface.material.character) {
+  // Every usable entry of this pixel's game tile cell is a candidate: the only lights with a non-zero target
+  // (world_rtxdi_initial_di.cs_6_5.hlsl:132-167). RIS over the full set gives W = sum(target) / target(y), so the
+  // local estimate is the tile's unshadowed lamp sum and one shadow ray supplies visibility (A24a).
+  if (tile_valid && g_restir.nee.numLocalLightSamples != 0u) {
     const LightIndexData tile = g_pt_tiles[cell];
-    const uint point_count = min(tile.pointLightCount, 63u);
-    const uint spot_count = min(tile.spotLightCount, 63u);
-    const uint entry_count = point_count + spot_count;
-    uint usable_count = 0u;
-    for (uint entry = 0u; entry < entry_count; ++entry) {
-      const bool point_entry = entry < point_count;
-      const int listed = point_entry ? tile.pointLightIndices[entry] : tile.spotLightIndices[entry - point_count];
-      usable_count += PtTileEntryUsable(listed, point_entry) ? 1u : 0u;
-    }
-    if (usable_count != 0u) {
-      for (uint candidate = 0u; candidate < g_restir.nee.numLocalLightSamples; ++candidate) {
-        const uint selected_rank = min(uint(RTXDI_GetNextRandom(rng.initialRandomSamplerState) * float(usable_count)),
-                                       usable_count - 1u);
-        uint light_index = g_lamp_count;
-        uint rank = 0u;
-        for (uint entry = 0u; entry < entry_count; ++entry) {
-          const bool point_entry = entry < point_count;
-          const int listed = point_entry ? tile.pointLightIndices[entry] : tile.spotLightIndices[entry - point_count];
-          const bool usable = PtTileEntryUsable(listed, point_entry);
-          if (usable && rank == selected_rank) light_index = uint(listed);
-          rank += usable ? 1u : 0u;
-        }
-        const RAB_LightInfo light_info = RAB_LoadLightInfo(light_index, false);
+    uint point_count, entry_count;
+    if (PtTileUsableEntries(tile, point_count, entry_count) != 0u) {
+      RTXDI_InitialSamplingMisData mis_data = RTXDI_ComputeInitialSamplingMisData(g_restir.nee);
+      mis_data.localLightMisWeight = 1.0;
+      mis_data.brdfMisWeight = 0.0;
+      for (uint entry = 0u; entry < entry_count; ++entry) {
+        const int listed = PtTileEntry(tile, entry, point_count);
+        if (listed < 0) continue;
         float2 uv;
         if (g_restir.isfast_light_jitter != 0u) {
           uv = asfloat(g_pt_noise.Load(int3(surface.pixel.x % 128u, surface.pixel.y % 128u + 128u * (g_frame % 32u), 0)).xy);
@@ -280,10 +264,10 @@ void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_
           uv = RTXDI_RandomlySelectLocalLightUV(rng.initialRandomSamplerState);
         }
         RTXDI_StreamLocalLightAtUVIntoReservoir(rng.initialRandomSamplerState, mis_data, surface,
-            g_restir.nee.brdfCutoff, mis_data.localLightMisWeight, light_index, uv, float(usable_count),
-            light_info, local_reservoir, local_sample);
+            g_restir.nee.brdfCutoff, mis_data.localLightMisWeight, uint(listed), uv, /*invSourcePdf*/ 1.0,
+            RAB_LoadLightInfo(uint(listed), false), local_reservoir, local_sample);
       }
-      RTXDI_FinalizeResampling(local_reservoir, 1.0, mis_data.numMisSamples);
+      RTXDI_FinalizeResampling(local_reservoir, 1.0, 1.0);
       local_reservoir.M = 1;
     }
   }

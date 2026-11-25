@@ -390,10 +390,21 @@ bool RAB_SurfaceImportanceSampleBsdf(RAB_Surface s, inout RTXDI_RandomSamplerSta
   }
   return dot(s.normal, dir) > 0.0;
 }
-// A tile-list entry is a candidate when it names a light of the list's type (world_rtxdi_initial_di.cs_6_5.hlsl:79-82).
-bool PtTileEntryUsable(int listed, bool point_entry) {
-  return listed >= 0 && uint(listed) < g_lamp_count
-         && g_pt_light_table[uint(listed)].type == (point_entry ? LAMP_TYPE_POINT : LAMP_TYPE_SPOT);
+// A tile-list entry is a candidate when it names a light of the list's type (world_rtxdi_initial_di.cs_6_5.hlsl:79-82);
+// returns its light index, or -1 when it is not a candidate.
+int PtTileEntry(LightIndexData tile, uint entry, uint point_count) {
+  const bool point_entry = entry < point_count;
+  const int listed = point_entry ? tile.pointLightIndices[entry] : tile.spotLightIndices[entry - point_count];
+  return (listed >= 0 && uint(listed) < g_lamp_count
+          && g_pt_light_table[uint(listed)].type == (point_entry ? LAMP_TYPE_POINT : LAMP_TYPE_SPOT)) ? listed : -1;
+}
+// Number of candidate entries in a tile cell; entries [0, point_count) are point lights, the rest spot lights.
+uint PtTileUsableEntries(LightIndexData tile, out uint point_count, out uint entry_count) {
+  point_count = min(tile.pointLightCount, 63u);
+  entry_count = point_count + min(tile.spotLightCount, 63u);
+  uint usable_count = 0u;
+  for (uint entry = 0u; entry < entry_count; ++entry) usable_count += PtTileEntry(tile, entry, point_count) >= 0 ? 1u : 0u;
+  return usable_count;
 }
 // Exact per-pixel game tile cell (copied from world_rtxdi_light_bridge.hlsli:59-76; the DI bridge is removed in M7).
 bool PtGetLightTileCell(RAB_Surface surface, out uint cell) {
@@ -423,8 +434,6 @@ float RAB_GetPTSampleTargetPdfForSurface(float3 location, float3 radiance, RAB_S
   return RTXDI_Luminance(RAB_GetReflectedBsdfRadianceForSurface(location, radiance, s));
 }
 float RAB_GetLightSampleTargetPdfForSurface(RAB_LightSample sample, RAB_Surface s) {
-  // Game-response samples (64u) carry a per-light response in (light index x uv) space, so no solid-angle division.
-  if ((s.flags & 64u) != 0u) return sample.solidAnglePdf > 0.0 ? RTXDI_Luminance(sample.radiance) : 0.0;
   if (sample.solidAnglePdf <= 0.0) return 0.0;
   return RTXDI_Luminance(RAB_GetReflectedBsdfRadianceForSurface(sample.position, sample.radiance, s)) / sample.solidAnglePdf;
 }
@@ -541,34 +550,11 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
   } else {
     s.solidAnglePdf = 1.0;
   }
-  if ((surface.flags & 64u) != 0u) {
-    // Game lamp response (lighting_0xCA3D8596 :1378-1442) from the lamp centre: colour x attenuation x cone x
-    // max(N.L, translucency). The sampled position keeps soft shadows; the wrap is clamped at 0 so the RIS target stays
-    // non-negative where a lamp has no translucency.
-    float3 game_color = max(surface.material.character
-        ? lp.charaColor * g_restir.char_lamp_intensity
-        : lp.color * (g_restir.lamp_material_scale != 0u ? surface.lampScale : 1.0), 0.0);
-    const float3 to_c = lp.pos - surface.worldPos;
-    const float3 l_c = normalize(to_c);
-    game_color *= LampDistanceAttenuation(lp, to_c);
-    if (info.type == LAMP_TYPE_SPOT) game_color *= LampSpotCone(lp, l_c);
-    if (g_restir.local_clamp_enabled != 0u) game_color = min(game_color, float3(g_restir.local_clamp, g_restir.local_clamp, g_restir.local_clamp));
-    s.radiance = game_color * max(max(dot(surface.normal, l_c), lp.translucency * g_restir.lamp_wrap_scale), 0.0)
-        * g_restir.lamp_intensity;
-    s.position = center;
-    return s;
-  }
   float3 color = max(surface.material.character ? lp.charaColor * g_restir.char_lamp_intensity : lp.color, 0.0);
   color *= LampDistanceAttenuation(lp, to) * surface.lampScale;
   if (info.type == LAMP_TYPE_SPOT) color *= LampSpotCone(lp, l);
-  // The game's environment lamp response is colour x max(N.L, translucency) (lighting_0xCA3D8596); times the Lambert
-  // cos this restores the wrap on pure-Lambert surfaces only, so no specular lobe is scaled.
-  const float cos_l = dot(surface.normal, l);
-  const float wrap = lp.translucency * g_restir.lamp_wrap_scale;
-  if ((surface.flags & 32u) != 0u && wrap > 0.0 && cos_l > 1e-4)
-    color *= max(wrap, cos_l) / cos_l;
   if (g_restir.local_clamp_enabled != 0u) color = min(color, float3(g_restir.local_clamp, g_restir.local_clamp, g_restir.local_clamp));
-  s.radiance = color * (3.14159265 * s.solidAnglePdf);
+  s.radiance = color * (3.14159265 * s.solidAnglePdf) * g_restir.lamp_intensity;
   s.position = center;
   return s;
 }
@@ -847,19 +833,44 @@ void PtSampleNee(RAB_Surface surface, inout RTXDI_RandomSamplerState rng, out fl
   scatter_pdf = RAB_SurfaceEvaluateBrdfPdf(surface, l);
 }
 
-// The game's lamp response with ray-traced visibility from a fresh lamp-only NEE sample (A23b), for environment and
-// characters. 64u selects the game-response target; it stays on this local copy and never reaches a reservoir.
-// g_restir.nee has no BRDF samples, so the candidate source pdf is the light pmf only.
+// The game's lamp response (lighting_0xCA3D8596 :1378-1442) summed over this pixel's tile cell, for environment and
+// characters: colour x attenuation x cone x max(N.L, translucency) from each lamp centre. One lamp, picked in proportion
+// to its response, traces one shadow ray to a sphere sample, so the estimate is bounded by the unshadowed sum (A24a).
 float3 PtGameLamp(RAB_Surface surface, inout RTXDI_RandomSamplerState rng) {
-  RAB_Surface game_surface = surface;
-  game_surface.flags |= 64u;
-  float3 radiance_from_lights;
-  RTXDI_SampledLightData light_data;
-  float nee_pdf, scatter_pdf;
-  RAB_LightSample light_sample;
-  PtSampleNee(game_surface, rng, radiance_from_lights, light_data, nee_pdf, scatter_pdf, light_sample, false);
-  if (nee_pdf <= 0.0 || RTXDI_SampledLightData_GetLightIndex(light_data) >= g_lamp_count) return 0.0;
-  return light_sample.radiance * PtLightVisibility(surface, light_sample.position) / nee_pdf;
+  uint cell = 0u;
+  if (!PtGetLightTileCell(surface, cell)) return 0.0;
+  const LightIndexData tile = g_pt_tiles[cell];
+  uint point_count, entry_count;
+  if (PtTileUsableEntries(tile, point_count, entry_count) == 0u) return 0.0;
+  float3 selected_response = 0.0;
+  uint selected_index = 0u;
+  float response_sum = 0.0;
+  for (uint entry = 0u; entry < entry_count; ++entry) {
+    const int listed = PtTileEntry(tile, entry, point_count);
+    if (listed < 0) continue;
+    const LightParam lp = g_pt_lights[uint(listed)];
+    const float3 to_c = lp.pos - surface.worldPos;
+    const float3 l_c = normalize(to_c);
+    float3 color = max(surface.material.character
+        ? lp.charaColor * g_restir.char_lamp_intensity
+        : lp.color * (g_restir.lamp_material_scale != 0u ? surface.lampScale : 1.0), 0.0);
+    color *= LampDistanceAttenuation(lp, to_c);
+    if (g_pt_light_table[uint(listed)].type == LAMP_TYPE_SPOT) color *= LampSpotCone(lp, l_c);
+    if (g_restir.local_clamp_enabled != 0u) color = min(color, float3(g_restir.local_clamp, g_restir.local_clamp, g_restir.local_clamp));
+    const float3 response = color * max(max(dot(surface.normal, l_c), lp.translucency * g_restir.lamp_wrap_scale), 0.0)
+        * g_restir.lamp_intensity;
+    const float weight = RTXDI_Luminance(response);
+    response_sum += weight;
+    if (weight > 0.0 && RTXDI_GetNextRandom(rng) * response_sum < weight) {
+      selected_response = response;
+      selected_index = uint(listed);
+    }
+  }
+  if (response_sum <= 0.0) return 0.0;
+  const float2 uv = float2(RTXDI_GetNextRandom(rng), RTXDI_GetNextRandom(rng));
+  const RAB_LightSample light_sample = RAB_SamplePolymorphicLight(RAB_LoadLightInfo(selected_index, false), surface, uv);
+  return selected_response * (response_sum / RTXDI_Luminance(selected_response))
+         * PtLightVisibility(surface, light_sample.position);
 }
 
 #endif  // FALCOM_WORLD_PT_BRIDGE_HLSLI

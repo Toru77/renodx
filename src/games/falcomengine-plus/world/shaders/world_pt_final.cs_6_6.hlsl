@@ -243,8 +243,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 #if !defined(PT_WATER_SURFACE)
   float3 game_lamp = 0.0;
   if (pt_direct && game_mix > 0.0) {
-    // The game's lamp response with RT visibility from a fresh lamp-only NEE sample (A20 C2, A23b), so lamps never
-    // compete with indirect paths inside the unified reservoir. Environment and characters share it.
+    // The game's lamp response over the pixel's tile list with RT visibility (A24a). The estimate is bounded by the
+    // unshadowed tile sum, so it is added unclamped. Environment and characters share it.
     RTXDI_RandomSamplerState lamp_rng = RTXDI_InitRandomSampler(id.xy, g_frame, 13u);
     game_lamp = PtGameLamp(surface, lamp_rng);
   }
@@ -294,8 +294,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         ? raw_specular : min(raw_specular, g_refl_sample_clamp);
     const float3 char_spec = g_refl_enabled != 0u ? clamped : 0.0;
     g_pt_specular[id.xy] = pt_direct
-        ? float4(char_spec + surface.material.diffuseAlbedo * PtClampLuminance(game_lamp, g_restir.direct_clamp) * game_mix,
-                 1.0)
+        ? float4(char_spec + surface.material.diffuseAlbedo * game_lamp * game_mix, 1.0)
         : float4(0, 0, 0, 0);
   } else if (g_refl_enabled == 0u) {
     g_pt_specular[id.xy] = float4(0, 0, 0, 0);
