@@ -529,9 +529,10 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
       if (shader_injection_data.char_shadow_mode >= 0.5f) {
         r3.z = r3.z * saturate(r5.z);
       }
+      const float charCsm = shadowTexture.SampleLevel(samLinear_s, min(shadowUVClamp_g.xy, v1.xy), 0).x;
       if (shader_injection_data.pt_sun_vis_bound > 0.5f) {
         const float4 v = ptSunVisibility_g.Load(int3(v0.xy, 0));
-        if (v.a >= 0.0f) r3.z *= v.a;
+        r3.z *= (v.a >= 0.0f) ? v.a : charCsm;
       }
       // Character sun toon share: the game sun is lerp(shadow, lit, V); the physical share comes from t48 (A24b).
       if (shader_injection_data.pt_direct_bound > 0.5f && ptGiValid) {

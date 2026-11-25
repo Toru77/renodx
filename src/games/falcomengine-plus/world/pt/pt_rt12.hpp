@@ -590,7 +590,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
       return fallback(pt::PtReason::TargetFailed);
     }
   }
-  const bool game_sun_shadows = pt::g_restir_game_sun_shadows > 0.5f || pt::g_restir_direct > 0.5f;
+  const bool game_sun_shadows = pt::g_restir_game_sun_shadows > 0.5f;
   Rt12Shared& sun_vis = r.sun_visibility[k];
   if (game_sun_shadows && (!sun_vis.texture11 || sun_vis.width != w || sun_vis.height != h)) {
     RetireShared(s, sun_vis, s.last_signal);

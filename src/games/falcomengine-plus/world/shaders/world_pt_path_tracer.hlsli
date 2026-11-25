@@ -236,10 +236,11 @@ bool PtDetermineOutgoingRay(inout RTXDI_PathTracerContext<PTContextType> ctx,
 template<typename PTContextType>
 void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_PathTracerRandomContext rng,
                   inout RAB_PathTracerUserData ud) {
-  // Reservoir direct light streams in every mode; the Toon Amounts only weight it at final shading (A24b).
   if (g_restir.direct_enabled == 0u) return;
   const RAB_Surface surface = ctx.GetIntersectionSurface();
   if (!RAB_IsSurfaceValid(surface)) return;
+  // A light type whose Toon Amount is 1 has zero physical radiance here (A25 R1), so its candidates are skipped.
+  const bool character = surface.material.character;
   uint cell = 0u;
   const bool tile_valid = PtGetLightTileCell(surface, cell);
   RTXDI_DIReservoir local_reservoir = RTXDI_EmptyDIReservoir();
@@ -247,7 +248,7 @@ void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_
   // Every usable entry of this pixel's game tile cell is a candidate: the only lights with a non-zero target
   // (world_rtxdi_initial_di.cs_6_5.hlsl:132-167). RIS over the full set gives W = sum(target) / target(y), so the
   // local estimate is the tile's unshadowed lamp sum and one shadow ray supplies visibility (A24a).
-  if (tile_valid) {
+  if (tile_valid && (character ? g_restir.char_lamp_toon : g_restir.lamp_toon) < 1.0) {
     const LightIndexData tile = g_pt_tiles[cell];
     uint point_count, entry_count;
     if (PtTileUsableEntries(tile, point_count, entry_count) != 0u) {
@@ -275,7 +276,8 @@ void PtPrimaryNee(inout RTXDI_PathTracerContext<PTContextType> ctx, inout RTXDI_
   RAB_LightSample sun_sample = RAB_EmptyLightSample();
   // One infinite-light sample (InitialSampling.hlsli:375-399), keeping the IS-FAST uv source.
   const RAB_LightInfo sun_info = RAB_LoadLightInfo(g_lamp_count, false);
-  if (sun_info.index != RTXDI_LIGHT_TABLE_INVALID_INDEX) {
+  if (sun_info.index != RTXDI_LIGHT_TABLE_INVALID_INDEX
+      && (character ? g_restir.char_sun_toon : g_restir.sun_toon) < 1.0) {
     const float2 sun_uv = (g_restir.isfast_light_jitter != 0u)
         ? asfloat(g_pt_noise.Load(int3(surface.pixel.x % 128u, surface.pixel.y % 128u + 128u * (g_frame % 32u), 0)).xy)
         : RTXDI_RandomlySelectInfiniteLightUV(rng.initialRandomSamplerState);

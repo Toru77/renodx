@@ -259,10 +259,6 @@ void main(uint3 id : SV_DispatchThreadID) {
   if (is_direct) {
     diffuse = PtClampLuminance(diffuse, g_restir.direct_clamp);
     specular = PtClampLuminance(specular, g_restir.direct_clamp);
-    // The physical direct part takes the share the game toon shading leaves (A24b).
-    const float toon = sun_sample ? (character ? g_restir.char_sun_toon : g_restir.sun_toon) : lamp_toon;
-    diffuse *= 1.0 - toon;
-    specular *= 1.0 - toon;
   }
   const float3 raw_specular = PtInvalidPixelGuard(specular);
   diffuse = PtInvalidPixelGuard(diffuse);

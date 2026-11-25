@@ -508,6 +508,10 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
     // Lambert BRDF divides by pi, and an area light spreads that over its solid angle: radiance = pi x colour / Omega,
     // where 1 / Omega = solidAnglePdf (delta lights use pdf 1).
     s.radiance = max(g_pt_sun_color, 0.0) * (3.14159265 * s.solidAnglePdf) * g_restir.sun_intensity;
+    // G-buffer primaries take the physical share the game toon shading leaves (A25 R1); bounces stay fully physical.
+    if ((surface.flags & 8u) != 0u) {
+      s.radiance *= 1.0 - (surface.material.character ? g_restir.char_sun_toon : g_restir.sun_toon);
+    }
     s.position = surface.worldPos + direction * kPtFarLightDistance;
     return s;
   }
@@ -555,6 +559,9 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo info, RAB_Surface surfa
   if (info.type == LAMP_TYPE_SPOT) color *= LampSpotCone(lp, l);
   if (g_restir.local_clamp_enabled != 0u) color = min(color, float3(g_restir.local_clamp, g_restir.local_clamp, g_restir.local_clamp));
   s.radiance = color * (3.14159265 * s.solidAnglePdf) * g_restir.lamp_intensity;
+  if ((surface.flags & 8u) != 0u) {
+    s.radiance *= 1.0 - (surface.material.character ? g_restir.char_lamp_toon : g_restir.lamp_toon);
+  }
   s.position = center;
   return s;
 }
