@@ -474,7 +474,7 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
       if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
       return;
     }
-    if ((mode == 41 || mode == 42) && (cortaoMrtFlags & 8u) == 0u) {
+    if ((mode == 41 || mode == 42 || mode == 43) && (cortaoMrtFlags & 8u) == 0u) {
       // CORTAO Ambient AO (M6f): characters never reach the environment ambient add; shown black.
       o0.rgb = float3(0.0, 0.0, 0.0);
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy;
@@ -1094,6 +1094,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       if (cortaoSpecOcc) {
         // CORTAO Specular Occlusion (M7): factor the raw cubemap sample before the SSR blend.
         cortaoSoFactor = FalcomCortaoSpecularOcclusion(r5.x, cortaoSoAxis, FalcomSafeNormalize3(r22.xyz, cortaoSoAxis), saturate(r15.z));
+        if (shader_injection_data.cortao_specular_strength != 1.0f) cortaoSoFactor = saturate(lerp(1.0, cortaoSoFactor, shader_injection_data.cortao_specular_strength));  // CORTAO M8
         dynCubeSampleColA *= cortaoSoFactor;
       }
       r21.xyz = dynCubeSampleColA;
@@ -1195,6 +1196,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       if (cortaoSpecOcc) {
         // CORTAO Specular Occlusion (M7): factor the raw cubemap sample before SSR/resolve.
         cortaoSoFactor = FalcomCortaoSpecularOcclusion(r5.x, cortaoSoAxis, FalcomSafeNormalize3(r21.xyz, cortaoSoAxis), saturate(r15.z));
+        if (shader_injection_data.cortao_specular_strength != 1.0f) cortaoSoFactor = saturate(lerp(1.0, cortaoSoFactor, shader_injection_data.cortao_specular_strength));  // CORTAO M8
         dynCubeSampleColB *= cortaoSoFactor;
       }
       r21.xyz = dynCubeSampleColB;
@@ -1286,8 +1288,12 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   }
   // CORTAO Occlude Shadow Fill (M6e): the game's AO formula on the shadow-side fill (r10 = sceneShadowColor_g term)
   // before the sun ramp, so only the shadow side is occluded.
+  // CORTAO M8: the fill AO weight, scaled by Shadow Fill AO Strength when it is not 1.
+  float cortaoFillK = (1.0 - r5.x) * r17.z * mapAOIntensity_g;
+  if (shader_injection_data.cortao_shadow_fill_strength != 1.0f)
+    cortaoFillK = saturate(cortaoFillK * shader_injection_data.cortao_shadow_fill_strength);
   if (cortaoAmbientOnly && shader_injection_data.cortao_shadow_fill > 0.5f)
-    r10.xyz = (r10.xyz * mapAOColor_g.xyz - r10.xyz) * ((1.0 - r5.x) * r17.z * mapAOIntensity_g) + r10.xyz;
+    r10.xyz = (r10.xyz * mapAOColor_g.xyz - r10.xyz) * cortaoFillK + r10.xyz;
   r15.yzw = float3(1,1,1) + -r10.xyz;
   r10.xyz = r2.xxx * r15.yzw + r10.xyz;
   r2.x = log2(r3.z);
@@ -1411,7 +1417,21 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   }
   // CORTAO Ambient Only (M6c): the game's AO formula on the ambient term (r13) instead of the final colour.
   const float3 cortaoAmbientIn = r13.xyz;
-  if (cortaoAmbientOnly) r13.xyz = (r13.xyz * mapAOColor_g.xyz - r13.xyz) * ((1.0 - r5.x) * r17.z * mapAOIntensity_g) + r13.xyz;
+  // CORTAO M8: the ambient AO weight, scaled by Ambient AO Strength when it is not 1.
+  float cortaoAmbientK = (1.0 - r5.x) * r17.z * mapAOIntensity_g;
+  if (shader_injection_data.cortao_ambient_strength != 1.0f)
+    cortaoAmbientK = saturate(cortaoAmbientK * shader_injection_data.cortao_ambient_strength);
+  if (cortaoAmbientOnly) r13.xyz = (r13.xyz * mapAOColor_g.xyz - r13.xyz) * cortaoAmbientK + r13.xyz;
+  if ((int)shader_injection_data.gtvbao_debug_view == 43) {
+    // CORTAO Shadow Fill AO (M8): the multiplier applied to the shadow-side fill, grey like Final AO. Neutral when
+    // Occlude Shadow Fill is off, so the view shows no AO there.
+    const float3 cortaoFillMul = (cortaoAmbientOnly && shader_injection_data.cortao_shadow_fill > 0.5f)
+        ? (mapAOColor_g.xyz - 1.0) * cortaoFillK + 1.0 : float3(1.0, 1.0, 1.0);
+    o0.rgb = saturate(dot(cortaoFillMul, float3(0.298999995, 0.587000012, 0.114))).xxx * 0.3;
+    o0.a = 1.0; o1.xyzw = uint4(0, 255 * saturate(0.1 * r16.w), 0, 0); o2.x = 0; o2.y = min(0xffff, (uint)(65.535 * r18.x));
+    if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+    return;
+  }
   if ((int)shader_injection_data.gtvbao_debug_view == 42) {
     // CORTAO Specular Occlusion (M7): the factor applied to the raw cubemap sample, grey like Final AO.
     o0.rgb = saturate(cortaoSoFactor).xxx * 0.3;
@@ -1423,7 +1443,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     // CORTAO Ambient AO (M6f): the multiplier M6c applies to the probe ambient r13, (tint - 1) * k + 1 with the game's
     // AO strength and tint, shown as luminance like Final AO. Neutral where Ambient Only does not apply (incl. PT GI).
     const float3 cortaoAmbientMul = cortaoAmbientOnly
-        ? (mapAOColor_g.xyz - 1.0) * ((1.0 - r5.x) * r17.z * mapAOIntensity_g) + 1.0 : float3(1.0, 1.0, 1.0);
+        ? (mapAOColor_g.xyz - 1.0) * cortaoAmbientK + 1.0 : float3(1.0, 1.0, 1.0);
     o0.rgb = saturate(dot(cortaoAmbientMul, float3(0.298999995, 0.587000012, 0.114))).xxx * 0.3;
     o0.a = 1.0; o1.xyzw = uint4(0, 255 * saturate(0.1 * r16.w), 0, 0); o2.x = 0; o2.y = min(0xffff, (uint)(65.535 * r18.x));
     if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
