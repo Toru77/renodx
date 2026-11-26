@@ -58,6 +58,7 @@ static const std::unordered_map<std::string_view, std::string_view> kSectionCate
     {"GTVBAO Temporal Accumulation", "Ambient Occlusion"},
     {"GTVBAO Spatial Filter", "Ambient Occlusion"},
     {"CORTAO", "Ambient Occlusion"},
+    {"CORTAO Temporal Accumulation", "Ambient Occlusion"},
     {"Foliage Grass AO", "Ambient Occlusion"},
     {"GTVBGI", "Indirect Lighting"},
     {"GTVBGI Temporal Accumulation", "Indirect Lighting"},

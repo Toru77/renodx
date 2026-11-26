@@ -762,6 +762,11 @@ static float g_cortao_intensity = 1.f;
 static float g_cortao_ambient_only = 0.f;  // CORTAOAmbientOnly: 1 = apply the t22 AO to ambient light only
 static float g_cortao_temporal_noise = 1.f;
 static float g_cortao_noise_type = 0.f;  // CORTAONoiseType: 0 CORTAO, 1 Hilbert, 2 IS-FAST
+static float g_cortao_temporal_enabled = 0.f;  // CortaoTemporalEnabled: SVGF reprojection of the CORTAO AO (README "Filtering")
+static float g_cortao_history_weight = 0.8f;   // CortaoHistoryWeight
+static float g_cortao_history_length = 128.f;  // CortaoSvgfHistoryLength
+static float g_cortao_depth_rejection = 0.2f;  // CortaoDepthRejection
+static float g_cortao_normal_rejection = 0.f;  // CortaoNormalRejection
 static float g_cortao_mip_bias = -4.f;
 static float g_cortao_max_slope_compensation = 4.f;
 static float g_cortao_backface_threshold = 0.5f;
@@ -1269,6 +1274,14 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   falcom_world::denoise::TextureSet<1> cortao_occlusion_bent = {};
   falcom_world::denoise::TextureSet<1> cortao_bent_normal = {};
   uint64_t cortao_bent_frame = UINT64_MAX;
+  // CORTAO temporal accumulation (M6b): this technique's reset-rule state.
+  bool cortao_temporal_last = false;
+  uint64_t cortao_last_frame = UINT64_MAX;
+  uint32_t cortao_seen_w = 0u;
+  uint32_t cortao_seen_h = 0u;
+  CortaoPushConstants cortao_prev_key = {};
+  bool cortao_prev_key_valid = false;
+  float cortao_prev_history_length = 0.f;
   reshade::api::pipeline_layout cortao_filter_layout = {};
   reshade::api::pipeline cortao_filter_pipeline = {};
   int cortao_filter_pipeline_key = -1;
@@ -13052,6 +13065,13 @@ static void DestroyCortaoResources(reshade::api::device* dev, DeviceData* d) {
   d->cortao_main_pipeline_key = -1;
   d->cortao_filter_pipeline_key = -1;
   d->cortao_bent_frame = UINT64_MAX;
+  d->cortao_temporal_last = false;
+  d->cortao_last_frame = UINT64_MAX;
+  d->cortao_seen_w = 0u;
+  d->cortao_seen_h = 0u;
+  d->cortao_prev_key = {};
+  d->cortao_prev_key_valid = false;
+  d->cortao_prev_history_length = 0.f;
 }
 
 // ----------- Contact Shadows (customshaders/shadows/*.cs_5_0.hlsl) -----------
@@ -16104,6 +16124,13 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
     return false;
   }
 
+  const bool rr_bypass = falcom_world::rr::RrOwnsDenoise();
+  const bool temporal_wanted = g_cortao_temporal_enabled > 0.5f && (IsSora1st() || IsSora2nd() || IsKai())
+                               && g_cpuopt_deferred_dispatch < 0.5f && !rr_bypass;
+  if (g_cortao_temporal_enabled > 0.5f && !temporal_wanted)
+    CortaoLog(std::string("temporal off: deferred=") + std::to_string(g_cpuopt_deferred_dispatch > 0.5f) + " rr=" + std::to_string(rr_bypass), true);
+  if (temporal_wanted && d->cortao_last_frame == d->frame_index) return true;  // one accumulation per frame (GTVBAO rule)
+
   CreateComputePipelinesIfNeeded(dev, d);
   if (!EnsureCortaoResources(dev, d, w, h)) return false;
   if (!d->cortao_prepass_pipeline.handle || !d->cortao_main_pipeline.handle) {
@@ -16142,12 +16169,13 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
   const auto CS = reshade::api::shader_stage::all_compute;
+  const bool motion_ok = temporal_wanted && UpdateRtMotion(dev, d, true);
   const denoise::ComputePipelineDesc kCortaoUpsampleDesc = {.srv_count = denoise::kUpsampleSrvCount, .uav_count = denoise::kUpsampleUavCount, .sampler_count = 0u, .push_count = denoise::kUpsamplePushCount, .code = __gtvbao_svgf_upsample, .name = "gtvbao upsample", .log_enabled = g_cortao_debug_log > 0.5f};
   denoise::DenoiseReady ready = {};
   if (d->captured_mrt_normal_srv.handle != 0u && d->captured_scene_cbv_view.handle != 0u
       && denoise::EnsureComputePipeline(dev, &d->gtvbao_denoise.upsample_pipeline, kCortaoUpsampleDesc)
       && denoise::EnsureTextureSet(dev, &d->gtvbao_svgf_raw, reshade::api::format::r16g16b16a16_float, 8u, w, h)) {
-    ready = denoise::EnsureDenoise(dev, &d->gtvbao_denoise, {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = w, .trace_height = h, .full_width = w, .full_height = h, .temporal = false, .spatial = false, .log_prefix = "[cortao]", .full_resolution = false, .nearest_fallback = true, .bypass_svgf = false, .log_enabled = g_cortao_debug_log > 0.5f});
+    ready = denoise::EnsureDenoise(dev, &d->gtvbao_denoise, {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = w, .trace_height = h, .full_width = w, .full_height = h, .temporal = motion_ok, .spatial = false, .log_prefix = "[cortao]", .full_resolution = false, .nearest_fallback = true, .bypass_svgf = false, .log_enabled = g_cortao_debug_log > 0.5f});
   }
   if (!ready.ok) {
     CortaoLog("svgf chain not ready", true);
@@ -16209,6 +16237,29 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   pc.debug_mode = dbg_on ? static_cast<float>(dbg) : 0.f;
   pc.noise_type = static_cast<float>(noise_type);
   pc.noise_index = g_cortao_temporal_noise > 0.5f ? static_cast<float>(d->frame_index % 64u) : 0.f;
+
+  // Temporal reset (shared rule, world/compute/compute_state.hpp): AO-shaping push values; per-frame values excluded.
+  CortaoPushConstants key = pc;
+  key.random_seed = 0u;
+  key.noise_index = 0.f;
+  key.debug_mode = 0.f;
+  falcom_world::compute::ResetReason reset = falcom_world::compute::ResetReason::Disabled;
+  if (temporal_wanted) {
+    reset = falcom_world::compute::TemporalResetReason(falcom_world::compute::TemporalFrame{
+        .temporal_on = true,
+        .was_on = d->cortao_temporal_last,
+        .resized = d->cortao_seen_w != w || d->cortao_seen_h != h,
+        .frame = d->frame_index,
+        .last_frame = d->cortao_last_frame,
+        .guard = d->dyncube_loadingWipePending || d->frame_index < d->resize_guard_until_frame,
+        .scaled = false,
+        .params_changed = d->cortao_prev_key_valid
+                          && (std::memcmp(&key, &d->cortao_prev_key, sizeof(key)) != 0
+                              || d->cortao_prev_history_length != g_cortao_history_length),
+        .motion_ok = motion_ok});
+    if (reset != falcom_world::compute::ResetReason::None)
+      CortaoLog(std::string("temporal reset: ") + falcom_world::compute::ResetReasonName(reset));
+  }
 
   // Pass 1: prepass packs depth and view normals into mip 0 and its coarse levels.
   GtvbaoBindPipeline(cl, d->cortao_prepass_pipeline);
@@ -16287,9 +16338,9 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
                               .full_height = h,
                               .divisor = 1.f,
                               .debug_mode = 0,
-                              .svgf = {g_gtvbao_history_weight, g_gtvbao_depth_rejection, g_gtvbao_normal_rejection,
-                                       false, 1.f, g_gtvbao_svgf_luminance_edge_stop,
-                                       g_gtvbao_svgf_depth_sigma, g_gtvbao_svgf_normal_power, false, g_gtvbao_svgf_history_length, g_gtvbao_svgf_radius_scale},
+                              .svgf = {g_cortao_history_weight, g_cortao_depth_rejection, g_cortao_normal_rejection,
+                                       reset == falcom_world::compute::ResetReason::None, 1.f, g_gtvbao_svgf_luminance_edge_stop,
+                                       g_gtvbao_svgf_depth_sigma, g_gtvbao_svgf_normal_power, false, g_cortao_history_length, 1.f},
                               .luminance_weights = denoise::kSvgfLuminanceAo,
                               .upsample_intensity = 1.f,
                               .upsample_char_intensity = 1.f,
@@ -16305,12 +16356,20 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
 
   d->gtvbao_temporal_last = false;
   d->gtvbao_prev_params_valid = false;
+  d->cortao_temporal_last = ready.temporal;
+  d->cortao_last_frame = d->frame_index;
+  d->cortao_seen_w = w;
+  d->cortao_seen_h = h;
+  d->cortao_prev_key = key;
+  d->cortao_prev_key_valid = temporal_wanted;
+  d->cortao_prev_history_length = g_cortao_history_length;
   CortaoLog(std::string("run exit ok ") + std::to_string(w) + "x" + std::to_string(h)
         + " mips=" + std::to_string(d->cortao_mip_count)
         + " samples=" + std::to_string(kCortaoSampleCounts[d->cortao_main_pipeline_key % 7])
         + " filter=" + (filter_on ? ((d->cortao_filter_pipeline_key % 2) == 1 ? "large" : "small") : "off")
         + " bent=" + std::to_string(bent_on)
-        + " noise=" + (noise_type == 0 ? "cortao" : (noise_type == 1 ? "hilbert" : "isfast")));
+        + " noise=" + (noise_type == 0 ? "cortao" : (noise_type == 1 ? "hilbert" : "isfast"))
+        + " temporal=" + std::to_string(ready.temporal));
   return true;
 }
 
@@ -16960,6 +17019,16 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   }
   if (fdw_reason == DLL_PROCESS_ATTACH) {
     falcom_world::AddSvgfRows(&settings, IsAdvancedSettingsMode, IsAdvancedSettingsMode, {.prefix = "Gtvbao", .temporal_section = "GTVBAO Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBAO AO with the game motion (RTV4 target) and blends it in after validation (SVGF). Runs on Sora 1st, Sora 2nd and Kai only; off while Deferred Dispatch is On. Resets on camera cuts, frame gaps and parameter changes.", .temporal_enabled = &g_gtvbao_temporal_enabled, .full_res_denoise = &g_gtvbao_full_res_denoise, .history_weight = &g_gtvbao_history_weight, .depth_rejection = &g_gtvbao_depth_rejection, .normal_rejection = &g_gtvbao_normal_rejection, .spatial_section = "GTVBAO Spatial Filter", .spatial_enabled_tooltip = "Denoises the GTVBAO AO with the SVGF a-trous filter (depth, normal and AO edge stops). Off = no filter.", .spatial_enabled = &g_gtvbao_svgf_spatial_enabled, .iterations = &g_gtvbao_svgf_iterations, .luminance_edge_stop = &g_gtvbao_svgf_luminance_edge_stop, .depth_sigma = &g_gtvbao_svgf_depth_sigma, .normal_power = &g_gtvbao_svgf_normal_power, .half_res_iterations = &g_gtvbao_svgf_half_res_iterations, .history_length = &g_gtvbao_svgf_history_length, .radius_scale = &g_gtvbao_svgf_radius_scale, .half_res_radius_scale = &g_gtvbao_svgf_half_res_radius_scale, .default_temporal_enabled = 0.f, .default_full_res_denoise = 0.f, .default_history_weight = 0.8f, .default_history_length = 128.f, .default_depth_rejection = 0.200f, .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 1.f, .default_half_res_iterations = 1.f, .default_luminance_edge_stop = 16.f, .default_depth_sigma = 0.10f});
+    falcom_world::AddSvgfRows(&settings, []() { return CortaoSelected() && IsAdvancedSettingsMode(); }, IsAdvancedSettingsMode,
+        {.prefix = "Cortao", .temporal_section = "CORTAO Temporal Accumulation",
+         .temporal_enabled_tooltip = "Reprojects the previous frame's CORTAO AO with the game motion (RTV4 target) and blends it in after depth and normal validation (SVGF reprojection only). CORTAO relies on external temporal filtering (README \"Filtering\"). Needs Temporal Noise On to converge. Off while Deferred Dispatch is On or DLSS Ray Reconstruction owns denoising. Resets on camera cuts, frame gaps, resizes and parameter changes.",
+         .temporal_enabled = &g_cortao_temporal_enabled, .full_res_denoise = nullptr,
+         .history_weight = &g_cortao_history_weight, .depth_rejection = &g_cortao_depth_rejection,
+         .normal_rejection = &g_cortao_normal_rejection, .spatial_section = nullptr, .spatial_enabled_tooltip = nullptr,
+         .spatial_enabled = nullptr, .iterations = nullptr, .luminance_edge_stop = nullptr,
+         .history_length = &g_cortao_history_length,
+         .default_temporal_enabled = 0.f, .default_history_weight = 0.8f, .default_history_length = 128.f,
+         .default_depth_rejection = 0.2f, .default_normal_rejection = 0.f});
     falcom_world::AddSvgfRows(&settings, []() { return VbgiRowVisible(); }, IsAdvancedSettingsMode, {.prefix = "Vbgi", .temporal_section = "GTVBGI Temporal Accumulation", .temporal_enabled_tooltip = "Reprojects the previous frame's GTVBGI with the game motion and blends it in after validation. Runs only with inline dispatch.", .temporal_enabled = &g_vbgi_temporal_enabled, .full_res_denoise = &g_vbgi_full_res_denoise, .temporal_far_only = &g_vbgi_temporal_far_only, .history_weight = &g_vbgi_history_weight, .depth_rejection = &g_vbgi_depth_rejection, .normal_rejection = &g_vbgi_normal_rejection, .spatial_section = "GTVBGI Spatial Filter", .spatial_enabled_tooltip = "Denoises the final GTVBGI output with edge-aware weights (depth plane and normal). Off = no filter.", .spatial_enabled = &g_vbgi_spatial_enabled, .iterations = &g_vbgi_svgf_iterations, .luminance_edge_stop = &g_vbgi_svgf_luminance_edge_stop, .depth_sigma = &g_vbgi_svgf_depth_sigma, .normal_power = &g_vbgi_svgf_normal_power, .history_length = &g_vbgi_svgf_history_length, .radius_scale = &g_vbgi_svgf_radius_scale, .default_temporal_enabled = 1.f, .default_temporal_far_only = 1.f, .default_history_weight = 0.99f, .default_history_length = 128.f, .default_depth_rejection = 0.2f, .default_normal_rejection = 0.f, .default_spatial_enabled = 1.f, .default_iterations = 5.f, .default_luminance_edge_stop = 16.f, .default_depth_sigma = 8.f, .default_normal_power = 128.f, .default_radius_scale = 4.f});
     falcom_world::AddSettings(&settings, IsSora2nd(), IsAdvancedSettingsMode);
   }

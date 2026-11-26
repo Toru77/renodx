@@ -123,17 +123,19 @@ settings->push_back(new Setting{
         .is_visible = [visible, enabled = rows.temporal_enabled]() { return visible() && *enabled < 0.5f; },
     });
   }
-  settings->push_back(new Setting{
-      .key = prefix + "FullResDenoise",
-      .binding = rows.full_res_denoise,
-      .value_type = SettingValueType::BOOLEAN,
-      .default_value = rows.default_full_res_denoise,
-      .label = "Full Res Denoise",
-      .section = rows.temporal_section,
-      .tooltip = "Reconstruct to full resolution before temporal accumulation and spatial filtering. Uses substantially more GPU memory and processing time.",
-      .labels = {"Off", "On"},
-      .is_visible = visible,
-  });
+  if (rows.full_res_denoise != nullptr) {
+    settings->push_back(new Setting{
+        .key = prefix + "FullResDenoise",
+        .binding = rows.full_res_denoise,
+        .value_type = SettingValueType::BOOLEAN,
+        .default_value = rows.default_full_res_denoise,
+        .label = "Full Res Denoise",
+        .section = rows.temporal_section,
+        .tooltip = "Reconstruct to full resolution before temporal accumulation and spatial filtering. Uses substantially more GPU memory and processing time.",
+        .labels = {"Off", "On"},
+        .is_visible = visible,
+    });
+  }
   settings->push_back(new Setting{
       .key = prefix + "HistoryWeight",
       .binding = rows.history_weight,
@@ -189,6 +191,7 @@ settings->push_back(new Setting{
       .format = "%.2f",
       .is_visible = visible,
   });
+  if (rows.spatial_enabled == nullptr) return;  // caller without spatial rows (CORTAO: README "Filtering")
   settings->push_back(new Setting{
       .key = prefix + "SpatialEnabled",
       .binding = rows.spatial_enabled,
