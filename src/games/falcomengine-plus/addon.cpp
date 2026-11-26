@@ -4520,6 +4520,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 4.f,
         .label = "Max Slope Compensation",
         .section = "CORTAO",
+        .tooltip = "Surfaces seen at a steep angle cover less screen area, so CORTAO enlarges their occluders to keep occlusion consistent as the camera moves. This limits how far they may be enlarged. 4.0 is the recommended default; 1.0 disables slope compensation. Lower values let occluders fade out sooner (less popping, but less occlusion on slopes). Higher values are more view-independent but can pop and flicker as surfaces approach 90 degrees.",
         .min = 1.f,
         .max = 8.f,
         .format = "%.1f",
