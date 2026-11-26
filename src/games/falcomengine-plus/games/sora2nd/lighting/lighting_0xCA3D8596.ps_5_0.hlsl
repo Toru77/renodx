@@ -164,6 +164,7 @@ Texture2D<float4> depthTexture : register(t4);
 Texture2D<float4> ssaoTexture : register(t5);
 Texture2D<uint4> gtvbaoTexture : register(t22);  // GTVBAO AO (r32_uint, packed 0-255)
 Texture2D<float4> vbgiTexture : register(t23);   // VBGI indirect diffuse (R16G16B16A16)
+Texture2D<float4> cortaoBentTexture : register(t25);  // CORTAO bent normals (R8G8B8A8_SNORM: x occlusion, yzw view-space bent normal), M5
 StructuredBuffer<DeferredParam> deferredParams_g : register(t6);
 Texture2D<float4> shadowTexture : register(t7);
 Texture2D<float4> outlinePrepareTexture : register(t8);
@@ -355,6 +356,7 @@ void main(
   r1.xy = (int2)r1.xy;
   r1.zw = float2(0,0);
   r1.xyz = mrtTexture0.Load(r1.xyz).xyw;
+  const uint cortaoMrtFlags = (uint)r1.z;  // CORTAO M5: mrtTexture0.w flag word (bit 15 = the mod's foliage marker)
   mrtTexture1.GetDimensions(0, fDest.x, fDest.y, fDest.z);
   r2.xy = fDest.xy;
   r2.xy = v1.xy * r2.xy;
@@ -927,6 +929,17 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r1.x = mad((int)r3.y, 576, (int)r1.x);
   r1.x = (int)r3.x + (int)r1.x;
   r1.x = min(4607, (uint)r1.x);
+  // CORTAO bent-normal ambient (M5): the L2 SH probe ambient below is evaluated with the CORTAO bent normal
+  // (t25: x occlusion, yzw view-space bent normal) on environment pixels; the surface normal is restored after it.
+  const float3 cortaoSurfaceN = r8.xyw;
+  if (shader_injection_data.cortao_bent_bound > 0.5f && shader_injection_data.cortao_bent_ambient_strength > 0.0f && csIsCharacter < 0.5 && (cortaoMrtFlags & 0x8000u) == 0u) {
+    uint cortaoBentW, cortaoBentH;
+    cortaoBentTexture.GetDimensions(cortaoBentW, cortaoBentH);
+    const uint2 cortaoBentTexel = min(uint2(saturate(v1.xy) * float2(cortaoBentW, cortaoBentH)), uint2(cortaoBentW, cortaoBentH) - 1u);
+    const float3 cortaoBentWorld = FalcomSafeNormalize3(mul(cortaoBentTexture.Load(int3(cortaoBentTexel, 0)).yzw, (float3x3)viewInv_g), cortaoSurfaceN);
+    r8.xyw = FalcomSafeNormalize3(lerp(cortaoSurfaceN, cortaoBentWorld, saturate(shader_injection_data.cortao_bent_ambient_strength)), cortaoSurfaceN);
+    r1.y = r8.w * r8.w;
+  }
   r13.xyz = lightProbe_g[1].xyz * r8.xxx + lightProbe_g[0].xyz;
   r13.xyz = lightProbe_g[2].xyz * r8.yyy + r13.xyz;
   r13.xyz = lightProbe_g[3].xyz * r8.www + r13.xyz;
@@ -941,6 +954,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r1.y = r8.y * r8.y;
   r1.y = r8.x * r8.x + -r1.y;
   r13.xyz = lightProbe_g[8].xyz * r1.yyy + r13.xyz;
+  r8.xyw = cortaoSurfaceN;  // CORTAO M5: restore the surface normal for every non-SH term
   r13.xyz = max(float3(0,0,0), r13.xyz);
   if (ptGiValid) r13.xyz = ptGiIrradiance;  // path-traced GI replaces the probe ambient
   r14.x = viewInv_g._m30 + -r4.x;

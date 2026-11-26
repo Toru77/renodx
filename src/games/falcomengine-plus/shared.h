@@ -38,7 +38,7 @@ struct ShaderInjectData {
   // read on `char_shadow_mode >= 0.5f` and not on `== 1`. That engine code is
   // still in the Sora and Kai character/SSAO shaders.
   float char_shadow_mode;
-  float reserved_slot_19;  // RETIRED: no remaining consumer; kept for the layout.
+  float cortao_bent_bound;  // 0/1: t25 holds this frame's CORTAO bent normals for the lighting L2 SH ambient (M5); was reserved_slot_19
   float pt_sun_toon;  // Sun Toon Amount [0..1]: game sun share of environment sun light under PT direct; was the Physical Direct Light slot
   float pt_char_sun_toon;  // Character Sun Toon Amount [0..1]: game sun share on characters under PT direct; was reserved_slot_21
   float pt_direct_bound;                    // 0/1: t47/t48 carry unified PT direct light this draw; was reserved_slot_01
@@ -134,7 +134,7 @@ struct ShaderInjectData {
   float vbgi_multibounce_max_clamp; // RETIRED: no setting drives it (was SSGIMultiBounceMaxClamp), kept for the layout
   float pt_char_cast_shadow;  // Character Cast Shadow Strength [0..1]: darkens full-tint character parts in cast shadow; was reserved_slot_28
   float pt_ao_strength;  // PT Environment AO Strength [0..1] (non-character, non-foliage) applied through the game's own AO slot; was reserved_slot_29.
-  float reserved_slot_30;  // RETIRED: no remaining consumer; kept for the layout.
+  float cortao_bent_ambient_strength;  // CORTAO Bent Ambient Strength [0..1], read only while cortao_bent_bound (M5); was reserved_slot_30
   float pt_foliage_ao_strength;  // PT Foliage AO Strength [0..1], mod-marked foliage pixels (mrt0.w bit 15); was reserved_slot_31
   float vbgi_adaptive_luma_strength;  // RETIRED: no setting drives it, kept for the layout
   float rtxdi_sun_wind_transmission;  // RETIRED: unread; kept for the layout

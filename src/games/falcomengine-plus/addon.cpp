@@ -506,6 +506,7 @@ ShaderInjectData shader_injection = {
 // ----------- GTVBAO Backend � constants, types, fwd decls -----------
 
 constexpr uint32_t kLightingGtvbaoRegister = 22u;
+constexpr uint32_t kLightingCortaoBentRegister = 25u;  // t25 cortaoBentTexture: CORTAO bent normals for the SH ambient (M5)
 constexpr uint32_t kLightingVbgiRegister = 23u;     // t23 = vbgiTexture
 constexpr uint32_t kLightingPtRegister = 47u;  // t47 = ptGiTexture (world/pt path-traced GI)
 constexpr uint32_t kLightingDepthRegister = 4u;     // t4 = depthTexture (Sora)
@@ -775,6 +776,8 @@ static float g_cortao_filter_size = 1.f;
 static float g_cortao_filter_depth_sensitivity = 512.f;
 static float g_cortao_filter_normal_sensitivity = 16.f;
 static float g_cortao_bent_normals = 0.f;
+static float g_cortao_bent_ambient = 0.f;           // CORTAOBentAmbient: 1 = the lighting SH ambient uses the bent normal
+static float g_cortao_bent_ambient_strength = 1.f;  // CORTAOBentAmbientStrength [0..1]
 
 // -- Dynamic Cubemaps (Sora 2nd) � standalone t17 replacement --
 constexpr uint32_t kDynCubeRegister = 17u;         // t17 texEnvMap_g
@@ -4637,6 +4640,32 @@ renodx::utils::settings::Settings settings = {
         .label = "Bent Normals",
         .section = "CORTAO",
         .labels = {"Off", "On"},
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOBentAmbient",
+        .binding = &g_cortao_bent_ambient,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Bent Normal Ambient",
+        .section = "CORTAO",
+        .tooltip = "Evaluates the game's ambient light probe (L2 SH) with the CORTAO bent normal instead of the surface normal on environment pixels; CORTAO bent normals are meant for sampling ambient light. Needs Bent Normals On. Characters and foliage keep the surface normal.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return g_cortao_bent_normals > 0.5f; },
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOBentAmbientStrength",
+        .binding = &g_cortao_bent_ambient_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Bent Ambient Strength",
+        .section = "CORTAO",
+        .tooltip = "Blend from the surface normal (0) to the bent normal (1) for the ambient probe. 0 = identical to Off.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_cortao_bent_normals > 0.5f && g_cortao_bent_ambient > 0.5f; },
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -12116,6 +12145,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   }
   shader_injection.gtvbao_debug_view = (float)ActiveGtvbaoDebugMode();
   shader_injection.gtvbao_dedicated_bound = 0.f;
+  shader_injection.cortao_bent_bound = 0.f;
   // The lighting shaders read char_gtvbao_* for whichever technique fills t22.
   shader_injection.char_gtvbao_mode = CortaoSelected() ? g_cortao_char_mode : g_gtvbao_char_mode;
   shader_injection.char_gtvbao_mask_strength = CortaoSelected() ? g_cortao_char_mask_strength : g_gtvbao_char_mask_strength;
@@ -12312,6 +12342,32 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               &srv,
           });
       shader_injection.gtvbao_dedicated_bound = 1.f;
+    }
+  }
+  // CORTAO bent-normal ambient (M5): t25 = the newest CORTAO bent-normal output (x occlusion, yzw view-space bent
+  // normal), used by the lighting shaders for the L2 SH ambient only. Deferred dispatch writes it one frame earlier.
+  if (CortaoSelected() && g_cortao_bent_normals > 0.5f && g_cortao_bent_ambient > 0.5f) {
+    const bool fresh = dd->cortao_bent_frame != UINT64_MAX
+                       && (dd->frame_index - dd->cortao_bent_frame) <= (g_cpuopt_deferred_dispatch > 0.5f ? 1u : 0u);
+    if (dd->cortao_bent_normal.srv[0].handle != 0u && fresh) {
+      cmd_list->push_descriptors(
+          reshade::api::shader_stage::pixel,
+          reshade::api::pipeline_layout{0},
+          0,
+          reshade::api::descriptor_table_update{
+              {},
+              kLightingCortaoBentRegister,
+              0,
+              1,
+              reshade::api::descriptor_type::texture_shader_resource_view,
+              &dd->cortao_bent_normal.srv[0],
+          });
+      shader_injection.cortao_bent_bound = 1.f;
+      shader_injection.cortao_bent_ambient_strength = std::clamp(g_cortao_bent_ambient_strength, 0.f, 1.f);
+      CortaoLog("bent ambient bound t25");
+    } else {
+      CortaoLog(std::string("bent ambient not bound: output=") + std::to_string(dd->cortao_bent_normal.srv[0].handle != 0u)
+                + " fresh=" + std::to_string(fresh));
     }
   }
 

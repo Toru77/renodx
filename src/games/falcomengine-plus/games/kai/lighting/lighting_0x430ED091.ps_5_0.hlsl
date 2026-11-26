@@ -225,6 +225,7 @@ Texture3D<float4> atmosphereExtinctionLUT : register(t20);
 Texture2D<float4> texMirror_g : register(t21);
 Texture2D<uint> gtvbaoTexture : register(t22);
 Texture2D<float4> gtvbaoVBGITexture : register(t23);
+Texture2D<float4> cortaoBentTexture : register(t25);  // CORTAO bent normals (R8G8B8A8_SNORM: x occlusion, yzw view-space bent normal), M5
 Texture3D<float2> isfast_noise : register(t24);
 // Shared Dynamic Cubemap + SSR bindings (same slots as Sora 2nd; pushed unconditionally by the addon).
 TextureCube<float4> dynCubeHistPosTex : register(t29);   // temporal history world pos (a = validity)
@@ -1000,6 +1001,17 @@ void main(
   r5.z = min(4607, (uint)r5.z);
   r6.w = lightIndices_g[r5.z].lightProbeCount;
   r6.w = min(14, (uint)r6.w);
+  // CORTAO bent-normal ambient (M5): the L2 SH probe ambient below is evaluated with the CORTAO bent normal
+  // (t25: x occlusion, yzw view-space bent normal) on environment pixels; the surface normal is restored after it.
+  const float3 cortaoSurfaceN = r5.xyw;
+  if (shader_injection_data.cortao_bent_bound > 0.5f && shader_injection_data.cortao_bent_ambient_strength > 0.0f && is_environment_pixel) {
+    uint cortaoBentW, cortaoBentH;
+    cortaoBentTexture.GetDimensions(cortaoBentW, cortaoBentH);
+    const uint2 cortaoBentTexel = min(uint2(saturate(v1.xy) * float2(cortaoBentW, cortaoBentH)), uint2(cortaoBentW, cortaoBentH) - 1u);
+    const float3 cortaoBentWorld = FalcomSafeNormalize3(mul(cortaoBentTexture.Load(int3(cortaoBentTexel, 0)).yzw, (float3x3)viewInv_g), cortaoSurfaceN);
+    r5.xyw = FalcomSafeNormalize3(lerp(cortaoSurfaceN, cortaoBentWorld, saturate(shader_injection_data.cortao_bent_ambient_strength)), cortaoSurfaceN);
+    r3.y = r5.w * r5.w;
+  }
   r3.y = r3.y * 3 + -1;
   r7.z = r5.y * r5.y;
   r7.z = r5.x * r5.x + -r7.z;
@@ -1097,6 +1109,7 @@ void main(
   r12.xyz = r15.xyz * r5.xxx + r12.xyz;
   r12.xyz = lightProbe_g[7].xyz * r3.yyy + r12.xyz;
   r12.xyz = lightProbe_g[8].xyz * r7.zzz + r12.xyz;
+  r5.xyw = cortaoSurfaceN;  // CORTAO M5: restore the surface normal for every non-SH term
   r12.xyz = r12.xyz * r6.www;
   r12.xyz = r7.www ? r12.xyz : 0;
   r12.xyz = max(float3(0,0,0), r12.xyz);

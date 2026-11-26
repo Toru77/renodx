@@ -185,6 +185,7 @@ Texture2D<float4> depthTexture : register(t4);
 Texture2D<float4> ssaoTexture : register(t5);
 Texture2D<uint4> gtvbaoTexture : register(t22);  // GTVBAO AO (r32_uint, packed 0-255)
 Texture2D<float4> vbgiTexture : register(t23);   // VBGI indirect diffuse (R16G16B16A16)
+Texture2D<float4> cortaoBentTexture : register(t25);  // CORTAO bent normals (R8G8B8A8_SNORM: x occlusion, yzw view-space bent normal), M5
 StructuredBuffer<DeferredParam> deferredParams_g : register(t6);
 StructuredBuffer<OutlineShapeParam> outlineShapes_g : register(t7);
 Texture2D<float4> outlineShapeMask : register(t8);
@@ -249,6 +250,7 @@ void main(
   r1.xy = (int2)r1.xy;
   r1.zw = float2(0,0);
   r1.xyz = mrtTexture0.Load(r1.xyz).xyw;
+  const uint cortaoMrtFlags = (uint)r1.z;  // CORTAO M5: mrtTexture0.w flag word (bit 15 = the mod's foliage marker)
   mrtTexture1.GetDimensions(0, fDest.x, fDest.y, fDest.z);
   r2.xy = fDest.xy;
   r2.xy = v1.xy * r2.xy;
@@ -694,6 +696,17 @@ void main(
   r3.z = mad((int)r6.z, 576, (int)r3.z);
   r3.y = (int)r3.y + (int)r3.z;
   r3.y = min(4607, (uint)r3.y);
+  // CORTAO bent-normal ambient (M5): the L2 SH probe ambient below is evaluated with the CORTAO bent normal
+  // (t25: x occlusion, yzw view-space bent normal) on environment pixels; the surface normal is restored after it.
+  const float3 cortaoSurfaceN = r6.xyw;
+  if (shader_injection_data.cortao_bent_bound > 0.5f && shader_injection_data.cortao_bent_ambient_strength > 0.0f && csIsCharacter < 0.5 && (cortaoMrtFlags & 0x8000u) == 0u) {
+    uint cortaoBentW, cortaoBentH;
+    cortaoBentTexture.GetDimensions(cortaoBentW, cortaoBentH);
+    const uint2 cortaoBentTexel = min(uint2(saturate(v1.xy) * float2(cortaoBentW, cortaoBentH)), uint2(cortaoBentW, cortaoBentH) - 1u);
+    const float3 cortaoBentWorld = FalcomSafeNormalize3(mul(cortaoBentTexture.Load(int3(cortaoBentTexel, 0)).yzw, (float3x3)viewInv_g), cortaoSurfaceN);
+    r6.xyw = FalcomSafeNormalize3(lerp(cortaoSurfaceN, cortaoBentWorld, saturate(shader_injection_data.cortao_bent_ambient_strength)), cortaoSurfaceN);
+    r1.y = r6.w * r6.w;
+  }
   r11.xyz = lightProbe_g[1].xyz * r6.xxx + lightProbe_g[0].xyz;
   r11.xyz = lightProbe_g[2].xyz * r6.yyy + r11.xyz;
   r11.xyz = lightProbe_g[3].xyz * r6.www + r11.xyz;
@@ -708,6 +721,7 @@ void main(
   r1.y = r6.y * r6.y;
   r1.y = r6.x * r6.x + -r1.y;
   r11.xyz = lightProbe_g[8].xyz * r1.yyy + r11.xyz;
+  r6.xyw = cortaoSurfaceN;  // CORTAO M5: restore the surface normal for every non-SH term
   r11.xyz = max(float3(0,0,0), r11.xyz);
   r12.x = viewInv_g._m30 + -r5.x;
   r12.y = viewInv_g._m31 + -r5.y;
