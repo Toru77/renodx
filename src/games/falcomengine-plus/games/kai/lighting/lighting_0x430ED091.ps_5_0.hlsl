@@ -432,6 +432,10 @@ void main(
     uint xpacked = gtvbaoTexture.Load(int3(uint2(v1.xy * float2(xw, xh)), 0));
     GTVBAO_sample = float3(float(xpacked) / 255.0, 0.0, 0.0);
   }
+  // CORTAO M9: character AO with the Ambient AO Strength, 1 - saturate((1 - ao) * s), before Char Mask. CORTAO in t22 only;
+  // equals GTVBAO_sample.x otherwise (and at strength 1.0), so the default is bit-identical. Also read by debug mode 41.
+  const float cortaoCharAo = (GTVBAO_bound && shader_injection_data.cortao_ambient_only > 0.5f && shader_injection_data.cortao_ambient_strength != 1.0f)
+      ? 1.0 - saturate((1.0 - GTVBAO_sample.x) * shader_injection_data.cortao_ambient_strength) : GTVBAO_sample.x;
   float3 ao_sample = ssao_sample;
   if (GTVBAO_bound) {
     // GTVBAO policy: replace AO.X only. Preserve legacy AO.YZ for SSS/material compatibility.
@@ -442,9 +446,9 @@ void main(
         ao_sample.x = ssao_sample.x;  // Off: use vanilla SSAO for characters
       } else {
         float charMask = saturate(shader_injection_data.char_gtvbao_mask_strength);
-        ao_sample.x = lerp(GTVBAO_sample.x, ssao_sample.x, charMask);
+        ao_sample.x = lerp(cortaoCharAo, ssao_sample.x, charMask);  // CORTAO M9
         // Kai character shading reads AO .y (engine character AO), not .x: apply GTVBAO there too (Sora parity: mask 1 = none).
-        ao_sample.y *= lerp(GTVBAO_sample.x, 1.0, charMask);
+        ao_sample.y *= lerp(cortaoCharAo, 1.0, charMask);  // CORTAO M9
       }
     }
     if (GTVBAO_bent_normals_enabled && is_environment_pixel) {
@@ -493,6 +497,12 @@ void main(
     // question is whether a given pixel has a G-buffer normal at all, and
     // characters are forward-shaded so they typically never get one. Blacking
     // them out here would hide exactly the case worth inspecting.
+    if (is_character_pixel && GTVBAO_debug_mode_ui == 41u) {
+      // CORTAO Ambient AO (M9): characters show the character AO value with the Ambient AO Strength (before Char Mask).
+      o0 = float4(saturate(cortaoCharAo).xxx, 1.0);
+      o1 = r1;
+      return;
+    }
     if (is_character_pixel && GTVBAO_debug_mode_ui != 1u && !(GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 38u)) {
       o0 = float4(0.0, 0.0, 0.0, 1.0);
       o1 = r1;

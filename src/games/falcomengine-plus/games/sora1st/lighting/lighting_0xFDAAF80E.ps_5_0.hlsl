@@ -311,6 +311,11 @@ void main(
   // the csIsCharacter test) and CORTAO filling t22.
   const bool cortaoAmbientOnly = shader_injection_data.cortao_ambient_only > 0.5f && shader_injection_data.gtvbao_dedicated_bound > 0.5f
                                  && (cortaoMrtFlags & 8u) != 0u;
+  // CORTAO M9: character AO with the Ambient AO Strength, 1 - saturate((1 - ao) * s), before Char Mask. CORTAO in t22 only,
+  // character pixels only; skipped at 1.0 so the default is bit-identical. Also read by debug mode 41.
+  const bool cortaoCharScale = shader_injection_data.cortao_ambient_only > 0.5f && shader_injection_data.gtvbao_dedicated_bound > 0.5f
+                               && (cortaoMrtFlags & 8u) == 0u && shader_injection_data.cortao_ambient_strength != 1.0f;
+  const float cortaoCharAo = cortaoCharScale ? 1.0 - saturate((1.0 - r4.x) * shader_injection_data.cortao_ambient_strength) : r4.x;
   if (shader_injection_data.gtvbao_debug_view > 0.5f) {
     int mode = (int)shader_injection_data.gtvbao_debug_view;
     float hdr_scale = 0.3;
@@ -329,8 +334,9 @@ void main(
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
     if ((mode == 41 || mode == 42 || mode == 43) && (cortaoMrtFlags & 8u) == 0u) {
-      // CORTAO Ambient AO (M6f): characters never reach the environment ambient add; shown black.
-      o0.rgb = float3(0.0, 0.0, 0.0);
+      // CORTAO Ambient AO (M6f/M9): characters never reach the environment ambient add. Mode 41 shows the character AO value
+      // with the Ambient AO Strength (before Char Mask); modes 42 and 43 stay black (no such term on characters).
+      o0.rgb = (mode == 41) ? saturate(cortaoCharAo).xxx * 0.3 : float3(0.0, 0.0, 0.0);
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
     if (mode >= 22 && mode <= 38) {
@@ -346,6 +352,7 @@ void main(
   }
   bool is_character_pixel = (((uint)r1.z & 8u) == 0u);
   csIsCharacter = is_character_pixel ? 1.0 : 0.0;
+  if (cortaoCharScale) r4.x = cortaoCharAo;  // CORTAO M9: the game character AO tint and the Char Mask multiply both read r4.x
   uint2 mrt0_xy_raw = (uint2)r1.xy;
   r1.w = (int)r1.z & 8;
   if (r1.w == 0) {

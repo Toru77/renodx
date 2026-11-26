@@ -440,6 +440,11 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
   // the csIsCharacter test), CORTAO filling t22, no path-traced GI.
   const bool cortaoAmbientOnly = shader_injection_data.cortao_ambient_only > 0.5f && shader_injection_data.gtvbao_dedicated_bound > 0.5f
                                  && (cortaoMrtFlags & 8u) != 0u && !ptGiValid;
+  // CORTAO M9: character AO with the Ambient AO Strength, 1 - saturate((1 - ao) * s), before Char Mask. CORTAO in t22 only,
+  // character pixels only, not path-traced GI pixels; skipped at 1.0 so the default is bit-identical. Also read by debug mode 41.
+  const bool cortaoCharScale = shader_injection_data.cortao_ambient_only > 0.5f && shader_injection_data.gtvbao_dedicated_bound > 0.5f
+                               && (cortaoMrtFlags & 8u) == 0u && !ptGiValid && shader_injection_data.cortao_ambient_strength != 1.0f;
+  const float cortaoCharAo = cortaoCharScale ? 1.0 - saturate((1.0 - r5.x) * shader_injection_data.cortao_ambient_strength) : r5.x;
   if (shader_injection_data.gtvbao_debug_view > 0.5f) {
     int mode = (int)shader_injection_data.gtvbao_debug_view;
     float hdr_scale = 0.3;
@@ -475,8 +480,9 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
       return;
     }
     if ((mode == 41 || mode == 42 || mode == 43) && (cortaoMrtFlags & 8u) == 0u) {
-      // CORTAO Ambient AO (M6f): characters never reach the environment ambient add; shown black.
-      o0.rgb = float3(0.0, 0.0, 0.0);
+      // CORTAO Ambient AO (M6f/M9): characters never reach the environment ambient add. Mode 41 shows the character AO value
+      // with the Ambient AO Strength (before Char Mask); modes 42 and 43 stay black (no such term on characters).
+      o0.rgb = (mode == 41) ? saturate(cortaoCharAo).xxx * 0.3 : float3(0.0, 0.0, 0.0);
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy;
       if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
       return;
@@ -533,6 +539,7 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
   csIsCharacter = (r3.z == 0) ? 1.0 : 0.0;
   if (r3.z == 0) {
     if (ptGiValid) r5.x = ptAo;
+    if (cortaoCharScale) r5.x = cortaoCharAo;  // CORTAO M9: the game character AO tint and the Char Mask multiply both read r5.x
     r8.yz = (uint2)r3.xx >> int2(5,10);
     r8.x = r3.x;
     r8.xyz = (int3)r8.xyz & int3(31,31,31);

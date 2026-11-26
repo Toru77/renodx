@@ -6,7 +6,7 @@
 // visibility: CORTAO AO value (1 = unoccluded). coneAxis, refl: unit world-space vectors. roughness: [0, 1]. Returns [0, 1].
 float FalcomCortaoSpecularOcclusion(float visibility, float3 coneAxis, float3 refl, float roughness) {
   const float r0 = acos(sqrt(saturate(1.0 - visibility)));
-  const float cosSpec = exp2(-3.32193 * roughness * roughness);
+  const float cosSpec = exp2(-3.32193 * max(roughness, 0.04) * max(roughness, 0.04));  // GGX lobe cone; roughness floored at 0.04 (M9: a 0 cone made mirrors black)
   const float r1 = acos(saturate(cosSpec));
   const float d = acos(clamp(dot(coneAxis, refl), -1.0, 1.0));
   const float capMin = 6.2831853 - 6.2831853 * cos(min(r0, r1));
@@ -14,7 +14,10 @@ float FalcomCortaoSpecularOcclusion(float visibility, float3 coneAxis, float3 re
   if (d <= max(r0, r1) - min(r0, r1)) area = capMin;
   else if (d >= r0 + r1) area = 0.0;
   else area = smoothstep(0.0, 1.0, 1.0 - saturate((d - abs(r0 - r1)) / (r0 + r1 - abs(r0 - r1)))) * capMin;
-  return saturate(area / max(6.2831853 * (1.0 - cosSpec), 1e-4));
+  const float so = saturate(area / max(6.2831853 * (1.0 - cosSpec), 1e-4));
+  // M9 Smooth Surface Fade (stylistic): fades the occlusion out on smooth materials, using the raw roughness. 0 = off.
+  const float fade = shader_injection_data.cortao_specular_smooth_fade;
+  return fade > 0.0f ? lerp(1.0, so, saturate(roughness / fade)) : so;
 }
 float3 FalcomCortaoBentWorld(Texture2D<float4> bentTex, float2 uv, float3x3 viewToWorld, float3 fallback) {
   uint w, h;

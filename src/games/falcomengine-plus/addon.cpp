@@ -106,7 +106,7 @@ ShaderInjectData shader_injection = {
     .cortao_ambient_strength = 1.f,
     .cortao_shadow_fill_strength = 1.f,
     .cortao_specular_strength = 1.f,
-    .reserved_slot_08 = 1.f,
+    .cortao_specular_smooth_fade = 0.f,
     .reserved_slot_09 = 0.f,
     .reserved_slot_10 = 1.f,
     .cs_contact_local_bound = 0.f,
@@ -764,6 +764,7 @@ static float g_cortao_specular_occlusion = 0.f;  // CORTAOSpecularOcclusion
 static float g_cortao_ambient_strength = 1.f;      // CORTAOAmbientStrength (M8)
 static float g_cortao_shadow_fill_strength = 1.f;  // CORTAOShadowFillStrength (M8)
 static float g_cortao_specular_strength = 1.f;     // CORTAOSpecularStrength (M8)
+static float g_cortao_specular_smooth_fade = 0.f;  // CORTAOSpecularSmoothFade (M9)
 static float g_cortao_temporal_noise = 1.f;
 static float g_cortao_noise_type = 0.f;  // CORTAONoiseType: 0 CORTAO, 1 Hilbert, 2 IS-FAST
 static float g_cortao_temporal_enabled = 0.f;  // CortaoTemporalEnabled: SVGF reprojection of the CORTAO AO (README "Filtering")
@@ -4491,7 +4492,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "AO Intensity (Master)",
         .section = "CORTAO",
-        .tooltip = "Strength of the CORTAO AO value itself, for every use (ambient, shadow fill, specular occlusion, characters): visibility = pow(visibility, this). 1.0 is physically based (CORTAO README intensity tweak). The strengths below scale each use separately.",
+        .tooltip = "Strength of the CORTAO AO value itself; affects every use, including characters (ambient, shadow fill, specular occlusion, character AO): visibility = pow(visibility, this). 1.0 is physically based (CORTAO README intensity tweak). The strengths below scale each use separately.",
         .min = 0.25f,
         .max = 4.f,
         .format = "%.2f",
@@ -4504,7 +4505,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Ambient AO Strength",
         .section = "CORTAO",
-        .tooltip = "Stylistic: scales how strongly the AO darkens the light-probe ambient. 1 = game strength; 0 = none; above 1 up to the game's full AO tint.",
+        .tooltip = "Stylistic: scales how strongly the AO darkens the light-probe ambient; applies to environment ambient and to characters (before Char Mask). 1 = game strength; 0 = none; above 1 up to the game's full AO tint.",
         .min = 0.f,
         .max = 2.f,
         .format = "%.2f",
@@ -4528,7 +4529,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Shadow Fill AO Strength",
         .section = "CORTAO",
-        .tooltip = "Stylistic: scales how strongly the AO darkens the shadow-side fill light (needs Occlude Shadow Fill). 1 = game strength; 0 = none; above 1 up to the game's full AO tint.",
+        .tooltip = "Stylistic: scales how strongly the AO darkens the shadow-side fill light (needs Occlude Shadow Fill). Environment only: characters have no shadow-fill term. 1 = game strength; 0 = none; above 1 up to the game's full AO tint.",
         .min = 0.f,
         .max = 2.f,
         .format = "%.2f",
@@ -4553,9 +4554,23 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Specular Occlusion Strength",
         .section = "CORTAO",
-        .tooltip = "Stylistic: scales how strongly Specular Occlusion darkens cubemap reflections (needs Specular Occlusion). 1 = unscaled; 0 = none; above 1 stronger, clamped to black.",
+        .tooltip = "Stylistic: scales how strongly Specular Occlusion darkens cubemap reflections (needs Specular Occlusion). Environment only: characters have no cubemap-reflection term. 1 = unscaled; 0 = none; above 1 stronger, clamped to black.",
         .min = 0.f,
         .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_cortao_specular_occlusion > 0.5f; },
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOSpecularSmoothFade",
+        .binding = &g_cortao_specular_smooth_fade,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "Smooth Surface Fade",
+        .section = "CORTAO",
+        .tooltip = "Stylistic: reduces Specular Occlusion on very smooth, mirror-like materials. Occlusion fades in from roughness 0 up to this value. 0 = off (full CORTAO specular occlusion). Unlike Specular Occlusion Strength, rough materials are not affected.",
+        .min = 0.f,
+        .max = 0.5f,
         .format = "%.2f",
         .is_enabled = []() { return g_cortao_specular_occlusion > 0.5f; },
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
@@ -4770,7 +4785,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Debug View",
         .section = "CORTAO",
-        .tooltip = "Final AO Value: the AO value the game receives (after the CORTAO filter, temporal accumulation and upsample, with AO Intensity). Raw AO: the main pass before filtering. Input Normal: the normal CORTAO used. Bent Normal: the main-pass bent normal (needs Bent Normals). Filtered AO: after the CORTAO filter, before temporal (equals Raw AO with Filter Off). Filtered Bent Normal: the bent normal Bent Normal Ambient reads (needs Bent Normals). Temporal Confidence: history age, black (new) to white (full); purple when temporal is not running. AO Target: where the AO is applied: green = ambient light (CORTAO), blue = characters, red = path-traced GI pixels. Ambient AO: the AO applied to the light-probe ambient (with Ambient AO Strength), grey on a neutral background. Specular Occlusion: the factor applied to cubemap reflections (with Specular Occlusion Strength); white = not occluded or not applied. Shadow Fill AO: the AO applied to the shadow-side fill (with Shadow Fill AO Strength); neutral when Occlude Shadow Fill is off. Characters are black in the last three. Purple = sky or not available.",
+        .tooltip = "Final AO Value: the AO value the game receives (after the CORTAO filter, temporal accumulation and upsample, with AO Intensity). Raw AO: the main pass before filtering. Input Normal: the normal CORTAO used. Bent Normal: the main-pass bent normal (needs Bent Normals). Filtered AO: after the CORTAO filter, before temporal (equals Raw AO with Filter Off). Filtered Bent Normal: the bent normal Bent Normal Ambient reads (needs Bent Normals). Temporal Confidence: history age, black (new) to white (full); purple when temporal is not running. AO Target: where the AO is applied: green = ambient light (CORTAO), blue = characters, red = path-traced GI pixels. Ambient AO: the AO applied to the light-probe ambient (with Ambient AO Strength), grey on a neutral background. Specular Occlusion: the factor applied to cubemap reflections (with Specular Occlusion Strength); white = not occluded or not applied. Shadow Fill AO: the AO applied to the shadow-side fill (with Shadow Fill AO Strength); neutral when Occlude Shadow Fill is off. Characters: Ambient AO shows the character AO value with Ambient AO Strength (before Char Mask); Specular Occlusion and Shadow Fill AO show them black. Purple = sky or not available.",
         .labels = {"Off", "Final AO Value", "Raw AO", "Input Normal", "Bent Normal", "Filtered AO", "Filtered Bent Normal", "Temporal Confidence", "AO Target", "Ambient AO", "Specular Occlusion", "Shadow Fill AO"},
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
@@ -12249,6 +12264,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   shader_injection.cortao_ambient_strength = std::clamp(g_cortao_ambient_strength, 0.f, 2.f);
   shader_injection.cortao_shadow_fill_strength = std::clamp(g_cortao_shadow_fill_strength, 0.f, 2.f);
   shader_injection.cortao_specular_strength = std::clamp(g_cortao_specular_strength, 0.f, 2.f);
+  shader_injection.cortao_specular_smooth_fade = std::clamp(g_cortao_specular_smooth_fade, 0.f, 0.5f);
   // The lighting shaders read char_gtvbao_* for whichever technique fills t22.
   shader_injection.char_gtvbao_mode = CortaoSelected() ? g_cortao_char_mode : g_gtvbao_char_mode;
   shader_injection.char_gtvbao_mask_strength = CortaoSelected() ? g_cortao_char_mask_strength : g_gtvbao_char_mask_strength;

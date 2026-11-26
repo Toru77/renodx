@@ -86,7 +86,7 @@ struct ShaderInjectData {
   float cortao_ambient_strength;       // CORTAO Ambient AO Strength [0..2] (M8, stylistic): scales the M6c ambient AO weight; 1 = game; was reserved_slot_05
   float cortao_shadow_fill_strength;   // CORTAO Shadow Fill AO Strength [0..2] (M8, stylistic): scales the M6e fill AO weight; 1 = game; was reserved_slot_06
   float cortao_specular_strength;      // CORTAO Specular Occlusion Strength [0..2] (M8, stylistic): lerp(1, so, s); 1 = unscaled; was reserved_slot_07
-  float reserved_slot_08;              // reserved: unused slot kept so later packoffsets do not move
+  float cortao_specular_smooth_fade;   // CORTAO Smooth Surface Fade [0..0.5] (M9, stylistic): fades specular occlusion out below this raw roughness; 0 = off; was reserved_slot_08
   float reserved_slot_09;              // reserved: unused slot kept so later packoffsets do not move
   float reserved_slot_10;              // reserved: unused slot kept so later packoffsets do not move
   float cs_contact_local_bound;        // runtime 0/1: t40 holds this frame's local contact term (DeployShadows)
