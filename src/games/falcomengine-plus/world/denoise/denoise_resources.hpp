@@ -139,6 +139,7 @@ struct ComputePipelineDesc {
   uint32_t push_count;
   std::span<const std::uint8_t> code;  // empty: the shader is not embedded
   const char* name;                    // log name
+  bool log_enabled = true;  // false suppresses this pipeline's log lines
 };
 
 // Creates one compute pipeline on first use (ComputePipeline layout); a failure is latched and logged once.
@@ -146,7 +147,9 @@ inline bool EnsureComputePipeline(reshade::api::device* device, ComputePipeline*
   if (p->pipeline.handle != 0u) return true;
   if (p->failed) return false;
   const auto fail = [&](const char* stage) {
-    renodx::utils::log::w("[world-denoise] ", desc.name, " pipeline creation failed: ", stage);
+    if (desc.log_enabled) {
+      renodx::utils::log::w("[world-denoise] ", desc.name, " pipeline creation failed: ", stage);
+    }
     p->failed = true;
     return false;
   };
@@ -197,7 +200,9 @@ inline bool EnsureComputePipeline(reshade::api::device* device, ComputePipeline*
   shader.entry_point = "main";
   reshade::api::pipeline_subobject subobject = {reshade::api::pipeline_subobject_type::compute_shader, 1, &shader};
   if (!device->create_pipeline(p->layout, 1, &subobject, &p->pipeline)) return fail("compute pipeline");
-  renodx::utils::log::i("[world-denoise] ", desc.name, " pipeline ready");
+  if (desc.log_enabled) {
+    renodx::utils::log::i("[world-denoise] ", desc.name, " pipeline ready");
+  }
   return true;
 }
 

@@ -757,6 +757,7 @@ static float g_cortao_max_slope_compensation = 4.f;
 static float g_cortao_backface_threshold = 0.5f;
 static float g_cortao_backface_boost = 0.5f;
 static float g_cortao_debug_view = 0.f;
+static float g_cortao_debug_log = 0.f;  // CORTAODebugLog: 1 = CORTAO writes diagnostics to ReShade.log
 
 // -- Dynamic Cubemaps (Sora 2nd) � standalone t17 replacement --
 constexpr uint32_t kDynCubeRegister = 17u;         // t17 texEnvMap_g
@@ -4511,6 +4512,17 @@ renodx::utils::settings::Settings settings = {
         .label = "Debug View",
         .section = "CORTAO",
         .labels = {"Off", "AO Only", "Raw AO", "Input Normal"},
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAODebugLog",
+        .binding = &g_cortao_debug_log,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Debug Log",
+        .section = "CORTAO",
+        .tooltip = "Writes CORTAO diagnostics (resource creation, skips, failures with reasons, run summary) to ReShade.log. Off = CORTAO writes nothing to the log. Independent of Custom Shader Log.",
+        .labels = {"Off", "On"},
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     // -- Foliage Grass AO --
@@ -8546,10 +8558,9 @@ static void ApplyGTVBAOCSDispatchFix(
 // Log mutex: destroy-event handlers can fire on loader threads while the render
 // thread logs. Recursive (handlers log through CSLog while holding it).
 static std::recursive_mutex s_cslogMutex;
-static void CSLog(const char* tag, const std::string& msg, bool warn) {
-  if (shader_injection.custom_shader_logging < 0.5f) return;
+// Throttled emitter shared by CSLog and CortaoLog (no gate of its own).
+static void CSLogEmit(const char* tag, const std::string& msg, bool warn) {
   std::lock_guard<std::recursive_mutex> csLogLock(s_cslogMutex);
-  if (shader_injection.custom_shader_logging < 0.5f) return;
   using clock = std::chrono::steady_clock;
   // Per-message suppression: alternating messages under one tag must not defeat
   // the throttle (each differs from the previous). First sight and any change log
@@ -8566,6 +8577,18 @@ static void CSLog(const char* tag, const std::string& msg, bool warn) {
   s_last[key] = now;
   reshade::log::message(warn ? reshade::log::level::warning : reshade::log::level::info,
                         (std::string("[CustomShader] ") + tag + ": " + msg).c_str());
+}
+static void CSLog(const char* tag, const std::string& msg, bool warn) {
+  if (shader_injection.custom_shader_logging < 0.5f) return;
+  std::lock_guard<std::recursive_mutex> csLogLock(s_cslogMutex);
+  if (shader_injection.custom_shader_logging < 0.5f) return;
+  CSLogEmit(tag, msg, warn);
+}
+// Every CORTAO log goes through here: nothing is written unless CORTAO Debug Log is On
+// (independent of Custom Shader Log). Same throttle as CSLog; keep rotating values out of msg.
+static void CortaoLog(const std::string& msg, bool warn = false) {
+  if (g_cortao_debug_log < 0.5f) return;
+  CSLogEmit("cortao", msg, warn);
 }
 
 // 1/sec heartbeat emitter (recency anchor). Gated by the same toggle.
@@ -9124,10 +9147,17 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   if (shader_injection.gtvbao_mode > 0.5f) {
     const std::string liveDepth = d->captured_depth_srv.handle ? d->captured_depth_dims : "none";
     const std::string wantDims = std::to_string(d->working_width) + "x" + std::to_string(d->working_height);
-    const bool dimMismatch = (liveDepth != wantDims);
-    CSLog("gtvbao", std::string("invoke working=") + wantDims + " liveDepth=" + liveDepth + " cbv=" + (d->captured_scene_cbv_valid ? "ok" : "MISSING"), dimMismatch || !d->captured_scene_cbv_valid);
-    ok = CortaoSelected() ? RunCORTAO(cl, d) : RunGTVBAO(cl, d);
-    CSLog("gtvbao", std::string("invoke exit") + (ok ? " ok" : " FAILED"), !ok);
+    const std::string invokeMsg = std::string("invoke working=") + wantDims + " liveDepth=" + liveDepth + " cbv=" + (d->captured_scene_cbv_valid ? "ok" : "MISSING");
+    const bool invokeWarn = liveDepth != wantDims || !d->captured_scene_cbv_valid;
+    if (CortaoSelected()) {
+      CortaoLog("deferred " + invokeMsg, invokeWarn);
+      ok = RunCORTAO(cl, d);
+      CortaoLog(std::string("deferred invoke exit") + (ok ? " ok" : " FAILED"), !ok);
+    } else {
+      CSLog("gtvbao", invokeMsg, invokeWarn);
+      ok = RunGTVBAO(cl, d);
+      CSLog("gtvbao", std::string("invoke exit") + (ok ? " ok" : " FAILED"), !ok);
+    }
   }
   const bool ao_ok = GtvbaoSelected() && ok;
   if (VbgiRunning()) {
@@ -12090,9 +12120,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       bool ao_ok = false;
       if (gtvbao_active && dd->ao_term_a_srv.handle) {
         if (CortaoSelected()) {
-          CSLog("cortao", "inline invoke");
+          CortaoLog("inline invoke");
           const bool ok_cortao = RunCORTAO(cmd_list, dd);
-          CSLog("cortao", std::string("inline invoke exit") + (ok_cortao ? " ok" : " FAILED"), !ok_cortao);
+          CortaoLog(std::string("inline invoke exit") + (ok_cortao ? " ok" : " FAILED"), !ok_cortao);
         } else {
           const std::string liveDepth = dd->captured_depth_srv.handle ? dd->captured_depth_dims : "none";
           const std::string wantDims = std::to_string(dd->working_width) + "x" + std::to_string(dd->working_height);
@@ -15287,14 +15317,14 @@ static bool EnsureCortaoResources(reshade::api::device* dev, DeviceData* d, uint
     sd.address_u = sd.address_v = sd.address_w = reshade::api::texture_address_mode::border;
     sd.border_color[0] = sd.border_color[1] = sd.border_color[2] = sd.border_color[3] = 0.f;
     if (!dev->create_sampler(sd, &d->cortao_border_sampler)) {
-      CSLog("cortao", "create_sampler(border) failed", true);
+      CortaoLog("create_sampler(border) failed", true);
       return false;
     }
   }
 
   if (!d->cortao_lut_texture.handle) {
     if (__cortao_occluder_lut_16.size() != 18432u) {
-      CSLog("cortao", "occluder lut size " + std::to_string(__cortao_occluder_lut_16.size()) + " != 18432", true);
+      CortaoLog("occluder lut size " + std::to_string(__cortao_occluder_lut_16.size()) + " != 18432", true);
       return false;
     }
     reshade::api::resource_desc rd = {};
@@ -15307,17 +15337,17 @@ static bool EnsureCortaoResources(reshade::api::device* dev, DeviceData* d, uint
     sub.row_pitch = 48;
     sub.slice_pitch = 1152;
     if (!dev->create_resource(rd, &sub, reshade::api::resource_usage::shader_resource, &d->cortao_lut_texture)) {
-      CSLog("cortao", "create_resource(occluder lut) failed", true);
+      CortaoLog("create_resource(occluder lut) failed", true);
       return false;
     }
     if (!dev->create_resource_view(d->cortao_lut_texture, reshade::api::resource_usage::shader_resource,
                                    reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_3d,
                                                                     reshade::api::format::r16_unorm, 0, 1, 0, 1),
                                    &d->cortao_lut_srv)) {
-      CSLog("cortao", "create_resource_view(occluder lut) failed", true);
+      CortaoLog("create_resource_view(occluder lut) failed", true);
       return false;
     }
-    CSLog("cortao", "occluder lut created 24x24x16 r16_unorm bytes=18432");
+    CortaoLog("occluder lut created 24x24x16 r16_unorm bytes=18432");
   }
 
   if (!d->cortao_packed_texture.handle || d->cortao_width != w || d->cortao_height != h) {
@@ -15333,14 +15363,14 @@ static bool EnsureCortaoResources(reshade::api::device* dev, DeviceData* d, uint
     rd.heap = reshade::api::memory_heap::gpu_only;
     rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
     if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &d->cortao_packed_texture)) {
-      CSLog("cortao", "create_resource(packed) failed", true);
+      CortaoLog("create_resource(packed) failed", true);
       return false;
     }
     if (!dev->create_resource_view(d->cortao_packed_texture, reshade::api::resource_usage::shader_resource,
                                    reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
                                                                     reshade::api::format::r32_float, 0, mips, 0, 1),
                                    &d->cortao_packed_srv)) {
-      CSLog("cortao", "create_resource_view(packed srv) failed", true);
+      CortaoLog("create_resource_view(packed srv) failed", true);
       return false;
     }
     for (uint32_t m = 0u; m < kCortaoPackedMipLevels; ++m) {
@@ -15348,20 +15378,20 @@ static bool EnsureCortaoResources(reshade::api::device* dev, DeviceData* d, uint
                                      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
                                                                       reshade::api::format::r32_float, m, 1, 0, 1),
                                      &d->cortao_packed_uavs[m])) {
-        CSLog("cortao", "create_resource_view(packed uav) failed mip=" + std::to_string(m), true);
+        CortaoLog("create_resource_view(packed uav) failed mip=" + std::to_string(m), true);
         return false;
       }
     }
     d->cortao_width = w;
     d->cortao_height = h;
     d->cortao_mip_count = mips;
-    CSLog("cortao", std::string("packed created ") + std::to_string(w) + "x" + std::to_string(h)
+    CortaoLog(std::string("packed created ") + std::to_string(w) + "x" + std::to_string(h)
                     + " mips=" + std::to_string(mips));
   }
 
   if (!d->cortao_border_sampler.handle || !d->cortao_lut_texture.handle || !d->cortao_lut_srv.handle
       || !d->cortao_packed_texture.handle || !d->cortao_packed_srv.handle) {
-    CSLog("cortao", std::string("null handles sampler=") + std::to_string(d->cortao_border_sampler.handle != 0u)
+    CortaoLog(std::string("null handles sampler=") + std::to_string(d->cortao_border_sampler.handle != 0u)
           + " lut=" + std::to_string(d->cortao_lut_texture.handle != 0u)
           + " lutSrv=" + std::to_string(d->cortao_lut_srv.handle != 0u)
           + " packed=" + std::to_string(d->cortao_packed_texture.handle != 0u)
@@ -15370,7 +15400,7 @@ static bool EnsureCortaoResources(reshade::api::device* dev, DeviceData* d, uint
   }
   for (uint32_t m = 0u; m < kCortaoPackedMipLevels; ++m) {
     if (!d->cortao_packed_uavs[m].handle) {
-      CSLog("cortao", "null handles packedUav=" + std::to_string(m), true);
+      CortaoLog("null handles packedUav=" + std::to_string(m), true);
       return false;
     }
   }
@@ -15796,7 +15826,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
 static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   namespace denoise = falcom_world::denoise;
   if (!d->captured_depth_srv.handle || !d->captured_mrt_normal_srv.handle || !d->captured_scene_cbv_view.handle) {
-    CSLog("cortao", "skipped: depth=" + std::to_string(d->captured_depth_srv.handle != 0u)
+    CortaoLog("skipped: depth=" + std::to_string(d->captured_depth_srv.handle != 0u)
           + " mrt=" + std::to_string(d->captured_mrt_normal_srv.handle != 0u)
           + " cbv=" + std::to_string(d->captured_scene_cbv_view.handle != 0u), true);
     return false;
@@ -15805,7 +15835,7 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   auto* dev = cl->get_device();
   const uint32_t w = d->working_width, h = d->working_height;
   if (w < 64u || h < 64u || w != d->captured_depth_w || h != d->captured_depth_h) {
-    CSLog("cortao", std::string("size ABORT: working=") + std::to_string(w) + "x" + std::to_string(h)
+    CortaoLog(std::string("size ABORT: working=") + std::to_string(w) + "x" + std::to_string(h)
           + " depth=" + std::to_string(d->captured_depth_w) + "x" + std::to_string(d->captured_depth_h), true);
     return false;
   }
@@ -15813,32 +15843,32 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   CreateComputePipelinesIfNeeded(dev, d);
   if (!EnsureCortaoResources(dev, d, w, h)) return false;
   if (!d->cortao_prepass_pipeline.handle || !d->cortao_main_pipeline.handle) {
-    CSLog("cortao", std::string("pipelines missing prepass=") + std::to_string(d->cortao_prepass_pipeline.handle != 0u)
+    CortaoLog(std::string("pipelines missing prepass=") + std::to_string(d->cortao_prepass_pipeline.handle != 0u)
           + " main=" + std::to_string(d->cortao_main_pipeline.handle != 0u)
           + " key=" + std::to_string(d->cortao_main_pipeline_key), true);
     return false;
   }
   if (!EnsureGTVBAODescriptorTables(dev, d->cortao_prepass_layout, &d->cortao_prepass_tables)) {
-    CSLog("cortao", "descriptor tables failed: prepass", true);
+    CortaoLog("descriptor tables failed: prepass", true);
     return false;
   }
   if (!EnsureGTVBAODescriptorTables(dev, d->cortao_main_layout, &d->cortao_main_tables)) {
-    CSLog("cortao", "descriptor tables failed: main", true);
+    CortaoLog("descriptor tables failed: main", true);
     return false;
   }
 
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
   const auto CS = reshade::api::shader_stage::all_compute;
-  static constexpr denoise::ComputePipelineDesc kCortaoUpsampleDesc = {.srv_count = denoise::kUpsampleSrvCount, .uav_count = denoise::kUpsampleUavCount, .sampler_count = 0u, .push_count = denoise::kUpsamplePushCount, .code = __gtvbao_svgf_upsample, .name = "gtvbao upsample"};
+  const denoise::ComputePipelineDesc kCortaoUpsampleDesc = {.srv_count = denoise::kUpsampleSrvCount, .uav_count = denoise::kUpsampleUavCount, .sampler_count = 0u, .push_count = denoise::kUpsamplePushCount, .code = __gtvbao_svgf_upsample, .name = "gtvbao upsample", .log_enabled = g_cortao_debug_log > 0.5f};
   denoise::DenoiseReady ready = {};
   if (d->captured_mrt_normal_srv.handle != 0u && d->captured_scene_cbv_view.handle != 0u
       && denoise::EnsureComputePipeline(dev, &d->gtvbao_denoise.upsample_pipeline, kCortaoUpsampleDesc)
       && denoise::EnsureTextureSet(dev, &d->gtvbao_svgf_raw, reshade::api::format::r16g16b16a16_float, 8u, w, h)) {
-    ready = denoise::EnsureDenoise(dev, &d->gtvbao_denoise, {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = w, .trace_height = h, .full_width = w, .full_height = h, .temporal = false, .spatial = false, .log_prefix = "[cortao]", .full_resolution = false, .nearest_fallback = true, .bypass_svgf = false});
+    ready = denoise::EnsureDenoise(dev, &d->gtvbao_denoise, {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = w, .trace_height = h, .full_width = w, .full_height = h, .temporal = false, .spatial = false, .log_prefix = "[cortao]", .full_resolution = false, .nearest_fallback = true, .bypass_svgf = false, .log_enabled = g_cortao_debug_log > 0.5f});
   }
   if (!ready.ok) {
-    CSLog("cortao", "svgf chain not ready", true);
+    CortaoLog("svgf chain not ready", true);
     return false;
   }
 
@@ -15948,7 +15978,7 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
 
   d->gtvbao_temporal_last = false;
   d->gtvbao_prev_params_valid = false;
-  CSLog("cortao", std::string("run exit ok ") + std::to_string(w) + "x" + std::to_string(h)
+  CortaoLog(std::string("run exit ok ") + std::to_string(w) + "x" + std::to_string(h)
         + " mips=" + std::to_string(d->cortao_mip_count)
         + " samples=" + std::to_string(std::lround(g_cortao_quality)));
   return true;

@@ -39,6 +39,7 @@ struct DenoiseRequest {
   bool nearest_fallback = false;
   bool history_only = false;
   bool bypass_svgf = false;  // RR owns denoising; keep input conversion and output reconstruction only.
+  bool log_enabled = true;  // false suppresses this request's log lines (CORTAO Debug Log Off)
 };
 
 // The passes the chain can run this frame (ok: the output exists).
@@ -73,7 +74,9 @@ inline DenoiseReady EnsureDenoise(reshade::api::device* device, DenoiseSet* set,
     set->mode_valid = false;
   }
   if (!request.history_only && !EnsureTextureSet(device, &set->output, request.output_format, request.output_bytes_per_pixel, request.full_width, request.full_height)) {
-    renodx::utils::log::w(request.log_prefix, " final texture creation failed");
+    if (request.log_enabled) {
+      renodx::utils::log::w(request.log_prefix, " final texture creation failed");
+    }
     set->mode_valid = false;
     return {};
   }
@@ -98,7 +101,9 @@ inline DenoiseReady EnsureDenoise(reshade::api::device* device, DenoiseSet* set,
                     && EnsureTextureSet(device, &set->history_moments, reshade::api::format::r32g32b32a32_float, 16u, denoise_width, denoise_height)
                     && EnsureTextureSet(device, &set->history_guide, reshade::api::format::r32g32b32a32_float, 16u, denoise_width, denoise_height);
     if (!reproject_run) {
-      renodx::utils::log::w(request.log_prefix, " history texture creation failed");
+      if (request.log_enabled) {
+        renodx::utils::log::w(request.log_prefix, " history texture creation failed");
+      }
     } else if (history_recreated) {
       set->history_index = 0u;
       set->mode_valid = false;
