@@ -29,6 +29,7 @@ RWTexture2D<float> g_outOcclusion : register(u1);     // filter input, R8_UNORM 
 #endif
 RWTexture2D<float4> g_outDebug : register(u3);        // u2 is the bent output (M4)
 Texture3D<float2> g_srcIsfastNoise : register(t5);    // IS-FAST 128x128x32 RG8 (fast_noise_ea.dds), M6a
+Texture2D<float> g_srcGameDepth : register(t6);       // M12 game depth for normal shaping (captured_depth_srv)
 
 static bool g_falcomCortaoMaskFoliage = false;
 cortao_uint cortao_samplePackedData(cortao_float2 texCoords, cortao_float mipmap) {
@@ -44,7 +45,7 @@ cortao_uint cortao_samplePackedData(cortao_float2 texCoords, cortao_float mipmap
   return packed;
 }
 cortao_half3 cortao_loadNormal(cortao_int2 pixelCoords) {
-  return (cortao_half3)FalcomCortaoViewNormal(g_srcMrtNormal, pixelCoords);
+  return (cortao_half3)FalcomCortaoViewNormal(g_srcMrtNormal, g_srcGameDepth, pixelCoords);
 }
 cortao_uint cortao_sampleOccluderLookupTable(cortao_float3 texCoords) {
   return (cortao_uint)(g_srcOccluderLut.SampleLevel(g_samplerPointClamp, texCoords, 0.0) * 65535.0 + 0.5); // tables/occluder/README SM 6.7 workaround

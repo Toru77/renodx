@@ -534,14 +534,15 @@ constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
 
 // -- CORTAO (customshaders/cortao) --
 constexpr uint32_t kCortaoPackedMipLevels = 8u;
-constexpr uint32_t kCortaoPushConstantFloats = 20u;
+constexpr uint32_t kCortaoPushConstantFloats = 28u;
 
 // Mirrors cb_cortao in cortao_common.hlsl; both blocks must stay in lockstep.
 struct CortaoPushConstants {
   uint32_t width, height, mip_count, random_seed;
   float max_radius, max_screenspace_radius_height_ratio, mip_bias, max_slope_compensation;
   float backface_threshold, backface_boost, filter_depth_sensitivity, filter_normal_sensitivity;
-  float intensity, filter_enabled, foliage_exclude, foliage_ao_value, debug_mode, noise_type, noise_index, pad2;
+  float intensity, filter_enabled, foliage_exclude, foliage_ao_value, debug_mode, noise_type, noise_index, normal_influence;
+  float normal_z_preservation, normal_depth_blend, normal_sharpness, normal_edge_rejection, normal_detail_response, normal_max_mrt_weight, pad2, pad3;
 };
 static_assert(sizeof(CortaoPushConstants) == kCortaoPushConstantFloats * 4u);
 
@@ -792,6 +793,13 @@ static float g_cortao_filter_normal_sensitivity = 16.f;
 static float g_cortao_bent_normals = 0.f;
 static float g_cortao_bent_ambient = 0.f;           // CORTAOBentAmbient: 1 = the lighting SH ambient uses the bent normal
 static float g_cortao_bent_ambient_strength = 1.f;  // CORTAOBentAmbientStrength [0..1]
+static float g_cortao_normal_influence = 1.f;        // CORTAONormalInfluence [0..2] (M12)
+static float g_cortao_normal_depth_blend = 1.f;      // CORTAONormalDepthBlend [0..1] (M12)
+static float g_cortao_normal_sharpness = 1.f;        // CORTAONormalSharpness [0.01..4] (M12)
+static float g_cortao_normal_edge_rejection = 0.f;   // CORTAONormalEdgeRejection [0..2] (M12)
+static float g_cortao_normal_z_preservation = 1.f;   // CORTAONormalZPreservation [0..2] (M12)
+static float g_cortao_normal_detail_response = 0.f;  // CORTAONormalDetailResponse [0..1] (M12)
+static float g_cortao_normal_max_mrt_weight = 1.f;   // CORTAONormalMaxMrtWeight [0..1] (M12)
 
 // -- Dynamic Cubemaps (Sora 2nd) � standalone t17 replacement --
 constexpr uint32_t kDynCubeRegister = 17u;         // t17 texEnvMap_g
@@ -4656,6 +4664,97 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.5f,
         .label = "Backface Boost",
         .section = "CORTAO",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAONormalInfluence",
+        .binding = &g_cortao_normal_influence,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Normal Influence",
+        .section = "CORTAO",
+        .tooltip = "Scales the xy of the normal CORTAO uses for receivers and occluder discs (GTVBAO Normal Influence, same math). 1.0 = neutral. Below 1 turns normals toward the camera. A Falcom Engine+ extension; CORTAO accepts any view-space normal (README cortao_loadNormal).",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAONormalDepthBlend",
+        .binding = &g_cortao_normal_depth_blend,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Normal Depth Blend",
+        .section = "CORTAO",
+        .tooltip = "Base weight of the g-buffer (MRT) normal against a normal rebuilt from depth (GTVBAO's depth normal). 1.0 = neutral (MRT normal only); 0 = depth normal only, which removes normal-map detail from the AO. A Falcom Engine+ extension.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAONormalSharpness",
+        .binding = &g_cortao_normal_sharpness,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Normal Sharpness",
+        .section = "CORTAO",
+        .tooltip = "Gamma on Normal Depth Blend (GTVBAO Normal Sharpness). 1.0 = neutral; only acts when Normal Depth Blend is between 0 and 1.",
+        .min = 0.01f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAONormalEdgeRejection",
+        .binding = &g_cortao_normal_edge_rejection,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "Normal Edge Rejection",
+        .section = "CORTAO",
+        .tooltip = "Moves toward the depth normal where the depth jumps (silhouettes), as GTVBAO Normal Edge Rejection. 0.0 = neutral.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAONormalZPreservation",
+        .binding = &g_cortao_normal_z_preservation,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Normal Z Preservation",
+        .section = "CORTAO",
+        .tooltip = "Scales the view-space z of the MRT normal (GTVBAO Normal Z Preservation, floored at 0.05). 1.0 = neutral; above 1 flattens normal-map tilt toward the camera. GTVBAO's default is 2.0.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAONormalDetailResponse",
+        .binding = &g_cortao_normal_detail_response,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "Normal Detail Response",
+        .section = "CORTAO",
+        .tooltip = "Reweights the MRT normal by its disagreement with the depth normal (GTVBAO Normal Detail Response). 0.0 = neutral; 1.0 leans on the depth normal where they agree. GTVBAO's default is 1.0.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAONormalMaxMrtWeight",
+        .binding = &g_cortao_normal_max_mrt_weight,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Normal Max MRT Weight",
+        .section = "CORTAO",
+        .tooltip = "Caps the final MRT normal weight; the same control as GTVBAO's Normal Max Darkening. 1.0 = neutral (no cap).",
         .min = 0.f,
         .max = 1.f,
         .format = "%.2f",
@@ -15640,7 +15739,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     if (make_layout(2u, kCortaoPackedMipLevels, &d->cortao_prepass_layout, 1u, kCortaoPushConstantFloats) && !d->cortao_prepass_pipeline.handle)
       mkcs(__cortao_prepass, "main", d->cortao_prepass_layout, &d->cortao_prepass_pipeline);
     const int key = std::clamp((int)std::lround(g_cortao_quality), 0, 6) + (g_cortao_bent_normals > 0.5f ? 7 : 0);
-    if (make_layout(6u, 4u, &d->cortao_main_layout, 2u, kCortaoPushConstantFloats)) {
+    if (make_layout(7u, 4u, &d->cortao_main_layout, 2u, kCortaoPushConstantFloats)) {
       if (d->cortao_main_pipeline.handle && d->cortao_main_pipeline_key != key) {
         dev->destroy_pipeline(d->cortao_main_pipeline);
         d->cortao_main_pipeline = {};
@@ -16327,6 +16426,13 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   pc.filter_enabled = filter_on ? 1.f : 0.f;
   pc.filter_depth_sensitivity = std::clamp(g_cortao_filter_depth_sensitivity, 0.f, 4096.f);
   pc.filter_normal_sensitivity = std::clamp(g_cortao_filter_normal_sensitivity, 0.f, 256.f);
+  pc.normal_influence = std::clamp(g_cortao_normal_influence, 0.f, 2.f);
+  pc.normal_z_preservation = std::clamp(g_cortao_normal_z_preservation, 0.f, 2.f);
+  pc.normal_depth_blend = std::clamp(g_cortao_normal_depth_blend, 0.f, 1.f);
+  pc.normal_sharpness = std::clamp(g_cortao_normal_sharpness, 0.01f, 4.f);
+  pc.normal_edge_rejection = std::clamp(g_cortao_normal_edge_rejection, 0.f, 2.f);
+  pc.normal_detail_response = std::clamp(g_cortao_normal_detail_response, 0.f, 1.f);
+  pc.normal_max_mrt_weight = std::clamp(g_cortao_normal_max_mrt_weight, 0.f, 1.f);
   pc.foliage_exclude = foliage_mask_valid ? 1.f : 0.f;
   pc.foliage_ao_value = std::clamp(g_cortao_foliage_ao_value, 0.f, 1.f);
   pc.debug_mode = dbg_on ? static_cast<float>(dbg) : 0.f;
@@ -16376,12 +16482,12 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   GtvbaoBindPipeline(cl, d->cortao_main_pipeline);
   {
     reshade::api::sampler samplers[2] = {d->cortao_border_sampler, d->point_clamp_sampler};
-    reshade::api::resource_view srvs[6] = {d->cortao_packed_srv, d->captured_mrt_normal_srv, d->cortao_lut_srv, foliage_mask_valid ? d->cortao_foliage_mask.srv[0] : d->fallback_srv, bent_on ? d->cortao_bent_lut_srv : d->fallback_srv, noise_type == 2 ? d->isfast_noise_srv : d->fallback_srv};
+    reshade::api::resource_view srvs[7] = {d->cortao_packed_srv, d->captured_mrt_normal_srv, d->cortao_lut_srv, foliage_mask_valid ? d->cortao_foliage_mask.srv[0] : d->fallback_srv, bent_on ? d->cortao_bent_lut_srv : d->fallback_srv, noise_type == 2 ? d->isfast_noise_srv : d->fallback_srv, d->captured_depth_srv};
     reshade::api::resource_view uavs[4] = {d->gtvbao_svgf_raw.uav[0], filter_on ? (bent_on ? d->cortao_occlusion_bent.uav[0] : d->cortao_occlusion.uav[0]) : d->fallback_uav, bent_on ? d->cortao_bent_normal.uav[0] : d->fallback_uav, dbg_on ? d->debug_uav : d->fallback_uav};
     reshade::api::descriptor_table_update u[4] = {
         {{}, 0, 0, 2, reshade::api::descriptor_type::sampler, samplers},
         {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
-        {{}, 0, 0, 6, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
+        {{}, 0, 0, 7, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
         {{}, 0, 0, 4, reshade::api::descriptor_type::texture_unordered_access_view, uavs},
     };
     GtvbaoApplyDescriptors(dev, cl, d->cortao_main_layout, &d->cortao_main_tables, 4, u);

@@ -18,7 +18,7 @@ RWTexture2D<float> g_outPackedMip6 : register(u6);
 RWTexture2D<float> g_outPackedMip7 : register(u7);
 
 cortao_float cortao_loadDepth(cortao_int2 pixelCoords) { return g_srcGameDepth.Load(int3(pixelCoords, 0)); }
-cortao_float3 cortao_loadNormal(cortao_int2 pixelCoords) { return FalcomCortaoViewNormal(g_srcMrtNormal, pixelCoords); }
+cortao_float3 cortao_loadNormal(cortao_int2 pixelCoords) { return FalcomCortaoViewNormal(g_srcMrtNormal, g_srcGameDepth, pixelCoords); }
 void cortao_writePackedData(cortao_int2 pixelCoords, cortao_int mipLevel, cortao_uint data) {
   const float v = asfloat(data);
   if (mipLevel == 0) g_outPackedMip0[pixelCoords] = v;
