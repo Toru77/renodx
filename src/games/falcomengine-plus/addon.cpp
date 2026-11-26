@@ -4066,12 +4066,13 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "GTVBAOMode",
         .binding = &shader_injection.gtvbao_mode,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f,
-        .label = "AO Technique",
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "GTVBAO",
         .section = "GTVBAO",
-        .tooltip = "Off = vanilla game AO. GTVBAO = visibility-bitmask compute AO. CORTAO = circular-occluder ray-traced compute AO (settings in the CORTAO section).",
-        .labels = {"Off (Vanilla AO)", "GTVBAO", "CORTAO"},
+        .tooltip = "Off = vanilla game AO. On = GTVBAO visibility-bitmask compute AO.",
+        .labels = {"Off", "On"},
+        .parse = [](float v) { return v >= 1.5f ? 0.f : v; },  // old CORTAO value 2 is no longer selectable; fall back to vanilla AO
     },
     new renodx::utils::settings::Setting{
         .key = "GTVBAOQuality",
