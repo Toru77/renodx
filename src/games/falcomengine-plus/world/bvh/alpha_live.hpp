@@ -208,6 +208,7 @@ inline void SyncLiveAlbedo(reshade::api::device* device, reshade::api::command_l
 
   std::vector<AlbedoSourceJob> sources;
   std::unordered_set<uint64_t> ready_keys;    // draw keys whose mesh is ready for the atlas
+  std::unordered_map<uint64_t, uint64_t> albedo_source_ready_counts;  // source id -> ready keys, for the dump
   std::unordered_set<uint64_t> ready_uids;     // static meshes with UVs, not dynamic and not alpha-tested
   std::unordered_set<uint64_t> dead_textures;  // destroyed textures whose slice must be released
   std::vector<reshade::api::resource> stale;   // albedo-only proxies freed once their slice is filled
@@ -248,17 +249,33 @@ inline void SyncLiveAlbedo(reshade::api::device* device, reshade::api::command_l
       job.proxy = source.proxy;
       job.format = source.format;
       if (source.texture_dead) dead_textures.insert(source.texture);
+      uint64_t ready_count = 0u;
       for (const uint64_t key : source.keys) {
         const auto mesh_it = g_pool.mesh_by_key.find(key);
         if (mesh_it == g_pool.mesh_by_key.end() || mesh_it->second >= g_pool.meshes.size()) continue;
         const WorldMesh& mesh = g_pool.meshes[mesh_it->second];
         if (ready_uids.count(mesh.uid) == 0u || data->slot_by_uid.count(mesh.uid) == 0u) continue;
         ready_keys.insert(key);
+        ready_count += 1u;
         if (source.proxy.handle == 0u) continue;  // its copy is being made (outside the lock)
         job.keys.push_back({key, {mesh.alpha_state.material.scroll[0], mesh.alpha_state.material.scroll[1]},
                             mesh.alpha_state.material.swizzle});
       }
+      albedo_source_ready_counts[source_id] = ready_count;
       if (!job.keys.empty()) sources.push_back(job);
+    }
+    // A dead texture never blits, so its albedo-only copy would hold a budget slot forever. The next draw recopies it
+    // under the live handle; the slice it used is released by the dead-texture handling below.
+    for (auto it = g_pool.alpha_sources.begin(); it != g_pool.alpha_sources.end();) {
+      PoolAlphaSource& source = it->second;
+      if (!source.albedo_only || dead_textures.count(source.texture) == 0u) {
+        ++it;
+        continue;
+      }
+      for (const uint64_t key : source.keys) g_pool.albedo_retry_at[key] = frame + kAlbedoRetryFrames;
+      g_pool.stats.albedo_dead_freed += 1u;
+      free_albedo_only_source(it->first, source);
+      it = g_pool.alpha_sources.erase(it);
     }
     // An albedo-only copy whose keys never reach a ready static mesh holds a source budget slot forever.
     // Release it through the same unlink/free path as after a blit and give its keys a fresh retry stamp.
@@ -297,6 +314,16 @@ inline void SyncLiveAlbedo(reshade::api::device* device, reshade::api::command_l
     for (const auto& entry : albedo.slice_of_texture) {
       if (dead_textures.count(entry.first) != 0u) continue;
       g_pool.albedo_sliced_textures.insert(entry.first);
+    }
+    g_pool.albedo_live_list.clear();
+    for (const auto& [source_id, source] : g_pool.alpha_sources) {
+      if (!source.albedo_only) continue;
+      const auto ready = albedo_source_ready_counts.find(source_id);
+      g_pool.albedo_live_list.push_back(
+          {source_id, source.texture, static_cast<uint64_t>(source.keys.size()),
+           ready != albedo_source_ready_counts.end() ? ready->second : 0u, source.texture_dead,
+           g_pool.albedo_sliced_textures.count(source.texture) != 0u,
+           frame >= source.capture_frame ? frame - source.capture_frame : 0u, source.keys.empty()});
     }
     for (auto it = g_pool.albedo_key_texture.begin(); it != g_pool.albedo_key_texture.end();) {
       if (dead_textures.count(it->second) != 0u) {

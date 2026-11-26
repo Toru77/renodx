@@ -455,9 +455,10 @@ struct PoolAlphaSource {
   uint64_t hold_until = 0u;             // keyless copy (no key yet): kept until this frame, 0 = none
   reshade::api::resource proxy = {0u};  // empty while its copy is being made
   reshade::api::format format = reshade::api::format::unknown;  // the format of the view the game bound
-  uint64_t bytes = 0u;                  // mip 0 bytes (kAlphaSourceBytesMax)
+  uint64_t bytes = 0u;                  // proxy bytes (kAlphaSourceBytesMax)
   bool blitted = false;                 // the atlas has been filled from it at least once
   bool albedo_only = false;             // captured for the material atlas, no alpha key uses it (separate budget)
+  uint32_t capture_frame = 0u;          // frame the copy was reserved (age_frames in the dump)
   uint32_t unready_since = 0u;          // albedo-only: first frame no key had a ready mesh, 0 = none
   std::unordered_set<uint64_t> keys;    // draw keys that use this texture
 };
@@ -490,6 +491,18 @@ struct PoolAlbedoGpuStats {
   uint64_t copies = 0u;               // source copies made for material-atlas draws
   uint64_t refused = 0u;              // material-atlas draws whose source was not copied
   uint32_t tlas_albedo_instances = 0u;
+};
+
+// One live albedo-only source copy, for the dump only (published by SyncLiveAlbedo under the pool lock).
+struct PoolAlbedoSourceDump {
+  uint64_t id = 0u;
+  uint64_t texture = 0u;
+  uint64_t keys = 0u;
+  uint64_t ready_keys = 0u;
+  bool texture_dead = false;
+  bool sliced = false;
+  uint32_t age_frames = 0u;
+  bool keyless = false;
 };
 
 // The atlas maps, for the dump only (the panel copies PoolAlphaGpuStats every UI frame and must not copy them). Copied
@@ -1184,6 +1197,7 @@ struct PoolStats {
   uint64_t albedo_unready_freed = 0u;   // albedo-only copies released for having no ready mesh for kAlbedoUnreadyFrames
   uint64_t albedo_copies_avoided = 0u;  // albedo-only captures mapped to an already-sliced texture (no copy made)
   uint64_t albedo_sliced_copies_freed = 0u;  // albedo-only copies freed once their texture was sliced
+  uint64_t albedo_dead_freed = 0u;      // albedo-only copies freed when the game destroyed their texture
   uint64_t albedo_dead_textures = 0u;   // sliced textures the game destroyed
   uint64_t albedo_meshes_with_uvs = 0u;  // gauges from the pool snapshot in SyncLiveAlbedo
   uint64_t albedo_meshes_total = 0u;
@@ -1638,6 +1652,7 @@ struct PoolState {
   std::unordered_set<uint64_t> alpha_source_done;  // draw keys needing no further copy (refused)
   std::unordered_map<uint64_t, uint64_t> albedo_retry_at;  // atlas-only draw key -> frame it may be captured again
   std::unordered_set<uint64_t> albedo_material_keys;  // mirror of the albedo atlas' mapped keys (read by the retry gate)
+  std::vector<PoolAlbedoSourceDump> albedo_live_list;  // dump-only copy of the live albedo-only sources
   std::unordered_set<uint64_t> alpha_indirect_keys;  // keys of indirect alpha draws attached to their source (resolve)
   PoolAlphaDumpMaps alpha_maps;  // dump-only copies of the atlas maps (SyncLiveAlpha)
   std::unordered_set<uint64_t> wind_keys;  // draw keys admitted as wind rest poses (cleared when alpha_wind_opaque goes off)
@@ -1654,7 +1669,7 @@ struct PoolState {
   std::unordered_set<uint64_t> albedo_sliced_textures;  // sliced texture handles published by SyncLiveAlbedo
   std::unordered_map<uint64_t, uint64_t> albedo_key_texture;  // draw key -> sliced texture, mapped with no copy
   std::unordered_set<uint64_t> albedo_dead_textures;  // sliced textures the game destroyed (quarantined next present)
-  uint64_t albedo_source_bytes = 0u;        // their mip 0 bytes (kAlbedoSourceBytesMax)
+  uint64_t albedo_source_bytes = 0u;        // their proxy bytes (kAlbedoSourceBytesMax)
   PoolAlphaGpuStats alpha_gpu;
   PoolAlbedoGpuStats albedo_gpu;
   uint64_t dynamic_revision = 0u;  // bumped when a moving instance changes pose (not a change of the set)
@@ -4283,8 +4298,20 @@ inline uint64_t CapturePoolAlphaSource(reshade::api::device* device, reshade::ap
     }
     return 0u;
   }
+  uint32_t proxy_width = desc.texture.width;
+  uint32_t proxy_height = desc.texture.height;
+  uint32_t source_mip = 0u;
+  if (albedo && desc.texture.levels > 1u) {
+    for (uint32_t level = 0u; level < desc.texture.levels; ++level) {
+      const uint32_t width = (std::max)(1u, desc.texture.width >> level);
+      if (width < 256u) break;
+      source_mip = level;
+      proxy_width = width;
+      proxy_height = (std::max)(1u, desc.texture.height >> level);
+    }
+  }
   const uint64_t bytes = reshade::api::format_slice_pitch(
-      format, reshade::api::format_row_pitch(format, desc.texture.width), desc.texture.height);
+      format, reshade::api::format_row_pitch(format, proxy_width), proxy_height);
   uint64_t source_id = 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
@@ -4368,6 +4395,7 @@ inline uint64_t CapturePoolAlphaSource(reshade::api::device* device, reshade::ap
     source.texture = texture.handle;
     source.bytes = bytes;
     source.albedo_only = albedo;
+    source.capture_frame = frame;
     if (albedo) {
       g_pool.albedo_live_sources += 1u;
       g_pool.albedo_source_bytes += bytes;
@@ -4381,11 +4409,11 @@ inline uint64_t CapturePoolAlphaSource(reshade::api::device* device, reshade::ap
     g_pool.alpha_source_by_texture[texture.handle] = source_id;
   }
   const reshade::api::resource_desc proxy_desc(
-      reshade::api::resource_type::texture_2d, desc.texture.width, desc.texture.height, 1, 1, format, 1,
+      reshade::api::resource_type::texture_2d, proxy_width, proxy_height, 1, 1, format, 1,
       reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest);
   reshade::api::resource proxy = {0u};
   const bool made = device->create_resource(proxy_desc, nullptr, reshade::api::resource_usage::copy_dest, &proxy);
-  if (made) cmd_list->copy_texture_region(texture, 0u, nullptr, proxy, 0u, nullptr);
+  if (made) cmd_list->copy_texture_region(texture, source_mip, nullptr, proxy, 0u, nullptr);
   bool kept = false;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
@@ -7792,6 +7820,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   uint64_t alpha_held_vertex_bytes = 0u;  // vertex bytes held by requests in the Uvs phase
   PoolAlphaGpuStats alpha_gpu;
   PoolAlbedoGpuStats albedo_gpu;
+  std::vector<PoolAlbedoSourceDump> albedo_live_list;
   std::vector<PoolAlphaKeyDump> alpha_keys;
   std::vector<std::pair<uint64_t, int64_t>> wind_keys_dump;  // wind rest-pose keys with their mesh ids (-1: no mesh)
   PoolAlphaDumpMaps alpha_maps;
@@ -7874,6 +7903,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
     for (const auto& entry : g_pool.mesh_requests) alpha_held_vertex_bytes += entry.second.vertex_bytes.size();
     alpha_gpu = g_pool.alpha_gpu;
     albedo_gpu = g_pool.albedo_gpu;
+    albedo_live_list = g_pool.albedo_live_list;
     alpha_maps = g_pool.alpha_maps;
     for (const WorldMesh& mesh : g_pool.meshes) {
       if (g_pool.alpha_key_source.count(mesh.mesh_key) != 0u) sourced_uids.insert(mesh.uid);
@@ -8059,7 +8089,18 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"albedo_dead_textures\": " << stats.albedo_dead_textures
       << ", \"albedo_meshes_with_uvs\": " << stats.albedo_meshes_with_uvs
       << ", \"albedo_meshes_total\": " << stats.albedo_meshes_total
-      << ", \"uv_refresh_queued\": " << stats.uv_refresh_queued
+      << ", \"albedo_dead_freed\": " << stats.albedo_dead_freed
+      << ", \"albedo_live_list\": [";
+  for (size_t i = 0; i < albedo_live_list.size(); ++i) {
+    const PoolAlbedoSourceDump& entry = albedo_live_list[i];
+    out << (i != 0u ? "," : "") << "\n    {\"id\": " << entry.id << ", \"texture\": \""
+        << renodx::utils::log::AsHex(entry.texture) << "\", \"keys\": " << entry.keys
+        << ", \"ready_keys\": " << entry.ready_keys << ", \"texture_dead\": "
+        << (entry.texture_dead ? "true" : "false") << ", \"sliced\": " << (entry.sliced ? "true" : "false")
+        << ", \"age_frames\": " << entry.age_frames << ", \"keyless\": " << (entry.keyless ? "true" : "false")
+        << "}";
+  }
+  out << "\n  ], \"uv_refresh_queued\": " << stats.uv_refresh_queued
       << ", \"uv_refresh_done\": " << stats.uv_refresh_done
       << ", \"uv_refresh_mismatch\": " << stats.uv_refresh_mismatch
       << ", \"uv_refresh_skipped\": " << stats.uv_refresh_skipped
