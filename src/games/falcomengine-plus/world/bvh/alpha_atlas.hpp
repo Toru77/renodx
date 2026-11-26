@@ -24,9 +24,10 @@ inline constexpr uint64_t kAlphaSourceBytesMax = 256ull << 20;  // bytes of live
 inline constexpr uint32_t kAlphaSliceQuarantineFrames = 16u;  // a released slice is reused after this many frames
 inline constexpr uint32_t kAlphaOrphanFrames = 600u;  // a keyless copy (indirect draw) is held this many presents for its resolve
 
-// Albedo atlas: one RGBA8 slice per static mesh, sampled at the hit's UV by the path tracer (A35).
+// Albedo atlas: one RGBA8 slice per unique t0 source texture, sampled at the hit's UV by the path tracer (A35).
 inline constexpr uint32_t kAlbedoAtlasSlices = 512u;
 inline constexpr uint32_t kAlbedoSliceSize = 128u;
+inline constexpr uint32_t kAlbedoMaterials = 2048u;  // one entry per (slice, scroll, swizzle)
 
 enum class AlphaUvRangeStatus { NotRequired,
                                 Valid,
@@ -62,25 +63,25 @@ struct AlphaMaterialGPU {
 };
 static_assert(sizeof(AlphaMaterialGPU) == 32u, "AlphaMaterialGPU is 32 bytes");
 
-// One per albedo slice, read by the PT shaders. 32 bytes, mirroring AlphaMaterialGPU.
+// One per material, read by the PT shaders through header.w - 1. 32 bytes, mirroring AlphaMaterialGPU.
 struct AlbedoMaterialGPU {
   uint32_t slice = 0u;
   float scroll[2] = {};
   uint32_t swizzle = 0u;
-  uint32_t uv_slot = 0u;
+  uint32_t uv_slot = 0u;  // unused by the shader: UVs come from the mesh's bbox_min.w
   uint32_t pad[3] = {};
 };
 static_assert(sizeof(AlbedoMaterialGPU) == 32u, "AlbedoMaterialGPU is 32 bytes");
 
-// Same bookkeeping as AlphaSliceTable, sized for the albedo atlas.
+// Same bookkeeping as AlphaSliceTable, sized for the albedo atlas. The owner is a source id, not a mesh uid.
 struct AlbedoSliceTable {
   std::array<uint64_t, kAlbedoAtlasSlices> owner = {};
   uint32_t used = 0u;
 
-  int32_t Acquire(uint64_t mesh_uid) {
+  int32_t Acquire(uint64_t source_id) {
     for (uint32_t slice = 0u; slice < kAlbedoAtlasSlices; ++slice) {
       if (owner[slice] != 0u) continue;
-      owner[slice] = mesh_uid;
+      owner[slice] = source_id;
       used += 1u;
       return static_cast<int32_t>(slice);
     }
@@ -91,6 +92,46 @@ struct AlbedoSliceTable {
     if (slice >= kAlbedoAtlasSlices || owner[slice] == 0u) return;
     owner[slice] = 0u;
     used -= 1u;
+  }
+};
+
+// One entry per distinct (slice, scroll, swizzle), addressed by material index + 1 in the instance header.
+struct AlbedoMaterialTable {
+  struct Entry {
+    AlbedoMaterialGPU gpu = {};
+    uint32_t refs = 0u;  // draw keys mapped to this entry
+  };
+  std::array<Entry, kAlbedoMaterials> entries = {};
+  uint32_t used = 0u;
+
+  // Adds a reference to a matching entry, or claims a free index for a new one; -1 when the table is full.
+  int32_t FindOrInsert(uint32_t slice, const float scroll[2], uint32_t swizzle) {
+    for (uint32_t i = 0u; i < kAlbedoMaterials; ++i) {
+      const Entry& entry = entries[i];
+      if (entry.refs != 0u && entry.gpu.slice == slice && entry.gpu.scroll[0] == scroll[0]
+          && entry.gpu.scroll[1] == scroll[1] && entry.gpu.swizzle == swizzle) {
+        entries[i].refs += 1u;
+        return static_cast<int32_t>(i);
+      }
+    }
+    for (uint32_t i = 0u; i < kAlbedoMaterials; ++i) {
+      Entry& entry = entries[i];
+      if (entry.refs != 0u) continue;
+      entry.gpu = {.slice = slice, .scroll = {scroll[0], scroll[1]}, .swizzle = swizzle};
+      entry.refs = 1u;
+      used += 1u;
+      return static_cast<int32_t>(i);
+    }
+    return -1;
+  }
+
+  void Release(uint32_t index) {
+    if (index >= kAlbedoMaterials || entries[index].refs == 0u) return;
+    entries[index].refs -= 1u;
+    if (entries[index].refs == 0u) {
+      entries[index] = {};
+      used -= 1u;
+    }
   }
 };
 

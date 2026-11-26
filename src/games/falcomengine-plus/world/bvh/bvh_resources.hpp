@@ -191,6 +191,7 @@ struct LiveBvhStats {
   uint32_t tlas_unusable = 0u;    // in the region, mesh failed (no BLAS)
   uint32_t tlas_alpha_instances = 0u;  // alpha-tested instances in the TLAS (with a material slot)
   uint32_t tlas_alpha_waiting = 0u;    // alpha-tested instances left out: their material is not on the GPU yet
+  uint32_t tlas_albedo_instances = 0u;  // static instances in the TLAS with an albedo material
   uint32_t tlas_near_fade = 0u;      // in the TLAS with the game camera's near fade applied
   uint32_t tlas_camera_hidden = 0u;  // in the TLAS, never drawn by a camera VS (shadow-only or no view)
   uint32_t tlas_nodes = 0u;
@@ -321,20 +322,22 @@ struct AlbedoGpu {
   reshade::api::resource atlas = {0u};  // Texture2DArray<R8G8B8A8_UNORM>, kAlbedoAtlasSlices layers of 128 x 128
   reshade::api::resource_view atlas_srv = {0u};
   reshade::api::resource_view atlas_uav = {0u};
-  reshade::api::resource materials = {0u};  // AlbedoMaterialGPU per slice (zero-initialised)
+  reshade::api::resource materials = {0u};  // AlbedoMaterialGPU per material index (zero-initialised)
   reshade::api::resource_view materials_srv = {0u};
   reshade::api::sampler sampler = {0u};
   reshade::api::pipeline_layout blit_layout = {0u};
   reshade::api::descriptor_table blit_tables[3] = {};  // t0 source, s0 sampler, u0 atlas
   reshade::api::pipeline blit_pipeline = {0u};
   AlbedoSliceTable slices;
-  std::unordered_map<uint64_t, uint32_t> slot_of_uid;  // mesh uid -> slice of its material (read by the PT shaders)
+  std::unordered_map<uint64_t, uint32_t> slice_of_source;  // source id -> slice
+  AlbedoMaterialTable material_table;
+  std::unordered_map<uint64_t, uint32_t> material_of_key;  // draw key -> material index (read by the TLAS)
   std::vector<std::pair<uint32_t, uint32_t>> quarantine;  // (slice, frame released)
   GpuTimer timer;
   uint64_t blits = 0u;
   uint32_t blits_frame = 0u;
-  uint64_t cap_refused = 0u;
-  std::unordered_set<uint64_t> cap_refused_uids;
+  uint32_t cap_refused_slices = 0u;     // sources refused a slice (the atlas is full)
+  uint32_t cap_refused_materials = 0u;  // keys refused a material (the table is full)
   bool failure_logged = false;
 };
 
@@ -581,6 +584,7 @@ inline void DestroyAlphaGpu(reshade::api::device* device, BvhDeviceData* data) {
 // Destroys the albedo atlas and its blit (material atlas off, or the device goes).
 inline void DestroyAlbedoGpu(reshade::api::device* device, BvhDeviceData* data) {
   AlbedoGpu& albedo = data->albedo;
+  if (!albedo.material_of_key.empty()) data->store_version += 1u;
   for (reshade::api::descriptor_table& table : albedo.blit_tables) {
     if (table.handle != 0u) device->free_descriptor_table(table);
     table = {0u};
@@ -596,9 +600,10 @@ inline void DestroyAlbedoGpu(reshade::api::device* device, BvhDeviceData* data) 
   albedo.blit_layout = {0u};
   albedo.sampler = {0u};
   albedo.slices = {};
-  albedo.slot_of_uid.clear();
+  albedo.slice_of_source.clear();
+  albedo.material_table = {};
+  albedo.material_of_key.clear();
   albedo.quarantine.clear();
-  albedo.cap_refused_uids.clear();
   albedo.failure_logged = false;
   albedo.blits_frame = 0u;
 }

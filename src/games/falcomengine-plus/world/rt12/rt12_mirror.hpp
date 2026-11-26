@@ -50,7 +50,7 @@ struct Rt12Mirror {
   std::array<std::array<uint8_t, 32>, kRt12AlphaSlices> materials = {};
   uint64_t materials_version = 0u;
   // Albedo materials: the same persistent producer copy, drained into the session by its own version.
-  std::array<AlbedoMaterialGPU, kAlbedoAtlasSlices> albedo_materials = {};
+  std::array<AlbedoMaterialGPU, kAlbedoMaterials> albedo_materials = {};
   uint64_t albedo_material_version = 0u;
   uint64_t sanitized_triangles = 0u;  // total since the scene was created
 };
@@ -194,10 +194,10 @@ inline void MirrorMaterial(uint32_t slice, const void* bytes32) {
   }
 }
 
-inline void MirrorAlbedoMaterial(uint32_t slice, const AlbedoMaterialGPU& material) {
+inline void MirrorAlbedoMaterial(uint32_t index, const AlbedoMaterialGPU& material) {
   std::lock_guard lock(g_rt12_mirror.mutex);
-  if (slice < kAlbedoAtlasSlices) {
-    g_rt12_mirror.albedo_materials[slice] = material;
+  if (index < kAlbedoMaterials) {
+    g_rt12_mirror.albedo_materials[index] = material;
     g_rt12_mirror.albedo_material_version += 1u;
   }
 }

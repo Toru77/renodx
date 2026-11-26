@@ -503,8 +503,8 @@ struct Rt12State {
   std::array<std::array<uint8_t, 32>, kRt12AlphaSlices> material_cpu = {};
   bool materials_dirty = true;
   uint64_t materials_version_seen = ~0ull;  // g_rt12_mirror.materials_version last copied (~0: copy at the first present)
-  Microsoft::WRL::ComPtr<ID3D12Resource> albedo_materials;  // DEFAULT, kAlbedoAtlasSlices * 32 bytes
-  std::array<AlbedoMaterialGPU, kAlbedoAtlasSlices> albedo_material_cpu = {};
+  Microsoft::WRL::ComPtr<ID3D12Resource> albedo_materials;  // DEFAULT, kAlbedoMaterials * 32 bytes
+  std::array<AlbedoMaterialGPU, kAlbedoMaterials> albedo_material_cpu = {};
   bool albedo_materials_dirty = false;
   uint64_t albedo_material_version_seen = ~0ull;  // g_rt12_mirror.albedo_material_version last copied
   std::vector<Rt12Blas> blas;               // index = live store slot
@@ -1412,7 +1412,7 @@ inline bool CreateRt12(reshade::api::device* device) {
     s.atlas = Rt12Shared{};
   }
   // 15b. Albedo mirror. A failure leaves the albedo path off (the PT binds null descriptors); it never fails the session.
-  hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, kAlbedoAtlasSlices * 32u, D3D12_RESOURCE_STATE_COMMON,
+  hr = CreateRt12Buffer(s.device12.Get(), D3D12_HEAP_TYPE_DEFAULT, kAlbedoMaterials * 32u, D3D12_RESOURCE_STATE_COMMON,
                         D3D12_RESOURCE_FLAG_NONE, s.albedo_materials);
   if (FAILED(hr)) {
     renodx::utils::log::w("[world-rt12] albedo materials not created hr=", renodx::utils::log::AsHex(static_cast<uint32_t>(hr)));

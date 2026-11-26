@@ -973,7 +973,7 @@ inline reshade::api::resource_view RunPtTrace(reshade::api::device* device, resh
   albedo_srv.Texture2DArray.MipLevels = 1u;
   albedo_srv.Texture2DArray.ArraySize = kAlbedoAtlasSlices;
   set_srv(55u, albedo_texture, albedo_srv);
-  set_srv(56u, albedo_on ? s.albedo_materials.Get() : nullptr, Rt12BufferSrv(32u, kAlbedoAtlasSlices));
+  set_srv(56u, albedo_on ? s.albedo_materials.Get() : nullptr, Rt12BufferSrv(32u, kAlbedoMaterials));
   D3D12_SHADER_RESOURCE_VIEW_DESC tlas_srv = {};
   tlas_srv.Format = DXGI_FORMAT_UNKNOWN;
   tlas_srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;

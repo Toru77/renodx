@@ -1109,6 +1109,7 @@ inline void RebuildLiveTlas(
   uint32_t camera_hidden = 0u;
   uint32_t alpha_instances = 0u;
   uint32_t alpha_waiting = 0u;
+  uint32_t albedo_instances = 0u;
   size_t kept = 0u;  // in-place compaction: info[kept] takes each kept entry
   for (size_t read = 0u; read < info.size(); ++read) {
     LiveTlasInstance& instance = info[read];
@@ -1133,8 +1134,9 @@ inline void RebuildLiveTlas(
       alpha_instances += 1u;
     }
     if (!instance.alpha && pt::g_pt_material_atlas > 0.5f) {
-      const auto albedo_it = data->albedo.slot_of_uid.find(instance.uid);
-      instance.albedo = albedo_it != data->albedo.slot_of_uid.end() ? albedo_it->second + 1u : 0u;
+      const auto albedo_it = data->albedo.material_of_key.find(instance.mesh_key);
+      instance.albedo = albedo_it != data->albedo.material_of_key.end() ? albedo_it->second + 1u : 0u;
+      if (instance.albedo != 0u) albedo_instances += 1u;
     } else {
       instance.albedo = 0u;
     }
@@ -1156,6 +1158,7 @@ inline void RebuildLiveTlas(
   stats.tlas_unusable = unusable;
   stats.tlas_alpha_instances = alpha_instances;
   stats.tlas_alpha_waiting = alpha_waiting;
+  stats.tlas_albedo_instances = albedo_instances;
 
   std::vector<LiveTlasInstance> previous_info;  // cache diagnostics: the TLAS this build replaces
   bool replaced = false;

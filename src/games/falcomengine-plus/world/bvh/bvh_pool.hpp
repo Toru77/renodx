@@ -475,6 +475,20 @@ struct PoolAlphaGpuStats {
   float trace_ms = -1.f;           // GPU ms of the last trace dispatch (-1: not measured)
 };
 
+// The albedo GPU stage's numbers as the pool last saw them (written under g_pool.mutex by SyncLiveAlbedo at the
+// start of each present, so they lag one present). Read by the dump.
+struct PoolAlbedoGpuStats {
+  uint32_t sources = 0u;              // unique t0 copies with a slice
+  uint32_t slices_used = 0u;
+  uint32_t materials_used = 0u;
+  uint32_t keys_mapped = 0u;
+  uint32_t cap_refused_slices = 0u;
+  uint32_t cap_refused_materials = 0u;
+  uint64_t copies = 0u;               // source copies made for material-atlas draws
+  uint64_t refused = 0u;              // material-atlas draws whose source was not copied
+  uint32_t tlas_albedo_instances = 0u;
+};
+
 // The atlas maps, for the dump only (the panel copies PoolAlphaGpuStats every UI frame and must not copy them). Copied
 // under the pool lock by SyncLiveAlpha at each store change, with alpha_foliage on.
 struct PoolAlphaDumpMaps {
@@ -1604,6 +1618,7 @@ struct PoolState {
   uint32_t alpha_copy_frame = 0u;
   uint32_t alpha_copies_frame = 0u;  // source copies made in alpha_copy_frame
   PoolAlphaGpuStats alpha_gpu;
+  PoolAlbedoGpuStats albedo_gpu;
   uint64_t dynamic_revision = 0u;  // bumped when a moving instance changes pose (not a change of the set)
   PoolPrevTrace prev_trace;
 };
@@ -7427,6 +7442,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   uint64_t alpha_key_count = 0u;
   uint64_t alpha_held_vertex_bytes = 0u;  // vertex bytes held by requests in the Uvs phase
   PoolAlphaGpuStats alpha_gpu;
+  PoolAlbedoGpuStats albedo_gpu;
   std::vector<PoolAlphaKeyDump> alpha_keys;
   std::vector<std::pair<uint64_t, int64_t>> wind_keys_dump;  // wind rest-pose keys with their mesh ids (-1: no mesh)
   PoolAlphaDumpMaps alpha_maps;
@@ -7508,6 +7524,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
     alpha_key_count = g_pool.alpha_keys.size();
     for (const auto& entry : g_pool.mesh_requests) alpha_held_vertex_bytes += entry.second.vertex_bytes.size();
     alpha_gpu = g_pool.alpha_gpu;
+    albedo_gpu = g_pool.albedo_gpu;
     alpha_maps = g_pool.alpha_maps;
     for (const WorldMesh& mesh : g_pool.meshes) {
       if (g_pool.alpha_key_source.count(mesh.mesh_key) != 0u) sourced_uids.insert(mesh.uid);
@@ -7670,7 +7687,15 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"indirect_copies\": " << stats.alpha_indirect_copies << ", \"orphans_attached\": " << stats.alpha_orphans_attached
       << ", \"orphans_expired\": " << stats.alpha_orphans_expired << ", \"orphan_missed\": " << stats.alpha_orphan_missed
       << ", \"indirect_source_changed\": " << stats.alpha_indirect_source_changed
-      << ", \"wind_refused_off\": " << stats.wind_refused_off << ", \"wind_rest_draws\": " << stats.wind_rest_draws << "},\n";
+      << ", \"wind_refused_off\": " << stats.wind_refused_off << ", \"wind_rest_draws\": " << stats.wind_rest_draws
+      << ", \"albedo_sources\": " << albedo_gpu.sources
+      << ", \"albedo_slices_used\": " << albedo_gpu.slices_used << ", \"albedo_slices_total\": " << kAlbedoAtlasSlices
+      << ", \"albedo_materials_used\": " << albedo_gpu.materials_used << ", \"albedo_materials_total\": " << kAlbedoMaterials
+      << ", \"albedo_keys_mapped\": " << albedo_gpu.keys_mapped
+      << ", \"albedo_cap_refused_slices\": " << albedo_gpu.cap_refused_slices
+      << ", \"albedo_cap_refused_materials\": " << albedo_gpu.cap_refused_materials
+      << ", \"albedo_copies\": " << albedo_gpu.copies << ", \"albedo_refused\": " << albedo_gpu.refused
+      << ", \"tlas_albedo_instances\": " << albedo_gpu.tlas_albedo_instances << "},\n";
   out << "  \"alpha_keys_total\": " << alpha_keys.size() << ", \"alpha_keys\": [";
   for (size_t i = 0; i < alpha_keys.size() && i < kPoolDumpMaxAlphaKeys; ++i) {
     const PoolAlphaKeyDump& entry = alpha_keys[i];
