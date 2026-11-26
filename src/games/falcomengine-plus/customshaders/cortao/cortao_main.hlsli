@@ -8,6 +8,8 @@
 #define FALCOM_CORTAO_BENT_NORMALS 0
 #endif
 #define CORTAO_BENT_NORMAL_LOOKUP_TABLE FALCOM_CORTAO_BENT_NORMALS
+#define FALCOM_CORTAO_USER_NOISE 1  // Noise Type (M6a); CORTAO option = the reference expression below
+#include "../gtvbao/GTVBAO.h"        // HilbertIndex, XE_HILBERT_WIDTH (shared with GTVBAO's Hilbert noise)
 
 #include "../../reference/CORTAO-main/src/shaders/CORTAOMainPass.h"
 
@@ -26,6 +28,7 @@ RWTexture2D<float4> g_outBentNormal : register(u2);     // R8G8B8A8_SNORM
 RWTexture2D<float> g_outOcclusion : register(u1);     // filter input, R8_UNORM (M3)
 #endif
 RWTexture2D<float4> g_outDebug : register(u3);        // u2 is the bent output (M4)
+Texture3D<float2> g_srcIsfastNoise : register(t5);    // IS-FAST 128x128x32 RG8 (fast_noise_ea.dds), M6a
 
 static bool g_falcomCortaoMaskFoliage = false;
 cortao_uint cortao_samplePackedData(cortao_float2 texCoords, cortao_float mipmap) {
@@ -45,6 +48,24 @@ cortao_half3 cortao_loadNormal(cortao_int2 pixelCoords) {
 }
 cortao_uint cortao_sampleOccluderLookupTable(cortao_float3 texCoords) {
   return (cortao_uint)(g_srcOccluderLut.SampleLevel(g_samplerPointClamp, texCoords, 0.0) * 65535.0 + 0.5); // tables/occluder/README SM 6.7 workaround
+}
+// Falcom Engine+ noise extension (FALCOM_CORTAO_USER_NOISE in CORTAOMainPass.h): the per-pixel random values of the main pass.
+cortao_uint2 FalcomCortaoUserNoise(cortao_uint2 pixelCoords, cortao_uint randomSeed) {
+  // CORTAO: the unmodified reference expression (CORTAOMainPass.h, FALCOM_CORTAO_USER_NOISE 0 branch).
+  if (CORTAO_noise_type < 0.5f) return cortao_hash(cortao_seed(pixelCoords) + cortao_unpack16(randomSeed));
+  const uint t = (uint)CORTAO_noise_index;
+  float2 n;
+  if (CORTAO_noise_type < 1.5f) {
+    // Hilbert: R2 over the 64x64 Hilbert curve, the sequence of gtvbao_main.cs_5_0.hlsl SpatioTemporalNoise_Hilbert.
+    const uint i = HilbertIndex(pixelCoords.x % XE_HILBERT_WIDTH, pixelCoords.y % XE_HILBERT_WIDTH) + 288u * (t % 64u);
+    n = float2(frac(0.5 + (float)i * 0.75487766624669276005), frac(0.5 + (float)i * 0.5698402909980532659114));
+  } else {
+    // IS-FAST: the raw texel; CORTAO needs uniform random numbers, so no GTVBAO strength/scale/seed shaping.
+    n = g_srcIsfastNoise.Load(int4(pixelCoords.x & 127u, pixelCoords.y & 127u, t & 31u, 0));
+  }
+  // 24 significant bits per channel in the high bits; the low byte (spiral flip bit) from the other channel.
+  const uint2 q = uint2(saturate(n) * 16777215.0);
+  return (q << 8u) | (q.yx & 0xFFu);
 }
 #if FALCOM_CORTAO_BENT_NORMALS
 cortao_half3 cortao_loadBentNormalLookupTable(cortao_uint rayBits) {
@@ -119,7 +140,11 @@ void main(uint2 workgroupID : SV_GroupID, uint localIndex : SV_GroupIndex) {
 #if FALCOM_CORTAO_BENT_NORMALS
     g_outBentNormal[pixelCoords] = float4(1.0, 0.0, 0.0, 1.0);
 #endif
+#if FALCOM_CORTAO_BENT_NORMALS
+    if (CORTAO_filter_enabled > 0.5f) g_outOcclusion[pixelCoords] = float4(1.0, 0.0, 0.0, 1.0);
+#else
     if (CORTAO_filter_enabled > 0.5f) g_outOcclusion[pixelCoords] = 1.0;
+#endif
     return;
   }
   // cortao_mainPass returns before cortao_writeResult for sky pixels (CORTAOMainPass.h:374-377): pre-write full visibility.

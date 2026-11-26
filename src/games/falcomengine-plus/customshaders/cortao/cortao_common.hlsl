@@ -37,8 +37,8 @@ cbuffer cb_cortao : register(b13)
   float CORTAO_foliage_exclude;               // c[14] 1 = foliage mask fresh and exclusion on (M2)
   float CORTAO_foliage_ao_value;              // c[15] (M2)
   float CORTAO_debug_mode;                    // c[16] 0, or 22 Raw AO, 26 Input Normal, 28 Bent Normal (M4)
-  float CORTAO_pad0;                          // c[17] pads the block to a full register
-  float CORTAO_pad1;                          // c[18]
+  float CORTAO_noise_type;                    // c[17] 0 = CORTAO hash (reference), 1 = Hilbert, 2 = IS-FAST (M6a)
+  float CORTAO_noise_index;                   // c[18] temporal noise index: frame % 64 with Temporal Noise On, else 0 (M6a)
   float CORTAO_pad2;                          // c[19]
 };
 

@@ -74,6 +74,13 @@
 #endif
 
 
+//Falcom Engine+ extension (not part of CORTAO v1.0.1): FALCOM_CORTAO_USER_NOISE 1 takes the main pass
+//per-pixel random values from the user callback FalcomCortaoUserNoise. 0 (default) is the unmodified reference.
+#ifndef FALCOM_CORTAO_USER_NOISE
+	#define FALCOM_CORTAO_USER_NOISE 0
+#endif
+
+
 //Functions to implement
 
 cortao_half3 cortao_loadNormal(cortao_int2 pixelCoords);
@@ -89,6 +96,11 @@ cortao_uint cortao_samplePackedData(cortao_float2 texCoords, cortao_float mipmap
 #endif
 
 void cortao_writeResult(cortao_int2 pixelCoords, cortao_half occlusion, cortao_half3 bentNormal, cortao_half3x3 tangentSpaceTransform, cortao_uint rayBits);
+
+
+#if FALCOM_CORTAO_USER_NOISE
+	cortao_uint2 FalcomCortaoUserNoise(cortao_uint2 pixelCoords, cortao_uint randomSeed); //Falcom Engine+ extension
+#endif
 
 
 #if CORTAO_DEBUG_HOOKS
@@ -383,7 +395,11 @@ void cortao_mainPass(cortao_uint2 pixelCoords, CORTAOMainPassParameters params) 
 
 	
 	//Setup a set of random variables used during the setup code
+	#if FALCOM_CORTAO_USER_NOISE
+		cortao_uint2 random = FalcomCortaoUserNoise(pixelCoords, params.randomSeed); //Falcom Engine+ extension
+	#else
 	cortao_uint2 random = cortao_hash(cortao_seed(pixelCoords) + cortao_unpack16(params.randomSeed));
+	#endif
 	
 	cortao_float randomSampleRotation = cortao_float(random.x) * (cortao_float(CORTAO_PI2) / cortao_float(0xFFFFFFFFu));
 	cortao_float offsetDither = cortao_float(random.y) * (1.0 / cortao_float(0xFFFFFFFFu));

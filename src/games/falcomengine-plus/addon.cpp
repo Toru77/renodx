@@ -541,7 +541,7 @@ struct CortaoPushConstants {
   uint32_t width, height, mip_count, random_seed;
   float max_radius, max_screenspace_radius_height_ratio, mip_bias, max_slope_compensation;
   float backface_threshold, backface_boost, filter_depth_sensitivity, filter_normal_sensitivity;
-  float intensity, filter_enabled, foliage_exclude, foliage_ao_value, debug_mode, pad0, pad1, pad2;
+  float intensity, filter_enabled, foliage_exclude, foliage_ao_value, debug_mode, noise_type, noise_index, pad2;
 };
 static_assert(sizeof(CortaoPushConstants) == kCortaoPushConstantFloats * 4u);
 
@@ -552,6 +552,7 @@ constexpr std::array<std::span<const uint8_t>, 2> kCortaoFilterShaders = {__cort
 constexpr std::array<std::span<const uint8_t>, 7> kCortaoMainBentShaders = {
     __cortao_main_bent_s4, __cortao_main_bent_s6, __cortao_main_bent_s8, __cortao_main_bent_s12,
     __cortao_main_bent_s16, __cortao_main_bent_s24, __cortao_main_bent_s32};
+constexpr int kCortaoSampleCounts[7] = {4, 6, 8, 12, 16, 24, 32};  // CORTAO_SAMPLE_COUNT per Quality index (README quality names)
 constexpr std::array<std::span<const uint8_t>, 2> kCortaoFilterBentShaders = {__cortao_filter_bent_small, __cortao_filter_bent_large};
 constexpr int kCortaoDebugModes[5] = {0, 1, 22, 26, 28};
 
@@ -759,6 +760,7 @@ static float g_cortao_max_radius = 1.f;
 static float g_cortao_max_screenspace_radius_height_ratio = 0.2f;
 static float g_cortao_intensity = 1.f;
 static float g_cortao_temporal_noise = 1.f;
+static float g_cortao_noise_type = 0.f;  // CORTAONoiseType: 0 CORTAO, 1 Hilbert, 2 IS-FAST
 static float g_cortao_mip_bias = -4.f;
 static float g_cortao_max_slope_compensation = 4.f;
 static float g_cortao_backface_threshold = 0.5f;
@@ -4486,6 +4488,17 @@ renodx::utils::settings::Settings settings = {
         .section = "CORTAO",
         .tooltip = "Off uses a constant random seed for use without TAA; On changes the seed every frame.",
         .labels = {"Off", "On"},
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAONoiseType",
+        .binding = &g_cortao_noise_type,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Noise Type",
+        .section = "CORTAO",
+        .tooltip = "Per-pixel random values of the CORTAO main pass. CORTAO = the reference hash (unchanged). Hilbert = R2 sequence over a 64x64 Hilbert curve (as GTVBAO). IS-FAST = embedded spatio-temporal blue noise; needs the IS-FAST master toggle, otherwise CORTAO is used. Hilbert and IS-FAST are a Falcom Engine+ extension, not part of CORTAO.",
+        .labels = {"CORTAO", "Hilbert", "IS-FAST"},
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -15498,7 +15511,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     if (make_layout(2u, kCortaoPackedMipLevels, &d->cortao_prepass_layout, 1u, kCortaoPushConstantFloats) && !d->cortao_prepass_pipeline.handle)
       mkcs(__cortao_prepass, "main", d->cortao_prepass_layout, &d->cortao_prepass_pipeline);
     const int key = std::clamp((int)std::lround(g_cortao_quality), 0, 6) + (g_cortao_bent_normals > 0.5f ? 7 : 0);
-    if (make_layout(5u, 4u, &d->cortao_main_layout, 2u, kCortaoPushConstantFloats)) {
+    if (make_layout(6u, 4u, &d->cortao_main_layout, 2u, kCortaoPushConstantFloats)) {
       if (d->cortao_main_pipeline.handle && d->cortao_main_pipeline_key != key) {
         dev->destroy_pipeline(d->cortao_main_pipeline);
         d->cortao_main_pipeline = {};
@@ -15614,9 +15627,11 @@ static bool EnsureCortaoResources(reshade::api::device* dev, DeviceData* d, uint
       return false;
     }
     if (!dev->create_resource_view(d->cortao_bent_lut_buffer, reshade::api::resource_usage::shader_resource,
-                                   reshade::api::resource_view_desc(reshade::api::format::r8g8_snorm, 0u, 131072u),
+                                   // ReShade D3D11 passes buffer view offset/size through as FirstElement/NumElements (d3d11_impl_type_convert.cpp:589-591): elements, not bytes.
+                                   reshade::api::resource_view_desc(reshade::api::format::r8g8_snorm, 0u, 65536u),
                                    &d->cortao_bent_lut_srv)) {
       CortaoLog("create_resource_view(bent lut) failed", true);
+      dr(d->cortao_bent_lut_buffer);  // retry next frame instead of keeping a buffer without a view
       return false;
     }
     CortaoLog("bent lut created 65536 r8g8_snorm");
@@ -16143,6 +16158,14 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
     DispatchFoliageMask(cl, d, d->captured_depth_srv, d->cortao_foliage_mask.uav[0], d->cortao_foliage_mask.texture[0], w, h, fpc);
   }
 
+  const int noise_type_wanted = std::clamp((int)std::lround(g_cortao_noise_type), 0, 2);
+  if (noise_type_wanted == 2 && g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, d);
+  const bool isfast_ok = g_isfast_enabled > 0.5f && d->isfast_texture_loaded && d->isfast_noise_srv.handle != 0u;
+  const int noise_type = (noise_type_wanted == 2 && !isfast_ok) ? 0 : noise_type_wanted;
+  if (noise_type_wanted == 2 && !isfast_ok)
+    CortaoLog(std::string("noise IS-FAST unavailable: master=") + std::to_string(g_isfast_enabled > 0.5f)
+              + " loaded=" + std::to_string(d->isfast_texture_loaded) + "; using CORTAO", true);
+
   CortaoPushConstants pc = {};
   pc.width = w;
   pc.height = h;
@@ -16170,6 +16193,8 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   pc.foliage_exclude = foliage_mask_valid ? 1.f : 0.f;
   pc.foliage_ao_value = std::clamp(g_cortao_foliage_ao_value, 0.f, 1.f);
   pc.debug_mode = dbg_on ? static_cast<float>(dbg) : 0.f;
+  pc.noise_type = static_cast<float>(noise_type);
+  pc.noise_index = g_cortao_temporal_noise > 0.5f ? static_cast<float>(d->frame_index % 64u) : 0.f;
 
   // Pass 1: prepass packs depth and view normals into mip 0 and its coarse levels.
   GtvbaoBindPipeline(cl, d->cortao_prepass_pipeline);
@@ -16191,12 +16216,12 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   GtvbaoBindPipeline(cl, d->cortao_main_pipeline);
   {
     reshade::api::sampler samplers[2] = {d->cortao_border_sampler, d->point_clamp_sampler};
-    reshade::api::resource_view srvs[5] = {d->cortao_packed_srv, d->captured_mrt_normal_srv, d->cortao_lut_srv, foliage_mask_valid ? d->cortao_foliage_mask.srv[0] : d->fallback_srv, bent_on ? d->cortao_bent_lut_srv : d->fallback_srv};
+    reshade::api::resource_view srvs[6] = {d->cortao_packed_srv, d->captured_mrt_normal_srv, d->cortao_lut_srv, foliage_mask_valid ? d->cortao_foliage_mask.srv[0] : d->fallback_srv, bent_on ? d->cortao_bent_lut_srv : d->fallback_srv, noise_type == 2 ? d->isfast_noise_srv : d->fallback_srv};
     reshade::api::resource_view uavs[4] = {d->gtvbao_svgf_raw.uav[0], filter_on ? (bent_on ? d->cortao_occlusion_bent.uav[0] : d->cortao_occlusion.uav[0]) : d->fallback_uav, bent_on ? d->cortao_bent_normal.uav[0] : d->fallback_uav, dbg_on ? d->debug_uav : d->fallback_uav};
     reshade::api::descriptor_table_update u[4] = {
         {{}, 0, 0, 2, reshade::api::descriptor_type::sampler, samplers},
         {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
-        {{}, 0, 0, 5, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
+        {{}, 0, 0, 6, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
         {{}, 0, 0, 4, reshade::api::descriptor_type::texture_unordered_access_view, uavs},
     };
     GtvbaoApplyDescriptors(dev, cl, d->cortao_main_layout, &d->cortao_main_tables, 4, u);
@@ -16268,9 +16293,10 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   d->gtvbao_prev_params_valid = false;
   CortaoLog(std::string("run exit ok ") + std::to_string(w) + "x" + std::to_string(h)
         + " mips=" + std::to_string(d->cortao_mip_count)
-        + " samples=" + std::to_string(std::lround(g_cortao_quality))
+        + " samples=" + std::to_string(kCortaoSampleCounts[d->cortao_main_pipeline_key % 7])
         + " filter=" + (filter_on ? ((d->cortao_filter_pipeline_key % 2) == 1 ? "large" : "small") : "off")
-        + " bent=" + std::to_string(bent_on));
+        + " bent=" + std::to_string(bent_on)
+        + " noise=" + (noise_type == 0 ? "cortao" : (noise_type == 1 ? "hilbert" : "isfast")));
   return true;
 }
 

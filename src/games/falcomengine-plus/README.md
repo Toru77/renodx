@@ -73,7 +73,7 @@ GT-VBAO computes screen-space ambient occlusion by evaluating visibility bitmask
 CORTAO ray-traces screen-space circular occluders built from a mipmapped packed depth/normal buffer to compute physically based ambient occlusion. It is selected by AO Technique as an alternative to GTVBAO and writes the same AO output the lighting shaders read. It follows the reference's DX11 workarounds (R32_FLOAT packed buffer, UNORM 16-ray occluder lookup table).
 
 **Code:** [`customshaders/cortao`](customshaders/cortao/); bent-normal ambient (M5): [Sora 1st](games/sora1st/lighting/lighting_0xFDAAF80E.ps_5_0.hlsl), [Sora 2nd](games/sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl), [Kai](games/kai/lighting/lighting_0x430ED091.ps_5_0.hlsl), [Kai soft](games/kai/lighting/lightingsoft_0xF6C55E5F.ps_5_0.hlsl) (t25).
-**Reference:** [`reference/CORTAO-main`](reference/CORTAO-main/) (v1.0.1).
+**Reference:** [`reference/CORTAO-main`](reference/CORTAO-main/) (v1.0.1); the vendored CORTAOMainPass.h carries one marked Falcom Engine+ extension (FALCOM_CORTAO_USER_NOISE, Noise Type).
 **License:** [`licenses/CORTAO-LICENSE.txt`](licenses/CORTAO-LICENSE.txt).
 
 #### GTVBGI / VBGI
