@@ -18,8 +18,18 @@ RWTexture2D<float4> g_outSvgfRaw : register(u0);
 RWTexture2D<float> g_outOcclusion : register(u1);     // filter input, R8_UNORM (M3)
 RWTexture2D<float4> g_outDebug : register(u3);        // u2 is the bent output (M4)
 
+static bool g_falcomCortaoMaskFoliage = false;
 cortao_uint cortao_samplePackedData(cortao_float2 texCoords, cortao_float mipmap) {
-  return asuint(g_srcPacked.SampleLevel(g_samplerPointBorder, texCoords, mipmap));
+  const cortao_uint packed = asuint(g_srcPacked.SampleLevel(g_samplerPointBorder, texCoords, mipmap));
+  // Foliage does not cast for non-foliage receivers: packed 0 is "no geometry", which
+  // cortao_computeRayOcclusion always culls (CORTAOMainPass.h: sky and off-screen samples have depth 0).
+  if (g_falcomCortaoMaskFoliage) {
+    uint mw, mh;
+    g_srcFoliageMask.GetDimensions(mw, mh);
+    const int2 mc = min(int2(saturate(texCoords) * float2(mw, mh)), int2(mw, mh) - 1);
+    if (g_srcFoliageMask.Load(int3(mc, 0)) != 0u) return 0u;
+  }
+  return packed;
 }
 cortao_half3 cortao_loadNormal(cortao_int2 pixelCoords) {
   return (cortao_half3)FalcomCortaoViewNormal(g_srcMrtNormal, pixelCoords);
@@ -31,7 +41,7 @@ void cortao_writeResult(cortao_int2 pixelCoords, cortao_half occlusion, cortao_h
                         cortao_half3x3 tangentSpaceTransform, cortao_uint rayBits) {
   const float visibility = pow(saturate((float)occlusion), CORTAO_intensity); // README intensity tweak
   if (CORTAO_filter_enabled > 0.5f) g_outOcclusion[pixelCoords] = visibility;
-  else FalcomCortaoWriteVisibility(g_outSvgfRaw, pixelCoords, visibility);
+  else FalcomCortaoWriteVisibility(g_outSvgfRaw, g_srcFoliageMask, pixelCoords, visibility);
   if (CORTAO_debug_mode > 21.5f) {
     if ((int)CORTAO_debug_mode == 22) g_outDebug[pixelCoords] = float4(visibility.xxx, 1.0);
     else if ((int)CORTAO_debug_mode == 26) g_outDebug[pixelCoords] = float4((float3)tangentSpaceTransform[2] * 0.5 + 0.5, 1.0);
@@ -75,8 +85,14 @@ uint2 deinterleave(uint index) {
 void main(uint2 workgroupID : SV_GroupID, uint localIndex : SV_GroupIndex) {
   const uint2 pixelCoords = workgroupID * uint2(WORKGROUP_SIZE, WORKGROUP_SIZE) + deinterleave(localIndex);
   if (pixelCoords.x >= CORTAO_width || pixelCoords.y >= CORTAO_height) return;
+  const bool receiverFoliage = CORTAO_foliage_exclude > 0.5f && g_srcFoliageMask.Load(int3(pixelCoords, 0)) != 0u;
+  g_falcomCortaoMaskFoliage = CORTAO_foliage_exclude > 0.5f && !receiverFoliage;
+  if (receiverFoliage && CORTAO_foliage_ao_value <= 0.0f && CORTAO_debug_mode < 21.5f) {
+    FalcomCortaoWriteVisibility(g_outSvgfRaw, g_srcFoliageMask, pixelCoords, 1.0); // GTVBAO perf P2 parity
+    return;
+  }
   // cortao_mainPass returns before cortao_writeResult for sky pixels (CORTAOMainPass.h:374-377): pre-write full visibility.
-  FalcomCortaoWriteVisibility(g_outSvgfRaw, pixelCoords, 1.0);
+  FalcomCortaoWriteVisibility(g_outSvgfRaw, g_srcFoliageMask, pixelCoords, 1.0);
   if (CORTAO_debug_mode > 21.5f) g_outDebug[pixelCoords] = float4(0.25, 0.0, 0.25, 1.0);
   cortao_mainPass(pixelCoords, FalcomCortaoPopulateMainPassParameters());
 }

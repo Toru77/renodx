@@ -54,7 +54,10 @@ float3 FalcomCortaoViewNormal(Texture2D<uint4> mrt, int2 pix)
 }
 
 // SVGF raw layout, no GTVBAO ×1.5 byte scale.
-void FalcomCortaoWriteVisibility(RWTexture2D<float4> outRaw, uint2 p, float visibility)
+void FalcomCortaoWriteVisibility(RWTexture2D<float4> outRaw, Texture2D<uint> foliageMask, uint2 p, float visibility)
 {
+  // GTVBAO parity (GTVBAO.hlsli:746-752): blend foliage receivers toward full visibility.
+  if (CORTAO_foliage_exclude > 0.5f && foliageMask.Load(int3(p, 0)) != 0u)
+    visibility = lerp(visibility, 1.0, 1.0 - saturate(CORTAO_foliage_ao_value));
   outRaw[p] = float4(visibility, visibility, visibility, 1.0);
 }

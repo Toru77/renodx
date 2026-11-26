@@ -758,6 +758,12 @@ static float g_cortao_backface_threshold = 0.5f;
 static float g_cortao_backface_boost = 0.5f;
 static float g_cortao_debug_view = 0.f;
 static float g_cortao_debug_log = 0.f;  // CORTAODebugLog: 1 = CORTAO writes diagnostics to ReShade.log
+static float g_cortao_exclude_foliage = 1.f;
+static float g_cortao_foliage_ao_value = 0.f;
+static float g_gtvbao_char_mode = 2.f;
+static float g_gtvbao_char_mask_strength = 0.75f;
+static float g_cortao_char_mode = 2.f;
+static float g_cortao_char_mask_strength = 0.75f;
 
 // -- Dynamic Cubemaps (Sora 2nd) � standalone t17 replacement --
 constexpr uint32_t kDynCubeRegister = 17u;         // t17 texEnvMap_g
@@ -1239,6 +1245,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline_layout cortao_prepass_layout = {}, cortao_main_layout = {};
   reshade::api::pipeline cortao_prepass_pipeline = {}, cortao_main_pipeline = {};
   int cortao_main_pipeline_key = -1;
+  falcom_world::denoise::TextureSet<1> cortao_foliage_mask = {};
   GTVBAODescriptorTableSet cortao_prepass_tables = {}, cortao_main_tables = {};
   // -- Debug UAV (bitmask debug views 6-8) --
   reshade::api::resource debug_texture = {};
@@ -3966,23 +3973,24 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .key = "CharGTVBAOMode",
-        .binding = &shader_injection.char_gtvbao_mode,
+        .binding = &g_gtvbao_char_mode,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 2.f,
         .label = "Allow GTVBAO",
         .section = "GTVBAO",
         .labels = {"Off", "On", "Combined"},
+        .is_enabled = []() { return GtvbaoSelected(); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharGTVBAOMaskStr",
-        .binding = &shader_injection.char_gtvbao_mask_strength,
+        .binding = &g_gtvbao_char_mask_strength,
         .default_value = 75.f,
         .label = "GTVBAO Char Mask",
         .section = "GTVBAO",
         .min = 0.f,
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.char_gtvbao_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && g_gtvbao_char_mode > 0.5f; },
         .parse = [](float v) { return v * 0.01f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -4502,6 +4510,55 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 1.f,
         .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOExcludeFoliage",
+        .binding = &g_cortao_exclude_foliage,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Exclude Foliage",
+        .section = "CORTAO",
+        .tooltip = "Skip AO computation on foliage pixels (prevent wind disocclusion noise).",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOFoliageAOValue",
+        .binding = &g_cortao_foliage_ao_value,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f,
+        .label = "Foliage AO Value",
+        .section = "CORTAO",
+        .tooltip = "Blends foliage AO toward fully bright. 1.0 = keep normal CORTAO AO (like foliage exclusion OFF). 0.0 = no AO on foliage (fully bright).",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return g_cortao_exclude_foliage > 0.5f; },
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOCharMode",
+        .binding = &g_cortao_char_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "Allow CORTAO",
+        .section = "CORTAO",
+        .labels = {"Off", "On", "Combined"},
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOCharMaskStr",
+        .binding = &g_cortao_char_mask_strength,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 75.f,
+        .label = "CORTAO Char Mask",
+        .section = "CORTAO",
+        .min = 0.f,
+        .max = 100.f,
+        .format = "%.0f",
+        .is_enabled = []() { return g_cortao_char_mode > 0.5f; },
+        .parse = [](float v) { return v * 0.01f; },
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -11981,6 +12038,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   }
   shader_injection.gtvbao_debug_view = (float)ActiveGtvbaoDebugMode();
   shader_injection.gtvbao_dedicated_bound = 0.f;
+  // The lighting shaders read char_gtvbao_* for whichever technique fills t22.
+  shader_injection.char_gtvbao_mode = CortaoSelected() ? g_cortao_char_mode : g_gtvbao_char_mode;
+  shader_injection.char_gtvbao_mask_strength = CortaoSelected() ? g_cortao_char_mask_strength : g_gtvbao_char_mask_strength;
   shader_injection.gtvbao_vbgi_bound = 0.f;
   SyncISFASTToShaderInjection(cmd_list);  // keep IS-FAST mirrors in sync
   // Push IS-FAST noise texture for PCSS shadow jitter (t24 only � NO sampler push,
@@ -12804,6 +12864,7 @@ static void DestroyCortaoResources(reshade::api::device* dev, DeviceData* d) {
   dv(d->cortao_packed_srv);
   for (auto& u : d->cortao_packed_uavs) dv(u);
   dr(d->cortao_packed_texture);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->cortao_foliage_mask);
   dv(d->cortao_lut_srv);
   dr(d->cortao_lut_texture);
   if (d->cortao_border_sampler.handle) {
@@ -15601,6 +15662,26 @@ static void RunGTVBAOSharedPrep(reshade::api::command_list* cl, DeviceData* d) {
 
 // -- Dispatch --
 
+// Foliage mask pre-pass shared by GTVBAO and CORTAO (gtvbao_foliage_mask.cs_5_0.hlsl: t0 depth for size, t1 MRT, u0 mask).
+static void DispatchFoliageMask(reshade::api::command_list* cl, DeviceData* d, reshade::api::resource_view depth_srv,
+                                reshade::api::resource_view mask_uav, reshade::api::resource mask_texture,
+                                uint32_t width, uint32_t height, const std::array<float, kGtvbaoPushConstantFloats>& pc) {
+  auto* dev = cl->get_device();
+  GtvbaoBindPipeline(cl, d->foliage_mask_pipeline);
+  reshade::api::resource_view fm_srvs[2] = {depth_srv, d->captured_mrt_normal_srv};
+  reshade::api::descriptor_table_update fu[4] = {
+      {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_clamp_sampler},
+      {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+      {{}, 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, fm_srvs},
+      {{}, 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &mask_uav},
+  };
+  GtvbaoApplyDescriptors(dev, cl, d->foliage_mask_layout, &d->foliage_mask_tables, 4, fu);
+  cl->push_constants(reshade::api::shader_stage::all_compute, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0,
+                     kGtvbaoPushConstantFloats, pc.data());
+  cl->dispatch((width + 7) / 8, (height + 7) / 8, 1);
+  GtvbaoBarrier(cl, mask_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+}
+
 static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   namespace compute = falcom_world::compute;
   if (!d->captured_depth_srv.handle) return false;
@@ -15681,25 +15762,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   RunGTVBAOSharedPrep(cl, d);
 
   // -- Foliage mask pre-pass (AO working domain, reads MRT normal, writes R8_UINT) --
-  if (foliage_mask_valid) {
-    uint32_t mkW = aw, mkH = ah;
-    GtvbaoBindPipeline(cl, d->foliage_mask_pipeline);
-    reshade::api::resource_view fm_srvs[2] = {
-        d->depth_mips_srv,          // t0 � working depth (GetDimensions)
-        d->captured_mrt_normal_srv  // t1 � G-buffer normal (bit 15 test)
-    };
-    reshade::api::descriptor_table_update fu[4] = {
-        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_clamp_sampler},
-        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
-        {{}, 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, fm_srvs},
-        {{}, 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->foliage_mask_uav},
-    };
-    GtvbaoApplyDescriptors(dev, cl, d->foliage_mask_layout, &d->foliage_mask_tables, 4, fu);
-    auto pc = BuildGTVBAOPushConstants(d);
-    cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
-    cl->dispatch((mkW + 7) / 8, (mkH + 7) / 8, 1);
-    GtvbaoBarrier(cl, d->foliage_mask_texture, UA, SR);
-  }
+  if (foliage_mask_valid) DispatchFoliageMask(cl, d, d->depth_mips_srv, d->foliage_mask_uav, d->foliage_mask_texture, aw, ah, BuildGTVBAOPushConstants(d));
 
   // Temporal accumulation: the reset rule shared with GTVBAO and VBGI over this pass's own state.
   // Motion is checked only while Temporal is wanted; without motion the AO stays spatial only.
@@ -15875,6 +15938,21 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   const int dbg = GtvbaoDebugMode();
   const bool dbg_on = IsGtvbaoComputeDebug(dbg) && d->debug_uav.handle;
 
+  const bool had_foliage_draws = d->foliage_drawn_this_frame;
+  d->foliage_drawn_this_frame = false;
+  const bool foliage_texture_ok = g_cortao_exclude_foliage > 0.5f
+      && falcom_world::denoise::EnsureTextureSet(dev, &d->cortao_foliage_mask, reshade::api::format::r8_uint, 1u, w, h);
+  const bool foliage_mask_valid = had_foliage_draws && foliage_texture_ok && d->foliage_mask_pipeline.handle != 0u;
+  if (g_cortao_exclude_foliage > 0.5f && !foliage_mask_valid)
+    CortaoLog(std::string("foliage mask skipped: drawn=") + std::to_string(had_foliage_draws) + " pipeline="
+              + std::to_string(d->foliage_mask_pipeline.handle != 0u) + " texture=" + std::to_string(foliage_texture_ok));
+  if (foliage_mask_valid) {
+    auto fpc = BuildGTVBAOPushConstants(d);
+    fpc[27] = 1.f;  // exclusion on (gtvbao_foliage_mask.cs_5_0.hlsl reads c[27])
+    fpc[35] = 0.f;  // Full: divisor 1 (c[35])
+    DispatchFoliageMask(cl, d, d->captured_depth_srv, d->cortao_foliage_mask.uav[0], d->cortao_foliage_mask.texture[0], w, h, fpc);
+  }
+
   CortaoPushConstants pc = {};
   pc.width = w;
   pc.height = h;
@@ -15899,8 +15977,8 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   pc.filter_depth_sensitivity = 512.f;
   pc.filter_normal_sensitivity = 16.f;
   pc.filter_enabled = 0.f;
-  pc.foliage_exclude = 0.f;
-  pc.foliage_ao_value = 1.f;
+  pc.foliage_exclude = foliage_mask_valid ? 1.f : 0.f;
+  pc.foliage_ao_value = std::clamp(g_cortao_foliage_ao_value, 0.f, 1.f);
   pc.debug_mode = dbg_on ? static_cast<float>(dbg) : 0.f;
 
   // Pass 1: prepass packs depth and view normals into mip 0 and its coarse levels.
@@ -15923,7 +16001,7 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   GtvbaoBindPipeline(cl, d->cortao_main_pipeline);
   {
     reshade::api::sampler samplers[2] = {d->cortao_border_sampler, d->point_clamp_sampler};
-    reshade::api::resource_view srvs[5] = {d->cortao_packed_srv, d->captured_mrt_normal_srv, d->cortao_lut_srv, d->fallback_srv, d->fallback_srv};
+    reshade::api::resource_view srvs[5] = {d->cortao_packed_srv, d->captured_mrt_normal_srv, d->cortao_lut_srv, foliage_mask_valid ? d->cortao_foliage_mask.srv[0] : d->fallback_srv, d->fallback_srv};
     reshade::api::resource_view uavs[4] = {d->gtvbao_svgf_raw.uav[0], d->fallback_uav, d->fallback_uav, dbg_on ? d->debug_uav : d->fallback_uav};
     reshade::api::descriptor_table_update u[4] = {
         {{}, 0, 0, 2, reshade::api::descriptor_type::sampler, samplers},
