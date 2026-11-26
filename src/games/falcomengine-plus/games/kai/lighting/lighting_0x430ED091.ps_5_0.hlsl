@@ -474,6 +474,9 @@ void main(
   // unaffected, which is why this needs no is_character_pixel test.
   ao_sample.y = ao_sample.y * char_shadow_sample;
   r4.xyz = ao_sample;
+  // CORTAO Ambient Only (M6c), declared here for the M6d AO Target view.
+  const bool cortaoAmbientOnly = shader_injection_data.cortao_ambient_only > 0.5f && shader_injection_data.gtvbao_dedicated_bound > 0.5f
+                                 && !is_character_pixel;
   uint GTVBAO_debug_mode_ui = (uint)round(max(shader_injection_data.gtvbao_debug_mode, 0.0));
   const bool run_GTVBAO_debug = !GTVBAO_force_neutral_x
       && GTVBAO_debug_mode_ui > 0u
@@ -615,6 +618,10 @@ void main(
           is_foliage_pixel_t1_broad ? 1.0 : 0.0,
           is_foliage_pixel_t1_sss ? 1.0 : 0.0,
           t10_debug);
+    } else if (GTVBAO_debug_mode_ui == 40u) {
+      // CORTAO AO Target (M6d): green = ambient term only (Ambient Only), grey = whole lit colour (game path).
+      // Character pixels are blacked out above: their AO path is unchanged.
+      debug_color = cortaoAmbientOnly ? float3(0.0, r4.x, 0.0) : r4.xxx;
     } else if (GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 38u) {
       // ── MRT normal / horizon diagnostics (22-29) ──
       // The compute pass wrote these into its debug UAV, which the host pushed
@@ -1813,8 +1820,6 @@ void main(
         brdf_diffuse_str);
   }
   // CORTAO Ambient Only (M6c): the game's AO tint and weight on the ambient term (r12: probes + SSGI) instead of the final colour.
-  const bool cortaoAmbientOnly = shader_injection_data.cortao_ambient_only > 0.5f && shader_injection_data.gtvbao_dedicated_bound > 0.5f
-                                 && !is_character_pixel;
   const float3 cortaoAmbientIn = r12.xyz;
   if (cortaoAmbientOnly) {
     const float3 cortaoAoTint = r15.www * (min(float3(1, 1, 1), r15.xyz) - mapAOColor_g.xyz) + mapAOColor_g.xyz;

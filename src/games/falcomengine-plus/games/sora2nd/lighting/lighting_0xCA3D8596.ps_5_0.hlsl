@@ -435,6 +435,10 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
 
   // —— GTVBAO Debug View ——
   // Scaled for HDR: raw 0-1 AO values would be blinding without scaling.
+  // CORTAO Ambient Only (M6c), declared here for the M6d AO Target view: non-character pixels (mrtTexture0.w bit 3 set,
+  // the csIsCharacter test), CORTAO filling t22, no path-traced GI.
+  const bool cortaoAmbientOnly = shader_injection_data.cortao_ambient_only > 0.5f && shader_injection_data.gtvbao_dedicated_bound > 0.5f
+                                 && (cortaoMrtFlags & 8u) != 0u && !ptGiValid;
   if (shader_injection_data.gtvbao_debug_view > 0.5f) {
     int mode = (int)shader_injection_data.gtvbao_debug_view;
     float hdr_scale = 0.3;
@@ -453,6 +457,18 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
       uint4 raw = gtvbaoTexture.Load(int3(texel, 0));
       float raw_ao = float(raw.x) / 255.0;
       o0.rgb = float3(raw_ao, raw_ao, raw_ao) * hdr_scale;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy;
+      if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+      return;
+    }
+    if (mode == 40) {
+      // CORTAO AO Target (M6d): the applied AO value r5.x coloured by where it is applied. Green = ambient term only
+      // (Ambient Only), grey = whole lit colour (game path), blue = character path, red = path-traced GI pixels (PT AO).
+      float3 aoTarget = r5.xxx;
+      if (cortaoAmbientOnly) aoTarget = float3(0.0, r5.x, 0.0);
+      else if ((cortaoMrtFlags & 8u) == 0u) aoTarget = float3(0.0, 0.0, 1.0);
+      else if (ptGiValid) aoTarget = float3(r5.x, 0.0, 0.0);
+      o0.rgb = aoTarget * hdr_scale;
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy;
       if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
       return;
@@ -1368,8 +1384,6 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         brdf_diffuse_str);
   }
   // CORTAO Ambient Only (M6c): the game's AO formula on the ambient term (r13) instead of the final colour.
-  const bool cortaoAmbientOnly = shader_injection_data.cortao_ambient_only > 0.5f && shader_injection_data.gtvbao_dedicated_bound > 0.5f
-                                 && csIsCharacter < 0.5 && !ptGiValid;
   const float3 cortaoAmbientIn = r13.xyz;
   if (cortaoAmbientOnly) r13.xyz = (r13.xyz * mapAOColor_g.xyz - r13.xyz) * ((1.0 - r5.x) * r17.z * mapAOIntensity_g) + r13.xyz;
   r9.xyz = FalcomApplyContactToSun(

@@ -554,7 +554,7 @@ constexpr std::array<std::span<const uint8_t>, 7> kCortaoMainBentShaders = {
     __cortao_main_bent_s16, __cortao_main_bent_s24, __cortao_main_bent_s32};
 constexpr int kCortaoSampleCounts[7] = {4, 6, 8, 12, 16, 24, 32};  // CORTAO_SAMPLE_COUNT per Quality index (README quality names)
 constexpr std::array<std::span<const uint8_t>, 2> kCortaoFilterBentShaders = {__cortao_filter_bent_small, __cortao_filter_bent_large};
-constexpr int kCortaoDebugModes[5] = {0, 1, 22, 26, 28};
+constexpr int kCortaoDebugModes[9] = {0, 1, 22, 26, 28, 24, 25, 23, 40};  // Off, Final AO, Raw AO, Input Normal, Bent Normal, Filtered AO, Filtered Bent Normal, Temporal Confidence, AO Target (M6d)
 
 // DynCube loading wipe: color captures older than this mean no lighting draws
 // (loading screen) � arm history hard-replace so the next scene rebuilds clean.
@@ -1056,7 +1056,7 @@ static int VbgiGtvbaoDebugMode() {
 // AO-only: the VBGI row replaces the AO debug view, never mixes with it.
 static int GtvbaoDebugMode() {
   if (VbgiGtvbaoDebugMode() != 0) return 0;
-  if (CortaoSelected()) return kCortaoDebugModes[std::clamp((int)g_cortao_debug_view, 0, 4)];
+  if (CortaoSelected()) return kCortaoDebugModes[std::clamp((int)g_cortao_debug_view, 0, 8)];
   return kGtvbaoDebugModes[std::clamp((int)g_gtvbao_debug_ui, 0, 6)];
 }
 // What the lighting shaders show: VBGI wins when its row is set.
@@ -4714,7 +4714,8 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Debug View",
         .section = "CORTAO",
-        .labels = {"Off", "AO Only", "Raw AO", "Input Normal", "Bent Normal"},
+        .tooltip = "Final AO: the AO the game applies (after the CORTAO filter, temporal accumulation and upsample). Raw AO: the main pass before filtering. Input Normal: the normal CORTAO used. Bent Normal: the main-pass bent normal (needs Bent Normals). Filtered AO: after the CORTAO filter, before temporal (equals Raw AO with Filter Off). Filtered Bent Normal: the bent normal Bent Normal Ambient reads (needs Bent Normals). Temporal Confidence: history age, black (new) to white (full); purple when temporal is not running. AO Target: where the AO is applied: green = ambient only, grey = whole lit colour, blue = characters, red = path-traced GI pixels. Purple = sky or not available.",
+        .labels = {"Off", "Final AO", "Raw AO", "Input Normal", "Bent Normal", "Filtered AO", "Filtered Bent Normal", "Temporal Confidence", "AO Target"},
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -15553,7 +15554,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
       if (!d->cortao_main_pipeline.handle && mkcs(key < 7 ? kCortaoMainShaders[key] : kCortaoMainBentShaders[key - 7], "main", d->cortao_main_layout, &d->cortao_main_pipeline))
         d->cortao_main_pipeline_key = key;
     }
-    if (g_cortao_filter > 0.5f && make_layout(3u, 2u, &d->cortao_filter_layout, 1u, kCortaoPushConstantFloats)) {
+    if (g_cortao_filter > 0.5f && make_layout(3u, 3u, &d->cortao_filter_layout, 1u, kCortaoPushConstantFloats)) {
       const int fkey = std::clamp((int)std::lround(g_cortao_filter_size), 0, 1) + (g_cortao_bent_normals > 0.5f ? 2 : 0);
       if (d->cortao_filter_pipeline.handle && d->cortao_filter_pipeline_key != fkey) {
         dev->destroy_pipeline(d->cortao_filter_pipeline);
@@ -16298,12 +16299,12 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
     GtvbaoBarrier(cl, bent_on ? d->cortao_occlusion_bent.texture[0] : d->cortao_occlusion.texture[0], UA, SR);
     GtvbaoBindPipeline(cl, d->cortao_filter_pipeline);
     reshade::api::resource_view srvs[3] = {d->cortao_packed_srv, bent_on ? d->cortao_occlusion_bent.srv[0] : d->cortao_occlusion.srv[0], foliage_mask_valid ? d->cortao_foliage_mask.srv[0] : d->fallback_srv};
-    reshade::api::resource_view uavs[2] = {d->gtvbao_svgf_raw.uav[0], bent_on ? d->cortao_bent_normal.uav[0] : d->fallback_uav};
+    reshade::api::resource_view uavs[3] = {d->gtvbao_svgf_raw.uav[0], bent_on ? d->cortao_bent_normal.uav[0] : d->fallback_uav, dbg_on ? d->debug_uav : d->fallback_uav};
     reshade::api::descriptor_table_update u[4] = {
         {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->cortao_border_sampler},
         {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
         {{}, 0, 0, 3, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
-        {{}, 0, 0, 2, reshade::api::descriptor_type::texture_unordered_access_view, uavs},
+        {{}, 0, 0, 3, reshade::api::descriptor_type::texture_unordered_access_view, uavs},
     };
     GtvbaoApplyDescriptors(dev, cl, d->cortao_filter_layout, &d->cortao_filter_tables, 4, u);
     cl->push_constants(CS, d->cortao_filter_layout, kGtvbaoPushConstantsLayoutParam, 0, kCortaoPushConstantFloats, &pc);
@@ -16330,14 +16331,14 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
                               .motion_view = d->mb_rtv4_owned_srv,
                               .albedo_view = reshade::api::resource_view{0u},
                               .stats_uav = reshade::api::resource_view{0u},
-                              .debug_uav = reshade::api::resource_view{0u},
+                              .debug_uav = (dbg_on && dbg == 23) ? d->debug_uav : reshade::api::resource_view{0u},
                               .debug_texture = d->debug_texture,
                               .trace_width = w,
                               .trace_height = h,
                               .full_width = w,
                               .full_height = h,
                               .divisor = 1.f,
-                              .debug_mode = 0,
+                              .debug_mode = (dbg_on && dbg == 23) ? 5 : 0,  // SVGF history confidence (CORTAO Temporal Confidence, M6d)
                               .svgf = {g_cortao_history_weight, g_cortao_depth_rejection, g_cortao_normal_rejection,
                                        reset == falcom_world::compute::ResetReason::None, 1.f, g_gtvbao_svgf_luminance_edge_stop,
                                        g_gtvbao_svgf_depth_sigma, g_gtvbao_svgf_normal_power, false, g_cortao_history_length, 1.f},

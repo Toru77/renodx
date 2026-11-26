@@ -78,9 +78,10 @@ void cortao_writeResult(cortao_int2 pixelCoords, cortao_half occlusion, cortao_h
   if (CORTAO_filter_enabled > 0.5f) g_outOcclusion[pixelCoords] = float4(visibility, (float3)bentNormal);
   else FalcomCortaoWriteOutputs(g_outSvgfRaw, g_outBentNormal, g_srcFoliageMask, pixelCoords, float4(visibility, (float3)bentNormal));
   if (CORTAO_debug_mode > 21.5f) {
-    if ((int)CORTAO_debug_mode == 22) g_outDebug[pixelCoords] = float4(visibility.xxx, 1.0);
+    // With the filter off, the filtered views (24, 25) equal the main-pass result (M6d).
+    if ((int)CORTAO_debug_mode == 22 || ((int)CORTAO_debug_mode == 24 && CORTAO_filter_enabled < 0.5f)) g_outDebug[pixelCoords] = float4(visibility.xxx, 1.0);
     else if ((int)CORTAO_debug_mode == 26) g_outDebug[pixelCoords] = float4((float3)tangentSpaceTransform[2] * 0.5 + 0.5, 1.0);
-    else if ((int)CORTAO_debug_mode == 28) g_outDebug[pixelCoords] = float4((float3)bentNormal * 0.5 + 0.5, 1.0);
+    else if ((int)CORTAO_debug_mode == 28 || ((int)CORTAO_debug_mode == 25 && CORTAO_filter_enabled < 0.5f)) g_outDebug[pixelCoords] = float4((float3)bentNormal * 0.5 + 0.5, 1.0);
   }
 }
 #else
@@ -90,7 +91,7 @@ void cortao_writeResult(cortao_int2 pixelCoords, cortao_half occlusion, cortao_h
   if (CORTAO_filter_enabled > 0.5f) g_outOcclusion[pixelCoords] = visibility;
   else FalcomCortaoWriteVisibility(g_outSvgfRaw, g_srcFoliageMask, pixelCoords, visibility);
   if (CORTAO_debug_mode > 21.5f) {
-    if ((int)CORTAO_debug_mode == 22) g_outDebug[pixelCoords] = float4(visibility.xxx, 1.0);
+    if ((int)CORTAO_debug_mode == 22 || ((int)CORTAO_debug_mode == 24 && CORTAO_filter_enabled < 0.5f)) g_outDebug[pixelCoords] = float4(visibility.xxx, 1.0);
     else if ((int)CORTAO_debug_mode == 26) g_outDebug[pixelCoords] = float4((float3)tangentSpaceTransform[2] * 0.5 + 0.5, 1.0);
   }
 }

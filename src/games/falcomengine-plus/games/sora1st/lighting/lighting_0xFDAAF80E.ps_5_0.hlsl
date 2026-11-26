@@ -306,12 +306,25 @@ void main(
 
   // —— GTVBAO Debug View ——
   // Scaled for HDR: raw 0-1 AO values would be blinding without scaling.
+  // CORTAO Ambient Only (M6c), declared here for the M6d AO Target view: non-character pixels (mrtTexture0.w bit 3 set,
+  // the csIsCharacter test) and CORTAO filling t22.
+  const bool cortaoAmbientOnly = shader_injection_data.cortao_ambient_only > 0.5f && shader_injection_data.gtvbao_dedicated_bound > 0.5f
+                                 && (cortaoMrtFlags & 8u) != 0u;
   if (shader_injection_data.gtvbao_debug_view > 0.5f) {
     int mode = (int)shader_injection_data.gtvbao_debug_view;
     float hdr_scale = 0.3;
     if (mode == 1) {
       // AO Only: gray for visibility
       o0.rgb = float3(ao_sample.x * hdr_scale, ao_sample.x * hdr_scale, ao_sample.x * hdr_scale);
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+    if (mode == 40) {
+      // CORTAO AO Target (M6d): the applied AO value r4.x coloured by where it is applied. Green = ambient term only
+      // (Ambient Only), grey = whole lit colour (game path), blue = character path.
+      float3 aoTarget = r4.xxx;
+      if (cortaoAmbientOnly) aoTarget = float3(0.0, r4.x, 0.0);
+      else if ((cortaoMrtFlags & 8u) == 0u) aoTarget = float3(0.0, 0.0, 1.0);
+      o0.rgb = aoTarget * hdr_scale;
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
     if (mode >= 22 && mode <= 38) {
@@ -1119,8 +1132,6 @@ void main(
         brdf_diffuse_str);
   }
   // CORTAO Ambient Only (M6c): the game's AO formula on the ambient term (r11) instead of the final colour.
-  const bool cortaoAmbientOnly = shader_injection_data.cortao_ambient_only > 0.5f && shader_injection_data.gtvbao_dedicated_bound > 0.5f
-                                 && csIsCharacter < 0.5;
   const float3 cortaoAmbientIn = r11.xyz;
   if (cortaoAmbientOnly) r11.xyz = (r11.xyz * mapAOColor_g.xyz - r11.xyz) * ((1.0 - r4.x) * r4.w * mapAOIntensity_g) + r11.xyz;
   r7.xyz = FalcomApplyContactToSun(
