@@ -329,9 +329,10 @@ struct AlbedoGpu {
   reshade::api::descriptor_table blit_tables[3] = {};  // t0 source, s0 sampler, u0 atlas
   reshade::api::pipeline blit_pipeline = {0u};
   AlbedoSliceTable slices;
-  std::unordered_map<uint64_t, uint32_t> slice_of_source;  // source id -> slice
+  std::unordered_map<uint64_t, uint32_t> slice_of_texture;  // game texture handle -> slice (outlives the source copy)
   AlbedoMaterialTable material_table;
   std::unordered_map<uint64_t, uint32_t> material_of_key;  // draw key -> material index (read by the TLAS)
+  std::unordered_map<uint64_t, uint64_t> texture_of_key;   // draw key -> its source's texture handle
   std::vector<std::pair<uint32_t, uint32_t>> quarantine;  // (slice, frame released)
   GpuTimer timer;
   uint64_t blits = 0u;
@@ -600,9 +601,10 @@ inline void DestroyAlbedoGpu(reshade::api::device* device, BvhDeviceData* data) 
   albedo.blit_layout = {0u};
   albedo.sampler = {0u};
   albedo.slices = {};
-  albedo.slice_of_source.clear();
+  albedo.slice_of_texture.clear();
   albedo.material_table = {};
   albedo.material_of_key.clear();
+  albedo.texture_of_key.clear();
   albedo.quarantine.clear();
   albedo.failure_logged = false;
   albedo.blits_frame = 0u;

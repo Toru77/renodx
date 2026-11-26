@@ -82,15 +82,29 @@ inline std::string SerializePtReport() {
   out << "gpu_misses: " << p.gpu_misses << "\n";
   out << "gpu_atlas_hits: " << p.gpu_atlas_hits << "\n";
   bvh::PoolAlbedoGpuStats atlas;
+  uint64_t refused_cap = 0u, refused_frame = 0u, refused_bytes = 0u, refused_type = 0u;
+  uint64_t retries = 0u, uv_slot0 = 0u, uv_over_cap = 0u, live_sources = 0u;
   {
     std::lock_guard lock(bvh::g_pool.mutex);
     atlas = bvh::g_pool.albedo_gpu;
+    const bvh::PoolStats& stats = bvh::g_pool.stats;
+    refused_cap = stats.albedo_refused_sources_cap;
+    refused_frame = stats.albedo_refused_frame_cap;
+    refused_bytes = stats.albedo_refused_bytes;
+    refused_type = stats.albedo_refused_type;
+    retries = stats.albedo_retries;
+    uv_slot0 = stats.albedo_uv_slot0;
+    uv_over_cap = stats.albedo_uv_over_cap;
+    live_sources = stats.albedo_live_sources;
   }
   out << "atlas: sources " << atlas.sources << "; slices " << atlas.slices_used << "/" << kAlbedoAtlasSlices
       << "; materials " << atlas.materials_used << "/" << kAlbedoMaterials
       << "; keys " << atlas.keys_mapped << "; tlas_instances " << atlas.tlas_albedo_instances
       << "; copies " << atlas.copies << "; refused " << atlas.refused
-      << "; cap_refused " << atlas.cap_refused_slices << "/" << atlas.cap_refused_materials << "\n";
+      << "; cap_refused " << atlas.cap_refused_slices << "/" << atlas.cap_refused_materials
+      << "; refused cap/frame/bytes/type " << refused_cap << "/" << refused_frame << "/" << refused_bytes << "/"
+      << refused_type << "; retries " << retries << "; live " << live_sources << "/" << kAlbedoSourcesMax
+      << "; uv slot0 " << uv_slot0 << "; uv over cap " << uv_over_cap << "\n";
   out << "gpu_lock_drops: " << p.gpu_lock_drops << "\n";
   out << "gpu_writes: " << p.gpu_writes << "\n";
   out << "gpu_frame: " << p.gpu_frame << "\n";

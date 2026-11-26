@@ -456,6 +456,7 @@ struct PoolAlphaSource {
   reshade::api::format format = reshade::api::format::unknown;  // the format of the view the game bound
   uint64_t bytes = 0u;                  // mip 0 bytes (kAlphaSourceBytesMax)
   bool blitted = false;                 // the atlas has been filled from it at least once
+  bool albedo_only = false;             // captured for the material atlas, no alpha key uses it (separate budget)
   std::unordered_set<uint64_t> keys;    // draw keys that use this texture
 };
 // The GPU stage's numbers as the pool last saw them (written under g_pool.mutex by SyncLiveAlpha at the start of
@@ -764,6 +765,7 @@ struct PoolMeshRequest {
   int32_t uv_offset = -1;  // -1: no decodable UV
   reshade::api::format uv_format = reshade::api::format::unknown;
   PoolUvStream uv;                       // TEXCOORD0 in another slot (buffer 0: none)
+  bool atlas_only = false;               // atlas-only draw: over-cap UVs finish the mesh instead of failing it
   std::vector<uint8_t> vertex_bytes;     // the vertex read, held until the uv read decodes it
   PoolMeshPhase phase = PoolMeshPhase::Indices;
   bool in_flight = false;
@@ -1166,6 +1168,16 @@ struct PoolStats {
   uint64_t alpha_source_refused_deferred = 0u;  // of those: drawn on a deferred context (no copy there)
   uint64_t alpha_source_refused_type = 0u;      // of those: texture kind, view format, or the bound view is not the t0 texture
   uint64_t alpha_source_refused_failed = 0u;    // of those: the copy could not be made (the keys are refused)
+  // Material atlas (albedo-only) split diagnostics; the last two are gauges refreshed at the present.
+  uint64_t albedo_refused_sources_cap = 0u;
+  uint64_t albedo_refused_frame_cap = 0u;
+  uint64_t albedo_refused_bytes = 0u;
+  uint64_t albedo_refused_type = 0u;
+  uint64_t albedo_retries = 0u;
+  uint64_t albedo_uv_slot0 = 0u;
+  uint64_t albedo_uv_over_cap = 0u;
+  uint64_t albedo_live_sources = 0u;
+  uint64_t albedo_textures_sliced = 0u;
   uint64_t alpha_indirect_copies = 0u;   // keyless copies made for indirect alpha draws (mesh_key 0)
   uint64_t alpha_orphans_attached = 0u;  // keyless copies attached to their key at resolve
   uint64_t alpha_orphans_expired = 0u;   // keyless copies freed when their hold ran out (no resolve)
@@ -1609,6 +1621,8 @@ struct PoolState {
   bool alpha_capture_logged = false;  // the first capture after alpha_foliage was switched on is logged
   bool alpha_sync_logged = false;     // the first SyncLiveAlpha after alpha_foliage was switched on is logged
   std::unordered_set<uint64_t> alpha_source_done;  // draw keys needing no further copy (refused)
+  std::unordered_map<uint64_t, uint64_t> albedo_retry_at;  // atlas-only draw key -> frame it may be captured again
+  std::unordered_set<uint64_t> albedo_material_keys;  // mirror of the albedo atlas' mapped keys (read by the retry gate)
   std::unordered_set<uint64_t> alpha_indirect_keys;  // keys of indirect alpha draws attached to their source (resolve)
   PoolAlphaDumpMaps alpha_maps;  // dump-only copies of the atlas maps (SyncLiveAlpha)
   std::unordered_set<uint64_t> wind_keys;  // draw keys admitted as wind rest poses (cleared when alpha_wind_opaque goes off)
@@ -1619,6 +1633,10 @@ struct PoolState {
   std::vector<reshade::api::resource> alpha_dead_proxies;  // proxies to free at the next present (never in a destroy event)
   uint32_t alpha_copy_frame = 0u;
   uint32_t alpha_copies_frame = 0u;  // source copies made in alpha_copy_frame
+  uint32_t albedo_copy_frame = 0u;
+  uint32_t alpha_copies_frame_albedo = 0u;  // atlas-only source copies made in albedo_copy_frame
+  uint32_t albedo_live_sources = 0u;        // live atlas-only source copies (kAlbedoSourcesMax)
+  uint64_t albedo_source_bytes = 0u;        // their mip 0 bytes (kAlbedoSourceBytesMax)
   PoolAlphaGpuStats alpha_gpu;
   PoolAlbedoGpuStats albedo_gpu;
   uint64_t dynamic_revision = 0u;  // bumped when a moving instance changes pose (not a change of the set)
@@ -3575,6 +3593,7 @@ inline void RequeuePoolMeshKey(uint64_t mesh_key) {
   g_pool.failed_meshes.erase(mesh_key);
   g_pool.mesh_retry.erase(mesh_key);
   g_pool.alpha_source_done.erase(mesh_key);  // the new capture takes its own source copy
+  g_pool.albedo_retry_at.erase(mesh_key);
   UnmapPoolMeshKey(mesh_key);
 }
 
@@ -3737,15 +3756,17 @@ inline bool CollectPoolVertexBuffers(reshade::api::command_list* cmd_list, PoolV
   return true;
 }
 
-// The TEXCOORD0 stream of a draw when it is bound in a slot other than 0. Empty (no UVs) when the slot,
-// the element or the buffer does not fit. Reads the buffer size: call it before the pool lock.
-inline void ResolvePoolUvStream(reshade::api::device* device, const DrawRecord& draw, const PoolVertexBuffers& vbs, PoolUvStream* out) {
+// The TEXCOORD0 stream of a draw. Normally only a slot other than 0 counts (slot 0 is interleaved with the
+// positions and decoded there); atlas-only requests set allow_slot0 to capture that stream as well. Empty (no
+// UVs) when the slot, the element or the buffer does not fit. Reads the buffer size: call before the pool lock.
+inline void ResolvePoolUvStream(reshade::api::device* device, const DrawRecord& draw, const PoolVertexBuffers& vbs,
+                                PoolUvStream* out, bool allow_slot0) {
   namespace scene = renodx::utils::scene;
   *out = {};
   scene::InputLayoutInfo layout_info;
   if (!FindPoolInputLayout(draw, &layout_info)) return;
   const scene::InputElementCopy* uv = FindPoolTexcoord0(layout_info);
-  if (uv == nullptr || uv->buffer_binding == 0u) return;
+  if (uv == nullptr || (uv->buffer_binding == 0u && !allow_slot0)) return;
   out->slot = uv->buffer_binding;
   const scene::FormatInfo* info = scene::FindFormatInfo(uv->format);
   for (uint32_t i = 0u; i < vbs.count; ++i) {
@@ -3794,7 +3815,8 @@ inline bool PoolKeyBuffersTracked(const DrawRecord& draw, const PoolUvStream& uv
              || tracks(uv.buffer.handle));
 }
 
-inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord& draw, bool from_indirect, const PoolUvStream& uv) {
+inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord& draw, bool from_indirect,
+                          const PoolUvStream& uv, bool atlas_only = false) {
   const auto alpha_key = g_pool.alpha_keys.find(mesh_key);
   if (alpha_key != g_pool.alpha_keys.end() && !alpha_key->second.layout.valid) {
     renodx::utils::scene::InputLayoutInfo layout_info;
@@ -3832,6 +3854,8 @@ inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord&
   }
   request.serial = g_pool.next_mesh_serial++;
   request.uv = uv;
+  request.atlas_only = atlas_only;
+  if (atlas_only && uv.buffer.handle != 0u && uv.slot == 0u) g_pool.stats.albedo_uv_slot0 += 1u;
   request.buffer_key = PoolBufferKey(draw, uv);
   AddPoolMeshWaiting(request);
   g_pool.mesh_requests.emplace(mesh_key, std::move(request));
@@ -4008,6 +4032,13 @@ inline void UnlinkPoolAlphaTexture(uint64_t id, const PoolAlphaSource& source) {
   if (link != g_pool.alpha_source_by_texture.end() && link->second == id) g_pool.alpha_source_by_texture.erase(link);
 }
 
+// Caller holds g_pool.mutex. Releases the atlas-only share of a source copy; alpha copies keep their own budget.
+inline void ReleasePoolAlbedoBudget(const PoolAlphaSource& source) {
+  if (!source.albedo_only) return;
+  if (g_pool.albedo_live_sources != 0u) g_pool.albedo_live_sources -= 1u;
+  g_pool.albedo_source_bytes -= (std::min)(g_pool.albedo_source_bytes, source.bytes);
+}
+
 // Caller holds g_pool.mutex. The indirect source switch OFF, once per switch (re-armed by switching on): detaches the
 // indirect keys from their copies, drops the holds, and moves the copies left without a key to the dead list (freed at
 // the next present, outside the lock). Nothing here touches the device.
@@ -4034,6 +4065,7 @@ inline void ApplyPoolIndirectAlphaSwitch() {
     }
     if (it->second.proxy.handle != 0u) g_pool.alpha_dead_proxies.push_back(it->second.proxy);
     UnlinkPoolAlphaTexture(it->first, it->second);
+    ReleasePoolAlbedoBudget(it->second);
     it = g_pool.alpha_sources.erase(it);
   }
 }
@@ -4044,6 +4076,8 @@ inline void DrainPoolAlphaSources() {
     if (source.second.proxy.handle != 0u) g_pool.alpha_dead_proxies.push_back(source.second.proxy);
   }
   g_pool.alpha_sources.clear();
+  g_pool.albedo_live_sources = 0u;
+  g_pool.albedo_source_bytes = 0u;
   g_pool.alpha_source_by_texture.clear();
   g_pool.alpha_key_source.clear();
   g_pool.alpha_indirect_keys.clear();
@@ -4103,6 +4137,10 @@ inline uint64_t PoolAlphaProxyBytes() {
 inline uint64_t CapturePoolAlphaSource(reshade::api::device* device, reshade::api::command_list* cmd_list, uint64_t mesh_key,
                                        uint64_t view, bool immediate, bool albedo = false) {
   const bool keyless = mesh_key == 0u;
+  // Atlas-only refusals are retried; alpha refusals stay permanent (alpha_source_done).
+  const auto stamp_retry = [&](uint64_t key) {
+    if (albedo && !keyless) g_pool.albedo_retry_at[key] = g_state.frame.load() + kAlbedoRetryFrames;
+  };
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     const bool enabled = g_pool.alpha_foliage.load(std::memory_order_relaxed) || pt::g_pt_material_atlas > 0.5f;
@@ -4122,6 +4160,7 @@ inline uint64_t CapturePoolAlphaSource(reshade::api::device* device, reshade::ap
     g_pool.stats.alpha_source_refused += 1u;
     if (albedo) {
       g_pool.stats.albedo_source_refused += 1u;
+      stamp_retry(mesh_key);
     }
     g_pool.stats.alpha_source_refused_deferred += 1u;
     return 0u;
@@ -4131,10 +4170,14 @@ inline uint64_t CapturePoolAlphaSource(reshade::api::device* device, reshade::ap
       texture.handle != 0u ? device->get_resource_desc(texture) : reshade::api::resource_desc{};
   if (desc.type != reshade::api::resource_type::texture_2d || desc.texture.depth_or_layers != 1u || desc.texture.samples != 1u) {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    if (!keyless) g_pool.alpha_source_done.insert(mesh_key);
+    if (!keyless) {
+      if (albedo) stamp_retry(mesh_key);
+      else g_pool.alpha_source_done.insert(mesh_key);
+    }
     g_pool.stats.alpha_source_refused += 1u;
     if (albedo) {
       g_pool.stats.albedo_source_refused += 1u;
+      g_pool.stats.albedo_refused_type += 1u;
     }
     g_pool.stats.alpha_source_refused_type += 1u;
     return 0u;
@@ -4144,10 +4187,14 @@ inline uint64_t CapturePoolAlphaSource(reshade::api::device* device, reshade::ap
     bool first = false;
     {
       std::lock_guard<std::mutex> lock(g_pool.mutex);
-      if (!keyless) g_pool.alpha_source_done.insert(mesh_key);
+      if (!keyless) {
+        if (albedo) stamp_retry(mesh_key);
+        else g_pool.alpha_source_done.insert(mesh_key);
+      }
       g_pool.stats.alpha_source_refused += 1u;
       if (albedo) {
         g_pool.stats.albedo_source_refused += 1u;
+        g_pool.stats.albedo_refused_type += 1u;
       }
       g_pool.stats.alpha_source_refused_type += 1u;
       g_pool.stats.alpha_source_refused_format += 1u;
@@ -4170,6 +4217,10 @@ inline uint64_t CapturePoolAlphaSource(reshade::api::device* device, reshade::ap
       if (shared_it == g_pool.alpha_sources.end()) return 0u;
       PoolAlphaSource& shared = shared_it->second;
       if (keyless) return link->second;  // no refresh of hold_until: an orphan expires kAlphaOrphanFrames after its copy
+      if (!albedo && shared.albedo_only) {  // an alpha key now shares it: the copy moves back to the alpha budget
+        ReleasePoolAlbedoBudget(shared);
+        shared.albedo_only = false;
+      }
       shared.keys.insert(mesh_key);
       shared.hold_until = 0u;  // a key uses the copy: it is no orphan any more
       g_pool.alpha_key_source[mesh_key] = link->second;
@@ -4181,30 +4232,60 @@ inline uint64_t CapturePoolAlphaSource(reshade::api::device* device, reshade::ap
       g_pool.alpha_copy_frame = frame;
       g_pool.alpha_copies_frame = 0u;
     }
+    if (albedo && g_pool.albedo_copy_frame != frame) {
+      g_pool.albedo_copy_frame = frame;
+      g_pool.alpha_copies_frame_albedo = 0u;
+    }
     size_t keyless_sources = 0u;  // keyless copies cap, so they cannot starve the keyed sources
     if (keyless) {
       for (const auto& entry : g_pool.alpha_sources) keyless_sources += entry.second.keys.empty() ? 1u : 0u;
     }
-    if (g_pool.alpha_copies_frame >= kAlphaCopiesPerFrame || g_pool.alpha_sources.size() >= kAlphaSourcesMax
-        || keyless_sources >= kAlphaKeylessSourcesMax) {
-      g_pool.stats.alpha_source_refused += 1u;
-      if (albedo) {
+    if (albedo) {
+      const bool frame_cap = g_pool.alpha_copies_frame_albedo >= kAlbedoCopiesPerFrame;
+      const bool source_cap = g_pool.albedo_live_sources >= kAlbedoSourcesMax;
+      if (frame_cap || source_cap) {
+        g_pool.stats.alpha_source_refused += 1u;
         g_pool.stats.albedo_source_refused += 1u;
+        g_pool.stats.alpha_source_refused_cap += 1u;
+        if (frame_cap) g_pool.stats.albedo_refused_frame_cap += 1u;
+        if (source_cap) g_pool.stats.albedo_refused_sources_cap += 1u;
+        stamp_retry(mesh_key);
+        return 0u;
       }
-      g_pool.stats.alpha_source_refused_cap += 1u;
-      return 0u;
+      if (g_pool.albedo_source_bytes + bytes > kAlbedoSourceBytesMax) {
+        g_pool.stats.alpha_source_refused += 1u;
+        g_pool.stats.albedo_source_refused += 1u;
+        g_pool.stats.alpha_source_refused_cap += 1u;
+        g_pool.stats.alpha_source_refused_bytes += 1u;
+        g_pool.stats.albedo_refused_bytes += 1u;
+        stamp_retry(mesh_key);
+        return 0u;
+      }
+    } else {
+      if (g_pool.alpha_copies_frame >= kAlphaCopiesPerFrame || g_pool.alpha_sources.size() >= kAlphaSourcesMax
+          || keyless_sources >= kAlphaKeylessSourcesMax) {
+        g_pool.stats.alpha_source_refused += 1u;
+        g_pool.stats.alpha_source_refused_cap += 1u;
+        return 0u;
+      }
+      if (PoolAlphaProxyBytes() + bytes > kAlphaSourceBytesMax) {
+        g_pool.stats.alpha_source_refused += 1u;
+        g_pool.stats.alpha_source_refused_cap += 1u;
+        g_pool.stats.alpha_source_refused_bytes += 1u;
+        return 0u;
+      }
     }
-    if (PoolAlphaProxyBytes() + bytes > kAlphaSourceBytesMax) {
-      g_pool.stats.alpha_source_refused += 1u;
-      g_pool.stats.alpha_source_refused_cap += 1u;
-      g_pool.stats.alpha_source_refused_bytes += 1u;
-      return 0u;
-    }
-    g_pool.alpha_copies_frame += 1u;
+    if (albedo) g_pool.alpha_copies_frame_albedo += 1u;
+    else g_pool.alpha_copies_frame += 1u;
     source_id = g_pool.alpha_next_source++;
     PoolAlphaSource& source = g_pool.alpha_sources[source_id];  // reserved while its copy is made
     source.texture = texture.handle;
     source.bytes = bytes;
+    source.albedo_only = albedo;
+    if (albedo) {
+      g_pool.albedo_live_sources += 1u;
+      g_pool.albedo_source_bytes += bytes;
+    }
     if (keyless) {
       source.hold_until = frame + kAlphaOrphanFrames;
     } else {
@@ -4237,9 +4318,11 @@ inline uint64_t CapturePoolAlphaSource(reshade::api::device* device, reshade::ap
       if (it != g_pool.alpha_sources.end()) {  // the copy failed: its keys are refused
         for (const uint64_t key : it->second.keys) {
           g_pool.alpha_key_source.erase(key);
-          g_pool.alpha_source_done.insert(key);
+          if (albedo) stamp_retry(key);
+          else g_pool.alpha_source_done.insert(key);
         }
         UnlinkPoolAlphaTexture(source_id, it->second);
+        ReleasePoolAlbedoBudget(it->second);
         g_pool.alpha_sources.erase(it);
       }
       g_pool.stats.alpha_source_refused += 1u;
@@ -4348,6 +4431,7 @@ inline void OnPoolScanDraw(
   const PoolDrawGate gate = GatePoolDraw(draw, true);
   const bool atlas_draw = pt::g_pt_material_atlas > 0.5f && gate.vs_class == contract::VsClass::Rigid
                           && gate.skip == PoolSkip::None;
+  const bool atlas_only = atlas_draw && !gate.alpha_material;
   if (gate.wind_rest) {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     g_pool.stats.wind_rest_draws += 1u;
@@ -4362,7 +4446,7 @@ inline void OnPoolScanDraw(
   PoolVertexBuffers vbs;
   const bool vbs_known = (gate.alpha_material || atlas_draw) && CollectPoolVertexBuffers(cmd_list, &vbs);
   PoolUvStream uv;
-  if (vbs_known) ResolvePoolUvStream(device, draw, vbs, &uv);
+  if (vbs_known) ResolvePoolUvStream(device, draw, vbs, &uv, atlas_only);
   PoolSkip skip = gate.skip;
   PoolSlice slice;
   const uint32_t count = draw.instance_count == 0u ? 1u : draw.instance_count;
@@ -4434,7 +4518,7 @@ inline void OnPoolScanDraw(
       } else {
         schedule.copy_frame = frame;
         schedule.next_frame = frame + kPoolRecaptureFrames;
-        QueuePoolMesh(mesh_key, draw.vs_hash, draw, false, uv);
+        QueuePoolMesh(mesh_key, draw.vs_hash, draw, false, uv, atlas_only);
         queued = true;
       }
     } else if (skip == PoolSkip::None) {
@@ -4491,7 +4575,7 @@ inline void OnPoolScanDraw(
           schedule->next_frame = frame + kPoolRecaptureFrames;
           g_pool.stats.copied_draws += 1u;
           family.copied += 1u;
-          QueuePoolMesh(mesh_key, draw.vs_hash, draw, false, uv);
+          QueuePoolMesh(mesh_key, draw.vs_hash, draw, false, uv, atlas_only);
           queued = true;
         }
       }
@@ -4513,17 +4597,52 @@ inline void OnPoolScanDraw(
     cmd_list->copy_buffer_region(slice.instance_buffer, static_cast<uint64_t>(dynamic_copy.base) * kPoolInstanceStride,
                                  dynamic_copy.buffer, dynamic_copy.arena, static_cast<uint64_t>(dynamic_copy.count) * kPoolInstanceStride);
   }
-  if (queued && (gate.alpha_material || atlas_draw) && alpha_material.view != 0u) {
+  bool capture_due = true;
+  if (atlas_only && mesh_key != 0u && alpha_material.view != 0u) {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    const auto retry = g_pool.albedo_retry_at.find(mesh_key);
+    capture_due = retry == g_pool.albedo_retry_at.end() || retry->second <= frame;
+  }
+  if (queued && capture_due && (gate.alpha_material || atlas_only) && alpha_material.view != 0u) {
     const reshade::api::resource source = device->get_resource_from_view({alpha_material.view});
     if (source.handle != cl_data->ps_srv[contract::kAlphaTexSlot].handle) {
       std::lock_guard<std::mutex> lock(g_pool.mutex);
-      g_pool.alpha_source_done.insert(mesh_key);
+      if (atlas_only) {
+        g_pool.albedo_retry_at[mesh_key] = frame + kAlbedoRetryFrames;
+        g_pool.stats.albedo_refused_type += 1u;
+      } else {
+        g_pool.alpha_source_done.insert(mesh_key);
+      }
       g_pool.stats.alpha_source_refused += 1u;
-      if (atlas_draw && !gate.alpha_material) g_pool.stats.albedo_source_refused += 1u;
+      if (atlas_only) g_pool.stats.albedo_source_refused += 1u;
       g_pool.stats.alpha_source_refused_type += 1u;
       g_pool.stats.alpha_source_refused_view += 1u;
     } else {
-      CapturePoolAlphaSource(device, cmd_list, mesh_key, alpha_material.view, !deferred, atlas_draw && !gate.alpha_material);
+      CapturePoolAlphaSource(device, cmd_list, mesh_key, alpha_material.view, !deferred, atlas_only);
+    }
+  } else if (!queued && atlas_only && capture_due && mesh_key != 0u && alpha_material.view != 0u) {
+    // A refused atlas-only key retries even when this draw is not queued for a mesh copy.
+    bool retry = false;
+    {
+      std::lock_guard<std::mutex> lock(g_pool.mutex);
+      if (g_pool.albedo_material_keys.count(mesh_key) == 0u && g_pool.alpha_key_source.count(mesh_key) == 0u) {
+        g_pool.albedo_retry_at[mesh_key] = frame + kAlbedoRetryFrames;
+        g_pool.stats.albedo_retries += 1u;
+        retry = true;
+      }
+    }
+    if (retry) {
+      const reshade::api::resource source = device->get_resource_from_view({alpha_material.view});
+      if (source.handle != cl_data->ps_srv[contract::kAlphaTexSlot].handle) {
+        std::lock_guard<std::mutex> lock(g_pool.mutex);
+        g_pool.stats.alpha_source_refused += 1u;
+        g_pool.stats.albedo_source_refused += 1u;
+        g_pool.stats.alpha_source_refused_type += 1u;
+        g_pool.stats.alpha_source_refused_view += 1u;
+        g_pool.stats.albedo_refused_type += 1u;
+      } else {
+        CapturePoolAlphaSource(device, cmd_list, mesh_key, alpha_material.view, !deferred, true);
+      }
     }
   }
   if (tail_start != std::chrono::steady_clock::time_point{}) {
@@ -4595,6 +4714,7 @@ inline void OnPoolScanIndirectDraw(
   }
   const bool atlas_draw = pt::g_pt_material_atlas > 0.5f && gate.vs_class == contract::VsClass::Rigid
                           && gate.skip == PoolSkip::None;
+  const bool atlas_only = atlas_draw && !gate.alpha_material;
   PoolAlphaMaterial alpha_material;
   if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, gate.alpha_threshold_offset, &alpha_material);
   if (!gate.alpha_material && atlas_draw) {
@@ -4604,7 +4724,7 @@ inline void OnPoolScanIndirectDraw(
   PoolVertexBuffers vbs;
   const bool vbs_known = (gate.alpha_material || atlas_draw) && CollectPoolVertexBuffers(cmd_list, &vbs);
   PoolUvStream uv;
-  if (vbs_known) ResolvePoolUvStream(device, draw, vbs, &uv);
+  if (vbs_known) ResolvePoolUvStream(device, draw, vbs, &uv, atlas_only);
   PoolSkip skip = gate.skip;
   PoolSlice slice;
   stage.Set("indirect draw: slice");
@@ -4736,7 +4856,7 @@ inline void OnPoolScanIndirectDraw(
       copy.alpha = alpha_material;
       if (gate.alpha_material || atlas_draw) {
         copy.alpha_index = static_cast<uint32_t>(slot.indirect_alpha.size());
-        slot.indirect_alpha.push_back({uv, vbs, vbs_known, 0u, /*atlas*/ atlas_draw && !gate.alpha_material});
+        slot.indirect_alpha.push_back({uv, vbs, vbs_known, 0u, /*atlas*/ atlas_only});
         alpha_refs[alpha_ref_count++] = {g_pool.write_slot, copy.alpha_index};
         if (atlas_draw) any_atlas_ref = true;
         if (gate.alpha_material) any_alpha_ref = true;
@@ -4795,7 +4915,10 @@ inline void OnPoolScanIndirectDraw(
       g_pool.stats.alpha_source_refused += 1u;
       g_pool.stats.alpha_source_refused_type += 1u;
       g_pool.stats.alpha_source_refused_view += 1u;
-      if (any_atlas_ref) g_pool.stats.albedo_source_refused += 1u;
+      if (any_atlas_ref) {
+        g_pool.stats.albedo_source_refused += 1u;
+        if (!any_alpha_ref) g_pool.stats.albedo_refused_type += 1u;
+      }
     } else {
       source_id = CapturePoolAlphaSource(device, cmd_list, 0u, alpha_material.view, !deferred, any_atlas_ref && !any_alpha_ref);
     }
@@ -4854,6 +4977,8 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
   g_pool.alpha_keys.erase(mesh_key);
   g_pool.alpha_uv_requeued.erase(mesh_key);
   g_pool.alpha_source_done.erase(mesh_key);
+  g_pool.albedo_retry_at.erase(mesh_key);
+  g_pool.albedo_material_keys.erase(mesh_key);
   g_pool.alpha_indirect_keys.erase(mesh_key);
   g_pool.wind_keys.erase(mesh_key);
   g_pool.wind_sway.erase(mesh_key);
@@ -4867,6 +4992,7 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
           && (source->second.hold_until == 0u || g_state.frame.load() > source->second.hold_until)) {
         if (source->second.proxy.handle != 0u) g_pool.alpha_dead_proxies.push_back(source->second.proxy);
         UnlinkPoolAlphaTexture(key_source->second, source->second);
+        ReleasePoolAlbedoBudget(source->second);
         g_pool.alpha_sources.erase(source);
       }
     }
@@ -5908,6 +6034,11 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
   const uint32_t frame = g_state.frame.load();
   std::vector<std::string> log_lines;
   std::vector<std::string> warning_lines;
+  struct AlbedoRetryJob {
+    uint64_t key;
+    uint64_t view;
+  };
+  std::vector<AlbedoRetryJob> albedo_retry_jobs;  // deferred until the pool lock is released
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     PoolStagingSlot& slot = g_pool.slots[slot_index];
@@ -5979,8 +6110,16 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         uint64_t held = job.vertex_bytes.size();  // vertex bytes held by the requests in the Uvs phase
         for (const auto& entry : g_pool.mesh_requests) held += entry.second.vertex_bytes.size();
         if (held > g_pool.alpha_held_bytes_max) {
-          outcome = "held vertex bytes over the cap";
-          FailPoolMesh(request, outcome);
+          if (request->second.atlas_only) {
+            // Atlas-only meshes finish without the separate UV stream; alpha requests still fail.
+            const PoolCpuTimer cpu_timer{&g_pool.cpu_capture_us};
+            ApplyOrVerifyPoolMesh(request, job.mesh, PoolIndexSignature(job.indices), frame, &warning_lines);
+            g_pool.stats.albedo_uv_over_cap += 1u;
+            outcome = "uv skipped over cap";
+          } else {
+            outcome = "held vertex bytes over the cap";
+            FailPoolMesh(request, outcome);
+          }
         } else {
           PoolMeshRequest& queued = request->second;
           queued.indices = std::move(job.indices);
@@ -6135,10 +6274,21 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         }
         if ((copy.pass & kPoolPassWind) != 0u) g_pool.wind_keys.insert(mesh_key);
         if (copy.wind_index != UINT32_MAX) g_pool.wind_sway.try_emplace(mesh_key, indirect_wind[copy.wind_index]);
-        QueuePoolMesh(mesh_key, copy.vs_hash, record, true, alpha_side != nullptr ? alpha_side->uv : PoolUvStream{});
+        const bool atlas_only = alpha_side != nullptr && alpha_side->atlas && pt::g_pt_material_atlas > 0.5f;
+        QueuePoolMesh(mesh_key, copy.vs_hash, record, true, alpha_side != nullptr ? alpha_side->uv : PoolUvStream{}, atlas_only);
         if (alpha_side != nullptr && alpha_side->source != 0u
-            && ((AlphaMode() & 2u) != 0u || (alpha_side->atlas && pt::g_pt_material_atlas > 0.5f))) {
+            && ((AlphaMode() & 2u) != 0u || atlas_only)) {
           AttachPoolAlphaSource(mesh_key, alpha_side->source);
+        }
+        if (atlas_only && mesh_key != 0u && copy.alpha.view != 0u) {
+          const auto retry = g_pool.albedo_retry_at.find(mesh_key);
+          if ((retry == g_pool.albedo_retry_at.end() || retry->second <= frame)
+              && g_pool.albedo_material_keys.count(mesh_key) == 0u
+              && g_pool.alpha_key_source.count(mesh_key) == 0u) {
+            g_pool.albedo_retry_at[mesh_key] = frame + kAlbedoRetryFrames;
+            g_pool.stats.albedo_retries += 1u;
+            albedo_retry_jobs.push_back({mesh_key, copy.alpha.view});
+          }
         }
       }
 
@@ -6233,6 +6383,16 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       }
     }
   }
+  if (!albedo_retry_jobs.empty()) {
+    auto* immediate = reinterpret_cast<reshade::api::command_list*>(g_pool.immediate_cmd_list.load(std::memory_order_relaxed));
+    if (immediate != nullptr) {
+      for (const AlbedoRetryJob& job : albedo_retry_jobs) {
+        const reshade::api::resource source = device->get_resource_from_view({job.view});
+        if (source.handle == 0u) continue;
+        CapturePoolAlphaSource(device, immediate, job.key, job.view, true, true);
+      }
+    }
+  }
   for (const std::string& line : log_lines) pool_log::i(line);
   for (const std::string& line : warning_lines) pool_log::w(line);
 }
@@ -6261,6 +6421,7 @@ inline void PrunePool(uint32_t frame) {
     if (frame > it->second.last_frame + kPoolPruneAge) {
       if (!it->second.in_flight) RemovePoolMeshWaiting(it->second.buffer_key, it->first);
       g_pool.mesh_queued.erase(it->first);
+      g_pool.albedo_retry_at.erase(it->first);
       g_pool.stats.mesh_expired += 1u;
       it = g_pool.mesh_requests.erase(it);
     } else {
@@ -6586,6 +6747,8 @@ inline void ResetWorldPool() {
   g_pool.alpha_keys.clear();
   g_pool.alpha_uv_requeued.clear();
   DrainPoolAlphaSources();
+  g_pool.albedo_retry_at.clear();
+  g_pool.albedo_material_keys.clear();
   g_pool.alpha_off_applied = false;
   g_pool.prev_trace = {};
   g_pool.logged_invalidations = 0u;
@@ -7712,6 +7875,15 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"albedo_cap_refused_materials\": " << albedo_gpu.cap_refused_materials
       << ", \"albedo_copies\": " << albedo_gpu.copies << ", \"albedo_refused\": " << albedo_gpu.refused
       << ", \"albedo_indirect_refs\": " << stats.albedo_indirect_refs
+      << ", \"albedo_refused_sources_cap\": " << stats.albedo_refused_sources_cap
+      << ", \"albedo_refused_frame_cap\": " << stats.albedo_refused_frame_cap
+      << ", \"albedo_refused_bytes\": " << stats.albedo_refused_bytes
+      << ", \"albedo_refused_type\": " << stats.albedo_refused_type
+      << ", \"albedo_retries\": " << stats.albedo_retries
+      << ", \"albedo_uv_slot0\": " << stats.albedo_uv_slot0
+      << ", \"albedo_uv_over_cap\": " << stats.albedo_uv_over_cap
+      << ", \"albedo_live_sources\": " << stats.albedo_live_sources
+      << ", \"albedo_textures_sliced\": " << stats.albedo_textures_sliced
       << ", \"tlas_albedo_instances\": " << albedo_gpu.tlas_albedo_instances << "},\n";
   out << "  \"alpha_keys_total\": " << alpha_keys.size() << ", \"alpha_keys\": [";
   for (size_t i = 0; i < alpha_keys.size() && i < kPoolDumpMaxAlphaKeys; ++i) {

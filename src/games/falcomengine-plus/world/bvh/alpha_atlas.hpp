@@ -21,6 +21,11 @@ inline constexpr uint32_t kAlphaCopiesPerFrame = 4u;     // source copies made p
 inline constexpr uint32_t kAlphaSourcesMax = 64u;        // live source copies
 inline constexpr uint32_t kAlphaKeylessSourcesMax = 16u;  // live keyless copies (indirect draws awaiting their resolve)
 inline constexpr uint64_t kAlphaSourceBytesMax = 256ull << 20;  // bytes of live source copies (mip 0)
+// Atlas-only sources use their own budget, so alpha foliage cannot starve them. A copy is freed once its slice is filled.
+inline constexpr uint32_t kAlbedoSourcesMax = 32u;
+inline constexpr uint32_t kAlbedoCopiesPerFrame = 4u;
+inline constexpr uint64_t kAlbedoSourceBytesMax = 128ull << 20;
+inline constexpr uint32_t kAlbedoRetryFrames = 120u;  // an atlas-only capture is retried after this many presents
 inline constexpr uint32_t kAlphaSliceQuarantineFrames = 16u;  // a released slice is reused after this many frames
 inline constexpr uint32_t kAlphaOrphanFrames = 600u;  // a keyless copy (indirect draw) is held this many presents for its resolve
 
