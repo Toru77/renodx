@@ -219,8 +219,15 @@ inline void SyncLiveAlbedo(reshade::api::device* device, reshade::api::command_l
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     std::unordered_set<uint64_t> ready_uids;  // static meshes with UVs, not dynamic and not alpha-tested
+    g_pool.stats.albedo_meshes_with_uvs = 0u;
+    g_pool.stats.albedo_meshes_total = 0u;
     for (const WorldMesh& mesh : g_pool.meshes) {
-      if (!mesh.dynamic && !mesh.alpha && !mesh.uvs.empty()) ready_uids.insert(mesh.uid);
+      if (mesh.dynamic || mesh.alpha) continue;
+      g_pool.stats.albedo_meshes_total += 1u;
+      if (!mesh.uvs.empty()) {
+        g_pool.stats.albedo_meshes_with_uvs += 1u;
+        ready_uids.insert(mesh.uid);
+      }
     }
     // A texture-keyed slice outlives its copy: keep the mapping alive while its mesh and slice are alive.
     for (const auto& [key, index] : albedo.material_of_key) {
@@ -250,6 +257,39 @@ inline void SyncLiveAlbedo(reshade::api::device* device, reshade::api::command_l
                             mesh.alpha_state.material.swizzle});
       }
       if (!job.keys.empty()) sources.push_back(job);
+    }
+    // An albedo-only copy whose keys never reach a ready static mesh holds a source budget slot forever.
+    // Release it through the same unlink/free path as after a blit and give its keys a fresh retry stamp.
+    for (auto it = g_pool.alpha_sources.begin(); it != g_pool.alpha_sources.end();) {
+      PoolAlphaSource& source = it->second;
+      if (!source.albedo_only || source.proxy.handle == 0u) {
+        ++it;
+        continue;
+      }
+      bool any_ready = false;
+      for (const uint64_t key : source.keys) {
+        const auto mesh_it = g_pool.mesh_by_key.find(key);
+        if (mesh_it == g_pool.mesh_by_key.end() || mesh_it->second >= g_pool.meshes.size()) continue;
+        const WorldMesh& mesh = g_pool.meshes[mesh_it->second];
+        if (ready_uids.count(mesh.uid) != 0u && data->slot_by_uid.count(mesh.uid) != 0u) {
+          any_ready = true;
+          break;
+        }
+      }
+      if (any_ready) {
+        source.unready_since = 0u;
+        ++it;
+        continue;
+      }
+      if (source.unready_since == 0u) source.unready_since = frame;
+      if (frame - source.unready_since < kAlbedoUnreadyFrames) {
+        ++it;
+        continue;
+      }
+      for (const uint64_t key : source.keys) g_pool.albedo_retry_at[key] = frame + kAlbedoRetryFrames;
+      g_pool.stats.albedo_unready_freed += 1u;
+      free_albedo_only_source(it->first, source);
+      it = g_pool.alpha_sources.erase(it);
     }
     PoolAlbedoGpuStats& gpu = g_pool.albedo_gpu;
     gpu.sources = static_cast<uint32_t>(albedo.slice_of_texture.size());

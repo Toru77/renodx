@@ -514,6 +514,71 @@ inline bool UploadLiveMeshDescriptors(reshade::api::device* device, BvhDeviceDat
   return true;
 }
 
+// Present thread. Appends UVs refreshed in the pool into the live UV arena and rewrites only the mesh
+// descriptor's UV slot. Slot, uid, positions, indices and BLAS are unchanged; there is no old range to free.
+inline void RefreshLiveMeshUvs(reshade::api::device* device, reshade::api::command_list* cmd_list, BvhDeviceData* data) {
+  std::unordered_set<uint64_t> pending;
+  std::unordered_map<uint64_t, std::vector<std::array<float, 2>>> refreshed;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    pending.swap(g_pool.uv_refreshed_uids);
+    if (pending.empty()) return;
+    for (const WorldMesh& mesh : g_pool.meshes) {
+      if (pending.count(mesh.uid) != 0u && !mesh.uvs.empty()) refreshed.emplace(mesh.uid, mesh.uvs);
+    }
+  }
+
+  struct UvRefreshTarget {
+    uint32_t index = 0u;
+    uint32_t offset = 0u;
+    uint32_t count = 0u;
+  };
+  std::vector<UvRefreshTarget> targets;
+  std::vector<std::array<float, 2>> uv_batch;
+  for (const auto& [uid, uvs] : refreshed) {
+    const auto slot_it = data->slot_by_uid.find(uid);
+    if (slot_it == data->slot_by_uid.end() || slot_it->second >= data->slots.size()
+        || slot_it->second >= data->mesh_descriptors.size()) {
+      g_pool.stats.uv_refresh_skipped += 1u;
+      continue;
+    }
+    LiveMeshSlot& slot = data->slots[slot_it->second];
+    if (!slot.live || slot.uv_count != 0u || uvs.size() != slot.vertex_count) {
+      g_pool.stats.uv_refresh_skipped += 1u;
+      continue;
+    }
+    targets.push_back({slot_it->second, static_cast<uint32_t>(data->uvs.used + uv_batch.size()),
+                       static_cast<uint32_t>(uvs.size())});
+    uv_batch.insert(uv_batch.end(), uvs.begin(), uvs.end());
+  }
+  if (targets.empty()) return;
+
+  std::string error;
+  if (!EnsureLiveArena(device, cmd_list, data, &data->uvs, data->uvs.used + uv_batch.size(), &error)
+      || !WriteBufferRange(device, cmd_list, data->uvs.buffer, data->uvs.stride, data->uvs.used * data->uvs.stride,
+                           uv_batch.data(), uv_batch.size() * data->uvs.stride, &error)) {
+    g_pool.stats.uv_refresh_skipped += static_cast<uint32_t>(targets.size());
+    data->live.upload_failures += 1u;
+    data->live.last_failure = "live uv refresh failed: " + error;
+    data->upload_retry_frame = g_state.frame.load() + kLiveRetryFrames;
+    return;
+  }
+  for (const UvRefreshTarget& target : targets) {
+    LiveMeshSlot& slot = data->slots[target.index];
+    slot.uv_offset = target.offset;
+    slot.uv_count = target.count;
+    data->mesh_descriptors[target.index].bbox_min[3] = static_cast<float>(target.offset + 1u);
+  }
+  const uint64_t uv_first = data->uvs.used;
+  data->uvs.used += uv_batch.size();
+  const std::vector<float> no_vertices;
+  const std::vector<uint32_t> no_indices;
+  const std::vector<rt12::Rt12MirrorSlot> no_slots;
+  rt12::MirrorUpload(data->vertices.used, no_vertices, data->indices.used, no_indices, uv_first, uv_batch, no_slots);
+  UploadLiveMeshDescriptors(device, data, g_state.frame.load());
+  g_pool.stats.uv_refresh_done += static_cast<uint32_t>(targets.size());
+}
+
 inline void SyncLiveMeshes(
     reshade::api::device* device,
     reshade::api::command_list* cmd_list,
@@ -2481,6 +2546,8 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
       SyncLiveMeshes(device, cmd_list, data, frame);
       AddPerfBlockMs(kPerfBlockSyncMeshes, LiveElapsedMs(sync_start) - (data->live.blas_build_ms_sum - blas_before));
     }
+    stage.Set("live bvh: uv refresh");
+    RefreshLiveMeshUvs(device, cmd_list, data);
     stage.Set("live bvh: alpha");
     SyncLiveAlpha(device, cmd_list, data, frame);
     stage.Set("live bvh: tlas");

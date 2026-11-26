@@ -83,7 +83,9 @@ inline std::string SerializePtReport() {
   out << "gpu_atlas_hits: " << p.gpu_atlas_hits << "\n";
   bvh::PoolAlbedoGpuStats atlas;
   uint64_t refused_cap = 0u, refused_frame = 0u, refused_bytes = 0u, refused_type = 0u;
-  uint64_t retries = 0u, uv_slot0 = 0u, uv_over_cap = 0u, live_sources = 0u;
+  uint64_t retries = 0u, uv_over_cap = 0u, live_sources = 0u;
+  uint64_t uv_refresh_queued = 0u, uv_refresh_done = 0u, uv_refresh_mismatch = 0u, uv_refresh_skipped = 0u;
+  uint64_t unready_freed = 0u, meshes_with_uvs = 0u, meshes_total = 0u;
   {
     std::lock_guard lock(bvh::g_pool.mutex);
     atlas = bvh::g_pool.albedo_gpu;
@@ -93,9 +95,15 @@ inline std::string SerializePtReport() {
     refused_bytes = stats.albedo_refused_bytes;
     refused_type = stats.albedo_refused_type;
     retries = stats.albedo_retries;
-    uv_slot0 = stats.albedo_uv_slot0;
     uv_over_cap = stats.albedo_uv_over_cap;
     live_sources = stats.albedo_live_sources;
+    uv_refresh_queued = stats.uv_refresh_queued;
+    uv_refresh_done = stats.uv_refresh_done;
+    uv_refresh_mismatch = stats.uv_refresh_mismatch;
+    uv_refresh_skipped = stats.uv_refresh_skipped;
+    unready_freed = stats.albedo_unready_freed;
+    meshes_with_uvs = stats.albedo_meshes_with_uvs;
+    meshes_total = stats.albedo_meshes_total;
   }
   out << "atlas: sources " << atlas.sources << "; slices " << atlas.slices_used << "/" << kAlbedoAtlasSlices
       << "; materials " << atlas.materials_used << "/" << kAlbedoMaterials
@@ -104,7 +112,9 @@ inline std::string SerializePtReport() {
       << "; cap_refused " << atlas.cap_refused_slices << "/" << atlas.cap_refused_materials
       << "; refused cap/frame/bytes/type " << refused_cap << "/" << refused_frame << "/" << refused_bytes << "/"
       << refused_type << "; retries " << retries << "; live " << live_sources << "/" << kAlbedoSourcesMax
-      << "; uv slot0 " << uv_slot0 << "; uv over cap " << uv_over_cap << "\n";
+      << "; uv over cap " << uv_over_cap << "; uv refresh " << uv_refresh_queued << "/" << uv_refresh_done << "/"
+      << uv_refresh_mismatch << "/" << uv_refresh_skipped << "; unready freed " << unready_freed
+      << "; static meshes with UVs " << meshes_with_uvs << "/" << meshes_total << "\n";
   out << "gpu_lock_drops: " << p.gpu_lock_drops << "\n";
   out << "gpu_writes: " << p.gpu_writes << "\n";
   out << "gpu_frame: " << p.gpu_frame << "\n";

@@ -147,6 +147,7 @@ inline constexpr float kPoolMaxScale = 10000.f;
 inline constexpr float kPoolMaxPosition = 50000.f;  // farther translations: parked or horizon pieces
 inline constexpr const char* kWorldBuildId = "rt-panel-1 " __DATE__ " " __TIME__;  // every world_*.json and the manifest
 inline constexpr uint32_t kPoolPruneAge = 600u;
+inline constexpr uint32_t kAlbedoUnreadyFrames = 300u;  // an albedo-only copy with no ready mesh is released after this long
 inline constexpr uint32_t kPoolGhostKeyMax = 64u;  // instances per mesh key kept as overlap-retirement poses
 inline constexpr float kPoolGhostOverlap = 0.05f;  // fraction of the smaller box a fresher pose must overlap
 inline constexpr size_t kPoolMaxMeshes = 8192u;
@@ -457,6 +458,7 @@ struct PoolAlphaSource {
   uint64_t bytes = 0u;                  // mip 0 bytes (kAlphaSourceBytesMax)
   bool blitted = false;                 // the atlas has been filled from it at least once
   bool albedo_only = false;             // captured for the material atlas, no alpha key uses it (separate budget)
+  uint32_t unready_since = 0u;          // albedo-only: first frame no key had a ready mesh, 0 = none
   std::unordered_set<uint64_t> keys;    // draw keys that use this texture
 };
 // The GPU stage's numbers as the pool last saw them (written under g_pool.mutex by SyncLiveAlpha at the start of
@@ -766,6 +768,7 @@ struct PoolMeshRequest {
   reshade::api::format uv_format = reshade::api::format::unknown;
   PoolUvStream uv;                       // TEXCOORD0 in another slot (buffer 0: none)
   bool atlas_only = false;               // atlas-only draw: over-cap UVs finish the mesh instead of failing it
+  bool uv_refresh = false;               // re-reads UVs of an existing mesh; never creates or replaces a mesh
   std::vector<uint8_t> vertex_bytes;     // the vertex read, held until the uv read decodes it
   PoolMeshPhase phase = PoolMeshPhase::Indices;
   bool in_flight = false;
@@ -1174,10 +1177,16 @@ struct PoolStats {
   uint64_t albedo_refused_bytes = 0u;
   uint64_t albedo_refused_type = 0u;
   uint64_t albedo_retries = 0u;
-  uint64_t albedo_uv_slot0 = 0u;
   uint64_t albedo_uv_over_cap = 0u;
   uint64_t albedo_live_sources = 0u;
   uint64_t albedo_textures_sliced = 0u;
+  uint64_t albedo_unready_freed = 0u;   // albedo-only copies released for having no ready mesh for kAlbedoUnreadyFrames
+  uint64_t albedo_meshes_with_uvs = 0u;  // gauges from the pool snapshot in SyncLiveAlbedo
+  uint64_t albedo_meshes_total = 0u;
+  uint64_t uv_refresh_queued = 0u;
+  uint64_t uv_refresh_done = 0u;         // appended in RefreshLiveMeshUvs
+  uint64_t uv_refresh_mismatch = 0u;
+  uint64_t uv_refresh_skipped = 0u;      // no live slot for the uid, or its slot already has UVs
   uint64_t alpha_indirect_copies = 0u;   // keyless copies made for indirect alpha draws (mesh_key 0)
   uint64_t alpha_orphans_attached = 0u;  // keyless copies attached to their key at resolve
   uint64_t alpha_orphans_expired = 0u;   // keyless copies freed when their hold ran out (no resolve)
@@ -1535,6 +1544,8 @@ struct PoolState {
 
   // Meshes.
   std::unordered_map<uint64_t, PoolMeshRequest> mesh_requests;       // by mesh key
+  std::unordered_map<uint64_t, PoolMeshRequest> uv_refresh_requests;  // UV-only re-reads of existing meshes, by draw key
+  std::unordered_set<uint64_t> uv_refreshed_uids;                     // drained by RefreshLiveMeshUvs
   std::unordered_map<uint64_t, std::vector<uint64_t>> mesh_waiting;  // buffer key -> keys waiting for a copy
   uint64_t next_mesh_serial = 1u;
   uint64_t next_mesh_uid = 1u;  // WorldMesh::uid, never reused (also not by ResetWorldPool)
@@ -2146,8 +2157,12 @@ inline void UpdatePoolStats() {
     (void)key;
     if (request.in_flight) in_flight += 1u;
   }
+  for (const auto& [key, request] : g_pool.uv_refresh_requests) {
+    (void)key;
+    if (request.in_flight) in_flight += 1u;
+  }
   g_pool.stats.mesh_in_flight = in_flight;
-  g_pool.stats.mesh_queue = g_pool.mesh_requests.size() - in_flight;
+  g_pool.stats.mesh_queue = g_pool.mesh_requests.size() + g_pool.uv_refresh_requests.size() - in_flight;
   g_pool.stats.mesh_retry = g_pool.mesh_retry.size();
   g_pool.stats.meshes = g_pool.meshes.size();
   g_pool.stats.observed = g_pool.observations.size();
@@ -2287,6 +2302,15 @@ inline bool ReleasePoolIndirectRefs(const DrawRecord& draw) {
   return dead;
 }
 
+// Caller holds g_pool.mutex. A mesh key can have a normal capture or a UV refresh in flight, never both.
+inline std::pair<std::unordered_map<uint64_t, PoolMeshRequest>*, PoolMeshRequest*> FindPoolMeshRequest(uint64_t key) {
+  const auto normal = g_pool.mesh_requests.find(key);
+  if (normal != g_pool.mesh_requests.end()) return {&g_pool.mesh_requests, &normal->second};
+  const auto refresh = g_pool.uv_refresh_requests.find(key);
+  if (refresh != g_pool.uv_refresh_requests.end()) return {&g_pool.uv_refresh_requests, &refresh->second};
+  return {nullptr, nullptr};
+}
+
 // Caller holds g_pool.mutex. Detaches the ring and returns its buffers.
 // Meshes whose copies are dropped with it go back to waiting.
 inline std::vector<reshade::api::resource> DetachPoolStaging(reshade::api::device** out_device) {
@@ -2296,10 +2320,10 @@ inline std::vector<reshade::api::resource> DetachPoolStaging(reshade::api::devic
     if (slot.mesh_buffer.handle != 0u) buffers.push_back(slot.mesh_buffer);
     for (const DrawRecord& draw : slot.indirect_draws) ReleasePoolIndirectRefs(draw);
     for (const PoolMeshCopy& copy : slot.mesh_copies) {
-      const auto request = g_pool.mesh_requests.find(copy.mesh_key);
-      if (request == g_pool.mesh_requests.end() || request->second.serial != copy.serial) continue;
-      request->second.in_flight = false;
-      g_pool.mesh_waiting[request->second.buffer_key].push_back(copy.mesh_key);
+      PoolMeshRequest* request = FindPoolMeshRequest(copy.mesh_key).second;
+      if (request == nullptr || request->serial != copy.serial) continue;
+      request->in_flight = false;
+      g_pool.mesh_waiting[request->buffer_key].push_back(copy.mesh_key);
     }
     slot = {};
   }
@@ -3578,6 +3602,11 @@ inline void UnmapPoolMeshKey(uint64_t mesh_key) {
     if (!request->second.in_flight) RemovePoolMeshWaiting(request->second.buffer_key, mesh_key);
     g_pool.mesh_requests.erase(request);
   }
+  const auto refresh = g_pool.uv_refresh_requests.find(mesh_key);
+  if (refresh != g_pool.uv_refresh_requests.end()) {
+    if (!refresh->second.in_flight) RemovePoolMeshWaiting(refresh->second.buffer_key, mesh_key);
+    g_pool.uv_refresh_requests.erase(refresh);
+  }
   const auto it = g_pool.mesh_by_key.find(mesh_key);
   if (it == g_pool.mesh_by_key.end()) return;
   WorldMesh& mesh = g_pool.meshes[it->second];
@@ -3756,17 +3785,17 @@ inline bool CollectPoolVertexBuffers(reshade::api::command_list* cmd_list, PoolV
   return true;
 }
 
-// The TEXCOORD0 stream of a draw. Normally only a slot other than 0 counts (slot 0 is interleaved with the
-// positions and decoded there); atlas-only requests set allow_slot0 to capture that stream as well. Empty (no
-// UVs) when the slot, the element or the buffer does not fit. Reads the buffer size: call before the pool lock.
+// The TEXCOORD0 stream of a draw. Only a slot other than 0 counts: slot 0 is interleaved with the positions
+// and decoded there. Empty (no UVs) when the slot, the element or the buffer does not fit. Reads the buffer
+// size: call before the pool lock.
 inline void ResolvePoolUvStream(reshade::api::device* device, const DrawRecord& draw, const PoolVertexBuffers& vbs,
-                                PoolUvStream* out, bool allow_slot0) {
+                                PoolUvStream* out) {
   namespace scene = renodx::utils::scene;
   *out = {};
   scene::InputLayoutInfo layout_info;
   if (!FindPoolInputLayout(draw, &layout_info)) return;
   const scene::InputElementCopy* uv = FindPoolTexcoord0(layout_info);
-  if (uv == nullptr || (uv->buffer_binding == 0u && !allow_slot0)) return;
+  if (uv == nullptr || uv->buffer_binding == 0u) return;
   out->slot = uv->buffer_binding;
   const scene::FormatInfo* info = scene::FindFormatInfo(uv->format);
   for (uint32_t i = 0u; i < vbs.count; ++i) {
@@ -3855,10 +3884,44 @@ inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord&
   request.serial = g_pool.next_mesh_serial++;
   request.uv = uv;
   request.atlas_only = atlas_only;
-  if (atlas_only && uv.buffer.handle != 0u && uv.slot == 0u) g_pool.stats.albedo_uv_slot0 += 1u;
   request.buffer_key = PoolBufferKey(draw, uv);
   AddPoolMeshWaiting(request);
   g_pool.mesh_requests.emplace(mesh_key, std::move(request));
+}
+
+// Caller holds g_pool.mutex. A camera-pass atlas draw can re-read the UVs of a static mesh first captured
+// from a light-pass draw. The request uses the normal Indices -> Vertices -> Uvs phases and never maps a new
+// mesh or key; a matching decode only fills the existing mesh's UVs.
+inline void QueuePoolUvRefresh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord& draw, const PoolUvStream& uv) {
+  if (mesh_key == 0u || g_pool.uv_refresh_requests.count(mesh_key) != 0u) return;
+  const auto mesh_it = g_pool.mesh_by_key.find(mesh_key);
+  if (mesh_it == g_pool.mesh_by_key.end()) return;
+  const WorldMesh& mesh = g_pool.meshes[mesh_it->second];
+  if (mesh.alpha || mesh.dynamic || !mesh.uvs.empty()) return;
+  int32_t pos_offset = 0;
+  int32_t uv_offset = -1;
+  reshade::api::format pos_format = reshade::api::format::unknown;
+  reshade::api::format uv_format = reshade::api::format::unknown;
+  if (ResolvePoolMeshLayout(draw, &pos_offset, &pos_format, &uv_offset, &uv_format) != nullptr) return;
+  if (uv_offset < 0 && uv.buffer.handle == 0u) return;
+  PoolMeshRequest request;
+  request.mesh_key = mesh_key;
+  request.vs_hash = vs_hash;
+  request.serial = g_pool.next_mesh_serial++;
+  request.last_frame = g_state.frame.load();
+  request.queued_frame = request.last_frame;
+  request.draw = draw;
+  request.pos_offset = pos_offset;
+  request.pos_format = pos_format;
+  request.uv_offset = uv_offset;
+  request.uv_format = uv_format;
+  request.uv = uv;
+  request.atlas_only = true;
+  request.uv_refresh = true;
+  request.buffer_key = PoolBufferKey(draw, uv);
+  AddPoolMeshWaiting(request);
+  g_pool.uv_refresh_requests.emplace(mesh_key, std::move(request));
+  g_pool.stats.uv_refresh_queued += 1u;
 }
 
 // One draw-time copy, reserved under g_pool.mutex and recorded after it.
@@ -3911,12 +3974,13 @@ inline uint32_t ReservePoolMeshCopies(
   uint32_t count = 0u;
   size_t index = 0u;
   while (index < keys.size() && count < capacity && slot.mesh_copies.size() < kPoolMeshCopiesPerFrame) {
-    const auto request_it = g_pool.mesh_requests.find(keys[index]);
-    if (request_it == g_pool.mesh_requests.end() || request_it->second.in_flight) {
+    const uint64_t key = keys[index];
+    const auto [requests, found] = FindPoolMeshRequest(key);
+    if (found == nullptr || found->in_flight) {
       keys.erase(keys.begin() + static_cast<std::ptrdiff_t>(index));
       continue;
     }
-    PoolMeshRequest& request = request_it->second;
+    PoolMeshRequest& request = *found;
     const DrawRecord& queued = request.draw;
     const bool indices = request.phase == PoolMeshPhase::Indices;
     const bool uvs = request.phase == PoolMeshPhase::Uvs;
@@ -3949,7 +4013,12 @@ inline uint32_t ReservePoolMeshCopies(
     }
     if (error != nullptr) {
       keys.erase(keys.begin() + static_cast<std::ptrdiff_t>(index));
-      FailPoolMesh(request_it, error);
+      if (request.uv_refresh) {
+        g_pool.stats.uv_refresh_mismatch += 1u;
+        requests->erase(key);
+      } else {
+        FailPoolMesh(requests->find(key), error);
+      }
       continue;
     }
     // A tiny whole-buffer vertex or uv copy lands at staging offset 0 whatever offset it is given (owner dumps), so it is staged there.
@@ -4430,7 +4499,7 @@ inline void OnPoolScanDraw(
   const auto gate_start = PerfNow();
   const PoolDrawGate gate = GatePoolDraw(draw, true);
   const bool atlas_draw = pt::g_pt_material_atlas > 0.5f && gate.vs_class == contract::VsClass::Rigid
-                          && gate.skip == PoolSkip::None;
+                          && gate.skip == PoolSkip::None && (gate.pass & kPoolPassCamera) != 0u;
   const bool atlas_only = atlas_draw && !gate.alpha_material;
   if (gate.wind_rest) {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
@@ -4446,7 +4515,7 @@ inline void OnPoolScanDraw(
   PoolVertexBuffers vbs;
   const bool vbs_known = (gate.alpha_material || atlas_draw) && CollectPoolVertexBuffers(cmd_list, &vbs);
   PoolUvStream uv;
-  if (vbs_known) ResolvePoolUvStream(device, draw, vbs, &uv, atlas_only);
+  if (vbs_known) ResolvePoolUvStream(device, draw, vbs, &uv);
   PoolSkip skip = gate.skip;
   PoolSlice slice;
   const uint32_t count = draw.instance_count == 0u ? 1u : draw.instance_count;
@@ -4485,6 +4554,9 @@ inline void OnPoolScanDraw(
   const auto lock_start = PerfNow();
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
+    if (atlas_only && mesh_key != 0u && skip == PoolSkip::None && (gate.pass & kPoolPassCamera) != 0u) {
+      QueuePoolUvRefresh(mesh_key, draw.vs_hash, draw, uv);
+    }
     if (gate.alpha_material) NotePoolAlphaMaterial(PoolMeshKey(draw), alpha_material, vbs_known ? &vbs : nullptr);
     if (wind_read) g_pool.wind_sway[mesh_key] = wind;
     if (gate.wind_rest && skip == PoolSkip::None && !wind_read && !reduced) g_pool.stats.wind_sway_unread += 1u;
@@ -4597,11 +4669,14 @@ inline void OnPoolScanDraw(
     cmd_list->copy_buffer_region(slice.instance_buffer, static_cast<uint64_t>(dynamic_copy.base) * kPoolInstanceStride,
                                  dynamic_copy.buffer, dynamic_copy.arena, static_cast<uint64_t>(dynamic_copy.count) * kPoolInstanceStride);
   }
-  bool capture_due = true;
+  bool capture_due = false;
   if (atlas_only && mesh_key != 0u && alpha_material.view != 0u) {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
+    const auto mesh_it = g_pool.mesh_by_key.find(mesh_key);
+    const bool mesh_ready = mesh_it != g_pool.mesh_by_key.end()
+                            && (!g_pool.meshes[mesh_it->second].uvs.empty() || g_pool.uv_refresh_requests.count(mesh_key) != 0u);
     const auto retry = g_pool.albedo_retry_at.find(mesh_key);
-    capture_due = retry == g_pool.albedo_retry_at.end() || retry->second <= frame;
+    capture_due = mesh_ready && (retry == g_pool.albedo_retry_at.end() || retry->second <= frame);
   }
   if (queued && capture_due && (gate.alpha_material || atlas_only) && alpha_material.view != 0u) {
     const reshade::api::resource source = device->get_resource_from_view({alpha_material.view});
@@ -4713,7 +4788,7 @@ inline void OnPoolScanIndirectDraw(
     if (gate.wind_rest && !wind_read) g_pool.stats.wind_sway_unread += 1u;
   }
   const bool atlas_draw = pt::g_pt_material_atlas > 0.5f && gate.vs_class == contract::VsClass::Rigid
-                          && gate.skip == PoolSkip::None;
+                          && gate.skip == PoolSkip::None && (gate.pass & kPoolPassCamera) != 0u;
   const bool atlas_only = atlas_draw && !gate.alpha_material;
   PoolAlphaMaterial alpha_material;
   if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, gate.alpha_threshold_offset, &alpha_material);
@@ -4724,7 +4799,7 @@ inline void OnPoolScanIndirectDraw(
   PoolVertexBuffers vbs;
   const bool vbs_known = (gate.alpha_material || atlas_draw) && CollectPoolVertexBuffers(cmd_list, &vbs);
   PoolUvStream uv;
-  if (vbs_known) ResolvePoolUvStream(device, draw, vbs, &uv, atlas_only);
+  if (vbs_known) ResolvePoolUvStream(device, draw, vbs, &uv);
   PoolSkip skip = gate.skip;
   PoolSlice slice;
   stage.Set("indirect draw: slice");
@@ -5690,6 +5765,35 @@ inline const char* ApplyOrVerifyPoolMesh(
   return mismatch ? "differs from the previous capture, capturing again" : "captured, verifying with a second capture";
 }
 
+// Caller holds g_pool.mutex. A UV refresh only fills the existing mesh's UVs when the decoded vertices match
+// it at both ends; it never changes the mesh's key, uid, positions, indices or BLAS.
+inline const char* ApplyPoolUvRefresh(
+    std::unordered_map<uint64_t, PoolMeshRequest>::iterator request, const PoolDecodedMesh& decoded) {
+  const PoolMeshRequest& queued = request->second;
+  const auto mesh_it = g_pool.mesh_by_key.find(queued.mesh_key);
+  bool accepted = mesh_it != g_pool.mesh_by_key.end();
+  if (accepted) {
+    const WorldMesh& mesh = g_pool.meshes[mesh_it->second];
+    const auto close = [](const std::array<float, 3>& a, const std::array<float, 3>& b) {
+      for (int c = 0; c < 3; ++c) {
+        if (std::abs(a[c] - b[c]) > 1e-5f) return false;
+      }
+      return true;
+    };
+    accepted = decoded.positions.size() == mesh.positions.size()
+               && decoded.uvs.size() == decoded.positions.size() && !decoded.positions.empty()
+               && close(decoded.positions.front(), mesh.positions.front())
+               && close(decoded.positions.back(), mesh.positions.back());
+    if (accepted) {
+      g_pool.meshes[mesh_it->second].uvs = decoded.uvs;
+      g_pool.uv_refreshed_uids.insert(mesh.uid);
+    }
+  }
+  if (!accepted) g_pool.stats.uv_refresh_mismatch += 1u;
+  g_pool.uv_refresh_requests.erase(request);
+  return accepted ? "uvs refreshed" : "uv refresh discarded (vertices differ)";
+}
+
 struct PoolResolvedCopy {
   bool verified = false;
   int32_t gpu_base = 0;
@@ -5702,7 +5806,8 @@ struct PoolResolvedCopy {
 // the slot is read, so decoding runs without the lock) and the result.
 struct PoolMeshJob {
   PoolMeshCopy copy;
-  bool queued = false;  // a request with this serial existed when the slot was read
+  bool queued = false;     // a request with this serial existed when the slot was read
+  bool uv_refresh = false;  // this request can only fill UVs of an existing mesh
   uint32_t index_size = 0u;
   uint32_t index_count = 0u;
   int32_t vertex_offset = 0;
@@ -5820,17 +5925,18 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       job.copy = copy;
       job.staging.slot = slot_index;
       job.staging.ordinal = static_cast<uint32_t>(jobs.size());
-      const auto request = g_pool.mesh_requests.find(copy.mesh_key);
-      if (request != g_pool.mesh_requests.end() && request->second.serial == copy.serial) {
-        PoolMeshRequest& queued = request->second;
+      PoolMeshRequest* found = FindPoolMeshRequest(copy.mesh_key).second;
+      if (found != nullptr && found->serial == copy.serial) {
+        PoolMeshRequest& queued = *found;
         job.queued = true;
+        job.uv_refresh = queued.uv_refresh;
         job.index_size = queued.draw.index_size;
         job.index_count = queued.draw.index_count;
         job.vertex_offset = queued.draw.vertex_offset;
         job.stride = queued.draw.vb_stride;
         job.pos_offset = queued.pos_offset;
         job.pos_format = queued.pos_format;
-        job.uv_offset = g_pool.alpha_keys.count(queued.mesh_key) != 0u ? queued.uv_offset : -1;
+        job.uv_offset = job.uv_refresh || g_pool.alpha_keys.count(queued.mesh_key) != 0u ? queued.uv_offset : -1;
         job.uv_format = queued.uv_format;
         job.uv = queued.uv;
         job.min_vertex = queued.min_vertex;
@@ -6063,13 +6169,12 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     // Meshes first, so instances read in this slot can admit right away.
     if (!meshes_ok) g_pool.stats.map_failures += 1u;
     for (PoolMeshJob& job : jobs) {
-      const auto request = g_pool.mesh_requests.find(job.copy.mesh_key);
-      const bool current = job.queued && request != g_pool.mesh_requests.end()
-                           && request->second.serial == job.copy.serial;
+      const auto [requests, request] = FindPoolMeshRequest(job.copy.mesh_key);
+      const bool current = job.queued && request != nullptr && request->serial == job.copy.serial;
       const char* outcome = nullptr;
       if (job.staging.poisoned) ClassifyPoolStagingHead(job.staging, job.copy.mesh_key, cycle);
       if (current && meshes_ok) {
-        PoolMeshRequest& read = request->second;
+        PoolMeshRequest& read = *request;
         read.staging = job.staging;
         if (job.copy.phase == PoolMeshPhase::Indices) {
           read.min_vertex = job.min_vertex;
@@ -6087,17 +6192,23 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         outcome = "dropped (mesh released or re-queued)";
       } else if (!meshes_ok) {
         // Staging not readable: back in line for another copy.
-        PoolMeshRequest& queued = request->second;
+        PoolMeshRequest& queued = *request;
         if (job.copy.phase != PoolMeshPhase::Indices) queued.indices = std::move(job.indices);
         if (job.copy.phase == PoolMeshPhase::Uvs) queued.vertex_bytes = std::move(job.vertex_bytes);
         queued.in_flight = false;
         AddPoolMeshWaiting(queued);
         outcome = "staging not readable, copy again";
       } else if (job.error != nullptr) {
-        FailPoolMesh(request, job.error);
-        outcome = job.error;
+        if (job.uv_refresh) {
+          g_pool.stats.uv_refresh_mismatch += 1u;
+          requests->erase(job.copy.mesh_key);
+          outcome = "uv refresh discarded (decode failed)";
+        } else {
+          FailPoolMesh(requests->find(job.copy.mesh_key), job.error);
+          outcome = job.error;
+        }
       } else if (job.copy.phase == PoolMeshPhase::Indices) {
-        PoolMeshRequest& queued = request->second;
+        PoolMeshRequest& queued = *request;
         queued.indices = std::move(job.indices);
         queued.min_vertex = job.min_vertex;
         queued.max_vertex = job.max_vertex;
@@ -6109,19 +6220,25 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       } else if (job.copy.phase == PoolMeshPhase::Vertices && job.uv.buffer.handle != 0u) {
         uint64_t held = job.vertex_bytes.size();  // vertex bytes held by the requests in the Uvs phase
         for (const auto& entry : g_pool.mesh_requests) held += entry.second.vertex_bytes.size();
+        for (const auto& entry : g_pool.uv_refresh_requests) held += entry.second.vertex_bytes.size();
         if (held > g_pool.alpha_held_bytes_max) {
-          if (request->second.atlas_only) {
-            // Atlas-only meshes finish without the separate UV stream; alpha requests still fail.
+          if (request->atlas_only) {
+            // Atlas-only work finishes without the separate UV stream; alpha requests still fail.
             const PoolCpuTimer cpu_timer{&g_pool.cpu_capture_us};
-            ApplyOrVerifyPoolMesh(request, job.mesh, PoolIndexSignature(job.indices), frame, &warning_lines);
+            if (job.uv_refresh) {
+              ApplyPoolUvRefresh(requests->find(job.copy.mesh_key), job.mesh);
+            } else {
+              ApplyOrVerifyPoolMesh(requests->find(job.copy.mesh_key), job.mesh, PoolIndexSignature(job.indices), frame,
+                                    &warning_lines);
+            }
             g_pool.stats.albedo_uv_over_cap += 1u;
             outcome = "uv skipped over cap";
           } else {
             outcome = "held vertex bytes over the cap";
-            FailPoolMesh(request, outcome);
+            FailPoolMesh(requests->find(job.copy.mesh_key), outcome);
           }
         } else {
-          PoolMeshRequest& queued = request->second;
+          PoolMeshRequest& queued = *request;
           queued.indices = std::move(job.indices);
           queued.vertex_bytes = std::move(job.vertex_bytes);
           queued.phase = PoolMeshPhase::Uvs;
@@ -6132,7 +6249,12 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         }
       } else {
         const PoolCpuTimer cpu_timer{&g_pool.cpu_capture_us};
-        outcome = ApplyOrVerifyPoolMesh(request, job.mesh, PoolIndexSignature(job.indices), frame, &warning_lines);
+        if (job.uv_refresh) {
+          outcome = ApplyPoolUvRefresh(requests->find(job.copy.mesh_key), job.mesh);
+        } else {
+          outcome = ApplyOrVerifyPoolMesh(requests->find(job.copy.mesh_key), job.mesh, PoolIndexSignature(job.indices),
+                                          frame, &warning_lines);
+        }
       }
       if (log) {
         namespace log_utils = renodx::utils::log;
@@ -6275,14 +6397,22 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         if ((copy.pass & kPoolPassWind) != 0u) g_pool.wind_keys.insert(mesh_key);
         if (copy.wind_index != UINT32_MAX) g_pool.wind_sway.try_emplace(mesh_key, indirect_wind[copy.wind_index]);
         const bool atlas_only = alpha_side != nullptr && alpha_side->atlas && pt::g_pt_material_atlas > 0.5f;
-        QueuePoolMesh(mesh_key, copy.vs_hash, record, true, alpha_side != nullptr ? alpha_side->uv : PoolUvStream{}, atlas_only);
+        const PoolUvStream side_uv = alpha_side != nullptr ? alpha_side->uv : PoolUvStream{};
+        QueuePoolMesh(mesh_key, copy.vs_hash, record, true, side_uv, atlas_only);
+        if (atlas_only && (copy.pass & kPoolPassCamera) != 0u) {
+          QueuePoolUvRefresh(mesh_key, copy.vs_hash, record, side_uv);
+        }
         if (alpha_side != nullptr && alpha_side->source != 0u
             && ((AlphaMode() & 2u) != 0u || atlas_only)) {
           AttachPoolAlphaSource(mesh_key, alpha_side->source);
         }
         if (atlas_only && mesh_key != 0u && copy.alpha.view != 0u) {
+          const auto mesh_it = g_pool.mesh_by_key.find(mesh_key);
+          const bool mesh_ready = mesh_it != g_pool.mesh_by_key.end()
+                                  && (!g_pool.meshes[mesh_it->second].uvs.empty()
+                                      || g_pool.uv_refresh_requests.count(mesh_key) != 0u);
           const auto retry = g_pool.albedo_retry_at.find(mesh_key);
-          if ((retry == g_pool.albedo_retry_at.end() || retry->second <= frame)
+          if (mesh_ready && (retry == g_pool.albedo_retry_at.end() || retry->second <= frame)
               && g_pool.albedo_material_keys.count(mesh_key) == 0u
               && g_pool.alpha_key_source.count(mesh_key) == 0u) {
             g_pool.albedo_retry_at[mesh_key] = frame + kAlbedoRetryFrames;
@@ -6417,17 +6547,21 @@ inline void PrunePool(uint32_t frame) {
   // Meshes not drawn for a while (QueuePoolMesh refreshes last_frame at each
   // sighting): forget them and their indices; the next sighting queues them
   // again.
-  for (auto it = g_pool.mesh_requests.begin(); it != g_pool.mesh_requests.end();) {
-    if (frame > it->second.last_frame + kPoolPruneAge) {
-      if (!it->second.in_flight) RemovePoolMeshWaiting(it->second.buffer_key, it->first);
-      g_pool.mesh_queued.erase(it->first);
-      g_pool.albedo_retry_at.erase(it->first);
-      g_pool.stats.mesh_expired += 1u;
-      it = g_pool.mesh_requests.erase(it);
-    } else {
-      ++it;
+  const auto prune_requests = [frame](std::unordered_map<uint64_t, PoolMeshRequest>& requests) {
+    for (auto it = requests.begin(); it != requests.end();) {
+      if (frame > it->second.last_frame + kPoolPruneAge) {
+        if (!it->second.in_flight) RemovePoolMeshWaiting(it->second.buffer_key, it->first);
+        g_pool.mesh_queued.erase(it->first);
+        g_pool.albedo_retry_at.erase(it->first);
+        g_pool.stats.mesh_expired += 1u;
+        it = requests.erase(it);
+      } else {
+        ++it;
+      }
     }
-  }
+  };
+  prune_requests(g_pool.mesh_requests);
+  prune_requests(g_pool.uv_refresh_requests);
   for (auto it = g_pool.light_trails.begin(); it != g_pool.light_trails.end();) {
     if (frame > it->second.frame + kPoolPruneAge) {
       it = g_pool.light_trails.erase(it);
@@ -6711,6 +6845,8 @@ inline void ResetWorldPool() {
     }
   }
   g_pool.mesh_requests.clear();
+  g_pool.uv_refresh_requests.clear();
+  g_pool.uv_refreshed_uids.clear();
   g_pool.mesh_waiting.clear();
   g_pool.mesh_queued.clear();
   g_pool.mesh_retry.clear();
@@ -7880,10 +8016,16 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"albedo_refused_bytes\": " << stats.albedo_refused_bytes
       << ", \"albedo_refused_type\": " << stats.albedo_refused_type
       << ", \"albedo_retries\": " << stats.albedo_retries
-      << ", \"albedo_uv_slot0\": " << stats.albedo_uv_slot0
       << ", \"albedo_uv_over_cap\": " << stats.albedo_uv_over_cap
       << ", \"albedo_live_sources\": " << stats.albedo_live_sources
       << ", \"albedo_textures_sliced\": " << stats.albedo_textures_sliced
+      << ", \"albedo_unready_freed\": " << stats.albedo_unready_freed
+      << ", \"albedo_meshes_with_uvs\": " << stats.albedo_meshes_with_uvs
+      << ", \"albedo_meshes_total\": " << stats.albedo_meshes_total
+      << ", \"uv_refresh_queued\": " << stats.uv_refresh_queued
+      << ", \"uv_refresh_done\": " << stats.uv_refresh_done
+      << ", \"uv_refresh_mismatch\": " << stats.uv_refresh_mismatch
+      << ", \"uv_refresh_skipped\": " << stats.uv_refresh_skipped
       << ", \"tlas_albedo_instances\": " << albedo_gpu.tlas_albedo_instances << "},\n";
   out << "  \"alpha_keys_total\": " << alpha_keys.size() << ", \"alpha_keys\": [";
   for (size_t i = 0; i < alpha_keys.size() && i < kPoolDumpMaxAlphaKeys; ++i) {
