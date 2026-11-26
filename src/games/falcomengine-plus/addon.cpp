@@ -43,6 +43,7 @@
 #include "../../utils/state.hpp"
 #include "./fast_noise_ea.h"     // baked-in fast_noise_ea.dds (embed_file.exe output)
 #include "./customshaders/cortao/cortao_occluder_lut_16.h"  // embed_file.exe output of reference/CORTAO-main/tables/occluder/24x24x16x16_R16_UNORM.bin
+#include "./reference/CORTAO-main/tables/normal/CORTAOBentNormalLookupTable16Rays.h"  // CORTAO::bentNormalLookupTable16Rays: 65536 x R8G8_SNORM (non-inline global: include only here)
 #include "./kai_hero_light.hpp"  // Kai hero light: matches and zeroes the hero light in mapped light records
 #include "./shared.h"
 #include "./world/bvh/deform_probe.hpp"  // native D3D11 event query (DynCube validity readback poll)
@@ -547,7 +548,11 @@ constexpr std::array<std::span<const uint8_t>, 7> kCortaoMainShaders = {
     __cortao_main_s4, __cortao_main_s6, __cortao_main_s8, __cortao_main_s12,
     __cortao_main_s16, __cortao_main_s24, __cortao_main_s32};
 constexpr std::array<std::span<const uint8_t>, 2> kCortaoFilterShaders = {__cortao_filter_small, __cortao_filter_large};
-constexpr int kCortaoDebugModes[4] = {0, 1, 22, 26};
+constexpr std::array<std::span<const uint8_t>, 7> kCortaoMainBentShaders = {
+    __cortao_main_bent_s4, __cortao_main_bent_s6, __cortao_main_bent_s8, __cortao_main_bent_s12,
+    __cortao_main_bent_s16, __cortao_main_bent_s24, __cortao_main_bent_s32};
+constexpr std::array<std::span<const uint8_t>, 2> kCortaoFilterBentShaders = {__cortao_filter_bent_small, __cortao_filter_bent_large};
+constexpr int kCortaoDebugModes[5] = {0, 1, 22, 26, 28};
 
 // DynCube loading wipe: color captures older than this mean no lighting draws
 // (loading screen) � arm history hard-replace so the next scene rebuilds clean.
@@ -769,6 +774,7 @@ static float g_cortao_filter = 1.f;
 static float g_cortao_filter_size = 1.f;
 static float g_cortao_filter_depth_sensitivity = 512.f;
 static float g_cortao_filter_normal_sensitivity = 16.f;
+static float g_cortao_bent_normals = 0.f;
 
 // -- Dynamic Cubemaps (Sora 2nd) � standalone t17 replacement --
 constexpr uint32_t kDynCubeRegister = 17u;         // t17 texEnvMap_g
@@ -1039,7 +1045,7 @@ static int VbgiGtvbaoDebugMode() {
 // AO-only: the VBGI row replaces the AO debug view, never mixes with it.
 static int GtvbaoDebugMode() {
   if (VbgiGtvbaoDebugMode() != 0) return 0;
-  if (CortaoSelected()) return kCortaoDebugModes[std::clamp((int)g_cortao_debug_view, 0, 3)];
+  if (CortaoSelected()) return kCortaoDebugModes[std::clamp((int)g_cortao_debug_view, 0, 4)];
   return kGtvbaoDebugModes[std::clamp((int)g_gtvbao_debug_ui, 0, 6)];
 }
 // What the lighting shaders show: VBGI wins when its row is set.
@@ -1252,6 +1258,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   int cortao_main_pipeline_key = -1;
   falcom_world::denoise::TextureSet<1> cortao_foliage_mask = {};
   falcom_world::denoise::TextureSet<1> cortao_occlusion = {};
+  reshade::api::resource cortao_bent_lut_buffer = {};
+  reshade::api::resource_view cortao_bent_lut_srv = {};
+  falcom_world::denoise::TextureSet<1> cortao_occlusion_bent = {};
+  falcom_world::denoise::TextureSet<1> cortao_bent_normal = {};
+  uint64_t cortao_bent_frame = UINT64_MAX;
   reshade::api::pipeline_layout cortao_filter_layout = {};
   reshade::api::pipeline cortao_filter_pipeline = {};
   int cortao_filter_pipeline_key = -1;
@@ -4619,13 +4630,23 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+        .key = "CORTAOBentNormals",
+        .binding = &g_cortao_bent_normals,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Bent Normals",
+        .section = "CORTAO",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
         .key = "CORTAODebugView",
         .binding = &g_cortao_debug_view,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f,
         .label = "Debug View",
         .section = "CORTAO",
-        .labels = {"Off", "AO Only", "Raw AO", "Input Normal"},
+        .labels = {"Off", "AO Only", "Raw AO", "Input Normal", "Bent Normal"},
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -12923,6 +12944,10 @@ static void DestroyCortaoResources(reshade::api::device* dev, DeviceData* d) {
   dr(d->cortao_packed_texture);
   falcom_world::denoise::DestroyTextureSet(dev, &d->cortao_foliage_mask);
   falcom_world::denoise::DestroyTextureSet(dev, &d->cortao_occlusion);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->cortao_occlusion_bent);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->cortao_bent_normal);
+  dv(d->cortao_bent_lut_srv);
+  dr(d->cortao_bent_lut_buffer);
   dv(d->cortao_lut_srv);
   dr(d->cortao_lut_texture);
   if (d->cortao_border_sampler.handle) {
@@ -12943,6 +12968,7 @@ static void DestroyCortaoResources(reshade::api::device* dev, DeviceData* d) {
   d->cortao_height = 0u;
   d->cortao_main_pipeline_key = -1;
   d->cortao_filter_pipeline_key = -1;
+  d->cortao_bent_frame = UINT64_MAX;
 }
 
 // ----------- Contact Shadows (customshaders/shadows/*.cs_5_0.hlsl) -----------
@@ -15415,22 +15441,22 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (CortaoSelected()) {
     if (make_layout(2u, kCortaoPackedMipLevels, &d->cortao_prepass_layout, 1u, kCortaoPushConstantFloats) && !d->cortao_prepass_pipeline.handle)
       mkcs(__cortao_prepass, "main", d->cortao_prepass_layout, &d->cortao_prepass_pipeline);
-    const int key = std::clamp((int)std::lround(g_cortao_quality), 0, 6);
+    const int key = std::clamp((int)std::lround(g_cortao_quality), 0, 6) + (g_cortao_bent_normals > 0.5f ? 7 : 0);
     if (make_layout(5u, 4u, &d->cortao_main_layout, 2u, kCortaoPushConstantFloats)) {
       if (d->cortao_main_pipeline.handle && d->cortao_main_pipeline_key != key) {
         dev->destroy_pipeline(d->cortao_main_pipeline);
         d->cortao_main_pipeline = {};
       }
-      if (!d->cortao_main_pipeline.handle && mkcs(kCortaoMainShaders[key], "main", d->cortao_main_layout, &d->cortao_main_pipeline))
+      if (!d->cortao_main_pipeline.handle && mkcs(key < 7 ? kCortaoMainShaders[key] : kCortaoMainBentShaders[key - 7], "main", d->cortao_main_layout, &d->cortao_main_pipeline))
         d->cortao_main_pipeline_key = key;
     }
     if (g_cortao_filter > 0.5f && make_layout(3u, 2u, &d->cortao_filter_layout, 1u, kCortaoPushConstantFloats)) {
-      const int fkey = std::clamp((int)std::lround(g_cortao_filter_size), 0, 1);
+      const int fkey = std::clamp((int)std::lround(g_cortao_filter_size), 0, 1) + (g_cortao_bent_normals > 0.5f ? 2 : 0);
       if (d->cortao_filter_pipeline.handle && d->cortao_filter_pipeline_key != fkey) {
         dev->destroy_pipeline(d->cortao_filter_pipeline);
         d->cortao_filter_pipeline = {};
       }
-      if (!d->cortao_filter_pipeline.handle && mkcs(kCortaoFilterShaders[fkey], "main", d->cortao_filter_layout, &d->cortao_filter_pipeline)) d->cortao_filter_pipeline_key = fkey;
+      if (!d->cortao_filter_pipeline.handle && mkcs(fkey < 2 ? kCortaoFilterShaders[fkey] : kCortaoFilterBentShaders[fkey - 2], "main", d->cortao_filter_layout, &d->cortao_filter_pipeline)) d->cortao_filter_pipeline_key = fkey;
     }
   }
 
@@ -15518,6 +15544,26 @@ static bool EnsureCortaoResources(reshade::api::device* dev, DeviceData* d, uint
     d->cortao_mip_count = mips;
     CortaoLog(std::string("packed created ") + std::to_string(w) + "x" + std::to_string(h)
                     + " mips=" + std::to_string(mips));
+  }
+
+  if (g_cortao_bent_normals > 0.5f && !d->cortao_bent_lut_buffer.handle) {
+    if (sizeof(CORTAO::bentNormalLookupTable16Rays) != 131072u) {
+      CortaoLog("bent lut size " + std::to_string(sizeof(CORTAO::bentNormalLookupTable16Rays)) + " != 131072", true);
+      return false;
+    }
+    reshade::api::resource_desc bd(131072u, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::shader_resource);
+    reshade::api::subresource_data init = {CORTAO::bentNormalLookupTable16Rays, 0u, 0u};
+    if (!dev->create_resource(bd, &init, reshade::api::resource_usage::shader_resource, &d->cortao_bent_lut_buffer)) {
+      CortaoLog("create_resource(bent lut) failed", true);
+      return false;
+    }
+    if (!dev->create_resource_view(d->cortao_bent_lut_buffer, reshade::api::resource_usage::shader_resource,
+                                   reshade::api::resource_view_desc(reshade::api::format::r8g8_snorm, 0u, 131072u),
+                                   &d->cortao_bent_lut_srv)) {
+      CortaoLog("create_resource_view(bent lut) failed", true);
+      return false;
+    }
+    CortaoLog("bent lut created 65536 r8g8_snorm");
   }
 
   if (!d->cortao_border_sampler.handle || !d->cortao_lut_texture.handle || !d->cortao_lut_srv.handle
@@ -15998,6 +16044,16 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
     CortaoLog(std::string("filter requested but not ready: pipeline=") + std::to_string(d->cortao_filter_pipeline.handle != 0u)
               + " tables=" + std::to_string(filter_tables_ok) + " texture=" + std::to_string(filter_texture_ok), true);
 
+  const bool bent_requested = g_cortao_bent_normals > 0.5f;
+  const bool bent_out_ok = bent_requested && falcom_world::denoise::EnsureTextureSet(dev, &d->cortao_bent_normal, reshade::api::format::r8g8b8a8_snorm, 4u, w, h);
+  const bool bent_temp_ok = !filter_on || (bent_requested && falcom_world::denoise::EnsureTextureSet(dev, &d->cortao_occlusion_bent, reshade::api::format::r8g8b8a8_snorm, 4u, w, h));
+  const bool bent_on = bent_out_ok && bent_temp_ok && d->cortao_bent_lut_srv.handle != 0u
+      && d->cortao_main_pipeline_key >= 7 && (!filter_on || d->cortao_filter_pipeline_key >= 2);
+  if (bent_requested && !bent_on)
+    CortaoLog(std::string("bent normals not ready: lut=") + std::to_string(d->cortao_bent_lut_srv.handle != 0u) + " output="
+              + std::to_string(bent_out_ok) + " temp=" + std::to_string(bent_temp_ok) + "; occlusion only this frame", true);
+  if (bent_requested && !bent_on) return false;
+
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
   const auto CS = reshade::api::shader_stage::all_compute;
@@ -16079,8 +16135,8 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   GtvbaoBindPipeline(cl, d->cortao_main_pipeline);
   {
     reshade::api::sampler samplers[2] = {d->cortao_border_sampler, d->point_clamp_sampler};
-    reshade::api::resource_view srvs[5] = {d->cortao_packed_srv, d->captured_mrt_normal_srv, d->cortao_lut_srv, foliage_mask_valid ? d->cortao_foliage_mask.srv[0] : d->fallback_srv, d->fallback_srv};
-    reshade::api::resource_view uavs[4] = {d->gtvbao_svgf_raw.uav[0], filter_on ? d->cortao_occlusion.uav[0] : d->fallback_uav, d->fallback_uav, dbg_on ? d->debug_uav : d->fallback_uav};
+    reshade::api::resource_view srvs[5] = {d->cortao_packed_srv, d->captured_mrt_normal_srv, d->cortao_lut_srv, foliage_mask_valid ? d->cortao_foliage_mask.srv[0] : d->fallback_srv, bent_on ? d->cortao_bent_lut_srv : d->fallback_srv};
+    reshade::api::resource_view uavs[4] = {d->gtvbao_svgf_raw.uav[0], filter_on ? (bent_on ? d->cortao_occlusion_bent.uav[0] : d->cortao_occlusion.uav[0]) : d->fallback_uav, bent_on ? d->cortao_bent_normal.uav[0] : d->fallback_uav, dbg_on ? d->debug_uav : d->fallback_uav};
     reshade::api::descriptor_table_update u[4] = {
         {{}, 0, 0, 2, reshade::api::descriptor_type::sampler, samplers},
         {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
@@ -16093,10 +16149,10 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
   GtvbaoBarrier(cl, d->gtvbao_svgf_raw.texture[0], UA, SR);
   if (filter_on) {
-    GtvbaoBarrier(cl, d->cortao_occlusion.texture[0], UA, SR);
+    GtvbaoBarrier(cl, bent_on ? d->cortao_occlusion_bent.texture[0] : d->cortao_occlusion.texture[0], UA, SR);
     GtvbaoBindPipeline(cl, d->cortao_filter_pipeline);
-    reshade::api::resource_view srvs[3] = {d->cortao_packed_srv, d->cortao_occlusion.srv[0], foliage_mask_valid ? d->cortao_foliage_mask.srv[0] : d->fallback_srv};
-    reshade::api::resource_view uavs[2] = {d->gtvbao_svgf_raw.uav[0], d->fallback_uav};
+    reshade::api::resource_view srvs[3] = {d->cortao_packed_srv, bent_on ? d->cortao_occlusion_bent.srv[0] : d->cortao_occlusion.srv[0], foliage_mask_valid ? d->cortao_foliage_mask.srv[0] : d->fallback_srv};
+    reshade::api::resource_view uavs[2] = {d->gtvbao_svgf_raw.uav[0], bent_on ? d->cortao_bent_normal.uav[0] : d->fallback_uav};
     reshade::api::descriptor_table_update u[4] = {
         {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->cortao_border_sampler},
         {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
@@ -16107,6 +16163,10 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
     cl->push_constants(CS, d->cortao_filter_layout, kGtvbaoPushConstantsLayoutParam, 0, kCortaoPushConstantFloats, &pc);
     cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
     GtvbaoBarrier(cl, d->gtvbao_svgf_raw.texture[0], UA, SR);
+  }
+  if (bent_on) {
+    GtvbaoBarrier(cl, d->cortao_bent_normal.texture[0], UA, SR);
+    d->cortao_bent_frame = d->frame_index;
   }
   if (dbg_on) {
     GtvbaoBarrier(cl, d->debug_texture, UA, SR);
@@ -16153,7 +16213,8 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   CortaoLog(std::string("run exit ok ") + std::to_string(w) + "x" + std::to_string(h)
         + " mips=" + std::to_string(d->cortao_mip_count)
         + " samples=" + std::to_string(std::lround(g_cortao_quality))
-        + " filter=" + (filter_on ? (d->cortao_filter_pipeline_key == 1 ? "large" : "small") : "off"));
+        + " filter=" + (filter_on ? ((d->cortao_filter_pipeline_key % 2) == 1 ? "large" : "small") : "off")
+        + " bent=" + std::to_string(bent_on));
   return true;
 }
 

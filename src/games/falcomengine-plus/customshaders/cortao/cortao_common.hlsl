@@ -61,3 +61,13 @@ void FalcomCortaoWriteVisibility(RWTexture2D<float4> outRaw, Texture2D<uint> fol
     visibility = lerp(visibility, 1.0, 1.0 - saturate(CORTAO_foliage_ao_value));
   outRaw[p] = float4(visibility, visibility, visibility, 1.0);
 }
+
+// Writes the scalar visibility (SVGF raw) and the reference bent-normal output (occlusion, bent.xyz),
+// both with the same foliage-blended visibility.
+void FalcomCortaoWriteOutputs(RWTexture2D<float4> outRaw, RWTexture2D<float4> outBent, Texture2D<uint> foliageMask, uint2 p, float4 ssao) {
+  float visibility = ssao.x;
+  if (CORTAO_foliage_exclude > 0.5f && foliageMask.Load(int3(p, 0)) != 0u)
+    visibility = lerp(visibility, 1.0, 1.0 - saturate(CORTAO_foliage_ao_value));
+  outRaw[p] = float4(visibility, visibility, visibility, 1.0);
+  outBent[p] = float4(visibility, ssao.yzw);
+}

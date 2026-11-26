@@ -4,7 +4,10 @@
 
 #define CORTAO_RAY_COUNT 16
 #define CORTAO_OCCLUDER_LOOKUP_TABLE 1
-#define CORTAO_BENT_NORMAL_LOOKUP_TABLE 0
+#ifndef FALCOM_CORTAO_BENT_NORMALS
+#define FALCOM_CORTAO_BENT_NORMALS 0
+#endif
+#define CORTAO_BENT_NORMAL_LOOKUP_TABLE FALCOM_CORTAO_BENT_NORMALS
 
 #include "../../reference/CORTAO-main/src/shaders/CORTAOMainPass.h"
 
@@ -15,7 +18,13 @@ Texture2D<uint> g_srcFoliageMask : register(t3);      // M2
 SamplerState g_samplerPointBorder : register(s0);     // nearest, border 0 (README main pass)
 SamplerState g_samplerPointClamp : register(s1);      // nearest, clamp-to-edge
 RWTexture2D<float4> g_outSvgfRaw : register(u0);
+#if FALCOM_CORTAO_BENT_NORMALS
+Buffer<cortao_half2> g_srcBentNormalLut : register(t4);  // 65536 x R8G8_SNORM
+RWTexture2D<float4> g_outOcclusion : register(u1);      // filter input, R8G8B8A8_SNORM
+RWTexture2D<float4> g_outBentNormal : register(u2);     // R8G8B8A8_SNORM
+#else
 RWTexture2D<float> g_outOcclusion : register(u1);     // filter input, R8_UNORM (M3)
+#endif
 RWTexture2D<float4> g_outDebug : register(u3);        // u2 is the bent output (M4)
 
 static bool g_falcomCortaoMaskFoliage = false;
@@ -37,6 +46,23 @@ cortao_half3 cortao_loadNormal(cortao_int2 pixelCoords) {
 cortao_uint cortao_sampleOccluderLookupTable(cortao_float3 texCoords) {
   return (cortao_uint)(g_srcOccluderLut.SampleLevel(g_samplerPointClamp, texCoords, 0.0) * 65535.0 + 0.5); // tables/occluder/README SM 6.7 workaround
 }
+#if FALCOM_CORTAO_BENT_NORMALS
+cortao_half3 cortao_loadBentNormalLookupTable(cortao_uint rayBits) {
+  cortao_half2 bentNormal = g_srcBentNormalLut.Load(cortao_int(rayBits));
+  return cortao_half3(bentNormal, sqrt(cortao_half(1.0) - dot(bentNormal, bentNormal))); //reconstruct z
+}
+void cortao_writeResult(cortao_int2 pixelCoords, cortao_half occlusion, cortao_half3 bentNormal,
+                        cortao_half3x3 tangentSpaceTransform, cortao_uint rayBits) {
+  const float visibility = pow(saturate((float)occlusion), CORTAO_intensity); // README intensity tweak
+  if (CORTAO_filter_enabled > 0.5f) g_outOcclusion[pixelCoords] = float4(visibility, (float3)bentNormal);
+  else FalcomCortaoWriteOutputs(g_outSvgfRaw, g_outBentNormal, g_srcFoliageMask, pixelCoords, float4(visibility, (float3)bentNormal));
+  if (CORTAO_debug_mode > 21.5f) {
+    if ((int)CORTAO_debug_mode == 22) g_outDebug[pixelCoords] = float4(visibility.xxx, 1.0);
+    else if ((int)CORTAO_debug_mode == 26) g_outDebug[pixelCoords] = float4((float3)tangentSpaceTransform[2] * 0.5 + 0.5, 1.0);
+    else if ((int)CORTAO_debug_mode == 28) g_outDebug[pixelCoords] = float4((float3)bentNormal * 0.5 + 0.5, 1.0);
+  }
+}
+#else
 void cortao_writeResult(cortao_int2 pixelCoords, cortao_half occlusion, cortao_half3 bentNormal,
                         cortao_half3x3 tangentSpaceTransform, cortao_uint rayBits) {
   const float visibility = pow(saturate((float)occlusion), CORTAO_intensity); // README intensity tweak
@@ -47,6 +73,7 @@ void cortao_writeResult(cortao_int2 pixelCoords, cortao_half occlusion, cortao_h
     else if ((int)CORTAO_debug_mode == 26) g_outDebug[pixelCoords] = float4((float3)tangentSpaceTransform[2] * 0.5 + 0.5, 1.0);
   }
 }
+#endif
 
 // Transcription of CORTAO::populateMainPassParameters, flipY branch.
 CORTAOMainPassParameters FalcomCortaoPopulateMainPassParameters() {
@@ -89,12 +116,20 @@ void main(uint2 workgroupID : SV_GroupID, uint localIndex : SV_GroupIndex) {
   g_falcomCortaoMaskFoliage = CORTAO_foliage_exclude > 0.5f && !receiverFoliage;
   if (receiverFoliage && CORTAO_foliage_ao_value <= 0.0f && CORTAO_debug_mode < 21.5f) {
     FalcomCortaoWriteVisibility(g_outSvgfRaw, g_srcFoliageMask, pixelCoords, 1.0); // GTVBAO perf P2 parity
+#if FALCOM_CORTAO_BENT_NORMALS
+    g_outBentNormal[pixelCoords] = float4(1.0, 0.0, 0.0, 1.0);
+#endif
     if (CORTAO_filter_enabled > 0.5f) g_outOcclusion[pixelCoords] = 1.0;
     return;
   }
   // cortao_mainPass returns before cortao_writeResult for sky pixels (CORTAOMainPass.h:374-377): pre-write full visibility.
   FalcomCortaoWriteVisibility(g_outSvgfRaw, g_srcFoliageMask, pixelCoords, 1.0);
+#if FALCOM_CORTAO_BENT_NORMALS
+  g_outBentNormal[pixelCoords] = float4(1.0, 0.0, 0.0, 1.0);
+  if (CORTAO_filter_enabled > 0.5f) g_outOcclusion[pixelCoords] = float4(1.0, 0.0, 0.0, 1.0);
+#else
   if (CORTAO_filter_enabled > 0.5f) g_outOcclusion[pixelCoords] = 1.0;
+#endif
   if (CORTAO_debug_mode > 21.5f) g_outDebug[pixelCoords] = float4(0.25, 0.0, 0.25, 1.0);
   cortao_mainPass(pixelCoords, FalcomCortaoPopulateMainPassParameters());
 }
