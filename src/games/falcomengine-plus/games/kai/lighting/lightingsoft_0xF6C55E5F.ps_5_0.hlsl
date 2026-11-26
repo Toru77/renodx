@@ -471,7 +471,8 @@ void main(
   uint GTVBAO_debug_mode_ui = (uint)round(max(shader_injection_data.gtvbao_debug_mode, 0.0));
   const bool run_GTVBAO_debug = !GTVBAO_force_neutral_x
       && GTVBAO_debug_mode_ui > 0u
-      && (GTVBAO_bound || GTVBAO_debug_mode_ui >= 10u || GTVBAO_debug_blackout);
+      && (GTVBAO_bound || GTVBAO_debug_mode_ui >= 10u || GTVBAO_debug_blackout)
+      && (GTVBAO_debug_mode_ui != 41u || is_character_pixel);  // CORTAO Ambient AO (M6f): environment pixels continue to the ambient add
   if (run_GTVBAO_debug) {
     if (GTVBAO_debug_blackout && GTVBAO_debug_mode_ui <= 9u) {
       o0 = float4(0.0, 0.0, 0.0, 1.0);
@@ -1576,6 +1577,14 @@ void main(
   if (cortaoAmbientOnly) {
     const float3 cortaoAoTint = r15.www * (min(float3(1, 1, 1), r15.xyz) - mapAOColor_g.xyz) + mapAOColor_g.xyz;
     r12.xyz = (1.0 - r4.x) * (r12.xyz * cortaoAoTint - r12.xyz) + r12.xyz;
+  }
+  if (GTVBAO_debug_mode_ui == 41u) {
+    // CORTAO Ambient AO (M6f): the multiplier M6c applies to the ambient r12, (tint - 1) * (1 - ao) + 1 with the Kai
+    // AO tint (SSGI-weighted mapAOColor_g, same expression as the M6c block), shown as luminance like Final AO.
+    const float3 cortaoDbgTint = r15.www * (min(float3(1, 1, 1), r15.xyz) - mapAOColor_g.xyz) + mapAOColor_g.xyz;
+    const float3 cortaoAmbientMul = cortaoAmbientOnly ? (cortaoDbgTint - 1.0) * (1.0 - r4.x) + 1.0 : float3(1.0, 1.0, 1.0);
+    o0.rgb = saturate(dot(cortaoAmbientMul, float3(0.298999995, 0.587000012, 0.114))).xxx;
+    o0.a = 1.0; o1.xyzw = r1.xyzw; return;
   }
   r8.xyz = FalcomApplyContactToSun(
       r8.xyz * lightColor_g.xyz, is_character_pixel,

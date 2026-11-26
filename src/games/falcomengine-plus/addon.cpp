@@ -554,7 +554,7 @@ constexpr std::array<std::span<const uint8_t>, 7> kCortaoMainBentShaders = {
     __cortao_main_bent_s16, __cortao_main_bent_s24, __cortao_main_bent_s32};
 constexpr int kCortaoSampleCounts[7] = {4, 6, 8, 12, 16, 24, 32};  // CORTAO_SAMPLE_COUNT per Quality index (README quality names)
 constexpr std::array<std::span<const uint8_t>, 2> kCortaoFilterBentShaders = {__cortao_filter_bent_small, __cortao_filter_bent_large};
-constexpr int kCortaoDebugModes[9] = {0, 1, 22, 26, 28, 24, 25, 23, 40};  // Off, Final AO, Raw AO, Input Normal, Bent Normal, Filtered AO, Filtered Bent Normal, Temporal Confidence, AO Target (M6d)
+constexpr int kCortaoDebugModes[10] = {0, 1, 22, 26, 28, 24, 25, 23, 40, 41};  // Off, Final AO Value, Raw AO, Input Normal, Bent Normal, Filtered AO, Filtered Bent Normal, Temporal Confidence, AO Target, Ambient AO (M6f)
 
 // DynCube loading wipe: color captures older than this mean no lighting draws
 // (loading screen) � arm history hard-replace so the next scene rebuilds clean.
@@ -1056,7 +1056,7 @@ static int VbgiGtvbaoDebugMode() {
 // AO-only: the VBGI row replaces the AO debug view, never mixes with it.
 static int GtvbaoDebugMode() {
   if (VbgiGtvbaoDebugMode() != 0) return 0;
-  if (CortaoSelected()) return kCortaoDebugModes[std::clamp((int)g_cortao_debug_view, 0, 8)];
+  if (CortaoSelected()) return kCortaoDebugModes[std::clamp((int)g_cortao_debug_view, 0, 9)];
   return kGtvbaoDebugModes[std::clamp((int)g_gtvbao_debug_ui, 0, 6)];
 }
 // What the lighting shaders show: VBGI wins when its row is set.
@@ -4714,8 +4714,8 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Debug View",
         .section = "CORTAO",
-        .tooltip = "Final AO: the AO the game applies (after the CORTAO filter, temporal accumulation and upsample). Raw AO: the main pass before filtering. Input Normal: the normal CORTAO used. Bent Normal: the main-pass bent normal (needs Bent Normals). Filtered AO: after the CORTAO filter, before temporal (equals Raw AO with Filter Off). Filtered Bent Normal: the bent normal Bent Normal Ambient reads (needs Bent Normals). Temporal Confidence: history age, black (new) to white (full); purple when temporal is not running. AO Target: where the AO is applied: green = ambient only, grey = whole lit colour, blue = characters, red = path-traced GI pixels. Purple = sky or not available.",
-        .labels = {"Off", "Final AO", "Raw AO", "Input Normal", "Bent Normal", "Filtered AO", "Filtered Bent Normal", "Temporal Confidence", "AO Target"},
+        .tooltip = "Final AO Value: the AO value the game receives (after the CORTAO filter, temporal accumulation and upsample); it does not change with Ambient Only. Raw AO: the main pass before filtering. Input Normal: the normal CORTAO used. Bent Normal: the main-pass bent normal (needs Bent Normals). Filtered AO: after the CORTAO filter, before temporal (equals Raw AO with Filter Off). Filtered Bent Normal: the bent normal Bent Normal Ambient reads (needs Bent Normals). Temporal Confidence: history age, black (new) to white (full); purple when temporal is not running. AO Target: where the AO is applied: green = ambient only, grey = whole lit colour, blue = characters, red = path-traced GI pixels. Ambient AO: the AO that Ambient Only applies to the ambient light, as grey on a neutral background (the game's AO strength and tint included). Off = uniform neutral (the game darkens the whole colour instead); On = dark AO in creases and contacts. Characters are black. Purple = sky or not available.",
+        .labels = {"Off", "Final AO Value", "Raw AO", "Input Normal", "Bent Normal", "Filtered AO", "Filtered Bent Normal", "Temporal Confidence", "AO Target", "Ambient AO"},
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{

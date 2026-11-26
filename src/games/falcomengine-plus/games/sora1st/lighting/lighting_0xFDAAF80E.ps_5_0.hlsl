@@ -327,6 +327,11 @@ void main(
       o0.rgb = aoTarget * hdr_scale;
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
+    if (mode == 41 && (cortaoMrtFlags & 8u) == 0u) {
+      // CORTAO Ambient AO (M6f): characters never reach the environment ambient add; shown black.
+      o0.rgb = float3(0.0, 0.0, 0.0);
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
     if (mode >= 22 && mode <= 38) {
       // GTVBAO compute debug views: the compute pass wrote them into the debug UAV, pushed to t23.
       // Magenta when that push did not happen this frame.
@@ -1134,6 +1139,14 @@ void main(
   // CORTAO Ambient Only (M6c): the game's AO formula on the ambient term (r11) instead of the final colour.
   const float3 cortaoAmbientIn = r11.xyz;
   if (cortaoAmbientOnly) r11.xyz = (r11.xyz * mapAOColor_g.xyz - r11.xyz) * ((1.0 - r4.x) * r4.w * mapAOIntensity_g) + r11.xyz;
+  if ((int)shader_injection_data.gtvbao_debug_view == 41) {
+    // CORTAO Ambient AO (M6f): the multiplier M6c applies to the probe ambient r11, (tint - 1) * k + 1 with the game's
+    // AO strength and tint, shown as luminance like Final AO. Neutral where Ambient Only does not apply.
+    const float3 cortaoAmbientMul = cortaoAmbientOnly
+        ? (mapAOColor_g.xyz - 1.0) * ((1.0 - r4.x) * r4.w * mapAOIntensity_g) + 1.0 : float3(1.0, 1.0, 1.0);
+    o0.rgb = saturate(dot(cortaoAmbientMul, float3(0.298999995, 0.587000012, 0.114))).xxx * 0.3;
+    o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+  }
   r7.xyz = FalcomApplyContactToSun(
       r7.xyz * lightColor_g.xyz, is_character_pixel,
       contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0),

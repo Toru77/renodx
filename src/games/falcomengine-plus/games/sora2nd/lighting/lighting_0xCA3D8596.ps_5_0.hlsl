@@ -473,6 +473,13 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
       if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
       return;
     }
+    if (mode == 41 && (cortaoMrtFlags & 8u) == 0u) {
+      // CORTAO Ambient AO (M6f): characters never reach the environment ambient add; shown black.
+      o0.rgb = float3(0.0, 0.0, 0.0);
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy;
+      if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+      return;
+    }
     if (mode >= 22 && mode <= 38) {
       // GTVBAO compute debug views: the compute pass wrote them into the debug UAV, pushed to t23.
       // Magenta when that push did not happen this frame.
@@ -1386,6 +1393,16 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   // CORTAO Ambient Only (M6c): the game's AO formula on the ambient term (r13) instead of the final colour.
   const float3 cortaoAmbientIn = r13.xyz;
   if (cortaoAmbientOnly) r13.xyz = (r13.xyz * mapAOColor_g.xyz - r13.xyz) * ((1.0 - r5.x) * r17.z * mapAOIntensity_g) + r13.xyz;
+  if ((int)shader_injection_data.gtvbao_debug_view == 41) {
+    // CORTAO Ambient AO (M6f): the multiplier M6c applies to the probe ambient r13, (tint - 1) * k + 1 with the game's
+    // AO strength and tint, shown as luminance like Final AO. Neutral where Ambient Only does not apply (incl. PT GI).
+    const float3 cortaoAmbientMul = cortaoAmbientOnly
+        ? (mapAOColor_g.xyz - 1.0) * ((1.0 - r5.x) * r17.z * mapAOIntensity_g) + 1.0 : float3(1.0, 1.0, 1.0);
+    o0.rgb = saturate(dot(cortaoAmbientMul, float3(0.298999995, 0.587000012, 0.114))).xxx * 0.3;
+    o0.a = 1.0; o1.xyzw = uint4(0, 255 * saturate(0.1 * r16.w), 0, 0); o2.x = 0; o2.y = min(0xffff, (uint)(65.535 * r18.x));
+    if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+    return;
+  }
   r9.xyz = FalcomApplyContactToSun(
       r9.xyz * lightColor_g.xyz, csIsCharacter > 0.5,
       contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0),
