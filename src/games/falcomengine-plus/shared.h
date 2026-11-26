@@ -80,7 +80,7 @@ struct ShaderInjectData {
   // march (cs_contact_local_*). The first nine are reserved, and the last two are
   // cs_contact_local_bound and cs_contact_local_normal_bias. All eleven stay in place so
   // the packoffset of every later field is unchanged.
-  float cortao_ambient_only;            // 0/1: 1 whenever CORTAO fills t22 (M6g; was the M6c Ambient Only row); the lighting shaders apply the t22 AO to the ambient term only; was reserved_slot_02
+  float cortao_ambient_only;            // 0/1: 1 when CORTAO fills t22 and Whole-Colour AO is Off (M6g/M11); the lighting shaders then apply the t22 AO to the ambient term only, else the game applies it to the whole lit colour; was reserved_slot_02
   float cortao_specular_occlusion;     // 0/1: CORTAO Specular Occlusion (M7): environment reflections scaled by the cone-cone factor; was reserved_slot_03
   float cortao_shadow_fill;            // 0/1: CORTAO Occlude Shadow Fill (M6e): the AO also scales the shadow-side fill (sceneShadowColor_g); was reserved_slot_04
   float cortao_ambient_strength;       // CORTAO Ambient AO Strength [0..2] (M8, stylistic): scales the M6c ambient AO weight; 1 = game; was reserved_slot_05
