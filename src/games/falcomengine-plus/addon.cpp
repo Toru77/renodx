@@ -4570,7 +4570,7 @@ renodx::utils::settings::Settings settings = {
         .section = "CORTAO",
         .tooltip = "Stylistic: reduces Specular Occlusion on very smooth, mirror-like materials. Occlusion fades in from roughness 0 up to this value. 0 = off (full CORTAO specular occlusion). Unlike Specular Occlusion Strength, rough materials are not affected.",
         .min = 0.f,
-        .max = 0.5f,
+        .max = 1.f,
         .format = "%.2f",
         .is_enabled = []() { return g_cortao_specular_occlusion > 0.5f; },
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
@@ -12264,7 +12264,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   shader_injection.cortao_ambient_strength = std::clamp(g_cortao_ambient_strength, 0.f, 2.f);
   shader_injection.cortao_shadow_fill_strength = std::clamp(g_cortao_shadow_fill_strength, 0.f, 2.f);
   shader_injection.cortao_specular_strength = std::clamp(g_cortao_specular_strength, 0.f, 2.f);
-  shader_injection.cortao_specular_smooth_fade = std::clamp(g_cortao_specular_smooth_fade, 0.f, 0.5f);
+  shader_injection.cortao_specular_smooth_fade = std::clamp(g_cortao_specular_smooth_fade, 0.f, 1.f);
   // The lighting shaders read char_gtvbao_* for whichever technique fills t22.
   shader_injection.char_gtvbao_mode = CortaoSelected() ? g_cortao_char_mode : g_gtvbao_char_mode;
   shader_injection.char_gtvbao_mask_strength = CortaoSelected() ? g_cortao_char_mask_strength : g_gtvbao_char_mask_strength;
