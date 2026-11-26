@@ -86,6 +86,7 @@ inline std::string SerializePtReport() {
   uint64_t retries = 0u, uv_over_cap = 0u, live_sources = 0u;
   uint64_t uv_refresh_queued = 0u, uv_refresh_done = 0u, uv_refresh_mismatch = 0u, uv_refresh_skipped = 0u;
   uint64_t unready_freed = 0u, meshes_with_uvs = 0u, meshes_total = 0u;
+  uint64_t copies_avoided = 0u, sliced_freed = 0u, dead_textures = 0u;
   {
     std::lock_guard lock(bvh::g_pool.mutex);
     atlas = bvh::g_pool.albedo_gpu;
@@ -102,6 +103,9 @@ inline std::string SerializePtReport() {
     uv_refresh_mismatch = stats.uv_refresh_mismatch;
     uv_refresh_skipped = stats.uv_refresh_skipped;
     unready_freed = stats.albedo_unready_freed;
+    copies_avoided = stats.albedo_copies_avoided;
+    sliced_freed = stats.albedo_sliced_copies_freed;
+    dead_textures = stats.albedo_dead_textures;
     meshes_with_uvs = stats.albedo_meshes_with_uvs;
     meshes_total = stats.albedo_meshes_total;
   }
@@ -114,6 +118,7 @@ inline std::string SerializePtReport() {
       << refused_type << "; retries " << retries << "; live " << live_sources << "/" << kAlbedoSourcesMax
       << "; uv over cap " << uv_over_cap << "; uv refresh " << uv_refresh_queued << "/" << uv_refresh_done << "/"
       << uv_refresh_mismatch << "/" << uv_refresh_skipped << "; unready freed " << unready_freed
+      << "; avoided " << copies_avoided << "; sliced freed " << sliced_freed << "; dead textures " << dead_textures
       << "; static meshes with UVs " << meshes_with_uvs << "/" << meshes_total << "\n";
   out << "gpu_lock_drops: " << p.gpu_lock_drops << "\n";
   out << "gpu_writes: " << p.gpu_writes << "\n";

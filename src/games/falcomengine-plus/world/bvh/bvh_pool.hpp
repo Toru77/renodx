@@ -854,6 +854,7 @@ struct PoolIndirectAlpha {
   bool vbs_known = false;
   uint64_t source = 0u;  // alpha source id of the keyless copy (CapturePoolAlphaSource), 0 = none
   bool atlas = false;
+  uint64_t albedo_texture = 0u;  // sliced texture mapped without a copy (albedo-only keyless capture)
 };
 
 struct PoolStagingSlot {
@@ -1181,6 +1182,9 @@ struct PoolStats {
   uint64_t albedo_live_sources = 0u;
   uint64_t albedo_textures_sliced = 0u;
   uint64_t albedo_unready_freed = 0u;   // albedo-only copies released for having no ready mesh for kAlbedoUnreadyFrames
+  uint64_t albedo_copies_avoided = 0u;  // albedo-only captures mapped to an already-sliced texture (no copy made)
+  uint64_t albedo_sliced_copies_freed = 0u;  // albedo-only copies freed once their texture was sliced
+  uint64_t albedo_dead_textures = 0u;   // sliced textures the game destroyed
   uint64_t albedo_meshes_with_uvs = 0u;  // gauges from the pool snapshot in SyncLiveAlbedo
   uint64_t albedo_meshes_total = 0u;
   uint64_t uv_refresh_queued = 0u;
@@ -1647,6 +1651,9 @@ struct PoolState {
   uint32_t albedo_copy_frame = 0u;
   uint32_t alpha_copies_frame_albedo = 0u;  // atlas-only source copies made in albedo_copy_frame
   uint32_t albedo_live_sources = 0u;        // live atlas-only source copies (kAlbedoSourcesMax)
+  std::unordered_set<uint64_t> albedo_sliced_textures;  // sliced texture handles published by SyncLiveAlbedo
+  std::unordered_map<uint64_t, uint64_t> albedo_key_texture;  // draw key -> sliced texture, mapped with no copy
+  std::unordered_set<uint64_t> albedo_dead_textures;  // sliced textures the game destroyed (quarantined next present)
   uint64_t albedo_source_bytes = 0u;        // their mip 0 bytes (kAlbedoSourceBytesMax)
   PoolAlphaGpuStats alpha_gpu;
   PoolAlbedoGpuStats albedo_gpu;
@@ -4202,9 +4209,10 @@ inline uint64_t PoolAlphaProxyBytes() {
 // is freed at the next present). mesh_key 0 is an indirect draw whose args are not read yet: no key is recorded, the
 // copy is held for kAlphaOrphanFrames presents, and its id is returned for AttachPoolAlphaSource at resolve. The keyed
 // path returns 0. With the material atlas on, static draws use the same copy for their albedo slice; `albedo` selects
-// the separate albedo counters.
+// the separate albedo counters. An albedo-only capture of a texture that already has a slice makes no copy: a keyed
+// draw maps the key directly, a keyless draw returns the texture through `albedo_texture`.
 inline uint64_t CapturePoolAlphaSource(reshade::api::device* device, reshade::api::command_list* cmd_list, uint64_t mesh_key,
-                                       uint64_t view, bool immediate, bool albedo = false) {
+                                       uint64_t view, bool immediate, bool albedo = false, uint64_t* albedo_texture = nullptr) {
   const bool keyless = mesh_key == 0u;
   // Atlas-only refusals are retried; alpha refusals stay permanent (alpha_source_done).
   const auto stamp_retry = [&](uint64_t key) {
@@ -4280,6 +4288,15 @@ inline uint64_t CapturePoolAlphaSource(reshade::api::device* device, reshade::ap
   uint64_t source_id = 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
+    if (albedo && g_pool.albedo_sliced_textures.count(texture.handle) != 0u) {
+      g_pool.stats.albedo_copies_avoided += 1u;
+      if (keyless) {
+        if (albedo_texture != nullptr) *albedo_texture = texture.handle;
+      } else {
+        g_pool.albedo_key_texture[mesh_key] = texture.handle;
+      }
+      return 0u;
+    }
     const auto link = g_pool.alpha_source_by_texture.find(texture.handle);
     if (link != g_pool.alpha_source_by_texture.end()) {  // the texture has its copy: this key shares it
       const auto shared_it = g_pool.alpha_sources.find(link->second);
@@ -4931,7 +4948,7 @@ inline void OnPoolScanIndirectDraw(
       copy.alpha = alpha_material;
       if (gate.alpha_material || atlas_draw) {
         copy.alpha_index = static_cast<uint32_t>(slot.indirect_alpha.size());
-        slot.indirect_alpha.push_back({uv, vbs, vbs_known, 0u, /*atlas*/ atlas_only});
+        slot.indirect_alpha.push_back({uv, vbs, vbs_known, 0u, /*atlas*/ atlas_only, 0u});
         alpha_refs[alpha_ref_count++] = {g_pool.write_slot, copy.alpha_index};
         if (atlas_draw) any_atlas_ref = true;
         if (gate.alpha_material) any_alpha_ref = true;
@@ -4985,6 +5002,7 @@ inline void OnPoolScanIndirectDraw(
     // The same view guard as the direct path: the bound view must be the t0 resource.
     const reshade::api::resource source = device->get_resource_from_view({alpha_material.view});
     uint64_t source_id = 0u;
+    uint64_t albedo_texture = 0u;
     if (source.handle != cl_data->ps_srv[contract::kAlphaTexSlot].handle) {
       std::lock_guard<std::mutex> lock(g_pool.mutex);
       g_pool.stats.alpha_source_refused += 1u;
@@ -4995,13 +5013,19 @@ inline void OnPoolScanIndirectDraw(
         if (!any_alpha_ref) g_pool.stats.albedo_refused_type += 1u;
       }
     } else {
-      source_id = CapturePoolAlphaSource(device, cmd_list, 0u, alpha_material.view, !deferred, any_atlas_ref && !any_alpha_ref);
+      source_id = CapturePoolAlphaSource(device, cmd_list, 0u, alpha_material.view, !deferred, any_atlas_ref && !any_alpha_ref,
+                                         &albedo_texture);
     }
-    if (source_id != 0u) {
+    if (source_id != 0u || albedo_texture != 0u) {
       std::lock_guard<std::mutex> lock(g_pool.mutex);
       for (uint32_t i = 0u; i < alpha_ref_count; ++i) {
         PoolStagingSlot& alpha_slot = g_pool.slots[alpha_refs[i].first];
-        if (alpha_refs[i].second < alpha_slot.indirect_alpha.size()) alpha_slot.indirect_alpha[alpha_refs[i].second].source = source_id;
+        if (alpha_refs[i].second >= alpha_slot.indirect_alpha.size()) continue;
+        if (albedo_texture != 0u) {
+          alpha_slot.indirect_alpha[alpha_refs[i].second].albedo_texture = albedo_texture;
+        } else {
+          alpha_slot.indirect_alpha[alpha_refs[i].second].source = source_id;
+        }
       }
     }
   }
@@ -5157,6 +5181,10 @@ inline void OnDestroyResourcePool(reshade::api::device* device, reshade::api::re
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     if (!g_pool.indirect_refs.empty() && g_pool.indirect_refs.count(resource.handle) != 0u) {
       g_pool.indirect_dead.insert(resource.handle);
+    }
+    if (g_pool.albedo_sliced_textures.count(resource.handle) != 0u) {
+      g_pool.albedo_dead_textures.insert(resource.handle);
+      g_pool.stats.albedo_dead_textures += 1u;
     }
     if (!g_pool.alpha_sources.empty()) {  // the destroyed texture's copy is no longer linked to it
       const auto link = g_pool.alpha_source_by_texture.find(resource.handle);
@@ -6406,6 +6434,9 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
             && ((AlphaMode() & 2u) != 0u || atlas_only)) {
           AttachPoolAlphaSource(mesh_key, alpha_side->source);
         }
+        if (alpha_side != nullptr && alpha_side->albedo_texture != 0u) {
+          g_pool.albedo_key_texture[mesh_key] = alpha_side->albedo_texture;
+        }
         if (atlas_only && mesh_key != 0u && copy.alpha.view != 0u) {
           const auto mesh_it = g_pool.mesh_by_key.find(mesh_key);
           const bool mesh_ready = mesh_it != g_pool.mesh_by_key.end()
@@ -6885,6 +6916,9 @@ inline void ResetWorldPool() {
   DrainPoolAlphaSources();
   g_pool.albedo_retry_at.clear();
   g_pool.albedo_material_keys.clear();
+  g_pool.albedo_sliced_textures.clear();
+  g_pool.albedo_key_texture.clear();
+  g_pool.albedo_dead_textures.clear();
   g_pool.alpha_off_applied = false;
   g_pool.prev_trace = {};
   g_pool.logged_invalidations = 0u;
@@ -8020,6 +8054,9 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"albedo_live_sources\": " << stats.albedo_live_sources
       << ", \"albedo_textures_sliced\": " << stats.albedo_textures_sliced
       << ", \"albedo_unready_freed\": " << stats.albedo_unready_freed
+      << ", \"albedo_copies_avoided\": " << stats.albedo_copies_avoided
+      << ", \"albedo_sliced_copies_freed\": " << stats.albedo_sliced_copies_freed
+      << ", \"albedo_dead_textures\": " << stats.albedo_dead_textures
       << ", \"albedo_meshes_with_uvs\": " << stats.albedo_meshes_with_uvs
       << ", \"albedo_meshes_total\": " << stats.albedo_meshes_total
       << ", \"uv_refresh_queued\": " << stats.uv_refresh_queued

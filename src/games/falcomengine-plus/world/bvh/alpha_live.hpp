@@ -208,6 +208,7 @@ inline void SyncLiveAlbedo(reshade::api::device* device, reshade::api::command_l
 
   std::vector<AlbedoSourceJob> sources;
   std::unordered_set<uint64_t> ready_keys;    // draw keys whose mesh is ready for the atlas
+  std::unordered_set<uint64_t> ready_uids;     // static meshes with UVs, not dynamic and not alpha-tested
   std::unordered_set<uint64_t> dead_textures;  // destroyed textures whose slice must be released
   std::vector<reshade::api::resource> stale;   // albedo-only proxies freed once their slice is filled
   const auto free_albedo_only_source = [&](uint64_t source_id, const PoolAlphaSource& source) {
@@ -218,7 +219,8 @@ inline void SyncLiveAlbedo(reshade::api::device* device, reshade::api::command_l
   };
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    std::unordered_set<uint64_t> ready_uids;  // static meshes with UVs, not dynamic and not alpha-tested
+    for (uint64_t texture : g_pool.albedo_dead_textures) dead_textures.insert(texture);
+    g_pool.albedo_dead_textures.clear();
     g_pool.stats.albedo_meshes_with_uvs = 0u;
     g_pool.stats.albedo_meshes_total = 0u;
     for (const WorldMesh& mesh : g_pool.meshes) {
@@ -290,6 +292,18 @@ inline void SyncLiveAlbedo(reshade::api::device* device, reshade::api::command_l
       g_pool.stats.albedo_unready_freed += 1u;
       free_albedo_only_source(it->first, source);
       it = g_pool.alpha_sources.erase(it);
+    }
+    g_pool.albedo_sliced_textures.clear();
+    for (const auto& entry : albedo.slice_of_texture) {
+      if (dead_textures.count(entry.first) != 0u) continue;
+      g_pool.albedo_sliced_textures.insert(entry.first);
+    }
+    for (auto it = g_pool.albedo_key_texture.begin(); it != g_pool.albedo_key_texture.end();) {
+      if (dead_textures.count(it->second) != 0u) {
+        it = g_pool.albedo_key_texture.erase(it);
+      } else {
+        ++it;
+      }
     }
     PoolAlbedoGpuStats& gpu = g_pool.albedo_gpu;
     gpu.sources = static_cast<uint32_t>(albedo.slice_of_texture.size());
@@ -373,6 +387,47 @@ inline void SyncLiveAlbedo(reshade::api::device* device, reshade::api::command_l
     it = albedo.material_of_key.erase(it);
     mappings_changed = true;
   }
+  std::vector<uint32_t> mirrored_materials;
+  {
+    // Keys mapped without a copy (their texture already has a slice) join the same material table and mirror.
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    for (auto it = g_pool.albedo_key_texture.begin(); it != g_pool.albedo_key_texture.end();) {
+      const auto mesh_it = g_pool.mesh_by_key.find(it->first);
+      if (mesh_it == g_pool.mesh_by_key.end() || mesh_it->second >= g_pool.meshes.size()) {
+        it = g_pool.albedo_key_texture.erase(it);
+        continue;
+      }
+      const WorldMesh& mesh = g_pool.meshes[mesh_it->second];
+      if (ready_uids.count(mesh.uid) == 0u || data->slot_by_uid.count(mesh.uid) == 0u) {
+        ++it;
+        continue;
+      }
+      if (albedo.material_of_key.count(it->first) != 0u) {
+        it = g_pool.albedo_key_texture.erase(it);
+        continue;
+      }
+      const auto slice_it = albedo.slice_of_texture.find(it->second);
+      if (slice_it == albedo.slice_of_texture.end()) {
+        ++it;
+        continue;
+      }
+      const int32_t index = albedo.material_table.FindOrInsert(slice_it->second, mesh.alpha_state.material.scroll,
+                                                               mesh.alpha_state.material.swizzle);
+      if (index < 0) {
+        albedo.cap_refused_materials += 1u;
+        ++it;
+        continue;
+      }
+      albedo.material_of_key[it->first] = static_cast<uint32_t>(index);
+      albedo.texture_of_key[it->first] = it->second;
+      mirrored_materials.push_back(static_cast<uint32_t>(index));
+      mappings_changed = true;
+      it = g_pool.albedo_key_texture.erase(it);
+    }
+  }
+  for (const uint32_t index : mirrored_materials) {
+    rt12::MirrorAlbedoMaterial(index, albedo.material_table.entries[index].gpu);
+  }
   for (uint64_t texture : dead_textures) {
     const auto slice_it = albedo.slice_of_texture.find(texture);
     if (slice_it == albedo.slice_of_texture.end()) continue;
@@ -420,6 +475,20 @@ inline void SyncLiveAlbedo(reshade::api::device* device, reshade::api::command_l
     g_pool.stats.albedo_textures_sliced = static_cast<uint64_t>(albedo.slice_of_texture.size());
   }
   if (mappings_changed) data->store_version += 1u;
+  {
+    // A copy made for a texture that already has a slice never blits; its slot is free once its keys are mapped.
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    for (const AlbedoSourceJob& job : sources) {
+      if (job.blit || albedo.slice_of_texture.count(job.texture) == 0u) continue;
+      const auto source_it = g_pool.alpha_sources.find(job.source);
+      if (source_it == g_pool.alpha_sources.end() || !source_it->second.albedo_only) continue;
+      free_albedo_only_source(job.source, source_it->second);
+      g_pool.stats.albedo_sliced_copies_freed += 1u;
+      g_pool.alpha_sources.erase(source_it);
+    }
+  }
+  for (const reshade::api::resource proxy : stale) device->destroy_resource(proxy);
+  stale.clear();
   if (pending == 0u) return;
 
   using RU = reshade::api::resource_usage;
@@ -492,17 +561,6 @@ inline void SyncLiveAlbedo(reshade::api::device* device, reshade::api::command_l
       }
     }
     blits += 1u;
-  }
-  {
-    // A copy made for a texture that already has a slice never blits; its slot is free once its keys are mapped.
-    std::lock_guard<std::mutex> lock(g_pool.mutex);
-    for (const AlbedoSourceJob& job : sources) {
-      if (job.blit || albedo.slice_of_texture.count(job.texture) == 0u) continue;
-      const auto source_it = g_pool.alpha_sources.find(job.source);
-      if (source_it == g_pool.alpha_sources.end() || !source_it->second.albedo_only) continue;
-      free_albedo_only_source(job.source, source_it->second);
-      g_pool.alpha_sources.erase(source_it);
-    }
   }
   EndGpuTimer(cmd_list, &albedo.timer);
   if (mappings_changed) data->store_version += 1u;
