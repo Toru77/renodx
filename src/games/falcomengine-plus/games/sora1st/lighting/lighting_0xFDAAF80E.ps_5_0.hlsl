@@ -218,6 +218,7 @@ Texture2D<float4> csLocalContactTex : register(t40);
 
 #include "../../../shared.h"
 #include "../../../customshaders/shadows/shadows_common.hlsli"
+#include "../../../customshaders/cortao/cortao_specular_occlusion.hlsli"
 #include "../../../customshaders/dyncube/dyncube_sample.hlsli"
 #include "../../../customshaders/dyncube/dyncube_resolve.hlsli"
 #include "../../../reference/brdf.hlsli"
@@ -327,7 +328,7 @@ void main(
       o0.rgb = aoTarget * hdr_scale;
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
-    if (mode == 41 && (cortaoMrtFlags & 8u) == 0u) {
+    if ((mode == 41 || mode == 42) && (cortaoMrtFlags & 8u) == 0u) {
       // CORTAO Ambient AO (M6f): characters never reach the environment ambient add; shown black.
       o0.rgb = float3(0.0, 0.0, 0.0);
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
@@ -816,6 +817,10 @@ void main(
    float dynCubeVanillaMipFactor = 0.0;
    bool dynCubeReflActive = false;
    int dynCubeReflSrc = 1;
+  // CORTAO Specular Occlusion (M7): cone-cone factor for raw cubemap samples before SSR/resolve/PT.
+  const bool cortaoSpecOcc = cortaoAmbientOnly && shader_injection_data.cortao_specular_occlusion > 0.5f && (cortaoMrtFlags & 0x8000u) == 0u;
+  const float3 cortaoSoAxis = (cortaoSpecOcc && shader_injection_data.cortao_bent_bound > 0.5f) ? FalcomCortaoBentWorld(cortaoBentTexture, v1.xy, (float3x3)viewInv_g, r6.xyw) : r6.xyw;
+  float cortaoSoFactor = 1.0;
   if (r16.z != 0) {
     r16.xz = r13.yz * r7.yz;
     r7.y = (int)r1.w & 32;
@@ -836,6 +841,11 @@ void main(
            r18.xyz, r16.z,
            dynCubeSampleColA, dynCubeSampleFinalA,
            dynCubeNumLevelsA, dynCubeUnusedMipA);
+      if (cortaoSpecOcc) {
+        // CORTAO Specular Occlusion (M7): factor the raw cubemap sample before the SSR blend.
+        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r4.x, cortaoSoAxis, FalcomSafeNormalize3(r18.xyz, cortaoSoAxis), saturate(r13.z));
+        dynCubeSampleColA *= cortaoSoFactor;
+      }
       r17.xyz = dynCubeSampleColA;
       num_levels = dynCubeNumLevelsA;
       // Record the final sampled direction (including lookup flip and any spatial
@@ -938,6 +948,11 @@ void main(
            r17.xyz, r1.w,
            dynCubeSampleColB, dynCubeSampleFinalB,
            dynCubeNumLevelsB, dynCubeSampleMipB);
+      if (cortaoSpecOcc) {
+        // CORTAO Specular Occlusion (M7): factor the raw cubemap sample before SSR/resolve.
+        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r4.x, cortaoSoAxis, FalcomSafeNormalize3(r17.xyz, cortaoSoAxis), saturate(r13.z));
+        dynCubeSampleColB *= cortaoSoFactor;
+      }
       r17.xyz = dynCubeSampleColB;
       r1.w = dynCubeSampleMipB;
       num_levels = dynCubeNumLevelsB;
@@ -1143,6 +1158,11 @@ void main(
   // CORTAO Ambient Only (M6c): the game's AO formula on the ambient term (r11) instead of the final colour.
   const float3 cortaoAmbientIn = r11.xyz;
   if (cortaoAmbientOnly) r11.xyz = (r11.xyz * mapAOColor_g.xyz - r11.xyz) * ((1.0 - r4.x) * r4.w * mapAOIntensity_g) + r11.xyz;
+  if ((int)shader_injection_data.gtvbao_debug_view == 42) {
+    // CORTAO Specular Occlusion (M7): the factor applied to the raw cubemap sample, grey like Final AO.
+    o0.rgb = saturate(cortaoSoFactor).xxx * 0.3;
+    o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+  }
   if ((int)shader_injection_data.gtvbao_debug_view == 41) {
     // CORTAO Ambient AO (M6f): the multiplier M6c applies to the probe ambient r11, (tint - 1) * k + 1 with the game's
     // AO strength and tint, shown as luminance like Final AO. Neutral where Ambient Only does not apply.

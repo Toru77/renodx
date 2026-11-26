@@ -247,6 +247,7 @@ Texture2D<float4> csLocalContactTex : register(t40);
 
 #include "../../../shared.h"
 #include "../../../customshaders/shadows/shadows_common.hlsli"
+#include "../../../customshaders/cortao/cortao_specular_occlusion.hlsli"
 #include "../../../reference/rendering.hlsl"
 #include "../../../reference/brdf.hlsli"
 #include "../../../customshaders/dyncube/dyncube_sample.hlsli"
@@ -481,7 +482,7 @@ void main(
   const bool run_GTVBAO_debug = !GTVBAO_force_neutral_x
       && GTVBAO_debug_mode_ui > 0u
       && (GTVBAO_bound || GTVBAO_debug_mode_ui >= 10u || GTVBAO_debug_blackout)
-      && (GTVBAO_debug_mode_ui != 41u || is_character_pixel);  // CORTAO Ambient AO (M6f): environment pixels continue to the ambient add
+      && ((GTVBAO_debug_mode_ui != 41u && GTVBAO_debug_mode_ui != 42u) || is_character_pixel);  // CORTAO M7: Specular Occlusion pixels also continue to the ambient add
   if (run_GTVBAO_debug) {
     if (GTVBAO_debug_blackout && GTVBAO_debug_mode_ui <= 9u) {
       o0 = float4(0.0, 0.0, 0.0, 1.0);
@@ -1604,6 +1605,10 @@ void main(
    float dynCubeVanillaMipFactor = 0.0;
    bool dynCubeReflActive = false;
    int dynCubeReflSrc = 1;
+  // CORTAO Specular Occlusion (M7): cone-cone factor for raw cubemap samples before SSR/resolve/PT.
+  const bool cortaoSpecOcc = cortaoAmbientOnly && shader_injection_data.cortao_specular_occlusion > 0.5f && !is_foliage_pixel;
+  const float3 cortaoSoAxis = (cortaoSpecOcc && shader_injection_data.cortao_bent_bound > 0.5f) ? FalcomCortaoBentWorld(cortaoBentTexture, v1.xy, (float3x3)viewInv_g, r5.xyw) : r5.xyw;
+  float cortaoSoFactor = 1.0;
   if (r19.z != 0) {
     r16.xy = r13.yz * r4.yz;
     r4.y = (int)r1.x & 32;
@@ -1642,12 +1647,22 @@ void main(
           SmplCube_s,
           r21.xyz,
           r7.w).xyz;
+      // CORTAO Specular Occlusion (M7): factor the raw cubemap sample on the vanilla path before SSR.
+      if (cortaoSpecOcc) {
+        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r4.x, cortaoSoAxis, exp_probe_dir_ws, saturate(r13.z));
+        r20.xyz *= cortaoSoFactor;
+      }
       } else {
          DynCubeSampleDynamic(
              texEnvMap_g, SmplCube_s,
              exp_probe_dir_ws, kaiRoughBoostA,
              kaiSampleColA, kaiSampleFinalA,
              kaiNumLevelsA, kaiUnusedMipA);
+        // CORTAO Specular Occlusion (M7): factor the raw dynamic-cubemap sample before resolve/PT.
+        if (cortaoSpecOcc) {
+          cortaoSoFactor = FalcomCortaoSpecularOcclusion(r4.x, cortaoSoAxis, exp_probe_dir_ws, saturate(r13.z));
+          kaiSampleColA *= cortaoSoFactor;
+        }
         r20.xyz = kaiSampleColA;
         // Record the final sampled direction so validity and vanilla fallback test
         // the texel actually displayed, not its antipode.
@@ -1715,7 +1730,13 @@ void main(
       r6.x = (int)r6.x + -1;
       r6.x = (uint)r6.x;
       r4.y = r6.x * r4.y;
+      const float3 cortaoSoReflB = float3(1,-1,-1) * r16.xyz;
       r16.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r16.xyz, r4.y).xyz;
+      if (cortaoSpecOcc) {
+        // CORTAO Specular Occlusion (M7): factor the raw cubemap sample before SSR/resolve.
+        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r4.x, cortaoSoAxis, FalcomSafeNormalize3(cortaoSoReflB, cortaoSoAxis), saturate(r13.z));
+        r16.xyz *= cortaoSoFactor;
+      }
       r18.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r18.xyz, r4.y).xyz;
       r4.y = cmp(0 < r14.x);
       r6.x = 1 + -abs(r7.z);
@@ -1831,6 +1852,11 @@ void main(
   if (cortaoAmbientOnly) {
     const float3 cortaoAoTint = r15.www * (min(float3(1, 1, 1), r15.xyz) - mapAOColor_g.xyz) + mapAOColor_g.xyz;
     r12.xyz = (1.0 - r4.x) * (r12.xyz * cortaoAoTint - r12.xyz) + r12.xyz;
+  }
+  if (GTVBAO_debug_mode_ui == 42u) {
+    // CORTAO Specular Occlusion (M7): the factor applied to the raw cubemap sample, grey like Final AO.
+    o0.rgb = saturate(cortaoSoFactor).xxx;
+    o0.a = 1.0; o1.xyzw = r1.xyzw; return;
   }
   if (GTVBAO_debug_mode_ui == 41u) {
     // CORTAO Ambient AO (M6f): the multiplier M6c applies to the ambient r12, (tint - 1) * (1 - ao) + 1 with the Kai

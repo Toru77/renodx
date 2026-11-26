@@ -211,6 +211,7 @@ Texture2D<float4> ptReflTexture : register(t48);
 #define RTXDI_DEBUG_BRIGHTNESS (shader_injection_data.rtxdi_debug_brightness)
 #include "../../../world/shaders/world_rtxdi_debug.hlsli"
 #include "../../../customshaders/shadows/shadows_common.hlsli"
+#include "../../../customshaders/cortao/cortao_specular_occlusion.hlsli"
 #include "../../../customshaders/dyncube/dyncube_sample.hlsli"
 #include "../../../customshaders/dyncube/dyncube_resolve.hlsli"
 #include "../../../reference/brdf.hlsli"
@@ -473,7 +474,7 @@ if (shader_injection_data.pt_gi_bound > 0.5f) {
       if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
       return;
     }
-    if (mode == 41 && (cortaoMrtFlags & 8u) == 0u) {
+    if ((mode == 41 || mode == 42) && (cortaoMrtFlags & 8u) == 0u) {
       // CORTAO Ambient AO (M6f): characters never reach the environment ambient add; shown black.
       o0.rgb = float3(0.0, 0.0, 0.0);
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy;
@@ -1066,6 +1067,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
    float dynCubeVanillaMipFactor = 0.0;
    bool dynCubeReflActive = false;
    int dynCubeReflSrc = 1;
+  // CORTAO Specular Occlusion (M7): cone-cone factor for raw cubemap samples before SSR/resolve/PT.
+  const bool cortaoSpecOcc = cortaoAmbientOnly && shader_injection_data.cortao_specular_occlusion > 0.5f && (cortaoMrtFlags & 0x8000u) == 0u;
+  const float3 cortaoSoAxis = (cortaoSpecOcc && shader_injection_data.cortao_bent_bound > 0.5f) ? FalcomCortaoBentWorld(cortaoBentTexture, v1.xy, (float3x3)viewInv_g, r8.xyw) : r8.xyw;
+  float cortaoSoFactor = 1.0;
   if (r20.z != 0) {
     r5.yz = r15.yz * r9.yz;
     dynCubeVanillaMipFactor = r5.z;
@@ -1086,6 +1091,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
            r22.xyz, r5.z,
            dynCubeSampleColA, dynCubeSampleFinalA,
            dynCubeNumLevelsA, dynCubeUnusedMipA);
+      if (cortaoSpecOcc) {
+        // CORTAO Specular Occlusion (M7): factor the raw cubemap sample before the SSR blend.
+        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r5.x, cortaoSoAxis, FalcomSafeNormalize3(r22.xyz, cortaoSoAxis), saturate(r15.z));
+        dynCubeSampleColA *= cortaoSoFactor;
+      }
       r21.xyz = dynCubeSampleColA;
       num_levels = dynCubeNumLevelsA;
       // Record the final sampled direction (including lookup flip and any spatial
@@ -1182,6 +1192,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
            r21.xyz, r2.x,
            dynCubeSampleColB, dynCubeSampleFinalB,
            dynCubeNumLevelsB, dynCubeSampleMipB);
+      if (cortaoSpecOcc) {
+        // CORTAO Specular Occlusion (M7): factor the raw cubemap sample before SSR/resolve.
+        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r5.x, cortaoSoAxis, FalcomSafeNormalize3(r21.xyz, cortaoSoAxis), saturate(r15.z));
+        dynCubeSampleColB *= cortaoSoFactor;
+      }
       r21.xyz = dynCubeSampleColB;
       r2.x = dynCubeSampleMipB;
       num_levels = dynCubeNumLevelsB;
@@ -1397,6 +1412,13 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   // CORTAO Ambient Only (M6c): the game's AO formula on the ambient term (r13) instead of the final colour.
   const float3 cortaoAmbientIn = r13.xyz;
   if (cortaoAmbientOnly) r13.xyz = (r13.xyz * mapAOColor_g.xyz - r13.xyz) * ((1.0 - r5.x) * r17.z * mapAOIntensity_g) + r13.xyz;
+  if ((int)shader_injection_data.gtvbao_debug_view == 42) {
+    // CORTAO Specular Occlusion (M7): the factor applied to the raw cubemap sample, grey like Final AO.
+    o0.rgb = saturate(cortaoSoFactor).xxx * 0.3;
+    o0.a = 1.0; o1.xyzw = uint4(0, 255 * saturate(0.1 * r16.w), 0, 0); o2.x = 0; o2.y = min(0xffff, (uint)(65.535 * r18.x));
+    if (shader_injection_data.rtxdi_debug_view > 0.5f) o0.rgb = RtxdiDebugPixel((uint2)v0.xy, rtxdi_debug_consumer);
+    return;
+  }
   if ((int)shader_injection_data.gtvbao_debug_view == 41) {
     // CORTAO Ambient AO (M6f): the multiplier M6c applies to the probe ambient r13, (tint - 1) * k + 1 with the game's
     // AO strength and tint, shown as luminance like Final AO. Neutral where Ambient Only does not apply (incl. PT GI).
