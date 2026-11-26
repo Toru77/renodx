@@ -486,7 +486,7 @@ void main(
   const bool run_GTVBAO_debug = !GTVBAO_force_neutral_x
       && GTVBAO_debug_mode_ui > 0u
       && (GTVBAO_bound || GTVBAO_debug_mode_ui >= 10u || GTVBAO_debug_blackout)
-      && ((GTVBAO_debug_mode_ui != 41u && GTVBAO_debug_mode_ui != 42u && GTVBAO_debug_mode_ui != 43u) || is_character_pixel);  // CORTAO M7/M8: Specular Occlusion and Shadow Fill AO pixels also continue to the ambient add
+      && ((GTVBAO_debug_mode_ui != 41u && GTVBAO_debug_mode_ui != 42u && GTVBAO_debug_mode_ui != 43u && GTVBAO_debug_mode_ui != 44u) || is_character_pixel);  // CORTAO M7/M8: Specular Occlusion and Shadow Fill AO pixels also continue to the ambient add
   if (run_GTVBAO_debug) {
     if (GTVBAO_debug_blackout && GTVBAO_debug_mode_ui <= 9u) {
       o0 = float4(0.0, 0.0, 0.0, 1.0);
@@ -497,7 +497,7 @@ void main(
     // question is whether a given pixel has a G-buffer normal at all, and
     // characters are forward-shaded so they typically never get one. Blacking
     // them out here would hide exactly the case worth inspecting.
-    if (is_character_pixel && GTVBAO_debug_mode_ui == 41u) {
+    if (is_character_pixel && (GTVBAO_debug_mode_ui == 41u || GTVBAO_debug_mode_ui == 44u)) {
       // CORTAO Ambient AO (M9): characters show the character AO value with the Ambient AO Strength (before Char Mask).
       o0 = float4(saturate(cortaoCharAo).xxx, 1.0);
       o1 = r1;
@@ -1873,6 +1873,16 @@ void main(
   if (cortaoAmbientOnly) {
     const float3 cortaoAoTint = r15.www * (min(float3(1, 1, 1), r15.xyz) - mapAOColor_g.xyz) + mapAOColor_g.xyz;
     r12.xyz = cortaoAmbientK * (r12.xyz * cortaoAoTint - r12.xyz) + r12.xyz;
+  }
+  if (GTVBAO_debug_mode_ui == 44u) {
+    // CORTAO Combined AO: strongest darkening from ambient, shadow fill and specular occlusion, grey like Final AO.
+    const float3 cortaoCombinedTint = r15.www * (min(float3(1, 1, 1), r15.xyz) - mapAOColor_g.xyz) + mapAOColor_g.xyz;
+    const float3 cortaoCombinedAmb = cortaoAmbientOnly ? (cortaoCombinedTint - 1.0) * cortaoAmbientK + 1.0 : float3(1.0, 1.0, 1.0);
+    const float3 cortaoCombinedFill = (cortaoAmbientOnly && shader_injection_data.cortao_shadow_fill > 0.5f)
+        ? (cortaoCombinedTint - 1.0) * cortaoFillK + 1.0 : float3(1.0, 1.0, 1.0);
+    const float cortaoCombinedL = min(saturate(dot(cortaoCombinedAmb, float3(0.298999995, 0.587000012, 0.114))), saturate(dot(cortaoCombinedFill, float3(0.298999995, 0.587000012, 0.114))));
+    o0.rgb = saturate(min(cortaoCombinedL, cortaoSoFactor)).xxx;
+    o0.a = 1.0; o1.xyzw = r1.xyzw; return;
   }
   if (GTVBAO_debug_mode_ui == 43u) {
     // CORTAO Shadow Fill AO (M8): the multiplier applied to the shadow-side fill, grey like Final AO. Neutral when

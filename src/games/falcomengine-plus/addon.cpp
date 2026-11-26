@@ -555,7 +555,7 @@ constexpr std::array<std::span<const uint8_t>, 7> kCortaoMainBentShaders = {
     __cortao_main_bent_s16, __cortao_main_bent_s24, __cortao_main_bent_s32};
 constexpr int kCortaoSampleCounts[7] = {4, 6, 8, 12, 16, 24, 32};  // CORTAO_SAMPLE_COUNT per Quality index (README quality names)
 constexpr std::array<std::span<const uint8_t>, 2> kCortaoFilterBentShaders = {__cortao_filter_bent_small, __cortao_filter_bent_large};
-constexpr int kCortaoDebugModes[12] = {0, 1, 22, 26, 28, 24, 25, 23, 40, 41, 42, 43};  // Off, Final AO Value, Raw AO, Input Normal, Bent Normal, Filtered AO, Filtered Bent Normal, Temporal Confidence, AO Target, Ambient AO, Specular Occlusion, Shadow Fill AO (M8)
+constexpr int kCortaoDebugModes[13] = {0, 1, 22, 26, 28, 24, 25, 23, 40, 41, 42, 43, 44};  // Off, Final AO Value, Raw AO, Input Normal, Bent Normal, Filtered AO, Filtered Bent Normal, Temporal Confidence, AO Target, Ambient AO, Specular Occlusion, Shadow Fill AO, Combined AO
 
 // DynCube loading wipe: color captures older than this mean no lighting draws
 // (loading screen) � arm history hard-replace so the next scene rebuilds clean.
@@ -1070,7 +1070,7 @@ static int VbgiGtvbaoDebugMode() {
 // AO-only: the VBGI row replaces the AO debug view, never mixes with it.
 static int GtvbaoDebugMode() {
   if (VbgiGtvbaoDebugMode() != 0) return 0;
-  if (CortaoSelected()) return kCortaoDebugModes[std::clamp((int)g_cortao_debug_view, 0, 11)];
+  if (CortaoSelected()) return kCortaoDebugModes[std::clamp((int)g_cortao_debug_view, 0, 12)];
   return kGtvbaoDebugModes[std::clamp((int)g_gtvbao_debug_ui, 0, 6)];
 }
 // What the lighting shaders show: VBGI wins when its row is set.
@@ -4899,8 +4899,8 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Debug View",
         .section = "CORTAO",
-        .tooltip = "Final AO Value: the AO value the game receives (after the CORTAO filter, temporal accumulation and upsample, with AO Intensity). Raw AO: the main pass before filtering. Input Normal: the normal CORTAO used. Bent Normal: the main-pass bent normal (needs Bent Normals). Filtered AO: after the CORTAO filter, before temporal (equals Raw AO with Filter Off). Filtered Bent Normal: the bent normal Bent Normal Ambient reads (needs Bent Normals). Temporal Confidence: history age, black (new) to white (full); purple when temporal is not running. AO Target: where the AO is applied: green = ambient light (CORTAO), blue = characters, red = path-traced GI pixels. Ambient AO: the AO applied to the light-probe ambient (with Ambient AO Strength), grey on a neutral background. Specular Occlusion: the factor applied to cubemap reflections (with Specular Occlusion Strength); white = not occluded or not applied. Shadow Fill AO: the AO applied to the shadow-side fill (with Shadow Fill AO Strength); neutral when Occlude Shadow Fill is off. Characters: Ambient AO shows the character AO value with Ambient AO Strength (before Char Mask); Specular Occlusion and Shadow Fill AO show them black. With Whole-Colour AO On: AO Target shows the environment grey (whole lit colour); Ambient AO, Specular Occlusion and Shadow Fill AO are neutral (nothing applied there). Purple = sky or not available.",
-        .labels = {"Off", "Final AO Value", "Raw AO", "Input Normal", "Bent Normal", "Filtered AO", "Filtered Bent Normal", "Temporal Confidence", "AO Target", "Ambient AO", "Specular Occlusion", "Shadow Fill AO"},
+        .tooltip = "Final AO Value: the AO value the game receives (after the CORTAO filter, temporal accumulation and upsample, with AO Intensity). Raw AO: the main pass before filtering. Input Normal: the normal CORTAO used. Bent Normal: the main-pass bent normal (needs Bent Normals). Filtered AO: after the CORTAO filter, before temporal (equals Raw AO with Filter Off). Filtered Bent Normal: the bent normal Bent Normal Ambient reads (needs Bent Normals). Temporal Confidence: history age, black (new) to white (full); purple when temporal is not running. AO Target: where the AO is applied: green = ambient light (CORTAO), blue = characters, red = path-traced GI pixels. Ambient AO: the AO applied to the light-probe ambient (with Ambient AO Strength), grey on a neutral background. Specular Occlusion: the factor applied to cubemap reflections (with Specular Occlusion Strength); white = not occluded or not applied. Shadow Fill AO: the AO applied to the shadow-side fill (with Shadow Fill AO Strength); neutral when Occlude Shadow Fill is off. Characters: Ambient AO shows the character AO value with Ambient AO Strength (before Char Mask); Specular Occlusion and Shadow Fill AO show them black. With Whole-Colour AO On: AO Target shows the environment grey (whole lit colour); Ambient AO, Specular Occlusion and Shadow Fill AO are neutral (nothing applied there). Combined AO: the strongest darkening applied to ambient, shadow fill and cubemap reflections at once, grey like Final AO; neutral when Whole-Colour AO is On. Purple = sky or not available.",
+        .labels = {"Off", "Final AO Value", "Raw AO", "Input Normal", "Bent Normal", "Filtered AO", "Filtered Bent Normal", "Temporal Confidence", "AO Target", "Ambient AO", "Specular Occlusion", "Shadow Fill AO", "Combined AO"},
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{

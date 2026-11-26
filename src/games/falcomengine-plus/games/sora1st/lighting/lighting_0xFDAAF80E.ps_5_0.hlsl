@@ -333,10 +333,10 @@ void main(
       o0.rgb = aoTarget * hdr_scale;
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
-    if ((mode == 41 || mode == 42 || mode == 43) && (cortaoMrtFlags & 8u) == 0u) {
+    if ((mode == 41 || mode == 42 || mode == 43 || mode == 44) && (cortaoMrtFlags & 8u) == 0u) {
       // CORTAO Ambient AO (M6f/M9): characters never reach the environment ambient add. Mode 41 shows the character AO value
       // with the Ambient AO Strength (before Char Mask); modes 42 and 43 stay black (no such term on characters).
-      o0.rgb = (mode == 41) ? saturate(cortaoCharAo).xxx * 0.3 : float3(0.0, 0.0, 0.0);
+      o0.rgb = (mode == 41 || mode == 44) ? saturate(cortaoCharAo).xxx * 0.3 : float3(0.0, 0.0, 0.0);
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
     if (mode >= 22 && mode <= 38) {
@@ -1175,6 +1175,15 @@ void main(
   if (shader_injection_data.cortao_ambient_strength != 1.0f)
     cortaoAmbientK = saturate(cortaoAmbientK * shader_injection_data.cortao_ambient_strength);
   if (cortaoAmbientOnly) r11.xyz = (r11.xyz * mapAOColor_g.xyz - r11.xyz) * cortaoAmbientK + r11.xyz;
+  if ((int)shader_injection_data.gtvbao_debug_view == 44) {
+    // CORTAO Combined AO: strongest darkening from ambient, shadow fill and specular occlusion, grey like Final AO.
+    const float3 cortaoCombinedAmb = cortaoAmbientOnly ? (mapAOColor_g.xyz - 1.0) * cortaoAmbientK + 1.0 : float3(1.0, 1.0, 1.0);
+    const float3 cortaoCombinedFill = (cortaoAmbientOnly && shader_injection_data.cortao_shadow_fill > 0.5f)
+        ? (mapAOColor_g.xyz - 1.0) * cortaoFillK + 1.0 : float3(1.0, 1.0, 1.0);
+    const float cortaoCombinedL = min(saturate(dot(cortaoCombinedAmb, float3(0.298999995, 0.587000012, 0.114))), saturate(dot(cortaoCombinedFill, float3(0.298999995, 0.587000012, 0.114))));
+    o0.rgb = saturate(min(cortaoCombinedL, cortaoSoFactor)).xxx * 0.3;
+    o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+  }
   if ((int)shader_injection_data.gtvbao_debug_view == 43) {
     // CORTAO Shadow Fill AO (M8): the multiplier applied to the shadow-side fill, grey like Final AO. Neutral when
     // Occlude Shadow Fill is off, so the view shows no AO there.
