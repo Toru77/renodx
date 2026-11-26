@@ -68,6 +68,14 @@ GT-VBAO computes screen-space ambient occlusion by evaluating visibility bitmask
 **Code:** [`gtvbao`](customshaders/gtvbao/), [`gtvbao/GTVBAO.h`](customshaders/gtvbao/GTVBAO.h).
 **Reference:** [GameTechDev/GT-VBAO](https://github.com/GameTechDev/GT-VBAO), linked from the source header.
 
+#### CORTAO
+
+CORTAO ray-traces screen-space circular occluders built from a mipmapped packed depth/normal buffer to compute physically based ambient occlusion. It is selected by AO Technique as an alternative to GTVBAO and writes the same AO output the lighting shaders read. It follows the reference's DX11 workarounds (R32_FLOAT packed buffer, UNORM 16-ray occluder lookup table).
+
+**Code:** [`customshaders/cortao`](customshaders/cortao/).
+**Reference:** [`reference/CORTAO-main`](reference/CORTAO-main/) (v1.0.1).
+**License:** [`licenses/CORTAO-LICENSE.txt`](licenses/CORTAO-LICENSE.txt).
+
 #### GTVBGI / VBGI
 
 GTVBGI also uses visibility bitmasks to estimate indirect illumination. Far-field and multi-bounce paths have their own passes and history resources.
@@ -221,9 +229,9 @@ The addon captures resources from specific game shader bindings and draw events;
 
 | Resource | Where the addon gets it | Main consumers and tracing pointers |
 |---|---|---|
-| Scene depth | Captured from a recognized lighting shader's depth SRV: t4 in Sora shaders and t3 in Kai shaders. Binding constants and hash-gated capture are in [`addon.cpp`](addon.cpp); world lifetime/size tracking is in [`world/capture/depth_source.hpp`](world/capture/depth_source.hpp). | World ray tracing, GTVBAO/VBGI, contact shadows, and depth-aware temporal validation. Other passes may bind their own depth input; check that pass's shader and hook. |
-| G-buffer normal | Captured from t1 (`mrtTexture0`) on recognized lighting shaders. The game resource is held in add-on state and bound to passes that need surface orientation. | GTVBAO/VBGI, contact shadows, and edge-aware filters. Search `captured_mrt_normal_srv` in [`addon.cpp`](addon.cpp). |
-| Vanilla SSAO | Captured from t5 for Sora or t4 for Kai on the recognized lighting shader. This lets replacement/composite paths inspect or preserve the game's AO input. | GTVBAO activation and the game-specific lighting paths. See the register constants and `captured_ssao_srv` in [`addon.cpp`](addon.cpp). |
+| Scene depth | Captured from a recognized lighting shader's depth SRV: t4 in Sora shaders and t3 in Kai shaders. Binding constants and hash-gated capture are in [`addon.cpp`](addon.cpp); world lifetime/size tracking is in [`world/capture/depth_source.hpp`](world/capture/depth_source.hpp). | World ray tracing, GTVBAO/VBGI, CORTAO, contact shadows, and depth-aware temporal validation. Other passes may bind their own depth input; check that pass's shader and hook. |
+| G-buffer normal | Captured from t1 (`mrtTexture0`) on recognized lighting shaders. The game resource is held in add-on state and bound to passes that need surface orientation. | GTVBAO/VBGI, CORTAO, contact shadows, and edge-aware filters. Search `captured_mrt_normal_srv` in [`addon.cpp`](addon.cpp). |
+| Vanilla SSAO | Captured from t5 for Sora or t4 for Kai on the recognized lighting shader. This lets replacement/composite paths inspect or preserve the game's AO input. | GTVBAO/CORTAO activation and the game-specific lighting paths. See the register constants and `captured_ssao_srv` in [`addon.cpp`](addon.cpp). |
 | Scene constants (`cb_scene`) | Captured from b0 on lighting draws; draw-time values and ranges are tracked rather than assuming one stable buffer offset. | Camera transforms and reconstruction in world effects, shadow/fog passes, and game shader replacements. See [`world/capture/cb_tracking.hpp`](world/capture/cb_tracking.hpp), [`world/capture/cb_value_tracker.hpp`](world/capture/cb_value_tracker.hpp), and `captured_scene_cbv` in [`addon.cpp`](addon.cpp). |
 | Motion vectors: G-buffer RTV4 | Captured from the engine's RTV4 during render-target binding. `MBMotionRtv4Ensure` validates it, creates an add-on-owned SRV, and checks that dimensions match depth before world temporal passes use it. | GTVBAO/VBGI, Unified PT temporal reuse, and the default motion-blur input. If it conflicts with TAA t3, world temporal reuse is rejected; see `UpdateRtMotion` in [`addon.cpp`](addon.cpp). |
 | Motion vectors: TAA t3 | Captured from t3 only on recognized Sora TAA shader draws; this resource is not assumed ready before lighting. | Custom TAA, motion-adaptive RCAS, and the optional Sora motion-blur input. Kai motion blur uses RTV4. See the t3 capture in [`addon.cpp`](addon.cpp), [`taa_reproject.hlsli`](customshaders/taa/taa_reproject.hlsli), and RCAS/motion-blur dispatch setup there. |

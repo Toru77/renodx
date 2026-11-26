@@ -42,6 +42,7 @@
 #include "../../utils/shader.hpp"
 #include "../../utils/state.hpp"
 #include "./fast_noise_ea.h"     // baked-in fast_noise_ea.dds (embed_file.exe output)
+#include "./customshaders/cortao/cortao_occluder_lut_16.h"  // embed_file.exe output of reference/CORTAO-main/tables/occluder/24x24x16x16_R16_UNORM.bin
 #include "./kai_hero_light.hpp"  // Kai hero light: matches and zeroes the hero light in mapped light records
 #include "./shared.h"
 #include "./world/bvh/deform_probe.hpp"  // native D3D11 event query (DynCube validity readback poll)
@@ -528,6 +529,25 @@ constexpr uint32_t kGtvbaoSnapshotFloats = 33;
 constexpr uint32_t kLightingMrtNormalRegister = 1u;  // t1 = mrtTexture0 (g-buffer normals)
 constexpr uint64_t kGTVBAOStartupGuardFrames = 8u;
 constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
+
+// -- CORTAO (customshaders/cortao) --
+constexpr uint32_t kCortaoPackedMipLevels = 8u;
+constexpr uint32_t kCortaoPushConstantFloats = 20u;
+
+// Mirrors cb_cortao in cortao_common.hlsl; both blocks must stay in lockstep.
+struct CortaoPushConstants {
+  uint32_t width, height, mip_count, random_seed;
+  float max_radius, max_screenspace_radius_height_ratio, mip_bias, max_slope_compensation;
+  float backface_threshold, backface_boost, filter_depth_sensitivity, filter_normal_sensitivity;
+  float intensity, filter_enabled, foliage_exclude, foliage_ao_value, debug_mode, pad0, pad1, pad2;
+};
+static_assert(sizeof(CortaoPushConstants) == kCortaoPushConstantFloats * 4u);
+
+constexpr std::array<std::span<const uint8_t>, 7> kCortaoMainShaders = {
+    __cortao_main_s4, __cortao_main_s6, __cortao_main_s8, __cortao_main_s12,
+    __cortao_main_s16, __cortao_main_s24, __cortao_main_s32};
+constexpr int kCortaoDebugModes[4] = {0, 1, 22, 26};
+
 // DynCube loading wipe: color captures older than this mean no lighting draws
 // (loading screen) � arm history hard-replace so the next scene rebuilds clean.
 constexpr uint64_t kDynCubeLoadingStaleFrames = 5u;
@@ -725,6 +745,18 @@ static float g_gtvbao_upscale_plane_sigma = 0.02f;
 static float g_gtvbao_upscale_normal_power = 64.f;
 static float g_gtvbao_upscale_bilinear_sharpness = 1.f;
 static float g_gtvbao_upscale_nearest_fallback = 1.f;
+
+// -- CORTAO (customshaders/cortao) --
+static float g_cortao_quality = 4.f;
+static float g_cortao_max_radius = 1.f;
+static float g_cortao_max_screenspace_radius_height_ratio = 0.2f;
+static float g_cortao_intensity = 1.f;
+static float g_cortao_temporal_noise = 1.f;
+static float g_cortao_mip_bias = -4.f;
+static float g_cortao_max_slope_compensation = 4.f;
+static float g_cortao_backface_threshold = 0.5f;
+static float g_cortao_backface_boost = 0.5f;
+static float g_cortao_debug_view = 0.f;
 
 // -- Dynamic Cubemaps (Sora 2nd) � standalone t17 replacement --
 constexpr uint32_t kDynCubeRegister = 17u;         // t17 texEnvMap_g
@@ -983,6 +1015,9 @@ static float g_vbgi_svgf_depth_sigma = 8.f;
 static float g_vbgi_svgf_normal_power = 128.f;
 static float g_gtvbao_debug_ui = 0.f;  // GTVBAODebugMode index into kGtvbaoDebugModes
 constexpr int kGtvbaoDebugModes[7] = {0, 1, 22, 23, 24, 25, 26};
+static bool GtvbaoSelected() { return std::lround(shader_injection.gtvbao_mode) == 1; }
+static bool CortaoSelected() { return std::lround(shader_injection.gtvbao_mode) == 2; }
+
 // VBGI Debug View row (0=Off, 1..6) maps to GTVBAO debug modes 30..35 while g_vbgi_enabled.
 static int VbgiGtvbaoDebugMode() {
   if (!VbgiRunning()) return 0;
@@ -991,7 +1026,9 @@ static int VbgiGtvbaoDebugMode() {
 }
 // AO-only: the VBGI row replaces the AO debug view, never mixes with it.
 static int GtvbaoDebugMode() {
-  return VbgiGtvbaoDebugMode() != 0 ? 0 : kGtvbaoDebugModes[std::clamp((int)g_gtvbao_debug_ui, 0, 6)];
+  if (VbgiGtvbaoDebugMode() != 0) return 0;
+  if (CortaoSelected()) return kCortaoDebugModes[std::clamp((int)g_cortao_debug_view, 0, 3)];
+  return kGtvbaoDebugModes[std::clamp((int)g_gtvbao_debug_ui, 0, 6)];
 }
 // What the lighting shaders show: VBGI wins when its row is set.
 static int ActiveGtvbaoDebugMode() {
@@ -1188,6 +1225,20 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline_layout foliage_mask_layout = {};
   reshade::api::pipeline foliage_mask_pipeline = {};
   GTVBAODescriptorTableSet foliage_mask_tables = {};
+  // -- CORTAO (packed depth/normal mips, occluder LUT and two passes) --
+  reshade::api::resource cortao_packed_texture = {};
+  reshade::api::resource_view cortao_packed_srv = {};
+  std::array<reshade::api::resource_view, kCortaoPackedMipLevels> cortao_packed_uavs = {};
+  uint32_t cortao_mip_count = 0u;
+  uint32_t cortao_width = 0u;
+  uint32_t cortao_height = 0u;
+  reshade::api::resource cortao_lut_texture = {};
+  reshade::api::resource_view cortao_lut_srv = {};
+  reshade::api::sampler cortao_border_sampler = {};
+  reshade::api::pipeline_layout cortao_prepass_layout = {}, cortao_main_layout = {};
+  reshade::api::pipeline cortao_prepass_pipeline = {}, cortao_main_pipeline = {};
+  int cortao_main_pipeline_key = -1;
+  GTVBAODescriptorTableSet cortao_prepass_tables = {}, cortao_main_tables = {};
   // -- Debug UAV (bitmask debug views 6-8) --
   reshade::api::resource debug_texture = {};
   reshade::api::resource_view debug_srv = {};
@@ -1637,6 +1688,8 @@ static void CreateGTVBAOResources(reshade::api::device* device, DeviceData* data
 static void DestroyGTVBAOResources(reshade::api::device* device, DeviceData* data);
 static bool CreateComputePipelinesIfNeeded(reshade::api::device* device, DeviceData* data);
 static bool RunGTVBAO(reshade::api::command_list* cmd_list, DeviceData* data);
+static bool RunCORTAO(reshade::api::command_list* cmd_list, DeviceData* data);
+static void DestroyCortaoResources(reshade::api::device* device, DeviceData* data);
 static bool RunVBGI(reshade::api::command_list* cmd_list, DeviceData* data, bool prefilter_done);
 static bool RunVbgiRadiance(reshade::api::command_list* cmd_list, DeviceData* data);
 static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d);
@@ -3950,12 +4003,12 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "GTVBAOMode",
         .binding = &shader_injection.gtvbao_mode,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 1.f,
-        .label = "GTVBAO mode",
+        .label = "AO Technique",
         .section = "GTVBAO",
-        .tooltip = "Off = vanilla game AO. On = GTVBAO compute-shader AO.",
-        .labels = {"Off (Vanilla AO)", "On (GTVBAO)"},
+        .tooltip = "Off = vanilla game AO. GTVBAO = visibility-bitmask compute AO. CORTAO = circular-occluder ray-traced compute AO (settings in the CORTAO section).",
+        .labels = {"Off (Vanilla AO)", "GTVBAO", "CORTAO"},
     },
     new renodx::utils::settings::Setting{
         .key = "GTVBAOQuality",
@@ -3966,7 +4019,7 @@ renodx::utils::settings::Settings settings = {
         .section = "GTVBAO",
         .tooltip = "Slices x steps per side. Low 2x4, Medium 3x4, High 3x6, Ultra 4x10.",
         .labels = {"Low", "Medium", "High", "Ultra"},
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected(); },
     },
     new renodx::utils::settings::Setting{
         .key = "GTVBAOResolution",
@@ -3977,7 +4030,7 @@ renodx::utils::settings::Settings settings = {
         .section = "GTVBAO",
         .tooltip = "Full = native. Half = half size per axis (a quarter of the pixels). Lower resolutions are upsampled with depth and normal aware weights and are softer. The size is relative to the render resolution, so in-game upscaling makes it smaller.",
         .labels = {"Full", "Half"},
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected(); },
     },
     new renodx::utils::settings::Setting{
         .key = "GTVBAOUpscaleAlgorithm",
@@ -3988,7 +4041,7 @@ renodx::utils::settings::Settings settings = {
         .section = "GTVBAO Upscaling",
         .tooltip = "Joint Bilateral (Current) preserves the existing 2x2 depth and normal aware filter. Bilinear is smoother but can bleed across edges. Nearest Valid selects one edge-aware tap and can look blocky. Wider Joint Bilateral uses a 4x4 footprint and costs more. All modes pass through at native resolution.",
         .labels = {"Joint Bilateral (Current)", "Bilinear", "Nearest Valid", "Wider Joint Bilateral"},
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected(); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4001,7 +4054,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.005f,
         .max = 0.10f,
         .format = "%.3f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
+        .is_enabled = []() { return GtvbaoSelected() && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4014,7 +4067,7 @@ renodx::utils::settings::Settings settings = {
         .min = 1.f,
         .max = 64.f,
         .format = "%.0f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
+        .is_enabled = []() { return GtvbaoSelected() && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4027,7 +4080,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.5f,
         .max = 4.f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_upscale_algorithm < 2.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && g_gtvbao_upscale_algorithm < 2.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4039,7 +4092,7 @@ renodx::utils::settings::Settings settings = {
         .section = "GTVBAO Upscaling",
         .tooltip = "When all joint-bilateral taps are rejected by the edge weights, use the valid tap with the strongest spatial weight. Off leaves neutral AO at that pixel.",
         .labels = {"Off", "On"},
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
+        .is_enabled = []() { return GtvbaoSelected() && (g_gtvbao_upscale_algorithm < 0.5f || g_gtvbao_upscale_algorithm > 1.5f); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4053,7 +4106,7 @@ renodx::utils::settings::Settings settings = {
                    "IGN = Interleaved Gradient Noise. Hilbert = Hilbert curve noise. "
                    "Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
         .labels = {"IS-FAST", "IGN", "Hilbert"},
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_isfast_enabled > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && g_isfast_enabled > 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4065,7 +4118,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.01f,
         .max = 5.0f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected(); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4077,7 +4130,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.3f,
         .max = 3.0f,
         .format = "%.3f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected(); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4089,7 +4142,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.5f,
         .max = 5.0f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected(); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4101,7 +4154,7 @@ renodx::utils::settings::Settings settings = {
         .min = 1.0f,
         .max = 3.0f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected(); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4113,7 +4166,7 @@ renodx::utils::settings::Settings settings = {
         .section = "GTVBAO",
         .tooltip = "Estimate occluder thickness from connected depth samples. Base Thickness sets the starting thickness.",
         .labels = {"Off", "On"},
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected(); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4126,7 +4179,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.01f,
         .max = 2.0f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_auto_thickness < 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && g_gtvbao_auto_thickness < 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4139,7 +4192,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.01f,
         .max = 2.0f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_auto_thickness > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && g_gtvbao_auto_thickness > 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4151,7 +4204,7 @@ renodx::utils::settings::Settings settings = {
         .section = "GTVBAO",
         .tooltip = "Weight = uniform slices with a per-slice weight (reference mode 1). Project = cosine-lobe projection (mode 2, default). CDF = approximate inverse-CDF sampling (mode 3). Only used with Cosine weighting.",
         .labels = {"Weight", "Project", "CDF"},
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_hemisphere_weighting < 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && g_gtvbao_hemisphere_weighting < 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4163,7 +4216,7 @@ renodx::utils::settings::Settings settings = {
         .section = "GTVBAO",
         .tooltip = "Cosine = ground-truth cosine-weighted AO (default). Uniform = uniform-weighted hemisphere.",
         .labels = {"Cosine", "Uniform"},
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected(); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4175,7 +4228,7 @@ renodx::utils::settings::Settings settings = {
         .min = 2.0f,
         .max = 6.0f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected(); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4187,7 +4240,7 @@ renodx::utils::settings::Settings settings = {
         .section = "GTVBAO",
         .tooltip = "Off = depth normals only. On = use game g-buffer normals.",
         .labels = {"Off (Depth)", "On (MRT)"},
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected(); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4199,7 +4252,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 2.f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && g_gtvbao_normal_input_mode > 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4212,7 +4265,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 1.f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && g_gtvbao_normal_input_mode > 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4225,7 +4278,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.01f,
         .max = 4.f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && g_gtvbao_normal_input_mode > 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4238,7 +4291,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 2.f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && g_gtvbao_normal_input_mode > 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4251,7 +4304,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 2.f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && g_gtvbao_normal_input_mode > 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4264,7 +4317,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 1.f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && g_gtvbao_normal_input_mode > 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4277,7 +4330,7 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 1.f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && g_gtvbao_normal_input_mode > 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4289,6 +4342,7 @@ renodx::utils::settings::Settings settings = {
         .section = "GTVBAO",
         .tooltip = "Off: normal output.\nAO Only: the final AO on the lighting pass.\nRaw AO: this frame's AO before the SVGF denoise.\nTemporal Confidence: SVGF history length, black (new or no surface) to white (32 frames); blue = the reprojection did not run. Purple = sky, orange = no MRT normal (depth normal used), cyan = foliage.\nSlice AO: mean unoccluded slice fraction (flat surface ~1.0).\nBitmask: first slice's horizon mask (R popcount, G first set bit, B last set bit).\nAO Normal: the view-space normal the AO uses.\nKyoto and Daybreak 2 do not support the compute views (Raw AO, Temporal Confidence, Slice AO, Bitmask, AO Normal).",
         .labels = {"Off", "AO Only", "Raw AO", "Temporal Confidence", "Slice AO", "Bitmask", "AO Normal"},
+        .is_enabled = []() { return GtvbaoSelected(); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4322,7 +4376,7 @@ renodx::utils::settings::Settings settings = {
         .section = "GTVBAO",
         .tooltip = "Skip AO computation on foliage pixels (prevent wind disocclusion noise).",
         .labels = {"Off", "On"},
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected(); },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4336,8 +4390,128 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 1.f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_exclude_foliage > 0.5f; },
+        .is_enabled = []() { return GtvbaoSelected() && shader_injection.gtvbao_exclude_foliage > 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+
+    // -- CORTAO --
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOQuality",
+        .binding = &g_cortao_quality,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 4.f,
+        .label = "Quality",
+        .section = "CORTAO",
+        .labels = {"Minimal (4)", "Very Low (6)", "Low (8)", "Medium (12)", "High (16)", "Very High (24)", "Ultra (32)"},
+        .is_visible = []() { return CortaoSelected(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOMaxRadius",
+        .binding = &g_cortao_max_radius,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Max Radius",
+        .section = "CORTAO",
+        .tooltip = "World-space radius of the sampling circle.",
+        .min = 0.05f,
+        .max = 10.f,
+        .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOMaxScreenRadius",
+        .binding = &g_cortao_max_screenspace_radius_height_ratio,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.2f,
+        .label = "Max Screen Radius",
+        .section = "CORTAO",
+        .tooltip = "Maximum circle radius as a fraction of screen height (0.1 to 0.25 recommended).",
+        .min = 0.05f,
+        .max = 0.5f,
+        .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOIntensity",
+        .binding = &g_cortao_intensity,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 1.f,
+        .label = "Intensity",
+        .section = "CORTAO",
+        .tooltip = "Exponent applied to visibility; 1.0 is physically based.",
+        .min = 0.25f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOTemporalNoise",
+        .binding = &g_cortao_temporal_noise,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Temporal Noise",
+        .section = "CORTAO",
+        .tooltip = "Off uses a constant random seed for use without TAA; On changes the seed every frame.",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOMipBias",
+        .binding = &g_cortao_mip_bias,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = -4.f,
+        .label = "Mip Bias",
+        .section = "CORTAO",
+        .min = -6.f,
+        .max = -1.f,
+        .format = "%.1f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOMaxSlopeCompensation",
+        .binding = &g_cortao_max_slope_compensation,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 4.f,
+        .label = "Max Slope Compensation",
+        .section = "CORTAO",
+        .min = 1.f,
+        .max = 8.f,
+        .format = "%.1f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOBackfaceThreshold",
+        .binding = &g_cortao_backface_threshold,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.5f,
+        .label = "Backface Threshold",
+        .section = "CORTAO",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOBackfaceBoost",
+        .binding = &g_cortao_backface_boost,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.5f,
+        .label = "Backface Boost",
+        .section = "CORTAO",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAODebugView",
+        .binding = &g_cortao_debug_view,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Debug View",
+        .section = "CORTAO",
+        .labels = {"Off", "AO Only", "Raw AO", "Input Normal"},
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     // -- Foliage Grass AO --
     new renodx::utils::settings::Setting{
@@ -8952,10 +9126,10 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     const std::string wantDims = std::to_string(d->working_width) + "x" + std::to_string(d->working_height);
     const bool dimMismatch = (liveDepth != wantDims);
     CSLog("gtvbao", std::string("invoke working=") + wantDims + " liveDepth=" + liveDepth + " cbv=" + (d->captured_scene_cbv_valid ? "ok" : "MISSING"), dimMismatch || !d->captured_scene_cbv_valid);
-    ok = RunGTVBAO(cl, d);
+    ok = CortaoSelected() ? RunCORTAO(cl, d) : RunGTVBAO(cl, d);
     CSLog("gtvbao", std::string("invoke exit") + (ok ? " ok" : " FAILED"), !ok);
   }
-  const bool ao_ok = (shader_injection.gtvbao_mode > 0.5f) && ok;
+  const bool ao_ok = GtvbaoSelected() && ok;
   if (VbgiRunning()) {
     const bool ok_vbgi = RunVBGI(cl, d, ao_ok);
     CSLog("vbgi", std::string("invoke exit") + (ok_vbgi ? " ok" : " FAILED"), !ok_vbgi);
@@ -11915,12 +12089,18 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
       bool ao_ok = false;
       if (gtvbao_active && dd->ao_term_a_srv.handle) {
-        const std::string liveDepth = dd->captured_depth_srv.handle ? dd->captured_depth_dims : "none";
-        const std::string wantDims = std::to_string(dd->working_width) + "x" + std::to_string(dd->working_height);
-        CSLog("gtvbao", std::string("inline invoke working=") + wantDims + " liveDepth=" + liveDepth,
-              liveDepth != wantDims);
-        ao_ok = RunGTVBAO(cmd_list, dd);
-        CSLog("gtvbao", std::string("inline invoke exit") + (ao_ok ? " ok" : " FAILED"), !ao_ok);
+        if (CortaoSelected()) {
+          CSLog("cortao", "inline invoke");
+          const bool ok_cortao = RunCORTAO(cmd_list, dd);
+          CSLog("cortao", std::string("inline invoke exit") + (ok_cortao ? " ok" : " FAILED"), !ok_cortao);
+        } else {
+          const std::string liveDepth = dd->captured_depth_srv.handle ? dd->captured_depth_dims : "none";
+          const std::string wantDims = std::to_string(dd->working_width) + "x" + std::to_string(dd->working_height);
+          CSLog("gtvbao", std::string("inline invoke working=") + wantDims + " liveDepth=" + liveDepth,
+                liveDepth != wantDims);
+          ao_ok = RunGTVBAO(cmd_list, dd);
+          CSLog("gtvbao", std::string("inline invoke exit") + (ao_ok ? " ok" : " FAILED"), !ao_ok);
+        }
       }
       if (vbgi_active) {
         const bool ok_vbgi = RunVBGI(cmd_list, dd, ao_ok);
@@ -11942,6 +12122,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     falcom_world::denoise::ReleaseDenoiseTextures(dev, &dd->gtvbao_denoise);
     falcom_world::denoise::DestroyTextureSet(dev, &dd->gtvbao_svgf_raw);
   }
+  if (!CortaoSelected() && dd->cortao_packed_texture.handle != 0u) DestroyCortaoResources(dev, dd);
 
   // Push the GTVBAO AO result at t22.
   // In inline mode: fresh from dispatch above.
@@ -12472,6 +12653,7 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
 
 static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   if (!dev || !d) return;
+  DestroyCortaoResources(dev, d);
   auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
   auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
   auto dp = [&](reshade::api::pipeline& p) { if (p.handle) { dev->destroy_pipeline(p); p = {}; } };
@@ -12580,6 +12762,34 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   // Do NOT clear captured_depth_srv / captured_scene_cbv �
   // those reference game-owned resources that survive recreation.
   d->resources_created = false;
+}
+
+static void DestroyCortaoResources(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return;
+  auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
+  auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
+  auto dp = [&](reshade::api::pipeline& p) { if (p.handle) { dev->destroy_pipeline(p); p = {}; } };
+  auto dl = [&](reshade::api::pipeline_layout& l) { if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; } };
+
+  dv(d->cortao_packed_srv);
+  for (auto& u : d->cortao_packed_uavs) dv(u);
+  dr(d->cortao_packed_texture);
+  dv(d->cortao_lut_srv);
+  dr(d->cortao_lut_texture);
+  if (d->cortao_border_sampler.handle) {
+    dev->destroy_sampler(d->cortao_border_sampler);
+    d->cortao_border_sampler = {};
+  }
+  dp(d->cortao_prepass_pipeline);
+  dp(d->cortao_main_pipeline);
+  dl(d->cortao_prepass_layout);
+  dl(d->cortao_main_layout);
+  DestroyGTVBAODescriptorTables(dev, &d->cortao_prepass_tables);
+  DestroyGTVBAODescriptorTables(dev, &d->cortao_main_tables);
+  d->cortao_mip_count = 0u;
+  d->cortao_width = 0u;
+  d->cortao_height = 0u;
+  d->cortao_main_pipeline_key = -1;
 }
 
 // ----------- Contact Shadows (customshaders/shadows/*.cs_5_0.hlsl) -----------
@@ -15048,8 +15258,123 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!d->vbgi_far_temporal_pipeline.handle) mkcs(__vbgi_far_temporal, "main", d->vbgi_far_layout, &d->vbgi_far_temporal_pipeline);
   if (!d->vbgi_far_spatial_pipeline.handle) mkcs(__vbgi_far_spatial, "main", d->vbgi_far_layout, &d->vbgi_far_spatial_pipeline);
 
+  // CORTAO (customshaders/cortao): created only while selected, kept across calls; destroyed by DestroyCortaoResources.
+  if (CortaoSelected()) {
+    if (make_layout(2u, kCortaoPackedMipLevels, &d->cortao_prepass_layout, 1u, kCortaoPushConstantFloats) && !d->cortao_prepass_pipeline.handle)
+      mkcs(__cortao_prepass, "main", d->cortao_prepass_layout, &d->cortao_prepass_pipeline);
+    const int key = std::clamp((int)std::lround(g_cortao_quality), 0, 6);
+    if (make_layout(5u, 4u, &d->cortao_main_layout, 2u, kCortaoPushConstantFloats)) {
+      if (d->cortao_main_pipeline.handle && d->cortao_main_pipeline_key != key) {
+        dev->destroy_pipeline(d->cortao_main_pipeline);
+        d->cortao_main_pipeline = {};
+      }
+      if (!d->cortao_main_pipeline.handle && mkcs(kCortaoMainShaders[key], "main", d->cortao_main_layout, &d->cortao_main_pipeline))
+        d->cortao_main_pipeline_key = key;
+    }
+  }
+
   // -- Main pass: visibility bitmask AO only (GI removed; VBGI inactive). --
   return d->prefilter_pipeline.handle && d->main_pipeline.handle;
+}
+
+static bool EnsureCortaoResources(reshade::api::device* dev, DeviceData* d, uint32_t w, uint32_t h) {
+  auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
+  auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
+
+  if (!d->cortao_border_sampler.handle) {
+    reshade::api::sampler_desc sd = {};
+    sd.filter = reshade::api::filter_mode::min_mag_mip_point;
+    sd.address_u = sd.address_v = sd.address_w = reshade::api::texture_address_mode::border;
+    sd.border_color[0] = sd.border_color[1] = sd.border_color[2] = sd.border_color[3] = 0.f;
+    if (!dev->create_sampler(sd, &d->cortao_border_sampler)) {
+      CSLog("cortao", "create_sampler(border) failed", true);
+      return false;
+    }
+  }
+
+  if (!d->cortao_lut_texture.handle) {
+    if (__cortao_occluder_lut_16.size() != 18432u) {
+      CSLog("cortao", "occluder lut size " + std::to_string(__cortao_occluder_lut_16.size()) + " != 18432", true);
+      return false;
+    }
+    reshade::api::resource_desc rd = {};
+    rd.type = reshade::api::resource_type::texture_3d;
+    rd.texture = {24, 24, 16, 1, reshade::api::format::r16_unorm, 1};
+    rd.heap = reshade::api::memory_heap::gpu_only;
+    rd.usage = reshade::api::resource_usage::shader_resource;
+    reshade::api::subresource_data sub = {};
+    sub.data = const_cast<uint8_t*>(__cortao_occluder_lut_16.data());
+    sub.row_pitch = 48;
+    sub.slice_pitch = 1152;
+    if (!dev->create_resource(rd, &sub, reshade::api::resource_usage::shader_resource, &d->cortao_lut_texture)) {
+      CSLog("cortao", "create_resource(occluder lut) failed", true);
+      return false;
+    }
+    if (!dev->create_resource_view(d->cortao_lut_texture, reshade::api::resource_usage::shader_resource,
+                                   reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_3d,
+                                                                    reshade::api::format::r16_unorm, 0, 1, 0, 1),
+                                   &d->cortao_lut_srv)) {
+      CSLog("cortao", "create_resource_view(occluder lut) failed", true);
+      return false;
+    }
+    CSLog("cortao", "occluder lut created 24x24x16 r16_unorm bytes=18432");
+  }
+
+  if (!d->cortao_packed_texture.handle || d->cortao_width != w || d->cortao_height != h) {
+    dv(d->cortao_packed_srv);
+    for (auto& u : d->cortao_packed_uavs) dv(u);
+    dr(d->cortao_packed_texture);
+
+    uint32_t mips = 1u;
+    while (mips < kCortaoPackedMipLevels && (std::min(w, h) >> mips) >= 64u) ++mips;
+    reshade::api::resource_desc rd = {};
+    rd.type = reshade::api::resource_type::texture_2d;
+    rd.texture = {w, h, 1, 8, reshade::api::format::r32_float, 1};
+    rd.heap = reshade::api::memory_heap::gpu_only;
+    rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+    if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &d->cortao_packed_texture)) {
+      CSLog("cortao", "create_resource(packed) failed", true);
+      return false;
+    }
+    if (!dev->create_resource_view(d->cortao_packed_texture, reshade::api::resource_usage::shader_resource,
+                                   reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
+                                                                    reshade::api::format::r32_float, 0, mips, 0, 1),
+                                   &d->cortao_packed_srv)) {
+      CSLog("cortao", "create_resource_view(packed srv) failed", true);
+      return false;
+    }
+    for (uint32_t m = 0u; m < kCortaoPackedMipLevels; ++m) {
+      if (!dev->create_resource_view(d->cortao_packed_texture, reshade::api::resource_usage::unordered_access,
+                                     reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
+                                                                      reshade::api::format::r32_float, m, 1, 0, 1),
+                                     &d->cortao_packed_uavs[m])) {
+        CSLog("cortao", "create_resource_view(packed uav) failed mip=" + std::to_string(m), true);
+        return false;
+      }
+    }
+    d->cortao_width = w;
+    d->cortao_height = h;
+    d->cortao_mip_count = mips;
+    CSLog("cortao", std::string("packed created ") + std::to_string(w) + "x" + std::to_string(h)
+                    + " mips=" + std::to_string(mips));
+  }
+
+  if (!d->cortao_border_sampler.handle || !d->cortao_lut_texture.handle || !d->cortao_lut_srv.handle
+      || !d->cortao_packed_texture.handle || !d->cortao_packed_srv.handle) {
+    CSLog("cortao", std::string("null handles sampler=") + std::to_string(d->cortao_border_sampler.handle != 0u)
+          + " lut=" + std::to_string(d->cortao_lut_texture.handle != 0u)
+          + " lutSrv=" + std::to_string(d->cortao_lut_srv.handle != 0u)
+          + " packed=" + std::to_string(d->cortao_packed_texture.handle != 0u)
+          + " packedSrv=" + std::to_string(d->cortao_packed_srv.handle != 0u), true);
+    return false;
+  }
+  for (uint32_t m = 0u; m < kCortaoPackedMipLevels; ++m) {
+    if (!d->cortao_packed_uavs[m].handle) {
+      CSLog("cortao", "null handles packedUav=" + std::to_string(m), true);
+      return false;
+    }
+  }
+  return true;
 }
 
 // -- IS-FAST DDS loader (64�64�64, RG8_UNORM Texture3D) --
@@ -15465,6 +15790,167 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     d->gtvbao_prev_svgf_radius_scale = svgf_radius_scale;
   }
   CSLog("gtvbao", "run exit ok");
+  return true;
+}
+
+static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
+  namespace denoise = falcom_world::denoise;
+  if (!d->captured_depth_srv.handle || !d->captured_mrt_normal_srv.handle || !d->captured_scene_cbv_view.handle) {
+    CSLog("cortao", "skipped: depth=" + std::to_string(d->captured_depth_srv.handle != 0u)
+          + " mrt=" + std::to_string(d->captured_mrt_normal_srv.handle != 0u)
+          + " cbv=" + std::to_string(d->captured_scene_cbv_view.handle != 0u), true);
+    return false;
+  }
+
+  auto* dev = cl->get_device();
+  const uint32_t w = d->working_width, h = d->working_height;
+  if (w < 64u || h < 64u || w != d->captured_depth_w || h != d->captured_depth_h) {
+    CSLog("cortao", std::string("size ABORT: working=") + std::to_string(w) + "x" + std::to_string(h)
+          + " depth=" + std::to_string(d->captured_depth_w) + "x" + std::to_string(d->captured_depth_h), true);
+    return false;
+  }
+
+  CreateComputePipelinesIfNeeded(dev, d);
+  if (!EnsureCortaoResources(dev, d, w, h)) return false;
+  if (!d->cortao_prepass_pipeline.handle || !d->cortao_main_pipeline.handle) {
+    CSLog("cortao", std::string("pipelines missing prepass=") + std::to_string(d->cortao_prepass_pipeline.handle != 0u)
+          + " main=" + std::to_string(d->cortao_main_pipeline.handle != 0u)
+          + " key=" + std::to_string(d->cortao_main_pipeline_key), true);
+    return false;
+  }
+  if (!EnsureGTVBAODescriptorTables(dev, d->cortao_prepass_layout, &d->cortao_prepass_tables)) {
+    CSLog("cortao", "descriptor tables failed: prepass", true);
+    return false;
+  }
+  if (!EnsureGTVBAODescriptorTables(dev, d->cortao_main_layout, &d->cortao_main_tables)) {
+    CSLog("cortao", "descriptor tables failed: main", true);
+    return false;
+  }
+
+  const auto UA = reshade::api::resource_usage::unordered_access;
+  const auto SR = reshade::api::resource_usage::shader_resource;
+  const auto CS = reshade::api::shader_stage::all_compute;
+  static constexpr denoise::ComputePipelineDesc kCortaoUpsampleDesc = {.srv_count = denoise::kUpsampleSrvCount, .uav_count = denoise::kUpsampleUavCount, .sampler_count = 0u, .push_count = denoise::kUpsamplePushCount, .code = __gtvbao_svgf_upsample, .name = "gtvbao upsample"};
+  denoise::DenoiseReady ready = {};
+  if (d->captured_mrt_normal_srv.handle != 0u && d->captured_scene_cbv_view.handle != 0u
+      && denoise::EnsureComputePipeline(dev, &d->gtvbao_denoise.upsample_pipeline, kCortaoUpsampleDesc)
+      && denoise::EnsureTextureSet(dev, &d->gtvbao_svgf_raw, reshade::api::format::r16g16b16a16_float, 8u, w, h)) {
+    ready = denoise::EnsureDenoise(dev, &d->gtvbao_denoise, {.output_format = reshade::api::format::r32_uint, .output_bytes_per_pixel = 4u, .trace_width = w, .trace_height = h, .full_width = w, .full_height = h, .temporal = false, .spatial = false, .log_prefix = "[cortao]", .full_resolution = false, .nearest_fallback = true, .bypass_svgf = false});
+  }
+  if (!ready.ok) {
+    CSLog("cortao", "svgf chain not ready", true);
+    return false;
+  }
+
+  const int dbg = GtvbaoDebugMode();
+  const bool dbg_on = IsGtvbaoComputeDebug(dbg) && d->debug_uav.handle;
+
+  CortaoPushConstants pc = {};
+  pc.width = w;
+  pc.height = h;
+  pc.mip_count = d->cortao_mip_count;
+  uint32_t seed = 0u;
+  if (g_cortao_temporal_noise > 0.5f) {
+    seed = static_cast<uint32_t>(d->frame_index);
+    seed ^= seed >> 16;
+    seed *= 0x7feb352du;
+    seed ^= seed >> 15;
+    seed *= 0x846ca68bu;
+    seed ^= seed >> 16;
+  }
+  pc.random_seed = seed;
+  pc.max_radius = std::clamp(g_cortao_max_radius, 0.01f, 100.f);
+  pc.max_screenspace_radius_height_ratio = std::clamp(g_cortao_max_screenspace_radius_height_ratio, 0.01f, 0.5f);
+  pc.mip_bias = std::clamp(g_cortao_mip_bias, -8.f, 0.f);
+  pc.max_slope_compensation = std::clamp(g_cortao_max_slope_compensation, 1.f, 16.f);
+  pc.backface_threshold = std::clamp(g_cortao_backface_threshold, 0.f, 1.f);
+  pc.backface_boost = std::clamp(g_cortao_backface_boost, 0.f, 1.f);
+  pc.intensity = std::clamp(g_cortao_intensity, 0.1f, 8.f);
+  pc.filter_depth_sensitivity = 512.f;
+  pc.filter_normal_sensitivity = 16.f;
+  pc.filter_enabled = 0.f;
+  pc.foliage_exclude = 0.f;
+  pc.foliage_ao_value = 1.f;
+  pc.debug_mode = dbg_on ? static_cast<float>(dbg) : 0.f;
+
+  // Pass 1: prepass packs depth and view normals into mip 0 and its coarse levels.
+  GtvbaoBindPipeline(cl, d->cortao_prepass_pipeline);
+  {
+    reshade::api::resource_view srvs[2] = {d->captured_depth_srv, d->captured_mrt_normal_srv};
+    reshade::api::descriptor_table_update u[4] = {
+        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_clamp_sampler},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
+        {{}, 0, 0, kCortaoPackedMipLevels, reshade::api::descriptor_type::texture_unordered_access_view, d->cortao_packed_uavs.data()},
+    };
+    GtvbaoApplyDescriptors(dev, cl, d->cortao_prepass_layout, &d->cortao_prepass_tables, 4, u);
+    cl->push_constants(CS, d->cortao_prepass_layout, kGtvbaoPushConstantsLayoutParam, 0, kCortaoPushConstantFloats, &pc);
+  }
+  cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+  GtvbaoBarrier(cl, d->cortao_packed_texture, UA, SR);
+
+  // Pass 2: main circular-occluder AO. u0 is the SVGF raw target; u1/u2 stay unused until M3/M4.
+  GtvbaoBindPipeline(cl, d->cortao_main_pipeline);
+  {
+    reshade::api::sampler samplers[2] = {d->cortao_border_sampler, d->point_clamp_sampler};
+    reshade::api::resource_view srvs[5] = {d->cortao_packed_srv, d->captured_mrt_normal_srv, d->cortao_lut_srv, d->fallback_srv, d->fallback_srv};
+    reshade::api::resource_view uavs[4] = {d->gtvbao_svgf_raw.uav[0], d->fallback_uav, d->fallback_uav, dbg_on ? d->debug_uav : d->fallback_uav};
+    reshade::api::descriptor_table_update u[4] = {
+        {{}, 0, 0, 2, reshade::api::descriptor_type::sampler, samplers},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, 5, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
+        {{}, 0, 0, 4, reshade::api::descriptor_type::texture_unordered_access_view, uavs},
+    };
+    GtvbaoApplyDescriptors(dev, cl, d->cortao_main_layout, &d->cortao_main_tables, 4, u);
+    cl->push_constants(CS, d->cortao_main_layout, kGtvbaoPushConstantsLayoutParam, 0, kCortaoPushConstantFloats, &pc);
+  }
+  cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
+  GtvbaoBarrier(cl, d->gtvbao_svgf_raw.texture[0], UA, SR);
+  if (dbg_on) {
+    GtvbaoBarrier(cl, d->debug_texture, UA, SR);
+    d->gtvbao_debug_frame = d->frame_index;
+    d->gtvbao_debug_mode_written = static_cast<float>(dbg);
+  }
+
+  {
+    std::vector<reshade::api::descriptor_table_update> table_nulls;
+    denoise::DispatchDenoise(dev, cl, &d->gtvbao_denoise,
+                             {.raw_view = d->gtvbao_svgf_raw.srv[0],
+                              .depth_view = d->captured_depth_srv,
+                              .mrt_normal_view = d->captured_mrt_normal_srv,
+                              .scene_cbv_view = d->captured_scene_cbv_view,
+                              .motion_view = d->mb_rtv4_owned_srv,
+                              .albedo_view = reshade::api::resource_view{0u},
+                              .stats_uav = reshade::api::resource_view{0u},
+                              .debug_uav = reshade::api::resource_view{0u},
+                              .debug_texture = d->debug_texture,
+                              .trace_width = w,
+                              .trace_height = h,
+                              .full_width = w,
+                              .full_height = h,
+                              .divisor = 1.f,
+                              .debug_mode = 0,
+                              .svgf = {g_gtvbao_history_weight, g_gtvbao_depth_rejection, g_gtvbao_normal_rejection,
+                                       false, 1.f, g_gtvbao_svgf_luminance_edge_stop,
+                                       g_gtvbao_svgf_depth_sigma, g_gtvbao_svgf_normal_power, false, g_gtvbao_svgf_history_length, g_gtvbao_svgf_radius_scale},
+                              .luminance_weights = denoise::kSvgfLuminanceAo,
+                              .upsample_intensity = 1.f,
+                              .upsample_char_intensity = 1.f,
+                              .upsample_saturation = 1.f,
+                              .upsample = {.algorithm = g_gtvbao_upscale_algorithm,
+                                           .depth_plane_sigma = g_gtvbao_upscale_plane_sigma,
+                                           .normal_edge_power = g_gtvbao_upscale_normal_power,
+                                           .bilinear_weight_sharpness = g_gtvbao_upscale_bilinear_sharpness,
+                                           .nearest_valid_fallback = g_gtvbao_upscale_nearest_fallback}},
+                             ready, &table_nulls);
+    dev->update_descriptor_tables(static_cast<uint32_t>(table_nulls.size()), table_nulls.data());
+  }
+
+  d->gtvbao_temporal_last = false;
+  d->gtvbao_prev_params_valid = false;
+  CSLog("cortao", std::string("run exit ok ") + std::to_string(w) + "x" + std::to_string(h)
+        + " mips=" + std::to_string(d->cortao_mip_count)
+        + " samples=" + std::to_string(std::lround(g_cortao_quality)));
   return true;
 }
 

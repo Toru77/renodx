@@ -147,6 +147,15 @@ GTVBAO perf P3 (AO upsample at Full), implemented, not validated in game: at d =
 3. FPS at Full against HEAD.
 Send back: screenshots and FPS against HEAD.
 
+CORTAO M1, implemented, not validated in game: the prepass packs game depth and view-space G-buffer normals into eight R32_FLOAT mip levels, the main pass traces 16 circular occluders with the 24x24x16 R16_UNORM lookup table and writes SVGF raw visibility, and the shared upsample produces the t22 AO byte without CORTAO temporal or spatial filtering. Owner test list (Sora 2nd, then Sora 1st and Kai, with Deferred Dispatch on and off):
+1. AO Technique = GTVBAO: final image and GTVBAO Debug "AO Only" identical to HEAD.
+2. AO Technique = CORTAO: the CORTAO section appears (only Quality in Basic, the other rows in Advanced with GTVBAO rows greyed out); Debug "AO Only" shows white sky, dark creases and no full-screen black or white; AO stays fixed to geometry when rotating the camera; "Input Normal" shows smooth, camera-facing (+Z) surfaces with no noise; "Raw AO" matches "AO Only".
+3. Every Quality level renders.
+4. Max Radius 0.25 / 1 / 4 and Max Screen Radius 0.1 / 0.25 behave as the README describes.
+5. Temporal Noise Off gives a static pattern and On an animated pattern smoothed by TAA/DLSS.
+6. Switch CORTAO -> GTVBAO -> Off -> CORTAO, and change resolution or toggle DLSS: no crash, AO comes back.
+Send back: screenshots (final and debug views) for GTVBAO vs CORTAO per game, `[cortao]` log lines (`occluder lut created`, `packed created WxH mips=N`, `run exit ok`, and any skipped/FAILED/not-ready line), FPS or GPU time for GTVBAO High vs CORTAO High / Ultra, and crash logs if any.
+
 GTVBAO perf P4 (AO written in the SVGF raw layout), implemented, not validated in game: the GTVBAO main pass writes the SVGF raw layout (`GTVBAO_WriteSvgfRaw`) directly, and the separate input pass is gone. `ao_term_a` is still allocated but no longer written; removing it is deferred cleanup. Owner test: the SVGF M2a list items 1, 2, 4 and 6 against HEAD.
 
 GTVBAO perf P5 (CDF hoist, edge metric skip, full-mask stop), implemented, not validated in game: the per-slice cosine CDF terms are computed once per slice; the normal edge metric is skipped at Normal Edge Rejection 0 (its term is exactly 1); the horizon search stops once the bitmask is full (AO only). The GI output is bit-identical (test_gpu_gtvbao on WARP, 0 mismatches); its code generation changes. Item 6 (fast acos) dropped: the FXC /O3 listings of gtvbao_main, gtvbao_vbgi_main and gtvbao_vbgi_far_main already expand acos to the 4-coefficient Abramowitz-Stegun polynomial (its constants 0.018729, 0.074261, 0.212114 and 1.570729 appear in each listing; published error bound about 6.7e-5 rad, not measured here); a cheaper form would trade accuracy for an estimated 2 ALU per call. R16_FLOAT depth mips deferred: the GTVBGI far-field Thin hit window (bitmask thickness, default 0.3) is below the fp16 depth spacing beyond z = 512, and the depth-fallback normal precision changes AO at Normal Detail Response 1.0. Owner test list (Sora 1st, Sora 2nd and Kai):

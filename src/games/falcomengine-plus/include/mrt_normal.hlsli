@@ -47,4 +47,22 @@ float3 DecodeFalcomMrtNormalAsGame(uint2 packed)
   return float3(cos_a * ring, sin_a * ring, enc.y);
 }
 
+// Texel address for a screen UV in a source whose resolution differs from the
+// AO working domain. Every MRT normal reader must land on
+// the SAME texel for the same UV, or the two read different normals for one
+// pixel.
+//
+// The caller passes the already-scaled texel-space coordinate (i.e.
+// `uv * dims`), NOT a normalized UV, and that scaling is done ONCE by the
+// caller. Computing `(pix + 0.5) / work * dims` here instead would round twice
+// and can land just under an integer boundary, e.g. half-res 960 -> full 1920
+// at pix 252 gives 504.99999999999994 and floors to 504 where the old
+// `floor((252 + 0.5) * 2)` correctly gave 505. Keep the arithmetic in the
+// form the main pass used to keep the existing mapping bit-identical.
+int2 GTVBAO_MrtTexel(float2 uvTexelSpace, float2 mrtDims)
+{
+  int2 d = max(int2(mrtDims), int2(1, 1));
+  return clamp(int2(floor(uvTexelSpace)), int2(0, 0), d - 1);
+}
+
 #endif  // SRC_GAMES_FALCOMENGINE_PLUS_INCLUDE_MRT_NORMAL_HLSI_
