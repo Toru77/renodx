@@ -546,6 +546,7 @@ static_assert(sizeof(CortaoPushConstants) == kCortaoPushConstantFloats * 4u);
 constexpr std::array<std::span<const uint8_t>, 7> kCortaoMainShaders = {
     __cortao_main_s4, __cortao_main_s6, __cortao_main_s8, __cortao_main_s12,
     __cortao_main_s16, __cortao_main_s24, __cortao_main_s32};
+constexpr std::array<std::span<const uint8_t>, 2> kCortaoFilterShaders = {__cortao_filter_small, __cortao_filter_large};
 constexpr int kCortaoDebugModes[4] = {0, 1, 22, 26};
 
 // DynCube loading wipe: color captures older than this mean no lighting draws
@@ -764,6 +765,10 @@ static float g_gtvbao_char_mode = 2.f;
 static float g_gtvbao_char_mask_strength = 0.75f;
 static float g_cortao_char_mode = 2.f;
 static float g_cortao_char_mask_strength = 0.75f;
+static float g_cortao_filter = 1.f;
+static float g_cortao_filter_size = 1.f;
+static float g_cortao_filter_depth_sensitivity = 512.f;
+static float g_cortao_filter_normal_sensitivity = 16.f;
 
 // -- Dynamic Cubemaps (Sora 2nd) � standalone t17 replacement --
 constexpr uint32_t kDynCubeRegister = 17u;         // t17 texEnvMap_g
@@ -1246,6 +1251,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline cortao_prepass_pipeline = {}, cortao_main_pipeline = {};
   int cortao_main_pipeline_key = -1;
   falcom_world::denoise::TextureSet<1> cortao_foliage_mask = {};
+  falcom_world::denoise::TextureSet<1> cortao_occlusion = {};
+  reshade::api::pipeline_layout cortao_filter_layout = {};
+  reshade::api::pipeline cortao_filter_pipeline = {};
+  int cortao_filter_pipeline_key = -1;
+  GTVBAODescriptorTableSet cortao_filter_tables = {};
   GTVBAODescriptorTableSet cortao_prepass_tables = {}, cortao_main_tables = {};
   // -- Debug UAV (bitmask debug views 6-8) --
   reshade::api::resource debug_texture = {};
@@ -4559,6 +4569,53 @@ renodx::utils::settings::Settings settings = {
         .format = "%.0f",
         .is_enabled = []() { return g_cortao_char_mode > 0.5f; },
         .parse = [](float v) { return v * 0.01f; },
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOFilter",
+        .binding = &g_cortao_filter,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Filter",
+        .section = "CORTAO",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOFilterSize",
+        .binding = &g_cortao_filter_size,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Filter Size",
+        .section = "CORTAO",
+        .labels = {"Small (5 tap)", "Large (13 tap)"},
+        .is_enabled = []() { return g_cortao_filter > 0.5f; },
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOFilterDepthSensitivity",
+        .binding = &g_cortao_filter_depth_sensitivity,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 512.f,
+        .label = "Filter Depth Sensitivity",
+        .section = "CORTAO",
+        .min = 0.f,
+        .max = 2048.f,
+        .format = "%.0f",
+        .is_enabled = []() { return g_cortao_filter > 0.5f; },
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOFilterNormalSensitivity",
+        .binding = &g_cortao_filter_normal_sensitivity,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 16.f,
+        .label = "Filter Normal Sensitivity",
+        .section = "CORTAO",
+        .min = 0.f,
+        .max = 64.f,
+        .format = "%.1f",
+        .is_enabled = []() { return g_cortao_filter > 0.5f; },
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -12865,6 +12922,7 @@ static void DestroyCortaoResources(reshade::api::device* dev, DeviceData* d) {
   for (auto& u : d->cortao_packed_uavs) dv(u);
   dr(d->cortao_packed_texture);
   falcom_world::denoise::DestroyTextureSet(dev, &d->cortao_foliage_mask);
+  falcom_world::denoise::DestroyTextureSet(dev, &d->cortao_occlusion);
   dv(d->cortao_lut_srv);
   dr(d->cortao_lut_texture);
   if (d->cortao_border_sampler.handle) {
@@ -12873,14 +12931,18 @@ static void DestroyCortaoResources(reshade::api::device* dev, DeviceData* d) {
   }
   dp(d->cortao_prepass_pipeline);
   dp(d->cortao_main_pipeline);
+  dp(d->cortao_filter_pipeline);
   dl(d->cortao_prepass_layout);
   dl(d->cortao_main_layout);
+  dl(d->cortao_filter_layout);
   DestroyGTVBAODescriptorTables(dev, &d->cortao_prepass_tables);
   DestroyGTVBAODescriptorTables(dev, &d->cortao_main_tables);
+  DestroyGTVBAODescriptorTables(dev, &d->cortao_filter_tables);
   d->cortao_mip_count = 0u;
   d->cortao_width = 0u;
   d->cortao_height = 0u;
   d->cortao_main_pipeline_key = -1;
+  d->cortao_filter_pipeline_key = -1;
 }
 
 // ----------- Contact Shadows (customshaders/shadows/*.cs_5_0.hlsl) -----------
@@ -15362,6 +15424,14 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
       if (!d->cortao_main_pipeline.handle && mkcs(kCortaoMainShaders[key], "main", d->cortao_main_layout, &d->cortao_main_pipeline))
         d->cortao_main_pipeline_key = key;
     }
+    if (g_cortao_filter > 0.5f && make_layout(3u, 2u, &d->cortao_filter_layout, 1u, kCortaoPushConstantFloats)) {
+      const int fkey = std::clamp((int)std::lround(g_cortao_filter_size), 0, 1);
+      if (d->cortao_filter_pipeline.handle && d->cortao_filter_pipeline_key != fkey) {
+        dev->destroy_pipeline(d->cortao_filter_pipeline);
+        d->cortao_filter_pipeline = {};
+      }
+      if (!d->cortao_filter_pipeline.handle && mkcs(kCortaoFilterShaders[fkey], "main", d->cortao_filter_layout, &d->cortao_filter_pipeline)) d->cortao_filter_pipeline_key = fkey;
+    }
   }
 
   // -- Main pass: visibility bitmask AO only (GI removed; VBGI inactive). --
@@ -15920,6 +15990,14 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
     return false;
   }
 
+  const bool filter_tables_ok = g_cortao_filter > 0.5f && EnsureGTVBAODescriptorTables(dev, d->cortao_filter_layout, &d->cortao_filter_tables);
+  const bool filter_texture_ok = g_cortao_filter > 0.5f
+      && falcom_world::denoise::EnsureTextureSet(dev, &d->cortao_occlusion, reshade::api::format::r8_unorm, 1u, w, h);
+  const bool filter_on = filter_tables_ok && filter_texture_ok && d->cortao_filter_pipeline.handle != 0u;
+  if (g_cortao_filter > 0.5f && !filter_on)
+    CortaoLog(std::string("filter requested but not ready: pipeline=") + std::to_string(d->cortao_filter_pipeline.handle != 0u)
+              + " tables=" + std::to_string(filter_tables_ok) + " texture=" + std::to_string(filter_texture_ok), true);
+
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
   const auto CS = reshade::api::shader_stage::all_compute;
@@ -15974,9 +16052,9 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   pc.backface_threshold = std::clamp(g_cortao_backface_threshold, 0.f, 1.f);
   pc.backface_boost = std::clamp(g_cortao_backface_boost, 0.f, 1.f);
   pc.intensity = std::clamp(g_cortao_intensity, 0.1f, 8.f);
-  pc.filter_depth_sensitivity = 512.f;
-  pc.filter_normal_sensitivity = 16.f;
-  pc.filter_enabled = 0.f;
+  pc.filter_enabled = filter_on ? 1.f : 0.f;
+  pc.filter_depth_sensitivity = std::clamp(g_cortao_filter_depth_sensitivity, 0.f, 4096.f);
+  pc.filter_normal_sensitivity = std::clamp(g_cortao_filter_normal_sensitivity, 0.f, 256.f);
   pc.foliage_exclude = foliage_mask_valid ? 1.f : 0.f;
   pc.foliage_ao_value = std::clamp(g_cortao_foliage_ao_value, 0.f, 1.f);
   pc.debug_mode = dbg_on ? static_cast<float>(dbg) : 0.f;
@@ -16002,7 +16080,7 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   {
     reshade::api::sampler samplers[2] = {d->cortao_border_sampler, d->point_clamp_sampler};
     reshade::api::resource_view srvs[5] = {d->cortao_packed_srv, d->captured_mrt_normal_srv, d->cortao_lut_srv, foliage_mask_valid ? d->cortao_foliage_mask.srv[0] : d->fallback_srv, d->fallback_srv};
-    reshade::api::resource_view uavs[4] = {d->gtvbao_svgf_raw.uav[0], d->fallback_uav, d->fallback_uav, dbg_on ? d->debug_uav : d->fallback_uav};
+    reshade::api::resource_view uavs[4] = {d->gtvbao_svgf_raw.uav[0], filter_on ? d->cortao_occlusion.uav[0] : d->fallback_uav, d->fallback_uav, dbg_on ? d->debug_uav : d->fallback_uav};
     reshade::api::descriptor_table_update u[4] = {
         {{}, 0, 0, 2, reshade::api::descriptor_type::sampler, samplers},
         {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
@@ -16014,6 +16092,22 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   }
   cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
   GtvbaoBarrier(cl, d->gtvbao_svgf_raw.texture[0], UA, SR);
+  if (filter_on) {
+    GtvbaoBarrier(cl, d->cortao_occlusion.texture[0], UA, SR);
+    GtvbaoBindPipeline(cl, d->cortao_filter_pipeline);
+    reshade::api::resource_view srvs[3] = {d->cortao_packed_srv, d->cortao_occlusion.srv[0], foliage_mask_valid ? d->cortao_foliage_mask.srv[0] : d->fallback_srv};
+    reshade::api::resource_view uavs[2] = {d->gtvbao_svgf_raw.uav[0], d->fallback_uav};
+    reshade::api::descriptor_table_update u[4] = {
+        {{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &d->cortao_border_sampler},
+        {{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
+        {{}, 0, 0, 3, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
+        {{}, 0, 0, 2, reshade::api::descriptor_type::texture_unordered_access_view, uavs},
+    };
+    GtvbaoApplyDescriptors(dev, cl, d->cortao_filter_layout, &d->cortao_filter_tables, 4, u);
+    cl->push_constants(CS, d->cortao_filter_layout, kGtvbaoPushConstantsLayoutParam, 0, kCortaoPushConstantFloats, &pc);
+    cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
+    GtvbaoBarrier(cl, d->gtvbao_svgf_raw.texture[0], UA, SR);
+  }
   if (dbg_on) {
     GtvbaoBarrier(cl, d->debug_texture, UA, SR);
     d->gtvbao_debug_frame = d->frame_index;
@@ -16058,7 +16152,8 @@ static bool RunCORTAO(reshade::api::command_list* cl, DeviceData* d) {
   d->gtvbao_prev_params_valid = false;
   CortaoLog(std::string("run exit ok ") + std::to_string(w) + "x" + std::to_string(h)
         + " mips=" + std::to_string(d->cortao_mip_count)
-        + " samples=" + std::to_string(std::lround(g_cortao_quality)));
+        + " samples=" + std::to_string(std::lround(g_cortao_quality))
+        + " filter=" + (filter_on ? (d->cortao_filter_pipeline_key == 1 ? "large" : "small") : "off"));
   return true;
 }
 

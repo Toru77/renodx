@@ -89,10 +89,12 @@ void main(uint2 workgroupID : SV_GroupID, uint localIndex : SV_GroupIndex) {
   g_falcomCortaoMaskFoliage = CORTAO_foliage_exclude > 0.5f && !receiverFoliage;
   if (receiverFoliage && CORTAO_foliage_ao_value <= 0.0f && CORTAO_debug_mode < 21.5f) {
     FalcomCortaoWriteVisibility(g_outSvgfRaw, g_srcFoliageMask, pixelCoords, 1.0); // GTVBAO perf P2 parity
+    if (CORTAO_filter_enabled > 0.5f) g_outOcclusion[pixelCoords] = 1.0;
     return;
   }
   // cortao_mainPass returns before cortao_writeResult for sky pixels (CORTAOMainPass.h:374-377): pre-write full visibility.
   FalcomCortaoWriteVisibility(g_outSvgfRaw, g_srcFoliageMask, pixelCoords, 1.0);
+  if (CORTAO_filter_enabled > 0.5f) g_outOcclusion[pixelCoords] = 1.0;
   if (CORTAO_debug_mode > 21.5f) g_outDebug[pixelCoords] = float4(0.25, 0.0, 0.25, 1.0);
   cortao_mainPass(pixelCoords, FalcomCortaoPopulateMainPassParameters());
 }
