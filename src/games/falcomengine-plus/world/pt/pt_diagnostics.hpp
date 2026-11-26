@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include "../../../../utils/log.hpp"
+#include "../bvh/bvh_pool.hpp"
 #include "../rtxdi/rtxdi_state.hpp"
 #include "pt_state.hpp"
 namespace falcom_world::pt {
@@ -80,6 +81,16 @@ inline std::string SerializePtReport() {
   out << "gpu_hits: " << p.gpu_hits << "\n";
   out << "gpu_misses: " << p.gpu_misses << "\n";
   out << "gpu_atlas_hits: " << p.gpu_atlas_hits << "\n";
+  bvh::PoolAlbedoGpuStats atlas;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    atlas = bvh::g_pool.albedo_gpu;
+  }
+  out << "atlas: sources " << atlas.sources << "; slices " << atlas.slices_used << "/" << kAlbedoAtlasSlices
+      << "; materials " << atlas.materials_used << "/" << kAlbedoMaterials
+      << "; keys " << atlas.keys_mapped << "; tlas_instances " << atlas.tlas_albedo_instances
+      << "; copies " << atlas.copies << "; refused " << atlas.refused
+      << "; cap_refused " << atlas.cap_refused_slices << "/" << atlas.cap_refused_materials << "\n";
   out << "gpu_lock_drops: " << p.gpu_lock_drops << "\n";
   out << "gpu_writes: " << p.gpu_writes << "\n";
   out << "gpu_frame: " << p.gpu_frame << "\n";

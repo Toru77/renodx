@@ -848,6 +848,7 @@ struct PoolIndirectAlpha {
   PoolVertexBuffers vbs;
   bool vbs_known = false;
   uint64_t source = 0u;  // alpha source id of the keyless copy (CapturePoolAlphaSource), 0 = none
+  bool atlas = false;
 };
 
 struct PoolStagingSlot {
@@ -1156,6 +1157,7 @@ struct PoolStats {
   uint64_t alpha_source_copies = 0u;   // source textures copied for alpha draws (CapturePoolAlphaSource)
   uint64_t albedo_source_copies = 0u;  // source textures copied for material-atlas (static) draws
   uint64_t albedo_source_refused = 0u;  // material-atlas draws whose source was not copied
+  uint64_t albedo_indirect_refs = 0u;
   uint64_t alpha_source_refused = 0u;  // alpha draws whose source was not copied (texture kind, caps, deferred, failure)
   uint64_t alpha_source_refused_bytes = 0u;   // of those: the byte cap (kAlphaSourceBytesMax) was reached
   uint64_t alpha_source_refused_format = 0u;  // of those: the bound view's format is unknown or typeless
@@ -4591,10 +4593,16 @@ inline void OnPoolScanIndirectDraw(
     }
     if (gate.wind_rest && !wind_read) g_pool.stats.wind_sway_unread += 1u;
   }
+  const bool atlas_draw = pt::g_pt_material_atlas > 0.5f && gate.vs_class == contract::VsClass::Rigid
+                          && gate.skip == PoolSkip::None;
   PoolAlphaMaterial alpha_material;
   if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, gate.alpha_threshold_offset, &alpha_material);
+  if (!gate.alpha_material && atlas_draw) {
+    alpha_material.view = cl_data->ps_srv_view[contract::kAlphaTexSlot].handle;
+    alpha_material.resource = cl_data->ps_srv[contract::kAlphaTexSlot].handle;
+  }
   PoolVertexBuffers vbs;
-  const bool vbs_known = gate.alpha_material && CollectPoolVertexBuffers(cmd_list, &vbs);
+  const bool vbs_known = (gate.alpha_material || atlas_draw) && CollectPoolVertexBuffers(cmd_list, &vbs);
   PoolUvStream uv;
   if (vbs_known) ResolvePoolUvStream(device, draw, vbs, &uv);
   PoolSkip skip = gate.skip;
@@ -4638,6 +4646,8 @@ inline void OnPoolScanIndirectDraw(
   std::array<PoolMeshCopy, kPoolMeshCopiesPerDraw> mesh_copies;
   std::array<std::pair<uint32_t, uint32_t>, kPoolMaxIndirectSubDraws> alpha_refs;  // (slot, indirect_alpha entry) per reserved alpha copy
   uint32_t alpha_ref_count = 0u;
+  bool any_atlas_ref = false;
+  bool any_alpha_ref = false;
   std::array<PoolDynamicDraw, kPoolMaxIndirectSubDraws> dynamic_copies;  // P2b: slice copies of the sub-draws, reserved under the lock
   uint32_t dynamic_count = 0u;
   uint32_t wind_index = UINT32_MAX;
@@ -4724,10 +4734,13 @@ inline void OnPoolScanIndirectDraw(
       copy.ps_hash = draw.ps_hash;
       copy.pass = gate.pass;
       copy.alpha = alpha_material;
-      if (gate.alpha_material) {
+      if (gate.alpha_material || atlas_draw) {
         copy.alpha_index = static_cast<uint32_t>(slot.indirect_alpha.size());
-        slot.indirect_alpha.push_back({uv, vbs, vbs_known});
+        slot.indirect_alpha.push_back({uv, vbs, vbs_known, 0u, /*atlas*/ atlas_draw && !gate.alpha_material});
         alpha_refs[alpha_ref_count++] = {g_pool.write_slot, copy.alpha_index};
+        if (atlas_draw) any_atlas_ref = true;
+        if (gate.alpha_material) any_alpha_ref = true;
+        if (atlas_draw && !gate.alpha_material) g_pool.stats.albedo_indirect_refs += 1u;
       }
       if (wind_read && (gate.pass & kPoolPassWind) != 0u) {
         if (wind_index == UINT32_MAX) {
@@ -4772,7 +4785,8 @@ inline void OnPoolScanIndirectDraw(
                                  dyn.arena, static_cast<uint64_t>(dyn.count) * kPoolInstanceStride);
     cmd_list->copy_buffer_region(args_buffer, dyn.args_offset, dyn.buffer, dyn.args, kPoolIndirectArgsCopyBytes);
   }
-  if (alpha_ref_count != 0u && (AlphaMode() & 2u) != 0u && alpha_material.view != 0u) {
+  if (alpha_ref_count != 0u && alpha_material.view != 0u
+      && (((AlphaMode() & 2u) != 0u && any_alpha_ref) || (any_atlas_ref && pt::g_pt_material_atlas > 0.5f))) {
     // The same view guard as the direct path: the bound view must be the t0 resource.
     const reshade::api::resource source = device->get_resource_from_view({alpha_material.view});
     uint64_t source_id = 0u;
@@ -4781,8 +4795,9 @@ inline void OnPoolScanIndirectDraw(
       g_pool.stats.alpha_source_refused += 1u;
       g_pool.stats.alpha_source_refused_type += 1u;
       g_pool.stats.alpha_source_refused_view += 1u;
+      if (any_atlas_ref) g_pool.stats.albedo_source_refused += 1u;
     } else {
-      source_id = CapturePoolAlphaSource(device, cmd_list, 0u, alpha_material.view, !deferred, false);
+      source_id = CapturePoolAlphaSource(device, cmd_list, 0u, alpha_material.view, !deferred, any_atlas_ref && !any_alpha_ref);
     }
     if (source_id != 0u) {
       std::lock_guard<std::mutex> lock(g_pool.mutex);
@@ -6121,7 +6136,8 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         if ((copy.pass & kPoolPassWind) != 0u) g_pool.wind_keys.insert(mesh_key);
         if (copy.wind_index != UINT32_MAX) g_pool.wind_sway.try_emplace(mesh_key, indirect_wind[copy.wind_index]);
         QueuePoolMesh(mesh_key, copy.vs_hash, record, true, alpha_side != nullptr ? alpha_side->uv : PoolUvStream{});
-        if (alpha_side != nullptr && alpha_side->source != 0u && (AlphaMode() & 2u) != 0u) {
+        if (alpha_side != nullptr && alpha_side->source != 0u
+            && ((AlphaMode() & 2u) != 0u || (alpha_side->atlas && pt::g_pt_material_atlas > 0.5f))) {
           AttachPoolAlphaSource(mesh_key, alpha_side->source);
         }
       }
@@ -7695,6 +7711,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"albedo_cap_refused_slices\": " << albedo_gpu.cap_refused_slices
       << ", \"albedo_cap_refused_materials\": " << albedo_gpu.cap_refused_materials
       << ", \"albedo_copies\": " << albedo_gpu.copies << ", \"albedo_refused\": " << albedo_gpu.refused
+      << ", \"albedo_indirect_refs\": " << stats.albedo_indirect_refs
       << ", \"tlas_albedo_instances\": " << albedo_gpu.tlas_albedo_instances << "},\n";
   out << "  \"alpha_keys_total\": " << alpha_keys.size() << ", \"alpha_keys\": [";
   for (size_t i = 0; i < alpha_keys.size() && i < kPoolDumpMaxAlphaKeys; ++i) {
