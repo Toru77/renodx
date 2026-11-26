@@ -82,7 +82,7 @@ struct ShaderInjectData {
   // the packoffset of every later field is unchanged.
   float cortao_ambient_only;            // 0/1: 1 whenever CORTAO fills t22 (M6g; was the M6c Ambient Only row); the lighting shaders apply the t22 AO to the ambient term only; was reserved_slot_02
   float reserved_slot_03;              // reserved: unused slot kept so later packoffsets do not move
-  float reserved_slot_04;              // reserved: unused slot kept so later packoffsets do not move
+  float cortao_shadow_fill;            // 0/1: CORTAO Occlude Shadow Fill (M6e): the AO also scales the shadow-side fill (sceneShadowColor_g); was reserved_slot_04
   float reserved_slot_05;              // reserved: unused slot kept so later packoffsets do not move
   float reserved_slot_06;              // reserved: unused slot kept so later packoffsets do not move
   float reserved_slot_07;              // reserved: unused slot kept so later packoffsets do not move

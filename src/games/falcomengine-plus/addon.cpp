@@ -102,7 +102,7 @@ ShaderInjectData shader_injection = {
     .debug_show_env_sss = 0.f,
     .cortao_ambient_only = 0.f,
     .reserved_slot_03 = 1.f,
-    .reserved_slot_04 = 1.f,
+    .cortao_shadow_fill = 0.f,
     .reserved_slot_05 = 1.f,
     .reserved_slot_06 = 0.f,
     .reserved_slot_07 = 1.f,
@@ -759,6 +759,7 @@ static float g_cortao_quality = 4.f;
 static float g_cortao_max_radius = 1.f;
 static float g_cortao_max_screenspace_radius_height_ratio = 0.2f;
 static float g_cortao_intensity = 1.f;
+static float g_cortao_shadow_fill = 1.f;  // CORTAOOccludeShadowFill
 static float g_cortao_temporal_noise = 1.f;
 static float g_cortao_noise_type = 0.f;  // CORTAONoiseType: 0 CORTAO, 1 Hilbert, 2 IS-FAST
 static float g_cortao_temporal_enabled = 0.f;  // CortaoTemporalEnabled: SVGF reprojection of the CORTAO AO (README "Filtering")
@@ -4490,6 +4491,17 @@ renodx::utils::settings::Settings settings = {
         .min = 0.25f,
         .max = 4.f,
         .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOOccludeShadowFill",
+        .binding = &g_cortao_shadow_fill,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Occlude Shadow Fill",
+        .section = "CORTAO",
+        .tooltip = "Also applies the CORTAO AO to the game's shadow-side fill light (the ambient colour of shadowed surfaces), so contact AO stays in shadowed and interior areas. Sunlit and lamp-lit light stays unoccluded. Off = only the light-probe ambient is occluded.",
+        .labels = {"Off", "On"},
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -12175,6 +12187,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   shader_injection.gtvbao_dedicated_bound = 0.f;
   shader_injection.cortao_bent_bound = 0.f;
   shader_injection.cortao_ambient_only = CortaoSelected() ? 1.f : 0.f;  // M6g: CORTAO always occludes ambient light only (README: ambient multiplier)
+  shader_injection.cortao_shadow_fill = (CortaoSelected() && g_cortao_shadow_fill > 0.5f) ? 1.f : 0.f;
   // The lighting shaders read char_gtvbao_* for whichever technique fills t22.
   shader_injection.char_gtvbao_mode = CortaoSelected() ? g_cortao_char_mode : g_gtvbao_char_mode;
   shader_injection.char_gtvbao_mask_strength = CortaoSelected() ? g_cortao_char_mask_strength : g_gtvbao_char_mask_strength;

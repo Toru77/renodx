@@ -1745,6 +1745,12 @@ void main(
   r4.y = ssgiShadowRatio_g * r15.w;
   r13.yzw = sceneShadowColor_g.xyz * r15.xyz + -sceneShadowColor_g.xyz;
   r13.yzw = r4.yyy * r13.yzw + sceneShadowColor_g.xyz;
+  // CORTAO Occlude Shadow Fill (M6e): the Kai AO tint and weight on the shadow-side fill (r13.yzw = sceneShadowColor_g term)
+  // before it joins the sun ramp, so only the shadow side is occluded.
+  if (cortaoAmbientOnly && shader_injection_data.cortao_shadow_fill > 0.5f) {
+    const float3 cortaoFillTint = r15.www * (min(float3(1, 1, 1), r15.xyz) - mapAOColor_g.xyz) + mapAOColor_g.xyz;
+    r13.yzw = (1.0 - r4.x) * (r13.yzw * cortaoFillTint - r13.yzw) + r13.yzw;
+  }
   r8.xyz = r13.yzw + r8.xyz;
   r8.xyz = min(float3(1,1,1), r8.xyz);
   r13.yzw = r15.xyz + -r12.xyz;

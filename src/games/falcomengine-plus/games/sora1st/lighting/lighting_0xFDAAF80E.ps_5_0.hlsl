@@ -1029,6 +1029,10 @@ void main(
     }
   }
   r1.w = r7.x * r0.w;
+  // CORTAO Occlude Shadow Fill (M6e): the game's AO formula on the shadow-side fill (r8 = sceneShadowColor_g term)
+  // before the sun ramp, so only the shadow side is occluded.
+  if (cortaoAmbientOnly && shader_injection_data.cortao_shadow_fill > 0.5f)
+    r8.xyz = (r8.xyz * mapAOColor_g.xyz - r8.xyz) * ((1.0 - r4.x) * r4.w * mapAOIntensity_g) + r8.xyz;
   r13.yzw = float3(1,1,1) + -r8.xyz;
   r8.xyz = r1.www * r13.yzw + r8.xyz;
   r1.w = log2(r0.w);
