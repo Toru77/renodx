@@ -80,7 +80,7 @@ struct ShaderInjectData {
   // march (cs_contact_local_*). The first nine are reserved, and the last two are
   // cs_contact_local_bound and cs_contact_local_normal_bias. All eleven stay in place so
   // the packoffset of every later field is unchanged.
-  float cortao_ambient_only;            // 0/1: CORTAO Ambient Only (M6c); the lighting shaders apply the t22 AO to the ambient term only; was reserved_slot_02
+  float cortao_ambient_only;            // 0/1: 1 whenever CORTAO fills t22 (M6g; was the M6c Ambient Only row); the lighting shaders apply the t22 AO to the ambient term only; was reserved_slot_02
   float reserved_slot_03;              // reserved: unused slot kept so later packoffsets do not move
   float reserved_slot_04;              // reserved: unused slot kept so later packoffsets do not move
   float reserved_slot_05;              // reserved: unused slot kept so later packoffsets do not move

@@ -759,7 +759,6 @@ static float g_cortao_quality = 4.f;
 static float g_cortao_max_radius = 1.f;
 static float g_cortao_max_screenspace_radius_height_ratio = 0.2f;
 static float g_cortao_intensity = 1.f;
-static float g_cortao_ambient_only = 0.f;  // CORTAOAmbientOnly: 1 = apply the t22 AO to ambient light only
 static float g_cortao_temporal_noise = 1.f;
 static float g_cortao_noise_type = 0.f;  // CORTAONoiseType: 0 CORTAO, 1 Hilbert, 2 IS-FAST
 static float g_cortao_temporal_enabled = 0.f;  // CortaoTemporalEnabled: SVGF reprojection of the CORTAO AO (README "Filtering")
@@ -4494,17 +4493,6 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-        .key = "CORTAOAmbientOnly",
-        .binding = &g_cortao_ambient_only,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f,
-        .label = "Ambient Only",
-        .section = "CORTAO",
-        .tooltip = "Applies the CORTAO occlusion only to the game's ambient light (light probe, and SSGI on Kai) instead of the whole lit colour, as CORTAO intends (its occlusion is a multiplier for incoming ambient light). Sun and lamps are no longer darkened. Characters keep the game's AO path; Sora 2nd path-traced GI pixels keep PT AO. Off = game behaviour.",
-        .labels = {"Off", "On"},
-        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
         .key = "CORTAOTemporalNoise",
         .binding = &g_cortao_temporal_noise,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -4714,7 +4702,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Debug View",
         .section = "CORTAO",
-        .tooltip = "Final AO Value: the AO value the game receives (after the CORTAO filter, temporal accumulation and upsample); it does not change with Ambient Only. Raw AO: the main pass before filtering. Input Normal: the normal CORTAO used. Bent Normal: the main-pass bent normal (needs Bent Normals). Filtered AO: after the CORTAO filter, before temporal (equals Raw AO with Filter Off). Filtered Bent Normal: the bent normal Bent Normal Ambient reads (needs Bent Normals). Temporal Confidence: history age, black (new) to white (full); purple when temporal is not running. AO Target: where the AO is applied: green = ambient only, grey = whole lit colour, blue = characters, red = path-traced GI pixels. Ambient AO: the AO that Ambient Only applies to the ambient light, as grey on a neutral background (the game's AO strength and tint included). Off = uniform neutral (the game darkens the whole colour instead); On = dark AO in creases and contacts. Characters are black. Purple = sky or not available.",
+        .tooltip = "Final AO Value: the AO value the game receives (after the CORTAO filter, temporal accumulation and upsample); it does not change with Ambient Only. Raw AO: the main pass before filtering. Input Normal: the normal CORTAO used. Bent Normal: the main-pass bent normal (needs Bent Normals). Filtered AO: after the CORTAO filter, before temporal (equals Raw AO with Filter Off). Filtered Bent Normal: the bent normal Bent Normal Ambient reads (needs Bent Normals). Temporal Confidence: history age, black (new) to white (full); purple when temporal is not running. AO Target: where the AO is applied: green = ambient light (CORTAO), blue = characters, red = path-traced GI pixels. Ambient AO: the AO CORTAO applies to the ambient light, as grey on a neutral background (the game's AO strength and tint included); dark in creases and contacts. Off = uniform neutral (the game darkens the whole colour instead); On = dark AO in creases and contacts. Characters are black. Purple = sky or not available.",
         .labels = {"Off", "Final AO Value", "Raw AO", "Input Normal", "Bent Normal", "Filtered AO", "Filtered Bent Normal", "Temporal Confidence", "AO Target", "Ambient AO"},
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
@@ -12186,7 +12174,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   shader_injection.gtvbao_debug_view = (float)ActiveGtvbaoDebugMode();
   shader_injection.gtvbao_dedicated_bound = 0.f;
   shader_injection.cortao_bent_bound = 0.f;
-  shader_injection.cortao_ambient_only = (CortaoSelected() && g_cortao_ambient_only > 0.5f) ? 1.f : 0.f;
+  shader_injection.cortao_ambient_only = CortaoSelected() ? 1.f : 0.f;  // M6g: CORTAO always occludes ambient light only (README: ambient multiplier)
   // The lighting shaders read char_gtvbao_* for whichever technique fills t22.
   shader_injection.char_gtvbao_mode = CortaoSelected() ? g_cortao_char_mode : g_gtvbao_char_mode;
   shader_injection.char_gtvbao_mask_strength = CortaoSelected() ? g_cortao_char_mask_strength : g_gtvbao_char_mask_strength;
