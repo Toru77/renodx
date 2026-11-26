@@ -1564,10 +1564,19 @@ void main(
         HammonDiffuseCorrection(brdf_NdotL_sun, brdf_NdotV, brdf_NdotH_sun, brdf_VdotH_sun, brdf_roughness),
         brdf_diffuse_str);
   }
+  // CORTAO Ambient Only (M6c): the game's AO tint and weight on the ambient term (r12: probes + SSGI) instead of the final colour.
+  const bool cortaoAmbientOnly = shader_injection_data.cortao_ambient_only > 0.5f && shader_injection_data.gtvbao_dedicated_bound > 0.5f
+                                 && !is_character_pixel;
+  const float3 cortaoAmbientIn = r12.xyz;
+  if (cortaoAmbientOnly) {
+    const float3 cortaoAoTint = r15.www * (min(float3(1, 1, 1), r15.xyz) - mapAOColor_g.xyz) + mapAOColor_g.xyz;
+    r12.xyz = (1.0 - r4.x) * (r12.xyz * cortaoAoTint - r12.xyz) + r12.xyz;
+  }
   r8.xyz = FalcomApplyContactToSun(
       r8.xyz * lightColor_g.xyz, is_character_pixel,
       contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0),
       r8.w, shadowSplitDistance_g.y, csDepthTex, samPoint_s, v1.xy) + r12.xyz;
+  r12.xyz = cortaoAmbientIn;  // CORTAO M6c: restore the ambient register
   r4.y = min(1, r6.w);
   r6.xyw = float3(1,1,1) + -r8.xyz;
   r6.xyw = r4.yyy * r6.xyw + r8.xyz;
@@ -1944,6 +1953,7 @@ void main(
   r6.xyz = -mapAOColor_g.xyz + r6.xyz;
   r6.xyz = r15.www * r6.xyz + mapAOColor_g.xyz;
   r0.y = 1 + -r4.x;
+  if (cortaoAmbientOnly) r0.y = 0.0;  // CORTAO M6c: AO already applied to the ambient term
   r4.xyz = r5.xyz * r6.xyz + -r5.xyz;
   r4.xyz = r0.yyy * r4.xyz + r5.xyz;
   // The RenoDx SSS block that used to sit here multiplied r4.xyz by the

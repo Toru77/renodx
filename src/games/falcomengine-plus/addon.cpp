@@ -100,7 +100,7 @@ ShaderInjectData shader_injection = {
     .env_sss_bright_reject_fade = 0.5f,
     .env_sss_csm_gate = 0.f,
     .debug_show_env_sss = 0.f,
-    .reserved_slot_02 = 0.f,
+    .cortao_ambient_only = 0.f,
     .reserved_slot_03 = 1.f,
     .reserved_slot_04 = 1.f,
     .reserved_slot_05 = 1.f,
@@ -759,6 +759,7 @@ static float g_cortao_quality = 4.f;
 static float g_cortao_max_radius = 1.f;
 static float g_cortao_max_screenspace_radius_height_ratio = 0.2f;
 static float g_cortao_intensity = 1.f;
+static float g_cortao_ambient_only = 0.f;  // CORTAOAmbientOnly: 1 = apply the t22 AO to ambient light only
 static float g_cortao_temporal_noise = 1.f;
 static float g_cortao_noise_type = 0.f;  // CORTAONoiseType: 0 CORTAO, 1 Hilbert, 2 IS-FAST
 static float g_cortao_mip_bias = -4.f;
@@ -4477,6 +4478,17 @@ renodx::utils::settings::Settings settings = {
         .min = 0.25f,
         .max = 4.f,
         .format = "%.2f",
+        .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CORTAOAmbientOnly",
+        .binding = &g_cortao_ambient_only,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Ambient Only",
+        .section = "CORTAO",
+        .tooltip = "Applies the CORTAO occlusion only to the game's ambient light (light probe, and SSGI on Kai) instead of the whole lit colour, as CORTAO intends (its occlusion is a multiplier for incoming ambient light). Sun and lamps are no longer darkened. Characters keep the game's AO path; Sora 2nd path-traced GI pixels keep PT AO. Off = game behaviour.",
+        .labels = {"Off", "On"},
         .is_visible = []() { return CortaoSelected() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -12160,6 +12172,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   shader_injection.gtvbao_debug_view = (float)ActiveGtvbaoDebugMode();
   shader_injection.gtvbao_dedicated_bound = 0.f;
   shader_injection.cortao_bent_bound = 0.f;
+  shader_injection.cortao_ambient_only = (CortaoSelected() && g_cortao_ambient_only > 0.5f) ? 1.f : 0.f;
   // The lighting shaders read char_gtvbao_* for whichever technique fills t22.
   shader_injection.char_gtvbao_mode = CortaoSelected() ? g_cortao_char_mode : g_gtvbao_char_mode;
   shader_injection.char_gtvbao_mask_strength = CortaoSelected() ? g_cortao_char_mask_strength : g_gtvbao_char_mask_strength;

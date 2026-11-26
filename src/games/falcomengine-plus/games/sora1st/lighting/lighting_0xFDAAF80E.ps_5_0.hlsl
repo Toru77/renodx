@@ -1118,10 +1118,16 @@ void main(
         HammonDiffuseCorrection(brdf_NdotL_sun, brdf_NdotV, brdf_NdotH_sun, brdf_VdotH_sun, brdf_roughness),
         brdf_diffuse_str);
   }
+  // CORTAO Ambient Only (M6c): the game's AO formula on the ambient term (r11) instead of the final colour.
+  const bool cortaoAmbientOnly = shader_injection_data.cortao_ambient_only > 0.5f && shader_injection_data.gtvbao_dedicated_bound > 0.5f
+                                 && csIsCharacter < 0.5;
+  const float3 cortaoAmbientIn = r11.xyz;
+  if (cortaoAmbientOnly) r11.xyz = (r11.xyz * mapAOColor_g.xyz - r11.xyz) * ((1.0 - r4.x) * r4.w * mapAOIntensity_g) + r11.xyz;
   r7.xyz = FalcomApplyContactToSun(
       r7.xyz * lightColor_g.xyz, is_character_pixel,
       contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0),
       r0.w, shadowSplitDistance_g.z, csDepthTex, samPoint_s, v1.xy) + r11.xyz;
+  r11.xyz = cortaoAmbientIn;  // CORTAO M6c: restore the ambient register
   r1.w = min(1, r3.z);
   r8.xyz = float3(1,1,1) + -r7.xyz;
   r7.xyz = r1.www * r8.xyz + r7.xyz;
@@ -1519,6 +1525,7 @@ void main(
   r0.y = 1 + -r4.x;
   r0.y = r4.w * r0.y;
   r0.y = mapAOIntensity_g * r0.y;
+  if (cortaoAmbientOnly) r0.y = 0.0;  // CORTAO M6c: AO already applied to the ambient term
   r3.yzw = r2.xyw * mapAOColor_g.xyz + -r2.xyw;
   r0.yzw = r0.yyy * r3.yzw + r2.xyw;
   r1.y = -fogNearDistance_g + -r3.x;
