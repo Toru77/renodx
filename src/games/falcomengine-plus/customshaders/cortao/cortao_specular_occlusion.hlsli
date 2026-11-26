@@ -3,7 +3,8 @@
 // Included by the Sora 1st, Sora 2nd and Kai lighting shaders after shadows_common.hlsli (FalcomSafeNormalize3).
 #ifndef SRC_GAMES_FALCOMENGINE_PLUS_CUSTOMSHADERS_CORTAO_CORTAO_SPECULAR_OCCLUSION_HLSLI_
 #define SRC_GAMES_FALCOMENGINE_PLUS_CUSTOMSHADERS_CORTAO_CORTAO_SPECULAR_OCCLUSION_HLSLI_
-// visibility: CORTAO AO value (1 = unoccluded). coneAxis, refl: unit world-space vectors. roughness: [0, 1]. Returns [0, 1].
+// visibility: CORTAO AO value (1 = unoccluded). coneAxis, refl: unit world-space vectors.
+// roughness: [0, 1], the effective roughness of the sampled cubemap lobe (material roughness x G-buffer roughness, M10). Returns [0, 1].
 float FalcomCortaoSpecularOcclusion(float visibility, float3 coneAxis, float3 refl, float roughness) {
   const float r0 = acos(sqrt(saturate(1.0 - visibility)));
   const float cosSpec = exp2(-3.32193 * max(roughness, 0.04) * max(roughness, 0.04));  // GGX lobe cone; roughness floored at 0.04 (M9: a 0 cone made mirrors black)
@@ -15,7 +16,7 @@ float FalcomCortaoSpecularOcclusion(float visibility, float3 coneAxis, float3 re
   else if (d >= r0 + r1) area = 0.0;
   else area = smoothstep(0.0, 1.0, 1.0 - saturate((d - abs(r0 - r1)) / (r0 + r1 - abs(r0 - r1)))) * capMin;
   const float so = saturate(area / max(6.2831853 * (1.0 - cosSpec), 1e-4));
-  // M9 Smooth Surface Fade (stylistic): fades the occlusion out on smooth materials, using the raw roughness. 0 = off.
+  // M9 Smooth Surface Fade (stylistic): fades the occlusion out on smooth materials, using the unfloored effective roughness. 0 = off.
   const float fade = shader_injection_data.cortao_specular_smooth_fade;
   return fade > 0.0f ? lerp(1.0, so, saturate(roughness / fade)) : so;
 }

@@ -1418,7 +1418,7 @@ void main(
           r7.w).xyz;
       // CORTAO Specular Occlusion (M7): factor the raw cubemap sample on the vanilla path before SSR.
       if (cortaoSpecOcc) {
-        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r4.x, cortaoSoAxis, exp_probe_dir_ws, saturate(r13.z));
+        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r4.x, cortaoSoAxis, exp_probe_dir_ws, saturate(r16.y));  // M10: effective roughness (material x G-buffer), as the mip
         if (shader_injection_data.cortao_specular_strength != 1.0f) cortaoSoFactor = saturate(lerp(1.0, cortaoSoFactor, shader_injection_data.cortao_specular_strength));  // CORTAO M8
         r20.xyz *= cortaoSoFactor;
       }
@@ -1430,7 +1430,7 @@ void main(
              kaiNumLevelsA, kaiUnusedMipA);
         // CORTAO Specular Occlusion (M7): factor the raw dynamic-cubemap sample before resolve/PT.
         if (cortaoSpecOcc) {
-          cortaoSoFactor = FalcomCortaoSpecularOcclusion(r4.x, cortaoSoAxis, exp_probe_dir_ws, saturate(r13.z));
+          cortaoSoFactor = FalcomCortaoSpecularOcclusion(r4.x, cortaoSoAxis, exp_probe_dir_ws, saturate(r16.y));  // M10: effective roughness (material x G-buffer), as the mip
           if (shader_injection_data.cortao_specular_strength != 1.0f) cortaoSoFactor = saturate(lerp(1.0, cortaoSoFactor, shader_injection_data.cortao_specular_strength));  // CORTAO M8
           kaiSampleColA *= cortaoSoFactor;
         }
@@ -1502,7 +1502,7 @@ void main(
       r16.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r16.xyz, r4.y).xyz;
       if (cortaoSpecOcc) {
         // CORTAO Specular Occlusion (M7): factor the raw cubemap sample before SSR/resolve.
-        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r4.x, cortaoSoAxis, FalcomSafeNormalize3(cortaoSoReflB, cortaoSoAxis), saturate(r13.z));
+        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r4.x, cortaoSoAxis, FalcomSafeNormalize3(cortaoSoReflB, cortaoSoAxis), saturate(r13.z * r4.z));  // M10: effective roughness; r4.y is a mip level here
         if (shader_injection_data.cortao_specular_strength != 1.0f) cortaoSoFactor = saturate(lerp(1.0, cortaoSoFactor, shader_injection_data.cortao_specular_strength));  // CORTAO M8
         r16.xyz *= cortaoSoFactor;
       }

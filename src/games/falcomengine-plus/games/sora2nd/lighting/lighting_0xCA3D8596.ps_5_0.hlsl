@@ -1100,7 +1100,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
            dynCubeNumLevelsA, dynCubeUnusedMipA);
       if (cortaoSpecOcc) {
         // CORTAO Specular Occlusion (M7): factor the raw cubemap sample before the SSR blend.
-        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r5.x, cortaoSoAxis, FalcomSafeNormalize3(r22.xyz, cortaoSoAxis), saturate(r15.z));
+        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r5.x, cortaoSoAxis, FalcomSafeNormalize3(r22.xyz, cortaoSoAxis), saturate(r5.z));  // M10: effective roughness (material x G-buffer), as the mip
         if (shader_injection_data.cortao_specular_strength != 1.0f) cortaoSoFactor = saturate(lerp(1.0, cortaoSoFactor, shader_injection_data.cortao_specular_strength));  // CORTAO M8
         dynCubeSampleColA *= cortaoSoFactor;
       }
@@ -1202,7 +1202,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
            dynCubeNumLevelsB, dynCubeSampleMipB);
       if (cortaoSpecOcc) {
         // CORTAO Specular Occlusion (M7): factor the raw cubemap sample before SSR/resolve.
-        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r5.x, cortaoSoAxis, FalcomSafeNormalize3(r21.xyz, cortaoSoAxis), saturate(r15.z));
+        cortaoSoFactor = FalcomCortaoSpecularOcclusion(r5.x, cortaoSoAxis, FalcomSafeNormalize3(r21.xyz, cortaoSoAxis), saturate(r2.x));  // M10: effective roughness (material x G-buffer), as the mip
         if (shader_injection_data.cortao_specular_strength != 1.0f) cortaoSoFactor = saturate(lerp(1.0, cortaoSoFactor, shader_injection_data.cortao_specular_strength));  // CORTAO M8
         dynCubeSampleColB *= cortaoSoFactor;
       }
